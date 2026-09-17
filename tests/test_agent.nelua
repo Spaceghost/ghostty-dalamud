@@ -1,0 +1,264 @@
+-- End-to-end: start ghostty-agent (already running, see run script), open a
+-- session, read its output, check EXIT.
+require 'core.agent_client'
+require 'string'
+require 'vector'
+require 'io'
+require 'os'
+require 'arg'
+
+## cinclude '<unistd.h>'
+local function usleep(us: cuint): cint <cimport, nodecl> end
+
+local port: uint16 = (@uint16)(tointeger(arg[1]))
+local token: string = arg[2]
+local agent_pid: string = arg[3]
+
+local got: string = ''
+local collect = true       -- append SDATA to `got` (off for floods)
+local sdata_bytes: usize = 0
+local opened_id: uint32 = 0
+local opened_count = 0
+local exit_status: int32 = -1
+local exit_id: uint32 = 0
+local exited = false
+local ok_count = 0
+local first_ok: string = ''
+local err_count = 0
+local last_err: string = ''
+local attached_id: uint32 = 0
+local attached_offset: uint64 = 0
+local attached_count = 0
+local opened_bytes: uint64 = 0   -- SDATA bytes for the last opened session
+local attached_bytes: uint64 = 0 -- opened_bytes when its ATTACHED arrived
+
+local function on_event(ctx: pointer, ev: *AgentEvent): void
+  local text = string{data=(@*[0]byte)(ev.data), size=ev.len}
+  if ev.typ == PROTO_OK then
+    if ok_count == 0 then first_ok = text:copy() end
+    ok_count = ok_count + 1
+  elseif ev.typ == PROTO_ERR then
+    io.stderr:write('agent error: ', text, '\n')
+    err_count = err_count + 1
+    last_err = text:copy()
+  elseif ev.typ == PROTO_OPENED then opened_id = ev.id opened_count = opened_count + 1 opened_bytes = 0
+  elseif ev.typ == PROTO_SDATA then
+    sdata_bytes = sdata_bytes + ev.len
+    if ev.id == opened_id then opened_bytes = opened_bytes + ev.len end
+    if collect then got = got .. text end
+  elseif ev.typ == PROTO_EXIT then exited = true exit_status = ev.status exit_id = ev.id
+  elseif ev.typ == PROTO_ATTACHED then
+    attached_id = ev.id
+    attached_offset = ev.offset
+    attached_count = attached_count + 1
+    if ev.id == opened_id then attached_bytes = opened_bytes end
+  end
+end
+
+local now: float64 = 0.0
+local function pump1(c: *AgentClient): void
+  c:pump(now)
+  now = now + 0.01
+  usleep(10000)
+end
+
+local c: AgentClient
+c:init('127.0.0.1', port, token)
+c.on_event = on_event
+c:connect(now)
+for _ = 1, 200 do pump1(&c) if c:ready() then break end end
+assert(c:ready(), 'agent handshake: ' .. c.last_error)
+print('handshake ok:', first_ok, 'version', c.version, 'nonce', c.nonce)
+assert(first_ok:find('ghostty-agent 2 ', 1, true) == 1, 'the greeting carries protocol version 2 and a nonce')
+assert(c.version == 2 and c.nonce ~= 0)
+
+local argv: vector(string)
+argv:push('/bin/sh')
+argv:push('-c')
+argv:push('printf hello-from-pty; sleep 0.1; exit 3')
+local env: vector(string)
+env:push('FOO=bar')
+assert(c:open(80, 24, &argv, &env))
+for _ = 1, 500 do pump1(&c) if exited then break end end
+print('opened id', opened_id, 'exit', exit_status)
+print('output:', got)
+assert(opened_id > 0)
+assert(got:find('hello-from-pty', 1, true) > 0)
+assert(exited and exit_status == 3)
+
+-- second session: attach replay check
+got = ''
+exited = false
+argv:clear()
+argv:push('/bin/sh')
+argv:push('-c')
+argv:push('printf replay-me; sleep 3')
+c:open(80, 24, &argv, nilptr)
+for _ = 1, 100 do pump1(&c) if got:find('replay-me', 1, true) > 0 then break end end
+assert(got:find('replay-me', 1, true) > 0)
+local sid = opened_id
+
+-- a fresh terminal (fed 0) on another connection gets the whole history, no reset needed
+do
+  local fresh: AgentClient
+  fresh:init('127.0.0.1', port, token)
+  fresh.on_event = on_event
+  fresh:connect(now)
+  for _ = 1, 200 do pump1(&fresh) if fresh:ready() then break end end
+  got = ''
+  attached_count = 0
+  fresh:attach(sid, 0)
+  for _ = 1, 100 do pump1(&fresh) if attached_count > 0 then break end end
+  print('replay from 0:', got:gsub('\27', 'ESC'))
+  assert(attached_id == sid, 'ATTACH is answered by ATTACHED with its id')
+  assert(got:find('replay-me', 1, true) > 0 and got:find('\27c', 1, true) == 0, 'whole history, no reset')
+  assert(attached_offset >= 9, 'ATTACHED says how much output there was')
+  fresh:destroy()
+end
+
+-- this connection had all of it queued before its DETACH: even fed 0 replays none of it
+c:detach(sid)
+got = ''
+attached_count = 0
+c:attach(sid, 0)
+for _ = 1, 100 do pump1(&c) if attached_count > 0 then break end end
+assert(attached_count == 1 and #got == 0, 'output queued before the DETACH is not replayed')
+
+-- a terminal that has everything gets nothing
+c:detach(sid)
+got = ''
+attached_count = 0
+c:attach(sid, attached_offset)
+for _ = 1, 100 do pump1(&c) if attached_count > 0 then break end end
+assert(attached_count == 1 and #got == 0, 'nothing missed, nothing replayed')
+
+-- a position the agent cannot serve: reset and replay what it kept
+c:detach(sid)
+got = ''
+attached_count = 0
+c:attach(sid, 0xffffffffff)
+for _ = 1, 100 do pump1(&c) if attached_count > 0 then break end end
+print('replay reset:', got:gsub('\27', 'ESC'))
+assert(got:find('\27c', 1, true) == 1, 'replay starts with a terminal reset')
+assert(got:find('replay-me', 1, true) > 0, 'replayed output')
+
+-- attaching while attached replays nothing (every byte already came)
+got = ''
+attached_count = 0
+c:attach(sid, 0)
+for _ = 1, 100 do pump1(&c) if attached_count > 0 then break end end
+assert(attached_count == 1 and #got == 0, 'no duplicate output for an attached client')
+
+c:close_session(sid)
+for _ = 1, 100 do pump1(&c) if exited then break end end
+assert(exited, 'closed session exits')
+
+-- an unknown (or long gone) session: EXIT with 0xFFFFFFFF, not ERR
+exited = false
+err_count = 0
+c:attach(987654, 0)
+for _ = 1, 100 do pump1(&c) if exited then break end end
+assert(exited and exit_id == 987654 and exit_status == -1 and err_count == 0, 'ATTACH of an unknown id gets EXIT')
+
+-- the host clipboard round trip (the test agent uses a file, not the desktop)
+local clip: string = ''
+local function on_clip(ctx: pointer, ev: *AgentEvent): void
+  if ev.typ == PROTO_CLIP then clip = string.copy(string{data=(@*[0]byte)(ev.data), size=ev.len}) end
+end
+c.on_event = on_clip
+c:clip_set('copied in eorzea')
+c:clip_get()
+for _ = 1, 100 do pump1(&c) if #clip > 0 then break end end
+print('clipboard:', clip)
+assert(clip == 'copied in eorzea', 'system clipboard round trip through the agent')
+assert(#c.clip_fifo == 0, 'both clipboard replies matched')
+c.on_event = on_event
+
+-- a 1 MiB paste reaches the shell whole, although the PTY takes far less at once
+do
+  os.remove('build/agent-paste')
+  got = ''
+  exited = false
+  argv:clear()
+  argv:push('/bin/sh')
+  argv:push('-c')
+  argv:push('stty raw -echo; printf ready; sleep 1; head -c 1048576 > build/agent-paste')
+  c:open(80, 24, &argv, nilptr)
+  for _ = 1, 300 do pump1(&c) if got:find('ready', 1, true) > 0 then break end end
+  assert(got:find('ready', 1, true) > 0, 'paste shell started')
+  local paste: vector(uint8)
+  paste:resize(1048576)
+  for i = 0, < #paste do paste[i] = (@uint8)(97 + i % 26) end
+  c:write(opened_id, &paste[0], #paste)
+  paste:destroy()
+  for _ = 1, 1500 do pump1(&c) if exited then break end end
+  assert(exited and exit_status == 0, 'paste shell exits after reading everything')
+  local f = io.open('build/agent-paste', 'rb')
+  assert(f:isopen())
+  local content = f:read('a')
+  f:close()
+  print('pasted bytes:', #content)
+  assert(#content == 1048576, 'the whole paste arrived')
+  content:destroy()
+end
+
+-- frames queued before the handshake completes must not reach the agent before HELLO
+do
+  local c2: AgentClient
+  c2:init('127.0.0.1', port, token)
+  c2.on_event = on_event
+  err_count = 0
+  c2:connect(now)
+  local early: string = 'early'
+  c2:write(1, (@*[0]uint8)(early.data), early.size)
+  c2:list()
+  for _ = 1, 200 do pump1(&c2) if c2:ready() then break end end
+  for _ = 1, 20 do pump1(&c2) end
+  assert(c2:ready() and err_count == 0, 'no "hello first": the connection stays up')
+  c2:destroy()
+end
+
+-- a client that stops reading: the agent stops reading the shell instead of buffering it all
+do
+  exited = false
+  collect = false
+  argv:clear()
+  argv:push('yes')
+  opened_id = 0
+  c:open(80, 24, &argv, nilptr)
+  for _ = 1, 200 do pump1(&c) if opened_id ~= 0 then break end end
+  assert(opened_id ~= 0)
+  local yes_id = opened_id
+  usleep(2000000)
+  local path: string = '/proc/' .. agent_pid .. '/status'
+  local f = io.open(path, 'rb')
+  assert(f:isopen(), 'agent /proc status')
+  local st = f:read('a')
+  f:close()
+  local at = st:find('VmRSS:', 1, true)
+  assert(at > 0)
+  local kb = 0
+  local i = at + 6
+  while i <= #st and (st:byte(i) == 32 or st:byte(i) == 9) do i = i + 1 end
+  while i <= #st and st:byte(i) >= 48 and st:byte(i) <= 57 do kb = kb * 10 + (st:byte(i) - 48) i = i + 1 end
+  print('agent VmRSS kB after 2 s of unread `yes`:', kb)
+  assert(kb > 0 and kb < 16 * 1024, 'agent memory stays bounded') -- unbounded, 2 s of `yes` took 32 MiB
+  -- a panel unseen for a moment: DETACH, then ATTACH with what it has read.
+  -- The megabytes queued before the DETACH still arrive; none come twice.
+  local read_before = opened_bytes
+  c:detach(yes_id)
+  c:attach(yes_id, read_before)
+  attached_count = 0
+  for _ = 1, 3000 do pump1(&c) if attached_count > 0 then break end end
+  print('flood: fed at ATTACH', read_before, 'ATTACHED at', attached_offset, 'bytes received until then', attached_bytes)
+  assert(attached_count == 1 and attached_id == yes_id, 'the flooded session is attached again')
+  assert(attached_bytes == attached_offset, 'output queued before the DETACH is not replayed again')
+  c:close_session(yes_id)
+  for _ = 1, 3000 do pump1(&c) if exited then break end end
+  assert(exited, 'yes session closes')
+  collect = true
+end
+
+c:list()
+c:destroy()
+print('OK')

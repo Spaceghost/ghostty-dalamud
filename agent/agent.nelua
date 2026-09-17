@@ -1,0 +1,807 @@
+-- ghostty-agent: a small PTY server for Linux/macOS hosts.
+--
+-- The GhosttyDalamud plugin (running inside FFXIV, natively or under Wine/Proton)
+-- connects over TCP and opens shells, ssh clients, or anything else as
+-- persistent sessions. Sessions outlive client disconnects; the last
+-- 256 KiB of output is replayed on ATTACH so libghostty on the client can
+-- rebuild the screen, the same way Superlogical streams raw bytes.
+--
+-- Usage: ghostty-agent [--listen 127.0.0.1:7777] [--token-file PATH]
+--                      [--clipboard-file PATH] [--replay-bytes N] [--term xterm-256color]
+require 'string'
+require 'vector'
+require 'stringbuilder'
+require 'io'
+require 'os'
+require 'arg'
+require 'math'
+require 'memory'
+require 'core.sys.net'
+require 'core.protocol'
+
+## cinclude '<sys/types.h>'
+## cinclude '<sys/wait.h>'
+## cinclude '<sys/ioctl.h>'
+## cinclude '<sys/stat.h>'
+## cinclude '<signal.h>'
+## cinclude '<unistd.h>'
+## cinclude '<fcntl.h>'
+## cinclude '<poll.h>'
+## cinclude '<errno.h>'
+## cinclude '<stdlib.h>'
+## cinclude '<pty.h>'
+## cinclude '<termios.h>'
+## if ccinfo.is_linux and not ccinfo.is_musl then
+## linklib 'util'
+## end
+
+local winsize <cimport, nodecl, ctypedef> = @record{ ws_row: cushort, ws_col: cushort, ws_xpixel: cushort, ws_ypixel: cushort }
+local pollfd <cimport, nodecl, ctypedef> = @record{ fd: cint, events: cshort, revents: cshort }
+local function forkpty(amaster: *cint, name: cstring, termp: pointer, winp: *winsize): cint <cimport, nodecl> end
+local function execvp(file: cstring, argv: *[0]cstring): cint <cimport, nodecl> end
+local function setenv(name: cstring, value: cstring, overwrite: cint): cint <cimport, nodecl> end
+local function unsetenv(name: cstring): cint <cimport, nodecl> end
+local function chdir(path: cstring): cint <cimport, nodecl> end
+local function _exit(status: cint): void <cimport, nodecl> end
+local function ioctl(fd: cint, req: culong, ...: cvarargs): cint <cimport, nodecl> end
+local function read(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function write(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function close(fd: cint): cint <cimport, nodecl> end
+local function poll(fds: *[0]pollfd, n: culong, timeout: cint): cint <cimport, nodecl> end
+local function waitpid(pid: cint, status: *cint, options: cint): cint <cimport, nodecl> end
+local function kill(pid: cint, sig: cint): cint <cimport, nodecl> end
+local function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
+local function signal(sig: cint, handler: pointer): pointer <cimport, nodecl> end
+local function umask(mask: cuint): cuint <cimport, nodecl> end
+local function getpid(): cint <cimport, nodecl> end
+local function fork(): cint <cimport, nodecl> end
+local function pipe(fds: *[2]cint): cint <cimport, nodecl> end
+local function dup2(oldfd: cint, newfd: cint): cint <cimport, nodecl> end
+local TIOCSWINSZ: culong <cimport, nodecl, const>
+local POLLIN: cshort <cimport, nodecl, const>
+local POLLOUT: cshort <cimport, nodecl, const>
+local POLLHUP: cshort <cimport, nodecl, const>
+local POLLERR: cshort <cimport, nodecl, const>
+local WNOHANG: cint <cimport, nodecl, const>
+local SIGHUP: cint <cimport, nodecl, const>
+local SIGTERM: cint <cimport, nodecl, const>
+local SIGKILL: cint <cimport, nodecl, const>
+local SIGPIPE: cint <cimport, nodecl, const>
+local SIG_IGN: pointer <cimport, nodecl, const>
+local F_GETFL: cint <cimport, nodecl, const>
+local F_SETFL: cint <cimport, nodecl, const>
+local O_NONBLOCK: cint <cimport, nodecl, const>
+local errno: cint <cimport, nodecl>
+local EAGAIN: cint <cimport, nodecl, const>
+local EINTR: cint <cimport, nodecl, const>
+local EIO: cint <cimport, nodecl, const>
+
+local function WIFEXITED(s: cint): boolean <cimport, nodecl> end
+local function WEXITSTATUS(s: cint): cint <cimport, nodecl> end
+local function WIFSIGNALED(s: cint): boolean <cimport, nodecl> end
+local function WTERMSIG(s: cint): cint <cimport, nodecl> end
+
+-- Output this session had queued for a client when it detached: that much
+-- still reaches the client, so a later ATTACH does not replay it again.
+local DetachMark = @record{ client: usize, total: uint64 }
+
+local Session = @record{
+  id: uint32,
+  pid: cint,
+  fd: cint,
+  cols: uint16,
+  rows: uint16,
+  command: string,
+  replay: vector(uint8),   -- ring buffer of recent output
+  replay_head: usize,
+  total_out: uint64,       -- output bytes ever read (the ring holds the last #replay of them)
+  inbuf: ByteQueue,        -- input the PTY could not take yet (a large paste)
+  attached: vector(usize), -- client indexes
+  detached: vector(DetachMark), -- clients that detached, and how far their output went
+  exited: boolean,
+  exit_status: int32,
+}
+
+local Client = @record{
+  sock: NetSocket,
+  inq: ByteQueue,
+  outq: ByteQueue,
+  authed: boolean,
+  alive: boolean,
+}
+
+local Agent = @record{
+  listen_sock: NetSocket,
+  clients: vector(Client),
+  sessions: vector(Session),
+  next_id: uint32,
+  token: string,
+  clip_file: string,   -- tests: use this file instead of the desktop clipboard
+  replay_bytes: usize,
+  term: string,
+  hello: string,       -- "ghostty-agent <version> <nonce>": the nonce tells clients a restart happened
+}
+
+local INBUF_MAX: usize <comptime> = 8 * 1024 * 1024  -- input waiting for a PTY, per session
+local OUTQ_HIGH: usize <comptime> = 1024 * 1024      -- a client this far behind stops its sessions' reads
+
+local agent: Agent
+
+local function log(msg: string): void
+  io.stderr:write('[ghostty-agent] ', msg, '\n')
+end
+
+local function send_frame(c: *Client, typ: uint8, payload: *[0]uint8, len: usize): void
+  proto.write_frame(&c.outq, typ, payload, len)
+end
+
+local function send_text(c: *Client, typ: uint8, text: string): void
+  proto.write_frame(&c.outq, typ, (@*[0]uint8)(text.data), text.size)
+end
+
+local function find_session(id: uint32): *Session
+  for i = 0, < #agent.sessions do
+    if agent.sessions[i].id == id then return &agent.sessions[i] end
+  end
+  return nilptr
+end
+
+local function session_append_replay(s: *Session, data: *[0]uint8, n: usize): void
+  s.total_out = s.total_out + n
+  local cap = agent.replay_bytes
+  if n == 0 or cap == 0 then return end
+  local off: usize = 0
+  local size = (@usize)(#s.replay)
+  if size < cap then
+    -- filling up: the oldest byte stays at index 0
+    if s.replay:capacity() == 0 then s.replay:reserve(cap) end
+    local take = math.min(n, cap - size)
+    s.replay:resize(size + take)
+    memory.copy(&s.replay[size], data, take)
+    off = take
+  end
+  -- full: overwrite the oldest bytes, which start at replay_head
+  while off < n do
+    local take = math.min(n - off, cap - s.replay_head)
+    memory.copy(&s.replay[s.replay_head], &data[off], take)
+    s.replay_head = (s.replay_head + take) % cap
+    off = off + take
+  end
+end
+
+-- Send `count` bytes of the ring, starting `start` bytes after its oldest.
+local function send_replay_range(s: *Session, c: *Client, start: usize, count: usize): void
+  local size = (@usize)(#s.replay)
+  local first = start
+  if size >= agent.replay_bytes then first = (s.replay_head + start) % size end
+  local n1 = math.min(count, size - first)
+  if n1 > 0 then proto.write_frame_id(&c.outq, PROTO_SDATA, s.id, (@*[0]uint8)(&s.replay[first]), n1) end
+  if count > n1 then proto.write_frame_id(&c.outq, PROTO_SDATA, s.id, (@*[0]uint8)(&s.replay[0]), count - n1) end
+end
+
+-- A client that says how much output it already has (`fed`) gets only the
+-- rest, onto the screen it kept. Otherwise, or when the ring no longer holds
+-- the rest, its terminal is reset and gets everything the ring holds.
+local function session_replay_to(s: *Session, c: *Client, has_fed: boolean, fed: uint64): void
+  local size = (@uint64)(#s.replay)
+  if has_fed and fed <= s.total_out and s.total_out - fed <= size then
+    local missed = s.total_out - fed
+    if missed > 0 then send_replay_range(s, c, (@usize)(size - missed), (@usize)(missed)) end
+    return
+  end
+  if size == 0 then return end
+  -- reset the terminal first so stale state from another client doesn't leak
+  local reset: string = '\27c'
+  proto.write_frame_id(&c.outq, PROTO_SDATA, s.id, (@*[0]uint8)(reset.data), reset.size)
+  send_replay_range(s, c, 0, (@usize)(size))
+end
+
+-- Input for the PTY: what it cannot take now waits in `inbuf` (the main loop
+-- polls for POLLOUT and drains it), so a large paste arrives whole and in order.
+local function session_queue_input(s: *Session, p: *[0]uint8, n: usize): void
+  if s.inbuf:len() + n > INBUF_MAX then
+    local sb: stringbuilder
+    sb:writef('session %d: input backlog over %d bytes, dropped %d', s.id, INBUF_MAX, n)
+    local msg = sb:promote()
+    log(msg)
+    msg:destroy()
+    return
+  end
+  s.inbuf:push(p, n)
+end
+
+local function session_drain_input(s: *Session): void
+  while s.inbuf:len() > 0 do
+    local w = write(s.fd, s.inbuf:peek(), s.inbuf:len())
+    if w > 0 then
+      s.inbuf:consume((@usize)(w))
+    elseif w < 0 and errno == EINTR then
+      -- interrupted: try again
+    elseif w == 0 or errno == EAGAIN then
+      break
+    else
+      s.inbuf:consume(s.inbuf:len()) -- the PTY is gone (EIO): nobody reads this any more
+    end
+  end
+end
+
+local function session_write_input(s: *Session, p: *[0]uint8, n: usize): void
+  if s.inbuf:len() > 0 then session_queue_input(s, p, n) return end -- behind older input
+  local off: usize = 0
+  while off < n do
+    local w = write(s.fd, &p[off], n - off)
+    if w > 0 then
+      off = off + (@usize)(w)
+    elseif w < 0 and errno == EINTR then
+      -- interrupted: try again
+    elseif w == 0 or errno == EAGAIN then
+      session_queue_input(s, &p[off], n - off) -- PTY input buffer full
+      return
+    else
+      return
+    end
+  end
+end
+
+-- Some attached client is far behind on output: stop reading the shell (it
+-- blocks on its own writes) instead of queueing without bound.
+local function session_blocked(s: *Session): boolean
+  for i = 0, < #s.attached do
+    local ci = s.attached[i]
+    if ci < #agent.clients and agent.clients[ci].alive and agent.clients[ci].outq:len() > OUTQ_HIGH then return true end
+  end
+  return false
+end
+
+local function session_is_attached(s: *Session, ci: usize): boolean
+  for i = 0, < #s.attached do if s.attached[i] == ci then return true end end
+  return false
+end
+
+local function session_detach(s: *Session, ci: usize): void
+  for i = 0, < #s.attached do
+    if s.attached[i] == ci then s.attached:remove(i) return end
+  end
+end
+
+-- A client detached: everything read so far is queued for it (or already sent).
+local function session_mark_detach(s: *Session, ci: usize): void
+  for i = 0, < #s.detached do
+    if s.detached[i].client == ci then s.detached[i].total = s.total_out return end
+  end
+  s.detached:push(DetachMark{ client = ci, total = s.total_out })
+end
+
+-- How far the output queued for client `ci` went before it detached (false: it never did).
+local function session_take_mark(s: *Session, ci: usize): (boolean, uint64)
+  for i = 0, < #s.detached do
+    if s.detached[i].client == ci then
+      local total = s.detached[i].total
+      s.detached:remove(i)
+      return true, total
+    end
+  end
+  return false, 0
+end
+
+local function session_set_size(s: *Session, cols: uint16, rows: uint16): void
+  s.cols = cols
+  s.rows = rows
+  local ws: winsize = { ws_row = rows, ws_col = cols }
+  ioctl(s.fd, TIOCSWINSZ, &ws)
+end
+
+local function split_nul(p: *[0]uint8, len: usize): (vector(string), vector(string))
+  local argv: vector(string)
+  local env: vector(string)
+  local i: usize = 0
+  local start: usize = 0
+  local in_env = false
+  while i < len do
+    if p[i] == 0 then
+      if i == start then
+        -- empty entry marks the argv/env boundary
+        in_env = true
+      else
+        local s = string{data=(@*[0]byte)(&p[start]), size=i-start}:copy()
+        if in_env then env:push(s) else argv:push(s) end
+      end
+      start = i + 1
+    end
+    i = i + 1
+  end
+  if start < len then
+    local s = string{data=(@*[0]byte)(&p[start]), size=len-start}:copy()
+    if in_env then env:push(s) else argv:push(s) end
+  end
+  return argv, env
+end
+
+local function spawn(cols: uint16, rows: uint16, argv: *vector(string), env: *vector(string)): (cint, cint)
+  local ws: winsize = { ws_row = rows, ws_col = cols }
+  local master: cint = -1
+  local pid = forkpty(&master, nilptr, nilptr, &ws)
+  if pid < 0 then return -1, -1 end
+  if pid == 0 then
+    -- child
+    setenv('TERM', (@cstring)(agent.term.data), 1)
+    setenv('COLORTERM', 'truecolor', 1)
+    setenv('TERM_PROGRAM', 'ghostty-umbra', 1)
+    unsetenv('TMUX')
+    for i = 0, < #env do
+      local kv = env[i]
+      local eq = kv:find('=', 1, true)
+      if eq > 1 then
+        local k = kv:sub(1, eq - 1)
+        local v = kv:sub(eq + 1)
+        if k == 'PWD' or k == 'CWD' then
+          chdir((@cstring)(v.data))
+        else
+          setenv((@cstring)(k.data), (@cstring)(v.data), 1)
+        end
+      end
+    end
+    local cargv: [64]cstring
+    local n = #argv
+    if n > 63 then n = 63 end
+    for i = 0, < n do cargv[i] = (@cstring)(argv[i].data) end
+    cargv[n] = nilptr
+    if n > 0 then execvp(cargv[0], &cargv) end
+    _exit(127)
+  end
+  local flags = fcntl(master, F_GETFL, 0)
+  fcntl(master, F_SETFL, flags | O_NONBLOCK)
+  return pid, master
+end
+
+-- The host's system clipboard ------------------------------------------------------
+-- Copies inside the game land on the desktop clipboard and pastes come from it:
+-- wl-copy / wl-paste on Wayland, xclip on X11. Each runs as a short child
+-- process with a pipe; the agent waits for it (a clipboard tool exits at once,
+-- wl-copy forks its own server).
+local CLIP_MAX: usize <comptime> = 1024 * 1024
+
+local function exec_first(argvs: *[2][4]cstring): void
+  for i = 0, < 2 do
+    if argvs[i][0] ~= nilptr then execvp(argvs[i][0], &argvs[i]) end
+  end
+  _exit(127)
+end
+
+local function clipboard_set(data: *[0]uint8, len: usize): boolean
+  if #agent.clip_file > 0 then
+    local f = io.open(agent.clip_file, 'wb')
+    if not f:isopen() then return false end
+    f:write(string{data=(@*[0]byte)(data), size=len})
+    f:close()
+    return true
+  end
+  local fds: [2]cint
+  if pipe(&fds) ~= 0 then return false end
+  local pid = fork()
+  if pid < 0 then close(fds[0]) close(fds[1]) return false end
+  if pid == 0 then
+    dup2(fds[0], 0)
+    close(fds[0]) close(fds[1])
+    local argvs: [2][4]cstring = { { 'wl-copy', nilptr, nilptr, nilptr }, { 'xclip', '-selection', 'clipboard', nilptr } }
+    exec_first(&argvs)
+  end
+  close(fds[0])
+  local off: usize = 0
+  while off < len do
+    local n = write(fds[1], &data[off], len - off)
+    if n <= 0 then break end
+    off = off + (@usize)(n)
+  end
+  close(fds[1])
+  local status: cint = 0
+  waitpid(pid, &status, 0)
+  return off == len and WIFEXITED(status) and WEXITSTATUS(status) == 0
+end
+
+local function clipboard_get(): (boolean, string)
+  if #agent.clip_file > 0 then
+    local f = io.open(agent.clip_file, 'rb')
+    if not f:isopen() then return true, string.copy('') end
+    local content = f:read('a')
+    f:close()
+    return true, content
+  end
+  local fds: [2]cint
+  if pipe(&fds) ~= 0 then return false, '' end
+  local pid = fork()
+  if pid < 0 then close(fds[0]) close(fds[1]) return false, '' end
+  if pid == 0 then
+    dup2(fds[1], 1)
+    close(fds[0]) close(fds[1])
+    local argvs: [2][4]cstring = { { 'wl-paste', '--no-newline', nilptr, nilptr }, { 'xclip', '-o', '-selection', 'clipboard' } }
+    exec_first(&argvs)
+  end
+  close(fds[1])
+  local sb: stringbuilder
+  local buf: [8192]uint8
+  local pf: [1]pollfd = { { fd = fds[0], events = POLLIN } }
+  while #sb < CLIP_MAX do
+    if poll(&pf, 1, 1000) <= 0 then break end -- a stuck clipboard owner must not stall the agent
+    local n = read(fds[0], &buf, 8192)
+    if n <= 0 then break end
+    sb:write(string{data=(@*[0]byte)(&buf), size=(@usize)(n)})
+  end
+  close(fds[0])
+  local status: cint = 0
+  if waitpid(pid, &status, WNOHANG) == 0 then kill(pid, SIGKILL) waitpid(pid, &status, 0) end
+  return true, sb:promote()
+end
+
+local function send_opened_error(c: *Client, why: string): void
+  proto.write_frame_id(&c.outq, PROTO_OPENED, 0, (@*[0]uint8)(why.data), why.size)
+end
+
+local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usize): void
+  local c = &agent.clients[ci]
+  if not c.authed then
+    if typ == PROTO_HELLO then
+      local tok = string{data=(@*[0]byte)(payload), size=len}
+      if tok == agent.token then
+        c.authed = true
+        send_text(c, PROTO_OK, agent.hello)
+      else
+        send_text(c, PROTO_ERR, 'bad token')
+        c.alive = false
+      end
+    else
+      send_text(c, PROTO_ERR, 'hello first')
+      c.alive = false
+    end
+    return
+  end
+
+  if typ == PROTO_OPEN then
+    -- a failed open still answers with OPENED (id 0): clients match OPENED to OPEN in order
+    if len < 5 then send_opened_error(c, 'bad open') return end
+    local cols = proto.get_u16(payload)
+    local rows = proto.get_u16((@*[0]uint8)(&payload[2]))
+    local argv, env = split_nul((@*[0]uint8)(&payload[4]), len - 4)
+    if #argv == 0 then
+      argv:push(string.copy('/bin/sh'))
+      argv:push(string.copy('-l'))
+    end
+    local pid, fd = spawn(cols, rows, &argv, &env)
+    if pid < 0 then
+      send_opened_error(c, 'forkpty failed')
+      for i = 0, < #argv do argv[i]:destroy() end
+      for i = 0, < #env do env[i]:destroy() end
+      argv:destroy()
+      env:destroy()
+      return
+    end
+    local s: Session = { id = agent.next_id, pid = pid, fd = fd, cols = cols, rows = rows }
+    agent.next_id = agent.next_id + 1
+    local sb: stringbuilder
+    for i = 0, < #argv do
+      if i > 0 then sb:write(' ') end
+      sb:write(argv[i])
+    end
+    s.command = sb:promote()
+    s.attached:push(ci)
+    agent.sessions:push(s)
+    local idb: [4]uint8
+    proto.put_u32(&idb, s.id)
+    send_frame(c, PROTO_OPENED, &idb, 4)
+    log('opened session ' .. tostring(s.id) .. ': ' .. s.command)
+    for i = 0, < #argv do argv[i]:destroy() end
+    for i = 0, < #env do env[i]:destroy() end
+    argv:destroy()
+    env:destroy()
+  elseif typ == PROTO_DATA then
+    if len < 4 then return end
+    local s = find_session(proto.get_u32(payload))
+    if s == nilptr or s.exited then return end
+    session_write_input(s, (@*[0]uint8)(&payload[4]), len - 4)
+  elseif typ == PROTO_RESIZE then
+    if len < 8 then return end
+    local s = find_session(proto.get_u32(payload))
+    if s == nilptr then return end
+    session_set_size(s, proto.get_u16((@*[0]uint8)(&payload[4])), proto.get_u16((@*[0]uint8)(&payload[6])))
+  elseif typ == PROTO_CLOSE then
+    if len < 4 then return end
+    local s = find_session(proto.get_u32(payload))
+    if s == nilptr then return end
+    if not s.exited then kill(s.pid, SIGHUP) end
+  elseif typ == PROTO_ATTACH then
+    if len < 4 then return end
+    local id = proto.get_u32(payload)
+    local s = find_session(id)
+    if s == nilptr or s.exited then
+      -- gone (it exited while nobody was attached): EXIT lets the client close it
+      local st: [4]uint8
+      proto.put_u32(&st, s ~= nilptr and (@uint32)(s.exit_status) or PROTO_NO_SESSION)
+      proto.write_frame_id(&c.outq, PROTO_EXIT, id, &st, 4)
+      return
+    end
+    if not session_is_attached(s, ci) then
+      s.attached:push(ci)
+      local has_fed = len >= 12
+      local fed: uint64 = has_fed and proto.get_u64((@*[0]uint8)(&payload[4])) or 0
+      -- `fed` counts only what the client has read. What this connection queued
+      -- before its DETACH is still on the way: replaying it too would feed it twice.
+      local marked, queued = session_take_mark(s, ci)
+      if has_fed and marked and queued > fed then fed = queued end
+      session_replay_to(s, c, has_fed, fed)
+    end -- already attached: it has every byte, nothing to replay
+    local tb: [8]uint8
+    proto.put_u64(&tb, s.total_out)
+    proto.write_frame_id(&c.outq, PROTO_ATTACHED, id, &tb, 8)
+  elseif typ == PROTO_DETACH then
+    if len < 4 then return end
+    local s = find_session(proto.get_u32(payload))
+    if s ~= nilptr and session_is_attached(s, ci) then
+      session_detach(s, ci)
+      session_mark_detach(s, ci)
+    end
+  elseif typ == PROTO_LIST then
+    local sb: stringbuilder
+    for i = 0, < #agent.sessions do
+      local s = &agent.sessions[i]
+      sb:writef('%d\t%d\t%d\t%d\t%s\n', s.id, s.cols, s.rows, #s.attached, s.command)
+    end
+    local text = sb:promote()
+    send_text(c, PROTO_LISTR, text)
+    text:destroy()
+  elseif typ == PROTO_CLIP_SET then
+    if len <= CLIP_MAX and clipboard_set(payload, len) then
+      send_text(c, PROTO_OK, 'clipboard set')
+    else
+      send_text(c, PROTO_ERR, 'clipboard unavailable')
+    end
+  elseif typ == PROTO_CLIP_GET then
+    local ok, text = clipboard_get()
+    if ok then send_text(c, PROTO_CLIP, text) else send_text(c, PROTO_ERR, 'clipboard unavailable') end
+    text:destroy()
+  elseif typ == PROTO_HELLO then
+    send_text(c, PROTO_OK, 'already authenticated')
+  else
+    send_text(c, PROTO_ERR, 'unknown frame')
+  end
+end
+
+local function pump_client(ci: usize): void
+  local c = &agent.clients[ci]
+  if not c.alive then return end
+  local buf: [16384]uint8
+  for _ = 1, 32 do
+    local n = net.recv(c.sock, &buf, 16384)
+    if n > 0 then c.inq:push(&buf, (@usize)(n))
+    elseif n == 0 then break
+    else c.alive = false break end
+  end
+  while c.alive do
+    local ok, typ, payload, len = proto.read_frame(&c.inq)
+    if not ok then break end
+    handle_frame(ci, typ, payload, len)
+    c = &agent.clients[ci]  -- vector may have been touched
+    proto.frame_consume(&c.inq, len)
+  end
+end
+
+local function flush_client(ci: usize): void
+  local c = &agent.clients[ci]
+  while c.outq:len() > 0 do
+    local n = net.send(c.sock, c.outq:peek(), c.outq:len())
+    if n < 0 then c.alive = false break end
+    if n == 0 then break end
+    c.outq:consume((@usize)(n))
+  end
+end
+
+local function broadcast(s: *Session, typ: uint8, data: *[0]uint8, len: usize): void
+  for i = 0, < #s.attached do
+    local ci = s.attached[i]
+    if ci < #agent.clients and agent.clients[ci].alive then
+      proto.write_frame_id(&agent.clients[ci].outq, typ, s.id, data, len)
+    end
+  end
+end
+
+local function pump_session(si: usize): void
+  local s = &agent.sessions[si]
+  if s.exited then return end
+  session_drain_input(s)
+  local buf: [32768]uint8
+  if not session_blocked(s) then
+    for _ = 1, 16 do
+      local n = read(s.fd, &buf, 32768)
+      if n > 0 then
+        session_append_replay(s, &buf, (@usize)(n))
+        broadcast(s, PROTO_SDATA, &buf, (@usize)(n))
+      elseif n == 0 then
+        break
+      else
+        if errno == EAGAIN or errno == EINTR then break end
+        -- EIO: slave closed
+        break
+      end
+    end
+  end
+  local status: cint = 0
+  local r = waitpid(s.pid, &status, WNOHANG)
+  if r == s.pid then
+    s.exited = true
+    if WIFEXITED(status) then s.exit_status = WEXITSTATUS(status)
+    elseif WIFSIGNALED(status) then s.exit_status = 128 + WTERMSIG(status) end
+    -- drain any final output
+    while true do
+      local n = read(s.fd, &buf, 32768)
+      if n <= 0 then break end
+      session_append_replay(s, &buf, (@usize)(n))
+      broadcast(s, PROTO_SDATA, &buf, (@usize)(n))
+    end
+    local st: [4]uint8
+    proto.put_u32(&st, (@uint32)(s.exit_status))
+    broadcast(s, PROTO_EXIT, &st, 4)
+    close(s.fd)
+    log('session ' .. tostring(s.id) .. ' exited with ' .. tostring(s.exit_status))
+  end
+end
+
+local function reap(): void
+  -- drop dead clients (from the back so indexes stay valid) and detach them
+  local i: integer = #agent.clients - 1
+  while i >= 0 do
+    if not agent.clients[i].alive then
+      for si = 0, < #agent.sessions do
+        session_detach(&agent.sessions[si], (@usize)(i))
+        -- shift indexes above i
+        local s = &agent.sessions[si]
+        for k = 0, < #s.attached do
+          if s.attached[k] > (@usize)(i) then s.attached[k] = s.attached[k] - 1 end
+        end
+        session_take_mark(s, (@usize)(i)) -- its queue is gone with it
+        for k = 0, < #s.detached do
+          if s.detached[k].client > (@usize)(i) then s.detached[k].client = s.detached[k].client - 1 end
+        end
+      end
+      net.close(agent.clients[i].sock)
+      agent.clients[i].inq:destroy()
+      agent.clients[i].outq:destroy()
+      agent.clients:remove(i)
+    end
+    i = i - 1
+  end
+  -- drop exited sessions
+  local j: integer = #agent.sessions - 1
+  while j >= 0 do
+    if agent.sessions[j].exited then
+      agent.sessions[j].replay:destroy()
+      agent.sessions[j].inbuf:destroy()
+      agent.sessions[j].attached:destroy()
+      agent.sessions[j].detached:destroy()
+      agent.sessions[j].command:destroy()
+      agent.sessions:remove(j)
+    end
+    j = j - 1
+  end
+end
+
+local function read_token_file(path: string): string
+  local f = io.open(path, 'rb')
+  if f:isopen() then
+    local content = f:read('a')
+    f:close()
+    -- trim whitespace
+    local e = #content
+    while e > 0 and (content:byte(e) == 10 or content:byte(e) == 13 or content:byte(e) == 32) do e = e - 1 end
+    return content:sub(1, e)
+  end
+  -- generate
+  local sb: stringbuilder
+  local rf = io.open('/dev/urandom', 'rb')
+  local raw: string
+  if rf:isopen() then raw = rf:read(24) rf:close() end
+  local hex = '0123456789abcdef'
+  for i = 1, #raw do
+    local b = raw:byte(i)
+    sb:write(hex:sub((b >> 4) + 1, (b >> 4) + 1), hex:sub((b & 15) + 1, (b & 15) + 1))
+  end
+  local tok = sb:promote()
+  local old = umask(0x3f)
+  local wf = io.open(path, 'wb')
+  umask(old)
+  if wf:isopen() then
+    wf:write(tok, '\n')
+    wf:close()
+    log('wrote new token to ' .. path)
+  else
+    log('WARNING: could not write token file ' .. path)
+  end
+  return tok
+end
+
+local function parse_hostport(s: string): (string, uint16)
+  local colon = s:find(':', 1, true)
+  if colon == 0 then return s:copy(), 7777 end
+  return s:sub(1, colon - 1), (@uint16)(tointeger(s:sub(colon + 1)))
+end
+
+local function main(): integer
+  signal(SIGPIPE, SIG_IGN)
+  local listen_spec: string = '127.0.0.1:7777'
+  local token_path: string = ''
+  agent.replay_bytes = 256 * 1024
+  agent.term = 'xterm-256color'
+  agent.next_id = 1
+  local i = 1
+  while i <= #arg do
+    local a = arg[i]
+    if a == '--listen' and i < #arg then listen_spec = arg[i+1] i = i + 1
+    elseif a == '--token-file' and i < #arg then token_path = arg[i+1] i = i + 1
+    elseif a == '--clipboard-file' and i < #arg then agent.clip_file = arg[i+1] i = i + 1
+    elseif a == '--replay-bytes' and i < #arg then agent.replay_bytes = (@usize)(tointeger(arg[i+1])) i = i + 1
+    elseif a == '--term' and i < #arg then agent.term = arg[i+1] i = i + 1
+    elseif a == '--help' or a == '-h' then
+      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME]\n')
+      return 0
+    else
+      io.stderr:write('unknown argument: ', a, '\n')
+      return 2
+    end
+    i = i + 1
+  end
+  if #token_path == 0 then
+    local home = os.getenv('HOME')
+    local dir = home .. '/.config/ghostty-agent'
+    os.execute('mkdir -p "' .. dir .. '"')
+    token_path = dir .. '/token'
+  end
+  agent.token = read_token_file(token_path)
+  local host, port = parse_hostport(listen_spec)
+  agent.listen_sock = net.listen(host, port)
+  if not net.is_valid(agent.listen_sock) then
+    log('cannot listen on ' .. listen_spec)
+    return 1
+  end
+  log('listening on ' .. listen_spec .. ' (pid ' .. tostring(getpid()) .. ')')
+  -- a different nonce per agent process: a reconnecting client learns whether
+  -- its session ids still mean the same shells
+  local nonce: int64 = ((@int64)(os.time()) & 0xffffffff) << 20 | ((@int64)(getpid()) & 0xfffff)
+  if nonce == 0 then nonce = 1 end
+  do
+    local sb: stringbuilder
+    sb:writef('ghostty-agent %d %d', PROTO_VERSION, nonce)
+    agent.hello = sb:promote()
+  end
+
+  local fds: [512]pollfd
+  while true do
+    local n: usize = 0
+    fds[n] = { fd = net.socket_fd(agent.listen_sock), events = POLLIN }
+    n = n + 1
+    for ci = 0, < #agent.clients do
+      local ev = POLLIN
+      if agent.clients[ci].outq:len() > 0 then ev = ev | POLLOUT end -- wake when it can take more
+      if n < 512 then fds[n] = { fd = net.socket_fd(agent.clients[ci].sock), events = ev } n = n + 1 end
+    end
+    for si = 0, < #agent.sessions do
+      local s = &agent.sessions[si]
+      local ev: cshort = 0
+      if not s.exited and not session_blocked(s) then ev = POLLIN end
+      if not s.exited and s.inbuf:len() > 0 then ev = ev | POLLOUT end
+      if n < 512 and ev ~= 0 then fds[n] = { fd = s.fd, events = ev } n = n + 1 end
+    end
+    poll(&fds, n, 250)
+
+    local c = net.accept(agent.listen_sock)
+    while net.is_valid(c) do
+      local cl: Client = { sock = c, alive = true }
+      agent.clients:push(cl)
+      c = net.accept(agent.listen_sock)
+    end
+    for ci = 0, < #agent.clients do pump_client(ci) end
+    for si = 0, < #agent.sessions do pump_session(si) end
+    for ci = 0, < #agent.clients do flush_client(ci) end
+    reap()
+  end
+  return 0
+end
+
+os.exit(main())

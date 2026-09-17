@@ -1,0 +1,180 @@
+-- Wire protocol between the plugin and ghostty-agent (and any other server
+-- that speaks it). Every frame is: u8 type, u32 little-endian payload length,
+-- payload. Session ids are u32 little-endian. Strings are UTF-8, no NUL.
+--
+-- client -> agent
+--   HELLO   token                    answered by OK "ghostty-agent <version> <nonce>"
+--   OPEN    cols u16, rows u16, argv... (NUL separated), then "\0\0", env... (NUL separated)
+--   DATA    id, bytes
+--   RESIZE  id, cols u16, rows u16
+--   CLOSE   id                       kill the process and forget the session
+--   ATTACH  id [, fed u64]           subscribe; agent replays recent output, or with `fed`
+--                                    (output bytes the client already has) only what it missed.
+--                                    Output queued for this connection before its DETACH still
+--                                    arrives and is not replayed; fed 2^64-1 asks for a reset
+--   DETACH  id                       unsubscribe, session keeps running
+--   LIST
+-- agent -> client
+--   OK      text
+--   ERR     text
+--   OPENED  id [, error text]        id 0: the open failed, the text says why
+--   DATA    id, bytes
+--   EXIT    id, status i32           status 0xFFFFFFFF: no such session
+--   ATTACHED id, total u64           the replay for ATTACH is complete; `total` output bytes so far
+--   LIST    lines "id\tcols\trows\tattached\tcommand\n"
+--
+-- Version 1 agents greet with "ghostty-agent 1", report a failed OPEN or an
+-- unknown ATTACH id as ERR text, acknowledge ATTACH with OK "attached" and
+-- ignore `fed`; the client translates those into the version 2 events.
+--   CLIP_SET text -> OK            CLIP_GET -> CLIP text   (host system clipboard)
+--   TITLE   id, text (forwarded from OSC title changes seen by the agent; optional)
+
+global proto = @record{}
+
+global PROTO_HELLO: uint8 <comptime> = 1
+global PROTO_OPEN: uint8 <comptime> = 2
+global PROTO_DATA: uint8 <comptime> = 3
+global PROTO_RESIZE: uint8 <comptime> = 4
+global PROTO_CLOSE: uint8 <comptime> = 5
+global PROTO_ATTACH: uint8 <comptime> = 6
+global PROTO_DETACH: uint8 <comptime> = 7
+global PROTO_LIST: uint8 <comptime> = 8
+global PROTO_CLIP_SET: uint8 <comptime> = 9   -- text: put on the host's system clipboard
+global PROTO_CLIP_GET: uint8 <comptime> = 10  -- ask for the host's system clipboard
+
+global PROTO_OK: uint8 <comptime> = 16
+global PROTO_ERR: uint8 <comptime> = 17
+global PROTO_OPENED: uint8 <comptime> = 18
+global PROTO_SDATA: uint8 <comptime> = 19
+global PROTO_EXIT: uint8 <comptime> = 20
+global PROTO_LISTR: uint8 <comptime> = 21
+global PROTO_CLIP: uint8 <comptime> = 22      -- reply to CLIP_GET: the clipboard text
+global PROTO_ATTACHED: uint8 <comptime> = 23  -- version 2: ATTACH replayed
+
+global PROTO_VERSION: integer <comptime> = 2
+global PROTO_NO_SESSION: uint32 <comptime> = 0xFFFFFFFF -- EXIT status for an unknown id
+
+global PROTO_HEADER: usize <comptime> = 5
+global PROTO_MAX_PAYLOAD: usize <comptime> = 4 * 1024 * 1024
+
+function proto.put_u32(p: *[0]uint8, v: uint32): void
+  p[0] = (@uint8)(v & 0xff)
+  p[1] = (@uint8)((v >> 8) & 0xff)
+  p[2] = (@uint8)((v >> 16) & 0xff)
+  p[3] = (@uint8)((v >> 24) & 0xff)
+end
+
+function proto.get_u32(p: *[0]uint8): uint32
+  return (@uint32)(p[0]) | ((@uint32)(p[1]) << 8) | ((@uint32)(p[2]) << 16) | ((@uint32)(p[3]) << 24)
+end
+
+function proto.put_u64(p: *[0]uint8, v: uint64): void
+  proto.put_u32(p, (@uint32)(v & 0xffffffff))
+  proto.put_u32((@*[0]uint8)(&p[4]), (@uint32)(v >> 32))
+end
+
+function proto.get_u64(p: *[0]uint8): uint64
+  return (@uint64)(proto.get_u32(p)) | ((@uint64)(proto.get_u32((@*[0]uint8)(&p[4]))) << 32)
+end
+
+function proto.put_u16(p: *[0]uint8, v: uint16): void
+  p[0] = (@uint8)(v & 0xff)
+  p[1] = (@uint8)((v >> 8) & 0xff)
+end
+
+function proto.get_u16(p: *[0]uint8): uint16
+  return (@uint16)(p[0]) | ((@uint16)(p[1]) << 8)
+end
+
+-- A growable byte queue used for both directions.
+require 'vector'
+require 'memory'
+
+global ByteQueue = @record{ buf: vector(uint8), head: usize }
+
+function ByteQueue:len(): usize
+  return #self.buf - self.head
+end
+
+function ByteQueue:push(p: *[0]uint8, n: usize): void
+  if n == 0 then return end
+  local size = self.buf.size
+  local need = size + n
+  local cap = (@usize)(self.buf:capacity())
+  if need > cap then
+    -- vector.reserve allocates exactly what it is asked for: double by hand
+    if cap < 256 then cap = 256 end
+    while cap < need do cap = cap * 2 end
+    self.buf:reserve(cap)
+  end
+  self.buf.size = need
+  memory.copy(&self.buf.data[size], p, n)
+end
+
+function ByteQueue:push_string(s: string): void
+  self:push((@*[0]uint8)(s.data), s.size)
+end
+
+function ByteQueue:peek(): *[0]uint8
+  return (@*[0]uint8)(&self.buf[self.head])
+end
+
+local BYTEQUEUE_KEEP: usize <comptime> = 1024 * 1024 -- an empty queue keeps at most this much
+
+function ByteQueue:consume(n: usize): void
+  self.head = self.head + n
+  if self.head >= self.buf.size then
+    -- empty: hand a burst's memory back instead of keeping it for good
+    if (@usize)(self.buf:capacity()) > BYTEQUEUE_KEEP then self.buf:destroy() else self.buf:clear() end
+    self.head = 0
+  elseif self.head > 65536 and self.head > self.buf.size // 2 then
+    -- compact
+    local remaining = self.buf.size - self.head
+    memory.move(&self.buf.data[0], &self.buf.data[self.head], remaining)
+    self.buf.size = remaining
+    self.head = 0
+  end
+end
+
+function ByteQueue:destroy(): void
+  self.buf:destroy()
+  self.head = 0
+end
+
+-- Append a frame header + payload to a queue.
+function proto.write_frame(q: *ByteQueue, typ: uint8, payload: *[0]uint8, len: usize): void
+  local hdr: [5]uint8
+  hdr[0] = typ
+  proto.put_u32((@*[0]uint8)(&hdr[1]), (@uint32)(len))
+  q:push(&hdr, 5)
+  if len > 0 then q:push(payload, len) end
+end
+
+function proto.write_frame_id(q: *ByteQueue, typ: uint8, id: uint32, payload: *[0]uint8, len: usize): void
+  local hdr: [9]uint8
+  hdr[0] = typ
+  proto.put_u32((@*[0]uint8)(&hdr[1]), (@uint32)(len + 4))
+  proto.put_u32((@*[0]uint8)(&hdr[5]), id)
+  q:push(&hdr, 9)
+  if len > 0 then q:push(payload, len) end
+end
+
+-- Try to read one complete frame from `q`. Returns (true, type, payload, len)
+-- and consumes it; the payload pointer is valid until the next queue mutation.
+function proto.read_frame(q: *ByteQueue): (boolean, uint8, *[0]uint8, usize)
+  if q:len() < PROTO_HEADER then return false, 0, nilptr, 0 end
+  local p = q:peek()
+  local typ = p[0]
+  local len = (@usize)(proto.get_u32((@*[0]uint8)(&p[1])))
+  if len > PROTO_MAX_PAYLOAD then
+    -- corrupt stream; drop everything
+    q:consume(q:len())
+    return false, 0, nilptr, 0
+  end
+  if q:len() < PROTO_HEADER + len then return false, 0, nilptr, 0 end
+  return true, typ, (@*[0]uint8)(&p[PROTO_HEADER]), len
+end
+
+function proto.frame_consume(q: *ByteQueue, len: usize): void
+  q:consume(PROTO_HEADER + len)
+end
