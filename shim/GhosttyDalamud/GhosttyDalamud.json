@@ -1,10 +1,10 @@
 {
-  "Author": "Johnneylee Jack Rollins",
+  "Author": "Spaceghost",
   "Name": "Ghostty",
   "InternalName": "GhosttyDalamud",
   "AssemblyVersion": "0.2.0.0",
-  "Punchline": "A real terminal emulator (libghostty) inside the game.",
-  "Description": "Quake-style dropdown, floating windows and terminals pinned in the world, connected to shells on your own machine through ghostty-agent. /term to toggle. Works with or without Umbra; with Umbra, the Ghostty toolbar widget shows its status and a popup terminal.",
+  "Punchline": "Experimental terminal emulator (libghostty) inside the game.",
+  "Description": "Developer preview: dropdown, floating windows and world terminals using libghostty-vt. Local Windows ConPTY or a separately configured POSIX ghostty-agent. /term to toggle. Optional Umbra toolbar widget. Target-platform and in-game verification remain required.",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
   "Tags": [ "terminal", "ghostty", "utility" ],

@@ -1,10 +1,12 @@
 name: CI
-on: [workflow_dispatch]
+on: [push, pull_request, workflow_dispatch]
 permissions:
   contents: read
 jobs:
   source-checks:
     runs-on: ubuntu-24.04
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
@@ -20,7 +22,9 @@ jobs:
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
         with:
           dotnet-version: '10.0.x'
-      - name: Install the pinned Zig release from the official distribution
+      - name: Test native-cache file isolation without loading the game
+        run: dotnet run --project tests/cache/CacheTests.csproj -c Release
+      - name: Install pinned Zig from the official distribution
         shell: bash
         run: |
           python3 - <<'PY'
