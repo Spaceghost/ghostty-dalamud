@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project>
+  <!-- Exact allowlist: no host assemblies, PDB paths, user state, agent,
+       optional Umbra widget or writable-install development loader. -->
+  <Target Name="PackageGhostty" AfterTargets="Build">
+    <ItemGroup>
+      <GhosttyPackageFile Include="$(AssemblyName).dll;$(AssemblyName).json;ghostty_core.dll" />
+      <GhosttyPackageFile Include="@(GhosttyLua->'lua/%(Filename)%(Extension)')" />
+    </ItemGroup>
+    <DalamudPackager ProjectDir="$(MSBuildProjectDirectory)"
+                    OutputPath="$(OutputPath)"
+                    AssemblyName="$(AssemblyName)"
+                    ManifestType="json"
+                    MakeZip="true"
+                    Include="@(GhosttyPackageFile, ';')" />
+  </Target>
+</Project>

@@ -33,8 +33,7 @@ if [[ "$("$ZIG" version)" != "$ZIG_VERSION" ]]; then echo "warning: zig $("$ZIG"
 
 if [[ "${SKIP_DEPS:-0}" != 1 ]]; then
   echo "== nelua"
-  [[ -x "$NELUA" ]] || make -C vendor/nelua-lang -j"$(nproc)" >/dev/null
-  "$NELUA" --version | sed -n 1p
+  "$ROOT/tools/bootstrap-nelua.sh"
 
   echo "== libghostty-vt (host)"
   ( cd vendor/ghostty && "$ZIG" build -Demit-lib-vt -Dapp-runtime=none -Doptimize=ReleaseFast \

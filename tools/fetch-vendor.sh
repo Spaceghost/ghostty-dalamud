@@ -23,7 +23,9 @@ clone_pin() { # name repo commit
 clone_pin nelua-lang "$NELUA_REPOSITORY" "$NELUA_COMMIT"
 clone_pin ghostty "$GHOSTTY_REPOSITORY" "$GHOSTTY_COMMIT"
 clone_pin gc-cimgui "$CIMGUI_REPOSITORY" "$CIMGUI_COMMIT"
-clone_pin umbra-dist "$UMBRA_DIST_REPOSITORY" "$UMBRA_DIST_COMMIT"
+if [[ "${SKIP_SHIM:-0}" != 1 && "${SKIP_UMBRA:-0}" != 1 ]]; then
+  clone_pin umbra-dist "$UMBRA_DIST_REPOSITORY" "$UMBRA_DIST_COMMIT"
+fi
 
 if [[ ! -f "$V/lua/src/lua.h" ]]; then
   tmp="$(mktemp -d)"
@@ -37,10 +39,12 @@ fi
 echo "lua $LUA_VERSION"
 
 # Dalamud reference assemblies (for compiling the C# shim only).
-DD="${DALAMUD_LIB_PATH:-$HOME/.cache/dalamud-dev}"
-if [[ ! -f "$DD/Dalamud.dll" ]]; then
-  mkdir -p "$DD"
-  curl -fsSL "$DALAMUD_DISTRIB_URL" -o "$DD/latest.zip"
-  python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$DD/latest.zip" "$DD"
+if [[ "${SKIP_SHIM:-0}" != 1 ]]; then
+  DD="${DALAMUD_LIB_PATH:-$HOME/.cache/dalamud-dev}"
+  if [[ ! -f "$DD/Dalamud.dll" ]]; then
+    mkdir -p "$DD"
+    curl -fsSL "$DALAMUD_DISTRIB_URL" -o "$DD/latest.zip"
+    python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$DD/latest.zip" "$DD"
+  fi
+  echo "dalamud dev assemblies in $DD"
 fi
-echo "dalamud dev assemblies in $DD"
