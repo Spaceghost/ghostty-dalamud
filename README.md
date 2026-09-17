@@ -205,6 +205,14 @@ Reload with `/term reload`.
 `lua/bell.lua` shapes the visual bell: when a program rings (BEL), rings of
 light spread from your character's feet and the terminal that rang glows.
 
+`CONFIG.world.shadows` in `lua/world.lua` (Settings → Light → "Screens cast
+shadows (experimental)", off by default) puts a thin board, a background
+object only you see and with no collision, behind each world screen so it
+casts a shadow and blocks sunlight. **Experimental and untested in game**: it
+calls a game function found by signature, so a game patch can crash the game
+while it is on; seen from behind, the board probably hides the screen
+with the depth test on.
+
 ## Commands and keys
 
 `/term` (also `/tomestone` and `/tome`, see `host.commands`):
@@ -329,6 +337,7 @@ not been observed in game.** What they assume:
 | `IDtrBarEntry.OnClick` positions are screen coordinates | the info bar popup opens away from the entry |
 | The UI-hide defaults (`host.keep_visible`) match what Umbra did | change them in Settings → Info bar & hidden UI |
 | Panel lights survive a logout and login (world panels, pets, animation and world pins wait for a character) | lights missing or stale after logging back in |
+| Panel shadows (experimental, off by default): `BgObject.Create`'s signature still matches, `fun_b0_m0766.mdl` is 4 x 3 yalms with its origin at the bottom centre, creating and freeing background objects from the draw callback is safe, and the game does not free them itself on a zone change | a crash with the option on, boards in the wrong place or size (`CONFIG.world.shadows.model_*`), or no shadow |
 | Toolbar placement survives the widget becoming IPC-only (same file, assembly name and widget id) | re-add the Ghostty widget in Umbra |
 | Per-frame IPC (status and popup draw every frame, exceptions while offline) is cheap enough | frame time rises with the widget; a cheaper status channel is needed |
 | The info bar popup has no Esc-to-close, so Esc reaches the terminal | see `popup.close_on_blur` |

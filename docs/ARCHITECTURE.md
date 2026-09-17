@@ -28,9 +28,9 @@
   calls `gu_init_ex` with the install and config directories, forwards
   `UiBuilder.Draw` to `gu_frame` and the /xlplugins buttons, chat commands and
   info bar clicks to `gu_event`, and fills `GuHostApi` with callbacks (log,
-  fonts, key state, camera, objects, animation, lights, commands, info bar,
-  UI-hide flags, IPC, opening a link in the browser). The core decides what
-  to register, when, and under which names (`core/app/hostsurface.nelua`,
+  fonts, key state, camera, objects, animation, lights, shadow boards,
+  commands, info bar, UI-hide flags, IPC, opening a link in the browser). The core
+  decides what to register, when, and under which names (`core/app/hostsurface.nelua`,
   `CONFIG.host` in lua/init.lua).
 * **Umbra is optional.** `Umbra.Ghostty.dll` keeps its file, assembly name and
   widget id but holds no native code: the widget label and popup call
@@ -153,6 +153,41 @@ still holds the frame's depth when ImGui draws, the texel mapping under dynamic
 resolution or upscalers, edge alignment during fast camera turns, and
 behaviour in gpose and cutscenes.
 
+## Panel shadows (experimental)
+
+Off by default (`CONFIG.world.shadows.enabled`, "Screens cast shadows
+(experimental)" in Settings → Light). ImGui panels are not in the scene, so
+they cannot cast shadows by themselves. `core/app/occluders.nelua` gives each
+shown world panel a client-side `BgObject`: a flat model
+(`CONFIG.world.shadows.model`) scaled to the panel, turned by its yaw and
+pitch, and set `offset` yalms behind it, so the game's own shadow pass sees
+something where the panel is. The board follows the pose the panel is drawn
+at, so it moves with a carried panel and with a focused one floating out to
+meet you. The object exists only on this client and has
+no collision.
+
+* The shim forwards five callbacks (`bg_create`, `bg_ready`,
+  `bg_set_transform`, `bg_set_transparency`, `bg_destroy`, appended to
+  `GuHostApi`). `BgObject.Create` is found once with `ISigScanner`
+  (FFXIVClientStructs' signature); when the scan fails `bg_create` stays null
+  and the core leaves the feature off, as it does with an older shim.
+* A board is created lazily, polled until its model has loaded
+  (`ResourceHandle.LoadState == 7`), and only then transformed
+  (`UpdateTransforms(false)`, `UpdateCulling`); the transform is sent again
+  only when the pose changes. A model that has not loaded after 600 frames is
+  freed with one warning.
+* Boards are freed (`CleanupRender`, then `Dtor(1)`) when their panel is
+  closed, hidden, asleep, derezzed or full screen, when the option goes off or
+  the model changes, on a zone change, whenever no character is loaded, and in
+  `teardown_effects` (shutdown, `/term reload`, the kill switch), so a loader
+  swap leaves none behind.
+
+None of this has been observed in game: whether the board's shadow looks
+right, what `transparency` does to it, whether the model's size and origin
+are as assumed, and whether creating objects from the draw callback is safe.
+A game patch that changes `BgObject` can crash the game while the option is
+on.
+
 ## Repository layout
 
 ```
@@ -196,6 +231,7 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_world`, `test_worldpanel`, `test_worlddrag` | world panels: projection and hit testing, the presented pose and walk-up, drag placement and snapping, all against a fake game |
 | `test_host` | the exported host surface without ImGui: init, status, commands, the controller toggle's source and its foreground check, shutdown |
 | `test_lights` | panel lights against fake game light callbacks |
+| `test_occluders` | panel shadow boards against fake background object callbacks: placement, lifecycle, an older `GuHostApi` |
 | `test_chrome` | the glass chrome of the drop-down and windows: colour, tint, glow, tab strip, buttons, the settings button's badge |
 | `test_migrate` (`.nelua` + `.lua`) | the one-time migration from the Umbra-hosted home |
 | `test_hostsurface` | the plugin side against a recording fake host: activation and refusals, registration and shutdown order, suspension, events, info bar, `ghostty.open_url` (https only) and an older shim's smaller `GuHostApi` |
