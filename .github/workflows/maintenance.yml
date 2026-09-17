@@ -7,7 +7,7 @@ permissions:
 jobs:
   repair:
     if: github.repository == 'Spaceghost/ghostty-dalamud' && contains(github.event.head_commit.message, '[apply-maintenance]')
-    runs-on: ubuntu-24.04
+    runs-on: [self-hosted, linux]
     timeout-minutes: 10
     permissions:
       contents: write
@@ -20,17 +20,21 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ github.sha }}
-      - name: Apply, test, scrub and publish with an explicit lease
+      - name: Apply repairs and atomically preserve all branch histories
         id: repair
         shell: bash
         env:
           EXPECTED_HEAD: ${{ github.sha }}
         run: |
           set -euo pipefail
-          refs="$(git ls-remote --heads --tags origin)"
-          [[ "$(printf '%s\n' "$refs" | wc -l)" -eq 1 ]]
-          [[ "$(printf '%s\n' "$refs" | awk '{print $2}')" == refs/heads/main ]]
-          [[ "$(printf '%s\n' "$refs" | awk '{print $1}')" == "$EXPECTED_HEAD" ]]
+          snapshot="$RUNNER_TEMP/ghostty-maintenance-refs-$GITHUB_RUN_ID"
+          git ls-remote --heads --tags origin > "$snapshot"
+          [[ "$(awk '$2 == "refs/heads/main" {print $1}' "$snapshot")" == "$EXPECTED_HEAD" ]]
+          if grep -q 'refs/tags/' "$snapshot"; then
+            echo 'Unexpected tags: manual review required before rewriting.' >&2
+            exit 1
+          fi
+          git fetch origin '+refs/heads/*:refs/remotes/origin/*'
           git switch -C main "$EXPECTED_HEAD"
           python3 tools/maintenance/apply_repairs.py
           python3 - <<'PY'
@@ -44,17 +48,15 @@ jobs:
           PY
           python3 -m unittest discover -s tests -p 'test_*.py' -v
           git diff --check
-          # The write-capable maintenance workflow is one-shot, not permanent CI.
-          rm .github/workflows/maintenance.yml tools/maintenance/apply_repairs.py
+          publisher="$RUNNER_TEMP/ghostty-publish-$GITHUB_RUN_ID.py"
+          cp tools/maintenance/publish_all.py "$publisher"
+          rm .github/workflows/maintenance.yml tools/maintenance/apply_repairs.py tools/maintenance/publish_all.py
           git add -A
           git -c user.name=Spaceghost -c user.email=251370+Spaceghost@users.noreply.github.com commit -m 'Repair fresh installs, isolate native cache and clarify release readiness'
-          python3 tools/rewrite-identity.py --name Spaceghost --email 251370+Spaceghost@users.noreply.github.com --apply
+          python3 "$publisher" "$snapshot"
           python3 -m unittest discover -s tests -p 'test_*.py' -v
           git diff --check
-          git push --force-with-lease="refs/heads/main:$EXPECTED_HEAD" origin HEAD:refs/heads/main
-          head="$(git rev-parse HEAD)"
-          echo "head=$head" >> "$GITHUB_OUTPUT"
-          printf '## Maintenance result\n\nPublished repaired, identity-scrubbed main: `%s`.\n\nRegression tests passed. Native/in-game compatibility is reported separately.\n' "$head" >> "$GITHUB_STEP_SUMMARY"
+          rm -f "$publisher" "$snapshot"
   clean-linux-build:
     needs: repair
     runs-on: ubuntu-24.04
