@@ -1,0 +1,351 @@
+-- A terminal session: one libghostty terminal wired to a transport.
+require 'string'
+require 'vector'
+require 'stringbuilder'
+require 'core.ghostty'
+require 'core.termview'
+require 'core.selection'
+require 'core.protocol'
+require 'core.agent_client'
+require 'core.sys.conpty'
+require 'core.policy'
+
+global TransportKind = @enum(cint){ None = 0, Agent, ConPty, Superlogical }
+
+global Session = @record{
+  id: integer,
+  view: TermView,
+  encoder: GhosttyKeyEncoder,
+  event: GhosttyKeyEvent,
+  kind: TransportKind,
+  agent: *AgentClient,
+  agent_id: uint32,
+  awaiting_open: boolean,
+  keep_on_agent: boolean,   -- on destroy, detach and leave the shell running
+  conpty: ConPty,
+  title: string,
+  label: string,
+  exited: boolean,
+  exit_status: int32,
+  process_exited: boolean,  -- the shell itself ended (e.g. ctrl+d), not a connect failure
+  exited_at: float64,       -- host time the exit was first seen
+  font_scale: float64,      -- per-terminal zoom (ctrl+= / ctrl+- / ctrl+0); 0 means 1
+  sleeping: boolean,        -- detached from the agent while unseen (shell keeps running)
+  held: boolean,            -- put to sleep by the kill switch: wakes when it goes off
+  last_seen: float64,       -- host time this terminal was last drawn
+  run_occluded: boolean,    -- keep streaming and drawing state while unseen
+  appear: float32,          -- world panels: 0 derezzed .. 1 fully in (glitch in/out)
+  leaving: boolean,         -- world panels: glitching out, then closed
+  woke_at: float64,         -- host time it last woke (content fades in); 0 = never slept
+  present_t: float32,       -- world panel: 0 placed .. 1 presented (floated toward you)
+  present_v: float32,       -- its ease velocity
+  cell_w_px: uint32,
+  cell_h_px: uint32,
+  cell_w: float32,          -- cell size as last drawn, for mouse hit testing
+  cell_h: float32,
+  sel: SelectionState,      -- mouse selection gesture (the terminal owns the range itself)
+  pending_out: ByteQueue,   -- bytes typed before the agent acknowledged OPEN
+  unread: boolean,          -- output arrived while the tab was not visible
+  bells: integer,           -- BEL characters received; the host turns new ones into the visual bell
+  cols: uint16,
+  rows: uint16,
+  replaying: boolean,       -- the agent is replaying old output: libghostty's answers to it are dropped
+  attach_waits: integer,    -- ATTACHs sent and not yet answered by ATTACHED
+  fed: uint64,              -- agent output bytes fed to the terminal (ATTACH asks only for the rest); FED_UNKNOWN after a lost replay
+  open_argv: vector(string), -- what OPEN asks for, kept until the agent answers (a reconnect asks again)
+  open_env: vector(string),
+}
+
+
+-- `fed` when the screen matches no output position: a replay that may have
+-- reset it did not finish. ATTACH with it gets a reset and the whole replay.
+local FED_UNKNOWN: uint64 <comptime> = 0xffffffffffffffff_u64
+
+function Session:feed(data: *[0]uint8, len: usize): void
+  self.view:feed(data, len)
+  if self.fed ~= FED_UNKNOWN then self.fed = self.fed + len end
+  self.unread = true
+end
+
+function Session:feed_text(text: string): void
+  self.view:feed((@*[0]uint8)(text.data), text.size)
+end
+
+function Session:write(data: *[0]uint8, len: usize): void
+  if len == 0 or self.exited then return end
+  if self.kind == TransportKind.Agent then
+    if self.awaiting_open or self.agent == nilptr then
+      self.pending_out:push(data, len)
+    else
+      self.agent:write(self.agent_id, data, len)
+    end
+  elseif self.kind == TransportKind.ConPty then
+    self.conpty:write(data, len)
+  end
+end
+
+function Session:write_string(s: string): void
+  self:write((@*[0]uint8)(s.data), s.size)
+end
+
+-- libghostty answering the terminal (cursor position, mode and device reports).
+-- Replayed output asked those questions long ago: answering them now would
+-- type the answers into whatever runs in the shell today.
+local function on_write_pty(terminal: GhosttyTerminal, userdata: pointer, data: *[0]uint8, len: usize): void
+  local s = (@*Session)(userdata)
+  if s.replaying then return end
+  s:write(data, len)
+end
+
+-- libghostty calls this with (terminal, userdata) only; the title itself is a
+-- borrowed string read back through ghostty_terminal_get.
+local function on_title(terminal: GhosttyTerminal, userdata: pointer): void
+  local s = (@*Session)(userdata)
+  local t: GhosttyString = {}
+  if ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_TITLE, &t) ~= GHOSTTY_SUCCESS then return end
+  s.title:destroy()
+  s.title = string{data=t.ptr, size=t.len}:copy()
+end
+
+-- BEL: only counted here; the host notices the change and rings (core/app/bell.nelua).
+local function on_bell(terminal: GhosttyTerminal, userdata: pointer): void
+  local s = (@*Session)(userdata)
+  s.bells = s.bells + 1
+end
+
+local function configure_term(self: *Session): void
+  ghostty_terminal_set(self.view.term, GHOSTTY_TERMINAL_OPT_USERDATA, self)
+  ghostty_terminal_set(self.view.term, GHOSTTY_TERMINAL_OPT_WRITE_PTY, (@pointer)(on_write_pty))
+  ghostty_terminal_set(self.view.term, GHOSTTY_TERMINAL_OPT_TITLE_CHANGED, (@pointer)(on_title))
+  ghostty_terminal_set(self.view.term, GHOSTTY_TERMINAL_OPT_BELL, (@pointer)(on_bell))
+  local scrollback: usize = 10000
+  ghostty_terminal_set(self.view.term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &scrollback)
+end
+
+local function session_setup(self: *Session, id: integer, cols: uint16, rows: uint16): boolean
+  $self = {}
+  self.id = id
+  self.cols = cols
+  self.rows = rows
+  self.cell_w_px = 8
+  self.cell_h_px = 16
+  if not self.view:init(cols, rows) then return false end
+  if ghostty_key_encoder_new(nilptr, &self.encoder) ~= GHOSTTY_SUCCESS then return false end
+  if ghostty_key_event_new(nilptr, &self.event) ~= GHOSTTY_SUCCESS then return false end
+  configure_term(self)
+  return true
+end
+
+-- Attach to a shell that already runs on the agent (e.g. after the game was
+-- restarted). The agent replays recent output, which rebuilds the screen.
+function Session:init_attach(id: integer, label: string, cols: uint16, rows: uint16, agent: *AgentClient, agent_id: uint32): boolean
+  if not session_setup(self, id, cols, rows) then return false end
+  self.label = label:copy()
+  self.kind = TransportKind.Agent
+  self.agent = agent
+  self.agent_id = agent_id
+  if agent:attach(agent_id, 0) then
+    self.replaying = true -- until ATTACHED
+    self.attach_waits = 1
+  end
+  return true
+end
+
+-- Send OPEN for a session still waiting for its shell. False when it was not
+-- sent (not connected); the host calls it again once the agent is ready.
+function Session:reopen(): boolean
+  if self.kind ~= TransportKind.Agent or self.agent == nilptr or not self.awaiting_open or self.exited then return false end
+  return self.agent:open(self.cols, self.rows, &self.open_argv, &self.open_env)
+end
+
+-- Subscribe again to a running shell (wake, reconnect). The agent replays
+-- what this terminal has not seen; answers to it are dropped until ATTACHED.
+function Session:reattach(): void
+  if self.kind ~= TransportKind.Agent or self.agent == nilptr or self.awaiting_open or self.exited then return end
+  -- an earlier replay is still on its way and may reset the screen: counting it tells nothing
+  if self.replaying then self.fed = FED_UNKNOWN end
+  if self.agent:attach(self.agent_id, self.fed) then
+    self.replaying = true
+    self.attach_waits = self.attach_waits + 1
+    self.agent:resize(self.agent_id, self.cols, self.rows)
+  end
+end
+
+-- A terminal with no transport: the core feeds it text itself (the /term
+-- showcase banner and palette). Nothing typed into it goes anywhere.
+function Session:init_local(id: integer, label: string, cols: uint16, rows: uint16): boolean
+  if not session_setup(self, id, cols, rows) then return false end
+  self.label = label:copy()
+  self.kind = TransportKind.None
+  return true
+end
+
+function Session:init(id: integer, profile: *Profile, cols: uint16, rows: uint16, agent: *AgentClient): boolean
+  if not session_setup(self, id, cols, rows) then return false end
+  self.label = profile.name:copy()
+
+  if profile.transport == 'conpty' then
+    self.kind = TransportKind.ConPty
+    if not self.conpty:open(&profile.argv, profile.cwd, cols, rows) then
+      self:feed_text('\r\n[ghostty] ConPTY is unavailable on this host (needs Windows 10 1809+ or a recent Wine).\r\n')
+      self.exited = true
+    end
+  elseif profile.transport == 'superlogical' then
+    self.kind = TransportKind.Superlogical
+    self:feed_text('\r\n[ghostty] Superlogical support is waiting on its public client protocol.\r\n')
+    self:feed_text('[ghostty] Until then use the "agent" transport, which streams raw PTY bytes the same way.\r\n')
+    self.exited = true
+  else
+    self.kind = TransportKind.Agent
+    self.agent = agent
+    if agent == nilptr then
+      self:feed_text('\r\n[ghostty] no agent configured\r\n')
+      self.exited = true
+    else
+      self.awaiting_open = true
+      -- copies: a reload replaces the profiles while this may still wait
+      for i = 0, < #profile.argv do self.open_argv:push(profile.argv[i]:copy()) end
+      for i = 0, < #profile.env do self.open_env:push(profile.env[i]:copy()) end
+      if #profile.cwd > 0 then
+        local sb: stringbuilder -- no `..`: the concatenation would leak without a GC
+        sb:write('PWD=', profile.cwd)
+        self.open_env:push(sb:promote())
+      end
+      if not self:reopen() then
+        -- no `..` chains: without a GC every intermediate string would leak
+        local sb: stringbuilder
+        sb:writef('[ghostty] connecting to agent %s:%d ...\r\n', policy.agent.host, policy.agent.port)
+        local msg = sb:promote()
+        self:feed_text(msg)
+        msg:destroy()
+      end
+    end
+  end
+  return true
+end
+
+-- Unseen screens stop streaming: detach from the agent (the shell keeps
+-- running there). wake() reattaches; the agent sends what the terminal missed
+-- (or, when too much went by, resets it and replays what it kept).
+function Session:sleep(): void
+  if self.kind ~= TransportKind.Agent or self.agent == nilptr or self.awaiting_open or self.sleeping or self.exited then return end
+  self.agent:detach(self.agent_id)
+  self.sleeping = true
+end
+
+function Session:wake(): void
+  if not self.sleeping then return end
+  self.sleeping = false
+  self.appear = 0 -- glitch back in
+  selection_clear(&self.view, &self.sel)
+  self.sel = {}
+  self:reattach()
+end
+
+local function free_open_request(self: *Session): void
+  for i = 0, < #self.open_argv do self.open_argv[i]:destroy() end
+  for i = 0, < #self.open_env do self.open_env[i]:destroy() end
+  self.open_argv:destroy()
+  self.open_env:destroy()
+end
+
+-- Called by the host when the agent acknowledges OPEN.
+function Session:agent_opened(agent_id: uint32): void
+  self.agent_id = agent_id
+  self.awaiting_open = false
+  free_open_request(self)
+  if self.pending_out:len() > 0 then
+    self.agent:write(agent_id, self.pending_out:peek(), self.pending_out:len())
+    self.pending_out:consume(self.pending_out:len())
+  end
+  self.agent:resize(agent_id, self.cols, self.rows)
+end
+
+-- ATTACHED: the replay for one ATTACH is complete; `total` is the output position then.
+function Session:attached(has_total: boolean, total: uint64): void
+  if has_total then self.fed = total end
+  if self.attach_waits > 0 then self.attach_waits = self.attach_waits - 1 end
+  if self.attach_waits == 0 then self.replaying = false end -- live output from here on: answer it
+end
+
+-- The connection was replaced: ATTACHs on the old one get no answer. A replay
+-- cut short leaves a screen that matches no output position.
+function Session:connection_lost(): void
+  if self.replaying then self.fed = FED_UNKNOWN end
+  self.replaying = false
+  self.attach_waits = 0
+end
+
+function Session:mark_exited(status: int32): void
+  if self.exited then return end
+  self.exited = true
+  self.exit_status = status
+  self.process_exited = true
+  local sb: stringbuilder
+  sb:writef('\r\n\27[90m[process exited with status %d]\27[0m\r\n', status)
+  local msg = sb:promote()
+  self:feed_text(msg)
+  msg:destroy()
+end
+
+function Session:resize(cols: uint16, rows: uint16, cell_w_px: uint32, cell_h_px: uint32): void
+  self.cell_w_px = cell_w_px
+  self.cell_h_px = cell_h_px
+  if not self.view:resize(cols, rows, cell_w_px, cell_h_px) then return end
+  self.cols = cols
+  self.rows = rows
+  ghostty_key_encoder_setopt_from_terminal(self.encoder, self.view.term)
+  if self.kind == TransportKind.Agent and not self.awaiting_open and self.agent ~= nilptr then
+    self.agent:resize(self.agent_id, cols, rows)
+  elseif self.kind == TransportKind.ConPty then
+    self.conpty:resize(cols, rows)
+  end
+end
+
+-- Per-frame transport work for transports that need polling.
+function Session:pump(): void
+  if self.kind == TransportKind.ConPty and not self.exited then
+    local buf: [32768]uint8
+    for _ = 1, 8 do
+      local n = self.conpty:read(&buf, 32768)
+      if n == 0 then break end
+      self:feed(&buf, n)
+    end
+    if self.conpty:poll_exit() then
+      self:mark_exited((@int32)(self.conpty.exit_code))
+    end
+  end
+  -- keep the key encoder in sync with terminal modes (kitty keyboard, app cursor keys)
+  ghostty_key_encoder_setopt_from_terminal(self.encoder, self.view.term)
+end
+
+function Session:close(): void
+  if self.kind == TransportKind.Agent and self.agent ~= nilptr and not self.awaiting_open then
+    if self.keep_on_agent then
+      self.agent:detach(self.agent_id)
+    else
+      self.agent:close_session(self.agent_id)
+    end
+  elseif self.kind == TransportKind.ConPty then
+    self.conpty:close()
+  end
+  self.exited = true
+end
+
+function Session:destroy(): void
+  self:close()
+  if self.event ~= nilptr then ghostty_key_event_free(self.event) end
+  if self.encoder ~= nilptr then ghostty_key_encoder_free(self.encoder) end
+  self.view:destroy()
+  self.title:destroy()
+  self.label:destroy()
+  self.pending_out:destroy()
+  free_open_request(self)
+  $self = {}
+end
+
+-- Tab label: title if the app set one, else the profile name.
+function Session:display_name(): string
+  if #self.title > 0 then return self.title end
+  return self.label
+end
