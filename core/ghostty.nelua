@@ -1,0 +1,229 @@
+-- libghostty-vt bindings for Nelua.
+--
+-- Every type and function here mirrors vendor/ghostty/include/ghostty/vt.h.
+-- Records are declared `nodecl` so the C compiler uses the real header
+-- definitions; the field lists below only exist for Nelua type checking.
+-- Enum values and macros are imported by name, never hardcoded.
+
+-- We link libghostty-vt statically; without this the Windows header marks
+-- every function dllimport.
+## cdefine 'GHOSTTY_STATIC'
+## cinclude '<ghostty/vt.h>'
+## linklib 'ghostty-vt'
+
+global ghostty = @record{}
+
+-- Result codes -------------------------------------------------------------
+global GhosttyResult = @cint
+global GHOSTTY_SUCCESS: cint <cimport, nodecl, const>
+global GHOSTTY_OUT_OF_MEMORY: cint <cimport, nodecl, const>
+global GHOSTTY_INVALID_VALUE: cint <cimport, nodecl, const>
+global GHOSTTY_OUT_OF_SPACE: cint <cimport, nodecl, const>
+global GHOSTTY_NO_VALUE: cint <cimport, nodecl, const>
+global GHOSTTY_IO_ERROR: cint <cimport, nodecl, const>
+global GHOSTTY_LIMIT_EXCEEDED: cint <cimport, nodecl, const>
+global GHOSTTY_REJECTED: cint <cimport, nodecl, const>
+
+-- Opaque handles -----------------------------------------------------------
+global GhosttyTerminal <cimport, nodecl> = @pointer
+global GhosttyRenderState <cimport, nodecl> = @pointer
+global GhosttyRenderStateRowIterator <cimport, nodecl> = @pointer
+global GhosttyRenderStateRowCells <cimport, nodecl> = @pointer
+global GhosttyKeyEncoder <cimport, nodecl> = @pointer
+global GhosttyKeyEvent <cimport, nodecl> = @pointer
+global GhosttyAllocator <cimport, nodecl> = @record{ ctx: pointer, vtable: pointer }
+
+-- Plain data types ---------------------------------------------------------
+global GhosttyColorRgb <cimport, nodecl> = @record{ r: uint8, g: uint8, b: uint8 }
+global GhosttyString <cimport, nodecl> = @record{ ptr: *[0]uint8, len: usize }
+global GhosttyBuffer <cimport, nodecl> = @record{ ptr: *[0]uint8, cap: usize, len: usize }
+
+global GhosttyStyleColorValue <cimport, nodecl> = @union{
+  palette: uint8,
+  rgb: GhosttyColorRgb,
+  _padding: uint64,
+}
+global GhosttyStyleColor <cimport, nodecl> = @record{ tag: cint, value: GhosttyStyleColorValue }
+global GhosttyStyle <cimport, nodecl> = @record{
+  size: usize,
+  fg_color: GhosttyStyleColor,
+  bg_color: GhosttyStyleColor,
+  underline_color: GhosttyStyleColor,
+  bold: boolean,
+  italic: boolean,
+  faint: boolean,
+  blink: boolean,
+  inverse: boolean,
+  invisible: boolean,
+  strikethrough: boolean,
+  overline: boolean,
+  underline: cint,
+}
+
+global GhosttyRenderStateColors <cimport, nodecl> = @record{
+  size: usize,
+  background: GhosttyColorRgb,
+  foreground: GhosttyColorRgb,
+  cursor: GhosttyColorRgb,
+  cursor_has_value: boolean,
+  palette: [256]GhosttyColorRgb,
+}
+
+global GhosttyRenderStateRowSelection <cimport, nodecl> = @record{ size: usize, start_x: uint16, end_x: uint16 }
+
+global GhosttyRenderStateCursor <cimport, nodecl> = @record{
+  size: usize,
+  viewport_has_value: boolean,
+  viewport_x: uint16,
+  viewport_y: uint16,
+  wide_tail: boolean,
+  visible: boolean,
+  blinking: boolean,
+  password_input: boolean,
+  visual_style: cint,
+}
+
+global GhosttyTerminalScrollbar <cimport, nodecl> = @record{ total: uint64, offset: uint64, len: uint64 }
+global GhosttyTerminalScrollViewportValue <cimport, nodecl> = @union{ delta: isize, row: usize, _padding: [2]uint64 }
+global GhosttyTerminalScrollViewport <cimport, nodecl> = @record{ tag: cint, value: GhosttyTerminalScrollViewportValue }
+
+-- Enum values ---------------------------------------------------------------
+global GHOSTTY_SCROLL_VIEWPORT_TOP: cint <cimport, nodecl, const>
+global GHOSTTY_SCROLL_VIEWPORT_BOTTOM: cint <cimport, nodecl, const>
+global GHOSTTY_SCROLL_VIEWPORT_DELTA: cint <cimport, nodecl, const>
+global GHOSTTY_SCROLL_VIEWPORT_ROW: cint <cimport, nodecl, const>
+
+global GHOSTTY_TERMINAL_OPT_USERDATA: cint <cimport, nodecl, const>
+global GHOSTTY_TERMINAL_OPT_WRITE_PTY: cint <cimport, nodecl, const>
+global GHOSTTY_TERMINAL_OPT_BELL: cint <cimport, nodecl, const>
+global GHOSTTY_TERMINAL_OPT_TITLE_CHANGED: cint <cimport, nodecl, const>
+global GHOSTTY_TERMINAL_OPT_SIZE: cint <cimport, nodecl, const>
+global GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES: cint <cimport, nodecl, const>
+global GHOSTTY_TERMINAL_OPT_TERMINFO_NAME: cint <cimport, nodecl, const>
+
+global GHOSTTY_TERMINAL_DATA_COLS: cint <cimport, nodecl, const>
+global GHOSTTY_TERMINAL_DATA_ROWS: cint <cimport, nodecl, const>
+global GHOSTTY_TERMINAL_DATA_CURSOR_X: cint <cimport, nodecl, const>
+global GHOSTTY_TERMINAL_DATA_CURSOR_Y: cint <cimport, nodecl, const>
+global GHOSTTY_TERMINAL_DATA_SCROLLBAR: cint <cimport, nodecl, const>
+global GHOSTTY_TERMINAL_DATA_TITLE: cint <cimport, nodecl, const>
+
+global GHOSTTY_RENDER_STATE_DATA_COLS: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_DATA_ROWS: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_DATA_DIRTY: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_DATA_CURSOR: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_DATA_COLORS: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_OPTION_DIRTY: cint <cimport, nodecl, const>
+
+global GHOSTTY_RENDER_STATE_ROW_DATA_DIRTY: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_ROW_DATA_CELLS: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY: cint <cimport, nodecl, const>
+
+global GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_SELECTED: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_HAS_STYLING: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8: cint <cimport, nodecl, const>
+
+global GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW: cint <cimport, nodecl, const>
+
+global GHOSTTY_SGR_UNDERLINE_NONE: cint <cimport, nodecl, const>
+
+global GHOSTTY_KEY_ACTION_RELEASE: cint <cimport, nodecl, const>
+global GHOSTTY_KEY_ACTION_PRESS: cint <cimport, nodecl, const>
+global GHOSTTY_KEY_ACTION_REPEAT: cint <cimport, nodecl, const>
+
+global GHOSTTY_MODS_SHIFT: uint16 <cimport, nodecl, const>
+global GHOSTTY_MODS_CTRL: uint16 <cimport, nodecl, const>
+global GHOSTTY_MODS_ALT: uint16 <cimport, nodecl, const>
+global GHOSTTY_MODS_SUPER: uint16 <cimport, nodecl, const>
+
+-- Key codes (subset the plugin maps to; the full list is in key/event.h).
+## local keys = {
+##   'UNIDENTIFIED','BACKQUOTE','BACKSLASH','BRACKET_LEFT','BRACKET_RIGHT','COMMA',
+##   'DIGIT_0','DIGIT_1','DIGIT_2','DIGIT_3','DIGIT_4','DIGIT_5','DIGIT_6','DIGIT_7','DIGIT_8','DIGIT_9',
+##   'EQUAL','A','B','C','D','E','F','G','H','I','J','K','L','M','N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
+##   'MINUS','PERIOD','QUOTE','SEMICOLON','SLASH',
+##   'ALT_LEFT','ALT_RIGHT','BACKSPACE','CAPS_LOCK','CONTEXT_MENU','CONTROL_LEFT','CONTROL_RIGHT','ENTER',
+##   'META_LEFT','META_RIGHT','SHIFT_LEFT','SHIFT_RIGHT','SPACE','TAB',
+##   'DELETE','END','HOME','INSERT','PAGE_DOWN','PAGE_UP',
+##   'ARROW_DOWN','ARROW_LEFT','ARROW_RIGHT','ARROW_UP',
+##   'NUM_LOCK','NUMPAD_0','NUMPAD_1','NUMPAD_2','NUMPAD_3','NUMPAD_4','NUMPAD_5','NUMPAD_6','NUMPAD_7','NUMPAD_8','NUMPAD_9',
+##   'NUMPAD_ADD','NUMPAD_DECIMAL','NUMPAD_DIVIDE','NUMPAD_ENTER','NUMPAD_EQUAL','NUMPAD_MULTIPLY','NUMPAD_SUBTRACT',
+##   'ESCAPE','F1','F2','F3','F4','F5','F6','F7','F8','F9','F10','F11','F12',
+##   'PRINT_SCREEN','SCROLL_LOCK','PAUSE',
+## }
+## for _, k in ipairs(keys) do
+  global #|'GHOSTTY_KEY_'..k|#: cint <cimport, nodecl, const>
+## end
+
+-- Callback types -------------------------------------------------------------
+global GhosttyTerminalWritePtyFn = @function(terminal: GhosttyTerminal, userdata: pointer, data: *[0]uint8, len: usize): void
+-- The title is not passed to the callback; query GHOSTTY_TERMINAL_DATA_TITLE.
+global GhosttyTerminalTitleChangedFn = @function(terminal: GhosttyTerminal, userdata: pointer): void
+global GhosttyTerminalBellFn = @function(terminal: GhosttyTerminal, userdata: pointer): void
+
+-- Functions ------------------------------------------------------------------
+global function ghostty_type_json(): cstring <cimport, nodecl> end
+
+global function ghostty_terminal_new(allocator: *GhosttyAllocator, terminal: *GhosttyTerminal, cols: uint16, rows: uint16): GhosttyResult <cimport, nodecl> end
+global function ghostty_terminal_free(terminal: GhosttyTerminal): void <cimport, nodecl> end
+global function ghostty_terminal_resize(terminal: GhosttyTerminal, cols: uint16, rows: uint16, cell_width_px: uint32, cell_height_px: uint32): GhosttyResult <cimport, nodecl> end
+global function ghostty_terminal_set(terminal: GhosttyTerminal, option: cint, value: pointer): GhosttyResult <cimport, nodecl> end
+global function ghostty_terminal_vt_write(terminal: GhosttyTerminal, data: *[0]uint8, len: usize): void <cimport, nodecl> end
+global function ghostty_terminal_get(terminal: GhosttyTerminal, data: cint, out: pointer): GhosttyResult <cimport, nodecl> end
+global function ghostty_terminal_scroll_viewport(terminal: GhosttyTerminal, scroll: GhosttyTerminalScrollViewport): void <cimport, nodecl> end
+
+global function ghostty_render_state_new(allocator: *GhosttyAllocator, state: *GhosttyRenderState): GhosttyResult <cimport, nodecl> end
+global function ghostty_render_state_free(state: GhosttyRenderState): void <cimport, nodecl> end
+global function ghostty_render_state_update(state: GhosttyRenderState, terminal: GhosttyTerminal): GhosttyResult <cimport, nodecl> end
+global function ghostty_render_state_get(state: GhosttyRenderState, data: cint, out: pointer): GhosttyResult <cimport, nodecl> end
+global function ghostty_render_state_set(state: GhosttyRenderState, option: cint, value: pointer): GhosttyResult <cimport, nodecl> end
+
+global function ghostty_render_state_row_iterator_new(allocator: *GhosttyAllocator, out_iterator: *GhosttyRenderStateRowIterator): GhosttyResult <cimport, nodecl> end
+global function ghostty_render_state_row_iterator_free(iterator: GhosttyRenderStateRowIterator): void <cimport, nodecl> end
+global function ghostty_render_state_row_iterator_next(iterator: GhosttyRenderStateRowIterator): boolean <cimport, nodecl> end
+global function ghostty_render_state_row_get(iterator: GhosttyRenderStateRowIterator, data: cint, out: pointer): GhosttyResult <cimport, nodecl> end
+global function ghostty_render_state_row_set(iterator: GhosttyRenderStateRowIterator, option: cint, value: pointer): GhosttyResult <cimport, nodecl> end
+
+global function ghostty_render_state_row_cells_new(allocator: *GhosttyAllocator, out_cells: *GhosttyRenderStateRowCells): GhosttyResult <cimport, nodecl> end
+global function ghostty_render_state_row_cells_free(cells: GhosttyRenderStateRowCells): void <cimport, nodecl> end
+global function ghostty_render_state_row_cells_next(cells: GhosttyRenderStateRowCells): boolean <cimport, nodecl> end
+global function ghostty_render_state_row_cells_get(cells: GhosttyRenderStateRowCells, data: cint, out: pointer): GhosttyResult <cimport, nodecl> end
+
+global function ghostty_key_encoder_new(allocator: *GhosttyAllocator, encoder: *GhosttyKeyEncoder): GhosttyResult <cimport, nodecl> end
+global function ghostty_key_encoder_free(encoder: GhosttyKeyEncoder): void <cimport, nodecl> end
+global function ghostty_key_encoder_setopt_from_terminal(encoder: GhosttyKeyEncoder, terminal: GhosttyTerminal): void <cimport, nodecl> end
+global function ghostty_key_encoder_encode(encoder: GhosttyKeyEncoder, event: GhosttyKeyEvent, out_buf: *[0]cchar, out_buf_size: usize, out_len: *usize): GhosttyResult <cimport, nodecl> end
+
+global function ghostty_key_event_new(allocator: *GhosttyAllocator, event: *GhosttyKeyEvent): GhosttyResult <cimport, nodecl> end
+global function ghostty_key_event_free(event: GhosttyKeyEvent): void <cimport, nodecl> end
+global function ghostty_key_event_set_action(event: GhosttyKeyEvent, action: cint): void <cimport, nodecl> end
+global function ghostty_key_event_set_key(event: GhosttyKeyEvent, key: cint): void <cimport, nodecl> end
+global function ghostty_key_event_set_mods(event: GhosttyKeyEvent, mods: uint16): void <cimport, nodecl> end
+global function ghostty_key_event_set_consumed_mods(event: GhosttyKeyEvent, mods: uint16): void <cimport, nodecl> end
+global function ghostty_key_event_set_utf8(event: GhosttyKeyEvent, utf8: cstring, len: usize): void <cimport, nodecl> end
+global function ghostty_key_event_set_unshifted_codepoint(event: GhosttyKeyEvent, codepoint: uint32): void <cimport, nodecl> end
+
+global function ghostty_paste_is_safe(data: cstring, len: usize): boolean <cimport, nodecl> end
+global function ghostty_paste_encode(data: cstring, data_len: usize, bracketed: boolean, buf: *[0]cchar, buf_len: usize, out_written: *usize): GhosttyResult <cimport, nodecl> end
+
+-- Terminal modes (DEC private / ANSI), queried through GHOSTTY_TERMINAL_DATA_MODE.
+global GhosttyMode <cimport, nodecl> = @uint16
+global GhosttyTerminalModeConfig <cimport, nodecl> = @record{ mode: GhosttyMode, value: boolean }
+global GHOSTTY_TERMINAL_DATA_MODE: cint <cimport, nodecl, const>
+global function ghostty_mode_new(value: uint16, ansi: boolean): GhosttyMode <cimport, nodecl> end
+
+-- True when the terminal has DEC mode `num` (e.g. 2004 bracketed paste) enabled.
+global function ghostty_terminal_mode_enabled(terminal: GhosttyTerminal, num: uint16, ansi: boolean): boolean
+  local cfg: GhosttyTerminalModeConfig = { mode = ghostty_mode_new(num, ansi) }
+  if ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_MODE, &cfg) ~= GHOSTTY_SUCCESS then return false end
+  return cfg.value
+end
