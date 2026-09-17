@@ -1,0 +1,110 @@
+-- World panels as light sources: every shown panel owns one game light, a
+-- point light just in front of its readable side, so its backlight glows on
+-- the character's face and the world around it. lua/world.lua decides colour,
+-- strength and range; this module creates, moves, hides and frees the lights.
+require 'math'
+require 'vector'
+require 'core.app.state'
+
+local LIGHT_POINT: cint <comptime> = 2          -- Render.LightShape.PointLight
+local LIGHT_OFFSET: float32 <comptime> = 0.4    -- yalms in front of the panel
+local CREATE_RETRY_FRAMES: uint64 <comptime> = 300
+
+local PanelLight = @record{
+  id: integer,          -- session id of the panel
+  handle: pointer,      -- the game light
+  shown: boolean,
+  frame: uint64,        -- last frame the panel asked for light
+  x: float32, y: float32, z: float32,
+}
+
+local lights: vector(PanelLight)
+local lights_frame: uint64 = 1
+local lights_territory: uint32 = 0  -- zone the lights were made in (0 = none yet)
+local create_retry_at: uint64 = 0   -- after a failed create, wait before trying again
+
+local function light_free(l: *PanelLight): void
+  if l.handle ~= nilptr and host.api.light_destroy ~= nilptr then host.api.light_destroy(l.handle) end
+  l.handle = nilptr
+end
+
+-- Free every light (plugin shutdown, zone change).
+global function lights_destroy_all(): void
+  for i = 0, < #lights do light_free(&lights[i]) end
+  lights:destroy()
+  lights_territory = 0
+end
+
+-- Called for each world panel after placement. `shown` is false while Lua
+-- hides the panel or it sleeps unseen; `fade` dims the light (derez, full screen).
+global function light_panel(id: integer, shown: boolean, pl: *WorldPlacement, fade: float32): void
+  if not shown or host.api.light_create == nilptr or host.api.light_update == nilptr then return end
+  local i: integer = -1
+  for j = 0, < #lights do
+    if lights[j].id == id then i = j break end
+  end
+  if pl.light_intensity <= 0 then -- switched off in Lua
+    if i >= 0 then light_free(&lights[i]) lights:remove(i) end
+    return
+  end
+  if i < 0 then
+    if lights_frame < create_retry_at then return end
+    local handle = host.api.light_create(LIGHT_POINT)
+    if handle == nilptr then
+      create_retry_at = lights_frame + CREATE_RETRY_FRAMES
+      log(LOG_WARN, 'world: could not create a game light')
+      return
+    end
+    lights:push(PanelLight{ id = id, handle = handle })
+    i = #lights - 1
+  end
+  local l = &lights[i]
+  l.frame = lights_frame
+  -- along the panel's front normal, which tilts with its pitch
+  local sy, cy = math.sin(pl.yaw), math.cos(pl.yaw)
+  local sp, cp = math.sin(pl.pitch), math.cos(pl.pitch)
+  l.x = pl.x + (@float32)(sy * cp) * LIGHT_OFFSET
+  l.y = pl.y + (@float32)(sp) * LIGHT_OFFSET
+  l.z = pl.z + (@float32)(cy * cp) * LIGHT_OFFSET
+  local intensity = pl.light_intensity * math.clamp(pl.opacity, 0, 1) * math.clamp(fade, 0, 1)
+  local visible: cint = pl.light_shadows and 3 or 1
+  if host.api.light_update(l.handle, l.x, l.y, l.z, pl.light_r, pl.light_g, pl.light_b, intensity, pl.light_range, visible) == 0 then
+    light_free(l)
+    lights:remove(i)
+    return
+  end
+  l.shown = true
+end
+
+-- Once per frame after the panels: lights of closed panels are freed, lights
+-- no panel asked for this frame (hidden, asleep, derezzed, world toggled off)
+-- go dark, and a zone change frees them all so each panel makes a fresh one.
+global function lights_sync(): void
+  defer lights_frame = lights_frame + 1 end
+  if #lights == 0 then lights_territory = 0 return end
+  local pc: GuObject
+  if host.api.get_object ~= nilptr and host.api.get_object(WORLD_PLAYER, 0, &pc) ~= 0 and pc.found ~= 0 then
+    if lights_territory ~= 0 and pc.territory ~= lights_territory then
+      logf(LOG_INFO, 'world: zone %d -> %d, recreating panel lights', lights_territory, pc.territory)
+      lights_destroy_all()
+      return
+    end
+    lights_territory = pc.territory
+  end
+  local i: integer = #lights - 1
+  while i >= 0 do
+    local l = &lights[i]
+    local open = false
+    for j = 0, < #host.world do
+      if host.world[j].id == l.id then open = true break end
+    end
+    if not open then
+      light_free(l)
+      lights:remove(i)
+    elseif l.frame ~= lights_frame and l.shown then
+      host.api.light_update(l.handle, l.x, l.y, l.z, 0, 0, 0, 0, 0, 0)
+      l.shown = false
+    end
+    i = i - 1
+  end
+end

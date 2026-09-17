@@ -1,0 +1,120 @@
+-- Panel lights against fake game light callbacks: created once, updated every
+-- frame, dark while hidden, freed on close, zone change and shutdown, and
+-- never touched while lua/world.lua has cast_light off.
+require 'core.host'
+require 'string'
+require 'arg'
+
+local creates, updates, destroys, hides = 0, 0, 0, 0
+local live = 0
+local last_visible: cint = -1
+local last_intensity: float32 = 0
+local last_x: float32, last_z: float32 = 0, 0
+local territory: uint32 = 132
+
+local function fake_create(shape: cint): pointer
+  assert(shape == 2, 'a point light')
+  creates = creates + 1
+  live = live + 1
+  return (@pointer)(creates * 16)
+end
+local function fake_update(light: pointer, x: float32, y: float32, z: float32, r: float32, g: float32, b: float32,
+                           intensity: float32, range: float32, visible: cint): cint
+  assert(light ~= nilptr)
+  updates = updates + 1
+  if visible == 0 then hides = hides + 1 end
+  last_visible, last_intensity, last_x, last_z = visible, intensity, x, z
+  return 1
+end
+local function fake_destroy(light: pointer): cint
+  destroys = destroys + 1
+  live = live - 1
+  return 1
+end
+local function fake_object(which: cint, id: uint64, out: *GuObject): cint
+  $out = { x = 10, y = 0, z = 20, rotation = 0, entity_id = 7, territory = territory, found = 1 }
+  return 1
+end
+local function quiet(level: cint, msg: cstring): void end
+
+local api: GuHostApi = {
+  size = #GuHostApi, log = quiet, get_object = fake_object,
+  light_create = fake_create, light_update = fake_update, light_destroy = fake_destroy,
+}
+local dir: string = arg[1]
+assert(gu_init(&api, (@cstring)(dir.data)) == 0)
+
+-- two world panels (no transport: only their ids matter here)
+local s1: Session = { id = 101 }
+local s2: Session = { id = 102 }
+host.world:push(&s1)
+host.world:push(&s2)
+assert(#policy_world_command(101, 'here') == 0)
+assert(#policy_world_command(102, 'orbit 4 1') == 0)
+
+local t = 1.0
+local function frame(shown1: boolean, shown2: boolean, fade: float32): void
+  local ok1, p1 = policy_world_place(101, t, false)
+  light_panel(101, ok1 and shown1, &p1, fade)
+  local ok2, p2 = policy_world_place(102, t, false)
+  light_panel(102, ok2 and shown2, &p2, fade)
+  lights_sync()
+  t = t + 1 / 60
+end
+
+-- created once, updated every frame
+for _ = 1, 10 do frame(true, true, 1) end
+assert(creates == 2 and updates == 20 and destroys == 0, 'one light per panel, one update per frame')
+assert(last_visible == 1 and last_intensity > 0, 'shown and lit')
+local _, here = policy_world_place(101, t, false)
+frame(true, false, 1)
+assert(creates == 2, 'no new light while panels stay open')
+
+-- hidden: dark once, not updated again while hidden
+updates, hides = 0, 0
+frame(false, false, 1)
+frame(false, false, 1)
+assert(hides == 1 and updates == 1, 'a light goes dark once, then is left alone')
+frame(true, false, 1)
+assert(creates == 2 and last_visible == 1, 'the same light comes back')
+
+-- the light sits in front of the readable side (panel 101 faces -Z, toward the player)
+frame(true, false, 0.5)
+assert(last_z < here.z and math.abs(last_x - here.x) < 0.01, 'light in front of the panel')
+
+-- derez fades the intensity
+local _, pl = policy_world_place(101, t, false)
+frame(true, false, 0.25)
+assert(math.abs(last_intensity - pl.light_intensity * pl.opacity * 0.25) < 0.01, 'fade scales intensity')
+
+-- closing a panel frees its light
+host.world:remove(1)
+frame(true, false, 1)
+assert(destroys == 1 and live == 1, 'closed panel light freed')
+
+-- zone change: freed and made again in the new zone
+territory = 133
+frame(true, false, 1)
+assert(destroys == 2 and live == 0, 'zone change frees every light')
+frame(true, false, 1)
+assert(creates == 2, 'a panel pinned in the old zone casts nothing here')
+assert(#policy_world_command(101, 'me') == 0)
+frame(true, false, 1)
+assert(creates == 3 and live == 1, 'a panel in the new zone makes a fresh light')
+
+-- cast_light off: the light goes away and nothing is called afterwards
+assert(luaL_loadstring(policy.L, 'CONFIG.world.light.cast_light = false') == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+frame(true, false, 1)
+assert(live == 0, 'switched off in Lua frees the light')
+local before = creates + updates + destroys
+for _ = 1, 5 do frame(true, false, 1) end
+assert(creates + updates + destroys == before, 'no light calls while cast_light is off')
+assert(luaL_loadstring(policy.L, 'CONFIG.world.light.cast_light = true') == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+frame(true, false, 1)
+assert(live == 1, 'back on')
+
+-- shutdown frees what is left
+host.world:clear()
+gu_shutdown()
+assert(live == 0, 'shutdown frees every light')
+print('lights OK')
