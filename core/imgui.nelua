@@ -1,0 +1,271 @@
+-- Dear ImGui (cimgui 1.88 docking, as shipped by Dalamud) bindings.
+--
+-- Types and enum values come from the vendored cimgui.h so the C compiler
+-- owns every struct layout. Functions are NOT linked: Dalamud already has
+-- cimgui.dll loaded in-process, so the host resolves each export by name at
+-- runtime (GetProcAddress on Windows, a fake table in tests) and fills the
+-- `imgui` function table below.
+
+## cdefine 'CIMGUI_DEFINE_ENUMS_AND_STRUCTS'
+-- cimgui.h carries one C++-only `constexpr`; harmless as plain C.
+## cdefine 'constexpr'
+## if not ccinfo.is_windows then
+## cdefine '__cdecl'
+## end
+## cinclude '<cimgui.h>'
+
+global ImVec2 <cimport, nodecl> = @record{ x: float32, y: float32 }
+global ImVec4 <cimport, nodecl> = @record{ x: float32, y: float32, z: float32, w: float32 }
+global ImDrawVert <cimport, nodecl> = @record{ pos: ImVec2, uv: ImVec2, col: uint32 }
+global ImVector_ImDrawVert <cimport, nodecl> = @record{ Size: cint, Capacity: cint, Data: *[0]ImDrawVert }
+global ImDrawCmd <cimport, nodecl> = @record{
+  ClipRect: ImVec4, TextureId: pointer, VtxOffset: cuint, IdxOffset: cuint, ElemCount: cuint,
+  UserCallback: pointer,       -- draw-list callback (1.88: no UserCallbackDataSize)
+  UserCallbackData: pointer,
+}
+global ImVector_ImDrawCmd <cimport, nodecl> = @record{ Size: cint, Capacity: cint, Data: *[0]ImDrawCmd }
+-- Only the buffers are used (world-space panels remap vertices after drawing).
+global ImDrawList <cimport, nodecl> = @record{ CmdBuffer: ImVector_ImDrawCmd, VtxBuffer: ImVector_ImDrawVert }
+global ImFont <cimport, nodecl> = @record{}
+global ImGuiViewport <cimport, nodecl> = @record{ ID: uint32, Flags: cint, Pos: ImVec2, Size: ImVec2, WorkPos: ImVec2, WorkSize: ImVec2 }
+global ImVector_ImWchar <cimport, nodecl> = @record{ Size: cint, Capacity: cint, Data: *[0]uint16 }
+
+-- Only the ImGuiIO fields the plugin reads are declared; the C compiler uses
+-- the full definition from cimgui.h for offsets.
+global ImGuiIO <cimport, nodecl> = @record{
+  DeltaTime: float32,
+  DisplaySize: ImVec2,
+  WantCaptureMouse: boolean,
+  WantCaptureKeyboard: boolean,
+  WantTextInput: boolean,
+  MouseWheel: float32,
+  KeyCtrl: boolean,
+  KeyShift: boolean,
+  KeyAlt: boolean,
+  KeySuper: boolean,
+  InputQueueCharacters: ImVector_ImWchar,
+}
+
+## local consts = {
+##  'ImGuiWindowFlags_NoTitleBar','ImGuiWindowFlags_NoResize','ImGuiWindowFlags_NoMove','ImGuiWindowFlags_NoScrollbar',
+##  'ImGuiWindowFlags_NoScrollWithMouse','ImGuiWindowFlags_NoCollapse','ImGuiWindowFlags_NoBackground',
+##  'ImGuiWindowFlags_NoSavedSettings','ImGuiWindowFlags_NoFocusOnAppearing','ImGuiWindowFlags_NoDocking',
+##  'ImGuiWindowFlags_NoNav','ImGuiWindowFlags_AlwaysAutoResize',
+##  'ImGuiFocusedFlags_RootAndChildWindows','ImGuiHoveredFlags_RootAndChildWindows','ImGuiHoveredFlags_AnyWindow',
+##  'ImGuiCond_Always','ImGuiCond_Once','ImGuiCond_FirstUseEver',
+##  'ImGuiStyleVar_WindowPadding','ImGuiStyleVar_WindowRounding','ImGuiStyleVar_WindowBorderSize',
+##  'ImGuiCol_WindowBg','ImGuiCol_Text','ImGuiMouseButton_Left','ImGuiMouseButton_Right','ImGuiMouseButton_Middle',
+##  'ImGuiTabBarFlags_Reorderable','ImGuiTabBarFlags_AutoSelectNewTabs','ImGuiTabItemFlags_None','ImGuiTabItemFlags_Trailing','ImGuiTreeNodeFlags_DefaultOpen',
+##  'ImGuiTabBarFlags_TabListPopupButton','ImGuiTabBarFlags_FittingPolicyScroll',
+##  'ImGuiKey_None','ImGuiKey_Tab','ImGuiKey_LeftArrow','ImGuiKey_RightArrow','ImGuiKey_UpArrow','ImGuiKey_DownArrow',
+##  'ImGuiKey_PageUp','ImGuiKey_PageDown','ImGuiKey_Home','ImGuiKey_End','ImGuiKey_Insert','ImGuiKey_Delete',
+##  'ImGuiKey_Backspace','ImGuiKey_Space','ImGuiKey_Enter','ImGuiKey_Escape',
+##  'ImGuiKey_LeftCtrl','ImGuiKey_LeftShift','ImGuiKey_LeftAlt','ImGuiKey_LeftSuper',
+##  'ImGuiKey_RightCtrl','ImGuiKey_RightShift','ImGuiKey_RightAlt','ImGuiKey_RightSuper','ImGuiKey_Menu',
+##  'ImGuiKey_0','ImGuiKey_1','ImGuiKey_2','ImGuiKey_3','ImGuiKey_4','ImGuiKey_5','ImGuiKey_6','ImGuiKey_7','ImGuiKey_8','ImGuiKey_9',
+##  'ImGuiKey_A','ImGuiKey_B','ImGuiKey_C','ImGuiKey_D','ImGuiKey_E','ImGuiKey_F','ImGuiKey_G','ImGuiKey_H','ImGuiKey_I','ImGuiKey_J',
+##  'ImGuiKey_K','ImGuiKey_L','ImGuiKey_M','ImGuiKey_N','ImGuiKey_O','ImGuiKey_P','ImGuiKey_Q','ImGuiKey_R','ImGuiKey_S','ImGuiKey_T',
+##  'ImGuiKey_U','ImGuiKey_V','ImGuiKey_W','ImGuiKey_X','ImGuiKey_Y','ImGuiKey_Z',
+##  'ImGuiKey_F1','ImGuiKey_F2','ImGuiKey_F3','ImGuiKey_F4','ImGuiKey_F5','ImGuiKey_F6',
+##  'ImGuiKey_F7','ImGuiKey_F8','ImGuiKey_F9','ImGuiKey_F10','ImGuiKey_F11','ImGuiKey_F12',
+##  'ImGuiKey_Apostrophe','ImGuiKey_Comma','ImGuiKey_Minus','ImGuiKey_Period','ImGuiKey_Slash','ImGuiKey_Semicolon',
+##  'ImGuiKey_Equal','ImGuiKey_LeftBracket','ImGuiKey_Backslash','ImGuiKey_RightBracket','ImGuiKey_GraveAccent',
+##  'ImGuiKey_CapsLock','ImGuiKey_ScrollLock','ImGuiKey_NumLock','ImGuiKey_PrintScreen','ImGuiKey_Pause',
+##  'ImGuiKey_Keypad0','ImGuiKey_Keypad1','ImGuiKey_Keypad2','ImGuiKey_Keypad3','ImGuiKey_Keypad4',
+##  'ImGuiKey_Keypad5','ImGuiKey_Keypad6','ImGuiKey_Keypad7','ImGuiKey_Keypad8','ImGuiKey_Keypad9',
+##  'ImGuiKey_KeypadDecimal','ImGuiKey_KeypadDivide','ImGuiKey_KeypadMultiply','ImGuiKey_KeypadSubtract',
+##  'ImGuiKey_KeypadAdd','ImGuiKey_KeypadEnter','ImGuiKey_KeypadEqual',
+##  'ImGuiKey_ModCtrl','ImGuiKey_ModShift','ImGuiKey_ModAlt','ImGuiKey_ModSuper',
+##  'ImGuiKey_NamedKey_BEGIN','ImGuiKey_NamedKey_END',
+##  'ImGuiCol_Text','ImGuiCol_Tab','ImGuiCol_TabHovered','ImGuiCol_TabActive',
+##  'ImDrawFlags_RoundCornersTop','ImGuiButtonFlags_MouseButtonLeft','ImGuiButtonFlags_MouseButtonMiddle',
+##  'ImGuiCol_PopupBg','ImGuiCol_Border','ImGuiCol_ResizeGrip','ImGuiCol_ResizeGripHovered','ImGuiCol_ResizeGripActive',
+##  'ImGuiStyleVar_PopupRounding','ImGuiStyleVar_PopupBorderSize','ImGuiSliderFlags_AlwaysClamp',
+## }
+## for _, c in ipairs(consts) do
+  global #|c|#: cint <cimport, nodecl, const>
+## end
+
+-- The function table. Field names drop the `ig` / `ImDrawList_` prefixes;
+-- the cimgui export names are listed in `imgui_exports` below.
+global ImGuiApi = @record{
+  GetIO: function(): *ImGuiIO,
+  GetMainViewport: function(): *ImGuiViewport,
+  GetBackgroundDrawList: function(): *ImDrawList,
+  GetForegroundDrawList: function(): *ImDrawList,
+  Begin: function(name: cstring, p_open: *boolean, flags: cint): boolean,
+  End: function(): void,
+  BeginChild: function(str_id: cstring, size: ImVec2, border: boolean, flags: cint): boolean,
+  EndChild: function(): void,
+  SetNextWindowPos: function(pos: ImVec2, cond: cint, pivot: ImVec2): void,
+  SetNextWindowSize: function(size: ImVec2, cond: cint): void,
+  SetNextWindowFocus: function(): void,
+  SetNextWindowBgAlpha: function(alpha: float32): void,
+  GetWindowDrawList: function(): *ImDrawList,
+  GetWindowPos: function(pOut: *ImVec2): void,
+  GetWindowSize: function(pOut: *ImVec2): void,
+  GetContentRegionAvail: function(pOut: *ImVec2): void,
+  GetCursorScreenPos: function(pOut: *ImVec2): void,
+  SetCursorScreenPos: function(pos: ImVec2): void,
+  IsWindowFocused: function(flags: cint): boolean,
+  IsWindowHovered: function(flags: cint): boolean,
+  PushStyleVarFloat: function(idx: cint, val: float32): void,
+  PushStyleVarVec2: function(idx: cint, val: ImVec2): void,
+  PopStyleVar: function(count: cint): void,
+  PushStyleColorU32: function(idx: cint, col: uint32): void,
+  PopStyleColor: function(count: cint): void,
+  GetFont: function(): *ImFont,
+  GetFontSize: function(): float32,
+  PushFont: function(font: *ImFont): void,
+  PopFont: function(): void,
+  IsKeyDown: function(key: cint): boolean,
+  -- queue a key event as the backend would (input.nelua releases stuck keys)
+  IOAddKeyEvent: function(io: *ImGuiIO, key: cint, down: boolean): void,
+  GetFrameCount: function(): cint,
+  IsKeyPressed: function(key: cint, rep: boolean): boolean,
+  IsMouseClicked: function(button: cint, rep: boolean): boolean,
+  IsMouseDown: function(button: cint): boolean,
+  IsMouseReleased: function(button: cint): boolean,
+  GetMousePos: function(pOut: *ImVec2): void,
+  InvisibleButton: function(str_id: cstring, size: ImVec2, flags: cint): boolean,
+  IsItemActive: function(): boolean,
+  IsItemHovered: function(flags: cint): boolean,
+  SetKeyboardFocusHere: function(offset: cint): void,
+  SetNextFrameWantCaptureKeyboard: function(want: boolean): void,
+  SetNextFrameWantCaptureMouse: function(want: boolean): void,
+  GetClipboardText: function(): cstring,
+  SetClipboardText: function(text: cstring): void,
+  GetTime: function(): float64,
+  BeginTabBar: function(str_id: cstring, flags: cint): boolean,
+  EndTabBar: function(): void,
+  BeginTabItem: function(label: cstring, p_open: *boolean, flags: cint): boolean,
+  EndTabItem: function(): void,
+  TabItemButton: function(label: cstring, flags: cint): boolean,
+  SmallButton: function(label: cstring): boolean,
+  CollapsingHeader: function(label: cstring, flags: cint): boolean,
+  SliderFloat: function(label: cstring, v: *float32, v_min: float32, v_max: float32, format: cstring, flags: cint): boolean,
+  SliderInt: function(label: cstring, v: *cint, v_min: cint, v_max: cint, format: cstring, flags: cint): boolean,
+  Checkbox: function(label: cstring, v: *boolean): boolean,
+  BeginCombo: function(label: cstring, preview: cstring, flags: cint): boolean,
+  EndCombo: function(): void,
+  Separator: function(): void,
+  TextUnformatted: function(text: cstring, text_end: cstring): void,
+  PushTextWrapPos: function(wrap_local_pos_x: float32): void,
+  PopTextWrapPos: function(): void,
+  Spacing: function(): void,
+  PushStyleColorVec4: function(idx: cint, col: ImVec4): void,
+  SetWindowFocusNil: function(): void,
+  PushIDInt: function(id: cint): void,
+  PopID: function(): void,
+  Text: function(fmt: cstring, ...: cvarargs): void,
+  Button: function(label: cstring, size: ImVec2): boolean,
+  SameLine: function(offset: float32, spacing: float32): void,
+  Selectable: function(label: cstring, selected: boolean, flags: cint, size: ImVec2): boolean,
+  Dummy: function(size: ImVec2): void,
+  DrawListAddRectFilled: function(dl: *ImDrawList, p_min: ImVec2, p_max: ImVec2, col: uint32, rounding: float32, flags: cint): void,
+  DrawListAddTriangleFilled: function(dl: *ImDrawList, p1: ImVec2, p2: ImVec2, p3: ImVec2, col: uint32): void,
+  DrawListAddRect: function(dl: *ImDrawList, p_min: ImVec2, p_max: ImVec2, col: uint32, rounding: float32, flags: cint, thickness: float32): void,
+  DrawListAddLine: function(dl: *ImDrawList, p1: ImVec2, p2: ImVec2, col: uint32, thickness: float32): void,
+  DrawListAddText: function(dl: *ImDrawList, font: *ImFont, font_size: float32, pos: ImVec2, col: uint32, text_begin: cstring, text_end: cstring, wrap_width: float32, cpu_fine_clip_rect: *ImVec4): void,
+  DrawListPushClipRect: function(dl: *ImDrawList, min: ImVec2, max: ImVec2, intersect: boolean): void,
+  DrawListPopClipRect: function(dl: *ImDrawList): void,
+  FontCalcTextSizeA: function(pOut: *ImVec2, font: *ImFont, size: float32, max_width: float32, wrap_width: float32, text_begin: cstring, text_end: cstring, remaining: *cstring): void,
+  -- raw triangles with per-vertex colour (soft gradients: the visual bell)
+  DrawListPrimReserve: function(dl: *ImDrawList, idx_count: cint, vtx_count: cint): void,
+  DrawListPrimVtx: function(dl: *ImDrawList, pos: ImVec2, uv: ImVec2, col: uint32): void,
+  GetFontTexUvWhitePixel: function(pOut: *ImVec2): void,
+  -- glass chrome (core/chrome.nelua, core/app/dropdown.nelua)
+  DrawListAddCircle: function(dl: *ImDrawList, center: ImVec2, radius: float32, col: uint32, num_segments: cint, thickness: float32): void,
+  DrawListAddCircleFilled: function(dl: *ImDrawList, center: ImVec2, radius: float32, col: uint32, num_segments: cint): void,
+  DrawListAddPolyline: function(dl: *ImDrawList, points: *ImVec2, num_points: cint, col: uint32, flags: cint, thickness: float32): void,
+  BeginTooltip: function(): void,
+  EndTooltip: function(): void,
+  IsMouseDragging: function(button: cint, lock_threshold: float32): boolean,
+  IsItemActivated: function(): boolean,
+  IsItemDeactivatedAfterEdit: function(): boolean,
+  OpenPopup: function(str_id: cstring, flags: cint): void,
+  BeginPopup: function(str_id: cstring, flags: cint): boolean,
+  EndPopup: function(): void,
+  CloseCurrentPopup: function(): void,
+  -- callback: function(list: *ImDrawList, cmd: *ImDrawCmd): void, or IMDRAW_CALLBACK_RESET
+  DrawListAddCallback: function(dl: *ImDrawList, callback: pointer, callback_data: pointer): void,
+}
+
+-- Draw-list callback that makes the renderer restore its own state. Dalamud's
+-- value, not stock ImGui's (void*)-1: Dalamud uses -1 for its private blur
+-- callback, which frees UserCallbackData. Re-check Dalamud.Bindings.ImGui
+-- ImDrawCallbackResetRenderState on every Dalamud API bump.
+global IMDRAW_CALLBACK_RESET: isize <comptime> = -8
+
+global imgui: ImGuiApi
+
+## local exports = {
+##  {'GetIO','igGetIO'},{'GetMainViewport','igGetMainViewport'},{'GetBackgroundDrawList','igGetBackgroundDrawList_Nil'},{'GetForegroundDrawList','igGetForegroundDrawList_Nil'},{'Begin','igBegin'},{'End','igEnd'},
+##  {'BeginChild','igBeginChild_Str'},{'EndChild','igEndChild'},
+##  {'SetNextWindowPos','igSetNextWindowPos'},{'SetNextWindowSize','igSetNextWindowSize'},
+##  {'SetNextWindowFocus','igSetNextWindowFocus'},{'SetNextWindowBgAlpha','igSetNextWindowBgAlpha'},
+##  {'GetWindowDrawList','igGetWindowDrawList'},{'GetWindowPos','igGetWindowPos'},{'GetWindowSize','igGetWindowSize'},
+##  {'GetContentRegionAvail','igGetContentRegionAvail'},{'GetCursorScreenPos','igGetCursorScreenPos'},
+##  {'SetCursorScreenPos','igSetCursorScreenPos'},
+##  {'IsWindowFocused','igIsWindowFocused'},{'IsWindowHovered','igIsWindowHovered'},
+##  {'PushStyleVarFloat','igPushStyleVar_Float'},{'PushStyleVarVec2','igPushStyleVar_Vec2'},{'PopStyleVar','igPopStyleVar'},
+##  {'PushStyleColorU32','igPushStyleColor_U32'},{'PopStyleColor','igPopStyleColor'},
+##  {'GetFont','igGetFont'},{'GetFontSize','igGetFontSize'},{'PushFont','igPushFont'},{'PopFont','igPopFont'},
+##  {'IsKeyDown','igIsKeyDown'},{'IOAddKeyEvent','ImGuiIO_AddKeyEvent',true},{'GetFrameCount','igGetFrameCount'},{'IsKeyPressed','igIsKeyPressed'},
+##  {'IsMouseClicked','igIsMouseClicked'},{'IsMouseDown','igIsMouseDown'},{'IsMouseReleased','igIsMouseReleased'},
+##  {'GetMousePos','igGetMousePos'},{'InvisibleButton','igInvisibleButton'},{'IsItemActive','igIsItemActive'},
+##  {'IsItemHovered','igIsItemHovered'},{'SetKeyboardFocusHere','igSetKeyboardFocusHere'},
+##  {'SetNextFrameWantCaptureKeyboard','igSetNextFrameWantCaptureKeyboard'},
+##  {'SetNextFrameWantCaptureMouse','igSetNextFrameWantCaptureMouse'},
+##  {'GetClipboardText','igGetClipboardText'},{'SetClipboardText','igSetClipboardText'},{'GetTime','igGetTime'},
+##  {'BeginTabBar','igBeginTabBar'},{'EndTabBar','igEndTabBar'},{'BeginTabItem','igBeginTabItem'},
+##  {'EndTabItem','igEndTabItem'},{'TabItemButton','igTabItemButton'},{'SmallButton','igSmallButton'},{'CollapsingHeader','igCollapsingHeader_TreeNodeFlags'},{'SliderFloat','igSliderFloat'},{'SliderInt','igSliderInt'},{'Checkbox','igCheckbox'},{'BeginCombo','igBeginCombo'},{'EndCombo','igEndCombo'},{'Separator','igSeparator'},{'TextUnformatted','igTextUnformatted'},{'PushTextWrapPos','igPushTextWrapPos'},{'PopTextWrapPos','igPopTextWrapPos'},{'Spacing','igSpacing'},{'PushStyleColorVec4','igPushStyleColor_Vec4'},{'SetWindowFocusNil','igSetWindowFocus_Nil'},{'PushIDInt','igPushID_Int'},{'PopID','igPopID'},
+##  {'Text','igText'},{'Button','igButton'},{'SameLine','igSameLine'},{'Selectable','igSelectable_Bool'},{'Dummy','igDummy'},
+##  {'DrawListAddRectFilled','ImDrawList_AddRectFilled'},{'DrawListAddRect','ImDrawList_AddRect'},{'DrawListAddTriangleFilled','ImDrawList_AddTriangleFilled'},
+##  {'DrawListAddLine','ImDrawList_AddLine'},{'DrawListAddText','ImDrawList_AddText_FontPtr'},
+##  {'DrawListPushClipRect','ImDrawList_PushClipRect'},{'DrawListPopClipRect','ImDrawList_PopClipRect'},
+##  {'FontCalcTextSizeA','ImFont_CalcTextSizeA'},
+##  {'DrawListPrimReserve','ImDrawList_PrimReserve'},{'DrawListPrimVtx','ImDrawList_PrimVtx'},
+##  {'GetFontTexUvWhitePixel','igGetFontTexUvWhitePixel'},
+##  {'DrawListAddCircle','ImDrawList_AddCircle'},{'DrawListAddCircleFilled','ImDrawList_AddCircleFilled'},{'DrawListAddPolyline','ImDrawList_AddPolyline'},
+##  {'BeginTooltip','igBeginTooltip'},{'EndTooltip','igEndTooltip'},{'IsMouseDragging','igIsMouseDragging'},{'IsItemActivated','igIsItemActivated'},{'IsItemDeactivatedAfterEdit','igIsItemDeactivatedAfterEdit',true},
+##  {'OpenPopup','igOpenPopup_Str'},{'BeginPopup','igBeginPopup'},{'EndPopup','igEndPopup'},{'CloseCurrentPopup','igCloseCurrentPopup'},
+##  {'DrawListAddCallback','ImDrawList_AddCallback'},
+## }
+
+global ImGuiResolver = @function(name: cstring): pointer
+
+-- Fill the function table using `resolve`. Returns the number of exports that
+-- could not be resolved and reports each missing name through `report`.
+-- Optional exports (a third `true` in the list) stay nil when missing and do
+-- not count; their callers check for nil.
+global function imgui_bind(resolve: ImGuiResolver, report: function(name: cstring): void): integer
+  local missing: integer = 0
+  ## for _, e in ipairs(exports) do
+    do
+      local p: pointer = resolve(#[e[2]]#)
+      ## if not e[3] then
+      if p == nilptr then
+        missing = missing + 1
+        if report then report(#[e[2]]#) end
+      end
+      ## end
+      imgui.#|e[1]|# = (@#[ImGuiApi.value.fields[e[1]].type]#)(p)
+    end
+  ## end
+  return missing
+end
+
+global function imgui_ready(): boolean
+  return imgui.Begin ~= nilptr and imgui.GetIO ~= nilptr and imgui.DrawListAddText ~= nilptr
+end
+
+-- Small helpers -----------------------------------------------------------
+global function vec2(x: float32, y: float32): ImVec2
+  return ImVec2{ x = x, y = y }
+end
+
+-- Pack r,g,b,a bytes into ImU32 (IM_COL32 layout: ABGR little endian).
+global function im_col32(r: uint8, g: uint8, b: uint8, a: uint8): uint32
+  return (@uint32)(r) | ((@uint32)(g) << 8) | ((@uint32)(b) << 16) | ((@uint32)(a) << 24)
+end

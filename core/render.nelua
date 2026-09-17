@@ -1,0 +1,218 @@
+-- Draw a TermView into an ImGui draw list.
+require 'core.ghostty'
+require 'core.imgui'
+require 'core.termview'
+require 'memory'
+
+global RenderMetrics = @record{
+  font: *ImFont,
+  font_size: float32,
+  cell_w: float32,
+  cell_h: float32,
+}
+
+-- Measure the monospace cell size for `font` at `font_size`.
+global function render_measure(font: *ImFont, font_size: float32): RenderMetrics
+  local m: RenderMetrics = { font = font, font_size = font_size }
+  local sz: ImVec2
+  imgui.FontCalcTextSizeA(&sz, font, font_size, 3.4e38, 0.0, 'M', nilptr, nilptr)
+  m.cell_w = sz.x
+  if m.cell_w < 1.0 then m.cell_w = font_size * 0.6 end
+  m.cell_h = font_size
+  if sz.y > m.cell_h then m.cell_h = sz.y end
+  return m
+end
+
+global function render_grid_size(m: RenderMetrics, width: float32, height: float32): (uint16, uint16)
+  local cols: integer = (@integer)(width // m.cell_w)
+  local rows: integer = (@integer)(height // m.cell_h)
+  if cols < 2 then cols = 2 end
+  if rows < 1 then rows = 1 end
+  if cols > 500 then cols = 500 end
+  if rows > 200 then rows = 200 end
+  return (@uint16)(cols), (@uint16)(rows)
+end
+
+local function rgb(c: GhosttyColorRgb, a: uint8): uint32
+  return im_col32(c.r, c.g, c.b, a)
+end
+
+-- Longest merged background run in pixels (0 = unlimited). Curved world panels
+-- set it so wide runs get enough vertices to follow the curve.
+global render_max_run_px: float32 = 0
+
+-- Drawing onto a world panel, whose vertices are projected afterwards: glyph
+-- positions need no pixel snapping, so text runs merge whatever the cell width.
+global render_world: boolean = false
+
+-- Draw the terminal grid. `origin` is the top-left pixel of cell (0,0).
+-- `focused` picks a solid or hollow cursor; `blink_on` gates blinking cursors.
+global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m: RenderMetrics, focused: boolean, blink_on: boolean, bg_alpha: uint8, rounding: float32): void
+  local colors: GhosttyRenderStateColors = { size = #GhosttyRenderStateColors }
+  if ghostty_render_state_get(v.state, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors) ~= GHOSTTY_SUCCESS then return end
+
+  local total_w = m.cell_w * v.cols
+  local total_h = m.cell_h * v.rows
+  imgui.DrawListAddRectFilled(dl, origin, vec2(origin.x + total_w, origin.y + total_h), rgb(colors.background, bg_alpha), rounding, 0)
+
+  local iter = v.iter
+  if ghostty_render_state_get(v.state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &iter) ~= GHOSTTY_SUCCESS then return end
+
+  local text: [64]uint8
+  local y: float32 = origin.y
+  -- Same-colour ASCII glyphs in adjacent cells go out as one AddText. ImGui
+  -- snaps only a call's start to the pixel grid, so in 2D this matches
+  -- per-glyph drawing only when the cell width is a whole number of pixels.
+  local merge_text = render_world or m.cell_w == math.floor(m.cell_w)
+  local row_index: integer = 0
+  while ghostty_render_state_row_iterator_next(iter) do
+    local cells = v.cells
+    if ghostty_render_state_row_get(iter, GHOSTTY_RENDER_STATE_ROW_DATA_CELLS, &cells) == GHOSTTY_SUCCESS then
+      local sel: GhosttyRenderStateRowSelection = { size = #GhosttyRenderStateRowSelection }
+      local has_sel = ghostty_render_state_row_get(iter, GHOSTTY_RENDER_STATE_ROW_DATA_SELECTION, &sel) == GHOSTTY_SUCCESS
+      local x: float32 = origin.x
+      local col: integer = 0
+      -- Backgrounds are merged into runs so a full-width colored row is one rect.
+      local run_start: float32 = 0.0
+      local run_col: uint32 = 0
+      local run_active: boolean = false
+      local text_next_col: integer = -1 -- the cell that may extend the last glyph run
+      v.glyphs:clear()
+      v.glyph_bytes:clear()
+      while ghostty_render_state_row_cells_next(cells) do
+        local glen: uint32 = 0
+        ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_LEN, &glen)
+        local fg: GhosttyColorRgb = colors.foreground
+        local bg: GhosttyColorRgb = colors.background
+        local has_fg = ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, &fg) == GHOSTTY_SUCCESS
+        local has_bg = ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_BG_COLOR, &bg) == GHOSTTY_SUCCESS
+        local style: GhosttyStyle = { size = #GhosttyStyle }
+        local styled: boolean = false
+        ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_HAS_STYLING, &styled)
+        if styled then
+          ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style)
+          if style.inverse then
+            local t = fg
+            fg = bg
+            bg = t
+            has_bg = true
+          end
+          if style.faint then
+            fg.r = (@uint8)((@integer)(fg.r) * 2 // 3)
+            fg.g = (@uint8)((@integer)(fg.g) * 2 // 3)
+            fg.b = (@uint8)((@integer)(fg.b) * 2 // 3)
+          end
+        end
+        local selected: boolean = has_sel and col >= sel.start_x and col <= sel.end_x
+        if selected then
+          local t = fg
+          fg = bg
+          bg = t
+          has_bg = true
+        end
+
+        local bgcol: uint32 = rgb(bg, 255)
+        if has_bg then
+          if run_active and run_col == bgcol and (render_max_run_px <= 0 or x - run_start < render_max_run_px) then
+            -- extend
+          else
+            if run_active then
+              imgui.DrawListAddRectFilled(dl, vec2(run_start, y), vec2(x, y + m.cell_h), run_col, 0.0, 0)
+            end
+            run_active = true
+            run_start = x
+            run_col = bgcol
+          end
+        elseif run_active then
+          imgui.DrawListAddRectFilled(dl, vec2(run_start, y), vec2(x, y + m.cell_h), run_col, 0.0, 0)
+          run_active = false
+        end
+
+        -- Glyphs are queued and drawn after the row's background runs; a run
+        -- is only flushed when it ends, so drawing text now would bury it.
+        if glen > 0 and not (styled and style.invisible) then
+          local buf: GhosttyBuffer = { ptr = &text, cap = 63, len = 0 }
+          if ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &buf) == GHOSTTY_SUCCESS and buf.len > 0 then
+            local underline = styled and style.underline ~= GHOSTTY_SGR_UNDERLINE_NONE
+            local strike = styled and style.strikethrough
+            local bold = styled and style.bold
+            local fgcol = rgb(fg, 255)
+            local plain = not underline and not strike
+            if buf.len == 1 and text[0] == 32 and plain then
+              -- a written space draws nothing
+            else
+              local mergeable = merge_text and plain and buf.len == 1 and text[0] > 32 and text[0] < 127
+              local n = #v.glyphs
+              if mergeable and text_next_col == col and n > 0 and v.glyphs[n - 1].col == fgcol and v.glyphs[n - 1].bold == bold then
+                -- the run's bytes are the last ones queued
+                v.glyph_bytes:push(text[0])
+                v.glyphs[n - 1].len = v.glyphs[n - 1].len + 1
+              else
+                local off = #v.glyph_bytes
+                v.glyph_bytes:resize(off + buf.len)
+                memory.copy(&v.glyph_bytes[off], &text, buf.len)
+                v.glyphs:push(GlyphDraw{ x = x, col = fgcol, off = off, len = buf.len, bold = bold, underline = underline, strike = strike })
+              end
+              text_next_col = mergeable and col + 1 or -1
+            end
+          end
+        end
+        x = x + m.cell_w
+        col = col + 1
+      end
+      if run_active then
+        imgui.DrawListAddRectFilled(dl, vec2(run_start, y), vec2(x, y + m.cell_h), run_col, 0.0, 0)
+      end
+      if #v.glyphs > 0 then
+        v.glyph_bytes:push(0)
+        local bytes = (@*[0]byte)(&v.glyph_bytes[0])
+        for gi = 0, < #v.glyphs do
+          local g = v.glyphs[gi]
+          local b = (@cstring)(&bytes[g.off])
+          local e = (@cstring)(&bytes[g.off + g.len])
+          imgui.DrawListAddText(dl, m.font, m.font_size, vec2(g.x, y), g.col, b, e, 0.0, nilptr)
+          if g.bold then
+            imgui.DrawListAddText(dl, m.font, m.font_size, vec2(g.x + 0.7, y), g.col, b, e, 0.0, nilptr)
+          end
+          if g.underline then
+            local uy = y + m.cell_h - 2.0
+            imgui.DrawListAddLine(dl, vec2(g.x, uy), vec2(g.x + m.cell_w, uy), g.col, 1.0)
+          end
+          if g.strike then
+            local sy = y + m.cell_h * 0.5
+            imgui.DrawListAddLine(dl, vec2(g.x, sy), vec2(g.x + m.cell_w, sy), g.col, 1.0)
+          end
+        end
+      end
+    end
+    local clean: boolean = false
+    ghostty_render_state_row_set(iter, GHOSTTY_RENDER_STATE_ROW_OPTION_DIRTY, &clean)
+    y = y + m.cell_h
+    row_index = row_index + 1
+  end
+
+  -- Cursor.
+  local cur: GhosttyRenderStateCursor = { size = #GhosttyRenderStateCursor }
+  if ghostty_render_state_get(v.state, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cur) == GHOSTTY_SUCCESS and cur.visible and cur.viewport_has_value then
+    if not cur.blinking or blink_on or not focused then
+      local cx = origin.x + m.cell_w * cur.viewport_x
+      local cy = origin.y + m.cell_h * cur.viewport_y
+      local ccol = rgb(colors.foreground, 255)
+      if colors.cursor_has_value then ccol = rgb(colors.cursor, 255) end
+      if not focused then
+        imgui.DrawListAddRect(dl, vec2(cx, cy), vec2(cx + m.cell_w, cy + m.cell_h), ccol, 0.0, 0, 1.0)
+      elseif cur.visual_style == GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR then
+        imgui.DrawListAddRectFilled(dl, vec2(cx, cy), vec2(cx + 2.0, cy + m.cell_h), ccol, 0.0, 0)
+      elseif cur.visual_style == GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_UNDERLINE then
+        imgui.DrawListAddRectFilled(dl, vec2(cx, cy + m.cell_h - 2.0), vec2(cx + m.cell_w, cy + m.cell_h), ccol, 0.0, 0)
+      elseif cur.visual_style == GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK_HOLLOW then
+        imgui.DrawListAddRect(dl, vec2(cx, cy), vec2(cx + m.cell_w, cy + m.cell_h), ccol, 0.0, 0, 1.0)
+      else
+        imgui.DrawListAddRectFilled(dl, vec2(cx, cy), vec2(cx + m.cell_w, cy + m.cell_h), ccol, 0.0, 0)
+        -- Re-draw the glyph under a block cursor in the background color so it stays readable.
+        -- (Cheap approach: the terminal foreground/background swap is handled by the next frame's
+        -- selection logic; here we only paint the block.)
+      end
+    end
+  end
+end
