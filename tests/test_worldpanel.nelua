@@ -1,0 +1,780 @@
+-- Clicked world panels: the presented pose, title buttons, the wake fade, the
+-- walk-up state machine, and their tuning in lua/world.lua.
+require 'core.world'
+require 'core.policy'
+require 'core.app.worldview'
+require 'string'
+require 'math'
+require 'arg'
+
+local function near(a: float32, b: float32, eps: float32): boolean return math.abs(a - b) < eps end
+local function dist3(ax: float32, ay: float32, az: float32, bx: float32, by: float32, bz: float32): float32
+  return math.sqrt((ax - bx) ^ 2 + (ay - by) ^ 2 + (az - bz) ^ 2)
+end
+
+-- Camera at (0, 1.6, 6) looking down -Z: w = 6 - z.
+local cam: GuCamera = { width = 1000, height = 500 }
+cam.m[0] = 1
+cam.m[5] = 1
+cam.m[11] = -1
+cam.m[13] = -1.6
+cam.m[15] = 6
+
+do
+  local ok, cx, cy, cz = world_camera_position(&cam)
+  assert(ok and near(cx, 0, 1e-4) and near(cy, 1.6, 1e-4) and near(cz, 6, 1e-4), 'camera position from the view-projection matrix')
+  print('camera position OK')
+end
+
+-- Presented pose ------------------------------------------------------------------
+local function camera_present(occ_depth: float32): WorldPresent
+  -- goal 1.6 yalms in front of the camera at the character's eye height
+  return WorldPresent{
+    vx = 0, vy = 1.6, vz = 6, gx = 0, gy = 1.6, gz = 4.4,
+    cam_x = 0, cam_y = 1.6, cam_z = 6,
+    fraction = 0.4, min_distance = 1.2, curve_relax = 0.5, margin = 0.35, occ_depth = occ_depth,
+  }
+end
+
+local function faces(p: WorldPlacement, x: float32, z: float32): float32
+  local dx, dz = x - p.x, z - p.z
+  local l = math.sqrt(dx * dx + dz * dz)
+  return (math.sin(p.yaw) * dx + math.cos(p.yaw) * dz) / l
+end
+
+local function bulge(p: WorldPlacement): float32
+  return p.curve * (1 - math.cos(p.width * 0.5 / p.ppm / p.curve))
+end
+
+do
+  local placed: WorldPlacement = { x = 1.5, y = 1.8, z = -2, yaw = 0.6, pitch = 0.2, width = 1800, height = 1040, ppm = 640, curve = 3, opacity = 0.9 }
+  -- character at z = 2 (well in front of the panel)
+  local pr = camera_present(world_depth(&cam, 0, 0.8, 2))
+  local same = world_present_pose(&cam, placed, &pr, 0)
+  assert(same.x == placed.x and same.z == placed.z and same.yaw == placed.yaw, 'blend 0 is the placement')
+  local p = world_present_pose(&cam, placed, &pr, 1)
+  print('presented', p.x, p.y, p.z, 'yaw', p.yaw, 'curve', p.curve)
+  assert(dist3(p.x, p.y, p.z, 0, 1.6, 6) < dist3(placed.x, placed.y, placed.z, 0, 1.6, 6) - 1, 'presented pose is nearer the camera')
+  assert(faces(p, 0, 6) > 0.999, 'presented pose faces the camera')
+  assert(near(p.pitch, 0, 1e-4), 'presented pose stands upright')
+  assert(p.curve > placed.curve, 'presented pose is flatter')
+  assert(p.width == placed.width and p.ppm == placed.ppm, 'size is untouched')
+  assert(world_depth(&cam, p.x, p.y, p.z) - bulge(p) >= pr.occ_depth + pr.margin - 0.01, 'stays behind the character')
+  -- halfway through the ease it is halfway there
+  local h = world_present_pose(&cam, placed, &pr, 0.5)
+  assert(near(h.z, (placed.z + p.z) * 0.5, 0.01), 'blend moves linearly between the poses')
+
+  -- a character nearer the camera stops the panel at its depth
+  local pr2 = camera_present(world_depth(&cam, 0, 0.8, 1))
+  local q = world_present_pose(&cam, placed, &pr2, 1)
+  print('held behind the character at depth', world_depth(&cam, q.x, q.y, q.z), 'character', pr2.occ_depth)
+  assert(q.z < p.z - 0.05, 'moves less when the character is in the way')
+  assert(world_depth(&cam, q.x, q.y, q.z) - bulge(placed) >= pr2.occ_depth + pr2.margin - 0.01, 'never crosses the character depth')
+  assert(q.z > placed.z + 0.1, 'still floats part of the way')
+
+  -- a panel already in front of the character does not come any nearer, but turns
+  local front: WorldPlacement = placed
+  front.z = 3.5
+  local r = world_present_pose(&cam, front, &pr, 1)
+  assert(r.x == front.x and r.y == front.y and r.z == front.z, 'in front of the character: stays put')
+  assert(faces(r, 0, 6) > 0.999, 'in front of the character: still turns to the camera')
+
+  -- never nearer the camera than min_distance
+  local close: WorldPlacement = { x = 0, y = 1.6, z = 4, yaw = 0, width = 900, height = 500, ppm = 640 }
+  local pr3 = camera_present(0)
+  pr3.fraction = 1
+  pr3.min_distance = 1.9
+  local c = world_present_pose(&cam, close, &pr3, 1)
+  assert(dist3(c.x, c.y, c.z, 0, 1.6, 6) >= 1.9 - 0.01 and c.z > close.z, 'min distance to the camera')
+  print('present camera OK')
+end
+
+-- walk-up: the goal is the spot the character walks to, 1.8 yalms before the panel
+do
+  local placed: WorldPlacement = { x = 0, y = 1.8, z = -2, yaw = math.pi, width = 1800, height = 1040, ppm = 640 }
+  local pr: WorldPresent = {
+    vx = 0, vy = 1.6, vz = -0.2, gx = 0, gy = 1.6, gz = -0.2,
+    cam_x = 0, cam_y = 1.6, cam_z = 6,
+    fraction = 0.4, min_distance = 1.2, curve_relax = 0.5, margin = 0.35, occ_depth = world_depth(&cam, 0, 0.8, 3),
+  }
+  local p = world_present_pose(&cam, placed, &pr, 1)
+  print('walk-up presented', p.x, p.y, p.z, 'yaw', p.yaw)
+  assert(p.z > placed.z + 0.5, 'floats toward the approach point')
+  assert(dist3(p.x, p.y, p.z, 0, 1.6, -0.2) >= 1.2 - 0.01, 'never nearer where the character will stand than min_distance')
+  assert(faces(p, 0, -0.2) > 0.999, 'turns to face the character (it was facing away)')
+  print('present walk-up OK')
+end
+
+-- Ease ------------------------------------------------------------------------------
+do
+  local function run(fps: integer, seconds: float32, target: float32, x0: float32): float32
+    local x, v = x0, (@float32)(0)
+    local frames = (@integer)(seconds * fps + 0.5)
+    for _ = 1, frames do
+      local nx, nv = world_ease(x, v, target, (@float32)(1.0 / fps), 0.35)
+      assert(nx <= 1.0001 and nx >= -0.0001, 'critically damped: no overshoot')
+      if target > x0 then assert(nx >= x - 1e-6, 'monotonic toward the target') end
+      x, v = nx, nv
+    end
+    return x
+  end
+  local early = run(60, 0.1, 1, 0)
+  assert(early > 0.2 and early < 0.9, 'eases in, not a jump')
+  assert(run(60, 0.35, 1, 0) > 0.97, 'settles in about 0.35 s')
+  assert(math.abs(run(30, 0.2, 1, 0) - run(120, 0.2, 1, 0)) < 0.002, 'same motion at any frame rate')
+  assert(run(60, 0.35, 0, 1) < 0.03 and run(60, 0.8, 0, 1) == 0, 'floats back and comes to rest')
+  print('ease OK')
+end
+
+-- Title buttons -------------------------------------------------------------------
+do
+  local w: float32 = 1800
+  assert(world_title_button(w, 1790, 10) == WORLD_BUTTON_CLOSE)
+  assert(world_title_button(w, 1750, 10) == WORLD_BUTTON_FULL)
+  assert(world_title_button(w, 1720, 10) == WORLD_BUTTON_POPIN)
+  assert(world_title_button(w, 1680, 10) == WORLD_BUTTON_OCCLUDED, 'fourth button left of pop-in')
+  assert(world_title_button(w, 1650, 10) == WORLD_BUTTON_NONE, 'nothing left of the buttons')
+  assert(world_title_button(w, 1790, 40) == WORLD_BUTTON_NONE, 'below the title row')
+  assert(world_title_button(w, 1790, -1) == WORLD_BUTTON_NONE, 'above the panel')
+  assert(world_title_button(w, 1801, 10) == WORLD_BUTTON_NONE, 'right of the panel')
+  -- each drawn square sits inside its own hit column, clear of its neighbours
+  for b = WORLD_BUTTON_CLOSE, WORLD_BUTTON_OCCLUDED do
+    local x = world_title_button_x(w, b)
+    assert(world_title_button(w, x + 1, 5) == b and world_title_button(w, x + 25, 25) == b, 'square hits its own button')
+    assert(world_title_button(w, x + 13, 13) == b, 'square centre hits its own button')
+  end
+  assert(world_title_button_x(w, WORLD_BUTTON_CLOSE) == w - 30 and world_title_button_x(w, WORLD_BUTTON_POPIN) == w - 98, 'existing buttons keep their places')
+  print('title buttons OK')
+end
+
+-- Wake fade ---------------------------------------------------------------------
+do
+  assert(world_wake_fade(0, 50, 0.25) == 1, 'never slept: fully shown')
+  assert(world_wake_fade(10, 10, 0.25) == 0, 'just woke: hidden')
+  assert(near(world_wake_fade(10, 10.125, 0.25), 0.5, 1e-3), 'halfway at 0.125 s')
+  assert(world_wake_fade(10, 10.25, 0.25) == 1 and world_wake_fade(10, 12, 0.25) == 1, 'fully in after 0.25 s')
+  local last: float32 = 0
+  for k = 0, 25 do
+    local f = world_wake_fade(10, 10 + k * 0.01, 0.25)
+    assert(f >= last, 'fades in monotonically')
+    last = f
+  end
+  print('wake fade OK')
+end
+
+-- Walk-up state machine -----------------------------------------------------------
+local function walk_input(now: float64, x: float32, z: float32, rotation: float32): WorldWalkInput
+  return WorldWalkInput{
+    now = now, dt = 1.0 / 60, focus_id = 7, found = true,
+    x = x, z = z, rotation = rotation,
+    approach = 1.8, max_seconds = 3, turn_speed = 8, stuck_seconds = 0.5,
+  }
+end
+
+do -- turn first, then walk, then arrive and let go
+  local w: WorldWalk
+  world_walk_start(&w, 7, 0, 0, 0, 0, 10)
+  local x: float32, z: float32, rot: float32 = 0, 0, math.pi / 2
+  local now: float64 = 0
+  local st = world_walk_step(&w, walk_input(now, x, z, rot))
+  assert(st.turn and not st.hold, 'facing away: turn before walking')
+  local held_frames, released = 0, false
+  for _ = 1, 400 do
+    now = now + 1.0 / 60
+    if st.turn then rot = st.rotation end
+    if st.hold then
+      held_frames = held_frames + 1
+      x, z = x + math.sin(rot) * 0.1, z + math.cos(rot) * 0.1
+    end
+    st = world_walk_step(&w, walk_input(now, x, z, rot))
+    if st.release then released = true break end
+  end
+  print('walked to', x, z, 'in', now, 's')
+  assert(held_frames > 0 and released and w.id == 0 and w.ended == WORLD_WALK_ARRIVED, 'arrives and releases the key')
+  assert(math.sqrt(x * x + (10 - z) ^ 2) <= 1.8 + 0.11, 'stops within the approach distance')
+end
+
+-- one walk already under way (facing the panel, key held)
+local function walking(w: *WorldWalk): void
+  world_walk_start(w, 7, 0, 0, 0, 0, 10)
+  local st = world_walk_step(w, walk_input(0, 0, 0, 0))
+  assert(st.hold, 'facing the panel: walks at once')
+end
+
+do
+  local w: WorldWalk
+  walking(&w)
+  local inp = walk_input(0.1, 0, 0.3, 0)
+  inp.user_input = true
+  local st = world_walk_step(&w, inp)
+  assert(st.release and not st.hold and w.ended == WORLD_WALK_USER_INPUT, 'player input stops it')
+  st = world_walk_step(&w, walk_input(0.2, 0, 0.3, 0))
+  assert(not st.hold and not st.release and not st.turn, 'stays stopped (never walks back)')
+
+  walking(&w)
+  inp = walk_input(0.1, 0, 0.3, 0)
+  inp.focus_id = 8
+  st = world_walk_step(&w, inp)
+  assert(st.release and w.ended == WORLD_WALK_FOCUS_LOST, 'losing focus stops it')
+
+  walking(&w)
+  inp = walk_input(0.1, 0, 0.3, 0)
+  inp.in_combat = true
+  st = world_walk_step(&w, inp)
+  assert(st.release and w.ended == WORLD_WALK_COMBAT, 'combat stops it')
+
+  walking(&w)
+  inp = walk_input(0.1, 0, 0.3, 0)
+  inp.mounted = true
+  st = world_walk_step(&w, inp)
+  assert(st.release and w.ended == WORLD_WALK_MOUNTED, 'mounting stops it')
+
+  -- blocked by a wall: no ground covered for 0.5 s
+  walking(&w)
+  st = world_walk_step(&w, walk_input(0.4, 0, 0, 0))
+  assert(st.hold, 'not stuck yet at 0.4 s')
+  st = world_walk_step(&w, walk_input(0.6, 0, 0, 0))
+  assert(st.release and w.ended == WORLD_WALK_STUCK, 'stuck against a wall stops it')
+
+  -- slow progress that never arrives
+  walking(&w)
+  local t: float64 = 0
+  local zz: float32 = 0
+  repeat
+    t = t + 0.1
+    zz = zz + 0.06
+    st = world_walk_step(&w, walk_input(t, 0, zz, 0))
+  until not st.hold
+  assert(st.release and w.ended == WORLD_WALK_TIMEOUT and t > 3 and t < 3.2, 'gives up after max_seconds')
+
+  -- moving away (e.g. camera-relative movement)
+  walking(&w)
+  st = world_walk_step(&w, walk_input(0.1, 0, -1.2, 0))
+  assert(st.release and w.ended == WORLD_WALK_WRONG_WAY, 'going the wrong way stops it')
+
+  -- already there: nothing to hold, nothing to release
+  world_walk_start(&w, 7, 0, 0, 9, 0, 10)
+  st = world_walk_step(&w, walk_input(0, 0, 9, 0))
+  assert(not st.hold and not st.release and w.ended == WORLD_WALK_ARRIVED, 'already close enough')
+
+  -- cancelling reports whether the key was down
+  walking(&w)
+  assert(world_walk_stop(&w, WORLD_WALK_CANCELLED) and w.id == 0 and w.ended == WORLD_WALK_CANCELLED, 'cancel while holding releases')
+  assert(not world_walk_stop(&w, WORLD_WALK_CANCELLED), 'cancel when idle does nothing')
+  print('walk OK')
+end
+
+-- Tuning and walkability from lua/world.lua ---------------------------------------
+do
+  local d = world_read_tuning(nilptr)
+  assert(d.present and near(d.present_fraction, 0.4, 1e-4) and near(d.walk_approach, 1.8, 1e-4), 'defaults without Lua')
+  local function fake_object(which: cint, id: uint64, out: *GuObject): cint
+    $out = { x = 10, y = 0, z = 20, rotation = 0, entity_id = 7, territory = 132, found = 1 }
+    return 1
+  end
+  world_host.get_object = fake_object
+  local root: string = arg[1]
+  assert(policy_load(root), policy.error)
+  local t = world_read_tuning(policy.L)
+  assert(not t.present and t.walk and near(t.full_screen, 0.62, 1e-4) and near(t.present_ease, 0.35, 1e-4) and near(t.present_min_distance, 1.2, 1e-4)
+    and near(t.walk_max_seconds, 3, 1e-4), 'lua/world.lua tuning read (single click does not float by default)')
+  assert(luaL_loadstring(policy.L, 'CONFIG.world.present.fraction = 0.6 CONFIG.world.walk.enabled = false') == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  t = world_read_tuning(policy.L)
+  assert(near(t.present_fraction, 0.6, 1e-4) and not t.walk, 'changed settings are read the next frame')
+  assert(lua_gettop(policy.L) == 0, 'reading tuning leaves the Lua stack balanced')
+  local e = policy_world_command(1, 'here')
+  assert(#e == 0, e)
+  e = policy_world_command(2, 'pet')
+  assert(#e == 0, e)
+  e = policy_world_command(3, 'me')
+  assert(#e == 0, e)
+  assert(world_lua_walkable(policy.L, 1), 'a pin in the world is walkable')
+  assert(not world_lua_walkable(policy.L, 2), 'a pet moves with you: not walkable')
+  assert(not world_lua_walkable(policy.L, 3), 'a panel following you: not walkable')
+  assert(not world_lua_walkable(policy.L, 99), 'unknown terminal: not walkable')
+  assert(lua_gettop(policy.L) == 0, 'walkable leaves the Lua stack balanced')
+  print('tuning OK')
+end
+
+-- Steering through the game's walk input: no turning, the direction is
+-- relative to the reference heading (character facing or camera).
+do
+  local w: WorldWalk
+  world_walk_start(&w, 7, 0, 0, 0, 0, 10) -- panel straight ahead along +Z
+  local inp = walk_input(0, 0, 0, 0)
+  inp.turn_speed = 0
+  local st = world_walk_step(&w, inp)
+  assert(st.hold and not st.turn, 'steering mode sets off at once without turning')
+  local ok, left, fwd = world_walk_steer(&w, 0, 0, 0)
+  assert(ok and math.abs(left) < 1e-4 and math.abs(fwd - 1) < 1e-4, 'facing the panel: straight forward')
+  ok, left, fwd = world_walk_steer(&w, 0, 0, (@float32)(math.pi / 2)) -- facing +X
+  assert(ok and math.abs(left + 1) < 1e-4 and math.abs(fwd) < 1e-4, 'panel to the side: strafe toward it')
+  print('walk steer OK')
+end
+
+-- lua/world.lua per frame: no garbage -----------------------------------------------
+-- Three pets placed for 600 frames with the collector stopped: the placement
+-- tables, the player, the light and the pet order are all reused.
+do
+  local function fake_env(day: *float32, rain: *float32, weather: *uint8): cint
+    $day = 19 * 3600 $rain = 0.5 $weather = 7
+    return 1
+  end
+  world_host.get_environment = fake_env
+  local code: cstring = [[
+    local w = CONFIG.world
+    for id = 201, 203 do assert(w.command(id, 'pet') == nil) end
+    for f = 1, 5 do for id = 201, 203 do assert(w.place(id, 500 + f / 60, id == 202)) end end
+    collectgarbage('collect')
+    collectgarbage('stop')
+    local before = collectgarbage('count')
+    for f = 1, 600 do
+      local t = 501 + f / 60
+      for id = 201, 203 do assert(w.place(id, t, false)) end
+    end
+    local grew = collectgarbage('count') - before
+    collectgarbage('restart')
+    for id = 201, 203 do w.forget(id) end
+    print('placing 3 pets for 600 frames made KB', grew)
+    assert(grew < 64, 'placing pets makes garbage every frame')
+  ]]
+  assert(luaL_loadstring(policy.L, code) == LUA_OK, 'load')
+  if lua_pcall(policy.L, 0, 0, 0) ~= LUA_OK then
+    print(lua_tolstring(policy.L, -1, nilptr))
+    assert(false, 'pets without garbage')
+  end
+  world_host.get_environment = nilptr
+  print('world place garbage OK')
+end
+
+-- lua/world.lua persistence: written only when changed, through a swap, and
+-- without a pet's spring position or values that would not load back.
+do
+  local code: cstring = [[
+    local w = CONFIG.world
+    local path = (GHOSTTY_PLUGIN_DIR or '.') .. '/world-state.lua'
+    local real_open = io.open
+    local keep = nil -- other tests' saved layout, put back afterwards
+    local f = real_open(path, 'r')
+    if f then keep = f:read('a') f:close() end
+    assert(w.command(301, 'pet') == nil)
+    assert(w.command(302, 'here') == nil)
+    w.place(301, 700, true)
+    w.place(301, 700.1, true)
+    assert(w.anchors[301].x, 'the pet has a spring position')
+    local list = { { id = 301, agent = 9301, view = 'world', font_scale = 0 }, { id = 302, agent = 9302, view = 'world', font_scale = 0 } }
+    local writes = 0
+    io.open = function(p, mode)
+      if mode == 'w' then writes = writes + 1 end
+      return real_open(p, mode)
+    end
+    w.save_state(list)
+    w.save_state(list)
+    io.open = real_open
+    assert(writes == 1, 'an unchanged layout is not written again')
+    f = real_open(path, 'r')
+    local text = f:read('a')
+    f:close()
+    local pet = text:match('%[9301%] = {[^\n]*')
+    local pin = text:match('%[9302%] = {[^\n]*')
+    assert(pet and not pet:find('[{,] x = ') and not pet:find('[{,] z = ') and not pet:find('faced'), 'no pet spring state saved: ' .. tostring(pet))
+    assert(pin and pin:find('[{,] x = ') and pin:find('[{,] z = '), 'a pin keeps its position: ' .. tostring(pin))
+    assert(not real_open(path .. '.tmp', 'r'), 'the swap file is gone')
+    w.anchors[302].x = 1 / 0
+    w.anchors[302].y = 0 / 0
+    w.save_state(list)
+    local chunk, err = loadfile(path)
+    assert(chunk, err)
+    local saved = chunk()
+    assert(saved[9302] and saved[9302].z and saved[9302].x == nil, 'inf and nan are left out')
+    -- a failed write (disk full) leaves the saved file alone
+    f = real_open(path, 'r')
+    local good = f:read('a') f:close()
+    w.anchors[302].z = 5
+    io.open = function(p, mode)
+      local rf = real_open(p, mode)
+      if mode ~= 'w' or not rf then return rf end
+      return {
+        write = function(_, s) rf:write(s:sub(1, 8)) return nil, 'No space left on device' end,
+        close = function() return rf:close() end,
+      }
+    end
+    w.save_state(list)
+    io.open = real_open
+    f = real_open(path, 'r')
+    local after = f:read('a')
+    f:close()
+    assert(after == good, 'a short write does not replace the saved state')
+    assert(not real_open(path .. '.tmp', 'r'), 'the short swap file is removed')
+    w.save_state(list)
+    f = real_open(path, 'r')
+    after = f:read('a')
+    f:close()
+    assert(after ~= good and loadfile(path), 'the next good save still writes')
+    w.forget(301)
+    w.forget(302)
+    w._last_saved = nil
+    if keep then
+      f = real_open(path, 'w') f:write(keep) f:close()
+    else
+      os.remove(path)
+    end
+  ]]
+  assert(luaL_loadstring(policy.L, code) == LUA_OK, 'load')
+  if lua_pcall(policy.L, 0, 0, 0) ~= LUA_OK then
+    print(lua_tolstring(policy.L, -1, nilptr))
+    assert(false, 'world state persistence')
+  end
+  print('world state save OK')
+end
+
+-- CONFIG.world_pins ---------------------------------------------------------------
+-- Not before a character is loaded (retried once a second); a pin that cannot
+-- be placed (no target) is dropped without its freed session ending up in the
+-- world, and the pins after it still go in.
+do
+  local function no_player(which: cint, id: uint64, out: *GuObject): cint
+    $out = {}
+    return 1
+  end
+  local function player_only(which: cint, id: uint64, out: *GuObject): cint
+    $out = {}
+    if which == WORLD_PLAYER then $out = { x = 10, y = 0, z = 20, rotation = 0, entity_id = 7, territory = 132, found = 1 } end
+    return 1
+  end
+  host.api.get_object = no_player
+  world_host.get_object = no_player
+  assert(luaL_loadstring(policy.L, "CONFIG.world_pins = { 'me', 'target', 'me' }") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  assert(#policy.world_pins == 3 and #policy.profiles > 0)
+  apply_world_pins(100)
+  assert(not host.world_pins_done and #host.sessions == 0 and #host.world == 0, 'title screen: no sessions, tried again later')
+  host.api.get_object = player_only
+  world_host.get_object = player_only
+  apply_world_pins(100.5)
+  assert(#host.sessions == 0, 'retried once a second')
+  apply_world_pins(101)
+  assert(#host.world == 2 and #host.sessions == 2 and host.world_pins_done, 'the target pin is dropped, the ones around it kept')
+  assert(host.world[0] == host.sessions[0] and host.world[1] == host.sessions[1] and host.world_visible, 'the kept pins are the live sessions, shown')
+  local pok = policy_world_place(host.world[1].id, 0, false)
+  assert(pok, 'the pin after the dropped one is placed')
+  print('world pins OK')
+end
+
+-- draw_world on a fake ImGui ------------------------------------------------------
+-- A reversed-Z game camera behind the player at (10, 0, 20), looking along +Z
+-- (as in tests/test_depthpass.nelua); panels pinned in front of the player.
+local MAX_CMDS <comptime> = 4096
+local MAX_VERTS <comptime> = 400000
+local cmds: [MAX_CMDS]ImDrawCmd
+local verts: [MAX_VERTS]ImDrawVert
+local dl: ImDrawList
+local viewport: ImGuiViewport = { Size = { 2560, 1440 } }
+local io_state: ImGuiIO
+local now: float64 = 200
+local mouse_at: ImVec2 = { -5000, -5000 }
+local texts, focus_nil_calls, frame_count, diag_lines, diag_drawing = 0, 0, 0, 0, 0
+
+local function reset_list(): void
+  cmds[0] = { ClipRect = { 0, 0, 2560, 1440 } }
+  dl.CmdBuffer = { Size = 1, Capacity = MAX_CMDS, Data = (@*[0]ImDrawCmd)(&cmds) }
+  dl.VtxBuffer = { Size = 0, Capacity = MAX_VERTS, Data = (@*[0]ImDrawVert)(&verts) }
+end
+local function push_vert(p: ImVec2, col: uint32): void
+  assert(dl.VtxBuffer.Size < MAX_VERTS)
+  verts[dl.VtxBuffer.Size] = { pos = p, col = col }
+  dl.VtxBuffer.Size = dl.VtxBuffer.Size + 1
+  cmds[dl.CmdBuffer.Size - 1].ElemCount = cmds[dl.CmdBuffer.Size - 1].ElemCount + 1
+end
+local function quad(a: ImVec2, b: ImVec2, col: uint32): void
+  push_vert(a, col) push_vert(vec2(b.x, a.y), col) push_vert(b, col) push_vert(vec2(a.x, b.y), col)
+end
+local function fake_rect_filled(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint): void quad(a, b, col) end
+local function fake_rect(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint, th: float32): void quad(a, b, col) end
+local function fake_line(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, th: float32): void quad(a, b, col) end
+local function fake_triangle(l: *ImDrawList, a: ImVec2, b: ImVec2, c: ImVec2, col: uint32): void
+  push_vert(a, col) push_vert(b, col) push_vert(c, col)
+end
+local function fake_text(l: *ImDrawList, font: *ImFont, size: float32, pos: ImVec2, col: uint32, tb: cstring, te: cstring, ww: float32, clip: *ImVec4): void
+  texts = texts + 1
+  quad(pos, vec2(pos.x + 8, pos.y + 16), col)
+end
+local function fake_prim_reserve(l: *ImDrawList, idx: cint, vtx: cint): void end
+local function fake_prim_vtx(l: *ImDrawList, pos: ImVec2, uv: ImVec2, col: uint32): void push_vert(pos, col) end
+local function fake_uv(out: *ImVec2): void $out = vec2(0, 0) end
+local function fake_push_clip(l: *ImDrawList, a: ImVec2, b: ImVec2, intersect: boolean): void end
+local function fake_pop_clip(l: *ImDrawList): void end
+local function fake_calc(pOut: *ImVec2, font: *ImFont, size: float32, mw: float32, ww: float32, tb: cstring, te: cstring, rem: *cstring): void
+  $pOut = vec2(8, 16)
+end
+local function fake_bg(): *ImDrawList return &dl end
+local function fake_viewport(): *ImGuiViewport return &viewport end
+local function fake_mouse(out: *ImVec2): void $out = mouse_at end
+local function fake_false_flags(flags: cint): boolean return false end
+local function fake_want(want: boolean): void end
+local function fake_font(): *ImFont return nilptr end
+local function fake_font_size(): float32 return 16 end
+local function fake_time(): float64 return now end
+local function fake_io(): *ImGuiIO return &io_state end
+local function fake_clicked(button: cint, rep: boolean): boolean return false end
+local function fake_focus_nil(): void focus_nil_calls = focus_nil_calls + 1 end
+local function fake_frame_count(): cint return frame_count end
+local function fake_key_down(key: cint): boolean return false end
+local function fake_key_pressed(key: cint, rep: boolean): boolean return false end
+local function fake_set_clipboard(text: cstring): void end
+
+local function resolver(name: cstring): pointer
+  local n: string = name
+  if n == 'ImDrawList_AddRectFilled' then return (@pointer)(fake_rect_filled) end
+  if n == 'ImDrawList_AddRect' then return (@pointer)(fake_rect) end
+  if n == 'ImDrawList_AddLine' then return (@pointer)(fake_line) end
+  if n == 'ImDrawList_AddTriangleFilled' then return (@pointer)(fake_triangle) end
+  if n == 'ImDrawList_AddText_FontPtr' then return (@pointer)(fake_text) end
+  if n == 'ImDrawList_PrimReserve' then return (@pointer)(fake_prim_reserve) end
+  if n == 'ImDrawList_PrimVtx' then return (@pointer)(fake_prim_vtx) end
+  if n == 'igGetFontTexUvWhitePixel' then return (@pointer)(fake_uv) end
+  if n == 'ImDrawList_PushClipRect' then return (@pointer)(fake_push_clip) end
+  if n == 'ImDrawList_PopClipRect' then return (@pointer)(fake_pop_clip) end
+  if n == 'ImFont_CalcTextSizeA' then return (@pointer)(fake_calc) end
+  if n == 'igGetBackgroundDrawList_Nil' then return (@pointer)(fake_bg) end
+  if n == 'igGetMainViewport' then return (@pointer)(fake_viewport) end
+  if n == 'igGetMousePos' then return (@pointer)(fake_mouse) end
+  if n == 'igIsWindowHovered' then return (@pointer)(fake_false_flags) end
+  if n == 'igSetNextFrameWantCaptureMouse' then return (@pointer)(fake_want) end
+  if n == 'igSetNextFrameWantCaptureKeyboard' then return (@pointer)(fake_want) end
+  if n == 'igGetFont' then return (@pointer)(fake_font) end
+  if n == 'igGetFontSize' then return (@pointer)(fake_font_size) end
+  if n == 'igGetTime' then return (@pointer)(fake_time) end
+  if n == 'igGetIO' then return (@pointer)(fake_io) end
+  if n == 'igIsMouseClicked' then return (@pointer)(fake_clicked) end
+  if n == 'igSetWindowFocus_Nil' then return (@pointer)(fake_focus_nil) end
+  if n == 'igGetFrameCount' then return (@pointer)(fake_frame_count) end
+  if n == 'igIsKeyDown' then return (@pointer)(fake_key_down) end
+  if n == 'igIsKeyPressed' then return (@pointer)(fake_key_pressed) end
+  if n == 'igSetClipboardText' then return (@pointer)(fake_set_clipboard) end
+  return nilptr
+end
+
+local function fake_camera(c: *GuCamera): cint
+  -- reversed Z, infinite far plane, near 0.1, FoV 0.78, eye at (10, 1.7, 15)
+  $c = { width = 2560, height = 1440 }
+  local f = 1 / math.tan(0.78 / 2)
+  local a = f * 1440 / 2560
+  c.m[0] = -a
+  c.m[5] = f
+  c.m[11] = 1
+  c.m[12] = 10 * a
+  c.m[13] = -1.7 * f
+  c.m[15] = -15
+  c.m[14] = 0.1
+  return 1
+end
+local function game_player(which: cint, id: uint64, out: *GuObject): cint
+  $out = {}
+  if which == WORLD_PLAYER then
+    $out = { x = 10, y = 0, z = 20, rotation = 0, entity_id = 7, territory = 132, found = 1, height = 1.7, hitbox_radius = 0.5 }
+  end
+  return 1
+end
+local cam_h: float32, cam_v: float32, cam_d: float32 = 0, 0.3, 2
+local function fake_get_cam_state(h: *float32, v: *float32, d: *float32, dmin: *float32): cint
+  $h, $v, $d, $dmin = cam_h, cam_v, cam_d, 1.5
+  return 1
+end
+local function fake_set_cam_state(h: float32, v: float32, d: float32): cint
+  cam_h, cam_v, cam_d = h, v, d
+  return 1
+end
+local function capture_log(level: cint, msg: cstring): void
+  local m: string = msg
+  if m:find('panels:', 1, true) > 0 then
+    diag_lines = diag_lines + 1
+    if m:find('drawing at', 1, true) > 0 then diag_drawing = diag_drawing + 1 end
+  end
+end
+
+local keys_held = false -- W A S D as the fake keyboard holds them
+local function fake_keys(): boolean return keys_held end
+
+local function world_frame(press: boolean): void
+  reset_list()
+  now = now + 1.0 / 60
+  frame_count = frame_count + 1
+  host.lmb_pressed, host.lmb_down = press, press
+  draw_world(now)
+end
+
+-- panel pixel (u, v) of terminal `id` on the screen
+local function panel_screen(id: integer, u: float32, v: float32): ImVec2
+  local ok, pl = policy_world_place(id, now, host.world_focus == id)
+  assert(ok)
+  local b = world_basis(pl)
+  local x, y, z = world_point(&b, u, v)
+  local cam: GuCamera
+  fake_camera(&cam)
+  local pok, sx, sy = world_project(&cam, x, y, z)
+  assert(pok)
+  return vec2(sx, sy)
+end
+
+local function new_panel(pin: string): *Session
+  local s = session_new(0, 80, 24)
+  assert(s ~= nilptr)
+  local e = policy_world_command(s.id, pin)
+  assert(#e == 0, e)
+  s.appear = 1
+  host.world:push(s)
+  return s
+end
+
+do
+  while #host.world > 0 do close_terminal(host.world[0]) end
+  assert(#host.sessions == 0)
+  assert(imgui_bind(resolver, nilptr) > 0)
+  host.api.log = capture_log
+  host.api.get_camera = fake_camera
+  host.api.get_object = game_player
+  world_host.get_object = game_player
+  host.api.get_camera_state = fake_get_cam_state
+  host.api.set_camera_state = fake_set_cam_state
+  assert(luaL_loadstring(policy.L, "CONFIG.world.occlusion = 'off'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  host.world_visible, host.world_rez, host.world_last_time = true, 1, now
+
+  -- Camera ------------------------------------------------------------------------
+  -- closing the full-screen panel (the last one) still gives the zoom back
+  host.world_full_id = 0
+  host.cam_saved_d = 12
+  host.cam_active = true
+  for _ = 1, 120 do world_frame(false) end
+  assert(not host.cam_restore and host.cam_saved_d == 0 and near(cam_d, 12, 0.06), 'zoom restored with no panels left')
+  -- steering toward a panel: turning the camera yourself takes it over
+  cam_h, cam_d = 0, 5
+  host.cam_target_h, host.cam_target_v, host.cam_target_d = 1.2, 0.3, 5
+  host.cam_active = true
+  world_frame(false)
+  world_frame(false)
+  assert(host.cam_active and cam_h > 0.1, 'eases toward the panel')
+  cam_h = cam_h - 0.4
+  local held = cam_h
+  world_frame(false)
+  assert(not host.cam_active and cam_h == held, 'turning the camera yourself takes it over')
+  host.cam_active = true
+  for _ = 1, 240 do world_frame(false) end
+  assert(not host.cam_active and near(cam_h, 1.2, 0.02), 'left alone, it arrives')
+  print('world camera OK')
+
+  -- Clicks: an unfocused panel only takes focus ---------------------------------------
+  local s = new_panel('here')
+  diag_lines, diag_drawing = 0, 0
+  world_frame(false)
+  mouse_at = panel_screen(s.id, 400, 300)
+  host.world_focus = 0
+  world_frame(true)
+  assert(host.world_focus == s.id and focus_nil_calls == 1, 'a click focuses the panel and takes focus from ImGui windows')
+  assert(not s.sel.dragging, 'the focusing press does not start a selection')
+  world_frame(false)
+  now = now + 0.5 -- not a double click
+  world_frame(true)
+  assert(s.sel.dragging, 'a press on the focused panel selects')
+  world_frame(false)
+  assert(not s.sel.dragging)
+  host.world_focus = 0
+  now = now + 0.5
+  mouse_at = panel_screen(s.id, 1790, 1030)
+  world_frame(true)
+  assert(host.world_drag_id == 0 and host.world_focus == s.id, 'the resize grip of an unfocused panel only focuses it')
+  world_frame(false)
+  now = now + 0.5
+  world_frame(true)
+  assert(host.world_drag_id == s.id, 'the grip of the focused panel resizes')
+  world_frame(false)
+  assert(host.world_drag_id == 0)
+  mouse_at = vec2(-5000, -5000)
+  print('world clicks OK')
+
+  -- The log: one line while nothing changes -------------------------------------------
+  for _ = 1, 10 do world_frame(false) end
+  assert(diag_lines == 1 and diag_drawing == 1, 'the world summary is logged once, with the first drawn panel')
+
+  -- Tuning: read from Lua twice a second, not every frame -----------------------------
+  local function set_walk(on: boolean): void
+    assert(luaL_loadstring(policy.L, on and 'CONFIG.world.walk.enabled = true' or 'CONFIG.world.walk.enabled = false') == LUA_OK
+      and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  end
+  set_walk(not host.world_tuning.walk)
+  local want = not host.world_tuning.walk
+  local read_frames = 0
+  while host.world_tuning.walk ~= want do
+    world_frame(false)
+    read_frames = read_frames + 1
+    assert(read_frames <= 31, 'a settings change applies within half a second')
+  end
+  set_walk(not want)
+  world_frame(false)
+  assert(host.world_tuning.walk == want, 'not read again the very next frame')
+  now = now + 0.5
+  world_frame(false)
+  assert(host.world_tuning.walk ~= want, 'read again half a second later')
+  print('world tuning OK')
+
+  -- Level of detail: text too small to read is not drawn -----------------------------
+  host.world_focus = 0
+  local far = new_panel('at 0 60 1.7')
+  world_frame(false)
+  assert(diag_lines == 2, 'a new panel logs a new summary')
+  assert(far.cell_h > 0, 'drawn once to measure its cells')
+  local e = policy_world_command(far.id, 'hide')
+  e:destroy()
+  texts = 0
+  world_frame(false)
+  local near_only = texts
+  assert(near_only > 0, 'the near panel draws its text')
+  e = policy_world_command(far.id, 'hide off')
+  e:destroy()
+  texts = 0
+  world_frame(false)
+  assert(texts == near_only, 'the far panel draws no text')
+  host.world_focus = far.id
+  texts = 0
+  world_frame(false)
+  assert(texts > near_only, 'the far panel draws its text while focused')
+  host.world_focus = 0
+  print('world level of detail OK')
+
+  -- Walking: WASD typed into a focused terminal is text, not the player walking ------
+  local real_keys = world_movement_keys
+  world_movement_keys = fake_keys
+  keys_held = true
+  host.world_focus = s.id
+  host.drop_focus, host.walk_user_moved = false, false
+  host.terminal_focused = true
+  world_walk_start(&host.walk, s.id, now, 10, 20, 10, 40)
+  world_frame(false)
+  assert(host.walk.id == s.id, 'keys held while a terminal has focus: still walking')
+  host.terminal_focused = false
+  world_walk_start(&host.walk, s.id, now, 10, 20, 10, 40)
+  world_frame(false)
+  assert(host.walk.id == 0 and host.walk.ended == WORLD_WALK_USER_INPUT, 'keys held with no terminal focused: the player moved, the walk ends')
+  keys_held = false
+  world_movement_keys = real_keys
+  host.world_focus = 0
+  print('world walk keys OK')
+
+  -- Sleeping unseen ------------------------------------------------------------------
+  s.kind = TransportKind.Agent
+  s.agent = &host.agent
+  s.agent_id = 77
+  s.exited, s.awaiting_open, s.run_occluded = false, false, false
+  s.last_seen = now - 5
+  sleep_unseen(now)
+  assert(not s.sleeping, 'unseen for 5 s: still running (a camera turn does not rebuild it)')
+  s.last_seen = now - 31
+  s:feed_text('\27[?1049h')
+  sleep_unseen(now)
+  assert(not s.sleeping, 'a full-screen program stays awake: a replay would lose its modes')
+  s:feed_text('\27[?1049l')
+  sleep_unseen(now)
+  assert(s.sleeping, 'unseen for 30 s: sleeps')
+  print('world sleep OK')
+end
