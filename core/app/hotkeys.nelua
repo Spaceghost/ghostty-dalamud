@@ -1,0 +1,69 @@
+
+
+-- Input the game does not hand to ImGui: the toggle keys (Win32 key state),
+-- the controller button gestures.
+require 'core.app.worldview'
+
+-- Global hotkey while the drop-down is not focused.
+global function poll_toggle_key(): void
+  local pressed = false
+  -- While a terminal has focus the key arrives as an ImGui key event and
+  -- key_action (terminal.nelua) matches it against the same toggle chords
+  -- (which also keeps it out of the shell), so only poll when no terminal is
+  -- focused.
+  ## if ccinfo.is_windows then
+    -- ImGui never sees non-modifier key presses unless some ImGui text input
+    -- is active (Dalamud forwards them to the game instead), so ask Win32.
+    local vk = (@cint)(policy.toggle_consume_vk)
+    if vk > 0 then
+      local down = (GetAsyncKeyState(vk) & 0x8000) ~= 0
+      if down and not host.toggle_vk_down and not host.terminal_focused then
+        local pid: uint32 = 0
+        GetWindowThreadProcessId(GetForegroundWindow(), &pid)
+        local shift = (GetAsyncKeyState(0x10) & 0x8000) ~= 0
+        local ctrl = (GetAsyncKeyState(0x11) & 0x8000) ~= 0
+        local alt = (GetAsyncKeyState(0x12) & 0x8000) ~= 0
+        if pid == GetCurrentProcessId() then
+          if ctrl == policy.toggle_ctrl and shift == policy.toggle_shift and alt == policy.toggle_alt then
+            pressed = true
+          elseif ctrl == policy.world_toggle_ctrl and shift == policy.world_toggle_shift and alt == policy.world_toggle_alt then
+            toggle_world()
+          end
+        end
+      end
+      host.toggle_vk_down = down
+    end
+  ## else
+    if host.toggle_imkey ~= ImGuiKey_None and not host.terminal_focused then
+      local io = imgui.GetIO()
+      if not io.KeySuper and imgui.IsKeyPressed(host.toggle_imkey, false) then
+        if io.KeyCtrl == policy.toggle_ctrl and io.KeyShift == policy.toggle_shift and io.KeyAlt == policy.toggle_alt then
+          pressed = true
+        elseif io.KeyCtrl == policy.world_toggle_ctrl and io.KeyShift == policy.world_toggle_shift and io.KeyAlt == policy.world_toggle_alt then
+          toggle_world()
+        end
+      end
+    end
+  ## end
+  if policy.toggle_gamepad_mask ~= 0 then
+    if host.api.gamepad_down ~= nilptr then
+      -- tap: show/hide the dropdown; hold: next terminal; double tap: previous
+      local down = host.api.gamepad_down((@cint)(policy.toggle_gamepad_mask)) ~= 0
+      local ev = pad_gesture_update(&host.pad, down, imgui.GetTime())
+      if ev == PadGesture.Tap then pressed = true
+      elseif ev == PadGesture.HoldStep then select_terminal(1)
+      elseif ev == PadGesture.DoubleTap then select_terminal(-1) end
+    elseif host.api.gamepad_pressed ~= nilptr and host.api.gamepad_pressed((@cint)(policy.toggle_gamepad_mask)) ~= 0 then
+      pressed = true
+    end
+  end
+  if pressed then toggle_visible() end
+end
+
+global function resolve_toggle_key(): void
+  host.toggle_imkey = ImGuiKey_None
+  for i = 0, < input_key_count() do
+    local k = input_key(i)
+    if k.name == policy.toggle_key then host.toggle_imkey = k.imkey break end
+  end
+end

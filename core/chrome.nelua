@@ -1,0 +1,307 @@
+-- Glass chrome for the dropdown and floating windows: the maths behind the
+-- look (gradient, world-light tint, glow falloff, easing, tab layout), the
+-- icon buttons and what each one does by id, and the icon glyphs. Where the
+-- chrome sits and what the buttons act on lives in core/app/dropdown.nelua.
+require 'math'
+require 'string'
+require 'core.imgui'
+require 'core.world'
+
+-- Colours ------------------------------------------------------------------------
+
+-- The panels' gold accent and ink (core/app/worldview.nelua).
+global CHROME_GOLD: uint32 <comptime> = 0xFF5AA0C8   -- im_col32(200, 160, 90, 255)
+global CHROME_INK: uint32 <comptime> = 0xFFDCE6F0    -- im_col32(240, 230, 220, 255)
+global CHROME_INK_DIM: uint32 <comptime> = 0xFFA0A5AA -- im_col32(170, 165, 160, 255)
+global CHROME_INK_FAINT: uint32 <comptime> = 0xFF707478 -- im_col32(120, 116, 112, 255)
+
+local function mix(a: float32, b: float32, t: float32): float32 return a + (b - a) * t end
+local function channel(c: uint32, shift: uint32): float32 return (@float32)((c >> shift) & 0xFF) end
+local function byte(v: float32): uint32 return (@uint32)(math.clamp(v + 0.5, 0, 255)) end
+
+global function chrome_rgba(r: float32, g: float32, b: float32, a: float32): uint32
+  return byte(r) | (byte(g) << 8) | (byte(b) << 16) | (byte(a) << 24)
+end
+
+-- Straight blend of two colours, alpha included; `t` is clamped to 0..1.
+global function chrome_lerp(a: uint32, b: uint32, t: float32): uint32
+  t = math.clamp(t, 0, 1)
+  return chrome_rgba(mix(channel(a, 0), channel(b, 0), t), mix(channel(a, 8), channel(b, 8), t),
+    mix(channel(a, 16), channel(b, 16), t), mix(channel(a, 24), channel(b, 24), t))
+end
+
+-- Multiply the colour channels (alpha kept), as world light does to a panel.
+global function chrome_tint(c: uint32, r: float32, g: float32, b: float32): uint32
+  return chrome_rgba(channel(c, 0) * r, channel(c, 8) * g, channel(c, 16) * b, channel(c, 24))
+end
+
+global function chrome_fade_alpha(c: uint32, k: float32): uint32
+  return (c & 0x00FFFFFF) | (byte(channel(c, 24) * math.clamp(k, 0, 1)) << 24)
+end
+
+-- World light ------------------------------------------------------------------------
+
+-- The world's light as the chrome takes it from CONFIG.world.lighting():
+-- `strength` 0 keeps the chrome's own colours, 1 matches a world panel.
+global ChromeLight = @record{ r: float32, g: float32, b: float32, backlight: float32 }
+
+global function chrome_light(r: float32, g: float32, b: float32, backlight: float32, strength: float32): ChromeLight
+  local s = math.clamp(strength, 0, 1)
+  return ChromeLight{ r = mix(1, r, s), g = mix(1, g, s), b = mix(1, b, s), backlight = math.clamp(backlight, 0, 1) * s }
+end
+
+global ChromePalette = @record{
+  body_top: uint32, body_bottom: uint32,  -- the body's vertical gradient
+  edge_top: uint32, edge_bottom: uint32,  -- inner edge highlight, catching the light from above
+  sheen: uint32,                          -- soft band across the top
+  rim: uint32,                            -- dark hairline that holds the edge against bright scenes
+  glow: uint32,                           -- outer glow (alpha comes from chrome_glow_ring)
+  pill: uint32, pill_hover: uint32,       -- active and hovered tab / button fills
+}
+
+-- Colours for a body at `opacity`. Glass is lighter and a touch clearer at
+-- the top; flat is one even tone. The backlight lifts the body toward blue
+-- the way it lifts a world panel's background.
+global function chrome_palette(opacity: float32, glass: boolean, light: ChromeLight): ChromePalette
+  local a = math.clamp(opacity, 0, 1) * 255
+  local bl = light.backlight
+  local lr, lg, lb = 16 * bl, 18 * bl, 24 * bl
+  local p: ChromePalette
+  if glass then
+    p.body_top = chrome_rgba(34 + lr, 39 + lg, 50 + lb, a * 0.88)
+    p.body_bottom = chrome_rgba(10 + lr, 12 + lg, 17 + lb, a)
+    p.edge_top = chrome_rgba(255, 255, 255, 64)
+    p.edge_bottom = chrome_rgba(255, 255, 255, 8)
+    p.sheen = chrome_rgba(255, 255, 255, 16)
+  else
+    p.body_top = chrome_rgba(16 + lr, 18 + lg, 24 + lb, a)
+    p.body_bottom = p.body_top
+    p.edge_top = chrome_rgba(255, 255, 255, 14)
+    p.edge_bottom = p.edge_top
+    p.sheen = 0
+  end
+  p.body_top = chrome_tint(p.body_top, light.r, light.g, light.b)
+  p.body_bottom = chrome_tint(p.body_bottom, light.r, light.g, light.b)
+  p.edge_top = chrome_tint(p.edge_top, light.r, light.g, light.b)
+  p.edge_bottom = chrome_tint(p.edge_bottom, light.r, light.g, light.b)
+  p.sheen = chrome_tint(p.sheen, light.r, light.g, light.b)
+  p.rim = chrome_rgba(0, 0, 0, a * 0.45)
+  p.glow = chrome_rgba(90, 150, 220, 255) -- the panels' backlight blue
+  p.pill = chrome_tint(chrome_rgba(255, 255, 255, 26), light.r, light.g, light.b)
+  p.pill_hover = chrome_tint(chrome_rgba(255, 255, 255, 14), light.r, light.g, light.b)
+  return p
+end
+
+-- Ring `i` (1-based) of `n` stacked outward over `spread` pixels: its offset
+-- from the edge, width and alpha. Faint by day, it comes up with the
+-- backlight like a world panel's glow and falls off toward the outside.
+global function chrome_glow_ring(i: integer, n: integer, spread: float32, strength: float32, backlight: float32): (float32, float32, uint8)
+  if n < 1 then return 0, 0, 0 end
+  local w = spread / n
+  local falloff = 1 - (@float32)(i - 1) / n
+  local peak = math.clamp(strength, 0, 1) * (20 + 70 * math.clamp(backlight, 0, 1))
+  return w * ((@float32)(i) - 0.5), w, (@uint8)(byte(peak * falloff * falloff))
+end
+
+-- Recolour vertices `first`.. (drawn in white) with a vertical gradient from
+-- `top` at y0 to `bottom` at y1, keeping each vertex's own alpha so the
+-- antialiased fringe stays soft.
+global function chrome_shade_vertical(dl: *ImDrawList, first: cint, y0: float32, y1: float32, top: uint32, bottom: uint32): void
+  local h = y1 - y0
+  for i = first, < dl.VtxBuffer.Size do
+    local vert = &dl.VtxBuffer.Data[i]
+    local t: float32 = 0
+    if h > 0 then t = (vert.pos.y - y0) / h end
+    local c = chrome_lerp(top, bottom, t)
+    local a = ((c >> 24) & 0xFF) * ((vert.col >> 24) & 0xFF) // 255
+    vert.col = (c & 0x00FFFFFF) | (a << 24)
+  end
+end
+
+-- Fade vertices `first`.. out between x0 and x1 (gone past x1): a title too
+-- long for its tab trails off instead of being cut.
+global function chrome_fade_tail(dl: *ImDrawList, first: cint, x0: float32, x1: float32): void
+  if x1 <= x0 then return end
+  for i = first, < dl.VtxBuffer.Size do
+    local vert = &dl.VtxBuffer.Data[i]
+    if vert.pos.x > x0 then
+      vert.col = chrome_fade_alpha(vert.col, (x1 - vert.pos.x) / (x1 - x0))
+    end
+  end
+end
+
+-- Motion ------------------------------------------------------------------------------
+
+-- The dropdown's slide: critically damped toward `target` (0 hidden, 1
+-- shown), settling in `ms` and landing exactly on it. A reversal mid-slide
+-- never carries it past either end.
+global function chrome_ease(x: float32, v: float32, target: float32, dt: float32, ms: float32): (float32, float32)
+  local nx, nv = world_ease(x, v, target, dt, ms / 1000)
+  if nx <= 0 then return 0, 0 end
+  if nx >= 1 then return 1, 0 end
+  return nx, nv
+end
+
+-- Whether the dropdown's terminal takes the keyboard. It follows intent, not
+-- the slide: the eased tail lands well after `animation_ms`, and keys typed
+-- once it looks open must not reach the game. Never while it slides away,
+-- nor on the frame the press that summoned it arrived.
+global function chrome_takes_keys(open: boolean, summoned_now: boolean): boolean
+  return open and not summoned_now
+end
+
+-- Opacity over the slide: in over the first part so the body never pops.
+global function chrome_fade(t: float32): float32
+  local x = math.clamp(t * 1.5, 0, 1)
+  return x * x * (3 - 2 * x)
+end
+
+-- Tab strip --------------------------------------------------------------------------
+
+-- A tab's natural width: its title plus `extra` (padding, dot, close), within limits.
+global function chrome_tab_width(text_w: float32, extra: float32, min_w: float32, max_w: float32): float32
+  return math.clamp(text_w + extra, min_w, max_w)
+end
+
+-- How much natural widths totalling `total` shrink so `count` tabs with
+-- `gap` between them fit `area` (1 when they already fit). Tabs never go
+-- below their minimum; past that the strip scrolls.
+global function chrome_tab_fit(total: float32, count: integer, area: float32, gap: float32): float32
+  if count <= 0 or total <= 0 then return 1 end
+  local room = area - gap * (count - 1)
+  if room >= total then return 1 end
+  return math.max(room, 0) / total
+end
+
+-- Scroll that brings [x0, x1] (strip coordinates) into view, within the content.
+global function chrome_scroll_to(scroll: float32, x0: float32, x1: float32, area: float32, content: float32): float32
+  if x1 - scroll > area then scroll = x1 - area end
+  if x0 - scroll < 0 then scroll = x0 end
+  return math.clamp(scroll, 0, math.max(content - area, 0))
+end
+
+-- While a tab is dragged: -1 or 1 once the pointer passes the middle of the
+-- neighbour on that side (swap with it), 0 to stay. Swapping unequal widths
+-- leaves the pointer short of the new neighbour's middle, so it never flips back.
+global function chrome_drag_swap(mouse_x: float32, index: integer, count: integer, prev_mid: float32, next_mid: float32): integer
+  if index > 0 and mouse_x < prev_mid then return -1 end
+  if index < count - 1 and mouse_x > next_mid then return 1 end
+  return 0
+end
+
+-- Buttons --------------------------------------------------------------------------
+
+global ChromeAction = @enum{
+  None = 0,
+  NewTab, Profiles, Window, Pin, Pet, Minimize, Settings, Hide, -- the tab bar
+  Dock, Close,                                                  -- a floating window's header
+}
+
+global ChromeIcon = @enum{ Plus = 0, Chevron, Window, Pin, Paw, Minimize, Gear, Hide, Dock, Close }
+
+global ChromeButton = @record{
+  id: string,
+  action: ChromeAction,
+  icon: ChromeIcon,
+  group: integer,   -- neighbours in another group sit further apart
+  tip: string,
+}
+
+global CHROME_TAB_BUTTONS <comptime> = 8
+global chrome_tab_buttons: [CHROME_TAB_BUTTONS]ChromeButton = {
+  { id = 'new', action = ChromeAction.NewTab, icon = ChromeIcon.Plus, group = 0, tip = 'New tab' },
+  { id = 'profiles', action = ChromeAction.Profiles, icon = ChromeIcon.Chevron, group = 0, tip = 'New tab from a profile' },
+  { id = 'window', action = ChromeAction.Window, icon = ChromeIcon.Window, group = 1, tip = 'Pop this tab out into a window' },
+  { id = 'pin', action = ChromeAction.Pin, icon = ChromeIcon.Pin, group = 1, tip = 'Pin this tab into the world where you stand' },
+  { id = 'pet', action = ChromeAction.Pet, icon = ChromeIcon.Paw, group = 1, tip = 'Let this tab float beside you as a pet' },
+  { id = 'min', action = ChromeAction.Minimize, icon = ChromeIcon.Minimize, group = 1, tip = 'Minimize this tab to the toolbar' },
+  { id = 'cfg', action = ChromeAction.Settings, icon = ChromeIcon.Gear, group = 2, tip = 'Settings' },
+  { id = 'hide', action = ChromeAction.Hide, icon = ChromeIcon.Hide, group = 2, tip = 'Hide the dropdown' },
+}
+
+global CHROME_WINDOW_BUTTONS <comptime> = 3
+global chrome_window_buttons: [CHROME_WINDOW_BUTTONS]ChromeButton = {
+  { id = 'dock', action = ChromeAction.Dock, icon = ChromeIcon.Dock, group = 0, tip = 'Back into the dropdown as a tab' },
+  { id = 'pet', action = ChromeAction.Pet, icon = ChromeIcon.Paw, group = 0, tip = 'Let it float beside you as a pet' },
+  { id = 'close', action = ChromeAction.Close, icon = ChromeIcon.Close, group = 1, tip = 'Close the terminal' },
+}
+
+-- The action behind a button id (tab bar first, then window headers).
+global function chrome_action(id: string): ChromeAction
+  for i = 0, < CHROME_TAB_BUTTONS do
+    if chrome_tab_buttons[i].id == id then return chrome_tab_buttons[i].action end
+  end
+  for i = 0, < CHROME_WINDOW_BUTTONS do
+    if chrome_window_buttons[i].id == id then return chrome_window_buttons[i].action end
+  end
+  return ChromeAction.None
+end
+
+-- Left edge of button `i` of a row of `n` square buttons ending at `right`.
+global function chrome_button_x(buttons: *[0]ChromeButton, n: integer, i: integer, right: float32, size: float32, gap: float32, group_gap: float32): float32
+  local x = right
+  for k = n - 1, i, -1 do
+    x = x - size
+    if k == i then break end
+    x = x - (buttons[k - 1].group ~= buttons[k].group and group_gap or gap)
+  end
+  return x
+end
+
+-- Button under (mx, my) in a row whose top is `top`, or -1.
+global function chrome_button_at(buttons: *[0]ChromeButton, n: integer, right: float32, top: float32, size: float32, gap: float32, group_gap: float32, mx: float32, my: float32): integer
+  if my < top or my >= top + size then return -1 end
+  for i = 0, < n do
+    local x = chrome_button_x(buttons, n, i, right, size, gap, group_gap)
+    if mx >= x and mx < x + size then return i end
+  end
+  return -1
+end
+
+-- Icons ---------------------------------------------------------------------------
+
+-- Draw `icon` centred on (cx, cy) in a button `size` pixels square.
+global function chrome_draw_icon(dl: *ImDrawList, icon: ChromeIcon, cx: float32, cy: float32, size: float32, col: uint32, hole: uint32): void
+  local r = size * 0.28
+  local t = math.max(size * 0.07, 1.5)
+  if icon == ChromeIcon.Plus then
+    imgui.DrawListAddLine(dl, vec2(cx - r, cy), vec2(cx + r, cy), col, t)
+    imgui.DrawListAddLine(dl, vec2(cx, cy - r), vec2(cx, cy + r), col, t)
+  elseif icon == ChromeIcon.Chevron or icon == ChromeIcon.Hide then
+    -- down: more below; up: slide away
+    local d: float32 = icon == ChromeIcon.Chevron and 1 or -1
+    local pts: [3]ImVec2 = { vec2(cx - r * 0.8, cy - r * 0.35 * d), vec2(cx, cy + r * 0.45 * d), vec2(cx + r * 0.8, cy - r * 0.35 * d) }
+    imgui.DrawListAddPolyline(dl, &pts[0], 3, col, 0, t)
+  elseif icon == ChromeIcon.Window then
+    imgui.DrawListAddRect(dl, vec2(cx - r, cy - r * 0.8), vec2(cx + r, cy + r * 0.8), col, 2, 0, t * 0.85)
+    imgui.DrawListAddRectFilled(dl, vec2(cx - r, cy - r * 0.8), vec2(cx + r, cy - r * 0.8 + t * 1.8), col, 2, ImDrawFlags_RoundCornersTop)
+  elseif icon == ChromeIcon.Pin then
+    imgui.DrawListAddTriangleFilled(dl, vec2(cx - r * 0.42, cy - r * 0.05), vec2(cx + r * 0.42, cy - r * 0.05), vec2(cx, cy + r), col)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy - r * 0.35), r * 0.6, col, 16)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy - r * 0.35), r * 0.24, hole, 12)
+  elseif icon == ChromeIcon.Paw then
+    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy + r * 0.38), r * 0.46, col, 16)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx - r * 0.72, cy - r * 0.08), r * 0.2, col, 10)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx - r * 0.27, cy - r * 0.55), r * 0.21, col, 10)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx + r * 0.27, cy - r * 0.55), r * 0.21, col, 10)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx + r * 0.72, cy - r * 0.08), r * 0.2, col, 10)
+  elseif icon == ChromeIcon.Minimize then
+    imgui.DrawListAddLine(dl, vec2(cx - r, cy + r * 0.55), vec2(cx + r, cy + r * 0.55), col, t * 1.1)
+  elseif icon == ChromeIcon.Gear then
+    -- a wheel with square teeth and a hole
+    for k = 0, < 8 do
+      local a = (@float32)(k) * (@float32)(math.pi) / 4
+      local ux, uy = (@float32)(math.cos(a)), (@float32)(math.sin(a))
+      imgui.DrawListAddLine(dl, vec2(cx + ux * r * 0.5, cy + uy * r * 0.5), vec2(cx + ux * r * 0.98, cy + uy * r * 0.98), col, r * 0.36)
+    end
+    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r * 0.7, col, 20)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r * 0.3, hole, 12)
+  elseif icon == ChromeIcon.Dock then
+    imgui.DrawListAddLine(dl, vec2(cx - r, cy - r * 0.85), vec2(cx + r, cy - r * 0.85), col, t)
+    imgui.DrawListAddLine(dl, vec2(cx, cy + r), vec2(cx, cy - r * 0.1), col, t)
+    imgui.DrawListAddTriangleFilled(dl, vec2(cx - r * 0.5, cy + r * 0.05), vec2(cx + r * 0.5, cy + r * 0.05), vec2(cx, cy - r * 0.5), col)
+  elseif icon == ChromeIcon.Close then
+    imgui.DrawListAddLine(dl, vec2(cx - r * 0.7, cy - r * 0.7), vec2(cx + r * 0.7, cy + r * 0.7), col, t)
+    imgui.DrawListAddLine(dl, vec2(cx + r * 0.7, cy - r * 0.7), vec2(cx - r * 0.7, cy + r * 0.7), col, t)
+  end
+end
