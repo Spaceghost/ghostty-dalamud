@@ -355,7 +355,7 @@ do
   lua([[assert(ghostty.open_url == nil and ghostty.host_info)
     local S, vote = CONFIG.settings, require('vote')
     S.values[vote.KEY] = nil
-    assert(vote.open(S) == false and S.badge(), 'the button logs instead')]])
+    assert(vote.open(S) == false and not S.badge(), 'the button logs the link and clears the badge')]])
   expect('', 'nothing opened')
   assert(vote_logs == 1, 'logged once, with the link')
   gu_shutdown()
