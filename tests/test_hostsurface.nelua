@@ -348,7 +348,7 @@ end
 -- A shim from before open_url: its smaller GuHostApi leaves ghostty.open_url nil --------------------
 do
   local old: GuHostApi = api
-  old.size = #GuHostApi - #pointer -- ends before open_url; the field past it is never read
+  old.size = (@usize)(&old.open_url) - (@usize)(&old) -- ends before open_url; fields past it are never read
   assert(gu_init_ex(&old, &info) == INIT_OK)
   expect(REGISTERED, 'an older shim registers the same')
   assert(host.api.open_url == nilptr, 'nothing copied past size')
