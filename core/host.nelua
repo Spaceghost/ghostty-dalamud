@@ -77,6 +77,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
       -- nothing runs per frame from here: let go of what the game still shows or does for us
       host.disabled_teardown = true
       teardown_effects()
+      dualsense_reader_close(&host.dualsense)
       host.world_focus = 0
       agent_hold_sessions() -- the connection goes unread from here on
     end
@@ -231,6 +232,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   showcase_stop() -- demo terminals never outlive the session; yours come back
   teardown_effects()
   depthpass_shutdown()
+  dualsense_reader_close(&host.dualsense) -- no handle or pending read may outlive this module
   -- Leave agent shells running so the next start reattaches to them.
   for i = 0, < #host.sessions do host.sessions[i].keep_on_agent = true end
   if host.layout_restored then save_world_state() end

@@ -13,14 +13,14 @@ local S = {}
 
 local ALIGN = { 'left', 'center', 'right' }
 local MODS = { 'ctrl', 'ctrl+shift', 'ctrl+alt', 'alt', 'shift', '' }
-local PAD = { 'select', 'start', 'l3', 'r3', 'dpad_up', 'dpad_down', 'dpad_left', 'dpad_right', 'north', 'south', 'west', 'east', 'l1', 'r1', 'l2', 'r2', '' }
+local PAD = { 'select', 'create', 'start', 'l3', 'r3', 'dpad_up', 'dpad_down', 'dpad_left', 'dpad_right', 'north', 'south', 'west', 'east', 'l1', 'r1', 'l2', 'r2', '' }
 local DTR_MODES = { 'auto', 'always', 'never' }
 
 S.schema = {
   { 'Keys & controller', {
     { 'toggle_mods', 'combo', MODS, 'Dropdown toggle modifiers (+ `)' },
     { 'world_toggle_mods', 'combo', MODS, 'World terminals toggle modifiers (+ `)' },
-    { 'toggle_gamepad_button', 'combo', PAD, 'Controller button (tap / hold / double tap)' },
+    { 'toggle_gamepad_button', 'combo', PAD, 'Controller button (tap / hold / double tap; create = DualSense Create)' },
   } },
   { 'Dropdown', {
     { 'dropdown.height', 'slider', 0.15, 1.0, 'Height (fraction of screen)' },

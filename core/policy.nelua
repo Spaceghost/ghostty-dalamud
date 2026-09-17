@@ -73,6 +73,7 @@ global Policy = @record{
   world_toggle_shift: boolean,
   world_toggle_alt: boolean,
   toggle_gamepad_mask: integer, -- Dalamud GamepadButtons flags; 0 = no gamepad toggle
+  toggle_gamepad_hid: boolean,  -- 'create': the DualSense Create button, read from the controller's HID reports
   cursor_blink: boolean,
   close_on_exit: boolean,   -- close a terminal when its shell exits (ctrl+d)
   copy_on_select: boolean,  -- releasing a mouse selection copies it to the clipboard
@@ -176,8 +177,9 @@ local function clear_profiles(): void
 end
 
 -- Load <dir>/lua/init.lua. The script must return the config table.
--- Dalamud's GamepadButtons flag for a button name ("select" is the PS5
--- Create / Xbox View button). Unknown or empty names give 0.
+-- Dalamud's GamepadButtons flag for a button name ("select" is Xbox View;
+-- on a DualSense Dalamud reports the touchpad click as select). Unknown or
+-- empty names, and "create", give 0.
 global function policy_gamepad_mask(name: string): integer
   local names: [16]string = {
     'dpad_up', 'dpad_down', 'dpad_left', 'dpad_right', 'north', 'south', 'west', 'east',
@@ -187,6 +189,12 @@ global function policy_gamepad_mask(name: string): integer
     if names[i] == name then return 1 << i end
   end
   return 0
+end
+
+-- "create": the DualSense Create button, which Dalamud's gamepad state does
+-- not have; the core reads it from the controller (core/sys/dualsense_reader.nelua).
+global function policy_gamepad_hid(name: string): boolean
+  return name == 'create'
 end
 
 -- Scalar settings from the CONFIG table at stack index t (used at load and
@@ -207,6 +215,7 @@ local function read_settings(L: *lua_State, t: cint): void
   wm:destroy()
   local pad = lua_field_string(L, t, 'toggle_gamepad_button', '')
   policy.toggle_gamepad_mask = policy_gamepad_mask(pad)
+  policy.toggle_gamepad_hid = policy_gamepad_hid(pad)
   pad:destroy()
   policy.default_profile = lua_field_integer(L, t, 'default_profile', 1)
   policy.cursor_blink = lua_field_boolean(L, t, 'cursor_blink', true)

@@ -3,6 +3,25 @@
 -- Input the game does not hand to ImGui: the toggle keys (Win32 key state),
 -- the controller button gestures.
 require 'core.app.worldview'
+require 'core.sys.dualsense_reader'
+
+-- The controller toggle button this frame, from the source toggle_gamepad_button
+-- names: the DualSense Create button read from the controller's HID reports
+-- ('create'), or a Dalamud GamepadButtons flag through the shim. Returns
+-- whether the button's state is known (then `down` is it) and, from a shim
+-- without gamepad_down, whether it was pressed this frame.
+global function poll_toggle_pad(now: float64): (boolean, boolean, boolean)
+  if policy.toggle_gamepad_hid then
+    dualsense_reader_poll(&host.dualsense, now, log)
+    return true, dualsense_reader_take(&host.dualsense), false
+  end
+  dualsense_reader_close(&host.dualsense) -- not chosen (any more): let go of the controller
+  if policy.toggle_gamepad_mask == 0 then return false, false, false end
+  local mask = (@cint)(policy.toggle_gamepad_mask)
+  if host.api.gamepad_down ~= nilptr then return true, host.api.gamepad_down(mask) ~= 0, false end
+  if host.api.gamepad_pressed ~= nilptr then return false, false, host.api.gamepad_pressed(mask) ~= 0 end
+  return false, false, false
+end
 
 -- Global hotkey while the drop-down is not focused.
 global function poll_toggle_key(): void
@@ -45,17 +64,16 @@ global function poll_toggle_key(): void
       end
     end
   ## end
-  if policy.toggle_gamepad_mask ~= 0 then
-    if host.api.gamepad_down ~= nilptr then
-      -- tap: show/hide the dropdown; hold: next terminal; double tap: previous
-      local down = host.api.gamepad_down((@cint)(policy.toggle_gamepad_mask)) ~= 0
-      local ev = pad_gesture_update(&host.pad, down, imgui.GetTime())
-      if ev == PadGesture.Tap then pressed = true
-      elseif ev == PadGesture.HoldStep then select_terminal(1)
-      elseif ev == PadGesture.DoubleTap then select_terminal(-1) end
-    elseif host.api.gamepad_pressed ~= nilptr and host.api.gamepad_pressed((@cint)(policy.toggle_gamepad_mask)) ~= 0 then
-      pressed = true
-    end
+  local now = imgui.GetTime()
+  local have_state, down, pad_pressed = poll_toggle_pad(now)
+  if have_state then
+    -- tap: show/hide the dropdown; hold: next terminal; double tap: previous
+    local ev = pad_gesture_update(&host.pad, down, now)
+    if ev == PadGesture.Tap then pressed = true
+    elseif ev == PadGesture.HoldStep then select_terminal(1)
+    elseif ev == PadGesture.DoubleTap then select_terminal(-1) end
+  elseif pad_pressed then
+    pressed = true
   end
   if pressed then toggle_visible() end
 end

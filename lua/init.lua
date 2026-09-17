@@ -26,10 +26,16 @@ local config = {
   -- Windows virtual-key code to swallow so the game never sees the toggle
   -- key press (0xC0 = VK_OEM_3, the backquote key on US layouts).
   toggle_consume_vk = 0xC0,
-  -- Gamepad button that toggles the terminal (Dalamud GamepadButtons name):
-  -- "select" is the PS5 Create / Xbox View button. Empty string disables it.
-  -- dpad_up dpad_down dpad_left dpad_right north south west east
-  -- l1 l2 l3 r1 r2 r3 select start
+  -- Gamepad button that toggles the terminal: tap shows or hides the
+  -- drop-down, hold steps through terminals, double tap steps back. Names
+  -- (Dalamud GamepadButtons):
+  --   dpad_up dpad_down dpad_left dpad_right north south west east
+  --   l1 l2 l3 r1 r2 r3 select start
+  -- "select" is the Xbox View button; on a DualSense Dalamud reports the
+  -- touchpad click as select. "create" is the DualSense (and DualSense Edge)
+  -- Create button, which the game leaves unused: Dalamud does not see it, so
+  -- the plugin reads it from the controller itself (Windows HID; not yet
+  -- verified in game or under Wine). Empty string disables it.
   toggle_gamepad_button = 'select',
 
   cursor_blink = true,
