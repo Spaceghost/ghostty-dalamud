@@ -251,10 +251,12 @@ leaves unused. Dalamud's gamepad state has no such button, so the core reads
 the controller's HID input reports itself (`core/sys/dualsense_reader.nelua`):
 USB report `0x01` and Bluetooth reports `0x31` and `0x01` (simple mode),
 vendor `054C`, products `0CE6` and `0DF2`. It opens the controller read-only
-and shared, reads it without waiting (one overlapped read, collected once per
-frame), looks for a controller every 3 s while none is open (a few HID devices
-per frame), and closes it on unplug, when you pick another button, and when
-the plugin unloads. The default stays
+and shared, asks for a queue of only 2 reports on its handle, reads it
+without waiting (one overlapped read, collected once per frame), and closes
+it on unplug, when you pick another button, and when the plugin unloads.
+Create only counts while the game's window is in front: the controller's
+reports arrive whichever window has focus, and elsewhere Create is the
+capture button of Steam, Game Bar and Remote Play. The default stays
 `select`, so nothing changes without a DualSense. To switch, pick `create`
 under Settings → Keys & controller, or set it in your `lua/init.lua` copy:
 
@@ -262,13 +264,33 @@ under Settings → Keys & controller, or set it in your `lua/init.lua` copy:
 toggle_gamepad_button = 'create',
 ```
 
+Finding the controller is not free: listing and opening HID devices are
+synchronous calls on the render thread (under Wine each is a round trip
+through wineserver), and closing waits up to 1 s for the cancelled read.
+While no controller is open, a search looks at a few HID devices per frame
+and opens only those whose device path does not name another vendor or
+product. After a search that found nothing the next one waits 3 s, then 6,
+12, 24 and at most 30 s, so a controller that is off, unplugged, hidden (for
+example by HidHide) or not exposed through hidraw costs one search every
+30 s. A controller that fails to open with the same error twice (another
+program holds it) is retried every 30 s. A device arrival notification
+(`CM_Register_Notification`) starts a search within about a second and
+resets the wait; without one, a controller connected later can take up to
+30 s to be found.
+
 The log shows `DualSense 054c:0ce6 opened for the Create button` and, with the
 first report, which layout it sends. **This HID path has only been tested on
 the host with fake devices; it has not been observed in game, on Windows or
 under Wine.** Under Wine it relies on winebus exposing the controller through
 its hidraw backend, which needs read access to the controller's
-`/dev/hidraw*` node. Whether the search for a controller (every 3 s while none
-is open) costs a visible hitch on some systems has not been measured.
+`/dev/hidraw*` node. Not measured or observed: whether a search still costs a
+visible hitch, whether Wine delivers device arrival notifications, and how
+late Create arrives under Wine. Wine hands device reads to winedevice, so an
+overlapped read probably never completes at once: about one report is
+collected per frame while the controller sends about 250 a second. With the
+default queue of 32 reports every read would be about 130 ms old; the 2-report
+queue should keep it within a frame or two. That is inferred from how Wine
+handles overlapped reads, not observed.
 
 ## Privacy
 

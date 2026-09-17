@@ -5,15 +5,35 @@
 require 'core.app.worldview'
 require 'core.sys.dualsense_reader'
 
+global ForegroundFn = @function(): boolean
+
+-- Whether the game's window is in front (Windows). Elsewhere there is no
+-- such check and this is always true.
+global function game_foreground(): boolean
+  ## if ccinfo.is_windows then
+    local pid: uint32 = 0
+    GetWindowThreadProcessId(GetForegroundWindow(), &pid)
+    return pid == GetCurrentProcessId()
+  ## else
+    return true
+  ## end
+end
+
 -- The controller toggle button this frame, from the source toggle_gamepad_button
 -- names: the DualSense Create button read from the controller's HID reports
 -- ('create'), or a Dalamud GamepadButtons flag through the shim. Returns
 -- whether the button's state is known (then `down` is it) and, from a shim
--- without gamepad_down, whether it was pressed this frame.
-global function poll_toggle_pad(now: float64): (boolean, boolean, boolean)
+-- without gamepad_down, whether it was pressed this frame. The HID reports
+-- arrive whichever window is in front, and Create captures screenshots and
+-- video elsewhere (Steam, Game Bar, Remote Play): the reports are still
+-- drained, but Create only counts while `foreground` (game_foreground) says
+-- the game is in front.
+global function poll_toggle_pad(now: float64, foreground: ForegroundFn): (boolean, boolean, boolean)
   if policy.toggle_gamepad_hid then
     dualsense_reader_poll(&host.dualsense, now, log)
-    return true, dualsense_reader_take(&host.dualsense), false
+    local down = dualsense_reader_take(&host.dualsense)
+    if down and not foreground() then down = false end
+    return true, down, false
   end
   dualsense_reader_close(&host.dualsense) -- not chosen (any more): let go of the controller
   if policy.toggle_gamepad_mask == 0 then return false, false, false end
@@ -37,12 +57,10 @@ global function poll_toggle_key(): void
     if vk > 0 then
       local down = (GetAsyncKeyState(vk) & 0x8000) ~= 0
       if down and not host.toggle_vk_down and not host.terminal_focused then
-        local pid: uint32 = 0
-        GetWindowThreadProcessId(GetForegroundWindow(), &pid)
         local shift = (GetAsyncKeyState(0x10) & 0x8000) ~= 0
         local ctrl = (GetAsyncKeyState(0x11) & 0x8000) ~= 0
         local alt = (GetAsyncKeyState(0x12) & 0x8000) ~= 0
-        if pid == GetCurrentProcessId() then
+        if game_foreground() then
           if ctrl == policy.toggle_ctrl and shift == policy.toggle_shift and alt == policy.toggle_alt then
             pressed = true
           elseif ctrl == policy.world_toggle_ctrl and shift == policy.world_toggle_shift and alt == policy.world_toggle_alt then
@@ -65,7 +83,7 @@ global function poll_toggle_key(): void
     end
   ## end
   local now = imgui.GetTime()
-  local have_state, down, pad_pressed = poll_toggle_pad(now)
+  local have_state, down, pad_pressed = poll_toggle_pad(now, game_foreground)
   if have_state then
     -- tap: show/hide the dropdown; hold: next terminal; double tap: previous
     local ev = pad_gesture_update(&host.pad, down, now)
