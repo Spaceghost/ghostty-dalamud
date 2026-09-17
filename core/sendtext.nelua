@@ -1,0 +1,30 @@
+-- Text sent to a terminal from chat / hotbar macros (/term send, /term type).
+-- Escapes: \n \r \t \e \\ and ^A..^Z (control characters, e.g. ^C).
+require 'string'
+require 'stringbuilder'
+
+global function term_unescape(s: string): string
+  local sb: stringbuilder
+  local i: usize = 0
+  while i < s.size do
+    local c = s.data[i]
+    if c == '\\'_b and i + 1 < s.size then
+      local n = s.data[i + 1]
+      if n == 'n'_b then sb:writebyte(10)
+      elseif n == 'r'_b then sb:writebyte(13)
+      elseif n == 't'_b then sb:writebyte(9)
+      elseif n == 'e'_b then sb:writebyte(27)
+      elseif n == '\\'_b then sb:writebyte('\\'_b)
+      elseif n == '^'_b then sb:writebyte('^'_b)
+      else sb:writebyte(c) sb:writebyte(n) end
+      i = i + 2
+    elseif c == '^'_b and i + 1 < s.size and ((s.data[i + 1] >= 'A'_b and s.data[i + 1] <= 'Z'_b) or s.data[i + 1] == '['_b) then
+      sb:writebyte(s.data[i + 1] == '['_b and 27 or s.data[i + 1] - 'A'_b + 1)
+      i = i + 2
+    else
+      sb:writebyte(c)
+      i = i + 1
+    end
+  end
+  return sb:promote()
+end
