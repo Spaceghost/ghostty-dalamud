@@ -18,6 +18,8 @@ assert(policy.dropdown.width == 0.5 and policy.dropdown.min_width == 1200 and po
 assert(policy.toggle_gamepad_mask == 0x4000, 'select -> GamepadButtons.Select')
 assert(policy.toggle_ctrl and not policy.toggle_shift and not policy.toggle_alt, 'toggle is ctrl+grave')
 assert(policy_gamepad_mask('start') == 0x8000 and policy_gamepad_mask('l1') == 0x100 and policy_gamepad_mask('nope') == 0)
+assert(not policy.toggle_gamepad_hid, 'the DualSense is not read by default')
+assert(policy_gamepad_mask('create') == 0 and policy_gamepad_hid('create') and not policy_gamepad_hid('select') and not policy_gamepad_hid(''))
 print('agent', policy.agent.host, policy.agent.port, 'token_file', policy.agent.token_file)
 assert(#policy.profiles >= 3)
 for i = 0, < #policy.profiles do
@@ -60,6 +62,27 @@ do
   assert(n >= 3 and shown >= 2, 'showcase has shell and local terminals')
   local ok = policy_showcase_shot(1)
   assert(ok and policy_showcase_delay() > 0)
+end
+
+-- toggle_gamepad_button = 'create': the DualSense Create button, read over HID
+-- instead of a Dalamud gamepad flag; the settings window offers it.
+do
+  assert(luaL_loadstring(policy.L, "CONFIG.toggle_gamepad_button = 'create'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  assert(policy.toggle_gamepad_hid and policy.toggle_gamepad_mask == 0, 'create reads the controller, no Dalamud flag')
+  assert(luaL_loadstring(policy.L, [[
+    for _, section in ipairs(require('settings').schema) do
+      for _, e in ipairs(section[2]) do
+        if e[1] == 'toggle_gamepad_button' then
+          for _, name in ipairs(e[3]) do if name == 'create' then return end end
+        end
+      end
+    end
+    error('create is not offered')
+  ]]) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, 'the settings window offers create')
+  assert(luaL_loadstring(policy.L, "CONFIG.toggle_gamepad_button = 'select'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  assert(not policy.toggle_gamepad_hid and policy.toggle_gamepad_mask == 0x4000, 'and back')
 end
 
 -- A world command that throws a non-string still fails; per-frame hook errors

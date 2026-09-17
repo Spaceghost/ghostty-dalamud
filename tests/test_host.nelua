@@ -145,6 +145,42 @@ end
 state_file:destroy()
 assert(gu_command('reload') == 0, 'reload after a failed one')
 assert(gu_command('bogus') == 3)
+
+-- The controller toggle's source: toggle_gamepad_button = 'create' reads the
+-- DualSense over HID (fake devices on the host), any other button goes
+-- through the shim and lets go of the controller, shutdown closes it.
+local pad_bits: cint = 0
+local function fake_gamepad_down(mask: cint): cint return (pad_bits & mask) ~= 0 and 1 or 0 end
+do
+  assert(policy.toggle_gamepad_mask == 0x4000 and not policy.toggle_gamepad_hid, 'shipped default: select')
+  local have, down, pressed = poll_toggle_pad(1.0)
+  assert(not have and not down and not pressed, 'no gamepad callbacks: nothing')
+  host.api.gamepad_down = fake_gamepad_down
+  pad_bits = 0x4000
+  have, down = poll_toggle_pad(1.02)
+  assert(have and down and hid_fake.scans == 0, 'select comes from the shim; no HID scan')
+
+  hid_fake.devices[0] = { vid = 0x054C, pid = 0x0CE6, usage_page = 1, usage = 5, input_len = 64 }
+  hid_fake.count = 1
+  policy.toggle_gamepad_hid, policy.toggle_gamepad_mask = true, 0 -- what 'create' loads to (test_policy)
+  have, down = poll_toggle_pad(1.04)
+  assert(have and not down and hid_is_open(&host.dualsense.dev), 'create: the DualSense opens; the shim is not asked')
+  local report: [64]uint8
+  report[0], report[9] = 0x01, 0x10
+  hid_fake_push(&report, 64)
+  have, down = poll_toggle_pad(1.06)
+  assert(have and down, 'Create held')
+
+  policy.toggle_gamepad_hid, policy.toggle_gamepad_mask = false, 0x4000
+  have, down = poll_toggle_pad(1.08)
+  assert(have and down and not hid_is_open(&host.dualsense.dev) and hid_fake.closes == 1, 'back to select: the controller is let go')
+  policy.toggle_gamepad_hid, policy.toggle_gamepad_mask = true, 0
+  pad_bits = 0
+  have, down = poll_toggle_pad(1.10)
+  assert(have and not down and hid_is_open(&host.dualsense.dev), 'create again')
+  host.api.gamepad_down = nilptr
+end
 gu_toggle()
 gu_shutdown()
+assert(hid_fake.closes == 2 and not hid_is_open(&host.dualsense.dev), 'shutdown closes the controller')
 print('OK')

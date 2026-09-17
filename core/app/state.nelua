@@ -16,6 +16,7 @@ require 'core.agent_client'
 require 'core.world'
 require 'core.depthpass'
 require 'core.sendtext'
+require 'core.sys.dualsense_reader'
 require 'allocators.default'
 
 ## if ccinfo.is_windows then
@@ -161,6 +162,7 @@ global Host = @record{
   settings_open: boolean,
   settings_badge: boolean,          -- CONFIG.settings.badge(): a dot on the settings button (unseen vote ideas)
   pad: PadGestureState,             -- toggle button: tap / double tap / hold
+  dualsense: DualSenseReader,       -- toggle_gamepad_button = 'create': the controller read over HID
   select_idx: integer,
   -- raw mouse buttons (Dalamud only forwards clicks to ImGui while it wants the mouse)
   lmb_down: boolean, rmb_down: boolean,
