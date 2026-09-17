@@ -1,18 +1,10 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Microsoft.NET.Sdk">
-  <!--
-    Logic-free Umbra toolbar widget. The terminal lives in the GhosttyDalamud
-    plugin (ghostty_core.dll + lua/); this assembly only calls its IPC. The
-    assembly name, file name and widget id stay as they were so Umbra keeps
-    the existing plugin entry and toolbar placement. Reference paths default to
-    a Windows XIVLauncher install; tools/build.sh passes DalamudLibPath and
-    UmbraLibPath on the command line.
-  -->
+  <!-- Optional Umbra widget; the standalone plugin owns the native terminal. -->
   <PropertyGroup>
     <DalamudLibPath Condition="'$(DalamudLibPath)' == ''">$(APPDATA)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
-    <UmbraLibPath Condition="'$(UmbraLibPath)' == ''">$([System.IO.Directory]::GetDirectories($(APPDATA)\XIVLauncher\installedPlugins\Umbra\)[0])\</UmbraLibPath>
+    <UmbraLibPath Condition="'$(UmbraLibPath)' == ''">$(MSBuildThisFileDirectory)..\..\vendor\umbra-dist\dist\</UmbraLibPath>
   </PropertyGroup>
-
   <PropertyGroup>
     <TargetFramework>net10.0-windows</TargetFramework>
     <Platforms>x64</Platforms>
@@ -27,12 +19,11 @@
     <RootNamespace>Umbra.Ghostty</RootNamespace>
     <AssemblyName>Umbra.Ghostty</AssemblyName>
     <Version>0.2.0.0</Version>
-    <Authors>Johnneylee Jack Rollins</Authors>
+    <Authors>Spaceghost</Authors>
     <Description>Umbra toolbar widget for the Ghostty terminal plugin (GhosttyDalamud).</Description>
     <IsPackable>false</IsPackable>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
-
   <ItemGroup>
     <Reference Include="Umbra"><HintPath>$(UmbraLibPath)Umbra.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Umbra.Common"><HintPath>$(UmbraLibPath)Umbra.Common.dll</HintPath><Private>false</Private></Reference>

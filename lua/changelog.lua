@@ -1,91 +1,67 @@
--- The Changelog and About tabs of the settings window.
---
--- Entries are written for players, newest first. `status` marks work that
--- is merged but not yet verified in game ('beta') or still being built
--- ('next'), so the tab never claims more than has been seen working.
-
+-- Historical feature notes and the About tab. Version labels below are
+-- development milestones, not proof of published releases or target testing.
 local vote = require('vote')
-
 local C = {}
-
 C.releases = {
   {
-    version = 'next', title = 'In the workshop',
-    blurb = 'Being built right now. These land here as they are verified in game.',
+    version = 'next', title = 'Developer preview',
+    blurb = 'Implemented or in development; target-platform and in-game verification remain required.',
     items = {
-      { 'next', 'Vote on what gets built next: the About tab in Settings opens the vote page in your browser, and a small dot on the settings button shows while there are ideas you have not looked at. The plugin itself never goes online for it.' },
-      { 'next', 'Local terminals (conpty) on Windows start their shell with the structure size Windows expects. Not yet verified on Windows or under Wine.' },
-      { 'next', 'Controller: the DualSense Create button can open the terminal while the game is in front (choose create in Settings). Not yet tried with a real controller in game.' },
-      { 'next', 'Select text with the mouse — drag, double-click a word, triple-click a line — and copy it.' },
-      { 'next', 'Screens cast real in-game light: their backlight glows on your face and the world around you.' },
-      { 'next', 'Experimental, off by default: screens cast shadows and block sunlight (Settings, Light). Not yet tried in game, and a game patch may crash it.' },
-      { 'next', 'Click a screen and your character walks up to it while it floats out to meet you.' },
-      { 'next', 'The terminal bell rings out as a ripple of light from your character; the screen that rang glows.' },
-      { 'next', 'A Dalamud plugin of its own: /term, a server info bar entry with a popup terminal, Open and Settings in /xlplugins. Umbra adds its toolbar widget when installed, and your settings, token and screens move over by themselves.' },
-      { 'next', 'Drag screens through the world and snap them flat against walls and tables.' },
-      { 'next', 'The mouse wheel scrolls terminals, and scrolls less, vim and mouse-aware programs their own way.' },
-      { 'next', 'Hold the left mouse button to turn the camera without losing the terminal; a quick click on the world still lets go.' },
-      { 'next', 'Backspace and other keys no longer repeat when the game stutters.' },
-      { 'next', 'The dropdown is glass like the screens: it takes on the time of day, glows in the dark, slides in softly, and its tab bar has icon buttons with tooltips.' },
+      { 'next', 'Platform-specific default terminals, clean-build bootstrap and verified build references.' },
+      { 'next', 'The About tab opens the feature vote page; its catalogue is shipped locally.' },
+      { 'next', 'ConPTY startup structure size corrected. Native Windows behavior still requires verification.' },
+      { 'next', 'Optional DualSense Create handling via HID. Not yet verified with a real controller in game.' },
+      { 'next', 'Mouse selection: drag, double-click a word, or triple-click a line, then copy.' },
+      { 'next', 'World-panel lighting, drag placement and walk-up behavior require target testing.' },
+      { 'next', 'Experimental shadow boards are off by default. Game updates may invalidate the signature.' },
+      { 'next', 'Visual bell effects and standalone-plugin configuration migration require in-game testing.' },
+      { 'next', 'Drop-down appearance, camera interaction and input handling remain under validation.' },
     },
   },
   {
-    version = '0.4', title = 'Make it yours',
-    blurb = 'Everything is configurable, and your layout comes back exactly as you left it.',
+    version = '0.4', title = 'Configuration and layout',
+    blurb = 'Historical development notes; not a compatibility guarantee.',
     items = {
-      { 'new', 'Settings window (/term config, or cfg in the tab bar) with live changes, saved to settings.lua.' },
-      { 'new', 'Every terminal remembers where it lives — tab, window, minimized, pinned or pet — and its zoom.' },
-      { 'new', 'Screens nobody can see go to sleep and wake with their output replayed; mark one to keep running.' },
-      { 'new', 'Choose the pose your character holds: glowing device, book, pen and paper, camera, thinking, lookout, or any animation id.' },
-      { 'new', 'Per-terminal zoom: ctrl+= ctrl+- ctrl+0, or ctrl+wheel.' },
-      { 'new', 'Pop a screen into the dropdown, fly it full screen, or double-click to drop into first person facing it.' },
-      { 'new', 'Screens react to the time of day and weather, with a backlight when it gets dark.' },
-      { 'fix', 'Screens behind your character are cut out around it instead of drawing over it.' },
-      { 'fix', 'Panels seen from behind read correctly instead of mirrored.' },
+      { 'new', 'Settings window, saved overrides, per-terminal zoom and layout persistence.' },
+      { 'new', 'Hidden-screen sleep/replay, configurable character poses and full-screen presentation.' },
+      { 'new', 'Lighting and weather-dependent appearance.' },
+      { 'fix', 'Character cut-outs and rear-facing panel text handling.' },
     },
   },
   {
     version = '0.3', title = 'Companions',
-    blurb = 'Terminals that follow you around like pets, and a character who uses them.',
+    blurb = 'Historical development notes; not a compatibility guarantee.',
     items = {
-      { 'new', 'Pet terminals float beside your character, trail after you on springs and settle gently when you stop.' },
-      { 'new', 'Your character holds a glowing device while a terminal is out, and works it faster while you type.' },
-      { 'new', 'Screens derez in a scanline dissolve when combat starts and come back afterwards.' },
-      { 'new', 'Controller: tap to open, hold to step through screens, double-tap to step back.' },
-      { 'new', 'Taskbar in the Umbra toolbar popup; hotbar macros: /term send, type, min, restore, focus.' },
-      { 'fix', 'Movement is never taken over: clicking the world, moving or combat hands input back to the game.' },
-      { 'fix', 'Recovered characters stuck in a pose the game treated as "operating a siege machine".' },
+      { 'new', 'Following terminals, character animation and combat transitions.' },
+      { 'new', 'Controller gestures, popup taskbar and terminal hotbar commands.' },
+      { 'fix', 'Movement hand-back and recovery from a persistent character pose.' },
     },
   },
   {
-    version = '0.2', title = 'Worldbound',
-    blurb = 'Terminals leave the screen and step into Eorzea.',
+    version = '0.2', title = 'World panels',
+    blurb = 'Historical development notes; not a compatibility guarantee.',
     items = {
-      { 'new', 'Pin terminals in the world: in place, above your target, in front of you, or orbiting you.' },
-      { 'new', 'Curved panels with crisp 40 px text, resize by dragging an edge, close with the ×.' },
-      { 'new', 'Floating windows, a hide button, ctrl+` for the dropdown and ctrl+shift+` for world screens.' },
+      { 'new', 'Pinned and orbiting world terminals, floating windows and resize controls.' },
       { 'new', 'Commands: /term, /tomestone and /tome.' },
     },
   },
   {
-    version = '0.1', title = 'First light',
-    blurb = 'A real terminal emulator inside the game, backed by libghostty.',
+    version = '0.1', title = 'Terminal core',
+    blurb = 'Historical development notes; not a compatibility guarantee.',
     items = {
-      { 'new', 'Quake-style dropdown with tabs, connected to shells on your machine through ghostty-agent.' },
-      { 'new', 'Full colour, cursor styles, kitty keyboard protocol, bracketed paste, scrollback.' },
-      { 'new', 'Shells survive game restarts and reattach with their screen intact.' },
-      { 'fix', 'Keys typed into the terminal no longer open the chat box.' },
+      { 'new', 'Drop-down tabs and POSIX agent sessions.' },
+      { 'new', 'libghostty-vt terminal state, color, keyboard encoding, paste and scrollback.' },
+      { 'new', 'Reattachment while the agent and hosted session remain alive.' },
+      { 'fix', 'Terminal versus game-chat keyboard handling.' },
     },
   },
 }
-
 local TAG = {
   new = { 'NEW', 0.42, 0.80, 0.62 },
   fix = { 'FIX', 0.92, 0.74, 0.40 },
   beta = { 'BETA', 0.55, 0.70, 0.98 },
-  next = { 'SOON', 0.66, 0.62, 0.78 },
+  next = { 'PREVIEW', 0.66, 0.62, 0.78 },
 }
-
 function C.draw_changelog(ui)
   for i, rel in ipairs(C.releases) do
     local head = rel.version == 'next' and rel.title or (rel.version .. ' · ' .. rel.title)
@@ -100,9 +76,6 @@ function C.draw_changelog(ui)
     end
   end
 end
-
--- `settings` (lua/settings.lua) keeps the vote page marker; without it the
--- vote section is left out.
 function C.draw_about(ui, settings)
   if settings then
     vote.draw(ui, settings)
@@ -111,18 +84,16 @@ function C.draw_about(ui, settings)
     ui.spacing()
   end
   ui.wrapped('Ghostty for FFXIV', 0.92, 0.86, 0.72)
-  ui.wrapped('A real terminal emulator living in Eorzea: libghostty-vt for the terminal, a Nelua core for everything on screen, Lua for every decision you can change, and tiny C# shims that only forward calls to the game.')
+  ui.wrapped('Independent developer preview using libghostty-vt, a Nelua core, Lua configuration and C# host adapters. Not an official Ghostty project or a claim of official Dalamud-list acceptance.')
   ui.spacing()
-  ui.wrapped('Made by Johnneylee Jack Rollins', 0.92, 0.86, 0.72)
+  ui.wrapped('Made by Spaceghost', 0.92, 0.86, 0.72)
   ui.wrapped('github.com/Spaceghost', 0.55, 0.70, 0.98)
   ui.spacing()
   ui.wrapped('Umbra', 0.92, 0.86, 0.72)
-  ui.wrapped('Ghostty is becoming a Dalamud plugin of its own (GhosttyDalamud). It loads the terminal core, answers /term, /tomestone and /tome, puts an entry in the server info bar (click for the dropdown, right-click for a popup terminal) and opens from /xlplugins. Everything works without Umbra: the dropdown, windows, world screens, pets, commands, settings and controller gestures.')
-  ui.wrapped('With Umbra installed, the Ghostty toolbar widget becomes a small companion that asks the plugin for its status and popup terminal, and the info bar entry steps aside. Without the plugin running, the widget just says "ghostty offline".')
-  ui.wrapped('Settings, the agent token and your screen layout live in pluginConfigs/GhosttyDalamud and are copied over once from the old Umbra home. All of this is new and still in the workshop: it has not been seen working in game yet (see Changelog).', 0.66, 0.62, 0.78)
+  ui.wrapped('The standalone plugin is designed to work without Umbra. The optional widget uses its versioned IPC and displays offline status when the plugin is unavailable. Target-platform and in-game verification remain required.')
+  ui.wrapped('User configuration belongs in pluginConfigs/GhosttyDalamud. Back up old Umbra configuration before testing migration. Host-side tests do not validate a game installation.', 0.66, 0.62, 0.78)
   ui.spacing()
   ui.wrapped('Your data', 0.92, 0.86, 0.72)
-  ui.wrapped('Shells run on your own machine through ghostty-agent (loopback, token protected). Poses, lights and screens are client-side: other players never see your terminal.')
+  ui.wrapped('Local Windows terminals use ConPTY. Agent terminals execute commands on the configured agent host. Keep agent connections on loopback or behind a protected tunnel: the token authenticates, but does not encrypt, the stream. Review logs, terminal output and screenshots before sharing them.')
 end
-
 return C

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Rewrite the original maintainer identity in a disposable, single-branch clone.
+"""One-time original-maintainer identity rewrite for a disposable Git clone.
 
-Original identities are read from Git, never stored in tracked configuration or
-printed. This command never pushes; publishing requires an explicit leased push.
+Original identities are read from Git, not stored in configuration or printed.
+Binary matches stop the rewrite: executable bytes must be rebuilt or removed,
+not edited by blind replacement. This module never pushes on its own.
 """
 from __future__ import annotations
 import argparse
@@ -28,6 +29,8 @@ def root_identity(head: str) -> tuple[bytes, bytes]:
 
 def rewrite(head: str, name: bytes, email: bytes) -> tuple[str, int, int]:
     old_name, old_email = root_identity(head)
+    if (old_name, old_email) == (name, email):
+        raise RuntimeError('Root identity is already canonical; review later identities explicitly.')
     replacements = []
     for old, new in [(old_name, name), (old_email, email)]:
         if old == new:
@@ -35,8 +38,7 @@ def rewrite(head: str, name: bytes, email: bytes) -> tuple[str, int, int]:
         if len(old) < 5:
             raise RuntimeError('Identity is too short for safe literal replacement.')
         for encoding in ('utf-8', 'utf-16le', 'utf-16be'):
-            replacements.append((old.decode('utf-8').encode(encoding),
-                                 new.decode('utf-8').encode(encoding)))
+            replacements.append((old.decode('utf-8').encode(encoding), new.decode('utf-8').encode(encoding)))
 
     def clean(data: bytes) -> bytes:
         for old, new in replacements:
@@ -61,6 +63,8 @@ def rewrite(head: str, name: bytes, email: bytes) -> tuple[str, int, int]:
         raw = git('cat-file', kind, oid)
         if kind == 'blob':
             out = clean(raw)
+            if out != raw and b'\0' in raw:
+                raise RuntimeError('A binary contains identifying data; rebuild or remove it explicitly before rewriting.')
         elif kind == 'tree':
             entries = []
             pos = 0
@@ -75,6 +79,8 @@ def rewrite(head: str, name: bytes, email: bytes) -> tuple[str, int, int]:
                 entries.append((mode, new_name, new_child))
                 pos = end + 1 + size
             entries.sort(key=lambda e: e[1] + (b'/' if e[0] == b'40000' else b''))
+            if len({e[1] for e in entries}) != len(entries):
+                raise RuntimeError('Identity replacement would create a filename collision.')
             out = b''.join(m + b' ' + n + b'\0' + bytes.fromhex(c) for m, n, c in entries)
         elif kind == 'commit':
             header, message = raw.split(b'\n\n', 1)
@@ -92,8 +98,7 @@ def rewrite(head: str, name: bytes, email: bytes) -> tuple[str, int, int]:
                 modified.append(clean(block))
             out = b'\n'.join(modified) + b'\n\n' + clean(message)
             if out != raw:
-                modified = [b for b in modified if b.split(b' ', 1)[0]
-                            not in (b'gpgsig', b'gpgsig-sha256', b'mergetag')]
+                modified = [b for b in modified if b.split(b' ', 1)[0] not in (b'gpgsig', b'gpgsig-sha256', b'mergetag')]
                 out = b'\n'.join(modified) + b'\n\n' + clean(message)
                 rewritten_commits += 1
         else:
@@ -130,13 +135,13 @@ def main() -> None:
         return
     refs = git('for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/tags').splitlines()
     if refs != [b'refs/heads/main']:
-        raise RuntimeError('This maintenance command requires main to be the only branch/tag.')
+        raise RuntimeError('Use scrub-history.sh for a repository with multiple branches.')
     if git('status', '--porcelain').strip():
         raise RuntimeError('Worktree is not clean.')
     new_head, commits, objects = rewrite(head, args.name.encode(), args.email.encode())
     git('update-ref', 'refs/heads/main', new_head, head)
     git('reset', '--hard', new_head)
-    print(f'Identity rewrite: {commits} commits rewritten; {objects} reachable objects checked; 0 identity remnants.')
+    print(f'Identity rewrite: {commits} commits rewritten; {objects} reachable objects checked; 0 original identity remnants.')
     print('New head:', new_head)
 
 

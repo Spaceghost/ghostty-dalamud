@@ -1,15 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Microsoft.NET.Sdk">
-  <!--
-    Logic-free Dalamud plugin shim. Everything real lives in ghostty_core.dll
-    (Nelua) and lua/. The manifest is GhosttyDalamud.json beside this file;
-    tools/build.sh assembles the loadable folder in build/dist/GhosttyDalamud/.
-    Override DalamudLibPath on the command line.
-  -->
+  <!-- The native core and Lua modules are assembled by tools/build.sh. -->
   <PropertyGroup>
     <DalamudLibPath Condition="'$(DalamudLibPath)' == ''">$(APPDATA)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
   </PropertyGroup>
-
   <PropertyGroup>
     <TargetFramework>net10.0-windows</TargetFramework>
     <Platforms>x64</Platforms>
@@ -24,16 +18,14 @@
     <RootNamespace>GhosttyDalamud</RootNamespace>
     <AssemblyName>GhosttyDalamud</AssemblyName>
     <Version>0.2.0.0</Version>
-    <Authors>Johnneylee Jack Rollins</Authors>
+    <Authors>Spaceghost</Authors>
     <Description>Ghostty terminal inside FFXIV (libghostty-vt core written in Nelua, policy in Lua).</Description>
     <IsPackable>false</IsPackable>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
   </PropertyGroup>
-
   <ItemGroup>
     <None Include="GhosttyDalamud.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
-
   <ItemGroup>
     <Reference Include="Dalamud"><HintPath>$(DalamudLibPath)Dalamud.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Dalamud.Bindings.ImGui"><HintPath>$(DalamudLibPath)Dalamud.Bindings.ImGui.dll</HintPath><Private>false</Private></Reference>

@@ -29,7 +29,7 @@ for i = 0, < #policy.profiles do
   io.write('\n')
 end
 assert(policy.profiles[0].transport == 'agent')
-assert(policy.profiles[0].argv[0] == '/bin/bash')
+assert(policy.profiles[0].argv[0] == '/bin/sh', 'POSIX default does not require Bash')
 local buf: [64]cchar
 local n = policy_key_action('c', true, true, false, false, &buf, 64)
 assert(n == 4 and (@string)((@cstring)(&buf)) == 'copy', 'ctrl+shift+c -> copy')
@@ -40,8 +40,7 @@ assert(n == 0, 'ctrl+a -> terminal')
 n = policy_key_action('tab', true, false, false, false, &buf, 64)
 assert((@string)((@cstring)(&buf)) == 'next_tab')
 
--- /term showcase needs nothing on disk: each terminal either gets text from
--- lua/showcase.lua (show) or runs a command in a shell (send).
+-- Showcase content must not expose local checkout paths.
 do
   local n = 0
   local shown = 0
@@ -64,8 +63,6 @@ do
   assert(ok and policy_showcase_delay() > 0)
 end
 
--- toggle_gamepad_button = 'create': the DualSense Create button, read over HID
--- instead of a Dalamud gamepad flag; the settings window offers it.
 do
   assert(luaL_loadstring(policy.L, "CONFIG.toggle_gamepad_button = 'create'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
   policy_refresh()
@@ -85,8 +82,6 @@ do
   assert(not policy.toggle_gamepad_hid and policy.toggle_gamepad_mask == 0x4000, 'and back')
 end
 
--- A world command that throws a non-string still fails; per-frame hook errors
--- are logged, once per distinct message.
 local function lua_run(code: cstring): boolean
   return luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK
 end
@@ -109,7 +104,6 @@ for i = 1, 3 do
 end
 assert(hook_logs == 1 and policy.last_hook_error[POLICY_HOOK_PLACE]:find('place broke', 1, true) > 0, 'logged once')
 assert(lua_run("CONFIG.animation = { on_frame = function() error('frame broke') end }"))
--- place and on_frame failing in the same frames: each logs once, not every call
 for i = 1, 4 do
   assert(not policy_world_place(1, 0, false))
   policy_anim_frame(i)
@@ -119,7 +113,6 @@ assert(policy.last_hook_error[POLICY_HOOK_ON_FRAME]:find('frame broke', 1, true)
 assert(lua_gettop(policy.L) == 0, 'hooks leave the stack balanced')
 world_host.log = nilptr
 
--- CONFIG.dropdown, popup or agent missing or not a table: defaults, no Lua panic
 local mindir: string = 'build/test-policy-min'
 local function write_min_init(text: string): void
   local luadir = mindir .. '/lua'
@@ -137,8 +130,6 @@ write_min_init("return { popup = 3, profiles = { { name = 'sh' } } }\n")
 assert(policy_load(mindir), 'minimal config loads')
 assert(policy.dropdown.height == 0.45 and policy.popup_width == 900 and policy.agent.port == 7777, 'defaults')
 assert(#policy.profiles == 1 and policy.profiles[0].name == 'sh')
-
--- a syntax error in init.lua is reported with its text
 write_min_init('return {\n')
 assert(not policy_load(mindir) and #policy.error > 0, 'load error has text')
 print('load error:', policy.error)
