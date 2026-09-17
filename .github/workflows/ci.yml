@@ -1,0 +1,49 @@
+name: CI
+on: [workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  source-checks:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - run: python3 -m unittest discover -s tests -p 'test_*.py' -v
+  linux-build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: '10.0.x'
+      - name: Install the pinned Zig release from the official distribution
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, tarfile, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ghostty-zig'
+          root.mkdir(parents=True, exist_ok=True)
+          version = next(line.split('=', 1)[1].strip() for line in pathlib.Path('toolchain.env').read_text().splitlines() if line.startswith('ZIG_VERSION='))
+          with urllib.request.urlopen('https://ziglang.org/download/index.json', timeout=60) as response:
+              release = json.load(response)[version]['x86_64-linux']
+          assert release['tarball'].startswith('https://ziglang.org/'), 'unexpected toolchain origin'
+          archive = root / 'zig.tar.xz'
+          with urllib.request.urlopen(release['tarball'], timeout=120) as response, archive.open('wb') as output:
+              shutil.copyfileobj(response, output)
+          with archive.open('rb') as stream:
+              assert hashlib.file_digest(stream, 'sha256').hexdigest() == release['shasum'], 'toolchain checksum mismatch'
+          with tarfile.open(archive) as tar:
+              tar.extractall(root, filter='data')
+          binaries = list(root.glob('*/zig'))
+          assert len(binaries) == 1, 'unexpected toolchain layout'
+          with open(os.environ['GITHUB_PATH'], 'a') as output:
+              output.write(str(binaries[0].parent) + '\n')
+          PY
+      - run: tools/fetch-vendor.sh
+      - run: tools/build.sh
+      - run: vendor/nelua-lang/nelua-lua tests/test_defaults.lua
+      - run: tests/run.sh
