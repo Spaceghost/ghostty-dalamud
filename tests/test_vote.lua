@@ -58,20 +58,21 @@ do
   print('catalogue OK')
 end
 
--- No ghostty.open_url (a shim from before it): logged, nothing marked ---------------------
+-- No ghostty.open_url (a shim from before it): logged with the link, badge dismissed ------
 do
   local S, V = fresh()
   assert(ghostty.open_url == nil)
   assert(S.badge(), 'unseen ideas: badge on')
   assert(V.open(S) == false, 'cannot open')
   assert(logged_with('cannot open links') and logged_with(V.url), 'says so, with the link')
-  assert(S.values[V.KEY] == nil and S.badge() and not exists(settings_file), 'not marked seen, nothing saved')
+  assert(S.values[V.KEY] == V.catalogue_version and not S.badge() and exists(settings_file), 'seen: the badge never sticks')
 
-  -- the host refusing: logged with its reason, still not seen
+  -- the host refusing: logged with its reason, and also marked seen
+  S.values[V.KEY] = nil
   ghostty.open_url = function(url) return false, 'no browser' end
   logged = {}
   assert(V.open(S) == false and logged_with('could not open') and logged_with('no browser'))
-  assert(S.values[V.KEY] == nil and not exists(settings_file))
+  assert(S.values[V.KEY] == V.catalogue_version and not S.badge())
   print('without open_url OK')
 end
 

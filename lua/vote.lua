@@ -52,19 +52,27 @@ end
 -- Open the page in the system browser and remember this catalogue as seen.
 -- `settings` is lua/settings.lua (values + save). True when the browser was
 -- asked to open it; otherwise the link is logged and nothing is marked seen.
+-- Pressing the button counts as seeing the new ideas even when no browser can be
+-- opened: the link is shown under the button and logged, so the badge never sticks.
+local function mark_seen(settings)
+  settings.values[V.KEY] = V.catalogue_version
+  settings.save()
+end
+
 function V.open(settings)
   local open = ghostty and ghostty.open_url
   if not open then
     log('vote: this plugin build cannot open links; visit ' .. V.url)
+    mark_seen(settings)
     return false
   end
   local ok, why = open(V.url)
   if not ok then
     log('vote: could not open ' .. V.url .. (why and (' (' .. tostring(why) .. ')') or ''))
+    mark_seen(settings)
     return false
   end
-  settings.values[V.KEY] = V.catalogue_version
-  settings.save()
+  mark_seen(settings)
   return true
 end
 
