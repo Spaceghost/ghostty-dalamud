@@ -64,6 +64,7 @@ internal static unsafe class HostApi
         Api->IpcUnregister  = &IpcUnregister;
         Api->Raycast        = &Raycast;
         Api->GetSceneDepth  = &GetSceneDepth;
+        Api->OpenUrl        = &OpenUrl;
     }
 
     public static void Free()
@@ -157,6 +158,14 @@ internal static unsafe class HostApi
     private static void IpcUnregister()
     {
         try { GhosttyIpc.Unregister(); } catch { /* the core is shutting down either way */ }
+    }
+
+    // the core only passes https links; opening one is Dalamud's job
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int OpenUrl(byte* url)
+    {
+        if (url == null) return 0;
+        try { Dalamud.Utility.Util.OpenLink(Str(url)); return 1; } catch { return 0; }
     }
 
     // Fonts and keys -----------------------------------------------------------------------------

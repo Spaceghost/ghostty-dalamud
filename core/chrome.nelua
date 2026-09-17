@@ -258,6 +258,17 @@ global function chrome_button_at(buttons: *[0]ChromeButton, n: integer, right: f
   return -1
 end
 
+-- A small gold dot in the top right corner of a `size` square button at (x, y),
+-- like a tab's unread dot, on a ring of `ring` so it stands off the icon.
+-- The settings button wears it while the vote page has ideas the player has not seen.
+global CHROME_BADGE_TIP <comptime> = 'Settings (new ideas to vote on, see About)'
+global function chrome_draw_badge(dl: *ImDrawList, x: float32, y: float32, size: float32, ring: uint32): void
+  local r: float32 = 3
+  local cx, cy = x + size - r - 2, y + r + 2
+  imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r + 1.5, ring, 12)
+  imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r, CHROME_GOLD, 12)
+end
+
 -- Icons ---------------------------------------------------------------------------
 
 -- Draw `icon` centred on (cx, cy) in a button `size` pixels square.

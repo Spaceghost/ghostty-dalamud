@@ -7,6 +7,7 @@
 -- option; no core change is needed.
 
 local changelog = require('changelog')
+local vote = require('vote')
 
 local S = {}
 
@@ -205,6 +206,19 @@ function S.save()
   if f then f:write(table.concat(out)) f:close() end
 end
 
+-- Unseen ideas on the vote page (lua/vote.lua): the core puts a small dot on
+-- the settings button while this is true.
+function S.badge()
+  return vote.unseen(S.values) > 0
+end
+
+-- Back to the defaults. The vote page marker is not a setting and stays.
+function S.reset()
+  local seen = S.values[vote.KEY]
+  S.values = { [vote.KEY] = seen }
+  S.save()
+end
+
 -- An error inside a tab is logged once (it repeats every frame) and the tab
 -- is still closed, so ImGui's tab stack stays balanced.
 local last_error
@@ -231,8 +245,11 @@ function S.draw()
       ui.end_tab()
       if not ok then report(err) end
     end
-    if ui.tab('About') then
-      local ok, err = pcall(changelog.draw_about, ui)
+    -- the label changes, the ###id keeps it the same tab
+    local badge_ok, badge = pcall(S.badge)
+    if not badge_ok then report(badge) end
+    if ui.tab(badge_ok and badge and 'About (new)###about' or 'About###about') then
+      local ok, err = pcall(changelog.draw_about, ui, S)
       ui.end_tab()
       if not ok then report(err) end
     end
@@ -275,8 +292,7 @@ function S.draw_settings(ui)
   S.draw_status(ui)
   ui.separator()
   if ui.button('Reset all to defaults') then
-    S.values = {}
-    S.save()
+    S.reset()
     ui.text('Defaults restore on the next reload (/term reload).')
   end
   if save_now then S.save() end

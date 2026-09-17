@@ -2,7 +2,8 @@
 -- exports before init, refusals (legacy core, busy mutex) and their retries,
 -- the single-init guard, registration and shutdown order, suspension while
 -- the legacy core is loaded, the event queue, info bar visibility and failed
--- command retries.
+-- command retries, and links handed to the browser (ghostty.open_url) with an
+-- older, smaller GuHostApi.
 require 'core.host'
 require 'string'
 require 'stringbuilder'
@@ -51,7 +52,15 @@ local function expect(want: string, why: string): void
   reset_calls()
 end
 
-local function quiet(level: cint, msg: cstring): void end
+local vote_logs: integer = 0 -- lua/vote.lua saying it cannot open the page
+local function quiet(level: cint, msg: cstring): void
+  if (@string)(msg):find('vote:', 1, true) > 0 then vote_logs = vote_logs + 1 end
+end
+local open_ok: cint = 1
+local function open_url(url: cstring): cint
+  rec('open_url', url)
+  return open_ok
+end
 local function consume(vk: cint): void end
 local function command_add(name: cstring, help: cstring): cint
   assert(help ~= nilptr and #(@string)(help) > 0, 'help text')
@@ -83,6 +92,7 @@ local api: GuHostApi = {
   command_add = command_add, command_remove = command_remove,
   dtr_set = dtr_set, dtr_remove = dtr_remove, set_ui_hide = set_ui_hide,
   plugin_loaded = plugin_loaded, ipc_register = ipc_register, ipc_unregister = ipc_unregister,
+  open_url = open_url,
 }
 local info: GuInitInfo = {
   size = #GuInitInfo, host_kind = HOST_KIND_DALAMUD,
@@ -250,6 +260,47 @@ do
   expect('dtr shown', 'status text back')
 end
 
+-- Links: only https, forwarded to the host; the vote page through lua/vote.lua ---------------------
+do
+  assert(url_is_https('https://spacegho.st/mods/ffxiv/term/vote/') and url_is_https('HTTPS://example.org') and url_is_https('https://a'))
+  assert(not url_is_https('http://example.org'), 'plain http')
+  assert(not url_is_https('https://') and not url_is_https('https:///etc/passwd'), 'no host')
+  assert(not url_is_https('file:///C:/Windows/System32/calc.exe') and not url_is_https('javascript:alert(1)'), 'other schemes')
+  assert(not url_is_https('') and not url_is_https('https:') and not url_is_https(' https://example.org'), 'nothing before the scheme')
+  assert(not url_is_https('https://example.org/a b') and not url_is_https('https://example.org/\n'), 'whitespace')
+  assert(not url_is_https('https://example.org/"x') and not url_is_https('https://example.org\\x'), 'quotes, backslashes')
+  local nul: string = 'https://example.org\0.exe'
+  assert(#nul == 24 and not url_is_https(nul), 'an embedded NUL')
+  local sb: stringbuilder
+  sb:write('https://example.org/')
+  for i = #'https://example.org/', < URL_MAX do sb:write('a') end
+  local long = sb:promote()
+  assert(#long == URL_MAX and url_is_https(long), 'up to URL_MAX bytes')
+  long = long .. 'a'
+  assert(not url_is_https(long), 'not past it')
+
+  reset_calls()
+  lua([[assert(ghostty.open_url('https://example.org/vote/') == true)]])
+  expect('open_url https://example.org/vote/', 'forwarded as given')
+  lua([[local ok, why = ghostty.open_url('file:///etc/passwd') assert(ok == false and why:find('https'))
+    assert(ghostty.open_url(nil) == false and ghostty.open_url({}) == false)]])
+  expect('', 'refused links never reach the host')
+  open_ok = 0
+  lua([[local ok, why = ghostty.open_url('https://example.org/') assert(ok == false and why:find('could not'))]])
+  expect('open_url https://example.org/', 'a host failure is reported back')
+  open_ok = 1
+
+  -- the settings window's button: the page opens, the badge goes
+  lua("CONFIG.settings.values['vote.seen_version'] = nil") -- never opened
+  settings_badge_refresh()
+  assert(host.settings_badge, 'unseen ideas: the settings button wears its dot')
+  lua([[local S, vote = CONFIG.settings, require('vote')
+    assert(S.badge() and vote.open(S) and not S.badge())]])
+  expect('open_url https://spacegho.st/mods/ffxiv/term/vote/', 'the vote page')
+  settings_badge_refresh()
+  assert(not host.settings_badge and vote_logs == 0)
+end
+
 -- Shutdown unregisters before the callbacks are forgotten ----------------------------------------
 do
   gu_shutdown()
@@ -292,6 +343,23 @@ do
   expect('', 'registered names are not added again')
   gu_shutdown()
   expect(UNREGISTERED, 'all three removed')
+end
+
+-- A shim from before open_url: its smaller GuHostApi leaves ghostty.open_url nil --------------------
+do
+  local old: GuHostApi = api
+  old.size = #GuHostApi - #pointer -- ends before open_url; the field past it is never read
+  assert(gu_init_ex(&old, &info) == INIT_OK)
+  expect(REGISTERED, 'an older shim registers the same')
+  assert(host.api.open_url == nilptr, 'nothing copied past size')
+  lua([[assert(ghostty.open_url == nil and ghostty.host_info)
+    local S, vote = CONFIG.settings, require('vote')
+    S.values[vote.KEY] = nil
+    assert(vote.open(S) == false and S.badge(), 'the button logs instead')]])
+  expect('', 'nothing opened')
+  assert(vote_logs == 1, 'logged once, with the link')
+  gu_shutdown()
+  expect(UNREGISTERED, 'shutdown')
 end
 
 -- gu_init (tests, plain embedding) without the surface callbacks registers nothing ----------------

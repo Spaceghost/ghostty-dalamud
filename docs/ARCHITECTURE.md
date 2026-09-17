@@ -29,8 +29,9 @@
   `UiBuilder.Draw` to `gu_frame` and the /xlplugins buttons, chat commands and
   info bar clicks to `gu_event`, and fills `GuHostApi` with callbacks (log,
   fonts, key state, camera, objects, animation, lights, commands, info bar,
-  UI-hide flags, IPC). The core decides what to register, when, and under
-  which names (`core/app/hostsurface.nelua`, `CONFIG.host` in lua/init.lua).
+  UI-hide flags, IPC, opening a link in the browser). The core decides what
+  to register, when, and under which names (`core/app/hostsurface.nelua`,
+  `CONFIG.host` in lua/init.lua).
 * **Umbra is optional.** `Umbra.Ghostty.dll` keeps its file, assembly name and
   widget id but holds no native code: the widget label and popup call
   `GhosttyDalamud.v1.Status / PopupSize / PopupDraw / PopupReset / Post` over
@@ -184,9 +185,10 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_world`, `test_worldpanel`, `test_worlddrag` | world panels: projection and hit testing, the presented pose and walk-up, drag placement and snapping, all against a fake game |
 | `test_host` | the exported host surface without ImGui: init, status, commands, shutdown |
 | `test_lights` | panel lights against fake game light callbacks |
-| `test_chrome` | the glass chrome of the drop-down and windows: colour, tint, glow, tab strip, buttons |
+| `test_chrome` | the glass chrome of the drop-down and windows: colour, tint, glow, tab strip, buttons, the settings button's badge |
 | `test_migrate` (`.nelua` + `.lua`) | the one-time migration from the Umbra-hosted home |
-| `test_hostsurface` | the plugin side against a recording fake host: activation and refusals, registration and shutdown order, suspension, events, info bar |
+| `test_hostsurface` | the plugin side against a recording fake host: activation and refusals, registration and shutdown order, suspension, events, info bar, `ghostty.open_url` (https only) and an older shim's smaller `GuHostApi` |
+| `test_vote` (`.nelua` + `.lua`) | the feature vote link: the shipped catalogue, new-idea count, the settings window's section and badge, the seen marker through `settings.lua` |
 | `test_agent` | `ghostty-agent` end to end over TCP |
 
 The last step checks that the core also compiles as a native host module.
