@@ -1,0 +1,347 @@
+-- The DualSense Create button: report parsing (USB, Bluetooth, Bluetooth
+-- simple), edge detection, and the reader against the fake HID devices of
+-- core/sys/hid.nelua (scan, open, reads, unplug, rescan, close).
+require 'core.dualsense'
+require 'core.sys.dualsense_reader'
+require 'core.input'
+require 'string'
+
+local function usb_report(b0: uint8, b1: uint8, b2: uint8): [64]uint8
+  local r: [64]uint8
+  r[0] = 0x01
+  r[1], r[2], r[3], r[4] = 0x80, 0x80, 0x80, 0x80 -- sticks centred
+  r[8] = 0x08 | b0 -- hat released
+  r[9], r[10] = b1, b2
+  return r
+end
+
+local function bt_report(b0: uint8, b1: uint8, b2: uint8): [78]uint8
+  local r: [78]uint8
+  r[0], r[1] = 0x31, 0x10
+  r[2], r[3], r[4], r[5] = 0x80, 0x80, 0x80, 0x80
+  r[9] = 0x08 | b0
+  r[10], r[11] = b1, b2
+  local crc = dualsense_bt_crc(&r)
+  r[74], r[75], r[76], r[77] = (@uint8)(crc & 0xff), (@uint8)((crc >> 8) & 0xff), (@uint8)((crc >> 16) & 0xff), (@uint8)(crc >> 24)
+  return r
+end
+
+-- Bluetooth simple report, padded to `n` bytes as Windows and Wine hand it out
+local function simple_report(b0: uint8, b1: uint8, b2: uint8): [600]uint8
+  local r: [600]uint8
+  r[0] = 0x01
+  r[1], r[2], r[3], r[4] = 0x80, 0x80, 0x80, 0x80
+  r[5] = 0x08 | b0
+  r[6], r[7] = b1, b2
+  return r
+end
+
+local function parse(data: *[0]uint8, n: usize): (DsLayout, uint32)
+  local b: uint32 = 0xdead
+  local l = dualsense_parse(data, n, &b)
+  return l, b
+end
+
+-- CRC-32 -------------------------------------------------------------------------
+do
+  local check: string = '123456789'
+  assert(crc32_update(0, (@*[0]uint8)(check.data), 9) == 0xCBF43926, 'CRC-32 check value')
+  assert(crc32_update(crc32_update(0, (@*[0]uint8)(check.data), 4), (@*[0]uint8)(&check.data[4]), 5) == 0xCBF43926, 'CRC-32 continues')
+  -- expected value from zlib.crc32(b'\xa1' + report[:74])
+  local r: [78]uint8
+  r[0], r[1] = 0x31, 0x10
+  r[2], r[3], r[4], r[5] = 0x80, 0x80, 0x80, 0x80
+  r[9], r[10] = 0x08, 0x10
+  assert(dualsense_bt_crc(&r) == 0xD6B0D1D1, 'Bluetooth report CRC with the 0xA1 header byte')
+  print('crc OK')
+end
+
+-- Which devices and collections --------------------------------------------------
+do
+  assert(dualsense_is_controller(0x054C, 0x0CE6) and dualsense_is_controller(0x054C, 0x0DF2), 'DualSense and DualSense Edge')
+  assert(not dualsense_is_controller(0x054C, 0x09CC) and not dualsense_is_controller(0x045E, 0x0CE6), 'DualShock 4, other vendor')
+  assert(dualsense_caps_ok(1, 5, 64) and dualsense_caps_ok(1, 5, 78) and dualsense_caps_ok(1, 5, 547), 'USB, Bluetooth, padded Bluetooth')
+  assert(not dualsense_caps_ok(1, 5, 10) and not dualsense_caps_ok(1, 5, 63) and not dualsense_caps_ok(1, 5, 70) and not dualsense_caps_ok(1, 5, 2000))
+  assert(not dualsense_caps_ok(1, 4, 64) and not dualsense_caps_ok(0xFF00, 5, 64), 'a gamepad collection only')
+  print('devices OK')
+end
+
+-- USB -----------------------------------------------------------------------------
+do
+  local r = usb_report(0, 0x10, 0)
+  local l, b = parse(&r, 64)
+  assert(l == DsLayout.Usb and b == DS_CREATE, 'USB Create: byte 9 bit 0x10')
+  r = usb_report(0, 0x20, 0)
+  l, b = parse(&r, 64)
+  assert(l == DsLayout.Usb and b == DS_OPTIONS, 'USB Options: byte 9 bit 0x20')
+  r = usb_report(0, 0, 0x01)
+  l, b = parse(&r, 64)
+  assert(b == DS_PS, 'USB PS: byte 10 bit 0x01')
+  r = usb_report(0, 0, 0x02)
+  l, b = parse(&r, 64)
+  assert(b == DS_TOUCHPAD, 'USB touchpad click: byte 10 bit 0x02')
+  r = usb_report(0xF0, 0xCF, 0x04) -- face buttons, L1 R1 L2 R2 L3 R3, mute
+  l, b = parse(&r, 64)
+  assert(l == DsLayout.Usb and b == 0, 'every other button reads as nothing')
+  r = usb_report(0xF0, 0xFF, 0x07)
+  l, b = parse(&r, 64)
+  assert(b == DS_CREATE | DS_OPTIONS | DS_PS | DS_TOUCHPAD)
+  print('usb OK')
+end
+
+-- Bluetooth -----------------------------------------------------------------------
+do
+  local r = bt_report(0, 0x10, 0)
+  local l, b = parse(&r, 78)
+  assert(l == DsLayout.Bluetooth and b == DS_CREATE, 'Bluetooth Create: byte 10 bit 0x10')
+  r = bt_report(0, 0x20, 0x03)
+  l, b = parse(&r, 78)
+  assert(b == DS_OPTIONS | DS_PS | DS_TOUCHPAD, 'Bluetooth Options, PS, touchpad: bytes 10 and 11')
+  r = bt_report(0, 0, 0)
+  r[9] = 0x10 -- where USB keeps Create: the face buttons over Bluetooth
+  local crc = dualsense_bt_crc(&r)
+  r[74], r[75], r[76], r[77] = (@uint8)(crc & 0xff), (@uint8)((crc >> 8) & 0xff), (@uint8)((crc >> 16) & 0xff), (@uint8)(crc >> 24)
+  l, b = parse(&r, 78)
+  assert(l == DsLayout.Bluetooth and b == 0, 'the Bluetooth offset is one byte later than USB')
+  r = bt_report(0, 0x10, 0)
+  r[10] = 0x00 -- a changed byte fails the CRC
+  l, b = parse(&r, 78)
+  assert(l == DsLayout.None and b == 0xdead, 'a report failing its CRC is ignored')
+  r = bt_report(0, 0x10, 0)
+  r[77] = r[77] ~ 1
+  l, b = parse(&r, 78)
+  assert(l == DsLayout.None, 'a wrong CRC is ignored')
+  print('bluetooth OK')
+end
+
+-- Bluetooth simple (and Wine's fixed-up report 0x31) -------------------------------
+do
+  local r = simple_report(0, 0x10, 0)
+  local l, b = parse(&r, 10)
+  assert(l == DsLayout.Simple and b == DS_CREATE, 'simple Create: byte 6 bit 0x10')
+  l, b = parse(&r, 78)
+  assert(l == DsLayout.Simple and b == DS_CREATE, 'padded to 78 bytes')
+  l, b = parse(&r, 547)
+  assert(l == DsLayout.Simple and b == DS_CREATE, 'padded to the longest Bluetooth report')
+  r = simple_report(0xF0, 0x20, 0x03)
+  l, b = parse(&r, 10)
+  assert(b == DS_OPTIONS | DS_PS | DS_TOUCHPAD)
+  r = simple_report(0xF0, 0xCF, 0)
+  l, b = parse(&r, 10)
+  assert(l == DsLayout.Simple and b == 0)
+  print('simple OK')
+end
+
+-- Short and foreign reports -------------------------------------------------------
+do
+  local r = usb_report(0, 0x10, 0x03)
+  local l, b = parse(&r, 0)
+  assert(l == DsLayout.None and b == 0xdead, 'empty')
+  l, b = parse(&r, 1)
+  assert(l == DsLayout.None, 'the id alone')
+  local short: [4]usize = { 9, 11, 32, 63 }
+  for i = 0, < 4 do
+    l, b = parse(&r, short[i])
+    assert(l == DsLayout.None and b == 0xdead, 'report 0x01 too short for USB and not a simple report')
+  end
+  l, b = parse(nilptr, 64)
+  assert(l == DsLayout.None)
+  local bt = bt_report(0, 0x10, 0)
+  l, b = parse(&bt, 77)
+  assert(l == DsLayout.None, 'report 0x31 shorter than 78 bytes')
+  r[0] = 0x02
+  l, b = parse(&r, 64)
+  assert(l == DsLayout.None and b == 0xdead, 'another report id')
+  print('invalid OK')
+end
+
+-- Edges -----------------------------------------------------------------------------
+do
+  assert(dualsense_edge(false, DS_CREATE, DS_CREATE) == DsEdge.Press)
+  assert(dualsense_edge(true, 0, DS_CREATE) == DsEdge.Release)
+  assert(dualsense_edge(true, DS_CREATE | DS_OPTIONS, DS_CREATE) == DsEdge.None)
+  assert(dualsense_edge(false, DS_OPTIONS | DS_PS | DS_TOUCHPAD, DS_CREATE) == DsEdge.None, 'other buttons are no Create edge')
+
+  local st: DsButtonState
+  local idle = usb_report(0, 0, 0)
+  local create = usb_report(0, 0x10, 0)
+  local create_options = usb_report(0x20, 0x30, 0x02)
+  local options = usb_report(0, 0x20, 0x01)
+  assert(dualsense_feed(&st, &idle, 64, DS_CREATE) == DsEdge.None and not st.down)
+  assert(dualsense_feed(&st, &options, 64, DS_CREATE) == DsEdge.None and not st.down, 'Options, PS: no edge')
+  assert(dualsense_feed(&st, &idle, 64, DS_CREATE) == DsEdge.None)
+  assert(dualsense_feed(&st, &create, 64, DS_CREATE) == DsEdge.Press and st.down)
+  assert(dualsense_feed(&st, &create, 64, DS_CREATE) == DsEdge.None, 'held: one press')
+  assert(dualsense_feed(&st, &create_options, 64, DS_CREATE) == DsEdge.None, 'other buttons while held: no edge')
+  assert(dualsense_feed(&st, &create, 64, DS_CREATE) == DsEdge.None)
+  assert(dualsense_feed(&st, &idle, 5, DS_CREATE) == DsEdge.None and st.down, 'a short report does not release')
+  local junk = bt_report(0, 0, 0)
+  junk[20] = 1 -- CRC no longer matches
+  assert(dualsense_feed(&st, &junk, 78, DS_CREATE) == DsEdge.None and st.down, 'a bad report does not release')
+  assert(st.ignored == 2 and st.reports == 7)
+  assert(dualsense_feed(&st, &options, 64, DS_CREATE) == DsEdge.Release and not st.down, 'released while Options goes down')
+  assert(st.layout == DsLayout.Usb)
+
+  -- frames: a press and release between two frames still shows for one frame
+  st = {}
+  assert(not dualsense_take(&st))
+  dualsense_feed(&st, &create, 64, DS_CREATE)
+  dualsense_feed(&st, &idle, 64, DS_CREATE)
+  assert(dualsense_take(&st), 'a press shorter than a frame')
+  assert(not dualsense_take(&st), 'and only for that frame')
+  dualsense_feed(&st, &create, 64, DS_CREATE)
+  assert(dualsense_take(&st) and dualsense_take(&st), 'held across frames')
+  dualsense_feed(&st, &idle, 64, DS_CREATE)
+  assert(not dualsense_take(&st))
+  print('edges OK')
+end
+
+-- The reader against fake HID devices ------------------------------------------------
+local logs: [64]string
+local nlogs: integer = 0
+local function log_cb(level: cint, msg: string): void
+  print('log', level, msg)
+  if nlogs < 64 then logs[nlogs] = msg:copy() end
+  nlogs = nlogs + 1
+end
+local function logged(needle: string): boolean
+  for i = 0, < math.min(nlogs, 64) do
+    if logs[i]:find(needle, 1, true) > 0 then return true end
+  end
+  return false
+end
+
+do
+  local r: DualSenseReader
+  -- nothing plugged in: one scan, then none for DS_RESCAN_S
+  dualsense_reader_poll(&r, 10.0, log_cb)
+  assert(hid_fake.scans == 1 and not hid_is_open(&r.dev) and not dualsense_reader_take(&r))
+  for i = 1, 20 do dualsense_reader_poll(&r, 10.0 + i * 0.1, log_cb) end
+  assert(hid_fake.scans == 1, 'no rescan within a few seconds')
+  dualsense_reader_poll(&r, 13.1, log_cb)
+  assert(hid_fake.scans == 2, 'rescan after DS_RESCAN_S')
+
+  -- a mouse-like device, a DualShock 4, a DualSense whose vendor collection is not the gamepad, then the DualSense
+  hid_fake.devices[0] = { vid = 0x046D, pid = 0xC52B, usage_page = 1, usage = 2, input_len = 20 }
+  hid_fake.devices[1] = { vid = 0x054C, pid = 0x09CC, usage_page = 1, usage = 5, input_len = 64 }
+  hid_fake.devices[2] = { vid = 0x054C, pid = 0x0CE6, usage_page = 0xFF00, usage = 1, input_len = 64 }
+  hid_fake.devices[3] = { vid = 0x054C, pid = 0x0CE6, usage_page = 1, usage = 5, input_len = 64, open_error = 5 }
+  hid_fake.count = 4
+  dualsense_reader_poll(&r, 16.2, log_cb)
+  assert(hid_fake.scans == 3 and hid_fake.probes == 4 and hid_fake.opens == 0, 'a scan looks at DS_SCAN_BUDGET devices per frame')
+  assert(logged('could not be opened (error 5)'), 'an open failure is logged')
+  local n = nlogs
+  dualsense_reader_poll(&r, 16.3, log_cb) -- the pass ends
+  dualsense_reader_poll(&r, 19.4, log_cb)
+  assert(hid_fake.scans == 4 and nlogs == n, 'the same open failure is logged once')
+  dualsense_reader_poll(&r, 19.5, log_cb)
+  assert(hid_fake.scans == 4 and r.scan.info == nilptr)
+
+  hid_fake.devices[3].open_error = 0
+  dualsense_reader_poll(&r, 22.5, log_cb)
+  assert(hid_fake.opens == 1 and hid_is_open(&r.dev) and r.dev.pid == 0x0CE6 and r.dev.input_len == 64, 'the DualSense gamepad collection opens')
+  assert(logged('054c:0ce6 opened'))
+
+  -- reports drive the Create button; several arrive per frame
+  local idle = usb_report(0, 0, 0)
+  local create = usb_report(0, 0x10, 0)
+  local options = usb_report(0, 0x20, 0x02)
+  hid_fake_push(&idle, 64)
+  hid_fake_push(&options, 64)
+  dualsense_reader_poll(&r, 22.6, log_cb)
+  assert(not dualsense_reader_take(&r), 'Options and the touchpad are not Create')
+  assert(logged('DualSense reports: USB (id 0x01, 64 bytes)'))
+  hid_fake_push(&create, 64)
+  dualsense_reader_poll(&r, 22.7, log_cb)
+  assert(dualsense_reader_take(&r))
+  dualsense_reader_poll(&r, 22.8, log_cb) -- no report this frame: still held
+  assert(dualsense_reader_take(&r))
+  hid_fake_push(&idle, 64)
+  dualsense_reader_poll(&r, 22.9, log_cb)
+  assert(not dualsense_reader_take(&r))
+
+  -- the gesture logic sees Create like any pad button: a tap toggles
+  local pad: PadGestureState
+  local tapped = false
+  local t = 30.0
+  local seq: [4]*[64]uint8 = { &create, &create, &idle, &idle }
+  for i = 0, < 40 do
+    if i < 4 then hid_fake_push(seq[i], 64) end
+    dualsense_reader_poll(&r, t, log_cb)
+    if pad_gesture_update(&pad, dualsense_reader_take(&r), t) == PadGesture.Tap then tapped = true end
+    t = t + 0.016
+  end
+  assert(tapped, 'a Create tap reaches the pad gestures')
+
+  local ignored_logged = logged('does not read')
+  local junk: [64]uint8 = { 0x05 }
+  hid_fake_push(&junk, 64)
+  hid_fake_push(&junk, 64)
+  dualsense_reader_poll(&r, 31.0, log_cb)
+  assert(not ignored_logged and logged('does not read (id 0x05, 64 bytes)'), 'an unknown report is logged')
+
+  -- unplugged while Create is held: the button lets go, the device closes, a rescan follows later
+  hid_fake_push(&create, 64)
+  dualsense_reader_poll(&r, 32.0, log_cb)
+  assert(dualsense_reader_take(&r))
+  hid_fake.read_error = 1167 -- ERROR_DEVICE_NOT_CONNECTED
+  dualsense_reader_poll(&r, 32.1, log_cb)
+  assert(not hid_is_open(&r.dev) and hid_fake.closes == 1 and not dualsense_reader_take(&r), 'read error: closed, released')
+  assert(logged('read failed (error 1167)'))
+  local scans = hid_fake.scans
+  dualsense_reader_poll(&r, 33.0, log_cb)
+  assert(hid_fake.scans == scans, 'no rescan right after the unplug')
+  dualsense_reader_poll(&r, 35.2, log_cb)
+  assert(hid_is_open(&r.dev) and hid_fake.opens == 2, 'plugged back: found again')
+  hid_fake_push(&idle, 64)
+  dualsense_reader_poll(&r, 35.3, log_cb)
+  hid_fake.read_error = 1167
+  dualsense_reader_poll(&r, 35.4, log_cb)
+  assert(not hid_is_open(&r.dev))
+
+  -- a device that fails before its first report is reopened quietly
+  dualsense_reader_poll(&r, 38.5, log_cb)
+  assert(hid_is_open(&r.dev))
+  hid_fake.read_error = 31
+  dualsense_reader_poll(&r, 38.6, log_cb)
+  assert(not hid_is_open(&r.dev) and logged('read failed (error 31)'))
+  n = nlogs
+  for i = 1, 3 do
+    dualsense_reader_poll(&r, 38.6 + i * 3.5, log_cb) -- reopened
+    assert(hid_is_open(&r.dev))
+    hid_fake.read_error = 31
+    dualsense_reader_poll(&r, 38.7 + i * 3.5, log_cb) -- and failing again
+    assert(not hid_is_open(&r.dev))
+  end
+  assert(nlogs == n and hid_fake.opens == 6, 'no log line every few seconds')
+  dualsense_reader_poll(&r, 55.0, log_cb)
+  hid_fake_push(&idle, 64)
+  dualsense_reader_poll(&r, 55.1, log_cb)
+  assert(hid_is_open(&r.dev) and nlogs == n + 1, 'a report ends the quiet')
+
+  -- turned off or shut down: the handle goes
+  dualsense_reader_close(&r)
+  local closes = hid_fake.closes
+  assert(not hid_is_open(&r.dev) and closes == hid_fake.opens and r.scan.info == nilptr)
+  dualsense_reader_close(&r)
+  assert(hid_fake.closes == closes, 'closing twice is harmless')
+
+  -- Bluetooth: a padded simple report, then full reports
+  hid_fake.devices[3].input_len = 78
+  dualsense_reader_poll(&r, 40.0, log_cb)
+  assert(hid_is_open(&r.dev) and r.dev.input_len == 78)
+  local simple = simple_report(0, 0x10, 0)
+  hid_fake_push(&simple, 78)
+  dualsense_reader_poll(&r, 40.1, log_cb)
+  assert(dualsense_reader_take(&r) and r.button.layout == DsLayout.Simple)
+  local bt = bt_report(0, 0, 0)
+  hid_fake_push(&bt, 78)
+  dualsense_reader_poll(&r, 40.2, log_cb)
+  assert(not dualsense_reader_take(&r) and r.button.layout == DsLayout.Bluetooth)
+  assert(logged('Bluetooth simple (id 0x01, 78 bytes)') and logged('Bluetooth (id 0x31, 78 bytes)'))
+  dualsense_reader_close(&r)
+  hid_fake.count = 0
+  for i = 0, < math.min(nlogs, 64) do logs[i]:destroy() end
+  print('reader OK')
+end
+print('OK')

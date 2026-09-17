@@ -1,0 +1,299 @@
+-- HID devices read without blocking the render thread (Windows: setupapi and
+-- hid.dll). A scan walks the HID device interfaces a few per call and opens
+-- the first one both predicates accept; reads are overlapped, one ReadFile
+-- in flight at a time, collected by GetOverlappedResult once it finished.
+-- Host builds get a fake the tests fill through `hid_fake`.
+require 'string'
+
+global HID_BUFFER_SIZE: usize <comptime> = 1024 -- devices with longer input reports are skipped
+
+-- Windows x64 layouts, spelled out so no hid or setupapi header is needed.
+global HidOverlapped = @record{ internal: usize, internal_high: usize, offset: uint32, offset_high: uint32, event: pointer }
+global HidGuid = @record{ data1: uint32, data2: uint16, data3: uint16, data4: [8]uint8 }
+global HidInterfaceData = @record{ cb_size: uint32, class_guid: HidGuid, flags: uint32, reserved: usize } -- SP_DEVICE_INTERFACE_DATA
+global HidAttributes = @record{ size: uint32, vendor_id: uint16, product_id: uint16, version: uint16 } -- HIDD_ATTRIBUTES
+global HidCaps = @record{ -- HIDP_CAPS
+  usage: uint16, usage_page: uint16,
+  input_len: uint16, output_len: uint16, feature_len: uint16,
+  reserved: [17]uint16,
+  counts: [10]uint16,
+}
+## static_assert(HidOverlapped.value.size == 32, 'OVERLAPPED')
+## static_assert(HidInterfaceData.value.size == 32, 'SP_DEVICE_INTERFACE_DATA')
+## static_assert(HidAttributes.value.size == 12, 'HIDD_ATTRIBUTES')
+## static_assert(HidCaps.value.size == 64, 'HIDP_CAPS')
+
+global HidDevice = @record{
+  handle: pointer,       -- nilptr: closed
+  event: pointer,        -- manual-reset event of the overlapped read
+  ov: HidOverlapped,
+  pending: boolean,      -- a ReadFile is in flight
+  vid: uint16, pid: uint16,
+  input_len: uint16,     -- InputReportByteLength: every read asks for exactly this
+  last_error: uint32,    -- why the last open or read failed
+  buf: [HID_BUFFER_SIZE]uint8,
+}
+
+global HidScan = @record{
+  info: pointer,         -- the device information set of a running scan, nilptr: none
+  guid: HidGuid,
+  index: uint32,
+}
+
+global HidIdMatch = @function(vid: uint16, pid: uint16): boolean
+global HidCapsMatch = @function(usage_page: uint16, usage: uint16, input_len: uint16): boolean
+-- Opened: `dev` is open. OpenFailed: a device matched but did not open (`dev`
+-- holds its ids and the error), the scan goes on. Finished: the scan is over.
+global HidStep = @enum{ Running = 0, Opened, OpenFailed, Finished }
+
+global function hid_is_open(dev: *HidDevice): boolean
+  return dev.handle ~= nilptr
+end
+
+## if ccinfo.is_windows then
+## cinclude '<windows.h>'
+## linklib 'setupapi'
+## linklib 'hid'
+
+local function CreateFileA(name: cstring, access: uint32, share: uint32, sa: pointer, disposition: uint32, flags: uint32, template: pointer): pointer <cimport, nodecl> end
+local function CloseHandle(h: pointer): cint <cimport, nodecl> end
+local function ReadFile(h: pointer, buf: pointer, n: uint32, read: pointer, ov: pointer): cint <cimport, nodecl> end
+local function GetOverlappedResult(h: pointer, ov: pointer, n: pointer, wait: cint): cint <cimport, nodecl> end
+local function CancelIoEx(h: pointer, ov: pointer): cint <cimport, nodecl> end
+local function CreateEventA(sa: pointer, manual: cint, initial: cint, name: pointer): pointer <cimport, nodecl> end
+local function WaitForSingleObject(h: pointer, ms: uint32): uint32 <cimport, nodecl> end
+local function GetLastError(): uint32 <cimport, nodecl> end
+local GENERIC_READ: uint32 <cimport, nodecl, const>
+local FILE_SHARE_READ: uint32 <cimport, nodecl, const>
+local FILE_SHARE_WRITE: uint32 <cimport, nodecl, const>
+local OPEN_EXISTING: uint32 <cimport, nodecl, const>
+local FILE_FLAG_OVERLAPPED: uint32 <cimport, nodecl, const>
+local ERROR_IO_PENDING: uint32 <cimport, nodecl, const>
+local ERROR_IO_INCOMPLETE: uint32 <cimport, nodecl, const>
+local INVALID_HANDLE_VALUE: pointer <cimport, nodecl, const>
+
+-- hid.dll and setupapi.dll, declared here (BOOLEAN results are one byte)
+local function HidD_GetHidGuid(guid: *HidGuid): void <cimport> end
+local function HidD_GetAttributes(h: pointer, attrs: *HidAttributes): uint8 <cimport> end
+local function HidD_GetPreparsedData(h: pointer, data: *pointer): uint8 <cimport> end
+local function HidD_FreePreparsedData(data: pointer): uint8 <cimport> end
+local function HidP_GetCaps(data: pointer, caps: *HidCaps): int32 <cimport> end
+local function SetupDiGetClassDevsA(guid: *HidGuid, enumerator: pointer, parent: pointer, flags: uint32): pointer <cimport> end
+local function SetupDiEnumDeviceInterfaces(info: pointer, devinfo: pointer, guid: *HidGuid, index: uint32, data: *HidInterfaceData): cint <cimport> end
+local function SetupDiGetDeviceInterfaceDetailA(info: pointer, data: *HidInterfaceData, detail: pointer, size: uint32, required: pointer, devinfo: pointer): cint <cimport> end
+local function SetupDiDestroyDeviceInfoList(info: pointer): cint <cimport> end
+local DIGCF_PRESENT: uint32 <comptime> = 0x02
+local DIGCF_DEVICEINTERFACE: uint32 <comptime> = 0x10
+local HIDP_STATUS_SUCCESS: int32 <comptime> = 0x00110000
+local HID_PATH_MAX <comptime> = 1024
+-- SP_DEVICE_INTERFACE_DETAIL_DATA_A with room for the path; its cbSize is the
+-- fixed part only, sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_A) = 8 on x64
+local HidDetail = @record{ cb_size: uint32, path: [HID_PATH_MAX]cchar }
+local DETAIL_CB_SIZE: uint32 <comptime> = 8
+
+global function hid_scan_end(scan: *HidScan): void
+  if scan.info ~= nilptr then SetupDiDestroyDeviceInfoList(scan.info) end
+  $scan = {}
+end
+
+global function hid_scan_begin(scan: *HidScan): boolean
+  hid_scan_end(scan)
+  HidD_GetHidGuid(&scan.guid)
+  local info = SetupDiGetClassDevsA(&scan.guid, nilptr, nilptr, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE)
+  if info == nilptr or info == INVALID_HANDLE_VALUE then return false end
+  scan.info = info
+  return true
+end
+
+local function open_interface(scan: *HidScan, iface: *HidInterfaceData, id_ok: HidIdMatch, caps_ok: HidCapsMatch, dev: *HidDevice): HidStep
+  local detail: HidDetail
+  detail.cb_size = DETAIL_CB_SIZE
+  if SetupDiGetDeviceInterfaceDetailA(scan.info, iface, &detail, #HidDetail, nilptr, nilptr) == 0 then return HidStep.Running end
+  detail.path[HID_PATH_MAX - 1] = 0
+  local path = (@cstring)(&detail.path[0])
+  -- no access rights: enough for attributes and caps, and for devices other programs hold exclusively
+  local probe = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nilptr, OPEN_EXISTING, 0, nilptr)
+  if probe == INVALID_HANDLE_VALUE then return HidStep.Running end
+  local attrs: HidAttributes = { size = #HidAttributes }
+  local caps: HidCaps
+  local ok = HidD_GetAttributes(probe, &attrs) ~= 0 and id_ok(attrs.vendor_id, attrs.product_id)
+  if ok then
+    local pp: pointer = nilptr
+    ok = HidD_GetPreparsedData(probe, &pp) ~= 0
+    if ok then
+      ok = HidP_GetCaps(pp, &caps) == HIDP_STATUS_SUCCESS and caps.input_len > 0 and caps.input_len <= HID_BUFFER_SIZE
+           and caps_ok(caps.usage_page, caps.usage, caps.input_len)
+      HidD_FreePreparsedData(pp)
+    end
+  end
+  CloseHandle(probe)
+  if not ok then return HidStep.Running end
+  -- read only, shared: the game and other programs keep using the controller
+  local h = CreateFileA(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nilptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nilptr)
+  local ev: pointer = nilptr
+  if h ~= INVALID_HANDLE_VALUE then ev = CreateEventA(nilptr, 1, 0, nilptr) end
+  if h == INVALID_HANDLE_VALUE or ev == nilptr then
+    local err = GetLastError()
+    if h ~= INVALID_HANDLE_VALUE then CloseHandle(h) end
+    $dev = {}
+    dev.vid, dev.pid, dev.last_error = attrs.vendor_id, attrs.product_id, err
+    return HidStep.OpenFailed
+  end
+  $dev = {}
+  dev.handle, dev.event = h, ev
+  dev.ov.event = ev
+  dev.vid, dev.pid, dev.input_len = attrs.vendor_id, attrs.product_id, caps.input_len
+  return HidStep.Opened
+end
+
+-- Look at up to `budget` more device interfaces.
+global function hid_scan_step(scan: *HidScan, budget: integer, id_ok: HidIdMatch, caps_ok: HidCapsMatch, dev: *HidDevice): HidStep
+  if scan.info == nilptr then return HidStep.Finished end
+  for _ = 1, budget do
+    local iface: HidInterfaceData = { cb_size = #HidInterfaceData }
+    if SetupDiEnumDeviceInterfaces(scan.info, nilptr, &scan.guid, scan.index, &iface) == 0 then
+      hid_scan_end(scan) -- ERROR_NO_MORE_ITEMS, or a failure: this pass is over either way
+      return HidStep.Finished
+    end
+    scan.index = scan.index + 1
+    local step = open_interface(scan, &iface, id_ok, caps_ok, dev)
+    if step == HidStep.Opened then hid_scan_end(scan) end
+    if step ~= HidStep.Running then return step end
+  end
+  return HidStep.Running
+end
+
+-- One finished input report: its length (the bytes are in dev.buf), 0 when
+-- none has arrived yet, -1 when reading failed (unplugged: close the device).
+global function hid_read(dev: *HidDevice): isize
+  if dev.handle == nilptr then return -1 end
+  if not dev.pending then
+    local event = dev.event
+    dev.ov = {}
+    dev.ov.event = event
+    if ReadFile(dev.handle, &dev.buf, dev.input_len, nilptr, &dev.ov) == 0 then
+      local err = GetLastError()
+      if err ~= ERROR_IO_PENDING then
+        dev.last_error = err
+        return -1
+      end
+    end
+    dev.pending = true -- finished at once or not, GetOverlappedResult collects it
+  end
+  local n: uint32 = 0
+  if GetOverlappedResult(dev.handle, &dev.ov, &n, 0) == 0 then
+    local err = GetLastError()
+    if err == ERROR_IO_INCOMPLETE then return 0 end
+    dev.pending = false
+    dev.last_error = err
+    return -1
+  end
+  dev.pending = false
+  return (@isize)(n)
+end
+
+global function hid_close(dev: *HidDevice): void
+  local err = dev.last_error
+  if dev.handle ~= nilptr then
+    if dev.pending then
+      -- the read writes into dev.buf: let it finish before this module can be unloaded
+      CancelIoEx(dev.handle, &dev.ov)
+      WaitForSingleObject(dev.event, 1000)
+    end
+    CloseHandle(dev.handle)
+    if dev.event ~= nilptr then CloseHandle(dev.event) end
+  end
+  $dev = {}
+  dev.last_error = err
+end
+
+## else
+
+-- What a scan finds and what the open device reads, steered by the tests.
+global HidFakeDevice = @record{
+  vid: uint16, pid: uint16, usage_page: uint16, usage: uint16, input_len: uint16,
+  open_error: uint32, -- nonzero: opening fails with this error
+}
+global HID_FAKE_REPORTS <comptime> = 16
+global HidFake = @record{
+  devices: [4]HidFakeDevice,
+  count: integer,
+  scans: integer,      -- hid_scan_begin calls
+  probes: integer,     -- device interfaces looked at
+  opens: integer,
+  closes: integer,
+  reports: [HID_FAKE_REPORTS][128]uint8, -- queued input reports of the open device
+  lens: [HID_FAKE_REPORTS]usize,
+  head: integer, tail: integer,
+  read_error: uint32,  -- nonzero: the next read fails with it (unplugged)
+}
+global hid_fake: HidFake
+
+global function hid_fake_push(data: *[0]uint8, n: usize): void
+  assert(n <= 128 and hid_fake.tail - hid_fake.head < HID_FAKE_REPORTS, 'hid fake: report too long or queue full')
+  local slot = hid_fake.tail % HID_FAKE_REPORTS
+  for i: usize = 0, < n do hid_fake.reports[slot][i] = data[i] end
+  hid_fake.lens[slot] = n
+  hid_fake.tail = hid_fake.tail + 1
+end
+
+global function hid_scan_end(scan: *HidScan): void
+  $scan = {}
+end
+
+global function hid_scan_begin(scan: *HidScan): boolean
+  hid_scan_end(scan)
+  hid_fake.scans = hid_fake.scans + 1
+  scan.info = (@pointer)(1)
+  return true
+end
+
+global function hid_scan_step(scan: *HidScan, budget: integer, id_ok: HidIdMatch, caps_ok: HidCapsMatch, dev: *HidDevice): HidStep
+  if scan.info == nilptr then return HidStep.Finished end
+  for _ = 1, budget do
+    if scan.index >= (@uint32)(hid_fake.count) then
+      hid_scan_end(scan)
+      return HidStep.Finished
+    end
+    local d = hid_fake.devices[scan.index]
+    scan.index = scan.index + 1
+    hid_fake.probes = hid_fake.probes + 1
+    if id_ok(d.vid, d.pid) and d.input_len > 0 and d.input_len <= HID_BUFFER_SIZE and caps_ok(d.usage_page, d.usage, d.input_len) then
+      $dev = {}
+      dev.vid, dev.pid = d.vid, d.pid
+      if d.open_error ~= 0 then
+        dev.last_error = d.open_error
+        return HidStep.OpenFailed
+      end
+      dev.handle, dev.input_len = (@pointer)(1), d.input_len
+      hid_fake.opens = hid_fake.opens + 1
+      hid_scan_end(scan)
+      return HidStep.Opened
+    end
+  end
+  return HidStep.Running
+end
+
+global function hid_read(dev: *HidDevice): isize
+  if dev.handle == nilptr then return -1 end
+  if hid_fake.read_error ~= 0 then
+    dev.last_error = hid_fake.read_error
+    hid_fake.read_error = 0
+    return -1
+  end
+  if hid_fake.head == hid_fake.tail then return 0 end
+  local slot = hid_fake.head % HID_FAKE_REPORTS
+  hid_fake.head = hid_fake.head + 1
+  local n = hid_fake.lens[slot]
+  for i: usize = 0, < n do dev.buf[i] = hid_fake.reports[slot][i] end
+  return (@isize)(n)
+end
+
+global function hid_close(dev: *HidDevice): void
+  local err = dev.last_error
+  if dev.handle ~= nilptr then hid_fake.closes = hid_fake.closes + 1 end
+  $dev = {}
+  dev.last_error = err
+end
+
+## end
