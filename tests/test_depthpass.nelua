@@ -1,0 +1,413 @@
+-- World panels against the game's depth buffer, without a GPU: draw_world runs
+-- on a fake ImGui whose draw list follows ImGui 1.88's command rules, a fake
+-- game camera and a fake shim scene depth. Checks where the depth callbacks go
+-- in the draw list, what they would upload, when the capsule takes over, and
+-- that the capsule and `off` still behave as before.
+require 'core.host'
+require 'string'
+require 'arg'
+require 'io'
+require 'math'
+
+-- Fake ImGui -------------------------------------------------------------------------
+local MAX_CMDS <comptime> = 16384
+local MAX_VERTS <comptime> = 1000000
+local cmds: [MAX_CMDS]ImDrawCmd
+local verts: [MAX_VERTS]ImDrawVert
+local dl: ImDrawList
+local clip_stack: [64]ImVec4
+local clip_n = 0
+local viewport: ImGuiViewport = { Size = { 2560, 1440 } }
+local io_state: ImGuiIO
+local now: float64 = 100
+
+local function reset_list(): void
+  cmds[0] = { ClipRect = { 0, 0, 2560, 1440 } }
+  dl.CmdBuffer = { Size = 1, Capacity = MAX_CMDS, Data = (@*[0]ImDrawCmd)(&cmds) }
+  dl.VtxBuffer = { Size = 0, Capacity = MAX_VERTS, Data = (@*[0]ImDrawVert)(&verts) }
+  clip_n = 0
+end
+local function cur(): *ImDrawCmd return &cmds[dl.CmdBuffer.Size - 1] end
+-- ImDrawList::AddDrawCmd: a new command with the current header
+local function add_draw_cmd(): void
+  assert(dl.CmdBuffer.Size < MAX_CMDS)
+  cmds[dl.CmdBuffer.Size] = { ClipRect = cur().ClipRect, VtxOffset = (@cuint)(dl.VtxBuffer.Size) }
+  dl.CmdBuffer.Size = dl.CmdBuffer.Size + 1
+end
+local function push(n: integer, p: [4]ImVec2, col: uint32): void
+  local c = cur()
+  assert(c.UserCallback == nilptr, 'geometry never lands in a callback command')
+  for i = 0, < n do
+    assert(dl.VtxBuffer.Size < MAX_VERTS)
+    verts[dl.VtxBuffer.Size] = { pos = p[i], col = col }
+    dl.VtxBuffer.Size = dl.VtxBuffer.Size + 1
+  end
+  c.ElemCount = c.ElemCount + (n == 3 and 3 or 6)
+end
+local function quad(a: ImVec2, b: ImVec2, col: uint32): void
+  push(4, { a, vec2(b.x, a.y), b, vec2(a.x, b.y) }, col)
+end
+-- ImDrawList::_OnChangedClipRect: a used command is closed, an empty one takes the rect
+local function set_clip(r: ImVec4): void
+  if cur().ElemCount ~= 0 then add_draw_cmd() end
+  cur().ClipRect = r
+end
+-- ImDrawList::AddCallback (imgui 1.88 imgui_draw.cpp:473)
+local function fake_add_callback(l: *ImDrawList, cb: pointer, data: pointer): void
+  assert(l == &dl)
+  if cur().ElemCount ~= 0 then add_draw_cmd() end
+  cur().UserCallback = cb
+  cur().UserCallbackData = data
+  add_draw_cmd()
+end
+local function fake_rect_filled(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint): void quad(a, b, col) end
+local function fake_rect(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint, th: float32): void quad(a, b, col) end
+local function fake_line(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, th: float32): void quad(a, vec2(b.x + 1, b.y + 1), col) end
+local function fake_triangle(l: *ImDrawList, a: ImVec2, b: ImVec2, c: ImVec2, col: uint32): void push(3, { a, b, c, a }, col) end
+local function fake_text(l: *ImDrawList, font: *ImFont, size: float32, pos: ImVec2, col: uint32, tb: cstring, te: cstring, ww: float32, clip: *ImVec4): void
+  quad(pos, vec2(pos.x + 8, pos.y + 16), col)
+end
+local function fake_push_clip(l: *ImDrawList, a: ImVec2, b: ImVec2, intersect: boolean): void
+  clip_stack[clip_n] = cur().ClipRect
+  clip_n = clip_n + 1
+  set_clip(ImVec4{ a.x, a.y, b.x, b.y })
+end
+local function fake_pop_clip(l: *ImDrawList): void
+  clip_n = clip_n - 1
+  set_clip(clip_stack[clip_n])
+end
+local function fake_calc(pOut: *ImVec2, font: *ImFont, size: float32, mw: float32, ww: float32, tb: cstring, te: cstring, rem: *cstring): void
+  $pOut = vec2(8, 16)
+end
+local function fake_bg(): *ImDrawList return &dl end
+local function fake_viewport(): *ImGuiViewport return &viewport end
+local function fake_mouse(out: *ImVec2): void $out = vec2(-5000, -5000) end
+local function fake_false_flags(flags: cint): boolean return false end
+local function fake_want(want: boolean): void end
+local function fake_font(): *ImFont return nilptr end
+local function fake_font_size(): float32 return 16 end
+local function fake_time(): float64 return now end
+local function fake_io(): *ImGuiIO return &io_state end
+local function fake_clicked(button: cint, rep: boolean): boolean return false end
+
+local function resolver(name: cstring): pointer
+  local n: string = name
+  if n == 'ImDrawList_AddCallback' then return (@pointer)(fake_add_callback) end
+  if n == 'ImDrawList_AddRectFilled' then return (@pointer)(fake_rect_filled) end
+  if n == 'ImDrawList_AddRect' then return (@pointer)(fake_rect) end
+  if n == 'ImDrawList_AddLine' then return (@pointer)(fake_line) end
+  if n == 'ImDrawList_AddTriangleFilled' then return (@pointer)(fake_triangle) end
+  if n == 'ImDrawList_AddText_FontPtr' then return (@pointer)(fake_text) end
+  if n == 'ImDrawList_PushClipRect' then return (@pointer)(fake_push_clip) end
+  if n == 'ImDrawList_PopClipRect' then return (@pointer)(fake_pop_clip) end
+  if n == 'ImFont_CalcTextSizeA' then return (@pointer)(fake_calc) end
+  if n == 'igGetBackgroundDrawList_Nil' then return (@pointer)(fake_bg) end
+  if n == 'igGetMainViewport' then return (@pointer)(fake_viewport) end
+  if n == 'igGetMousePos' then return (@pointer)(fake_mouse) end
+  if n == 'igIsWindowHovered' then return (@pointer)(fake_false_flags) end
+  if n == 'igSetNextFrameWantCaptureMouse' then return (@pointer)(fake_want) end
+  if n == 'igSetNextFrameWantCaptureKeyboard' then return (@pointer)(fake_want) end
+  if n == 'igGetFont' then return (@pointer)(fake_font) end
+  if n == 'igGetFontSize' then return (@pointer)(fake_font_size) end
+  if n == 'igGetTime' then return (@pointer)(fake_time) end
+  if n == 'igGetIO' then return (@pointer)(fake_io) end
+  if n == 'igIsMouseClicked' then return (@pointer)(fake_clicked) end
+  return nilptr
+end
+
+-- Fake game ---------------------------------------------------------------------------
+-- The player at (10, 0, 20) faces +Z; `pin here` puts the panel 2.5 yalms ahead
+-- of them. The camera stands behind, so the player is between it and the panel.
+local EYE_X <comptime> = 10
+local EYE_Y <comptime> = 1.7
+local EYE_Z <comptime> = 15
+local standard_z = false
+local function fake_camera(c: *GuCamera): cint
+  -- reversed Z, infinite far plane, near 0.1, FoV 0.78, looking along +Z
+  $c = { width = 2560, height = 1440 }
+  local f = 1 / math.tan(0.78 / 2)
+  local a = f * 1440 / 2560
+  -- view: right (-1,0,0), up (0,1,0), back (0,0,-1) for a camera looking along +Z
+  c.m[0] = -a
+  c.m[5] = f
+  c.m[11] = 1                      -- w = z - eye z
+  c.m[12] = EYE_X * a
+  c.m[13] = -EYE_Y * f
+  c.m[15] = -EYE_Z
+  c.m[14] = 0.1                    -- reversed Z: clip z is the near plane
+  if standard_z then
+    c.m[10], c.m[14] = 1, -EYE_Z - 0.1
+  end
+  return 1
+end
+local function fake_object(which: cint, id: uint64, out: *GuObject): cint
+  $out = {}
+  if which == WORLD_PLAYER then
+    $out = { x = 10, y = 0, z = 20, rotation = 0, entity_id = 7, territory = 132, found = 1, height = 1.7, hitbox_radius = 0.5 }
+  end
+  return 1
+end
+local scene_ok: cint = 1
+local scene: GuSceneDepth = {
+  srv = (@pointer)(0x5000), ui_device = (@pointer)(0x6000),
+  actual_width = 1280, actual_height = 720, allocated_width = 2560, allocated_height = 1440,
+}
+local function fake_scene_depth(out: *GuSceneDepth): cint
+  $out = scene
+  return scene_ok
+end
+local depth_logs = 0 -- depth status lines in the log
+local function quiet(level: cint, msg: cstring): void
+  local m: string = msg
+  if m:find('depth test unavailable', 1, true) > 0 or m:find('depth-tested', 1, true) > 0 then depth_logs = depth_logs + 1 end
+  if level >= LOG_WARN then io.write('[log ', level, '] ', msg, '\n') end
+end
+
+-- Driving it --------------------------------------------------------------------------
+local Frame = @record{
+  begins: integer, ends: integer, resets: integer, others: integer,
+  first_begin: integer, first_geometry: integer, last_geometry: integer, last_end: integer, last_reset: integer,
+  cut: integer,  -- vertices the capsule faded out completely
+}
+
+local function frame(): Frame
+  reset_list()
+  now = now + 1 / 60
+  draw_world(now)
+  local r: Frame = { first_begin = -1, first_geometry = -1, last_geometry = -1, last_end = -1, last_reset = -1 }
+  for i = 0, < dl.CmdBuffer.Size do
+    local c = &cmds[i]
+    local cb = c.UserCallback
+    if cb == (@pointer)(depthpass_begin_cb) then
+      r.begins = r.begins + 1
+      if r.first_begin < 0 then r.first_begin = i end
+    elseif cb == (@pointer)(depthpass_end_cb) then
+      r.ends = r.ends + 1
+      r.last_end = i
+    elseif cb == (@pointer)(IMDRAW_CALLBACK_RESET) then
+      r.resets = r.resets + 1
+      r.last_reset = i
+    elseif cb ~= nilptr then
+      r.others = r.others + 1
+    elseif c.ElemCount > 0 then
+      if r.first_geometry < 0 then r.first_geometry = i end
+      r.last_geometry = i
+    end
+  end
+  for i = 0, < dl.VtxBuffer.Size do
+    if verts[i].col >> 24 == 0 then r.cut = r.cut + 1 end
+  end
+  return r
+end
+
+-- What Dalamud's renderer does with the list: run each callback in order (the
+-- reset is its own; draw commands are not drawn here).
+local function render(): void
+  for i = 0, < dl.CmdBuffer.Size do
+    local cb = cmds[i].UserCallback
+    if cb ~= nilptr and cb ~= (@pointer)(IMDRAW_CALLBACK_RESET) then
+      local f = (@function(*ImDrawList, *ImDrawCmd): void)(cb)
+      f(&dl, &cmds[i])
+    end
+  end
+end
+
+local function set_occlusion(mode: cstring): void
+  local sb: stringbuilder
+  sb:writef("CONFIG.world.occlusion = '%s'", mode)
+  local code = sb:promote()
+  assert(luaL_loadstring(policy.L, (@cstring)(code.data)) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  code:destroy()
+  policy_refresh()
+end
+
+local function no_depth(f: Frame, what: string): void
+  assert(f.begins == 0 and f.ends == 0 and f.resets == 0 and f.others == 0, what)
+end
+
+-- Setup ---------------------------------------------------------------------------------
+local api: GuHostApi = {
+  size = #GuHostApi, log = quiet, get_camera = fake_camera, get_object = fake_object, get_scene_depth = fake_scene_depth,
+}
+local dir: string = arg[1]
+assert(gu_init(&api, (@cstring)(dir.data)) == 0)
+assert(imgui_bind(resolver, nilptr) > 0)
+
+-- the embedded shader is the committed bytecode
+do
+  local fh = io.open('core/shaders/panel_depth.dxbc', 'rb')
+  assert(fh:isopen(), 'panel_depth.dxbc')
+  local bytes = fh:read('a')
+  fh:close()
+  assert(#bytes == #PANEL_DEPTH_DXBC and bytes:subview(1, 4) == 'DXBC', 'embedded DXBC')
+  for i = 0, < #bytes do assert(bytes.data[i] == PANEL_DEPTH_DXBC[i], 'embedded DXBC bytes') end
+  bytes:destroy()
+end
+
+local profile: Profile = { name = 'test', transport = 'superlogical' }
+local s: Session
+assert(s:init(501, &profile, 80, 24, nilptr))
+s.exited = false
+s.appear = 1
+host.world:push(&s)
+assert(#policy_world_command(501, 'here') == 0)
+host.world_visible = true
+host.world_rez = 1
+host.world_last_time = now
+
+-- Depth: the test goes around the panel ---------------------------------------------------
+assert(policy.world_occlusion == WORLD_OCCLUSION_DEPTH, 'depth is the default')
+local f = frame()
+print('depth frame:', f.begins, f.ends, f.resets, 'geometry cmds', f.first_geometry, '..', f.last_geometry, 'cut', f.cut)
+assert(depthpass.ready and #depthpass.reason == 0, depthpass.reason)
+assert(f.begins == 1 and f.ends == 1 and f.resets == 1 and f.others == 0, 'one begin, one end, one reset')
+assert(f.first_geometry > f.first_begin, 'the depth test is installed before the panel draws anything (glow included)')
+assert(f.last_geometry < f.last_end and f.last_end < f.last_reset, 'unbound after the last panel command, then the renderer resets')
+assert(f.last_reset == dl.CmdBuffer.Size - 2, 'nothing after the reset but the empty command ImGui adds')
+assert(cmds[f.first_begin].UserCallbackData == &depthpass.pool[0], 'the callback carries the panel constants')
+local depth_cut = f.cut -- vertices transparent by themselves; compared with `off` below
+do
+  local p = &depthpass.pool[0]
+  assert(p.v[36] == (@float32)(0.1) and p.v[39] == 1, 'near plane and full strength')
+  assert(p.v[34] == 0.5 and p.v[35] == 0.5, 'depth rendered at half resolution: half a texel per pixel')
+  assert(p.v[32] == 2560 and p.v[33] == 1440, 'viewport')
+  assert(p.v[40] == 2560 and p.v[41] == 1440 and p.v[42] == 1280 and p.v[43] == 720, 'depth texture: allocated, then rendered size')
+  assert(math.abs(p.v[37] - 0.01) < 1e-6 and p.v[38] == 1, 'tolerance and edge width from lua/world.lua')
+  -- every panel vertex is on the surface the shader intersects, at its depth
+  local _, pl = policy_world_place(501, now, false)
+  local want = pl.z - EYE_Z
+  for i = 0, < dl.VtxBuffer.Size do
+    local d = world_panel_ray_depth(p, verts[i].pos.x, verts[i].pos.y)
+    assert(math.abs(d - want) < 0.01 * want, 'vertex depth from the constants')
+  end
+end
+-- the renderer runs the callbacks: the begin callback uploads the pool slot
+assert(depthpass.ran == 0)
+render()
+assert(depthpass.ran == 1, 'begin callback ran')
+for i = 0, < 44 do assert(depthpass.last_upload.v[i] == depthpass.pool[0].v[i], 'uploaded constants') end
+local logs = depth_logs
+f = frame()
+render()
+assert(f.begins == 1 and depthpass.ready, 'still depth while the callbacks run')
+assert(depth_logs == logs and logs > 0, 'the depth status is logged once, not every frame')
+assert(run_command('depth') == 0, '/term depth reports')
+depth_logs = 0
+
+-- /term depth show: the panel shows the test (strength below 0) until toggled back
+assert(run_command('depth show') == 0 and depthpass.show)
+f = frame()
+render()
+assert(f.begins == 1 and depthpass.pool[0].v[39] == -1, 'show: negative strength')
+assert(run_command('depth show') == 0 and not depthpass.show)
+f = frame()
+render()
+assert(depthpass.pool[0].v[39] == 1, 'show off: full strength')
+
+-- the full-screen flight leaves the world: no test from its first frame (the
+-- vertices already slide off the surface the shader intersects), nor once flat
+host.world_full_id = 501
+host.world_full_t = 0.0001
+f = frame()
+render()
+assert(f.begins == 1 and depthpass.pool[0].v[39] == 0, 'strength 0 as soon as the flight starts')
+host.world_full_t = 1
+f = frame()
+render()
+assert(f.begins == 1 and depthpass.pool[0].v[39] == 0, 'strength 0 when full screen')
+host.world_full_id = 0
+host.world_full_t = 0
+host.world_full_last = 0
+f = frame()
+render()
+assert(depthpass.pool[0].v[39] == 1, 'strength back')
+
+-- Capsule and off ---------------------------------------------------------------------------
+set_occlusion('off')
+f = frame()
+no_depth(f, 'off: no callbacks')
+assert(f.cut == depth_cut, 'off: nothing cut out, and depth adds no cut-out of its own')
+set_occlusion('capsule')
+f = frame()
+no_depth(f, 'capsule: no callbacks')
+print('capsule cut', f.cut)
+assert(f.cut > depth_cut, 'capsule: the character is cut out of the panel behind it')
+local capsule_cut = f.cut
+set_occlusion('depth')
+f = frame()
+render()
+assert(f.begins == 1 and f.cut == depth_cut, 'switching back to depth live')
+
+-- Fallbacks to the capsule --------------------------------------------------------------------
+local function expect_capsule(what: string, reason: string): void
+  local g = frame()
+  render()
+  no_depth(g, what)
+  assert(g.cut == capsule_cut, what)
+  assert(not depthpass.ready and depthpass.reason:find(reason, 1, true) > 0, depthpass.reason)
+end
+
+host.api.get_scene_depth = nilptr
+expect_capsule('old shim', 'old shim')
+host.api.get_scene_depth = fake_scene_depth
+scene_ok = 0
+expect_capsule('no depth from the game', 'no scene depth')
+scene_ok = 1
+scene.srv = nilptr
+expect_capsule('no view', 'no shader resource view')
+scene.srv = (@pointer)(0x5000)
+standard_z = true
+expect_capsule('standard-Z camera', 'reversed-Z')
+standard_z = false
+f = frame()
+render()
+assert(f.begins == 1 and depthpass.ready, 'depth recovers by itself')
+assert(depth_logs == 5, 'each change of reason logged once: four fallbacks and the recovery')
+
+-- a renderer that never runs callbacks: the capsule takes over, until retried
+local switched = -1
+for i = 1, 200 do
+  f = frame() -- no render(): the callbacks are dropped
+  if f.begins == 0 and switched < 0 then switched = i end
+end
+print('capsule after', switched, 'frames of skipped callbacks')
+assert(switched > 100 and switched <= 125, 'skipped callbacks switch to the capsule after a while')
+assert(f.cut == capsule_cut and depthpass.broken and depthpass.reason:find('callbacks', 1, true) > 0, depthpass.reason)
+assert(run_command('depth retry') == 0)
+f = frame()
+render()
+assert(f.begins == 1 and depthpass.ready and not depthpass.broken, 'retry brings depth back')
+
+-- callbacks that run but bind nothing (a failed Map, a missing GPU object)
+-- count as skipped: the capsule takes over instead of an unoccluded panel
+depthpass.host_bind_fails = true
+switched = -1
+for i = 1, 200 do
+  f = frame()
+  render()
+  if f.begins == 0 and switched < 0 then switched = i end
+end
+assert(switched > 100 and switched <= 125 and f.cut == capsule_cut and depthpass.broken, 'unbound callbacks switch to the capsule')
+depthpass.host_bind_fails = false
+assert(run_command('depth retry') == 0)
+f = frame()
+render()
+assert(f.begins == 1 and depthpass.ready and depthpass.ran > 0, 'retry after unbound callbacks')
+
+-- the pool of panel constants: a full pool refuses (the panel uses the capsule)
+do
+  local fr: GuCamera
+  fake_camera(&fr)
+  assert(depthpass_frame_begin(fake_scene_depth, &fr))
+  local _, pl = policy_world_place(501, now, false)
+  local pb = world_basis(pl)
+  for i = 1, DEPTHPASS_POOL do assert(depthpass_panel_begin(&dl, &pb, 1), 'pool slot') end
+  assert(not depthpass_panel_begin(&dl, &pb, 1), 'pool exhausted')
+  assert(depthpass_frame_begin(fake_scene_depth, &fr) and depthpass_panel_begin(&dl, &pb, 1), 'the pool is per frame')
+end
+
+host.world:clear()
+s:destroy()
+gu_shutdown()
+assert(not depthpass.ready and depthpass.used == 0, 'shutdown resets the depth pass')
+print('depthpass OK')

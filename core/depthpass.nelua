@@ -1,0 +1,415 @@
+-- World panels behind game geometry: a per-pixel depth test against the
+-- game's own depth buffer, done inside Dalamud's ImGui pass.
+--
+-- Around each world panel in the background draw list, draw-list callbacks
+-- swap in core/shaders/panel_depth.hlsl with the game's scene depth at t1, a
+-- comparison sampler at s1 and the panel's constants at b0, then hand the
+-- renderer back its own state
+-- (IMDRAW_CALLBACK_RESET). Nothing is hooked: the callbacks run on Dalamud's
+-- D3D11 context while it draws this frame's ImGui data, inside the same
+-- Present as the frame that queued them.
+--
+-- Whether the depth path can be used this frame, the constants and the
+-- callback order are portable and tested on the host; only the D3D11 calls are
+-- Windows code. Whenever something is missing the caller falls back to the
+-- character capsule (core/app/worldview.nelua) and `reason` says why.
+require 'memory'
+require 'stringbuilder'
+require 'core.imgui'
+require 'core.world'
+require 'core.policy'
+
+-- Filled by the shim; layout must match GuSceneDepth in shim/Native.cs. Both
+-- pointers are borrowed (the game owns the view, Dalamud the device) and never
+-- released here.
+global GuSceneDepth = @record{
+  srv: pointer,               -- ID3D11ShaderResourceView of RenderTargetManager.DepthStencil
+  ui_device: pointer,         -- ID3D11Device Dalamud draws ImGui with (UiBuilder.DeviceHandle)
+  actual_width: uint32,       -- area rendered this frame (dynamic resolution renders less)
+  actual_height: uint32,
+  allocated_width: uint32,    -- texture size
+  allocated_height: uint32,
+}
+
+global DEPTHPASS_POOL <comptime> = 32
+-- Frames in a row whose callbacks never ran before the renderer counts as
+-- skipping them (a renderer that ignores callbacks would leave panels with no
+-- occlusion at all); the capsule takes over.
+local MISS_LIMIT <comptime> = 120
+-- LOG_INFO / LOG_WARN (core/app/state.nelua)
+local LOG_INFO <comptime> = 1
+local LOG_WARN <comptime> = 2
+
+-- The shader, compiled by tools/build-shaders.lua and embedded at build time
+-- (no generated C: a static initializer, so it also exists under noentrypoint).
+## local f = io.open('core/shaders/panel_depth.dxbc', 'rb')
+## if not f then static_error('core/shaders/panel_depth.dxbc not found (build from the repository root)') end
+## local dxbc = f:read('a') f:close()
+## local init = aster.InitList{}
+## for i = 1, #dxbc do init[i] = aster.Number{dxbc:byte(i)} end
+global PANEL_DEPTH_DXBC: [#[#dxbc]#]byte <const> = #[init]#
+
+global DepthPass = @record{
+  ready: boolean,             -- this frame's panels may use the depth test
+  broken: boolean,            -- latched until the device changes or `/term depth retry`
+  broken_reason: string,
+  reason: string,             -- why depth is not in use this frame ('' when it is); static text
+  logged: string,             -- last reason reported to the log
+  logged_once: boolean,
+  show: boolean,              -- `/term depth show`: panels show the test instead of applying it
+  scene: GuSceneDepth,        -- this frame's depth
+  frame: WorldDepthFrame,
+  cam: GuCamera,              -- this frame's camera, for the panels' constants
+  format: cint,               -- DXGI format of the depth view (Windows)
+  hresult: clong,             -- last failed D3D11 call
+  used: integer,              -- pool slots taken this frame
+  pool: [DEPTHPASS_POOL]WorldDepthParams, -- read by the callbacks at render time
+  issued: integer,            -- begin callbacks queued in the last depth frame
+  ran: uint64,                -- begin callbacks the renderer has run (total)
+  ran_seen: uint64,
+  misses: integer,
+  last_upload: WorldDepthParams, -- host builds: what the last begin callback would upload
+  host_bind_fails: boolean,   -- host builds: the tests' stand-in for a callback that binds nothing
+}
+
+global depthpass: DepthPass
+
+local function fail(reason: string): boolean
+  depthpass.reason = reason
+  return false
+end
+
+local function latch(reason: string): boolean
+  depthpass.broken = true
+  depthpass.broken_reason = reason
+  return fail(reason)
+end
+
+## if ccinfo.is_windows then
+-- D3D11 through the C COM macros. Each macro is imported as a typed function:
+-- it expands to (This)->lpVtbl->Method(This, ...), so `this` must be typed.
+## cdefine 'COBJMACROS'
+## cinclude '<d3d11.h>'
+
+local HRESULT <cimport, nodecl> = @clong
+local GUID <cimport, nodecl> = @record{ Data1: culong, Data2: cushort, Data3: cushort, Data4: [8]cuchar }
+local ID3D11Device <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11DeviceContext <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11PixelShader <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11Buffer <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11Resource <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11ShaderResourceView <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11SamplerState <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11ClassLinkage <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11ClassInstance <cimport, nodecl, forwarddecl> = @record{}
+local D3D11_BUFFER_DESC <cimport, nodecl> = @record{ ByteWidth: cuint, Usage: cint, BindFlags: cuint, CPUAccessFlags: cuint, MiscFlags: cuint, StructureByteStride: cuint }
+local D3D11_MAPPED_SUBRESOURCE <cimport, nodecl> = @record{ pData: pointer, RowPitch: cuint, DepthPitch: cuint }
+local D3D11_SHADER_RESOURCE_VIEW_DESC <cimport, nodecl> = @record{ Format: cint, ViewDimension: cint }
+local D3D11_SAMPLER_DESC <cimport, nodecl> = @record{ Filter: cint, AddressU: cint, AddressV: cint, AddressW: cint, MipLODBias: float32,
+  MaxAnisotropy: cuint, ComparisonFunc: cint, BorderColor: [4]float32, MinLOD: float32, MaxLOD: float32 }
+
+local function ID3D11Device_CreatePixelShader(this: *ID3D11Device, code: pointer, len: csize, linkage: *ID3D11ClassLinkage, out: **ID3D11PixelShader): HRESULT <cimport, nodecl> end
+local function ID3D11Device_CreateBuffer(this: *ID3D11Device, desc: *D3D11_BUFFER_DESC, data: pointer, out: **ID3D11Buffer): HRESULT <cimport, nodecl> end
+local function ID3D11Device_CreateSamplerState(this: *ID3D11Device, desc: *D3D11_SAMPLER_DESC, out: **ID3D11SamplerState): HRESULT <cimport, nodecl> end
+local function ID3D11Device_GetImmediateContext(this: *ID3D11Device, out: **ID3D11DeviceContext): void <cimport, nodecl> end
+local function ID3D11Device_QueryInterface(this: *ID3D11Device, riid: *GUID, out: *pointer): HRESULT <cimport, nodecl> end
+local function ID3D11Device_Release(this: *ID3D11Device): culong <cimport, nodecl> end
+local function ID3D11DeviceContext_Map(this: *ID3D11DeviceContext, res: *ID3D11Resource, sub: cuint, kind: cint, flags: cuint, out: *D3D11_MAPPED_SUBRESOURCE): HRESULT <cimport, nodecl> end
+local function ID3D11DeviceContext_Unmap(this: *ID3D11DeviceContext, res: *ID3D11Resource, sub: cuint): void <cimport, nodecl> end
+local function ID3D11DeviceContext_PSSetShader(this: *ID3D11DeviceContext, ps: *ID3D11PixelShader, inst: **ID3D11ClassInstance, n: cuint): void <cimport, nodecl> end
+local function ID3D11DeviceContext_PSSetShaderResources(this: *ID3D11DeviceContext, slot: cuint, n: cuint, views: **ID3D11ShaderResourceView): void <cimport, nodecl> end
+local function ID3D11DeviceContext_PSSetSamplers(this: *ID3D11DeviceContext, slot: cuint, n: cuint, samplers: **ID3D11SamplerState): void <cimport, nodecl> end
+local function ID3D11DeviceContext_PSSetConstantBuffers(this: *ID3D11DeviceContext, slot: cuint, n: cuint, bufs: **ID3D11Buffer): void <cimport, nodecl> end
+local function ID3D11DeviceContext_Release(this: *ID3D11DeviceContext): culong <cimport, nodecl> end
+local function ID3D11PixelShader_Release(this: *ID3D11PixelShader): culong <cimport, nodecl> end
+local function ID3D11Buffer_Release(this: *ID3D11Buffer): culong <cimport, nodecl> end
+local function ID3D11SamplerState_Release(this: *ID3D11SamplerState): culong <cimport, nodecl> end
+local function ID3D11ShaderResourceView_GetDesc(this: *ID3D11ShaderResourceView, out: *D3D11_SHADER_RESOURCE_VIEW_DESC): void <cimport, nodecl> end
+local function ID3D11ShaderResourceView_GetDevice(this: *ID3D11ShaderResourceView, out: **ID3D11Device): void <cimport, nodecl> end
+
+local IID_IUNKNOWN: GUID = { Data1 = 0, Data2 = 0, Data3 = 0, Data4 = { 0xC0, 0, 0, 0, 0, 0, 0, 0x46 } }
+local DXGI_FORMAT_R24_UNORM_X8_TYPELESS <comptime> = 46
+local DXGI_FORMAT_R32_FLOAT <comptime> = 41
+local DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS <comptime> = 21
+local D3D11_SRV_DIMENSION_TEXTURE2D <comptime> = 4
+local D3D11_USAGE_DYNAMIC <comptime> = 2
+local D3D11_BIND_CONSTANT_BUFFER <comptime> = 4
+local D3D11_CPU_ACCESS_WRITE <comptime> = 0x10000
+local D3D11_MAP_WRITE_DISCARD <comptime> = 4
+local D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR <comptime> = 0x95
+local D3D11_TEXTURE_ADDRESS_CLAMP <comptime> = 3
+local D3D11_COMPARISON_GREATER_EQUAL <comptime> = 7
+
+local gpu_device: *ID3D11Device        -- Dalamud's device the objects below belong to (borrowed)
+local gpu_ctx: *ID3D11DeviceContext    -- its immediate context (our reference)
+local gpu_ps: *ID3D11PixelShader
+local gpu_cb: *ID3D11Buffer
+local gpu_sampler: *ID3D11SamplerState
+local gpu_checked_srv: pointer         -- depth view already known to belong to gpu_device
+
+local function gpu_release(): void
+  if gpu_ps ~= nilptr then ID3D11PixelShader_Release(gpu_ps) gpu_ps = nilptr end
+  if gpu_cb ~= nilptr then ID3D11Buffer_Release(gpu_cb) gpu_cb = nilptr end
+  if gpu_sampler ~= nilptr then ID3D11SamplerState_Release(gpu_sampler) gpu_sampler = nilptr end
+  if gpu_ctx ~= nilptr then ID3D11DeviceContext_Release(gpu_ctx) gpu_ctx = nilptr end
+  gpu_device = nilptr
+  gpu_checked_srv = nilptr
+end
+
+-- COM identity: two interface pointers are the same object when their
+-- IUnknown pointers are equal.
+local function same_object(a: *ID3D11Device, b: *ID3D11Device): boolean
+  if a == nilptr or b == nilptr then return false end
+  if a == b then return true end
+  local ua: pointer, ub: pointer
+  if ID3D11Device_QueryInterface(a, &IID_IUNKNOWN, &ua) < 0 then return false end
+  local same = false
+  if ID3D11Device_QueryInterface(b, &IID_IUNKNOWN, &ub) >= 0 then
+    same = ua == ub
+    ID3D11Device_Release((@*ID3D11Device)(ub))
+  end
+  ID3D11Device_Release((@*ID3D11Device)(ua))
+  return same
+end
+
+local function gpu_prepare(sd: *GuSceneDepth): boolean
+  if sd.ui_device == nilptr then return fail('Dalamud reports no D3D11 device') end
+  local dev = (@*ID3D11Device)(sd.ui_device)
+  if dev ~= gpu_device then
+    -- a new device gets a fresh start
+    gpu_release()
+    depthpass.broken = false
+    gpu_device = dev
+  end
+  if depthpass.broken then return fail(depthpass.broken_reason) end
+  -- the view's kind every frame: a view the game recreates can reuse an address
+  local srv = (@*ID3D11ShaderResourceView)(sd.srv)
+  local desc: D3D11_SHADER_RESOURCE_VIEW_DESC
+  ID3D11ShaderResourceView_GetDesc(srv, &desc)
+  depthpass.format = desc.Format
+  if desc.ViewDimension ~= D3D11_SRV_DIMENSION_TEXTURE2D or (desc.Format ~= DXGI_FORMAT_R24_UNORM_X8_TYPELESS
+     and desc.Format ~= DXGI_FORMAT_R32_FLOAT and desc.Format ~= DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS) then
+    return fail('the scene depth view has an unexpected format or is multisampled')
+  end
+  -- its device only when the view changes (a new device resets the cache above)
+  if sd.srv ~= gpu_checked_srv then
+    local owner: *ID3D11Device
+    ID3D11ShaderResourceView_GetDevice(srv, &owner)
+    local same = same_object(owner, dev)
+    if owner ~= nilptr then ID3D11Device_Release(owner) end
+    if not same then return fail('the scene depth belongs to a different D3D11 device than ImGui') end
+    gpu_checked_srv = sd.srv
+  end
+  -- each object on its own, so one that failed before is not left missing
+  if gpu_ps == nilptr then
+    local hr = ID3D11Device_CreatePixelShader(dev, &PANEL_DEPTH_DXBC, #PANEL_DEPTH_DXBC, nilptr, &gpu_ps)
+    if hr < 0 then
+      gpu_ps = nilptr
+      depthpass.hresult = hr
+      return latch('CreatePixelShader rejected the panel depth shader')
+    end
+  end
+  if gpu_cb == nilptr then
+    local bd: D3D11_BUFFER_DESC = {
+      ByteWidth = #WorldDepthParams, Usage = D3D11_USAGE_DYNAMIC,
+      BindFlags = D3D11_BIND_CONSTANT_BUFFER, CPUAccessFlags = D3D11_CPU_ACCESS_WRITE,
+    }
+    local hr = ID3D11Device_CreateBuffer(dev, &bd, nilptr, &gpu_cb)
+    if hr < 0 then
+      gpu_cb = nilptr
+      depthpass.hresult = hr
+      return latch('CreateBuffer failed for the panel depth constants')
+    end
+  end
+  if gpu_sampler == nilptr then
+    local sdesc: D3D11_SAMPLER_DESC = {
+      Filter = D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR, AddressU = D3D11_TEXTURE_ADDRESS_CLAMP,
+      AddressV = D3D11_TEXTURE_ADDRESS_CLAMP, AddressW = D3D11_TEXTURE_ADDRESS_CLAMP,
+      ComparisonFunc = D3D11_COMPARISON_GREATER_EQUAL, MaxLOD = 3.402823466e38,
+    }
+    local hr = ID3D11Device_CreateSamplerState(dev, &sdesc, &gpu_sampler)
+    if hr < 0 then
+      gpu_sampler = nilptr
+      depthpass.hresult = hr
+      return latch('CreateSamplerState failed for the depth comparison')
+    end
+  end
+  if gpu_ctx == nilptr then
+    ID3D11Device_GetImmediateContext(dev, &gpu_ctx)
+    if gpu_ctx == nilptr then return latch('the D3D11 device has no immediate context') end
+  end
+  return true
+end
+## else
+local function gpu_prepare(sd: *GuSceneDepth): boolean
+  if depthpass.broken then return fail(depthpass.broken_reason) end
+  return true
+end
+## end
+
+-- Draw-list callbacks (C ABI; called by Dalamud's renderer as
+-- void(*)(const ImDrawList*, const ImDrawCmd*)). No allocation, no errors, no
+-- shim calls: they run inside Present.
+
+-- Before a panel: the depth shader, the game's depth and the panel's
+-- constants. True once everything is bound; anything less leaves the panel
+-- on ImGui's own shader.
+local function bind(p: *WorldDepthParams): boolean
+  ## if ccinfo.is_windows then
+    if gpu_ctx == nilptr or gpu_ps == nilptr or gpu_cb == nilptr or gpu_sampler == nilptr or depthpass.scene.srv == nilptr then
+      return false
+    end
+    local mapped: D3D11_MAPPED_SUBRESOURCE
+    if ID3D11DeviceContext_Map(gpu_ctx, (@*ID3D11Resource)(gpu_cb), 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped) < 0 then return false end
+    memory.copy(mapped.pData, &p.v, #WorldDepthParams)
+    ID3D11DeviceContext_Unmap(gpu_ctx, (@*ID3D11Resource)(gpu_cb), 0)
+    local cb = gpu_cb
+    local srv = (@*ID3D11ShaderResourceView)(depthpass.scene.srv)
+    local sampler = gpu_sampler
+    ID3D11DeviceContext_PSSetConstantBuffers(gpu_ctx, 0, 1, &cb)
+    ID3D11DeviceContext_PSSetShaderResources(gpu_ctx, 1, 1, &srv)
+    ID3D11DeviceContext_PSSetSamplers(gpu_ctx, 1, 1, &sampler)
+    ID3D11DeviceContext_PSSetShader(gpu_ctx, gpu_ps, nilptr, 0)
+    return true
+  ## else
+    if depthpass.host_bind_fails then return false end
+    depthpass.last_upload = $p
+    return true
+  ## end
+end
+
+global function depthpass_begin_cb(list: *ImDrawList, cmd: *ImDrawCmd): void
+  local p = (@*WorldDepthParams)(cmd.UserCallbackData)
+  if p == nilptr or not bind(p) then return end
+  -- only a bound test counts as run: callbacks that bind nothing hand over to the capsule
+  depthpass.ran = depthpass.ran + 1
+end
+
+-- After a panel: unbind what the reset leaves alone (it restores the shader
+-- but not PS slots t1, s1 or b0), so the depth texture is not still bound as a
+-- shader input when the game binds it as its depth target again.
+global function depthpass_end_cb(list: *ImDrawList, cmd: *ImDrawCmd): void
+  ## if ccinfo.is_windows then
+    if gpu_ctx == nilptr then return end
+    local no_srv: *ID3D11ShaderResourceView = nilptr
+    local no_cb: *ID3D11Buffer = nilptr
+    local no_sampler: *ID3D11SamplerState = nilptr
+    ID3D11DeviceContext_PSSetShaderResources(gpu_ctx, 1, 1, &no_srv)
+    ID3D11DeviceContext_PSSetSamplers(gpu_ctx, 1, 1, &no_sampler)
+    ID3D11DeviceContext_PSSetConstantBuffers(gpu_ctx, 0, 1, &no_cb)
+  ## end
+end
+
+-- Per frame -----------------------------------------------------------------------
+
+-- Can this frame's panels be depth-tested? Records `reason` when not.
+global function depthpass_frame_begin(get_scene_depth: function(out: *GuSceneDepth): cint, cam: *GuCamera): boolean
+  depthpass.ready = false
+  -- last frame's callbacks have run by now, unless the renderer skips them
+  if depthpass.issued > 0 then
+    if depthpass.ran == depthpass.ran_seen then depthpass.misses = depthpass.misses + 1 else depthpass.misses = 0 end
+    if depthpass.misses >= MISS_LIMIT then
+      depthpass.misses = 0
+      latch('the renderer does not run draw-list callbacks')
+    end
+  end
+  depthpass.ran_seen = depthpass.ran
+  depthpass.issued = 0
+  depthpass.used = 0
+  if get_scene_depth == nilptr then return fail('the shim has no scene depth callback (old shim)') end
+  local sd: GuSceneDepth
+  if get_scene_depth(&sd) == 0 then return fail('the game has no scene depth') end
+  depthpass.scene = sd
+  if sd.srv == nilptr then return fail('the scene depth has no shader resource view') end
+  if sd.actual_width == 0 or sd.actual_height == 0 or cam.width < 1 or cam.height < 1 then return fail('the scene depth has no size') end
+  local okf, frame = world_depth_frame(cam)
+  if not okf then return fail('the camera is not reversed-Z with an infinite far plane') end
+  if not gpu_prepare(&sd) then return false end
+  depthpass.frame = frame
+  depthpass.cam = $cam
+  depthpass.reason = ''
+  depthpass.ready = true
+  return true
+end
+
+-- The occlusion this frame really uses: depth needs the whole depth path,
+-- otherwise the capsule stands in. Each change of why is logged once.
+global function depthpass_select(requested: uint8, get_scene_depth: function(out: *GuSceneDepth): cint, cam: *GuCamera,
+                                 log: function(level: cint, msg: string): void): uint8
+  if requested ~= WORLD_OCCLUSION_DEPTH then
+    depthpass.ready = false
+    depthpass.reason = ''
+    return requested
+  end
+  local ok = depthpass_frame_begin(get_scene_depth, cam)
+  if not depthpass.logged_once or depthpass.reason ~= depthpass.logged then
+    depthpass.logged, depthpass.logged_once = depthpass.reason, true
+    if ok then
+      log(LOG_INFO, 'world: panels are depth-tested against the game')
+    else
+      local msg = 'world: depth test unavailable, using the character cut-out: ' .. depthpass.reason
+      log(LOG_WARN, msg)
+      msg:destroy()
+    end
+  end
+  return ok and WORLD_OCCLUSION_DEPTH or WORLD_OCCLUSION_CAPSULE
+end
+
+-- Queue the depth test before a panel's first draw command; `strength` 0
+-- keeps the panel whole. False when this panel cannot have it (not ready,
+-- pool full, degenerate basis); draw it with the capsule then.
+global function depthpass_panel_begin(dl: *ImDrawList, b: *WorldBasis, strength: float32): boolean
+  if not depthpass.ready or depthpass.used >= DEPTHPASS_POOL then return false end
+  local sd = &depthpass.scene
+  if depthpass.show and strength > 0 then strength = -1 end
+  local ok, params = world_depth_params(&depthpass.frame, &depthpass.cam, b, sd.allocated_width, sd.allocated_height,
+    sd.actual_width, sd.actual_height, policy.world_occlusion_tolerance, policy.world_occlusion_edge, strength)
+  if not ok then return false end
+  local slot = &depthpass.pool[depthpass.used]
+  $slot = params
+  depthpass.used = depthpass.used + 1
+  depthpass.issued = depthpass.issued + 1
+  imgui.DrawListAddCallback(dl, (@pointer)(depthpass_begin_cb), slot)
+  return true
+end
+
+-- After the panel's last draw command: unbind, then let the renderer restore itself.
+global function depthpass_panel_end(dl: *ImDrawList): void
+  imgui.DrawListAddCallback(dl, (@pointer)(depthpass_end_cb), nilptr)
+  imgui.DrawListAddCallback(dl, (@pointer)(IMDRAW_CALLBACK_RESET), nilptr)
+end
+
+-- `/term depth retry`: forget a latched failure and start the GPU objects over.
+global function depthpass_retry(): void
+  depthpass.broken = false
+  depthpass.broken_reason = ''
+  depthpass.misses = 0
+  ## if ccinfo.is_windows then
+    gpu_release()
+  ## end
+end
+
+global function depthpass_shutdown(): void
+  ## if ccinfo.is_windows then
+    gpu_release()
+  ## end
+  depthpass = {}
+end
+
+-- One line for `/term depth`.
+global function depthpass_describe(requested: uint8): string
+  local sb: stringbuilder
+  local names: [3]string = { 'off', 'capsule', 'depth' }
+  sb:writef('occlusion %s', names[requested < 3 and requested or 2])
+  if requested == WORLD_OCCLUSION_DEPTH then
+    if depthpass.ready then sb:write(': depth test active') else sb:writef(': using the capsule (%s)', depthpass.reason) end
+  end
+  if depthpass.show then sb:write(' (showing the test)') end
+  local sd = &depthpass.scene
+  local cw, ch = math.max(depthpass.cam.width, 1), math.max(depthpass.cam.height, 1)
+  sb:writef('; depth view %p format %d, %ux%u rendered of %ux%u, texel scale %.3f x %.3f; %d panels last frame, %d callbacks run',
+    sd.srv, depthpass.format, sd.actual_width, sd.actual_height, sd.allocated_width, sd.allocated_height,
+    sd.actual_width / cw, sd.actual_height / ch, depthpass.used, depthpass.ran)
+  if depthpass.hresult ~= 0 then sb:writef('; last HRESULT 0x%08x', (@uint32)(depthpass.hresult)) end
+  return sb:promote()
+end
