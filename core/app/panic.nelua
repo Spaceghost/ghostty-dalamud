@@ -1,0 +1,52 @@
+
+
+-- Nelua runtime panics inside the game: route them to the Dalamud log.
+require 'core.app.state'
+
+
+-- Nelua runtime panics (bounds checks, asserts) normally go to stderr, which
+-- nothing reads inside the game. Built with `-P "writestderr='hooked'" -P
+-- "abort='hooked'"`, they are routed to the Dalamud log and ghostty-panic.log.
+## if pragmas.writestderr == 'hooked' then
+local stderr_buf: [1024]byte
+local stderr_len: usize = 0
+local function fopen(path: cstring, mode: cstring): pointer <cimport, cinclude '<stdio.h>', nodecl> end
+local function fputs(s: cstring, f: pointer): cint <cimport, cinclude '<stdio.h>', nodecl> end
+local function fclose(f: pointer): cint <cimport, cinclude '<stdio.h>', nodecl> end
+
+local function nelua_write_stderr(msg: cstring, len: usize, flush: boolean): void <cexport, codename 'nelua_write_stderr'>
+  local src = (@*[0]byte)(msg)
+  for i: usize = 0, < len do
+    if stderr_len < #stderr_buf - 1 then
+      stderr_buf[stderr_len] = src[i]
+      stderr_len = stderr_len + 1
+    end
+  end
+  if not flush then return end
+  stderr_buf[stderr_len] = 0
+  if host.api.log ~= nilptr then host.api.log(LOG_ERROR, (@cstring)(&stderr_buf)) end
+  if #host.dir > 0 and #host.dir < 900 then
+    local path: [1024]byte
+    local n: usize = 0
+    for i: usize = 0, < #host.dir do path[n] = host.dir.data[i] n = n + 1 end
+    local name: cstring = '/ghostty-panic.log'
+    local nb = (@*[0]byte)(name)
+    local j: usize = 0
+    while nb[j] ~= 0 do path[n] = nb[j] n = n + 1 j = j + 1 end
+    path[n] = 0
+    local f = fopen((@cstring)(&path), 'a')
+    if f ~= nilptr then
+      fputs((@cstring)(&stderr_buf), f)
+      fputs('\n', f)
+      fclose(f)
+    end
+  end
+  stderr_len = 0
+end
+## end
+## if pragmas.abort == 'hooked' then
+local function c_abort(): void <cimport 'abort', cinclude '<stdlib.h>', nodecl> end
+local function nelua_abort(): void <cexport, codename 'nelua_abort'>
+  c_abort()
+end
+## end

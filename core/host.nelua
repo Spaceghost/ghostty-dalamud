@@ -1,0 +1,294 @@
+-- The plugin core as seen from the C# shim: the exported C functions. The
+-- work lives in core/app/*; the shim only forwards calls.
+require 'core.app.panic'
+require 'core.app.commands'
+require 'core.app.hostsurface'
+require 'allocators.default'
+
+-- Exports -----------------------------------------------------------------------
+
+-- Initialise from the GhosttyDalamud plugin. `api` and `info` may be smaller
+-- structs from an older shim; only fields within their `size` are read.
+-- Returns INIT_OK, or why the core is not active yet (it retries by itself
+-- from gu_frame while the reason lasts): INIT_BUSY another core holds this
+-- process, INIT_LEGACY the Umbra-hosted ghostty_umbra.dll is loaded.
+global function gu_init_ex(api: *GuHostApi, info: *GuInitInfo): cint <cexport, codename 'gu_init_ex'>
+  return surface_init(api, info)
+end
+
+-- One directory for the shipped files and the user's state (tests, plain
+-- embedding). Registers the same host surfaces when the callbacks exist.
+global function gu_init(api: *GuHostApi, plugin_dir: cstring): cint <cexport, codename 'gu_init'>
+  local info: GuInitInfo = {
+    size = #GuInitInfo, host_kind = HOST_KIND_EMBEDDED,
+    install_dir = plugin_dir, config_dir = plugin_dir, configs_root = '',
+  }
+  return surface_init(api, &info)
+end
+
+-- True on the release of a left click on the bare world that stayed short and
+-- still. Holding the button to turn the camera is not a click: the game hides
+-- and pins the cursor while turning, so the camera angle is checked as well.
+local WORLD_CLICK_SECONDS <comptime> = 0.35
+local WORLD_CLICK_PIXELS <comptime> = 6
+local WORLD_CLICK_TURN <comptime> = 0.02 -- radians
+local function world_click_off(now: float64): boolean
+  local h: float32, v: float32, d: float32, dmin: float32 = 0, 0, 0, 0
+  local have_cam = host.api.get_camera_state ~= nilptr and host.api.get_camera_state(&h, &v, &d, &dmin) ~= 0
+  local mouse: ImVec2
+  imgui.GetMousePos(&mouse)
+  if host.lmb_pressed then
+    host.world_press_armed = not host.click_used and not imgui.IsWindowHovered(ImGuiHoveredFlags_AnyWindow)
+    host.world_press_at, host.world_press_pos = now, mouse
+    host.world_press_h, host.world_press_v = h, v
+    return false
+  end
+  if not host.world_press_armed then return false end
+  if host.lmb_down then
+    local dh = math.abs(h - host.world_press_h)
+    if dh > math.pi then dh = 2 * math.pi - dh end
+    if host.rmb_down or now - host.world_press_at > WORLD_CLICK_SECONDS
+       or (have_cam and (dh > WORLD_CLICK_TURN or math.abs(v - host.world_press_v) > WORLD_CLICK_TURN)) then
+      host.world_press_armed = false -- a drag, a hold or a mouse walk: not a click
+    end
+    return false
+  end
+  host.world_press_armed = false
+  local dx, dy = mouse.x - host.world_press_pos.x, mouse.y - host.world_press_pos.y
+  return now - host.world_press_at <= WORLD_CLICK_SECONDS and dx * dx + dy * dy <= WORLD_CLICK_PIXELS * WORLD_CLICK_PIXELS
+end
+
+-- Something happened on the shim's side (GuEventKind): a chat command with
+-- its arguments in `text`, the /xlplugins Open or Settings button, an info bar
+-- click (`a` button, `b` modifiers, x/y where), the loaded plugins changed.
+-- Safe from any thread; handled on the next frame.
+global function gu_event(kind: cint, a: cint, b: cint, x: float32, y: float32, text: cstring): void <cexport, codename 'gu_event'>
+  surface_post(kind, a, b, x, y, text)
+end
+
+-- Per-frame entry point, called from the plugin's UiBuilder.Draw.
+global function gu_frame(): void <cexport, codename 'gu_frame'>
+  surface_tick()
+  if not host.initialized then return end
+  host.frame = host.frame + 1
+  surface_events() -- chat commands work even with the kill switch on
+  if policy.disabled then -- kill switch (init.lua disabled = true)
+    if not host.disabled_teardown then
+      -- nothing runs per frame from here: let go of what the game still shows or does for us
+      host.disabled_teardown = true
+      teardown_effects()
+      host.world_focus = 0
+      agent_hold_sessions() -- the connection goes unread from here on
+    end
+    return
+  end
+  if host.disabled_teardown then
+    host.disabled_teardown = false
+    agent_release_sessions()
+  end
+  if not ensure_imgui() then return end
+  local now = imgui.GetTime()
+  local dt = now - host.last_time
+  if dt < 0 or dt > 0.5 then dt = 1.0 / 60.0 end
+  host.last_time = now
+  agent_pump(now)
+  for i = 0, < #host.sessions do
+    local s = host.sessions[i]
+    if s.kind == TransportKind.ConPty then s:pump() end
+  end
+  -- suspended: the legacy core draws; keep sessions and the agent alive only
+  local live = boot.state == HostState.Active
+  local in_world = false -- a character is loaded (not the title screen or character select)
+  do
+    local lmb, rmb = false, false
+    ## if ccinfo.is_windows then
+      lmb = (GetAsyncKeyState(0x01) & 0x8000) ~= 0
+      rmb = (GetAsyncKeyState(0x02) & 0x8000) ~= 0
+    ## else
+      lmb = imgui.IsMouseDown(ImGuiMouseButton_Left)
+      rmb = imgui.IsMouseDown(ImGuiMouseButton_Right)
+    ## end
+    host.lmb_pressed = lmb and not host.lmb_down and not rmb
+    -- movement intent drops terminal focus: both buttons (mouse walk),
+    -- middle click, or right-drag steering with W A S D Q E
+    local drop = false
+    ## if ccinfo.is_windows then
+      local mmb = (GetAsyncKeyState(0x04) & 0x8000) ~= 0
+      if (lmb and rmb) or mmb then drop = true end
+      if rmb then
+        local keys: [6]cint = { 0x57, 0x41, 0x53, 0x44, 0x51, 0x45 } -- W A S D Q E
+        for ki = 0, < 6 do
+          if (GetAsyncKeyState(keys[ki]) & 0x8000) ~= 0 then drop = true break end
+        end
+      end
+    ## end
+    -- combat starting drops focus too
+    local pc: GuObject
+    in_world = host.api.get_object ~= nilptr and host.api.get_object(WORLD_PLAYER, 0, &pc) ~= 0 and pc.found ~= 0
+    local combat = in_world and pc.in_combat ~= 0
+    if combat and not host.was_in_combat then drop = true end
+    host.was_in_combat = combat
+    host.drop_focus = drop
+    if drop and live then
+      -- before anything draws: this frame's keys (the W that starts the walk) go to the game, not a shell
+      host.world_focus = 0
+      host.world_full_id = 0
+      imgui.SetWindowFocusNil()
+    end
+    host.lmb_down, host.rmb_down = lmb, rmb
+    host.click_used = false
+  end
+  host.terminal_focused = host.terminal_focused_now
+  host.terminal_focused_now = false
+  if live then
+    poll_toggle_key()
+    draw_dropdown(now, dt)
+    draw_windows()
+    draw_anchored_popup()
+    draw_settings()
+  end
+  reap_exited(now)
+  -- only after the layout came back: saving earlier (or while the agent is
+  -- unreachable) would overwrite the state we are about to restore
+  if host.layout_restored and now - host.world_saved_at > 5.0 then
+    host.world_saved_at = now
+    save_world_state()
+  end
+  if live and in_world then
+    sync_animation()
+    policy_anim_frame(now)
+    apply_world_pins(now)
+    draw_world(now)
+    draw_bell(now) -- after the world screens: light behind one is cut out, not painted over it
+  end
+  bell_demo_tick(now)
+  -- a click on the game world (not an ImGui window, not a panel) unfocuses
+  -- every terminal so the keyboard goes back to the game
+  if live and (host.drop_focus or world_click_off(now)) then
+    host.world_focus = 0
+    host.world_full_id = 0
+    imgui.SetWindowFocusNil()
+  end
+  update_status()
+end
+
+-- Draw the popup terminal into `dl` at the given rectangle: the Umbra toolbar
+-- widget's popup node calls this through IPC, inside its popup window.
+-- flags bit 0: the caller already pushed a font, draw in it.
+global function gu_popup_draw(dl: *ImDrawList, x1: float32, y1: float32, x2: float32, y2: float32, flags: cint): void <cexport, codename 'gu_popup_draw'>
+  if not host.initialized or boot.state ~= HostState.Active or not ensure_imgui() then return end
+  local push, pop = host.api.push_mono_font, host.api.pop_font
+  if (flags & 1) ~= 0 then host.api.push_mono_font, host.api.pop_font = nilptr, nilptr end
+  popup_body(dl, x1, y1, x2, y2)
+  host.api.push_mono_font, host.api.pop_font = push, pop
+end
+
+-- Restart the popup session (e.g. after it exited).
+global function gu_popup_reset(): void <cexport, codename 'gu_popup_reset'>
+  if not host.initialized then return end
+  if host.popup_session ~= nilptr then
+    session_remove(host.popup_session)
+    host.popup_session = nilptr
+  end
+end
+
+global function gu_popup_size(w: *cint, h: *cint): void <cexport, codename 'gu_popup_size'>
+  local pw: cint, ph: cint = 900, 480
+  if host.initialized and policy.loaded then pw, ph = (@cint)(policy.popup_width), (@cint)(policy.popup_height) end
+  if w ~= nilptr then $w = pw end
+  if h ~= nilptr then $h = ph end
+end
+
+global function gu_toggle(): void <cexport, codename 'gu_toggle'>
+  if not host.initialized then return end
+  toggle_visible()
+end
+
+global function gu_command(text: cstring): cint <cexport, codename 'gu_command'>
+  if not host.initialized then return 1 end
+  return run_command(text)
+end
+
+-- Copy the widget label into `buf`; returns its length. Only the Umbra widget
+-- asks (through IPC), so each call also says the widget is on screen.
+global function gu_status(buf: *[0]cchar, cap: usize): usize <cexport, codename 'gu_status'>
+  if buf == nilptr or cap == 0 then return 0 end
+  surface.widget_seen = true
+  surface.widget_seen_ms = procguard_now_ms()
+  local text: string = 'ghostty off'
+  if host.initialized then text = host.status end
+  local n = #text
+  if n >= cap then n = cap - 1 end
+  for i: usize = 0, < n do buf[i] = (@cchar)(text.data[i]) end
+  buf[n] = 0
+  return n
+end
+
+global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
+  defer surface_reset() end -- whatever state we were in, forget the shim's callbacks
+  if not host.initialized then return end
+  surface_shutdown() -- commands, info bar entry and IPC go first
+  showcase_stop() -- demo terminals never outlive the session; yours come back
+  teardown_effects()
+  depthpass_shutdown()
+  -- Leave agent shells running so the next start reattaches to them.
+  for i = 0, < #host.sessions do host.sessions[i].keep_on_agent = true end
+  if host.layout_restored then save_world_state() end
+  for i = #host.sessions - 1, 0, -1 do session_remove(host.sessions[i]) end
+  agent_final_flush() -- the queued DETACH/CLOSE frames, before the socket goes away
+  host.sessions:destroy()
+  host.dropdown_tabs:destroy()
+  host.windows:destroy()
+  host.minimized:destroy()
+  host.world:destroy()
+  host.world_covers:destroy()
+  host.pending_open:destroy()
+  bell_reset()
+  host.agent:destroy()
+  net.shutdown()
+  -- ghostty_loader unloads this module and starts a fresh copy: free the Lua
+  -- state and every string, and leave no pointers for the next start.
+  policy_unload()
+  host.world_diag:destroy()
+  host.agent_error_shown:destroy()
+  host.bell_demo_label:destroy()
+  host.showcase_ids:destroy()
+  host.showcase_hidden:destroy()
+  host.status:destroy()
+  host.dir:destroy()
+  local api = host.api
+  host = {}
+  host.api = api -- the log line below; surface_reset clears it afterwards
+  log(LOG_INFO, 'ghostty core stopped')
+end
+
+global function gu_version(): cstring <cexport, codename 'gu_version'>
+  return 'ghostty-dalamud 0.2.0'
+end
+
+-- Called from the shim's hook on the game's walk input (every game frame).
+-- `left`/`forward` hold the player's own input; when the player is not
+-- steering and a walk-up is in progress, write the direction to the panel.
+-- `allowed` is the game's own movement-input gate; `legacy` is the legacy
+-- movement mode (input relative to the camera instead of the character).
+global function gu_walk_input(left: *float32, forward: *float32, allowed: cint, legacy: cint): void <cexport, codename 'gu_walk_input'>
+  if not host.initialized or host.walk.id == 0 or left == nilptr or forward == nilptr then return end
+  if $left ~= 0 or $forward ~= 0 then
+    host.walk_user_moved = true -- the player steers: walk_tick ends the walk
+    return
+  end
+  if allowed == 0 or host.api.get_object == nilptr then return end
+  local pc: GuObject
+  if host.api.get_object(WORLD_PLAYER, 0, &pc) == 0 or pc.found == 0 then return end
+  local ref = pc.rotation
+  if legacy ~= 0 and host.api.get_camera_state ~= nilptr then
+    local ch: float32, cv: float32, cd: float32, cmin: float32 = 0, 0, 0, 0
+    if host.api.get_camera_state(&ch, &cv, &cd, &cmin) ~= 0 then ref = ch + (@float32)(math.pi) end
+  end
+  local ok, l, f = world_walk_steer(&host.walk, pc.x, pc.z, ref)
+  if ok then
+    $left = l
+    $forward = f
+  end
+end
+

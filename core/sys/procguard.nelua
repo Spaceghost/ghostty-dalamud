@@ -1,0 +1,92 @@
+-- Process-wide facts the activation state machine needs: whether the legacy
+-- Umbra-hosted core (ghostty_umbra.dll) is mapped, a per-process mutex so
+-- only one core is ever active, a millisecond clock and a small lock for the
+-- event queue. Host builds get stubs the tests steer through `procguard_fake`.
+require 'string'
+require 'stringbuilder'
+
+global ProcGuardFake = @record{
+  legacy_loaded: boolean,  -- pretend ghostty_umbra.dll is mapped
+  mutex_held: boolean,     -- pretend another core holds the mutex
+  now_ms: uint64,          -- the clock
+  acquired: boolean,       -- we hold the (fake) mutex
+}
+global procguard_fake: ProcGuardFake
+
+## if ccinfo.is_windows then
+## cinclude '<windows.h>'
+local SRWLOCK <cimport, nodecl> = @record{ Ptr: pointer }
+local function GetModuleHandleA(name: cstring): pointer <cimport, nodecl> end
+local function CreateMutexA(attrs: pointer, owner: cint, name: cstring): pointer <cimport, nodecl> end
+local function CloseHandle(h: pointer): cint <cimport, nodecl> end
+local function GetLastError(): uint32 <cimport, nodecl> end
+local function GetTickCount64(): uint64 <cimport, nodecl> end
+local function win_pid(): uint32 <cimport 'GetCurrentProcessId', nodecl> end
+local function AcquireSRWLockExclusive(l: *SRWLOCK): void <cimport, nodecl> end
+local function ReleaseSRWLockExclusive(l: *SRWLOCK): void <cimport, nodecl> end
+local ERROR_ALREADY_EXISTS: uint32 <cimport, nodecl, const>
+
+local mutex: pointer = nilptr
+local lock: SRWLOCK -- zeroed = SRWLOCK_INIT, usable without initialisation
+
+global function procguard_legacy_loaded(): boolean
+  return GetModuleHandleA('ghostty_umbra.dll') ~= nilptr
+end
+
+-- Named per process: a second core in this game process (another copy of the
+-- plugin, a dev reload racing the old instance) finds it taken.
+global function procguard_acquire(): boolean
+  if mutex ~= nilptr then return true end
+  local sb: stringbuilder
+  sb:writef('Local\\ghostty-core-%d\0', win_pid())
+  local name = sb:promote()
+  local h = CreateMutexA(nilptr, 0, (@cstring)(name.data))
+  local err = GetLastError()
+  name:destroy()
+  if h == nilptr then return false end
+  if err == ERROR_ALREADY_EXISTS then
+    CloseHandle(h)
+    return false
+  end
+  mutex = h
+  return true
+end
+
+global function procguard_release(): void
+  if mutex ~= nilptr then CloseHandle(mutex) end
+  mutex = nilptr
+end
+
+global function procguard_now_ms(): uint64
+  return GetTickCount64()
+end
+
+global function procguard_lock(): void AcquireSRWLockExclusive(&lock) end
+global function procguard_unlock(): void ReleaseSRWLockExclusive(&lock) end
+
+## else
+
+global function procguard_legacy_loaded(): boolean
+  return procguard_fake.legacy_loaded
+end
+
+global function procguard_acquire(): boolean
+  if procguard_fake.acquired then return true end
+  if procguard_fake.mutex_held then return false end
+  procguard_fake.acquired = true
+  return true
+end
+
+global function procguard_release(): void
+  procguard_fake.acquired = false
+end
+
+global function procguard_now_ms(): uint64
+  return procguard_fake.now_ms
+end
+
+-- tests are single threaded
+global function procguard_lock(): void end
+global function procguard_unlock(): void end
+
+## end

@@ -1,0 +1,126 @@
+-- How the core was started and what it registered with its host: the
+-- activation state, both home directories, and the Dalamud surfaces
+-- (commands, server info bar entry, IPC). Lives outside `host`, which is wiped
+-- on every activation.
+require 'string'
+require 'vector'
+require 'core.app.state'
+require 'core.sys.procguard'
+
+-- INACTIVE -> PENDING (init refused for now, retried) -> ACTIVE <-> SUSPENDED
+-- (the legacy Umbra-hosted core appeared; we step aside until it is gone).
+global HostState = @enum{ Inactive = 0, Pending, Active, Suspended }
+
+global HOST_KIND_EMBEDDED: cint <comptime> = 0 -- tests, or anything calling gu_init
+global HOST_KIND_DALAMUD: cint <comptime> = 1  -- the GhosttyDalamud plugin
+
+-- gu_init_ex results
+global INIT_OK: cint <comptime> = 0
+global INIT_BAD_ARGS: cint <comptime> = 1
+global INIT_BUSY: cint <comptime> = 2
+global INIT_LEGACY: cint <comptime> = 3
+
+-- set_ui_hide bits: keep drawing while the game hides its UI for this reason
+global UI_KEEP_ALWAYS: cint <comptime> = 1   -- Dalamud's DisableAutomaticUiHide
+global UI_KEEP_USER: cint <comptime> = 2     -- the player hid the UI
+global UI_KEEP_CUTSCENE: cint <comptime> = 4
+global UI_KEEP_GPOSE: cint <comptime> = 8
+
+-- What the plugin passes to gu_init_ex. Fields past `size` are never read.
+global GuInitInfo = @record{
+  size: usize,
+  host_kind: cint,
+  install_dir: cstring,   -- read-only: ghostty_core.dll and the shipped lua/
+  config_dir: cstring,    -- writable: settings, world state, the user's lua overrides
+  configs_root: cstring,  -- Dalamud's pluginConfigs; the legacy Umbra home lives below it
+}
+
+global Boot = @record{
+  api: GuHostApi,
+  state: HostState,
+  host_kind: cint,
+  install_dir: string,
+  config_dir: string,
+  configs_root: string,
+  reason: cint,           -- last refusal (INIT_*), logged only when it changes
+  mutex: boolean,         -- procguard_acquire succeeded
+  last_try_ms: uint64,
+  last_guard_ms: uint64,
+}
+global boot: Boot
+
+-- CONFIG.host, re-read every couple of seconds (lua/init.lua).
+global HostCfg = @record{
+  help: string,
+  dtr_mode: string,       -- 'auto' | 'always' | 'never'
+  dtr_title: string,
+  dtr_tooltip: string,
+  keep_mask: cint,        -- UI_KEEP_* bits
+  close_on_blur: boolean, -- CONFIG.popup.close_on_blur
+}
+
+global Surface = @record{
+  cfg: HostCfg,
+  ipc: boolean,                  -- providers registered
+  commands: vector(string),
+  command_ok: vector(boolean),
+  command_retry_ms: uint64,
+  dtr_pushed: boolean,
+  dtr_shown: boolean,
+  dtr_text: string,
+  keep_mask_pushed: cint,        -- -1 before the first push
+  widget_seen: boolean,          -- the Umbra widget polled gu_status...
+  widget_seen_ms: uint64,        -- ...at this time
+  umbra_loaded: boolean,
+  events_dropped: integer,
+  last_action: string,           -- last DTR click action (for tests and the log)
+  popup_open: boolean,           -- anchored popup (no Umbra)
+  popup_x: float32, popup_y: float32,
+  popup_frames: integer,
+}
+global surface: Surface
+
+global WIDGET_FRESH_MS: uint64 <comptime> = 5000
+
+global function surface_widget_recent(now: uint64): boolean
+  return surface.widget_seen and now - surface.widget_seen_ms < WIDGET_FRESH_MS
+end
+
+global function host_state_name(st: HostState): cstring
+  if st == HostState.Pending then return 'pending'
+  elseif st == HostState.Active then return 'active'
+  elseif st == HostState.Suspended then return 'suspended' end
+  return 'inactive'
+end
+
+-- ghostty.host_info() -> { host, state, reason, umbra, widget, dtr_shown,
+-- commands = { [name] = registered }, install_dir, config_dir, events_dropped }
+local function l_host_info(L: *lua_State): cint
+  lua_createtable(L, 0, 10)
+  lua_pushstring(L, boot.host_kind == HOST_KIND_DALAMUD and 'dalamud' or 'embedded') lua_setfield(L, -2, 'host')
+  lua_pushstring(L, host_state_name(boot.state)) lua_setfield(L, -2, 'state')
+  local reason: cstring = ''
+  if boot.state == HostState.Suspended or boot.reason == INIT_LEGACY then reason = 'the Umbra-hosted core (ghostty_umbra.dll) is loaded'
+  elseif boot.reason == INIT_BUSY then reason = 'another ghostty core holds this process' end
+  lua_pushstring(L, reason) lua_setfield(L, -2, 'reason')
+  lua_pushboolean(L, surface.umbra_loaded and 1 or 0) lua_setfield(L, -2, 'umbra')
+  lua_pushboolean(L, surface_widget_recent(procguard_now_ms()) and 1 or 0) lua_setfield(L, -2, 'widget')
+  lua_pushboolean(L, surface.dtr_shown and 1 or 0) lua_setfield(L, -2, 'dtr_shown')
+  lua_createtable(L, 0, (@cint)(#surface.commands))
+  for i = 0, < #surface.commands do
+    lua_pushboolean(L, surface.command_ok[i] and 1 or 0)
+    lua_setfield(L, -2, (@cstring)(surface.commands[i].data))
+  end
+  lua_setfield(L, -2, 'commands')
+  lua_pushlstring(L, (@cstring)(boot.install_dir.data), boot.install_dir.size) lua_setfield(L, -2, 'install_dir')
+  lua_pushlstring(L, (@cstring)(boot.config_dir.data), boot.config_dir.size) lua_setfield(L, -2, 'config_dir')
+  lua_pushinteger(L, surface.events_dropped) lua_setfield(L, -2, 'events_dropped')
+  return 1
+end
+
+global function boot_lua_register(L: *lua_State): void
+  lua_getglobal(L, 'ghostty')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return end
+  lua_pushcclosure(L, l_host_info, 0) lua_setfield(L, -2, 'host_info')
+  lua_pop(L, 1)
+end

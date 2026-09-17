@@ -1,0 +1,244 @@
+
+
+-- Shared state of the plugin core: the callbacks the shim provides (GuHostApi),
+-- the Host record every app module works on, logging and ImGui binding.
+require 'string'
+require 'vector'
+require 'stringbuilder'
+require 'core.ghostty'
+require 'core.imgui'
+require 'core.termview'
+require 'core.render'
+require 'core.input'
+require 'core.policy'
+require 'core.session'
+require 'core.agent_client'
+require 'core.world'
+require 'core.depthpass'
+require 'core.sendtext'
+require 'allocators.default'
+
+## if ccinfo.is_windows then
+## cinclude '<windows.h>'
+global function GetModuleHandleA(name: cstring): pointer <cimport, nodecl> end
+global function GetProcAddress(mod: pointer, name: cstring): pointer <cimport, nodecl> end
+global function GetAsyncKeyState(vk: cint): int16 <cimport, nodecl> end
+global function GetForegroundWindow(): pointer <cimport, nodecl> end
+global function GetWindowThreadProcessId(hwnd: pointer, pid: *uint32): uint32 <cimport, nodecl> end
+global function GetCurrentProcessId(): uint32 <cimport, nodecl> end
+## end
+
+-- Callbacks the shim provides. All optional except `log`.
+global GuHostApi = @record{
+  size: usize,
+  log: function(level: cint, msg: cstring): void,
+  push_mono_font: function(): void,
+  pop_font: function(): void,
+  consume_key: function(vk: cint): void,
+  resolve_imgui: function(name: cstring): pointer,
+  gamepad_pressed: function(mask: cint): cint,   -- 1 on the frame a button goes down
+  gamepad_down: function(mask: cint): cint,      -- 1 while a button is held
+  get_camera: function(cam: *GuCamera): cint,
+  get_object: function(which: cint, entity_id: uint64, out: *GuObject): cint,
+  set_rotation: function(rotation: float32): cint,
+  anim_get: function(mode: *uint8, param: *uint8, base_override: *uint16, base_current: *uint16): cint,
+  anim_set: function(mode: uint8, param: uint8, base_override: uint16, use_set_mode: cint): cint,
+  anim_play: function(timeline: uint16): cint,
+  anim_speed: function(slot: uint32, speed: float32): cint,
+  get_environment: function(day_seconds: *float32, rain: *float32, weather: *uint8): cint,
+  push_world_font: function(): void,          -- large mono font for world panels
+  get_camera_state: function(dir_h: *float32, dir_v: *float32, distance: *float32, min_distance: *float32): cint,
+  set_camera_state: function(dir_h: float32, dir_v: float32, distance: float32): cint,
+  -- game lights cast by world panels (core/app/lights.nelua)
+  light_create: function(shape: cint): pointer,  -- nilptr on failure
+  light_update: function(light: pointer, x: float32, y: float32, z: float32, r: float32, g: float32, b: float32,
+                         intensity: float32, range: float32, visible: cint): cint, -- visible: 0 hidden, 1 shown, 3 shown with shadows
+  light_destroy: function(light: pointer): cint,
+  set_look_at: function(active: cint, x: float32, y: float32, z: float32): cint, -- head/eyes toward a world point (0 = let go)
+  -- what a standalone Dalamud plugin owns (core/app/hostsurface.nelua); 1 = ok
+  command_add: function(name: cstring, help: cstring): cint,
+  command_remove: function(name: cstring): cint,
+  dtr_set: function(title: cstring, text: cstring, tooltip: cstring, shown: cint): cint, -- server info bar entry
+  dtr_remove: function(): void,
+  set_ui_hide: function(mask: cint): void,        -- UI_KEEP_* bits: stay drawn while the game hides its UI
+  plugin_loaded: function(name: cstring): cint,   -- by InternalName
+  ipc_register: function(): cint,                 -- GhosttyDalamud.v1.* providers
+  ipc_unregister: function(): void,
+  -- game collision: 1 with the first hit along the unit direction within `max` yalms (WorldRaycast)
+  raycast: function(ox: float32, oy: float32, oz: float32, dx: float32, dy: float32, dz: float32,
+                    max: float32, hx: *float32, hy: *float32, hz: *float32): cint,
+  -- the game's depth buffer, for world panels hidden behind geometry (core/depthpass.nelua)
+  get_scene_depth: function(out: *GuSceneDepth): cint,
+}
+
+global LOG_INFO: cint <comptime> = 1
+global LOG_WARN: cint <comptime> = 2
+global LOG_ERROR: cint <comptime> = 3
+
+global Host = @record{
+  api: GuHostApi,
+  dir: string,                      -- writable config home (settings, world state, panic log)
+  initialized: boolean,
+  imgui_ok: boolean,
+  imgui_missing: integer,
+  agent: AgentClient,
+  agent_enabled: boolean,
+  agent_last_try: float64,
+  agent_listed: boolean,            -- LIST sent after the first successful connect
+  reattach_done: boolean,           -- LISTR handled (or no agent): the dropdown may open a fresh tab
+  layout_restored: boolean,         -- LISTR put the saved layout back: saving it now keeps it
+  agent_prev_state: AgentState,     -- connection state after the last agent_pump (reconnect detection)
+  agent_seen: boolean,              -- some connection reached Ready: agent_nonce says which agent that was
+  agent_nonce: uint64,              -- the agent process last seen Ready (0 unknown: a version 1 agent)
+  agent_error_shown: string,        -- connection error already shown in the waiting terminals
+  sessions: vector(*Session),
+  pending_open: vector(*Session),   -- FIFO awaiting agent OPENED; nilptr = closed while waiting
+  next_session_id: integer,
+  -- drop-down
+  dropdown_open: boolean,
+  dropdown_anim: float64,           -- 0 hidden .. 1 shown
+  dropdown_tabs: vector(*Session),
+  dropdown_active: integer,
+  dropdown_focus_next: boolean,
+  show_profiles: boolean,
+  -- glass chrome (core/app/dropdown.nelua)
+  dropdown_anim_v: float32,         -- slide velocity (critically damped)
+  dropdown_tab_scroll: float32,     -- tab strip scroll when the tabs overflow
+  dropdown_ul_x: float32, dropdown_ul_w: float32,   -- gold underline under the active tab, eased
+  dropdown_ul_vx: float32, dropdown_ul_vw: float32,
+  chrome_tip_key: integer,          -- button under the pointer and since when (tooltip delay)
+  chrome_tip_since: float64,
+  chrome_tip_frame: uint64,
+  -- floating terminal windows; shown and hidden together with the dropdown
+  windows: vector(*Session),
+  minimized: vector(*Session),      -- tucked away; listed in the toolbar widget popup
+  -- terminals pinned into the game world (placement from lua/world.lua)
+  world: vector(*Session),
+  world_focus: integer,             -- session id with keyboard focus, 0 = none
+  world_visible: boolean,           -- world/pet terminals shown (own toggle)
+  -- mouse resize of a world panel: 0 none, 1 right edge, 2 bottom edge, 3 corner
+  world_drag_id: integer,
+  world_close_id: integer,
+  world_popin_id: integer,
+  world_full_id: integer,           -- world terminal shown full screen (0 none)
+  world_full_t: float32,            -- 0 in the world .. 1 flat on screen (animated)
+  world_full_v: float32,            -- its velocity
+  world_full_toggle_id: integer,
+  world_full_last: integer,         -- session still animating back into the world
+  -- double-click: first-person camera on the panel
+  last_click_id: integer,
+  last_click_time: float64,
+  cam_active: boolean,              -- we are steering the camera toward a panel
+  cam_target_h: float32, cam_target_v: float32, cam_target_d: float32,
+  cam_saved_d: float32,             -- zoom to restore afterwards
+  cam_restore: boolean,
+  world_occluded_toggle_id: integer, -- title button: keep running when unseen
+  world_tuning: WorldTuning,        -- CONFIG.world.present / walk, read each frame
+  walk: WorldWalk,                  -- walking up to the clicked panel
+  walk_time: float64,
+  walk_user_moved: boolean,         -- the game's walk input saw the player steering
+  paste_target: integer,            -- session waiting for the system clipboard (agent CLIP reply)
+  -- /term bell demo: steps through the bell styles
+  -- /term showcase: demo terminals around the character, the player's own hidden
+  showcase_ids: vector(integer),    -- demo sessions it opened
+  showcase_hidden: vector(integer), -- the player's world terminals it hid
+  showcase_shot: integer,           -- next camera shot (1-based), 0 = camera idle
+  showcase_at: float64,             -- when the next step may happen
+  showcase_hold: float32,
+  showcase_moving: boolean,         -- steering toward a shot
+  bell_demo_step: integer,          -- next preset (1-based), 0 = not running
+  bell_demo_at: float64,
+  bell_demo_label: string,
+  bell_demo_label_until: float64,
+  look_at_on: boolean,              -- set_look_at is aiming the head at a panel
+  world_rez: float32,               -- 1 shown, 0 derezzed (combat)
+  world_covers: vector(WorldCover), -- panels drawn this frame, for light behind them (the bell)
+  anim_out: boolean,                -- last state sent to lua/animation.lua
+  world_saved_at: float64,
+  drawing_world: boolean,           -- draw_terminal uses the world font
+  settings_open: boolean,
+  pad: PadGestureState,             -- toggle button: tap / double tap / hold
+  select_idx: integer,
+  -- raw mouse buttons (Dalamud only forwards clicks to ImGui while it wants the mouse)
+  lmb_down: boolean, rmb_down: boolean,
+  lmb_pressed: boolean,             -- left button went down this frame, right button up
+  click_used: boolean,              -- a terminal claimed this frame's click
+  -- a left press on the bare world: a quick, still click unfocuses on release,
+  -- a drag (turning the camera) keeps the terminal focused
+  world_press_armed: boolean,
+  world_press_at: float64,
+  world_press_pos: ImVec2,
+  world_press_h: float32, world_press_v: float32,
+  drop_focus: boolean,              -- movement/combat intent this frame: give input back to the game
+  was_in_combat: boolean,
+  disabled_teardown: boolean,       -- the kill switch already let go of lights, walk, animation and streaming shells
+  world_last_time: float64,
+  world_drag_mode: integer,
+  world_drag_u0: float32, world_drag_v0: float32,
+  world_drag_w0: float32, world_drag_h0: float32,
+  last_world_toggle_frame: uint64,
+  world_pins_done: boolean,
+  world_diag: string,               -- last logged world draw state, logged on change
+  world_pins_last_try: float64,
+  frame: uint64,
+  last_toggle_frame: uint64,
+  toggle_vk_down: boolean,
+  terminal_focused: boolean,       -- a terminal had keyboard focus last frame
+  terminal_focused_now: boolean,
+  dropdown_font_size: float64,
+  -- popup (Umbra toolbar widget)
+  popup_session: *Session,
+  popup_font_size: float64,
+  last_time: float64,
+  status: string,
+  toggle_imkey: cint,
+  -- Alt + drag: carrying a world panel (core/world.nelua world_drag_step)
+  drag: WorldDrag,
+}
+
+global host: Host
+
+global function log(level: cint, msg: string): void
+  if host.api.log == nilptr then return end
+  local z = msg .. '\0'
+  host.api.log(level, (@cstring)(z.data))
+  z:destroy()
+end
+
+global function logf(level: cint, fmt: string, ...: varargs): void
+  local sb: stringbuilder
+  sb:writef(fmt, ...)
+  local s = sb:promote()
+  log(level, s)
+  s:destroy()
+end
+
+-- ImGui symbol resolution -------------------------------------------------
+global function resolve_imgui(name: cstring): pointer
+  if host.api.resolve_imgui ~= nilptr then
+    local p = host.api.resolve_imgui(name)
+    if p ~= nilptr then return p end
+  end
+  ## if ccinfo.is_windows then
+    local m = GetModuleHandleA('cimgui.dll')
+    if m == nilptr then m = GetModuleHandleA('cimgui') end
+    if m ~= nilptr then return GetProcAddress(m, name) end
+  ## end
+  return nilptr
+end
+
+global function report_missing(name: cstring): void
+  logf(LOG_WARN, 'cimgui export not found: %s', name)
+end
+
+global function ensure_imgui(): boolean
+  if host.imgui_ok then return true end
+  host.imgui_missing = imgui_bind(resolve_imgui, report_missing)
+  host.imgui_ok = host.imgui_missing == 0
+  if host.imgui_ok then
+    log(LOG_INFO, 'cimgui bound')
+  else
+    logf(LOG_ERROR, 'cimgui binding incomplete: %d exports missing; UI disabled', host.imgui_missing)
+  end
+  return host.imgui_ok
+end

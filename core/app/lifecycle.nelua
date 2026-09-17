@@ -1,0 +1,55 @@
+
+
+-- Status text, the settings window and (re)loading lua/init.lua.
+require 'core.app.hotkeys'
+require 'core.app.boot'
+
+global function update_status(): void
+  local sb: stringbuilder
+  if host.agent_enabled then
+    if host.agent.state == AgentState.Ready then sb:write('ghostty')
+    elseif host.agent.state == AgentState.Connecting or host.agent.state == AgentState.Handshake then sb:write('ghostty ~')
+    else sb:write('ghostty x') end
+  else
+    sb:write('ghostty')
+  end
+  local total = #host.dropdown_tabs + #host.windows + #host.world + #host.minimized
+  if total > 0 then sb:writef(' %d', total) end
+  if #host.minimized > 0 then sb:writef(' (%d min)', #host.minimized) end
+  host.status:destroy()
+  host.status = sb:promote()
+end
+
+-- Settings window ---------------------------------------------------------------
+global function draw_settings(): void
+  if not host.settings_open then return end
+  imgui.SetNextWindowSize(vec2(560, 680), ImGuiCond_FirstUseEver)
+  local open = true
+  if imgui.Begin('Ghostty settings###ghostty_settings', &open, ImGuiWindowFlags_NoDocking) then
+    if policy_settings_draw() then
+      policy_refresh()
+      host.dropdown_font_size = policy.dropdown.font_size
+      host.popup_font_size = policy.popup_font_size
+      resolve_toggle_key()
+    end
+  end
+  imgui.End()
+  host.settings_open = open
+end
+
+global function load_policy(): boolean
+  -- plain embedding (tests, gu_init): one directory is both homes
+  local install: string = #boot.install_dir > 0 and boot.install_dir or host.dir
+  local host_name: string = boot.host_kind == HOST_KIND_DALAMUD and 'dalamud' or 'test'
+  if not policy_load_dirs(install, host.dir, boot.configs_root, host_name) then
+    logf(LOG_ERROR, 'lua config failed: %s', policy.error)
+    return false
+  end
+  boot_lua_register(policy.L)
+  host.dropdown_font_size = policy.dropdown.font_size
+  host.popup_font_size = policy.popup_font_size
+  resolve_toggle_key()
+  agent_setup()
+  logf(LOG_INFO, 'config loaded: %d profiles, toggle key "%s"', #policy.profiles, policy.toggle_key)
+  return true
+end
