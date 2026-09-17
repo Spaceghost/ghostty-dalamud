@@ -1,0 +1,1435 @@
+-- World-space terminals: a terminal drawn as a flat panel placed in the game
+-- world. The terminal is rendered normally into a draw list at a 2D origin and
+-- every emitted vertex is then mapped through the panel's plane and the game's
+-- view-projection matrix, so glyphs, backgrounds and the cursor follow the
+-- panel's position and orientation with correct perspective.
+--
+-- Where panels go is decided in Lua (lua/world.lua); this module only does the
+-- math, the game queries it forwards to Lua, and the vertex transform.
+require 'math'
+require 'string'
+require 'core.lua'
+require 'core.imgui'
+require 'core.ui'
+
+-- Filled by the shim. Layouts must match GuObject/GuCamera in shim/Native.cs.
+global GuObject = @record{
+  x: float32, y: float32, z: float32,
+  rotation: float32,      -- radians around +Y; facing direction is (sin r, 0, cos r)
+  entity_id: uint64,
+  territory: uint32,
+  found: cint,
+  in_combat: cint,
+  height: float32,        -- model height in yalms
+  hitbox_radius: float32,
+  mounted: cint,
+}
+
+-- A character in screen space: a capsule from feet to head, and its depth.
+-- Panel pixels farther away than the character inside the capsule are faded
+-- out, so the character is never drawn behind a panel it stands in front of.
+global WorldOccluder = @record{
+  active: boolean,
+  ax: float32, ay: float32,   -- feet, screen (absolute)
+  bx: float32, by: float32,   -- head
+  radius: float32,            -- pixels
+  depth: float32,             -- clip w at the character
+}
+
+global GuCamera = @record{
+  m: [16]float32,         -- System.Numerics.Matrix4x4 (row vectors: clip = v * M)
+  width: float32,         -- game render size in pixels
+  height: float32,
+}
+
+global WORLD_PLAYER: cint <comptime> = 0
+global WORLD_TARGET: cint <comptime> = 1
+global WORLD_BY_ID: cint <comptime> = 2
+
+global WorldHost = @record{
+  get_camera: function(cam: *GuCamera): cint,
+  get_object: function(which: cint, entity_id: uint64, out: *GuObject): cint,
+  -- local player animation (client-side only; what posing plugins use)
+  anim_get: function(mode: *uint8, param: *uint8, base_override: *uint16, base_current: *uint16): cint,
+  anim_set: function(mode: uint8, param: uint8, base_override: uint16, use_set_mode: cint): cint,
+  anim_play: function(timeline: uint16): cint,
+  anim_speed: function(slot: uint32, speed: float32): cint,
+  get_environment: function(day_seconds: *float32, rain: *float32, weather: *uint8): cint,
+  log: function(msg: cstring): void,
+  set_rotation: function(rotation: float32): cint,
+}
+global world_host: WorldHost
+
+-- Where one panel is this frame, as returned by Lua.
+global WorldPlacement = @record{
+  x: float32, y: float32, z: float32,
+  yaw: float32,           -- direction the readable side faces
+  pitch: float32,         -- tilt back, radians
+  width: float32,         -- panel size in terminal pixels
+  height: float32,
+  ppm: float32,           -- terminal pixels per world unit (yalm)
+  opacity: float32,
+  curve: float32,         -- radius in yalms the panel bends around (edges toward the viewer); 0 = flat
+  tint_r: float32,        -- ambient light multiplier per channel (1 = unlit colours)
+  tint_g: float32,
+  tint_b: float32,
+  backlight: float32,     -- 0..1 glow behind the panel and brightening when the world is dim
+  run_occluded: boolean,  -- keep running while unseen (default: sleep)
+  light_intensity: float32, -- strength of the game light the panel casts (0 = none)
+  light_range: float32,     -- yalms
+  light_r: float32, light_g: float32, light_b: float32,
+  light_shadows: boolean,   -- the light casts shadows (expensive)
+}
+
+global WorldBasis = @record{
+  cx: float32, cy: float32, cz: float32,
+  rx: float32, rz: float32,              -- unit right (horizontal)
+  fx: float32, fz: float32,              -- unit front normal (toward the viewer)
+  ux: float32, uy: float32, uz: float32, -- up, world units per pixel
+  ypp: float32,                          -- yalms per pixel
+  curve: float32,
+  hw: float32, hh: float32,              -- half size in pixels
+  tint_r: float32, tint_g: float32, tint_b: float32,
+  mirror: boolean,                       -- seen from behind: flip so text still reads left to right
+}
+
+global function world_basis(p: WorldPlacement): WorldBasis
+  local sy, cy = math.sin(p.yaw), math.cos(p.yaw)
+  local sp, cp = math.sin(p.pitch), math.cos(p.pitch)
+  local inv = 1.0 / (p.ppm > 0 and p.ppm or 300.0)
+  -- front normal f = (sy, 0, cy); a viewer in front looks along -f and sees
+  -- right = up x f = (cy, 0, -sy)
+  local b: WorldBasis = {
+    cx = p.x, cy = p.y, cz = p.z,
+    rx = (@float32)(cy), rz = (@float32)(-sy),
+    fx = (@float32)(sy), fz = (@float32)(cy),
+    -- tilt: up leans back away from the viewer
+    ux = (@float32)(-sy * sp * inv), uy = (@float32)(cp * inv), uz = (@float32)(-cy * sp * inv),
+    ypp = (@float32)(inv),
+    curve = p.curve,
+    hw = p.width * 0.5, hh = p.height * 0.5,
+    tint_r = p.tint_r > 0 and p.tint_r or 1, tint_g = p.tint_g > 0 and p.tint_g or 1, tint_b = p.tint_b > 0 and p.tint_b or 1,
+  }
+  return b
+end
+
+-- Panel pixel (u, v) (origin top-left, v down) to a world point. With a curve
+-- radius the panel is a slice of a cylinder whose axis is on the viewer's side,
+-- so the edges wrap toward the viewer.
+global function world_point(b: *WorldBasis, u: float32, v: float32): (float32, float32, float32)
+  if b.mirror then u = b.hw * 2 - u end
+  local s = (u - b.hw) * b.ypp
+  local dv = b.hh - v
+  local lateral, forward = s, (@float32)(0)
+  if b.curve > 0.01 then
+    local ang = s / b.curve
+    lateral = b.curve * math.sin(ang)
+    forward = b.curve * (1.0 - math.cos(ang))
+  end
+  return b.cx + b.rx * lateral + b.fx * forward + b.ux * dv,
+         b.cy + b.uy * dv,
+         b.cz + b.rz * lateral + b.fz * forward + b.uz * dv
+end
+
+-- World point to screen pixels relative to the game viewport. Returns false
+-- behind the camera.
+global function world_project(cam: *GuCamera, x: float32, y: float32, z: float32): (boolean, float32, float32)
+  local m = &cam.m
+  local cx = x * m[0] + y * m[4] + z * m[8] + m[12]
+  local cy = x * m[1] + y * m[5] + z * m[9] + m[13]
+  local cw = x * m[3] + y * m[7] + z * m[11] + m[15]
+  if cw <= 0.0001 then return false, 0, 0 end
+  return true, 0.5 * cam.width * (cx / cw + 1.0), 0.5 * cam.height * (1.0 - cy / cw)
+end
+
+-- Direction the camera looks along. Clip w grows with view depth, and for
+-- row vectors w = x*m[3] + y*m[7] + z*m[11] + m[15], so (m[3], m[7], m[11]) is
+-- the forward axis up to scale.
+global function world_camera_forward(cam: *GuCamera): (float32, float32, float32)
+  local x, y, z = cam.m[3], cam.m[7], cam.m[11]
+  local len = math.sqrt(x * x + y * y + z * z)
+  if len < 1e-6 then return 0, 0, 1 end
+  return x / len, y / len, z / len
+end
+
+-- Clip-space depth (w) of a world point; grows with distance from the camera.
+global function world_depth(cam: *GuCamera, x: float32, y: float32, z: float32): float32
+  local m = &cam.m
+  return x * m[3] + y * m[7] + z * m[11] + m[15]
+end
+
+-- Screen capsule for a character (feet at o.x/y/z).
+global function world_occluder(cam: *GuCamera, o: *GuObject, vp: ImVec2): WorldOccluder
+  local occ: WorldOccluder
+  if o.found == 0 then return occ end
+  local h = o.height > 0.3 and o.height or 1.7
+  local r = math.max(o.hitbox_radius * 0.75, 0.32)
+  local ok1, fx, fy = world_project(cam, o.x, o.y + r * 0.6, o.z)
+  local ok2, hx, hy = world_project(cam, o.x, o.y + h - r * 0.4, o.z)
+  if not ok1 or not ok2 then return occ end
+  local cy = o.y + h * 0.5
+  local d = world_depth(cam, o.x, cy, o.z)
+  -- pixel radius: project a point `r` to the side, perpendicular to the view
+  local fx3, _, fz3 = world_camera_forward(cam)
+  local sx, sz = fz3, -fx3
+  local sl = math.sqrt(sx * sx + sz * sz)
+  if sl < 1e-4 then sx, sz, sl = 1, 0, 1 end
+  local okc, cxp, cyp = world_project(cam, o.x, cy, o.z)
+  local oks, sxp, syp = world_project(cam, o.x + sx / sl * r, cy, o.z + sz / sl * r)
+  if not okc or not oks then return occ end
+  occ.active = true
+  occ.ax, occ.ay = fx + vp.x, fy + vp.y
+  occ.bx, occ.by = hx + vp.x, hy + vp.y
+  occ.radius = math.sqrt((sxp - cxp) ^ 2 + (syp - cyp) ^ 2) * 1.15
+  occ.depth = d
+  return occ
+end
+
+-- 0 inside the capsule, 1 outside (soft edge of `feather` pixels).
+global function world_occluder_keep(occ: *WorldOccluder, px: float32, py: float32, feather: float32): float32
+  local dx, dy = occ.bx - occ.ax, occ.by - occ.ay
+  local len2 = dx * dx + dy * dy
+  local t: float32 = 0
+  if len2 > 1e-6 then t = math.clamp(((px - occ.ax) * dx + (py - occ.ay) * dy) / len2, 0, 1) end
+  local qx, qy = occ.ax + dx * t, occ.ay + dy * t
+  local dist = math.sqrt((px - qx) ^ 2 + (py - qy) ^ 2)
+  return math.clamp((dist - occ.radius) / feather, 0, 1)
+end
+
+-- Cheap deterministic noise in [0, 1) for the derez effect.
+global function world_hash(a: uint32, b: uint32): float32
+  local h: uint32 = a * 0x9E3779B1 ~ (b + 0x7F4A7C15) * 0x85EBCA77
+  h = (h ~ (h >> 15)) * 0x2C1B3C6D
+  h = h ~ (h >> 12)
+  return (@float32)(h & 0xFFFF) / 65536.0
+end
+
+-- Project the four panel corners (tl, tr, br, bl) into `out` (screen pixels,
+-- viewport-relative). False if any corner is behind the camera.
+global function world_corners(cam: *GuCamera, b: *WorldBasis, out: *[4]ImVec2): boolean
+  local us: [4]float32 = { 0, b.hw * 2, b.hw * 2, 0 }
+  local vs: [4]float32 = { 0, 0, b.hh * 2, b.hh * 2 }
+  for i = 0, < 4 do
+    local x, y, z = world_point(b, us[i], vs[i])
+    local ok, sx, sy = world_project(cam, x, y, z)
+    if not ok then return false end
+    out[i] = vec2(sx, sy)
+  end
+  return true
+end
+
+-- Screen point to panel pixels (u, v) through the homography of the projected
+-- corners q = (tl, tr, br, bl) of a panel `w` x `h` pixels (Heckbert's
+-- square-to-quad mapping, inverted). Exact for a flat panel.
+global function world_unproject(q: *[4]ImVec2, w: float32, h: float32, p: ImVec2): (boolean, float32, float32)
+  local p0, p1, p2, p3 = q[0], q[1], q[2], q[3]
+  local sx = p0.x - p1.x + p2.x - p3.x
+  local sy = p0.y - p1.y + p2.y - p3.y
+  local g: float64, hh: float64 = 0, 0
+  if math.abs(sx) > 1e-6 or math.abs(sy) > 1e-6 then
+    local dx1, dx2 = p1.x - p2.x, p3.x - p2.x
+    local dy1, dy2 = p1.y - p2.y, p3.y - p2.y
+    local den = dx1 * dy2 - dx2 * dy1
+    if math.abs(den) < 1e-9 then return false, 0, 0 end
+    g = (sx * dy2 - dx2 * sy) / den
+    hh = (dx1 * sy - sx * dy1) / den
+  end
+  local a = p1.x - p0.x + g * p1.x
+  local b = p3.x - p0.x + hh * p3.x
+  local c: float64 = p0.x
+  local d = p1.y - p0.y + g * p1.y
+  local e = p3.y - p0.y + hh * p3.y
+  local f: float64 = p0.y
+  -- adjugate of [[a b c] [d e f] [g h 1]]
+  local A, B, C = e - f * hh, c * hh - b, b * f - c * e
+  local D, E, F = f * g - d, a - c * g, c * d - a * f
+  local G, H, I = d * hh - e * g, b * g - a * hh, a * e - b * d
+  local den = G * p.x + H * p.y + I
+  if math.abs(den) < 1e-12 then return false, 0, 0 end
+  local u = (A * p.x + B * p.y + C) / den
+  local v = (D * p.x + E * p.y + F) / den
+  return true, (@float32)(u * w), (@float32)(v * h)
+end
+
+-- True when the projected corners (tl, tr, br, bl) wind the other way, i.e.
+-- the camera sees the back of the panel.
+global function world_backfacing(q: *[4]ImVec2): boolean
+  local area: float32 = 0
+  for i = 0, < 4 do
+    local a, c = q[i], q[(i + 1) % 4]
+    area = area + a.x * c.y - c.x * a.y
+  end
+  return area < 0
+end
+
+-- Is `p` inside the convex quad `q` (either winding)?
+global function world_point_in_quad(q: *[4]ImVec2, p: ImVec2): boolean
+  local pos, neg = false, false
+  for i = 0, < 4 do
+    local a, c = q[i], q[(i + 1) % 4]
+    local cross = (c.x - a.x) * (p.y - a.y) - (c.y - a.y) * (p.x - a.x)
+    if cross > 0 then pos = true elseif cross < 0 then neg = true end
+  end
+  return not (pos and neg)
+end
+
+-- Screen point to panel pixels on a possibly curved panel: the surface is
+-- split into a grid of small flat cells, the cell under `p` is found and
+-- inverted exactly. `out_hit` is false when `p` is not on the panel;
+-- u/v are still extrapolated from the nearest edge cell for grips.
+global function world_hit(cam: *GuCamera, b: *WorldBasis, p: ImVec2): (boolean, boolean, float32, float32)
+  local COLS <comptime> = 12
+  local ROWS <comptime> = 4
+  local w, h = b.hw * 2, b.hh * 2
+  local grid: [(COLS + 1) * (ROWS + 1)]ImVec2
+  for r = 0, ROWS do
+    for c = 0, COLS do
+      local x, y, z = world_point(b, w * c / COLS, h * r / ROWS)
+      local ok, sx, sy = world_project(cam, x, y, z)
+      if not ok then return false, false, 0, 0 end
+      grid[r * (COLS + 1) + c] = vec2(sx, sy)
+    end
+  end
+  local best_d: float32 = 3.4e38
+  local bu: float32, bv: float32 = 0, 0
+  local found = false
+  for r = 0, < ROWS do
+    for c = 0, < COLS do
+      local q: [4]ImVec2 = {
+        grid[r * (COLS + 1) + c], grid[r * (COLS + 1) + c + 1],
+        grid[(r + 1) * (COLS + 1) + c + 1], grid[(r + 1) * (COLS + 1) + c],
+      }
+      local cw, ch = w / COLS, h / ROWS
+      local uok, lu, lv = world_unproject(&q, cw, ch, p)
+      if uok then
+        local u, v = lu + cw * c, lv + ch * r
+        if world_point_in_quad(&q, p) then
+          return true, true, u, v
+        end
+        -- distance outside this cell in panel pixels, for edge grips
+        local du = math.max(0, math.max(-lu, lu - cw))
+        local dv = math.max(0, math.max(-lv, lv - ch))
+        local d = du + dv
+        if d < best_d then best_d, bu, bv, found = d, u, v, true end
+      end
+    end
+  end
+  return found, false, bu, bv
+end
+
+-- A panel drawn this frame, as something light behind it hides: its surface
+-- split into vertical columns (each exactly flat, even on a curved panel),
+-- projected once so many light points can be tested cheaply.
+global WORLD_COVER_COLS <comptime> = 12
+global WorldCover = @record{
+  b: WorldBasis,
+  alpha: float32,                                -- how much of the light behind it the panel hides
+  pts: [(WORLD_COVER_COLS + 1) * 2]ImVec2,       -- top and bottom of each column edge (viewport-relative)
+  minx: float32, maxx: float32, miny: float32, maxy: float32,
+}
+
+-- False if any part of the panel is behind the camera.
+global function world_cover(cam: *GuCamera, b: *WorldBasis, alpha: float32, out: *WorldCover): boolean
+  $out = { b = $b, alpha = alpha, minx = 3.4e38, maxx = -3.4e38, miny = 3.4e38, maxy = -3.4e38 }
+  for c = 0, WORLD_COVER_COLS do
+    for r = 0, 1 do
+      local x, y, z = world_point(b, b.hw * 2 * c / WORLD_COVER_COLS, b.hh * 2 * r)
+      local ok, sx, sy = world_project(cam, x, y, z)
+      if not ok then return false end
+      out.pts[c * 2 + r] = vec2(sx, sy)
+      out.minx, out.maxx = math.min(out.minx, sx), math.max(out.maxx, sx)
+      out.miny, out.maxy = math.min(out.miny, sy), math.max(out.maxy, sy)
+    end
+  end
+  return true
+end
+
+-- How much of a light point at screen (px, py) (viewport-relative), `depth`
+-- deep, shows past the panel: 1 unless the panel covers it from nearer the
+-- camera, softened over the first 0.1 yalm so light crossing a panel does not snap.
+global function world_cover_keep(cam: *GuCamera, c: *WorldCover, px: float32, py: float32, depth: float32): float32
+  if px < c.minx or px > c.maxx or py < c.miny or py > c.maxy then return 1 end
+  local p = vec2(px, py)
+  local cw = c.b.hw * 2 / WORLD_COVER_COLS
+  local hidden: float32 = 0
+  for k = 0, < WORLD_COVER_COLS do
+    local q: [4]ImVec2 = { c.pts[k * 2], c.pts[k * 2 + 2], c.pts[k * 2 + 3], c.pts[k * 2 + 1] }
+    if world_point_in_quad(&q, p) then
+      local ok, u, v = world_unproject(&q, cw, c.b.hh * 2, p)
+      if ok then
+        local x, y, z = world_point(&c.b, u + cw * k, v)
+        hidden = math.max(hidden, math.clamp((depth - world_depth(cam, x, y, z)) / 0.1, 0, 1))
+      end
+    end
+  end
+  return 1 - c.alpha * hidden
+end
+
+-- A panel's projection with everything that does not depend on the pixel
+-- worked out once: clip x, y and w are affine in the point's lateral offset,
+-- forward bulge and height on the panel, so each vertex needs no matrix and
+-- (on a gentle curve) no sin or cos.
+global WorldPanelProjection = @record{
+  base_x: float32, base_y: float32, base_w: float32, -- clip at the centre
+  r_x: float32, r_y: float32, r_w: float32,          -- per yalm to the right (negated when mirrored)
+  f_x: float32, f_y: float32, f_w: float32,          -- per yalm toward the viewer
+  u_x: float32, u_y: float32, u_w: float32,          -- per pixel up
+  hw: float32, hh: float32, ypp: float32, curve: float32,
+  sw: float32, sh: float32,                           -- half the view size in pixels
+}
+
+global function world_panel_projection(cam: *GuCamera, b: *WorldBasis): WorldPanelProjection
+  local m = &cam.m
+  local pre: WorldPanelProjection = { hw = b.hw, hh = b.hh, ypp = b.ypp, curve = b.curve, sw = cam.width * 0.5, sh = cam.height * 0.5 }
+  local cx: float64, cy: float64, cz: float64 = b.cx, b.cy, b.cz
+  pre.base_x = (@float32)(cx * m[0] + cy * m[4] + cz * m[8] + m[12])
+  pre.base_y = (@float32)(cx * m[1] + cy * m[5] + cz * m[9] + m[13])
+  pre.base_w = (@float32)(cx * m[3] + cy * m[7] + cz * m[11] + m[15])
+  -- lat(-s) = -lat(s) and fwd(-s) = fwd(s): mirroring flips the right axis only
+  local sign: float32 = b.mirror and -1 or 1
+  pre.r_x, pre.r_y, pre.r_w = sign * (b.rx * m[0] + b.rz * m[8]), sign * (b.rx * m[1] + b.rz * m[9]), sign * (b.rx * m[3] + b.rz * m[11])
+  pre.f_x, pre.f_y, pre.f_w = b.fx * m[0] + b.fz * m[8], b.fx * m[1] + b.fz * m[9], b.fx * m[3] + b.fz * m[11]
+  pre.u_x = b.ux * m[0] + b.uy * m[4] + b.uz * m[8]
+  pre.u_y = b.ux * m[1] + b.uy * m[5] + b.uz * m[9]
+  pre.u_w = b.ux * m[3] + b.uy * m[7] + b.uz * m[11]
+  return pre
+end
+
+-- Panel pixel (u, v) to screen pixels (viewport-relative) and clip w, as
+-- world_project(world_point(u, v)) and world_depth; false behind the camera
+-- (w is still returned).
+global function world_project_uv(pre: *WorldPanelProjection, u: float32, v: float32): (boolean, float32, float32, float32) <inline>
+  local s = (u - pre.hw) * pre.ypp
+  local dv = pre.hh - v
+  local lateral, forward = s, (@float32)(0)
+  if pre.curve > 0.01 then
+    local a = s / pre.curve
+    local a2 = a * a
+    if a2 <= 0.25 then
+      -- sin and 1 - cos by their series (|a| <= 0.5: the terms left out are
+      -- under 2e-6 of the radius)
+      lateral = s * (1 - a2 / 6 + a2 * a2 / 120)
+      forward = pre.curve * a2 * (0.5 - a2 / 24 + a2 * a2 / 720)
+    else
+      lateral = pre.curve * (@float32)(math.sin(a))
+      forward = pre.curve * (1 - (@float32)(math.cos(a)))
+    end
+  end
+  local cx = pre.base_x + lateral * pre.r_x + forward * pre.f_x + dv * pre.u_x
+  local cy = pre.base_y + lateral * pre.r_y + forward * pre.f_y + dv * pre.u_y
+  local cw = pre.base_w + lateral * pre.r_w + forward * pre.f_w + dv * pre.u_w
+  if cw <= 0.0001 then return false, 0, 0, cw end
+  return true, pre.sw * (cx / cw + 1), pre.sh * (1 - cy / cw), cw
+end
+
+-- Map vertices [first, last) of `dl`, drawn with panel pixel (0,0) at
+-- `origin`, onto the panel. Vertices behind the camera collapse to the
+-- viewport origin (callers cull panels whose corners are not all visible).
+-- Draw commands from `first_cmd` on get the whole game view as clip rect: the
+-- rects recorded while drawing are in panel space and would scissor the moved
+-- geometry away.
+-- `flat` > 0 blends toward a flat screen rectangle whose top-left is
+-- `flat_at` (panel pixels map 1:1), for the full-screen transition.
+global function world_transform_vertices(dl: *ImDrawList, first_cmd: cint, first: cint, cam: *GuCamera, b: *WorldBasis, origin: ImVec2, vp: ImVec2, rez: float32, t: float64, flat: float32, flat_at: ImVec2, occ: *WorldOccluder): void
+  local c0 = first_cmd > 0 and first_cmd - 1 or 0
+  for i = c0, < dl.CmdBuffer.Size do
+    dl.CmdBuffer.Data[i].ClipRect = ImVec4{ vp.x, vp.y, vp.x + cam.width, vp.y + cam.height }
+  end
+  local last = dl.VtxBuffer.Size
+  local derez = rez < 0.999
+  local lit = math.abs(b.tint_r - 1) > 0.01 or math.abs(b.tint_g - 1) > 0.01 or math.abs(b.tint_b - 1) > 0.01
+  local tick = (@uint32)(t * 24.0)
+  local pre = world_panel_projection(cam, b)
+  for i = first, < last do
+    local vert = &dl.VtxBuffer.Data[i]
+    local u, v = vert.pos.x - origin.x, vert.pos.y - origin.y
+    if derez then
+      -- scanline dissolve: rows vanish in a noisy order and tear sideways
+      local band = (@uint32)(math.max(v, 0) / 6.0)
+      local n = world_hash(band, tick)
+      local keep = math.clamp((rez * 1.3 - n) * 6.0, 0, 1)
+      u = u + (1.0 - rez) * (world_hash(band + 977, tick) - 0.5) * 90.0 * (1.0 - keep * 0.7)
+      local a = (vert.col >> 24) & 0xFF
+      vert.col = (vert.col & 0x00FFFFFF) | ((@uint32)(a * keep * rez) << 24)
+    end
+    if lit then
+      local r = (@float32)(vert.col & 0xFF) * b.tint_r
+      local g = (@float32)((vert.col >> 8) & 0xFF) * b.tint_g
+      local bl = (@float32)((vert.col >> 16) & 0xFF) * b.tint_b
+      vert.col = (vert.col & 0xFF000000) | (@uint32)(math.min(r, 255)) | ((@uint32)(math.min(g, 255)) << 8) | ((@uint32)(math.min(bl, 255)) << 16)
+    end
+    local px, py = vp.x, vp.y
+    local ok, depth = false, (@float32)(0)
+    if flat < 1 then -- fully flat: the panel's pose plays no part
+      local sx: float32, sy: float32
+      ok, sx, sy, depth = world_project_uv(&pre, u, v)
+      if ok then px, py = sx + vp.x, sy + vp.y end
+    end
+    if flat > 0 then
+      local fx, fy = flat_at.x + u, flat_at.y + v
+      if not ok then px, py = fx, fy end
+      px, py = px + (fx - px) * flat, py + (fy - py) * flat
+    end
+    vert.pos = vec2(px, py)
+    -- the character stands in front: cut its silhouette out of what is behind it
+    if occ ~= nilptr and occ.active and flat < 0.5 and depth > occ.depth + 0.25 then
+      local keep = world_occluder_keep(occ, px, py, 6)
+      if keep < 1 then
+        local a = (vert.col >> 24) & 0xFF
+        vert.col = (vert.col & 0x00FFFFFF) | ((@uint32)(a * keep) << 24)
+      end
+    end
+  end
+end
+
+-- Scale the alpha of vertices [first, end) of `dl`: content fading in.
+global function world_fade_vertices(dl: *ImDrawList, first: cint, alpha: float32): void
+  if alpha >= 0.999 then return end
+  for i = first, < dl.VtxBuffer.Size do
+    local vert = &dl.VtxBuffer.Data[i]
+    local a = (vert.col >> 24) & 0xFF
+    vert.col = (vert.col & 0x00FFFFFF) | ((@uint32)(a * math.clamp(alpha, 0, 1)) << 24)
+  end
+end
+
+-- A screen that just woke has an empty terminal until the agent's replay
+-- lands; its content fades in instead of popping. 1 when it never slept.
+global function world_wake_fade(woke_at: float64, now: float64, duration: float64): float32
+  if woke_at <= 0 or duration <= 0 then return 1 end
+  local t = math.clamp((now - woke_at) / duration, 0, 1)
+  return (@float32)(t * t * (3 - 2 * t))
+end
+
+-- Critically damped ease of `x` (velocity `v`) toward `target`, settling in
+-- about `time` seconds. Exact step, so any frame rate gives the same motion.
+global function world_ease(x: float32, v: float32, target: float32, dt: float32, time: float32): (float32, float32)
+  if time <= 0.001 then return target, 0 end
+  local w = 6.0 / time
+  local d = x - target
+  local e = math.exp(-w * dt)
+  local k = (v + w * d) * dt
+  local nx = target + (d + k) * e
+  local nv = (v - w * k) * e
+  if math.abs(nx - target) < 1e-4 and math.abs(nv) < 1e-3 then return target, 0 end
+  return (@float32)(nx), (@float32)(nv)
+end
+
+-- Title buttons along a panel's top-right edge, in panel pixels.
+global WORLD_BUTTON_NONE: integer <comptime> = 0
+global WORLD_BUTTON_CLOSE: integer <comptime> = 1
+global WORLD_BUTTON_FULL: integer <comptime> = 2
+global WORLD_BUTTON_POPIN: integer <comptime> = 3
+global WORLD_BUTTON_OCCLUDED: integer <comptime> = 4   -- keep running when unseen
+global WORLD_BUTTON_PITCH: float32 <comptime> = 34
+global WORLD_BUTTON_COUNT: integer <comptime> = 4
+
+-- Which button (if any) panel pixel (u, v) is on; each owns a 34 px column.
+global function world_title_button(width: float32, u: float32, v: float32): integer
+  if v < 0 or v >= WORLD_BUTTON_PITCH or u > width then return WORLD_BUTTON_NONE end
+  local k = (@integer)(math.floor((width - u) / WORLD_BUTTON_PITCH))
+  if k < 0 or k >= WORLD_BUTTON_COUNT then return WORLD_BUTTON_NONE end
+  return k + 1
+end
+
+-- Left edge of a button's 26 px square.
+global function world_title_button_x(width: float32, button: integer): float32
+  return width - 30 - WORLD_BUTTON_PITCH * (button - 1)
+end
+
+-- Camera position from the view-projection matrix: the one point whose clip
+-- x, y and w are all zero. False for a degenerate (non-perspective) matrix.
+global function world_camera_position(cam: *GuCamera): (boolean, float32, float32, float32)
+  local m = &cam.m
+  local a: float64, b: float64, c: float64 = m[0], m[4], m[8]
+  local d: float64, e: float64, f: float64 = m[1], m[5], m[9]
+  local g: float64, h: float64, i: float64 = m[3], m[7], m[11]
+  local r0: float64, r1: float64, r2: float64 = -m[12], -m[13], -m[15]
+  local det = a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+  if math.abs(det) < 1e-12 then return false, 0, 0, 0 end
+  local x = (r0 * (e * i - f * h) - b * (r1 * i - f * r2) + c * (r1 * h - e * r2)) / det
+  local y = (a * (r1 * i - f * r2) - r0 * (d * i - f * g) + c * (d * r2 - r1 * g)) / det
+  local z = (a * (e * r2 - r1 * h) - b * (d * r2 - r1 * g) + r0 * (d * h - e * g)) / det
+  return true, (@float32)(x), (@float32)(y), (@float32)(z)
+end
+
+-- Panel depth against the game's depth buffer ----------------------------------
+-- What hides panel pixels behind the scene (CONFIG.world.occlusion): nothing,
+-- the character capsule above, or a per-pixel test against the game's depth
+-- (core/depthpass.nelua, core/shaders/panel_depth.hlsl).
+global WORLD_OCCLUSION_OFF: uint8 <comptime> = 0
+global WORLD_OCCLUSION_CAPSULE: uint8 <comptime> = 1
+global WORLD_OCCLUSION_DEPTH: uint8 <comptime> = 2
+
+global function world_occlusion_mode(name: string): uint8
+  if name == 'off' then return WORLD_OCCLUSION_OFF end
+  if name == 'capsule' then return WORLD_OCCLUSION_CAPSULE end
+  return WORLD_OCCLUSION_DEPTH
+end
+
+-- The camera as the depth test sees it, computed once per frame.
+global WorldDepthFrame = @record{
+  inv: [16]float64,                -- inverse of the view-projection with the camera at the origin
+  ex: float64, ey: float64, ez: float64, -- camera position
+  znear: float64,                  -- clip z (reversed Z: ndc z = znear / view depth)
+}
+
+-- One panel's constants; the layout is cbuffer PanelDepth in
+-- core/shaders/panel_depth.hlsl (eleven float4 rows, 176 bytes).
+global WorldDepthParams = @record{ v: [44]float32 }
+
+-- Glow and grips reach past the panel edge; the shader's arc test allows for them (pixels).
+local DEPTH_ARC_MARGIN: float32 <comptime> = 64
+
+-- Inverse of a 4x4 matrix by cofactors. Works for either layout: the rows of
+-- the inverse are the inverse of the rows.
+global function world_mat4_inverse(m: [16]float64): (boolean, [16]float64)
+  local inv: [16]float64
+  inv[0] = m[5]*m[10]*m[15] - m[5]*m[11]*m[14] - m[9]*m[6]*m[15] + m[9]*m[7]*m[14] + m[13]*m[6]*m[11] - m[13]*m[7]*m[10]
+  inv[4] = -m[4]*m[10]*m[15] + m[4]*m[11]*m[14] + m[8]*m[6]*m[15] - m[8]*m[7]*m[14] - m[12]*m[6]*m[11] + m[12]*m[7]*m[10]
+  inv[8] = m[4]*m[9]*m[15] - m[4]*m[11]*m[13] - m[8]*m[5]*m[15] + m[8]*m[7]*m[13] + m[12]*m[5]*m[11] - m[12]*m[7]*m[9]
+  inv[12] = -m[4]*m[9]*m[14] + m[4]*m[10]*m[13] + m[8]*m[5]*m[14] - m[8]*m[6]*m[13] - m[12]*m[5]*m[10] + m[12]*m[6]*m[9]
+  inv[1] = -m[1]*m[10]*m[15] + m[1]*m[11]*m[14] + m[9]*m[2]*m[15] - m[9]*m[3]*m[14] - m[13]*m[2]*m[11] + m[13]*m[3]*m[10]
+  inv[5] = m[0]*m[10]*m[15] - m[0]*m[11]*m[14] - m[8]*m[2]*m[15] + m[8]*m[3]*m[14] + m[12]*m[2]*m[11] - m[12]*m[3]*m[10]
+  inv[9] = -m[0]*m[9]*m[15] + m[0]*m[11]*m[13] + m[8]*m[1]*m[15] - m[8]*m[3]*m[13] - m[12]*m[1]*m[11] + m[12]*m[3]*m[9]
+  inv[13] = m[0]*m[9]*m[14] - m[0]*m[10]*m[13] - m[8]*m[1]*m[14] + m[8]*m[2]*m[13] + m[12]*m[1]*m[10] - m[12]*m[2]*m[9]
+  inv[2] = m[1]*m[6]*m[15] - m[1]*m[7]*m[14] - m[5]*m[2]*m[15] + m[5]*m[3]*m[14] + m[13]*m[2]*m[7] - m[13]*m[3]*m[6]
+  inv[6] = -m[0]*m[6]*m[15] + m[0]*m[7]*m[14] + m[4]*m[2]*m[15] - m[4]*m[3]*m[14] - m[12]*m[2]*m[7] + m[12]*m[3]*m[6]
+  inv[10] = m[0]*m[5]*m[15] - m[0]*m[7]*m[13] - m[4]*m[1]*m[15] + m[4]*m[3]*m[13] + m[12]*m[1]*m[7] - m[12]*m[3]*m[5]
+  inv[14] = -m[0]*m[5]*m[14] + m[0]*m[6]*m[13] + m[4]*m[1]*m[14] - m[4]*m[2]*m[13] - m[12]*m[1]*m[6] + m[12]*m[2]*m[5]
+  inv[3] = -m[1]*m[6]*m[11] + m[1]*m[7]*m[10] + m[5]*m[2]*m[11] - m[5]*m[3]*m[10] - m[9]*m[2]*m[7] + m[9]*m[3]*m[6]
+  inv[7] = m[0]*m[6]*m[11] - m[0]*m[7]*m[10] - m[4]*m[2]*m[11] + m[4]*m[3]*m[10] + m[8]*m[2]*m[7] - m[8]*m[3]*m[6]
+  inv[11] = -m[0]*m[5]*m[11] + m[0]*m[7]*m[9] + m[4]*m[1]*m[11] - m[4]*m[3]*m[9] - m[8]*m[1]*m[7] + m[8]*m[3]*m[5]
+  inv[15] = m[0]*m[5]*m[10] - m[0]*m[6]*m[9] - m[4]*m[1]*m[10] + m[4]*m[2]*m[9] + m[8]*m[1]*m[6] - m[8]*m[2]*m[5]
+  local det = m[0] * inv[0] + m[1] * inv[4] + m[2] * inv[8] + m[3] * inv[12]
+  if math.abs(det) < 1e-30 then return false, inv end
+  for i = 0, < 16 do inv[i] = inv[i] / det end
+  return true, inv
+end
+
+-- Inverse of a 3x3 matrix (rows a[0..2], a[3..5], a[6..8]).
+local function mat3_inverse(a: [9]float64): (boolean, [9]float64)
+  local r: [9]float64
+  r[0] = a[4] * a[8] - a[5] * a[7]
+  r[1] = a[2] * a[7] - a[1] * a[8]
+  r[2] = a[1] * a[5] - a[2] * a[4]
+  r[3] = a[5] * a[6] - a[3] * a[8]
+  r[4] = a[0] * a[8] - a[2] * a[6]
+  r[5] = a[2] * a[3] - a[0] * a[5]
+  r[6] = a[3] * a[7] - a[4] * a[6]
+  r[7] = a[1] * a[6] - a[0] * a[7]
+  r[8] = a[0] * a[4] - a[1] * a[3]
+  local det = a[0] * r[0] + a[1] * r[3] + a[2] * r[6]
+  if math.abs(det) < 1e-30 then return false, r end
+  for i = 0, < 9 do r[i] = r[i] / det end
+  return true, r
+end
+
+-- The view-projection for positions relative to (px, py, pz): T(p) * VP for
+-- row vectors, so world-sized translations stay out of the GPU's float32 maths.
+global function world_camera_relative_vp(cam: *GuCamera, px: float64, py: float64, pz: float64): [16]float64
+  local r: [16]float64
+  for i = 0, < 16 do r[i] = cam.m[i] end
+  for j = 0, < 4 do
+    r[12 + j] = px * cam.m[j] + py * cam.m[4 + j] + pz * cam.m[8 + j] + cam.m[12 + j]
+  end
+  return r
+end
+
+-- The game's projection: reversed Z with an infinite far plane, so clip z is
+-- the constant near plane (the z column is (0, 0, 0, near)). Anything else and
+-- the depth buffer cannot be read back as distance; the caller falls back.
+global function world_reverse_infinite(cam: *GuCamera): (boolean, float32)
+  local m = &cam.m
+  if math.abs(m[2]) + math.abs(m[6]) + math.abs(m[10]) < 1e-5 and m[14] > 0 then return true, m[14] end
+  return false, 0
+end
+
+global function world_depth_frame(cam: *GuCamera): (boolean, WorldDepthFrame)
+  local f: WorldDepthFrame
+  local okz, zn = world_reverse_infinite(cam)
+  local okc, ex, ey, ez = world_camera_position(cam)
+  if not okz or not okc then return false, f end
+  local oki, inv = world_mat4_inverse(world_camera_relative_vp(cam, ex, ey, ez))
+  if not oki then return false, f end
+  f.inv, f.ex, f.ey, f.ez, f.znear = inv, ex, ey, ez, zn
+  return true, f
+end
+
+-- (lateral yalms, forward yalms, dv pixels) from a world offset: the rows of
+-- inverse([R F U]) with R, F, U as columns. U tilts with pitch, so this is
+-- not a transpose.
+global function world_basis_inverse(b: *WorldBasis): (boolean, [9]float64)
+  local a: [9]float64 = { b.rx, b.fx, b.ux, 0, 0, b.uy, b.rz, b.fz, b.uz }
+  return mat3_inverse(a)
+end
+
+-- Pack one panel's constants. The depth texture is `alloc_w` x `alloc_h` with
+-- this frame's scene in its top-left `rendered_w` x `rendered_h` (dynamic
+-- resolution renders less); `tolerance` in yalms, `edge` in pixels;
+-- `strength` 0 turns the test off for this panel, below 0 shows it.
+global function world_depth_params(f: *WorldDepthFrame, cam: *GuCamera, b: *WorldBasis, alloc_w: float32, alloc_h: float32,
+                                   rendered_w: float32, rendered_h: float32, tolerance: float32, edge: float32,
+                                   strength: float32): (boolean, WorldDepthParams)
+  local p: WorldDepthParams
+  local okb, bi = world_basis_inverse(b)
+  if not okb then return false, p end
+  for i = 0, < 16 do p.v[i] = f.inv[i] end
+  for r = 0, < 3 do
+    for c = 0, < 3 do p.v[16 + r * 4 + c] = bi[r * 3 + c] end
+  end
+  p.v[19] = (b.hw + DEPTH_ARC_MARGIN) * b.ypp
+  p.v[28], p.v[29], p.v[30] = b.cx - f.ex, b.cy - f.ey, b.cz - f.ez
+  p.v[31] = b.curve
+  p.v[32], p.v[33], p.v[34], p.v[35] = cam.width, cam.height, rendered_w / cam.width, rendered_h / cam.height
+  p.v[36], p.v[37], p.v[38], p.v[39] = f.znear, tolerance, edge, strength
+  p.v[40], p.v[41], p.v[42], p.v[43] = alloc_w, alloc_h, rendered_w, rendered_h
+  return true, p
+end
+
+-- The pixel shader's panel depth, for the tests: clip w (view depth) where the
+-- ray through viewport pixel (px, py) meets the panel, or 0 where the shader
+-- would leave the pixel alone. Mirrors main() in core/shaders/panel_depth.hlsl.
+global function world_panel_ray_depth(p: *WorldDepthParams, px: float64, py: float64): float64
+  local v = &p.v
+  local nx, ny = px / v[32] * 2 - 1, 1 - py / v[33] * 2
+  local h: [4]float64
+  for k = 0, < 4 do h[k] = nx * v[k] + ny * v[4 + k] + v[8 + k] + v[12 + k] end
+  if math.abs(h[3] * v[36]) < 1e-6 then return 0 end
+  local dx, dy, dz = h[0] / (h[3] * v[36]), h[1] / (h[3] * v[36]), h[2] / (h[3] * v[36])
+  local ox, oy, oz = -v[28], -v[29], -v[30]
+  local lox, loy = v[16] * ox + v[17] * oy + v[18] * oz, v[20] * ox + v[21] * oy + v[22] * oz
+  local ldx, ldy = v[16] * dx + v[17] * dy + v[18] * dz, v[20] * dx + v[21] * dy + v[22] * dz
+  local r: float64 = v[31]
+  local t: float64
+  if r <= 0.01 then
+    if math.abs(ldy) < 1e-9 then return 0 end
+    t = -loy / ldy
+  else
+    local cy = loy - r
+    local qa = ldx * ldx + ldy * ldy
+    local qb = 2 * (lox * ldx + cy * ldy)
+    local qc = lox * lox + cy * cy - r * r
+    local disc = qb * qb - 4 * qa * qc
+    if qa < 1e-12 or disc < 0 then return 0 end
+    local s = math.sqrt(disc)
+    local t0 = (-qb - s) / (2 * qa)
+    t = (-qb + s) / (2 * qa)
+    local p0x, p0y = lox + t0 * ldx, loy + t0 * ldy
+    if t0 > 0 and p0y < r and math.abs(r * math.atan(p0x, r - p0y)) <= v[19] then t = t0 end
+  end
+  if t <= 0 then return 0 end
+  return t
+end
+
+-- Presenting a clicked panel: it floats part of the way toward a goal in
+-- front of the viewer and turns to face them, as a blend over the placement
+-- Lua returned (anchors never move).
+global WorldPresent = @record{
+  vx: float32, vy: float32, vz: float32,          -- viewer: the panel turns to face it
+  gx: float32, gy: float32, gz: float32,          -- goal the panel floats toward
+  cam_x: float32, cam_y: float32, cam_z: float32, -- camera position
+  fraction: float32,     -- of the way to the goal at full blend
+  min_distance: float32, -- never nearer the viewer or the camera
+  curve_relax: float32,  -- curve radius grows by this factor at full blend (flatter)
+  margin: float32,       -- yalms kept behind the character
+  occ_depth: float32,    -- clip w of the character's body; 0 = no character
+}
+
+local function present_allowed(cam: *GuCamera, pr: *WorldPresent, x: float32, y: float32, z: float32, bulge: float32): boolean
+  local md2 = pr.min_distance * pr.min_distance
+  if (x - pr.vx) ^ 2 + (y - pr.vy) ^ 2 + (z - pr.vz) ^ 2 < md2 then return false end
+  if (x - pr.cam_x) ^ 2 + (y - pr.cam_y) ^ 2 + (z - pr.cam_z) ^ 2 < md2 then return false end
+  -- never between the camera and the character: stay deeper than its body
+  if pr.occ_depth > 0 and world_depth(cam, x, y, z) - bulge < pr.occ_depth + pr.margin then return false end
+  return true
+end
+
+global function world_present_pose(cam: *GuCamera, pl: WorldPlacement, pr: *WorldPresent, blend: float32): WorldPlacement
+  if blend <= 0.0001 then return pl end
+  -- how far the curved edges reach toward the viewer
+  local bulge: float32 = 0
+  if pl.curve > 0.01 and pl.ppm > 0 then
+    bulge = pl.curve * (1 - math.cos(math.min(pl.width * 0.5 / pl.ppm / pl.curve, math.pi * 0.5)))
+  end
+  local dx, dy, dz = pr.gx - pl.x, pr.gy - pl.y, pr.gz - pl.z
+  -- the farthest allowed point along the way (constraints only tighten as it nears)
+  local s = math.clamp(pr.fraction, 0, 1)
+  if not present_allowed(cam, pr, pl.x + dx * s, pl.y + dy * s, pl.z + dz * s, bulge) then
+    if not present_allowed(cam, pr, pl.x, pl.y, pl.z, bulge) then
+      s = 0
+    else
+      local lo, hi = (@float32)(0), s
+      for _ = 1, 20 do
+        local mid = (lo + hi) * 0.5
+        if present_allowed(cam, pr, pl.x + dx * mid, pl.y + dy * mid, pl.z + dz * mid, bulge) then lo = mid else hi = mid end
+      end
+      s = lo
+    end
+  end
+  s = s * math.clamp(blend, 0, 1)
+  local out = pl
+  out.x, out.y, out.z = pl.x + dx * s, pl.y + dy * s, pl.z + dz * s
+  local fx, fz = pr.vx - out.x, pr.vz - out.z
+  if fx * fx + fz * fz > 1e-6 then
+    local want = (@float32)(math.atan(fx, fz))
+    local turn = (want - pl.yaw + (@float32)(math.pi)) % (@float32)(2 * math.pi) - (@float32)(math.pi)
+    out.yaw = pl.yaw + turn * blend
+  end
+  out.pitch = pl.pitch * (1 - blend)
+  if pl.curve > 0.01 then out.curve = pl.curve * (1 + pr.curve_relax * blend) end
+  return out
+end
+
+-- Walking up to a clicked panel -------------------------------------------------
+-- The character turns toward the panel and the forward key is held until it
+-- is close enough. Anything the player does, and anything unexpected, ends
+-- the walk and lets go of the key. Pure: the caller reads the game and does
+-- the inputs.
+global WORLD_WALK_NONE: integer <comptime> = 0
+global WORLD_WALK_ARRIVED: integer <comptime> = 1
+global WORLD_WALK_USER_INPUT: integer <comptime> = 2
+global WORLD_WALK_FOCUS_LOST: integer <comptime> = 3
+global WORLD_WALK_COMBAT: integer <comptime> = 4
+global WORLD_WALK_MOUNTED: integer <comptime> = 5
+global WORLD_WALK_NO_CHARACTER: integer <comptime> = 6
+global WORLD_WALK_TIMEOUT: integer <comptime> = 7
+global WORLD_WALK_STUCK: integer <comptime> = 8
+global WORLD_WALK_WRONG_WAY: integer <comptime> = 9   -- e.g. camera-relative movement took it elsewhere
+global WORLD_WALK_CANCELLED: integer <comptime> = 10
+
+global WorldWalk = @record{
+  id: integer,               -- session walked to, 0 = not walking
+  tx: float32, tz: float32,  -- the panel as placed (not presented), horizontally
+  started: float64,
+  moved_at: float64,         -- last time it covered ground (or the hold began)
+  mx: float32, mz: float32,  -- where it was then
+  start_dist: float32,
+  holding: boolean,          -- forward key is down
+  ended: integer,            -- why the last walk ended (WORLD_WALK_*)
+}
+
+global WorldWalkInput = @record{
+  now: float64,
+  dt: float32,
+  focus_id: integer,         -- session with keyboard focus now
+  user_input: boolean,       -- movement keys or mouse steering from the player
+  found: boolean, in_combat: boolean, mounted: boolean,
+  x: float32, z: float32, rotation: float32,
+  approach: float32,         -- stop within this many yalms (horizontal)
+  max_seconds: float32,
+  turn_speed: float32,       -- radians per second
+  stuck_seconds: float32,    -- no ground covered this long while holding = blocked
+}
+
+global WorldWalkStep = @record{
+  hold: boolean,             -- keep the forward key down this frame
+  release: boolean,          -- let go of it now
+  turn: boolean,
+  rotation: float32,
+}
+
+global function world_walk_start(w: *WorldWalk, id: integer, now: float64, x: float32, z: float32, tx: float32, tz: float32): void
+  $w = { id = id, tx = tx, tz = tz, started = now, moved_at = now, mx = x, mz = z,
+         start_dist = (@float32)(math.sqrt((tx - x) ^ 2 + (tz - z) ^ 2)) }
+end
+
+-- End the walk; true when the key has to be released.
+global function world_walk_stop(w: *WorldWalk, why: integer): boolean
+  local held = w.holding
+  if w.id ~= 0 then w.ended = why end
+  w.id = 0
+  w.holding = false
+  return held
+end
+
+global function world_walk_step(w: *WorldWalk, inp: WorldWalkInput): WorldWalkStep
+  local out: WorldWalkStep
+  if w.id == 0 then return out end
+  local dx, dz = w.tx - inp.x, w.tz - inp.z
+  local dist = math.sqrt(dx * dx + dz * dz)
+  local why = WORLD_WALK_NONE
+  if inp.user_input then why = WORLD_WALK_USER_INPUT
+  elseif inp.focus_id ~= w.id then why = WORLD_WALK_FOCUS_LOST
+  elseif not inp.found then why = WORLD_WALK_NO_CHARACTER
+  elseif inp.in_combat then why = WORLD_WALK_COMBAT
+  elseif inp.mounted then why = WORLD_WALK_MOUNTED
+  elseif dist <= inp.approach then why = WORLD_WALK_ARRIVED
+  elseif inp.now - w.started > inp.max_seconds then why = WORLD_WALK_TIMEOUT
+  elseif dist > w.start_dist + 1.0 then why = WORLD_WALK_WRONG_WAY
+  else
+    if (inp.x - w.mx) ^ 2 + (inp.z - w.mz) ^ 2 > 0.05 * 0.05 then
+      w.moved_at, w.mx, w.mz = inp.now, inp.x, inp.z
+    end
+    if w.holding and inp.now - w.moved_at > inp.stuck_seconds then why = WORLD_WALK_STUCK end
+  end
+  if why ~= WORLD_WALK_NONE then
+    out.release = world_walk_stop(w, why)
+    return out
+  end
+  local want = math.atan(dx, dz)
+  local diff = (want - inp.rotation + math.pi) % (2 * math.pi) - math.pi
+  if inp.turn_speed > 0 and math.abs(diff) > 0.01 then
+    local step = inp.turn_speed * inp.dt
+    out.turn = true
+    out.rotation = inp.rotation + (@float32)(math.clamp(diff, -step, step))
+  end
+  -- set off once roughly facing it (or at once when the game steers the
+  -- character itself, turn_speed 0); the stuck clock starts with the hold
+  if not w.holding and (inp.turn_speed <= 0 or math.abs(diff) < 0.35) then
+    w.holding = true
+    w.moved_at, w.mx, w.mz = inp.now, inp.x, inp.z
+  end
+  out.hold = w.holding
+  return out
+end
+
+-- The game's walk input for a walk in progress: left/forward in the frame
+-- the game reads movement in (the character's facing in standard mode, the
+-- camera's in legacy mode). `ref` is that frame's heading.
+global function world_walk_steer(w: *WorldWalk, x: float32, z: float32, ref: float32): (boolean, float32, float32)
+  if w.id == 0 or not w.holding then return false, 0, 0 end
+  local rel = math.atan(w.tx - x, w.tz - z) - ref
+  return true, (@float32)(math.sin(rel)), (@float32)(math.cos(rel))
+end
+
+-- Placing panels by dragging ----------------------------------------------------
+-- Alt + left-drag carries a panel along the cursor ray at its distance from
+-- the camera; Shift lands it flush on the surface under the cursor, and Ctrl
+-- as well stretches it over that surface. Pure: rays go through `cast` (the
+-- shim's forward to the game's collision, or a fake scene in tests).
+
+-- 1 with the first hit point along the unit direction within `max` yalms, else 0.
+global WorldRaycast = @function(ox: float32, oy: float32, oz: float32, dx: float32, dy: float32, dz: float32,
+                                max: float32, hx: *float32, hy: *float32, hz: *float32): cint
+
+-- The ray from the camera through screen pixel (sx, sy), viewport-relative:
+-- origin, then unit direction. Only the x, y and w rows of the view-projection
+-- are inverted, which is exact whatever the depth mapping (reversed, infinite).
+global function world_cursor_ray(cam: *GuCamera, sx: float32, sy: float32): (boolean, float32, float32, float32, float32, float32, float32)
+  local ok, ox, oy, oz = world_camera_position(cam)
+  if not ok or cam.width < 1 or cam.height < 1 then return false, 0, 0, 0, 0, 0, 0 end
+  local m = &cam.m
+  local nx: float64 = 2.0 * sx / cam.width - 1.0
+  local ny: float64 = 1.0 - 2.0 * sy / cam.height
+  -- a direction along the ray keeps clip x = nx * w and clip y = ny * w, so it
+  -- is perpendicular to both rows below: their cross product is the ray
+  local ax: float64, ay: float64, az: float64 = m[0] - nx * m[3], m[4] - nx * m[7], m[8] - nx * m[11]
+  local bx: float64, by: float64, bz: float64 = m[1] - ny * m[3], m[5] - ny * m[7], m[9] - ny * m[11]
+  local dx, dy, dz = ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx
+  local len = math.sqrt(dx * dx + dy * dy + dz * dz)
+  if len < 1e-12 then return false, 0, 0, 0, 0, 0, 0 end
+  if dx * m[3] + dy * m[7] + dz * m[11] < 0 then len = -len end -- into the screen: depth grows
+  return true, ox, oy, oz, (@float32)(dx / len), (@float32)(dy / len), (@float32)(dz / len)
+end
+
+-- A pose's unit axes, as world_basis lays the panel out: right, up (leaning
+-- back with pitch) and the front normal of the readable side.
+global WorldAxes = @record{
+  rx: float32, ry: float32, rz: float32,
+  ux: float32, uy: float32, uz: float32,
+  nx: float32, ny: float32, nz: float32,
+}
+
+global function world_axes(yaw: float32, pitch: float32): WorldAxes
+  local sy, cy = math.sin(yaw), math.cos(yaw)
+  local sp, cp = math.sin(pitch), math.cos(pitch)
+  return WorldAxes{ rx = cy, ry = 0, rz = -sy, ux = -sy * sp, uy = cp, uz = -cy * sp, nx = sy * cp, ny = sp, nz = cy * cp }
+end
+
+-- A panel carried along the cursor ray: the grabbed pixel (u, v) sits `dist`
+-- yalms out along it, the panel upright, flat and turned to face the camera.
+global function world_drag_pose(pl: WorldPlacement, ox: float32, oy: float32, oz: float32, dx: float32, dy: float32, dz: float32,
+                                dist: float32, u: float32, v: float32): WorldPlacement
+  local out = pl
+  local gx, gy, gz = ox + dx * dist, oy + dy * dist, oz + dz * dist
+  if (ox - gx) ^ 2 + (oz - gz) ^ 2 > 1e-6 then out.yaw = (@float32)(math.atan(ox - gx, oz - gz)) end
+  local ypp = 1.0 / (pl.ppm > 0 and pl.ppm or 300.0)
+  local a = world_axes(out.yaw, 0)
+  local du, dv = (u - pl.width * 0.5) * ypp, (pl.height * 0.5 - v) * ypp
+  out.x, out.y, out.z = gx - a.rx * du, gy - dv, gz - a.rz * du
+  out.pitch, out.curve = 0, 0
+  return out
+end
+
+-- How upright a pose's up axis reads to a camera looking along unit (ax, az).
+local function pose_readable(yaw: float64, pitch: float64, ax: float64, az: float64): float64
+  local sp = math.sin(pitch)
+  return math.cos(pitch) - math.sin(yaw) * sp * ax - math.cos(yaw) * sp * az
+end
+
+local function wrap_angle(a: float64): float32
+  return (@float32)((a + math.pi) % (2 * math.pi) - math.pi)
+end
+
+-- Yaw and pitch that turn a panel's front to the surface normal n. Two poses
+-- share every normal (one upside down); the one reading upright from a camera
+-- looking along (ax, az) wins: up is up on walls, and on floors and ceilings
+-- the top edge points away from the camera. Poses have no roll, so on nearly
+-- level ground the yaw comes from the camera rather than from the slight tilt,
+-- which would turn the text any which way and flicker across terrain
+-- triangles; the front then leans only with the part of the tilt toward or
+-- away from the camera.
+local LEVEL_SIN2 <comptime> = 0.0302 -- sin^2(10 degrees): steeper surfaces set the yaw
+global function world_pose_from_normal(nx: float32, ny: float32, nz: float32, ax: float32, az: float32): (float32, float32)
+  local al = math.sqrt(ax * ax + az * az)
+  if al > 1e-6 then ax, az = ax / al, az / al else ax, az = 0, 0 end
+  local yaw: float64 = math.atan(-ax, -az)
+  if nx * nx + nz * nz > LEVEL_SIN2 then yaw = math.atan(nx, nz) end
+  local pitch: float64 = math.atan(ny, nx * math.sin(yaw) + nz * math.cos(yaw)) -- closest to n at this yaw
+  if pose_readable(yaw + math.pi, math.pi - pitch, ax, az) > pose_readable(yaw, pitch, ax, az) + 1e-4 then
+    yaw, pitch = yaw + math.pi, math.pi - pitch
+  end
+  return wrap_angle(yaw), wrap_angle(pitch)
+end
+
+global WorldSnap = @record{
+  ok: boolean,
+  x: float32, y: float32, z: float32,     -- where the cursor ray meets the surface
+  nx: float32, ny: float32, nz: float32,  -- unit surface normal on the camera's side
+}
+
+local function cast_toward(cast: WorldRaycast, ox: float32, oy: float32, oz: float32, tx: float32, ty: float32, tz: float32, reach: float32): (boolean, float32, float32, float32)
+  local dx, dy, dz = tx - ox, ty - oy, tz - oz
+  local len = math.sqrt(dx * dx + dy * dy + dz * dz)
+  if len < 1e-6 then return false, 0, 0, 0 end
+  local hx: float32, hy: float32, hz: float32 = 0, 0, 0
+  if cast(ox, oy, oz, dx / len, dy / len, dz / len, reach, &hx, &hy, &hz) == 0 then return false, 0, 0, 0 end
+  return true, hx, hy, hz
+end
+
+-- The surface under the cursor ray (origin o, unit direction d): the hit, and
+-- the normal of the plane through it and two more hits `probe` yalms beside
+-- it across the ray. Probes that fall off an edge or land on something far
+-- away are retried on the other sides. Not ok when no side measures a plane
+-- (thin or ragged geometry): a panel could not lie flush there.
+global function world_snap(cast: WorldRaycast, ox: float32, oy: float32, oz: float32, dx: float32, dy: float32, dz: float32,
+                           reach: float32, probe: float32): WorldSnap
+  local s: WorldSnap
+  if cast == nilptr then return s end
+  local hx: float32, hy: float32, hz: float32 = 0, 0, 0
+  if cast(ox, oy, oz, dx, dy, dz, reach, &hx, &hy, &hz) == 0 then return s end
+  -- a = d x up (d x +X when looking straight up or down), b = a x d
+  local ax, ay, az = -dz, (@float32)(0), dx
+  if ax * ax + az * az < 0.01 then ax, ay, az = 0, dz, -dy end
+  local al = math.sqrt(ax * ax + ay * ay + az * az)
+  ax, ay, az = ax / al, ay / al, az / al
+  local bx, by, bz = ay * dz - az * dy, az * dx - ax * dz, ax * dy - ay * dx
+  -- probes start just short of the hit on the clear ray, not at the camera:
+  -- from there they meet even a surface the cursor ray grazes at a steep
+  -- angle and land within reach of the hit
+  local back = math.min(probe * 2, math.sqrt((hx - ox) ^ 2 + (hy - oy) ^ 2 + (hz - oz) ^ 2) * 0.5)
+  local px, py, pz = hx - dx * back, hy - dy * back, hz - dz * back
+  local spread = probe * 6 -- farther is another object
+  for k = 0, < 4 do
+    local sa: float32 = (k & 1) == 0 and probe or -probe
+    local sb: float32 = (k & 2) == 0 and probe or -probe
+    local ok1, p1x, p1y, p1z = cast_toward(cast, px, py, pz, hx + ax * sa, hy + ay * sa, hz + az * sa, back + spread)
+    local ok2, p2x, p2y, p2z = cast_toward(cast, px, py, pz, hx + bx * sb, hy + by * sb, hz + bz * sb, back + spread)
+    if ok1 and ok2 then
+      local ux, uy, uz = p1x - hx, p1y - hy, p1z - hz
+      local vx, vy, vz = p2x - hx, p2y - hy, p2z - hz
+      if ux * ux + uy * uy + uz * uz < spread * spread and vx * vx + vy * vy + vz * vz < spread * spread then
+        local nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+        local nl = math.sqrt(nx * nx + ny * ny + nz * nz)
+        if nl > probe * probe * 0.05 then -- the probes landed apart, not on one line
+          if nx * (ox - hx) + ny * (oy - hy) + nz * (oz - hz) < 0 then nl = -nl end
+          s.ok, s.x, s.y, s.z = true, hx, hy, hz
+          s.nx, s.ny, s.nz = nx / nl, ny / nl, nz / nl
+          return s
+        end
+      end
+    end
+  end
+  return s
+end
+
+-- Flush against the snapped surface: centred over the hit, `offset` yalms off
+-- it along the normal, turned to it, flat. On nearly level ground the pose may
+-- lean sideways from the surface (poses have no roll): it is lifted by the
+-- most any edge would dip, so no edge sinks in.
+global function world_snap_pose(pl: WorldPlacement, s: *WorldSnap, cam_x: float32, cam_z: float32, offset: float32): WorldPlacement
+  local out = pl
+  out.yaw, out.pitch = world_pose_from_normal(s.nx, s.ny, s.nz, s.x - cam_x, s.z - cam_z)
+  local a = world_axes(out.yaw, out.pitch)
+  local ypp = 1.0 / (pl.ppm > 0 and pl.ppm or 300.0)
+  local dip = (pl.width * math.abs(a.rx * s.nx + a.ry * s.ny + a.rz * s.nz)
+             + pl.height * math.abs(a.ux * s.nx + a.uy * s.ny + a.uz * s.nz)) * 0.5 * ypp
+  local off = offset + dip
+  out.x, out.y, out.z = s.x + s.nx * off, s.y + s.ny * off, s.z + s.nz * off
+  out.curve = 0
+  return out
+end
+
+-- Stretch-to-fit result: a rectangle on the surface in the pose's axes.
+global WorldFit = @record{
+  ok: boolean,
+  cr: float32, cu: float32,  -- centre shift from the hit along right and up (yalms)
+  w: float32, h: float32,    -- size (yalms)
+}
+
+-- Flat surface at (r, u) yalms from the hit along the axes: a short ray from
+-- `lift` in front of the plane straight into it lands within `tol` of it.
+local function flat_at(cast: WorldRaycast, s: *WorldSnap, a: *WorldAxes, r: float32, u: float32, lift: float32, tol: float32): boolean
+  local px, py, pz = s.x + a.rx * r + a.ux * u, s.y + a.ry * r + a.uy * u, s.z + a.rz * r + a.uz * u
+  local hx: float32, hy: float32, hz: float32 = 0, 0, 0
+  if cast(px + a.nx * lift, py + a.ny * lift, pz + a.nz * lift, -a.nx, -a.ny, -a.nz, lift + tol, &hx, &hy, &hz) == 0 then return false end
+  return math.abs((hx - px) * a.nx + (hy - py) * a.ny + (hz - pz) * a.nz) <= tol
+end
+
+-- Whole steps the surface reaches from the hit along (dr, du), up to `max`.
+local function reach_along(cast: WorldRaycast, s: *WorldSnap, a: *WorldAxes, dr: float32, du: float32, max: float32, step: float32, lift: float32, tol: float32): float32
+  local d: float32 = 0
+  while d + step <= max + 1e-4 and flat_at(cast, s, a, dr * (d + step), du * (d + step), lift, tol) do
+    d = d + step
+  end
+  return d
+end
+
+local function edge_flat(cast: WorldRaycast, s: *WorldSnap, a: *WorldAxes, r0: float32, u0: float32, r1: float32, u1: float32, step: float32, lift: float32, tol: float32): boolean
+  local n = (@integer)(math.clamp(math.ceil(math.max(math.abs(r1 - r0), math.abs(u1 - u0)) / (step * 2)), 1, 8))
+  for i = 0, n do
+    if not flat_at(cast, s, a, r0 + (r1 - r0) * i / n, u0 + (u1 - u0) * i / n, lift, tol) then return false end
+  end
+  return true
+end
+
+-- The largest rectangle around the hit, in the axes of pose (yaw, pitch), over
+-- which the surface stays flat: grown from the hit along the axes, then its
+-- edges pulled in until they lie on the surface too, less `margin`. Bounded:
+-- at most `max` yalms each way and a fixed number of rounds; not ok when the
+-- result is under `min` either way or did not settle.
+global function world_fit(cast: WorldRaycast, s: *WorldSnap, yaw: float32, pitch: float32,
+                          max: float32, step: float32, margin: float32, min: float32, tol: float32): WorldFit
+  local fit: WorldFit
+  if cast == nilptr or not s.ok or step < 0.01 or max <= 0 then return fit end
+  local a = world_axes(yaw, pitch)
+  -- rays start this far out: clutter lower than that stops the fit, and
+  -- collision is one-sided, so taller clutter (the ray starting inside) does not
+  local lift = math.max(tol * 4, 0.5)
+  if not flat_at(cast, s, &a, 0, 0, lift, tol) then return fit end
+  local l = reach_along(cast, s, &a, -1, 0, max, step, lift, tol)
+  local r = reach_along(cast, s, &a, 1, 0, max, step, lift, tol)
+  local dn = reach_along(cast, s, &a, 0, -1, max, step, lift, tol)
+  local up = reach_along(cast, s, &a, 0, 1, max, step, lift, tol)
+  local settled = false
+  for _ = 1, 32 do
+    local shrunk = false
+    if up > 0 and not edge_flat(cast, s, &a, -l, up, r, up, step, lift, tol) then up, shrunk = math.max(0, up - step), true end
+    if dn > 0 and not edge_flat(cast, s, &a, -l, -dn, r, -dn, step, lift, tol) then dn, shrunk = math.max(0, dn - step), true end
+    if l > 0 and not edge_flat(cast, s, &a, -l, -dn, -l, up, step, lift, tol) then l, shrunk = math.max(0, l - step), true end
+    if r > 0 and not edge_flat(cast, s, &a, r, -dn, r, up, step, lift, tol) then r, shrunk = math.max(0, r - step), true end
+    if not shrunk then settled = true break end
+  end
+  local w, h = l + r - 2 * margin, dn + up - 2 * margin
+  if not settled or w < min or h < min then return fit end
+  return WorldFit{ ok = true, cr = (r - l) * 0.5, cu = (up - dn) * 0.5, w = w, h = h }
+end
+
+-- The snapped pose stretched over its fit (panel pixels at the pose's density).
+global function world_fit_pose(pl: WorldPlacement, fit: *WorldFit): WorldPlacement
+  if not fit.ok then return pl end
+  local out = pl
+  local a = world_axes(pl.yaw, pl.pitch)
+  out.x = pl.x + a.rx * fit.cr + a.ux * fit.cu
+  out.y = pl.y + a.ry * fit.cr + a.uy * fit.cu
+  out.z = pl.z + a.rz * fit.cr + a.uz * fit.cu
+  local ppm = pl.ppm > 0 and pl.ppm or 300
+  out.width, out.height = fit.w * ppm, fit.h * ppm
+  return out
+end
+
+-- The drag gesture. Alt arms it over a panel (the caller shows a grip and
+-- keeps the click from the game); a left press picks the panel up; the wheel
+-- pushes it out or pulls it in along the ray; letting go drops it; the right
+-- button, or the panel going away, puts it back. Alt only has to be down for
+-- the press.
+global WorldDrag = @record{
+  id: integer,               -- panel being carried, 0 = none
+  u: float32, v: float32,    -- the grabbed panel pixel
+  dist: float32,             -- yalms from the camera along the cursor ray
+  -- stretch-to-fit costs many rays: kept while the snap point stays put
+  fit: WorldFit,
+  fit_x: float32, fit_y: float32, fit_z: float32,
+  fit_time: float64,
+}
+
+global WorldDragInput = @record{
+  enabled: boolean,
+  alt: boolean, shift: boolean, ctrl: boolean,
+  lmb_down: boolean, lmb_pressed: boolean, rmb_down: boolean,
+  over_window: boolean,
+  hover_id: integer,         -- panel under the cursor, 0 = none
+  hover_u: float32, hover_v: float32,
+  hover_dist: float32,       -- camera to the point under the cursor (yalms)
+  shown: boolean,            -- the carried panel is still placed this frame
+  wheel: float32,            -- wheel notches this frame
+  wheel_step: float32,       -- yalms per notch
+  min_distance: float32, max_distance: float32,
+}
+
+global WorldDragStep = @record{
+  id: integer,               -- panel carried, dropped or put back this frame
+  armed: boolean,
+  started: boolean,
+  dragging: boolean,
+  dropped: boolean,          -- let go: pin it where it is
+  cancelled: boolean,        -- back where it was
+  snap: boolean,             -- Shift: onto the surface under the cursor
+  fit: boolean,              -- Ctrl as well: stretched over it
+}
+
+global function world_drag_step(d: *WorldDrag, inp: WorldDragInput): WorldDragStep
+  local out: WorldDragStep
+  local farthest = math.max(inp.min_distance, inp.max_distance)
+  if d.id == 0 then
+    out.armed = inp.enabled and inp.alt and inp.hover_id ~= 0 and not inp.over_window
+    if out.armed and inp.lmb_pressed then
+      $d = { id = inp.hover_id, u = inp.hover_u, v = inp.hover_v, dist = math.clamp(inp.hover_dist, inp.min_distance, farthest) }
+      out.started, out.dragging = true, true
+    end
+  elseif not inp.shown or inp.rmb_down then
+    out.cancelled = true
+  elseif not inp.lmb_down then
+    out.dropped = true
+  else
+    out.dragging = true
+    d.dist = math.clamp(d.dist + inp.wheel * inp.wheel_step, inp.min_distance, farthest)
+  end
+  out.id = d.id
+  out.snap = (out.dragging or out.dropped) and inp.shift
+  out.fit = out.snap and inp.ctrl
+  if out.dropped or out.cancelled then d.id = 0 end
+  return out
+end
+
+-- Lua bindings ------------------------------------------------------------------
+-- ghostty.player() / ghostty.target() / ghostty.object(entity_id) return
+-- { x, y, z, rotation, entity_id, territory, in_combat } or nil; ghostty.zone()
+-- returns the current territory id or nil. ghostty.player(t) and
+-- ghostty.target(t) fill and return the table `t` instead of a new one, so a
+-- per-frame caller makes no garbage.
+
+-- `reuse`: stack index of a table to fill instead (0: always a new table)
+local function push_object(L: *lua_State, which: cint, id: uint64, reuse: cint): cint
+  if world_host.get_object == nilptr then lua_pushnil(L) return 1 end
+  local o: GuObject
+  if world_host.get_object(which, id, &o) == 0 or o.found == 0 then lua_pushnil(L) return 1 end
+  if reuse > 0 and lua_type(L, reuse) == LUA_TTABLE then
+    lua_pushvalue(L, reuse)
+  else
+    lua_createtable(L, 0, 7)
+  end
+  lua_pushnumber(L, o.x) lua_setfield(L, -2, 'x')
+  lua_pushnumber(L, o.y) lua_setfield(L, -2, 'y')
+  lua_pushnumber(L, o.z) lua_setfield(L, -2, 'z')
+  lua_pushnumber(L, o.rotation) lua_setfield(L, -2, 'rotation')
+  lua_pushinteger(L, (@lua_Integer)(o.entity_id)) lua_setfield(L, -2, 'entity_id')
+  lua_pushinteger(L, o.territory) lua_setfield(L, -2, 'territory')
+  lua_pushboolean(L, o.in_combat) lua_setfield(L, -2, 'in_combat')
+  return 1
+end
+
+local function l_player(L: *lua_State): cint return push_object(L, WORLD_PLAYER, 0, 1) end
+local function l_target(L: *lua_State): cint return push_object(L, WORLD_TARGET, 0, 1) end
+local function l_object(L: *lua_State): cint
+  return push_object(L, WORLD_BY_ID, (@uint64)(lua_tointegerx(L, 1, nilptr)), 0)
+end
+local function l_zone(L: *lua_State): cint
+  if world_host.get_object == nilptr then lua_pushnil(L) return 1 end
+  local o: GuObject
+  if world_host.get_object(WORLD_PLAYER, 0, &o) == 0 or o.found == 0 then lua_pushnil(L) return 1 end
+  lua_pushinteger(L, o.territory)
+  return 1
+end
+
+-- ghostty.anim_state() -> mode, mode_param, base_override, base_playing (nil without a character)
+local function l_anim_state(L: *lua_State): cint
+  local mode: uint8, param: uint8, base: uint16, current: uint16 = 0, 0, 0, 0
+  if world_host.anim_get == nilptr or world_host.anim_get(&mode, &param, &base, &current) == 0 then lua_pushnil(L) return 1 end
+  lua_pushinteger(L, mode)
+  lua_pushinteger(L, param)
+  lua_pushinteger(L, base)
+  lua_pushinteger(L, current)
+  return 4
+end
+
+-- ghostty.anim_speed(slot, speed) -> boolean (slot 0 = base)
+local function l_anim_speed(L: *lua_State): cint
+  local ok = world_host.anim_speed ~= nilptr and world_host.anim_speed((@uint32)(lua_tointegerx(L, 1, nilptr)), (@float32)(lua_tonumberx(L, 2, nilptr))) ~= 0
+  lua_pushboolean(L, ok and 1 or 0)
+  return 1
+end
+
+-- ghostty.anim_set(mode, mode_param, base_override, use_set_mode) -> boolean
+local function l_anim_set(L: *lua_State): cint
+  local ok = world_host.anim_set ~= nilptr and world_host.anim_set(
+    (@uint8)(lua_tointegerx(L, 1, nilptr)), (@uint8)(lua_tointegerx(L, 2, nilptr)),
+    (@uint16)(lua_tointegerx(L, 3, nilptr)), lua_toboolean(L, 4)) ~= 0
+  lua_pushboolean(L, ok and 1 or 0)
+  return 1
+end
+
+-- ghostty.anim_play(action_timeline_id) -> boolean
+local function l_anim_play(L: *lua_State): cint
+  local ok = world_host.anim_play ~= nilptr and world_host.anim_play((@uint16)(lua_tointegerx(L, 1, nilptr))) ~= 0
+  lua_pushboolean(L, ok and 1 or 0)
+  return 1
+end
+
+-- ghostty.camera() -> fx, fy, fz: unit vector the camera looks along (nil if unknown)
+local function l_camera(L: *lua_State): cint
+  local cam: GuCamera
+  if world_host.get_camera == nilptr or world_host.get_camera(&cam) == 0 then lua_pushnil(L) return 1 end
+  local fx, fy, fz = world_camera_forward(&cam)
+  lua_pushnumber(L, fx) lua_pushnumber(L, fy) lua_pushnumber(L, fz)
+  return 3
+end
+
+-- ghostty.log(msg): write a [Ghostty] line to the Dalamud log
+local function l_log(L: *lua_State): cint
+  local msg = lua_tolstring(L, 1, nilptr)
+  if msg ~= nilptr and world_host.log ~= nilptr then world_host.log(msg) end
+  return 0
+end
+
+-- ghostty.set_rotation(radians): turn the local player (true on success)
+local function l_set_rotation(L: *lua_State): cint
+  local ok = world_host.set_rotation ~= nilptr and world_host.set_rotation((@float32)(lua_tonumberx(L, 1, nilptr))) ~= 0
+  lua_pushboolean(L, ok and 1 or 0)
+  return 1
+end
+
+-- ghostty.env() -> day_seconds, rain, weather (nil when unavailable)
+local function l_env(L: *lua_State): cint
+  local day: float32, rain: float32, weather: uint8 = 0, 0, 0
+  if world_host.get_environment == nilptr or world_host.get_environment(&day, &rain, &weather) == 0 then lua_pushnil(L) return 1 end
+  lua_pushnumber(L, day) lua_pushnumber(L, rain) lua_pushinteger(L, weather)
+  return 3
+end
+
+global function world_lua_register(L: *lua_State): void
+  lua_createtable(L, 0, 11)
+  lua_pushcclosure(L, l_env, 0) lua_setfield(L, -2, 'env')
+  ui_lua_register(L)
+  lua_pushcclosure(L, l_set_rotation, 0) lua_setfield(L, -2, 'set_rotation')
+  lua_pushcclosure(L, l_anim_speed, 0) lua_setfield(L, -2, 'anim_speed')
+  lua_pushcclosure(L, l_log, 0) lua_setfield(L, -2, 'log')
+  lua_pushcclosure(L, l_camera, 0) lua_setfield(L, -2, 'camera')
+  lua_pushcclosure(L, l_anim_state, 0) lua_setfield(L, -2, 'anim_state')
+  lua_pushcclosure(L, l_anim_set, 0) lua_setfield(L, -2, 'anim_set')
+  lua_pushcclosure(L, l_anim_play, 0) lua_setfield(L, -2, 'anim_play')
+  lua_pushcclosure(L, l_player, 0) lua_setfield(L, -2, 'player')
+  lua_pushcclosure(L, l_target, 0) lua_setfield(L, -2, 'target')
+  lua_pushcclosure(L, l_object, 0) lua_setfield(L, -2, 'object')
+  lua_pushcclosure(L, l_zone, 0) lua_setfield(L, -2, 'zone')
+  lua_setglobal(L, 'ghostty')
+end
+
+-- Present and walk tuning: CONFIG.world.present / CONFIG.world.walk from
+-- lua/world.lua, with these defaults for anything missing.
+global WorldTuning = @record{
+  present: boolean,
+  present_fraction: float32,
+  present_distance: float32,     -- goal this far in front of the camera
+  present_min_distance: float32,
+  present_ease: float32,         -- seconds
+  present_curve_relax: float32,
+  present_eye_height: float32,   -- goal height above the character's feet
+  present_margin: float32,
+  full_screen: float32,          -- fraction of the screen a double-clicked panel fills
+  full_ease: float32,            -- seconds the flight to and from full screen takes
+  walk: boolean,
+  walk_approach: float32,
+  walk_max_seconds: float32,
+  walk_turn_speed: float32,
+  walk_stuck_seconds: float32,
+  -- CONFIG.world.drag: placing panels by dragging
+  drag: boolean,
+  drag_wheel_step: float32,
+  drag_min_distance: float32,
+  drag_max_distance: float32,
+  drag_reach: float32,
+  drag_offset: float32,
+  drag_probe: float32,
+  drag_fit_max: float32,
+  drag_fit_step: float32,
+  drag_fit_margin: float32,
+  drag_fit_min: float32,
+  drag_fit_tolerance: float32,
+}
+
+local function push_config_world(L: *lua_State): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'world')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  return true -- stack: CONFIG, world
+end
+
+global function world_read_tuning(L: *lua_State): WorldTuning
+  local t: WorldTuning = {
+    present = true, present_fraction = 0.4, present_distance = 1.6, present_min_distance = 1.2,
+    present_ease = 0.35, present_curve_relax = 0.5, present_eye_height = 1.6, present_margin = 0.35, full_screen = 0.62, full_ease = 0.6,
+    walk = true, walk_approach = 1.8, walk_max_seconds = 3.0, walk_turn_speed = 0, walk_stuck_seconds = 0.5,
+    drag = true, drag_wheel_step = 0.35, drag_min_distance = 0.8, drag_max_distance = 40, drag_reach = 80,
+    drag_offset = 0.02, drag_probe = 0.15, drag_fit_max = 3, drag_fit_step = 0.1, drag_fit_margin = 0.05,
+    drag_fit_min = 0.4, drag_fit_tolerance = 0.05,
+  }
+  if L == nilptr or not push_config_world(L) then return t end
+  local w = lua_gettop(L)
+  lua_getfield(L, w, 'present')
+  if lua_type(L, -1) == LUA_TTABLE then
+    local p = lua_gettop(L)
+    t.present = lua_field_boolean(L, p, 'enabled', t.present)
+    t.present_fraction = (@float32)(lua_field_number(L, p, 'fraction', t.present_fraction))
+    t.full_screen = (@float32)(math.clamp(lua_field_number(L, p, 'full_screen', t.full_screen), 0.2, 1.0))
+    t.full_ease = (@float32)(math.clamp(lua_field_number(L, p, 'full_ease', t.full_ease), 0.05, 3.0))
+    t.present_distance = (@float32)(lua_field_number(L, p, 'distance', t.present_distance))
+    t.present_min_distance = (@float32)(lua_field_number(L, p, 'min_distance', t.present_min_distance))
+    t.present_ease = (@float32)(lua_field_number(L, p, 'ease', t.present_ease))
+    t.present_curve_relax = (@float32)(lua_field_number(L, p, 'curve_relax', t.present_curve_relax))
+    t.present_eye_height = (@float32)(lua_field_number(L, p, 'eye_height', t.present_eye_height))
+    t.present_margin = (@float32)(lua_field_number(L, p, 'margin', t.present_margin))
+  end
+  lua_pop(L, 1)
+  lua_getfield(L, w, 'walk')
+  if lua_type(L, -1) == LUA_TTABLE then
+    local k = lua_gettop(L)
+    t.walk = lua_field_boolean(L, k, 'enabled', t.walk)
+    t.walk_approach = (@float32)(lua_field_number(L, k, 'approach_distance', t.walk_approach))
+    t.walk_max_seconds = (@float32)(lua_field_number(L, k, 'max_seconds', t.walk_max_seconds))
+    t.walk_turn_speed = (@float32)(lua_field_number(L, k, 'turn_speed', t.walk_turn_speed))
+    t.walk_stuck_seconds = (@float32)(lua_field_number(L, k, 'stuck_seconds', t.walk_stuck_seconds))
+  end
+  lua_pop(L, 1)
+  lua_getfield(L, w, 'drag')
+  if lua_type(L, -1) == LUA_TTABLE then
+    local k = lua_gettop(L)
+    t.drag = lua_field_boolean(L, k, 'enabled', t.drag)
+    t.drag_wheel_step = (@float32)(lua_field_number(L, k, 'wheel_step', t.drag_wheel_step))
+    t.drag_min_distance = (@float32)(lua_field_number(L, k, 'min_distance', t.drag_min_distance))
+    t.drag_max_distance = (@float32)(lua_field_number(L, k, 'max_distance', t.drag_max_distance))
+    t.drag_reach = (@float32)(lua_field_number(L, k, 'reach', t.drag_reach))
+    t.drag_offset = (@float32)(lua_field_number(L, k, 'offset', t.drag_offset))
+    t.drag_probe = (@float32)(math.max(lua_field_number(L, k, 'probe', t.drag_probe), 0.02))
+    t.drag_fit_max = (@float32)(math.min(lua_field_number(L, k, 'fit_max', t.drag_fit_max), 10))
+    t.drag_fit_step = (@float32)(math.max(lua_field_number(L, k, 'fit_step', t.drag_fit_step), 0.05)) -- bounds the rays cast
+    t.drag_fit_margin = (@float32)(lua_field_number(L, k, 'fit_margin', t.drag_fit_margin))
+    t.drag_fit_min = (@float32)(lua_field_number(L, k, 'fit_min', t.drag_fit_min))
+    t.drag_fit_tolerance = (@float32)(lua_field_number(L, k, 'fit_tolerance', t.drag_fit_tolerance))
+  end
+  lua_pop(L, 3)
+  return t
+end
+
+-- CONFIG.world.walkable(terminal_id): does walking up to this panel make
+-- sense (fixed in the world, not trailing after the character)?
+global function world_lua_walkable(L: *lua_State, id: integer): boolean
+  if L == nilptr or not push_config_world(L) then return false end
+  lua_getfield(L, -1, 'walkable')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  lua_pushinteger(L, id)
+  local r = lua_pcall(L, 1, 1, 0) == LUA_OK and lua_toboolean(L, -1) ~= 0
+  lua_pop(L, 3)
+  return r
+end
