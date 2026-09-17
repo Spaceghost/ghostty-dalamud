@@ -1,0 +1,124 @@
+require 'core.policy'
+require 'string'
+require 'io'
+require 'os'
+require 'arg'
+
+local dir: string = arg[1]
+if not policy_load(dir) then
+  io.stderr:write('policy load failed: ', policy.error, '\n')
+  os.exit(1)
+end
+print('toggle_key', policy.toggle_key, 'vk', policy.toggle_consume_vk)
+print('dropdown height', policy.dropdown.height, 'font', policy.dropdown.font_size)
+assert(policy.dropdown.rounding == 8 and policy.dropdown.margin == 12 and not policy.dropdown.open_on_start)
+assert(policy.popup_rounding == 6)
+assert(policy.copy_on_select, 'copy_on_select defaults on')
+assert(policy.dropdown.width == 0.5 and policy.dropdown.min_width == 1200 and policy.dropdown.align == 'center')
+assert(policy.toggle_gamepad_mask == 0x4000, 'select -> GamepadButtons.Select')
+assert(policy.toggle_ctrl and not policy.toggle_shift and not policy.toggle_alt, 'toggle is ctrl+grave')
+assert(policy_gamepad_mask('start') == 0x8000 and policy_gamepad_mask('l1') == 0x100 and policy_gamepad_mask('nope') == 0)
+print('agent', policy.agent.host, policy.agent.port, 'token_file', policy.agent.token_file)
+assert(#policy.profiles >= 3)
+for i = 0, < #policy.profiles do
+  local p = policy_profile(i)
+  io.write(string.format('profile %d: %s [%s] argv=', i, p.name, p.transport))
+  for k = 0, < #p.argv do io.write(p.argv[k], ' ') end
+  io.write('\n')
+end
+assert(policy.profiles[0].transport == 'agent')
+assert(policy.profiles[0].argv[0] == '/bin/bash')
+local buf: [64]cchar
+local n = policy_key_action('c', true, true, false, false, &buf, 64)
+assert(n == 4 and (@string)((@cstring)(&buf)) == 'copy', 'ctrl+shift+c -> copy')
+n = policy_key_action('insert', true, false, false, false, &buf, 64)
+assert(n == 4 and (@string)((@cstring)(&buf)) == 'copy', 'ctrl+insert -> copy')
+n = policy_key_action('a', true, false, false, false, &buf, 64)
+assert(n == 0, 'ctrl+a -> terminal')
+n = policy_key_action('tab', true, false, false, false, &buf, 64)
+assert((@string)((@cstring)(&buf)) == 'next_tab')
+
+-- /term showcase needs nothing on disk: each terminal either gets text from
+-- lua/showcase.lua (show) or runs a command in a shell (send).
+do
+  local n = 0
+  local shown = 0
+  while true do
+    local ok, view, send, show = policy_showcase_terminal(n + 1)
+    if not ok then break end
+    n = n + 1
+    assert(#view > 0, 'showcase terminal has a place')
+    assert(#send > 0 or #show > 0, 'showcase terminal has content')
+    assert(send:find('~', 1, true) == 0 and send:find('/home/', 1, true) == 0, 'no paths into a checkout')
+    if #show > 0 then
+      shown = shown + 1
+      assert(show:find('[^\r]\n') == 0, 'show text uses CR LF: no line discipline behind it')
+      assert(show:find('\27[?25l', 1, true) > 0)
+    end
+    print(string.format('showcase %d: %s send=%d show=%d bytes', n, view, #send, #show))
+  end
+  assert(n >= 3 and shown >= 2, 'showcase has shell and local terminals')
+  local ok = policy_showcase_shot(1)
+  assert(ok and policy_showcase_delay() > 0)
+end
+
+-- A world command that throws a non-string still fails; per-frame hook errors
+-- are logged, once per distinct message.
+local function lua_run(code: cstring): boolean
+  return luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK
+end
+do
+  assert(lua_run('CONFIG.world.command = function() error({}) end'))
+  local e = policy_world_command(1, 'x')
+  assert(#e > 0, 'error({}) is an error')
+  e:destroy()
+end
+local hook_logs: integer = 0
+local function count_log(msg: cstring): void
+  hook_logs = hook_logs + 1
+  print('logged:', msg)
+end
+world_host.log = count_log
+assert(lua_run("CONFIG.world.place = function() error('place broke') end"))
+for i = 1, 3 do
+  local ok = policy_world_place(1, 0, false)
+  assert(not ok)
+end
+assert(hook_logs == 1 and policy.last_hook_error[POLICY_HOOK_PLACE]:find('place broke', 1, true) > 0, 'logged once')
+assert(lua_run("CONFIG.animation = { on_frame = function() error('frame broke') end }"))
+-- place and on_frame failing in the same frames: each logs once, not every call
+for i = 1, 4 do
+  assert(not policy_world_place(1, 0, false))
+  policy_anim_frame(i)
+end
+assert(hook_logs == 2, 'two hooks failing alternately log once each')
+assert(policy.last_hook_error[POLICY_HOOK_ON_FRAME]:find('frame broke', 1, true) > 0)
+assert(lua_gettop(policy.L) == 0, 'hooks leave the stack balanced')
+world_host.log = nilptr
+
+-- CONFIG.dropdown, popup or agent missing or not a table: defaults, no Lua panic
+local mindir: string = 'build/test-policy-min'
+local function write_min_init(text: string): void
+  local luadir = mindir .. '/lua'
+  assert(fs_mkdir((@cstring)(mindir.data)) and fs_mkdir((@cstring)(luadir.data)))
+  local path = luadir .. '/init.lua'
+  local f = io.open(path, 'wb')
+  assert(f:isopen())
+  f:write(text)
+  f:close()
+  f:destroy()
+  path:destroy()
+  luadir:destroy()
+end
+write_min_init("return { popup = 3, profiles = { { name = 'sh' } } }\n")
+assert(policy_load(mindir), 'minimal config loads')
+assert(policy.dropdown.height == 0.45 and policy.popup_width == 900 and policy.agent.port == 7777, 'defaults')
+assert(#policy.profiles == 1 and policy.profiles[0].name == 'sh')
+
+-- a syntax error in init.lua is reported with its text
+write_min_init('return {\n')
+assert(not policy_load(mindir) and #policy.error > 0, 'load error has text')
+print('load error:', policy.error)
+write_min_init('error({})\n')
+assert(not policy_load(mindir) and policy.error == 'error object is not a string')
+print('OK')

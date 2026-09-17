@@ -1,0 +1,821 @@
+-- Policy layer: everything the user can configure lives in Lua
+-- (lua/init.lua and friends). Nelua only reads the resulting tables.
+require 'string'
+require 'vector'
+require 'stringbuilder'
+require 'core.lua'
+require 'core.world'
+require 'core.sys.fs'
+require 'io'
+
+global Profile = @record{
+  name: string,
+  transport: string,        -- "agent" | "conpty" | "superlogical"
+  argv: vector(string),
+  env: vector(string),
+  host: string,             -- transport-specific target (agent host, superlogical url)
+  port: integer,
+  cwd: string,
+}
+
+global DropdownCfg = @record{
+  height: float64,          -- fraction of the viewport height
+  y_offset: float64,        -- pixels from the top (leave room for the Umbra toolbar)
+  animation_ms: float64,
+  font_size: float64,
+  opacity: float64,         -- 0..1 background alpha
+  padding: float64,
+  rounding: float64,        -- corner radius in pixels
+  margin: float64,          -- horizontal inset from the viewport edges
+  width: float64,           -- fraction of the viewport width
+  min_width: float64,       -- pixels; the fraction never shrinks it below this
+  align: string,            -- 'left' | 'center' | 'right'
+  open_on_start: boolean,
+  glass: boolean,           -- gradient body with an edge highlight (else flat)
+  glow: float64,            -- 0..1 soft outer glow
+  world_tint: float64,      -- 0..1 how much the chrome takes on the world's light, like a panel
+}
+
+global AgentCfg = @record{
+  host: string,
+  port: integer,
+  token: string,
+  token_file: string,
+}
+
+-- Per-frame Lua hooks; each remembers its own last logged error.
+global POLICY_HOOK_PLACE <comptime> = 0
+global POLICY_HOOK_ON_FRAME <comptime> = 1
+global POLICY_HOOK_ON_KEY <comptime> = 2
+global POLICY_HOOK_RESIZE <comptime> = 3
+global POLICY_HOOK_SETTINGS_DRAW <comptime> = 4
+global POLICY_HOOK_COUNT <comptime> = 5
+
+global Policy = @record{
+  L: *lua_State,
+  loaded: boolean,
+  error: string,
+  profiles: vector(Profile),
+  default_profile: integer,
+  dropdown: DropdownCfg,
+  popup_width: integer,
+  popup_height: integer,
+  popup_font_size: float64,
+  popup_rounding: float64,
+  agent: AgentCfg,
+  toggle_key: string,       -- ImGui key name in lowercase, e.g. "grave"
+  toggle_consume_vk: integer,
+  toggle_ctrl: boolean,     -- modifiers that must be held with toggle_key (others must be up)
+  toggle_shift: boolean,
+  toggle_alt: boolean,
+  world_toggle_ctrl: boolean,  -- modifiers for the world/pet terminals toggle
+  world_toggle_shift: boolean,
+  world_toggle_alt: boolean,
+  toggle_gamepad_mask: integer, -- Dalamud GamepadButtons flags; 0 = no gamepad toggle
+  cursor_blink: boolean,
+  close_on_exit: boolean,   -- close a terminal when its shell exits (ctrl+d)
+  copy_on_select: boolean,  -- releasing a mouse selection copies it to the clipboard
+  disabled: boolean,        -- kill switch: the core does nothing per frame
+  world_font_size: float64, -- font size on world panels; 0 = the font's native size (crispest)
+  world_pins: vector(string),  -- `/term pin` arguments to apply once a character is loaded
+  world_occlusion: uint8,   -- WORLD_OCCLUSION_* (CONFIG.world.occlusion)
+  world_occlusion_tolerance: float32, -- yalms a panel may sit behind the scene before it hides (grows with distance and slope)
+  world_occlusion_edge: float32,      -- pixels over which a covered edge blends
+  last_hook_error: [POLICY_HOOK_COUNT]string,  -- per POLICY_HOOK_*: the last error logged (each distinct text logs once)
+}
+
+global policy: Policy
+
+local function set_error(msg: string): void
+  policy.error:destroy()
+  policy.error = msg:copy()
+end
+
+-- The error object on top of the Lua stack, with its length (the size was
+-- missing before, so every load error was logged as empty text).
+local function set_lua_error(L: *lua_State): void
+  local len: usize = 0
+  local p = lua_tolstring(L, -1, &len)
+  if p ~= nilptr then
+    set_error(string{data=(@*[0]byte)(p), size=len})
+  else
+    set_error('error object is not a string')
+  end
+end
+
+local function clear_hook_errors(): void
+  for i = 0, < POLICY_HOOK_COUNT do policy.last_hook_error[i]:destroy() end
+end
+
+-- A per-frame hook failed with its error on top of the stack (not popped):
+-- log it once, and again only when that hook's text changes. Each hook keeps
+-- its own slot, so two hooks failing in the same frame do not relog each other.
+local function log_hook_error(L: *lua_State, hook: integer, what: cstring): void
+  local len: usize = 0
+  local p = lua_tolstring(L, -1, &len)
+  local msg: string = 'error object is not a string'
+  if p ~= nilptr then msg = string{data=(@*[0]byte)(p), size=len} end
+  if msg == policy.last_hook_error[hook] then return end
+  policy.last_hook_error[hook]:destroy()
+  policy.last_hook_error[hook] = msg:copy()
+  if world_host.log == nilptr then return end
+  local sb: stringbuilder
+  sb:write('lua ', what, ': ', msg)
+  local line = sb:promote()
+  world_host.log((@cstring)(line.data))
+  line:destroy()
+end
+
+local function read_string_list(L: *lua_State, idx: cint, out: *vector(string)): void
+  if lua_type(L, idx) ~= LUA_TTABLE then return end
+  local n = (@integer)(lua_rawlen(L, idx))
+  for i = 1, n do
+    lua_rawgeti(L, idx, i)
+    if lua_isstring(L, -1) ~= 0 then
+      local len: usize
+      local p = lua_tolstring(L, -1, &len)
+      out:push(string{data=(@*[0]byte)(p), size=len}:copy())
+    end
+    lua_pop(L, 1)
+  end
+end
+
+local function read_profile(L: *lua_State, idx: cint): Profile
+  local p: Profile
+  p.name = lua_field_string(L, idx, 'name', 'unnamed')
+  p.transport = lua_field_string(L, idx, 'transport', 'agent')
+  p.host = lua_field_string(L, idx, 'host', '')
+  p.port = lua_field_integer(L, idx, 'port', 0)
+  p.cwd = lua_field_string(L, idx, 'cwd', '')
+  lua_getfield(L, idx, 'command')
+  if lua_type(L, -1) == LUA_TTABLE then
+    read_string_list(L, -1, &p.argv)
+  elseif lua_isstring(L, -1) ~= 0 then
+    local len: usize
+    local s = lua_tolstring(L, -1, &len)
+    p.argv:push(string{data=(@*[0]byte)(s), size=len}:copy())
+  end
+  lua_pop(L, 1)
+  lua_getfield(L, idx, 'env')
+  read_string_list(L, -1, &p.env)
+  lua_pop(L, 1)
+  return p
+end
+
+local function clear_profiles(): void
+  for i = 0, < #policy.profiles do
+    local p = &policy.profiles[i]
+    p.name:destroy() p.transport:destroy() p.host:destroy() p.cwd:destroy()
+    for k = 0, < #p.argv do p.argv[k]:destroy() end
+    p.argv:destroy()
+    for k = 0, < #p.env do p.env[k]:destroy() end
+    p.env:destroy()
+  end
+  policy.profiles:clear()
+end
+
+-- Load <dir>/lua/init.lua. The script must return the config table.
+-- Dalamud's GamepadButtons flag for a button name ("select" is the PS5
+-- Create / Xbox View button). Unknown or empty names give 0.
+global function policy_gamepad_mask(name: string): integer
+  local names: [16]string = {
+    'dpad_up', 'dpad_down', 'dpad_left', 'dpad_right', 'north', 'south', 'west', 'east',
+    'l1', 'l2', 'l3', 'r1', 'r2', 'r3', 'select', 'start',
+  }
+  for i = 0, < 16 do
+    if names[i] == name then return 1 << i end
+  end
+  return 0
+end
+
+-- Scalar settings from the CONFIG table at stack index t (used at load and
+-- when the settings window applies changes, without touching sessions).
+local function read_settings(L: *lua_State, t: cint): void
+  policy.toggle_key:destroy()
+  policy.toggle_key = lua_field_string(L, t, 'toggle_key', 'grave')
+  policy.toggle_consume_vk = lua_field_integer(L, t, 'toggle_consume_vk', 0xC0)
+  local tm = lua_field_string(L, t, 'toggle_mods', 'ctrl')
+  policy.toggle_ctrl = tm:find('ctrl', 1, true) > 0
+  policy.toggle_shift = tm:find('shift', 1, true) > 0
+  policy.toggle_alt = tm:find('alt', 1, true) > 0
+  tm:destroy()
+  local wm = lua_field_string(L, t, 'world_toggle_mods', 'ctrl+shift')
+  policy.world_toggle_ctrl = wm:find('ctrl', 1, true) > 0
+  policy.world_toggle_shift = wm:find('shift', 1, true) > 0
+  policy.world_toggle_alt = wm:find('alt', 1, true) > 0
+  wm:destroy()
+  local pad = lua_field_string(L, t, 'toggle_gamepad_button', '')
+  policy.toggle_gamepad_mask = policy_gamepad_mask(pad)
+  pad:destroy()
+  policy.default_profile = lua_field_integer(L, t, 'default_profile', 1)
+  policy.cursor_blink = lua_field_boolean(L, t, 'cursor_blink', true)
+  policy.close_on_exit = lua_field_boolean(L, t, 'close_on_exit', true)
+  policy.copy_on_select = lua_field_boolean(L, t, 'copy_on_select', true)
+  policy.disabled = lua_field_boolean(L, t, 'disabled', false)
+  policy.world_font_size = lua_field_number(L, t, 'world_font_size', 0)
+
+  for i = 0, < #policy.world_pins do policy.world_pins[i]:destroy() end
+  policy.world_pins:clear()
+  lua_getfield(L, t, 'world_pins')
+  if lua_type(L, -1) == LUA_TTABLE then
+    local n = (@integer)(lua_rawlen(L, -1))
+    for i = 1, n do
+      lua_rawgeti(L, -1, i)
+      if lua_type(L, -1) == LUA_TSTRING then
+        local len: usize = 0
+        local p = lua_tolstring(L, -1, &len)
+        policy.world_pins:push(string.copy(string{data=(@*[0]byte)(p), size=len}))
+      end
+      lua_pop(L, 1)
+    end
+  end
+  lua_pop(L, 1)
+
+  lua_getfield(L, t, 'dropdown')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) lua_createtable(L, 0, 0) end -- not a table: defaults, no Lua panic
+  local d: cint = lua_gettop(L)
+  policy.dropdown.height = lua_field_number(L, d, 'height', 0.45)
+  policy.dropdown.y_offset = lua_field_number(L, d, 'y_offset', 0)
+  policy.dropdown.animation_ms = lua_field_number(L, d, 'animation_ms', 120)
+  policy.dropdown.font_size = lua_field_number(L, d, 'font_size', 15)
+  policy.dropdown.opacity = lua_field_number(L, d, 'opacity', 0.94)
+  policy.dropdown.padding = lua_field_number(L, d, 'padding', 6)
+  policy.dropdown.rounding = lua_field_number(L, d, 'rounding', 8)
+  policy.dropdown.margin = lua_field_number(L, d, 'margin', 12)
+  policy.dropdown.width = lua_field_number(L, d, 'width', 1.0)
+  policy.dropdown.min_width = lua_field_number(L, d, 'min_width', 1200)
+  policy.dropdown.align:destroy()
+  policy.dropdown.align = lua_field_string(L, d, 'align', 'center')
+  policy.dropdown.open_on_start = lua_field_boolean(L, d, 'open_on_start', false)
+  policy.dropdown.glass = lua_field_boolean(L, d, 'glass', true)
+  policy.dropdown.glow = lua_field_number(L, d, 'glow', 0.6)
+  policy.dropdown.world_tint = lua_field_number(L, d, 'world_tint', 1)
+  lua_pop(L, 1)
+
+  lua_getfield(L, t, 'world')
+  local w: cint = lua_gettop(L)
+  if lua_type(L, w) == LUA_TTABLE then
+    local occ = lua_field_string(L, w, 'occlusion', 'depth')
+    policy.world_occlusion = world_occlusion_mode(occ)
+    occ:destroy()
+    policy.world_occlusion_tolerance = (@float32)(math.clamp(lua_field_number(L, w, 'occlusion_tolerance', 0.01), 0.005, 1))
+    policy.world_occlusion_edge = (@float32)(math.clamp(lua_field_number(L, w, 'occlusion_edge', 1), 0, 3))
+  else
+    policy.world_occlusion = WORLD_OCCLUSION_DEPTH
+    policy.world_occlusion_tolerance, policy.world_occlusion_edge = 0.01, 1
+  end
+  lua_pop(L, 1)
+
+  lua_getfield(L, t, 'popup')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) lua_createtable(L, 0, 0) end
+  local pp: cint = lua_gettop(L)
+  policy.popup_width = lua_field_integer(L, pp, 'width', 900)
+  policy.popup_height = lua_field_integer(L, pp, 'height', 480)
+  policy.popup_font_size = lua_field_number(L, pp, 'font_size', 14)
+  policy.popup_rounding = lua_field_number(L, pp, 'rounding', 6)
+  lua_pop(L, 1)
+
+end
+
+-- Close the Lua state and free everything read from it. gu_shutdown calls
+-- this: the loader unloads the core and starts a fresh copy, so nothing may
+-- stay allocated behind it.
+global function policy_unload(): void
+  if policy.L ~= nilptr then lua_close(policy.L) end
+  clear_profiles()
+  policy.profiles:destroy()
+  for i = 0, < #policy.world_pins do policy.world_pins[i]:destroy() end
+  policy.world_pins:destroy()
+  policy.error:destroy()
+  policy.toggle_key:destroy()
+  policy.dropdown.align:destroy()
+  clear_hook_errors()
+  policy.agent.host:destroy()
+  policy.agent.token:destroy()
+  policy.agent.token_file:destroy()
+  policy = {}
+end
+
+-- Load lua/init.lua with two homes: `install` holds the shipped modules
+-- (read-only beside the plugin), `config` the user's writable state and any
+-- overriding modules. `host` names the embedding ('dalamud' runs the one-time
+-- migration from the Umbra-hosted layout first; 'test' does not).
+global function policy_load_dirs(install: string, config: string, configs_root: string, host_name: string): boolean
+  if policy.L ~= nilptr then lua_close(policy.L) policy.L = nilptr end
+  clear_profiles()
+  policy.loaded = false
+  clear_hook_errors() -- a reloaded config reports its hook errors afresh
+  local L = luaL_newstate()
+  if L == nilptr then set_error('luaL_newstate failed') return false end
+  luaL_openlibs(L)
+  world_lua_register(L)
+  fs_lua_register(L)
+  policy.L = L
+
+  local sb: stringbuilder
+  -- long-bracket strings need no escaping of Windows backslashes
+  sb:write('GHOSTTY_INSTALL_DIR = [==[', install, ']==]\n')
+  sb:write('GHOSTTY_CONFIG_DIR = [==[', config, ']==]\n')
+  sb:write('GHOSTTY_CONFIGS_ROOT = [==[', configs_root, ']==]\n')
+  sb:write('GHOSTTY_HOST = [==[', host_name, ']==]\n')
+  -- settings.lua, world-state.lua and friends are written here
+  sb:write('GHOSTTY_PLUGIN_DIR = GHOSTTY_CONFIG_DIR\n')
+  -- `require` finds the user's modules before the shipped ones
+  sb:write('package.path = GHOSTTY_CONFIG_DIR .. "/lua/?.lua;" .. GHOSTTY_INSTALL_DIR .. "/lua/?.lua;" .. package.path\n')
+  -- always the shipped migrate.lua; a failure is logged and never blocks loading
+  sb:write([[
+if GHOSTTY_HOST == 'dalamud' then
+  local ok, err = pcall(function() dofile(GHOSTTY_INSTALL_DIR .. '/lua/migrate.lua').run() end)
+  if not ok then ghostty.log('migration from Umbra failed: ' .. tostring(err)) end
+end
+]])
+  local bootstrap = sb:promote()
+  if luaL_loadstring(L, (@cstring)(bootstrap.data)) ~= LUA_OK or lua_pcall(L, 0, 0, 0) ~= LUA_OK then
+    set_lua_error(L)
+    bootstrap:destroy()
+    return false
+  end
+  bootstrap:destroy()
+
+  -- the user's init.lua (it carries the agent token) wins over the shipped one
+  local dir = config
+  do
+    local probe = config .. '/lua/init.lua'
+    local f = io.open(probe, 'rb')
+    if not f:isopen() then dir = install end
+    f:destroy() -- close() alone keeps the stream record allocated (no GC)
+    probe:destroy()
+  end
+  local path = dir .. '/lua/init.lua'
+  local rc = luaL_loadfilex(L, (@cstring)(path.data), nilptr)
+  path:destroy()
+  if rc ~= LUA_OK then
+    set_lua_error(L)
+    return false
+  end
+  if lua_pcall(L, 0, 1, 0) ~= LUA_OK then
+    set_lua_error(L)
+    return false
+  end
+  if lua_type(L, -1) ~= LUA_TTABLE then
+    set_error('init.lua must return a table')
+    return false
+  end
+  -- keep the config table reachable as a global for keymap callbacks
+  lua_pushvalue(L, -1)
+  lua_setglobal(L, 'CONFIG')
+
+  local t: cint = lua_gettop(L)
+  read_settings(L, t)
+
+  lua_getfield(L, t, 'agent')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) lua_createtable(L, 0, 0) end
+  local a: cint = lua_gettop(L)
+  policy.agent.host:destroy() policy.agent.token:destroy() policy.agent.token_file:destroy() -- a reload replaces them
+  policy.agent.host = lua_field_string(L, a, 'host', '127.0.0.1')
+  policy.agent.port = lua_field_integer(L, a, 'port', 7777)
+  policy.agent.token = lua_field_string(L, a, 'token', '')
+  policy.agent.token_file = lua_field_string(L, a, 'token_file', '')
+  lua_pop(L, 1)
+
+  lua_getfield(L, t, 'profiles')
+  if lua_type(L, -1) == LUA_TTABLE then
+    local n = (@integer)(lua_rawlen(L, -1))
+    for i = 1, n do
+      lua_rawgeti(L, -1, i)
+      if lua_type(L, -1) == LUA_TTABLE then
+        policy.profiles:push(read_profile(L, lua_gettop(L)))
+      end
+      lua_pop(L, 1)
+    end
+  end
+  lua_pop(L, 1)
+  lua_pop(L, 1) -- config table
+  policy.loaded = true
+  return true
+end
+
+-- One directory for both homes (tests, and anything embedding the core plainly).
+global function policy_load(dir: string): boolean
+  return policy_load_dirs(dir, dir, '', 'test')
+end
+
+-- Ask the keymap for an action name for a key chord. Returns an empty string
+-- when the key should go to the terminal. `key` is the ImGui key name in
+-- lowercase (e.g. "c", "f1", "grave"), mods are booleans.
+global function policy_key_action(key: string, ctrl: boolean, shift: boolean, alt: boolean, super: boolean, out: *[0]cchar, cap: usize): usize
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return 0 end
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return 0 end
+  lua_getfield(L, -1, 'on_key')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 2) return 0 end
+  lua_pushlstring(L, (@cstring)(key.data), key.size)
+  lua_pushboolean(L, ctrl and 1 or 0)
+  lua_pushboolean(L, shift and 1 or 0)
+  lua_pushboolean(L, alt and 1 or 0)
+  lua_pushboolean(L, super and 1 or 0)
+  local n: usize = 0
+  if lua_pcall(L, 5, 1, 0) == LUA_OK then
+    if lua_isstring(L, -1) ~= 0 then
+      local len: usize
+      local p = lua_tolstring(L, -1, &len)
+      if len >= cap then len = cap - 1 end
+      local pp = (@*[0]cchar)(p)
+      for i: usize = 0, < len do out[i] = pp[i] end
+      out[len] = 0
+      n = len
+    end
+    lua_pop(L, 1)
+  else
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 1)
+  return n
+end
+
+global function policy_profile(i: integer): *Profile
+  if i < 0 or i >= #policy.profiles then return nilptr end
+  return &policy.profiles[i]
+end
+
+-- World panels ------------------------------------------------------------------
+-- Both call into CONFIG.world (lua/world.lua); a missing module disables the
+-- feature quietly.
+
+local function push_world_fn(L: *lua_State, name: cstring): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'world')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, name)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  return true -- stack: CONFIG, world, fn
+end
+
+-- CONFIG.world.command(terminal_id, args) -> nil on success or an error string.
+global function policy_world_command(id: integer, args: string): string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return string.copy('no config') end
+  if not push_world_fn(L, 'command') then return string.copy('lua/world.lua is not loaded (CONFIG.world)') end
+  lua_pushinteger(L, id)
+  lua_pushlstring(L, (@cstring)(args.data), args.size)
+  local err: string
+  if lua_pcall(L, 2, 1, 0) ~= LUA_OK or lua_type(L, -1) == LUA_TSTRING then
+    local len: usize = 0
+    local msg = lua_tolstring(L, -1, &len)
+    if msg ~= nilptr then
+      err = string.copy(string{data=(@*[0]byte)(msg), size=len})
+    else
+      err = string.copy('lua error') -- error({}) must not read as success
+    end
+  end
+  lua_pop(L, 3)
+  return err
+end
+
+-- CONFIG.world.place(terminal_id, time, focused) -> placement table or nil (hidden).
+global function policy_world_place(id: integer, t: float64, focused: boolean): (boolean, WorldPlacement)
+  local pl: WorldPlacement
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return false, pl end
+  if not push_world_fn(L, 'place') then return false, pl end
+  lua_pushinteger(L, id)
+  lua_pushnumber(L, t)
+  lua_pushboolean(L, focused and 1 or 0)
+  local ok = false
+  if lua_pcall(L, 3, 1, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_PLACE, 'world.place')
+  elseif lua_type(L, -1) == LUA_TTABLE then
+    local r: cint = lua_gettop(L)
+    pl.x = (@float32)(lua_field_number(L, r, 'x', 0))
+    pl.y = (@float32)(lua_field_number(L, r, 'y', 0))
+    pl.z = (@float32)(lua_field_number(L, r, 'z', 0))
+    pl.yaw = (@float32)(lua_field_number(L, r, 'yaw', 0))
+    pl.pitch = (@float32)(lua_field_number(L, r, 'pitch', 0))
+    pl.width = (@float32)(lua_field_number(L, r, 'width', 900))
+    pl.height = (@float32)(lua_field_number(L, r, 'height', 520))
+    pl.ppm = (@float32)(lua_field_number(L, r, 'pixels_per_yalm', 300))
+    pl.opacity = (@float32)(lua_field_number(L, r, 'opacity', 0.9))
+    pl.curve = (@float32)(lua_field_number(L, r, 'curve', 0))
+    pl.tint_r = (@float32)(lua_field_number(L, r, 'tint_r', 1))
+    pl.tint_g = (@float32)(lua_field_number(L, r, 'tint_g', 1))
+    pl.tint_b = (@float32)(lua_field_number(L, r, 'tint_b', 1))
+    pl.backlight = (@float32)(lua_field_number(L, r, 'backlight', 0))
+    pl.run_occluded = lua_field_boolean(L, r, 'run_occluded', false)
+    pl.light_intensity = (@float32)(lua_field_number(L, r, 'light_intensity', 0))
+    pl.light_range = (@float32)(lua_field_number(L, r, 'light_range', 0))
+    pl.light_r = (@float32)(lua_field_number(L, r, 'light_r', 1))
+    pl.light_g = (@float32)(lua_field_number(L, r, 'light_g', 1))
+    pl.light_b = (@float32)(lua_field_number(L, r, 'light_b', 1))
+    pl.light_shadows = lua_field_boolean(L, r, 'light_shadows', false)
+    ok = true
+  end
+  lua_pop(L, 3)
+  return ok, pl
+end
+
+-- CONFIG.world.lighting() -> r, g, b, backlight: the world's light on a panel,
+-- for chrome that should match. False when the module or its answer is missing.
+global function policy_world_lighting(): (boolean, float32, float32, float32, float32)
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_world_fn(L, 'lighting') then return false, 1, 1, 1, 0 end
+  local ok = false
+  local r: float32, g: float32, b: float32, bl: float32 = 1, 1, 1, 0
+  if lua_pcall(L, 0, 4, 0) == LUA_OK then
+    if lua_type(L, -4) == LUA_TNUMBER then
+      ok = true
+      r, g, b = (@float32)(lua_tonumberx(L, -4, nilptr)), (@float32)(lua_tonumberx(L, -3, nilptr)), (@float32)(lua_tonumberx(L, -2, nilptr))
+      bl = (@float32)(lua_tonumberx(L, -1, nilptr))
+    end
+    lua_pop(L, 4)
+  else
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+  return ok, r, g, b, bl
+end
+
+-- Animation hooks -----------------------------------------------------------------
+-- CONFIG.animation.on_toggle(visible) and CONFIG.animation.on_key(time) from
+-- lua/animation.lua; missing functions are skipped.
+
+local function push_anim_fn(L: *lua_State, name: cstring): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'animation')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, name)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  return true
+end
+
+-- Returns an error message, or an empty string.
+global function policy_anim_toggle(visible: boolean): string
+  local L = policy.L
+  local err: string
+  if L == nilptr or not policy.loaded or not push_anim_fn(L, 'on_toggle') then return err end
+  lua_pushboolean(L, visible and 1 or 0)
+  if lua_pcall(L, 1, 0, 0) ~= LUA_OK then
+    local len: usize = 0
+    local msg = lua_tolstring(L, -1, &len)
+    if msg ~= nilptr then err = string.copy(string{data=(@*[0]byte)(msg), size=len}) end
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+  return err
+end
+
+global function policy_anim_frame(t: float64): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_anim_fn(L, 'on_frame') then return end
+  lua_pushnumber(L, t)
+  if lua_pcall(L, 1, 0, 0) ~= LUA_OK then log_hook_error(L, POLICY_HOOK_ON_FRAME, 'animation.on_frame') lua_pop(L, 1) end
+  lua_pop(L, 2)
+end
+
+global function policy_anim_key(t: float64): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_anim_fn(L, 'on_key') then return end
+  lua_pushnumber(L, t)
+  if lua_pcall(L, 1, 0, 0) ~= LUA_OK then log_hook_error(L, POLICY_HOOK_ON_KEY, 'animation.on_key') lua_pop(L, 1) end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.world.resize(terminal_id, width, height): the user dragged a panel edge.
+global function policy_world_resize(id: integer, w: float64, h: float64): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_world_fn(L, 'resize') then return end
+  lua_pushinteger(L, id)
+  lua_pushnumber(L, w)
+  lua_pushnumber(L, h)
+  if lua_pcall(L, 3, 0, 0) ~= LUA_OK then log_hook_error(L, POLICY_HOOK_RESIZE, 'world.resize') lua_pop(L, 1) end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.world.drop(terminal_id, pose) -> nil or an error string: a panel
+-- dragged with Alt was let go at `pl`; `fit_w`/`fit_h` > 0 (yalms) when it was
+-- stretched over a surface.
+global function policy_world_drop(id: integer, pl: WorldPlacement, fit_w: float32, fit_h: float32): string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return string.copy('no config') end
+  if not push_world_fn(L, 'drop') then return string.copy('lua/world.lua has no drop') end
+  lua_pushinteger(L, id)
+  lua_createtable(L, 0, 10)
+  lua_pushnumber(L, pl.x) lua_setfield(L, -2, 'x')
+  lua_pushnumber(L, pl.y) lua_setfield(L, -2, 'y')
+  lua_pushnumber(L, pl.z) lua_setfield(L, -2, 'z')
+  lua_pushnumber(L, pl.yaw) lua_setfield(L, -2, 'yaw')
+  lua_pushnumber(L, pl.pitch) lua_setfield(L, -2, 'pitch')
+  lua_pushnumber(L, pl.width) lua_setfield(L, -2, 'width')
+  lua_pushnumber(L, pl.height) lua_setfield(L, -2, 'height')
+  lua_pushnumber(L, pl.ppm) lua_setfield(L, -2, 'pixels_per_yalm')
+  if fit_w > 0 and fit_h > 0 then
+    lua_pushnumber(L, fit_w) lua_setfield(L, -2, 'fit_width')
+    lua_pushnumber(L, fit_h) lua_setfield(L, -2, 'fit_height')
+  end
+  local err: string
+  if lua_pcall(L, 2, 1, 0) ~= LUA_OK or lua_type(L, -1) == LUA_TSTRING then
+    local len: usize = 0
+    local msg = lua_tolstring(L, -1, &len)
+    if msg ~= nilptr then
+      err = string.copy(string{data=(@*[0]byte)(msg), size=len})
+    else
+      err = string.copy('lua error')
+    end
+  end
+  lua_pop(L, 3)
+  return err
+end
+
+-- Layout persistence: CONFIG.world.save_state({ {id=, agent=, view=, font_scale=}, ... })
+-- stores every terminal's place (tab, window, min, world + anchor) keyed by
+-- agent session id; CONFIG.world.restore(id, agent) -> view, font_scale.
+global LayoutEntry = @record{ id: integer, agent: uint32, view: cstring, font_scale: float64 }
+
+global function policy_world_save(entries: *vector(LayoutEntry)): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_world_fn(L, 'save_state') then return end
+  lua_createtable(L, (@cint)(#entries), 0)
+  for i = 0, < #entries do
+    local e = entries[i]
+    lua_createtable(L, 0, 4)
+    lua_pushinteger(L, e.id) lua_setfield(L, -2, 'id')
+    lua_pushinteger(L, e.agent) lua_setfield(L, -2, 'agent')
+    lua_pushstring(L, e.view) lua_setfield(L, -2, 'view')
+    lua_pushnumber(L, e.font_scale) lua_setfield(L, -2, 'font_scale')
+    lua_rawseti(L, -2, i + 1)
+  end
+  if lua_pcall(L, 1, 0, 0) ~= LUA_OK then lua_pop(L, 1) end
+  lua_pop(L, 2)
+end
+
+global function policy_world_restore(id: integer, agent: uint32): (string, float64)
+  local view: string
+  local fs: float64 = 0
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_world_fn(L, 'restore') then return view, fs end
+  lua_pushinteger(L, id)
+  lua_pushinteger(L, agent)
+  if lua_pcall(L, 2, 2, 0) == LUA_OK then
+    if lua_type(L, -2) == LUA_TSTRING then
+      local len: usize = 0
+      local p = lua_tolstring(L, -2, &len)
+      view = string.copy(string{data=(@*[0]byte)(p), size=len})
+    end
+    if lua_type(L, -1) == LUA_TNUMBER then fs = lua_tonumberx(L, -1, nilptr) end
+    lua_pop(L, 4)
+  else
+    lua_pop(L, 3)
+  end
+  return view, fs
+end
+
+-- Re-read settings from CONFIG after lua/settings.lua changed values.
+global function policy_refresh(): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return end
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) == LUA_TTABLE then read_settings(L, lua_gettop(L)) end
+  lua_pop(L, 1)
+end
+
+-- CONFIG.settings.draw() inside the settings window; true when values changed.
+global function policy_settings_draw(): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return false end
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'settings')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, 'draw')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  local changed = false
+  if lua_pcall(L, 0, 1, 0) == LUA_OK then
+    changed = lua_toboolean(L, -1) ~= 0
+  else
+    log_hook_error(L, POLICY_HOOK_SETTINGS_DRAW, 'settings.draw')
+  end
+  lua_pop(L, 3)
+  return changed
+end
+
+-- Visual bell ---------------------------------------------------------------------
+-- CONFIG.bell.style(terminal_id) from lua/bell.lua, asked once per bell;
+-- false when it returns nil (the bell is off) or the module is missing.
+require 'core.bell'
+
+local function push_bell_fn(L: *lua_State, name: cstring): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'bell')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, name)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  return true -- stack: CONFIG, bell, fn
+end
+
+global function policy_bell_style(id: integer): (boolean, BellStyle)
+  local st: BellStyle
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_bell_fn(L, 'style') then return false, st end
+  lua_pushinteger(L, id)
+  local ok = false
+  if lua_pcall(L, 1, 1, 0) == LUA_OK and lua_type(L, -1) == LUA_TTABLE then
+    local r: cint = lua_gettop(L)
+    st.from_character = lua_field_boolean(L, r, 'from_character', true)
+    st.rings = lua_field_integer(L, r, 'rings', 3)
+    st.max_radius = (@float32)(lua_field_number(L, r, 'max_radius', 3))
+    st.duration = (@float32)(lua_field_number(L, r, 'duration', 0.9))
+    st.glow_duration = (@float32)(lua_field_number(L, r, 'glow_duration', 1.2))
+    st.r = (@float32)(lua_field_number(L, r, 'r', 0.55))
+    st.g = (@float32)(lua_field_number(L, r, 'g', 0.82))
+    st.b = (@float32)(lua_field_number(L, r, 'b', 1))
+    ok = true
+  end
+  lua_pop(L, 3)
+  return ok, st
+end
+
+-- CONFIG.bell.command(args) -> error text or nil; CONFIG.bell.demo(i) -> label or nil.
+global function policy_bell_command(args: string): string
+  local err: string
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_bell_fn(L, 'command') then return err end
+  lua_pushlstring(L, (@cstring)(args.data), args.size)
+  if lua_pcall(L, 1, 1, 0) == LUA_OK and lua_type(L, -1) == LUA_TSTRING then
+    local len: usize = 0
+    local p = lua_tolstring(L, -1, &len)
+    err = string.copy(string{data=(@*[0]byte)(p), size=len})
+  end
+  lua_pop(L, 3)
+  return err
+end
+
+global function policy_bell_demo(i: integer): (boolean, string)
+  local label: string
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_bell_fn(L, 'demo') then return false, label end
+  lua_pushinteger(L, i)
+  local ok = false
+  if lua_pcall(L, 1, 1, 0) == LUA_OK and lua_type(L, -1) == LUA_TSTRING then
+    local len: usize = 0
+    local p = lua_tolstring(L, -1, &len)
+    label = string.copy(string{data=(@*[0]byte)(p), size=len})
+    ok = true
+  end
+  lua_pop(L, 3)
+  return ok, label
+end
+
+-- Showcase ------------------------------------------------------------------------
+-- CONFIG.showcase.terminal(i) / .shot(i) from lua/showcase.lua; false past the end.
+local function push_showcase_entry(L: *lua_State, fn: cstring, i: integer): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'showcase')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, fn)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  lua_pushinteger(L, i)
+  if lua_pcall(L, 1, 1, 0) ~= LUA_OK or lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 3) return false end
+  return true -- stack: CONFIG, showcase, entry
+end
+
+-- view: /term pin words; send: typed into a shell; show: text fed straight in.
+global function policy_showcase_terminal(i: integer): (boolean, string, string, string)
+  local view: string, send: string, show: string
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_showcase_entry(L, 'terminal', i) then return false, view, send, show end
+  local e = lua_gettop(L)
+  view = lua_field_string(L, e, 'view', 'pet')
+  send = lua_field_string(L, e, 'send', '')
+  show = lua_field_string(L, e, 'show', '')
+  lua_pop(L, 3)
+  return true, view, send, show
+end
+
+global function policy_showcase_shot(i: integer): (boolean, float32, float32, float32, float32)
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_showcase_entry(L, 'shot', i) then return false, 0, 0, 0, 0 end
+  local e = lua_gettop(L)
+  local yaw = (@float32)(lua_field_number(L, e, 'yaw', 0))
+  local pitch = (@float32)(lua_field_number(L, e, 'pitch', 0))
+  local dist = (@float32)(lua_field_number(L, e, 'distance', 8))
+  local hold = (@float32)(lua_field_number(L, e, 'hold', 5))
+  lua_pop(L, 3)
+  return true, yaw, pitch, dist, hold
+end
+
+-- CONFIG.showcase.start_delay (seconds before the first shot)
+global function policy_showcase_delay(): float64
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return 4 end
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return 4 end
+  lua_getfield(L, -1, 'showcase')
+  local d: float64 = 4
+  if lua_type(L, -1) == LUA_TTABLE then d = lua_field_number(L, lua_gettop(L), 'start_delay', 4) end
+  lua_pop(L, 2)
+  return d
+end
