@@ -21,6 +21,13 @@ global function update_status(): void
 end
 
 -- Settings window ---------------------------------------------------------------
+
+-- The settings button's dot follows lua/settings.lua: asked after loading and
+-- while the window (where the vote page is opened) is drawn, not every frame.
+global function settings_badge_refresh(): void
+  host.settings_badge = policy_settings_badge()
+end
+
 global function draw_settings(): void
   if not host.settings_open then return end
   imgui.SetNextWindowSize(vec2(560, 680), ImGuiCond_FirstUseEver)
@@ -32,6 +39,7 @@ global function draw_settings(): void
       host.popup_font_size = policy.popup_font_size
       resolve_toggle_key()
     end
+    settings_badge_refresh()
   end
   imgui.End()
   host.settings_open = open
@@ -46,6 +54,7 @@ global function load_policy(): boolean
     return false
   end
   boot_lua_register(policy.L)
+  settings_badge_refresh()
   host.dropdown_font_size = policy.dropdown.font_size
   host.popup_font_size = policy.popup_font_size
   resolve_toggle_key()

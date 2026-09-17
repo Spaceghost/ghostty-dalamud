@@ -49,7 +49,8 @@ global POLICY_HOOK_ON_FRAME <comptime> = 1
 global POLICY_HOOK_ON_KEY <comptime> = 2
 global POLICY_HOOK_RESIZE <comptime> = 3
 global POLICY_HOOK_SETTINGS_DRAW <comptime> = 4
-global POLICY_HOOK_COUNT <comptime> = 5
+global POLICY_HOOK_SETTINGS_BADGE <comptime> = 5
+global POLICY_HOOK_COUNT <comptime> = 6
 
 global Policy = @record{
   L: *lua_State,
@@ -698,6 +699,27 @@ global function policy_settings_draw(): boolean
   end
   lua_pop(L, 3)
   return changed
+end
+
+-- CONFIG.settings.badge(): true while the settings button should wear its dot
+-- (ideas on the vote page the player has not looked at). False when missing.
+global function policy_settings_badge(): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return false end
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'settings')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, 'badge')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  local on = false
+  if lua_pcall(L, 0, 1, 0) == LUA_OK then
+    on = lua_toboolean(L, -1) ~= 0
+  else
+    log_hook_error(L, POLICY_HOOK_SETTINGS_BADGE, 'settings.badge')
+  end
+  lua_pop(L, 3)
+  return on
 end
 
 -- Visual bell ---------------------------------------------------------------------

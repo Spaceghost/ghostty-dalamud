@@ -43,6 +43,7 @@ internal unsafe struct GuHostApi
     public delegate* unmanaged[Cdecl]<void> IpcUnregister;
     public delegate* unmanaged[Cdecl]<float, float, float, float, float, float, float, float*, float*, float*, int> Raycast;
     public delegate* unmanaged[Cdecl]<GuSceneDepth*, int> GetSceneDepth;
+    public delegate* unmanaged[Cdecl]<byte*, int> OpenUrl;
 }
 
 // Mirrors GuInitInfo in core/app/boot.nelua.

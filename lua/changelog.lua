@@ -4,6 +4,8 @@
 -- is merged but not yet verified in game ('beta') or still being built
 -- ('next'), so the tab never claims more than has been seen working.
 
+local vote = require('vote')
+
 local C = {}
 
 C.releases = {
@@ -11,6 +13,7 @@ C.releases = {
     version = 'next', title = 'In the workshop',
     blurb = 'Being built right now. These land here as they are verified in game.',
     items = {
+      { 'next', 'Vote on what gets built next: the About tab in Settings opens the vote page in your browser, and a small dot on the settings button shows while there are ideas you have not looked at. The plugin itself never goes online for it.' },
       { 'next', 'Select text with the mouse — drag, double-click a word, triple-click a line — and copy it.' },
       { 'next', 'Screens cast real in-game light: their backlight glows on your face and the world around you.' },
       { 'next', 'Click a screen and your character walks up to it while it floats out to meet you.' },
@@ -95,7 +98,15 @@ function C.draw_changelog(ui)
   end
 end
 
-function C.draw_about(ui)
+-- `settings` (lua/settings.lua) keeps the vote page marker; without it the
+-- vote section is left out.
+function C.draw_about(ui, settings)
+  if settings then
+    vote.draw(ui, settings)
+    ui.spacing()
+    ui.separator()
+    ui.spacing()
+  end
   ui.wrapped('Ghostty for FFXIV', 0.92, 0.86, 0.72)
   ui.wrapped('A real terminal emulator living in Eorzea: libghostty-vt for the terminal, a Nelua core for everything on screen, Lua for every decision you can change, and tiny C# shims that only forward calls to the game.')
   ui.spacing()

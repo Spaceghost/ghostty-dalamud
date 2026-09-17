@@ -118,9 +118,49 @@ local function l_host_info(L: *lua_State): cint
   return 1
 end
 
+-- Links the core hands to the host: https:// (any case) and a host, at most
+-- URL_MAX bytes, and nothing a command line could split or reinterpret: no
+-- whitespace, control characters, NUL, quotes or backslashes.
+global URL_MAX <comptime> = 2048
+global function url_is_https(url: string): boolean
+  local prefix: string = 'https://'
+  if #url <= #prefix or #url > URL_MAX then return false end
+  for i = 0, < #prefix do
+    local c = url.data[i]
+    if c >= 65 and c <= 90 then c = c + 32 end -- A-Z
+    if c ~= prefix.data[i] then return false end
+  end
+  if url.data[#prefix] == 47 then return false end -- '/': no host
+  for i = #prefix, < #url do
+    local c = url.data[i]
+    if c <= 32 or c == 127 or c == 34 or c == 92 then return false end -- controls, space, DEL, '"', '\'
+  end
+  return true
+end
+
+-- ghostty.open_url(url) -> true once the host was asked to open it in the
+-- system browser; false, reason otherwise. Only https links.
+local function l_open_url(L: *lua_State): cint
+  local len: usize = 0
+  local p = lua_tolstring(L, 1, &len)
+  if p == nilptr or not url_is_https(string{data=(@*[0]byte)(p), size=len}) then
+    log(LOG_WARN, 'open_url: refused, only https:// links open')
+    lua_pushboolean(L, 0) lua_pushstring(L, 'only https:// links open')
+    return 2
+  end
+  if host.api.open_url == nilptr or host.api.open_url(p) == 0 then
+    lua_pushboolean(L, 0) lua_pushstring(L, 'the host could not open it')
+    return 2
+  end
+  lua_pushboolean(L, 1)
+  return 1
+end
+
 global function boot_lua_register(L: *lua_State): void
   lua_getglobal(L, 'ghostty')
   if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return end
   lua_pushcclosure(L, l_host_info, 0) lua_setfield(L, -2, 'host_info')
+  -- an older shim has no open_url: ghostty.open_url stays nil and Lua says so
+  if host.api.open_url ~= nilptr then lua_pushcclosure(L, l_open_url, 0) lua_setfield(L, -2, 'open_url') end
   lua_pop(L, 1)
 end

@@ -236,6 +236,12 @@ do
     assert(prims > 0, 'every icon draws')
     assert(minx >= 88 and maxx <= 112 and miny >= 38 and maxy <= 62, 'inside its button')
   end
+  -- the settings button's dot (unseen vote ideas): ring and dot in the top right quarter
+  prims = 0
+  minx, miny, maxx, maxy = 1e9, 1e9, -1e9, -1e9
+  chrome_draw_badge(&dl, 88, 38, 24, 0)
+  assert(prims == 2 and minx >= 100 and maxx <= 112 and miny >= 38 and maxy <= 50, 'badge in the corner of its button')
+  assert((@string)(CHROME_BADGE_TIP):find('Settings', 1, true) == 1, 'the tooltip still names the button')
   print('icons OK')
 end
 imgui = {} -- the host below runs without ImGui
@@ -267,6 +273,29 @@ do
   assert(lua_gettop(policy.L) == 0, 'the Lua stack stays balanced')
   assert(policy.dropdown.glass and near((@float32)(policy.dropdown.glow), 0.6, 1e-5) and policy.dropdown.world_tint == 1, 'style options from lua/init.lua')
   print('world light OK')
+end
+
+-- The settings button's dot follows CONFIG.settings.badge() ------------------------------
+do
+  local function run_lua(code: cstring): void
+    assert(luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, code)
+  end
+  run_lua("CONFIG.settings.values['vote.seen_version'] = nil")
+  settings_badge_refresh()
+  assert(host.settings_badge, 'unseen vote ideas: dot on')
+  run_lua("CONFIG.settings.values['vote.seen_version'] = require('vote').catalogue_version")
+  settings_badge_refresh()
+  assert(not host.settings_badge, 'seen: dot off')
+  run_lua("SAVED_BADGE = CONFIG.settings.badge CONFIG.settings.badge = function() error('badge broke') end")
+  host.settings_badge = true
+  settings_badge_refresh()
+  assert(not host.settings_badge and policy.last_hook_error[POLICY_HOOK_SETTINGS_BADGE]:find('badge broke', 1, true) > 0, 'a failing hook: no dot, error kept')
+  run_lua("CONFIG.settings.badge = SAVED_BADGE SAVED_SETTINGS = CONFIG.settings CONFIG.settings = nil")
+  host.settings_badge = true
+  settings_badge_refresh()
+  assert(not host.settings_badge and lua_gettop(policy.L) == 0, 'no settings module: no dot, stack balanced')
+  run_lua("CONFIG.settings = SAVED_SETTINGS CONFIG.settings.values['vote.seen_version'] = nil")
+  print('settings badge OK')
 end
 
 local used: [11]integer

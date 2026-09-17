@@ -242,7 +242,12 @@ local function icon_button(dl: *ImDrawList, b: *ChromeButton, key: integer, x: f
   local ink = CHROME_INK_DIM
   if on then ink = CHROME_GOLD elseif hot or held then ink = CHROME_INK end
   chrome_draw_icon(dl, b.icon, x + size * 0.5, y + size * 0.5, size, ink, pal.body_top | 0xFF000000)
-  chrome_tooltip(key, hot, b.tip, now)
+  if b.action == ChromeAction.Settings and host.settings_badge then
+    chrome_draw_badge(dl, x, y, size, pal.body_top | 0xFF000000)
+    chrome_tooltip(key, hot, CHROME_BADGE_TIP, now)
+  else
+    chrome_tooltip(key, hot, b.tip, now)
+  end
   return pressed
 end
 

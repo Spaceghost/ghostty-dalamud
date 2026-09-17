@@ -34,6 +34,7 @@ GLIBC_TUNABLES=$HEAP_ENV build/nelua-cache/test_pending "$ROOT"
 run test_lights "$ROOT"
 run test_chrome "$ROOT"
 run test_migrate "$ROOT" "$ROOT/build/test-scratch"
+run test_vote "$ROOT" "$ROOT/build/test-scratch"
 run test_hostsurface "$ROOT" "$ROOT/build/test-scratch/surface"
 run test_depthpass "$ROOT"
 

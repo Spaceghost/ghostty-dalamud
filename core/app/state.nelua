@@ -69,6 +69,8 @@ global GuHostApi = @record{
                     max: float32, hx: *float32, hy: *float32, hz: *float32): cint,
   -- the game's depth buffer, for world panels hidden behind geometry (core/depthpass.nelua)
   get_scene_depth: function(out: *GuSceneDepth): cint,
+  -- hand a link to the system browser; the core only passes https links (ghostty.open_url)
+  open_url: function(url: cstring): cint,
 }
 
 global LOG_INFO: cint <comptime> = 1
@@ -157,6 +159,7 @@ global Host = @record{
   world_saved_at: float64,
   drawing_world: boolean,           -- draw_terminal uses the world font
   settings_open: boolean,
+  settings_badge: boolean,          -- CONFIG.settings.badge(): a dot on the settings button (unseen vote ideas)
   pad: PadGestureState,             -- toggle button: tap / double tap / hold
   select_idx: integer,
   -- raw mouse buttons (Dalamud only forwards clicks to ImGui while it wants the mouse)

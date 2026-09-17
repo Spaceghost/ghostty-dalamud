@@ -2,6 +2,11 @@
 
 **Vote on what it does next: https://spacegho.st/mods/ffxiv/term/vote/**
 
+In game, Settings → About has a button that opens the vote page in your
+browser, and a small dot on the settings button shows while there are ideas
+you have not looked at. The plugin never goes online for this: the idea count
+ships with each build. This is new and not yet verified in game.
+
 A [Ghostty](https://ghostty.org) terminal living inside Final Fantasy XIV, as
 a Dalamud plugin, so the game can double as a desktop. Press
 <kbd>ctrl</kbd>+<kbd>`</kbd> for a Quake-style drop-down with tabs, click the
