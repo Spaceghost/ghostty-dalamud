@@ -1,0 +1,161 @@
+-- Mouse selection: cell hit mapping, click counting, reading order, word and
+-- line units, and the text copied out of a real libghostty terminal.
+require 'core.selection'
+require 'string'
+
+-- the bindings mirror the C layouts (sizes from vt/selection.h on x86_64)
+assert(#GhosttyGridRef == 24 and #GhosttySelection == 64 and #GhosttyPoint == 24)
+assert(#GhosttyTerminalSelectWordOptions == 48 and #GhosttyTerminalSelectLineOptions == 56)
+assert(#GhosttyTerminalSelectionFormatOptions == 24)
+
+-- Pure logic ------------------------------------------------------------------
+do
+  local c, r = selection_cell_at(0, 0, 8, 16, 80, 24)
+  assert(c == 0 and r == 0)
+  c, r = selection_cell_at(15.9, 16, 8, 16, 80, 24)
+  assert(c == 1 and r == 1, 'pixel -> cell')
+  c, r = selection_cell_at(-5, -40, 8, 16, 80, 24)
+  assert(c == 0 and r == 0, 'clamped above/left')
+  c, r = selection_cell_at(9000, 9000, 8, 16, 80, 24)
+  assert(c == 79 and r == 23, 'clamped below/right')
+
+  local a, b = selection_span({5, 3}, {5, 3}, {2, 1}, {2, 1})
+  assert(a.x == 2 and a.y == 1 and b.x == 5 and b.y == 3, 'backward drag in reading order')
+  a, b = selection_span({2, 1}, {9, 1}, {0, 1}, {3, 1})
+  assert(a.x == 0 and b.x == 9, 'word drag keeps the whole anchor word')
+  a, b = selection_span({4, 2}, {4, 2}, {7, 2}, {7, 2})
+  assert(a.x == 4 and b.x == 7, 'same row, forward')
+
+  local ext = selection_extend_anchor({3, 1}, {6, 2}, {0, 0})
+  assert(ext.x == 6 and ext.y == 2, 'click before: anchor at the end')
+  ext = selection_extend_anchor({3, 1}, {6, 2}, {9, 4})
+  assert(ext.x == 3 and ext.y == 1, 'click after: anchor at the start')
+
+  local st: SelectionState
+  assert(selection_click(&st, 10.0, 4, 2) == 1)
+  assert(selection_click(&st, 10.2, 4, 2) == 2, 'double')
+  assert(selection_click(&st, 10.4, 4, 2) == 3, 'triple')
+  assert(selection_click(&st, 10.5, 4, 2) == 1, 'a fourth click starts over')
+  assert(selection_click(&st, 11.0, 4, 2) == 1, 'too slow')
+  assert(selection_click(&st, 11.1, 5, 2) == 1, 'other cell')
+  print('pure OK')
+end
+
+-- Terminal ------------------------------------------------------------------------
+local function feed(v: *TermView, s: string)
+  v:feed((@*[0]uint8)(s.data), s.size)
+end
+
+local function check(v: *TermView, want: string, what: string)
+  local got = selection_text(v)
+  print(what, '"' .. got .. '"')
+  assert(got == want, what)
+  got:destroy()
+end
+
+do
+  local v: TermView
+  assert(v:init(20, 4))
+  local st: SelectionState
+  feed(&v, 'hello world\r\nsecond line')
+
+  -- drag backwards across a row boundary: anchor cell to pointer cell, inclusive
+  assert(not selection_press(&v, &st, 8, 1, 1, false))
+  selection_drag(&v, &st, 2, 0)
+  assert(selection_release(&v, &st), 'drag leaves a selection')
+  check(&v, 'llo world\nsecond li', 'drag')
+
+  -- trailing blanks are trimmed
+  selection_press(&v, &st, 0, 0, 1, false)
+  selection_drag(&v, &st, 19, 0)
+  selection_release(&v, &st)
+  check(&v, 'hello world', 'row with trailing blanks')
+
+  -- a plain click clears and selects nothing
+  selection_press(&v, &st, 3, 0, 1, false)
+  selection_drag(&v, &st, 3, 0)
+  assert(not selection_release(&v, &st), 'click without drag')
+  check(&v, '', 'click')
+
+  -- double click: the word; dragging extends by whole words
+  assert(selection_press(&v, &st, 7, 0, 2, false), 'word')
+  check(&v, 'world', 'double click')
+  selection_drag(&v, &st, 1, 1)
+  selection_release(&v, &st)
+  check(&v, 'world\nsecond', 'word drag')
+
+  -- double click on blanks selects nothing (world panels go full screen then)
+  assert(not selection_press(&v, &st, 15, 0, 2, false), 'no word on blanks')
+  selection_release(&v, &st)
+
+  -- triple click: the line
+  assert(selection_press(&v, &st, 2, 1, 3, false), 'line')
+  selection_release(&v, &st)
+  check(&v, 'second line', 'triple click')
+
+  -- shift+click moves the near end
+  selection_press(&v, &st, 7, 0, 2, false)
+  selection_release(&v, &st)
+  selection_press(&v, &st, 2, 1, 1, true)
+  selection_release(&v, &st)
+  check(&v, 'world\nsec', 'shift+click after')
+  selection_press(&v, &st, 2, 0, 1, true)
+  selection_release(&v, &st)
+  check(&v, 'llo world\nsec', 'shift+click before')
+
+  selection_clear(&v, &st)
+  check(&v, '', 'cleared')
+  v:destroy()
+end
+
+do -- soft-wrapped rows copy as one line; the selection follows scrolling
+  local v: TermView
+  assert(v:init(10, 3))
+  local scrollback: usize = 100
+  ghostty_terminal_set(v.term, GHOSTTY_TERMINAL_OPT_SCROLLBACK_MAX_LINES, &scrollback)
+  local st: SelectionState
+  feed(&v, 'abcdefghijklmno\r\nxyz')
+  selection_press(&v, &st, 0, 0, 1, false)
+  selection_drag(&v, &st, 4, 1)
+  selection_release(&v, &st)
+  check(&v, 'abcdefghijklmno', 'soft wrap')
+
+  selection_press(&v, &st, 0, 2, 3, false)
+  selection_release(&v, &st)
+  check(&v, 'xyz', 'line before scrolling')
+  feed(&v, '\r\n1\r\n2\r\n3') -- pushes "xyz" up into the scrollback
+  check(&v, 'xyz', 'terminal tracks the selection')
+  -- a drag started before output keeps its anchor on the same text
+  selection_press(&v, &st, 0, 2, 1, false)        -- on "3"
+  feed(&v, '\r\n4')                               -- "3" moves up a row
+  selection_drag(&v, &st, 0, 2)                   -- pointer now over "4"
+  selection_release(&v, &st)
+  check(&v, '3\n4', 'anchor in screen coordinates')
+  v:destroy()
+end
+print('OK')
+
+-- Mouse wheel: scrollback, arrow keys on the alternate screen, wheel reports.
+do
+  local v: TermView
+  assert(v:init(20, 4))
+  local out: [32]byte
+  local function bytes(n: integer, o: *[32]byte): string
+    return string{ data = (@*[0]byte)(o), size = (@usize)(n) }
+  end
+  assert(v:wheel_bytes(true, 0, 0, &out) == 0, 'main screen: scroll the viewport')
+  feed(&v, '\27[?1049h')
+  local n = v:wheel_bytes(true, 0, 0, &out)
+  assert(n == 0 or bytes(n, &out) == '\27[A\27[A\27[A', 'alt screen: three arrows up when 1007 is on')
+  feed(&v, '\27[?1007h\27[?1h')
+  n = v:wheel_bytes(false, 0, 0, &out)
+  assert(bytes(n, &out) == '\27OB\27OB\27OB', 'application cursor keys: SS3 arrows down')
+  feed(&v, '\27[?1000h\27[?1006h')
+  n = v:wheel_bytes(true, 4, 2, &out)
+  assert(bytes(n, &out) == '\27[<64;5;3M', 'SGR wheel up at cell 5,3')
+  feed(&v, '\27[?1006l')
+  n = v:wheel_bytes(false, 0, 0, &out)
+  assert(bytes(n, &out) == '\27[M' .. string.char(32 + 65, 33, 33), 'X10 wheel down at 1,1')
+  v:destroy()
+  print('wheel OK')
+end
