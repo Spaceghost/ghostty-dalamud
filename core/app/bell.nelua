@@ -1,0 +1,317 @@
+-- The visual bell on screen: rings of light spreading from the character's
+-- feet, a shimmer rising up it, and the glow on the terminal that rang. The
+-- maths is core/bell.nelua and the style lua/bell.lua; the terminal views call
+-- the small glow helpers at the bottom.
+require 'core.app.state'
+require 'core.bell'
+
+local bell_tracks: vector(BellTrack)
+local bell_pulse: BellPulse
+local bell_rez: float32 = 1           -- fades out in combat, like the world screens
+local bell_last_time: float64 = 0
+
+local BellStop = @record{ dr: float32, dy: float32, a: float32, hot: float32 }
+local BellVtx = @record{ ok: boolean, pos: ImVec2, col: uint32 }
+local BELL_SEG <comptime> = 96
+local BELL_STOPS <comptime> = 5
+
+-- `hot` mixes toward white: the core of the light burns paler than its fringe.
+local function bell_col(r: float32, g: float32, b: float32, hot: float32, a: float32): uint32
+  r, g, b = r + (1 - r) * hot, g + (1 - g) * hot, b + (1 - b) * hot
+  return im_col32((@uint8)(math.clamp(r, 0, 1) * 255), (@uint8)(math.clamp(g, 0, 1) * 255),
+    (@uint8)(math.clamp(b, 0, 1) * 255), (@uint8)(math.clamp(a, 0, 1) * 255))
+end
+
+local function bell_track(s: *Session, now: float64): *BellTrack
+  for i = 0, < #bell_tracks do
+    if bell_tracks[i].id == s.id then return &bell_tracks[i] end
+  end
+  -- a terminal we have not met may be reattaching: its replayed bells are old news
+  bell_tracks:push(BellTrack{ id = s.id, seen = s.bells, quiet_until = now + BELL_QUIET })
+  return &bell_tracks[#bell_tracks - 1]
+end
+
+-- Turn new BELs on any terminal, seen or not, into glows and rings.
+local function bell_notice(now: float64): void
+  local i: integer = #bell_tracks - 1
+  while i >= 0 do
+    local alive = false
+    for k = 0, < #host.sessions do
+      if host.sessions[k].id == bell_tracks[i].id then alive = true break end
+    end
+    if not alive then bell_tracks:remove(i) end
+    i = i - 1
+  end
+  for k = 0, < #host.sessions do
+    local s = host.sessions[k]
+    local tr = bell_track(s, now)
+    if tr:update(s.bells, s.sleeping, now) then
+      local ok, st = policy_bell_style(s.id)
+      if ok then
+        tr.rang, tr.at, tr.style = true, now, st
+        if st.from_character then bell_pulse:ring(now, &st) end
+      end
+    end
+  end
+end
+
+local function bell_quad_ok(pts: *[(BELL_SEG + 1) * BELL_STOPS]BellVtx, k: integer, j: integer): boolean
+  local S <comptime> = BELL_STOPS
+  return pts[k * S + j].ok and pts[k * S + j + 1].ok and pts[(k + 1) * S + j].ok and pts[(k + 1) * S + j + 1].ok
+end
+
+-- A band of light around the vertical axis through (cx, cy, cz): `n` stops
+-- across it (radius and height offsets, alpha, whiteness) become strips of
+-- triangles with per-vertex colour, so every edge is a soft gradient. Segments
+-- behind the camera are skipped, and light behind the character or a world
+-- screen (as the camera sees it) is cut out so they stay in front.
+local function bell_band(dl: *ImDrawList, cam: *GuCamera, occ: *WorldOccluder, vp: ImVec2, uv: ImVec2,
+                         cx: float32, cy: float32, cz: float32, radius: float32,
+                         stops: *[BELL_STOPS]BellStop, n: integer,
+                         r: float32, g: float32, b: float32, alpha: float32): void
+  local S <comptime> = BELL_STOPS
+  local pts: [(BELL_SEG + 1) * BELL_STOPS]BellVtx
+  for k = 0, BELL_SEG do
+    local ang = k * 2 * math.pi / BELL_SEG
+    local ca, sa = (@float32)(math.cos(ang)), (@float32)(math.sin(ang))
+    for j = 0, < n do
+      local st = &stops[j]
+      local rr = math.max(radius + st.dr, 0)
+      local x, y, z = cx + ca * rr, cy + st.dy, cz + sa * rr
+      local p = &pts[k * S + j]
+      local depth = world_depth(cam, x, y, z)
+      local ok, sx, sy = world_project(cam, x, y, z)
+      p.ok = ok and depth > 0.2 -- not behind or grazing the camera, where points fly off to infinity
+      if p.ok then
+        p.pos = vec2(sx + vp.x, sy + vp.y)
+        local a = alpha * st.a
+        -- depth against the character's axis at the same height
+        local behind = depth - world_depth(cam, cx, y, cz)
+        if occ.active and behind > 0 then
+          local keep = world_occluder_keep(occ, p.pos.x, p.pos.y, 5)
+          a = a * (1 - (1 - keep) * math.min(behind / 0.15, 1))
+        end
+        for i = 0, < #host.world_covers do
+          a = a * world_cover_keep(cam, &host.world_covers[i], sx, sy, depth)
+        end
+        p.col = bell_col(r, g, b, st.hot, a)
+      end
+    end
+  end
+  local quads = 0
+  for k = 0, < BELL_SEG do
+    for j = 0, < n - 1 do
+      if bell_quad_ok(&pts, k, j) then quads = quads + 1 end
+    end
+  end
+  if quads == 0 then return end
+  imgui.DrawListPrimReserve(dl, (@cint)(quads * 6), (@cint)(quads * 6))
+  for k = 0, < BELL_SEG do
+    for j = 0, < n - 1 do
+      if bell_quad_ok(&pts, k, j) then
+        local p00, p01 = &pts[k * S + j], &pts[k * S + j + 1]
+        local p10, p11 = &pts[(k + 1) * S + j], &pts[(k + 1) * S + j + 1]
+        imgui.DrawListPrimVtx(dl, p00.pos, uv, p00.col)
+        imgui.DrawListPrimVtx(dl, p01.pos, uv, p01.col)
+        imgui.DrawListPrimVtx(dl, p11.pos, uv, p11.col)
+        imgui.DrawListPrimVtx(dl, p00.pos, uv, p00.col)
+        imgui.DrawListPrimVtx(dl, p11.pos, uv, p11.col)
+        imgui.DrawListPrimVtx(dl, p10.pos, uv, p10.col)
+      end
+    end
+  end
+end
+
+-- Once per frame, after the world screens: notice bells, then draw the rings
+-- and shimmer around the character into the background draw list.
+global function draw_bell(now: float64): void
+  bell_notice(now)
+  local pc: GuObject
+  local have_pc = host.api.get_object ~= nilptr and host.api.get_object(WORLD_PLAYER, 0, &pc) ~= 0 and pc.found ~= 0
+  local dt = (@float32)(math.clamp(now - bell_last_time, 0, 0.1))
+  bell_last_time = now
+  if have_pc and pc.in_combat ~= 0 then bell_rez = math.max(0, bell_rez - dt * 1.6)
+  else bell_rez = math.min(1, bell_rez + dt * 0.9) end
+  -- a world terminal flying out to full screen covers the world
+  local fade = bell_rez * (1 - host.world_full_t)
+  if not have_pc or fade <= 0.001 or bell_pulse:active(now) == 0 then return end
+  if host.api.get_camera == nilptr then return end
+  local cam: GuCamera
+  if host.api.get_camera(&cam) == 0 or cam.width < 1 or cam.height < 1 then return end
+  local vp = imgui.GetMainViewport().Pos
+  local dl = imgui.GetBackgroundDrawList()
+  local uv: ImVec2
+  imgui.GetFontTexUvWhitePixel(&uv)
+  local occ = world_occluder(&cam, &pc, vp)
+
+  -- pixels per yalm at the feet, so thin light never drops below a pixel or two
+  local ppy: float32 = 60
+  do
+    local fx, _, fz = world_camera_forward(&cam)
+    local sl = math.sqrt(fx * fx + fz * fz)
+    if sl < 1e-4 then fx, fz, sl = 0, 1, 1 end
+    local ok1, ax, ay = world_project(&cam, pc.x, pc.y, pc.z)
+    local ok2, bx, by = world_project(&cam, pc.x + fz / sl, pc.y, pc.z - fx / sl)
+    if ok1 and ok2 then ppy = math.max(math.sqrt((bx - ax) ^ 2 + (by - ay) ^ 2), 1) end
+  end
+
+  -- the shimmer: a soft band rising up the body, trailing light below it. It
+  -- fades as the camera comes close: in first person it would rise through the
+  -- camera as a wash across the whole screen.
+  local h = pc.height > 0.3 and pc.height or 1.7
+  local sok, rise, salpha = bell_shimmer_at(now - bell_pulse.start, bell_pulse.duration)
+  salpha = salpha * math.clamp(world_depth(&cam, pc.x, pc.y + h * 0.5, pc.z) - 1.2, 0, 1)
+  if sok and salpha > 0.003 then
+    local base = math.max(pc.hitbox_radius * 1.1, 0.45)
+    local lip = math.max(0.03, 2 / ppy)
+    local stops: [BELL_STOPS]BellStop = {
+      { dr = 0.04, dy = -0.5, a = 0 },
+      { dr = 0.02, dy = -0.18, a = 0.3 },
+      { dr = 0, dy = 0, a = 1, hot = 0.5 },
+      { dr = 0, dy = lip, a = 0 },
+    }
+    bell_band(dl, &cam, &occ, vp, uv, pc.x, pc.y + h * rise, pc.z, base * (1.1 - 0.3 * rise), &stops, 4,
+      bell_pulse.r, bell_pulse.g, bell_pulse.b, salpha * fade)
+  end
+
+  -- the rings: a bright leading edge with a soft fringe outside and a wide,
+  -- fading band of light trailing inside
+  local fringe = math.max(0.07, 3 / ppy)
+  local core = math.max(0.03, 1.5 / ppy)
+  for i = 0, < BELL_MAX_RINGS do
+    local ring = &bell_pulse.rings[i]
+    if ring.live then
+      local ok, radius, alpha, band = bell_ring_at(now - ring.born, ring.duration, ring.max_radius)
+      if ok and alpha > 0.003 then
+        local stops: [BELL_STOPS]BellStop = {
+          { dr = fringe, a = 0 },
+          { dr = 0, a = 1, hot = 0.55 },
+          { dr = -core, a = 0.85, hot = 0.3 },
+          { dr = -core - band * 0.4, a = 0.3 },
+          { dr = -core - band, a = 0 },
+        }
+        bell_band(dl, &cam, &occ, vp, uv, pc.x, pc.y + 0.02, pc.z, radius, &stops, 5,
+          ring.r, ring.g, ring.b, alpha * fade)
+      end
+    end
+  end
+end
+
+global function bell_reset(): void
+  bell_tracks:destroy()
+  bell_pulse = {}
+  bell_rez = 1
+end
+
+-- Glow helpers for the terminal views ---------------------------------------------
+
+-- Glow and flash (0..1) and colour for terminal `id` now.
+local function bell_state(id: integer): (float32, float32, float32, float32, float32)
+  for i = 0, < #bell_tracks do
+    local t = &bell_tracks[i]
+    if t.id == id then
+      if not t.rang then break end
+      local age = host.last_time - t.at
+      return bell_glow_at(age, t.style.glow_duration), bell_flash_at(age, t.style.glow_duration), t.style.r, t.style.g, t.style.b
+    end
+  end
+  return 0, 0, 0, 0, 0
+end
+
+-- A bright edge around a rectangle with a softer halo spilling outward.
+local function bell_border(dl: *ImDrawList, a: ImVec2, b: ImVec2, rounding: float32, glow: float32, r: float32, g: float32, bl: float32): void
+  if glow <= 0.004 then return end
+  for gi = 0, < 5 do
+    local pad = (@float32)(gi * 4 - 1)
+    local alpha: float32 = glow * 0.45 / math.max(gi, 1)
+    local hot: float32 = 0
+    local thick: float32 = 4
+    if gi == 0 then alpha, hot, thick = glow, 0.5, 2.5 end
+    imgui.DrawListAddRect(dl, vec2(a.x - pad, a.y - pad), vec2(b.x + pad, b.y + pad), bell_col(r, g, bl, hot, alpha),
+      rounding + math.max(pad, 0), 0, thick)
+  end
+end
+
+-- World screens, before the background (panel pixels at `o`): the bell lifts
+-- the backlight, which brightens the panel, and adds a halo in its colour.
+global function bell_panel_glow(dl: *ImDrawList, o: ImVec2, pl: *WorldPlacement, id: integer): void
+  local g, _, r, gg, b = bell_state(id)
+  if g <= 0.004 then return end
+  pl.backlight = math.max(pl.backlight, g * 0.8)
+  for gi = 1, 5 do
+    local pad = (@float32)(gi * 12) * (0.5 + 0.5 * g)
+    imgui.DrawListAddRectFilled(dl, vec2(o.x - pad, o.y - pad), vec2(o.x + pl.width + pad, o.y + pl.height + pad),
+      bell_col(r, gg, b, 0.2, g * 0.4 / gi), pad + 8, 0)
+  end
+end
+
+-- World screens, after the terminal: a bright border fading with the glow,
+-- drawn as short segments so it bends with the panel's curve.
+global function bell_panel_border(dl: *ImDrawList, o: ImVec2, w: float32, h: float32, id: integer): void
+  local g, _, r, gg, b = bell_state(id)
+  if g <= 0.004 then return end
+  local SEG <comptime> = 32
+  for layer = 0, < 2 do
+    local thick: float32 = 4 + 14 * g
+    local col = bell_col(r, gg, b, 0, g * 0.35)
+    if layer == 1 then thick, col = 2 + 3 * g, bell_col(r, gg, b, 0.6, g) end
+    local inset = thick * 0.5
+    for k = 0, < SEG do
+      local xa, xb = o.x + w * k / SEG, o.x + w * (k + 1) / SEG
+      imgui.DrawListAddLine(dl, vec2(xa, o.y + inset), vec2(xb, o.y + inset), col, thick)
+      imgui.DrawListAddLine(dl, vec2(xa, o.y + h - inset), vec2(xb, o.y + h - inset), col, thick)
+    end
+    imgui.DrawListAddLine(dl, vec2(o.x + inset, o.y), vec2(o.x + inset, o.y + h), col, thick)
+    imgui.DrawListAddLine(dl, vec2(o.x + w - inset, o.y), vec2(o.x + w - inset, o.y + h), col, thick)
+  end
+end
+
+-- Between Begin and End of a window: a glowing border pulse around it.
+local function bell_window_border(glow: float32, r: float32, g: float32, b: float32): void
+  if glow <= 0.004 then return end
+  local pos: ImVec2, size: ImVec2
+  imgui.GetWindowPos(&pos)
+  imgui.GetWindowSize(&size)
+  local dl = imgui.GetWindowDrawList()
+  -- the halo spills past the window's own clip rect
+  imgui.DrawListPushClipRect(dl, vec2(pos.x - 24, pos.y - 24), vec2(pos.x + size.x + 24, pos.y + size.y + 24), false)
+  bell_border(dl, pos, vec2(pos.x + size.x, pos.y + size.y), (@float32)(policy.dropdown.rounding), glow, r, g, b)
+  imgui.DrawListPopClipRect(dl)
+end
+
+-- The dropdown glows for whichever of its tabs rang.
+global function bell_dropdown_glow(): void
+  local best: float32, br: float32, bg: float32, bb: float32 = 0, 0, 0, 0
+  for i = 0, < #host.dropdown_tabs do
+    local g, _, r, gg, b = bell_state(host.dropdown_tabs[i].id)
+    if g > best then best, br, bg, bb = g, r, gg, b end
+  end
+  bell_window_border(best, br, bg, bb)
+end
+
+global function bell_window_glow(id: integer): void
+  local g, _, r, gg, b = bell_state(id)
+  bell_window_border(g, r, gg, b)
+end
+
+-- Toolbar popup: a taskbar chip whose terminal rang lights up.
+global function bell_chip_glow(dl: *ImDrawList, a: ImVec2, b: ImVec2, id: integer): void
+  local g, f, r, gg, bb = bell_state(id)
+  if g <= 0.004 then return end
+  imgui.DrawListAddRectFilled(dl, a, b, bell_col(r, gg, bb, 0, 0.7 * f), 6, 0)
+  imgui.DrawListAddRect(dl, a, b, bell_col(r, gg, bb, 0.5, g), 6, 0, 2)
+end
+
+-- Any rectangle a terminal is drawn in (the toolbar popup's own terminal).
+global function bell_rect_glow(dl: *ImDrawList, a: ImVec2, b: ImVec2, rounding: float32, id: integer): void
+  local g, _, r, gg, bb = bell_state(id)
+  bell_border(dl, vec2(a.x + 2, a.y + 2), vec2(b.x - 2, b.y - 2), rounding, g, r, gg, bb)
+end
+
+-- Ring the bell on a terminal as if its program had (feeds BEL to the
+-- terminal locally; nothing reaches the shell).
+global function bell_ring(s: *Session): void
+  local bel: [1]uint8 = { 7 }
+  s.view:feed(&bel, 1)
+end
+

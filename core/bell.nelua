@@ -1,0 +1,137 @@
+-- The visual bell as plain functions of time: rings of light spreading from
+-- the character's feet, the glow on the terminal that rang, and how bursts of
+-- bells coalesce. Drawing lives in core/app/bell.nelua; this module needs no
+-- ImGui, so it is tested on the host.
+require 'math'
+
+global BELL_COALESCE: float64 <comptime> = 0.25 -- a bell this soon after the last one starts no pulse
+global BELL_MAX_RINGS <comptime> = 3
+global BELL_STAGGER: float64 <comptime> = 0.16  -- seconds between the rings of one pulse
+global BELL_START_RADIUS: float32 <comptime> = 0.3
+-- A terminal that (re)attaches gets the agent's replay of recent output, old
+-- bells included; bells counted this long after attaching or waking are not new.
+global BELL_QUIET: float64 <comptime> = 1.5
+
+-- What lua/bell.lua decides for one bell (CONFIG.bell.style).
+global BellStyle = @record{
+  from_character: boolean,  -- rings around the character (else only the terminal glows)
+  rings: integer,           -- rings per pulse, 1..3
+  max_radius: float32,      -- yalms
+  duration: float32,        -- seconds one ring takes to spread and fade
+  glow_duration: float32,   -- seconds the terminal that rang glows
+  r: float32, g: float32, b: float32,
+}
+
+-- One ring keeps the style it started with, so settings changed mid-pulse
+-- never make it jump.
+global BellRing = @record{
+  live: boolean,
+  born: float64,
+  duration: float32,
+  max_radius: float32,
+  r: float32, g: float32, b: float32,
+}
+
+global BellPulse = @record{
+  rings: [BELL_MAX_RINGS]BellRing,
+  rang: boolean,
+  last: float64,        -- time of the latest bell
+  start: float64,       -- time the latest set of rings started (the shimmer follows it)
+  duration: float32,
+  r: float32, g: float32, b: float32,
+}
+
+-- Radius (yalms), alpha and the width of the soft band trailing inside the
+-- leading edge, `age` seconds into a ring. False outside [0, duration).
+global function bell_ring_at(age: float64, duration: float32, max_radius: float32): (boolean, float32, float32, float32)
+  if duration <= 0 or age < 0 or age >= duration then return false, 0, 0, 0 end
+  local p = age / duration
+  local e = 1 - (1 - p) ^ 3                              -- ease out: bursts out, then settles
+  local radius = BELL_START_RADIUS + (max_radius - BELL_START_RADIUS) * e
+  local alpha = math.min(p / 0.06, 1) * (1 - p) ^ 1.6    -- a breath of fade-in, a long fade-out
+  local band = 0.08 + 0.32 * e                           -- the light smears wider as it slows
+  return true, (@float32)(radius), (@float32)(alpha), (@float32)(band)
+end
+
+-- The shimmer rising up the character with each pulse: height as a fraction of
+-- the character's height, and alpha (faint by design).
+global function bell_shimmer_at(age: float64, duration: float32): (boolean, float32, float32)
+  local d = duration * 1.2
+  if d <= 0 or age < 0 or age >= d then return false, 0, 0 end
+  local p = age / d
+  local e = 1 - (1 - p) ^ 2
+  return true, (@float32)(0.05 + 1.05 * e), (@float32)(0.5 * math.sin(math.pi * p))
+end
+
+-- Glow on the terminal that rang, `age` seconds after its latest bell: full at
+-- once, then an ease-out decay to nothing.
+global function bell_glow_at(age: float64, duration: float32): float32
+  if duration <= 0 or age < 0 or age >= duration then return 0 end
+  return (@float32)((1 - age / duration) ^ 2)
+end
+
+-- The tab label flash: the glow, blinking a few times as it fades.
+global function bell_flash_at(age: float64, duration: float32): float32
+  local g = bell_glow_at(age, duration)
+  return (@float32)(g * (0.6 + 0.4 * math.cos(age * 2 * math.pi * 3)))
+end
+
+-- A bell at `now`. One within BELL_COALESCE of the previous bell, or while the
+-- last pulse's shimmer is still rising, starts nothing: steady bells (Tab at an
+-- empty prompt) make a calm pulse at most every shimmer length, never a strobe
+-- of rings and a shimmer snapping back to the feet. Otherwise `style.rings`
+-- staggered rings start, in free slots only, so no more than BELL_MAX_RINGS are
+-- ever active. Returns the rings started.
+function BellPulse:ring(now: float64, style: *BellStyle): integer
+  local busy = self.rang and (now - self.last < BELL_COALESCE or bell_shimmer_at(now - self.start, self.duration))
+  self.rang = true
+  self.last = now
+  if busy then return 0 end
+  local started = 0
+  for i = 0, < BELL_MAX_RINGS do
+    if started >= math.clamp(style.rings, 1, BELL_MAX_RINGS) then break end
+    local ring = &self.rings[i]
+    if not ring.live or now - ring.born >= ring.duration then
+      $ring = {
+        live = true, born = now + started * BELL_STAGGER,
+        duration = style.duration, max_radius = style.max_radius,
+        r = style.r, g = style.g, b = style.b,
+      }
+      started = started + 1
+    end
+  end
+  if started > 0 then
+    self.start = now
+    self.duration = style.duration
+    self.r, self.g, self.b = style.r, style.g, style.b
+  end
+  return started
+end
+
+-- Rings still to draw at `now` (including ones waiting for their stagger).
+function BellPulse:active(now: float64): integer
+  local n = 0
+  for i = 0, < BELL_MAX_RINGS do
+    local ring = &self.rings[i]
+    if ring.live and now - ring.born < ring.duration then n = n + 1 end
+  end
+  return n
+end
+
+-- Host-side bookkeeping for one terminal.
+global BellTrack = @record{
+  id: integer,
+  seen: integer,          -- Session.bells already handled
+  quiet_until: float64,   -- bells counted before this are replayed output
+  rang: boolean,
+  at: float64,            -- time of the latest bell (the glow restarts from it)
+  style: BellStyle,
+}
+
+-- `bells` is the session's BEL counter. True when a new bell should show.
+function BellTrack:update(bells: integer, sleeping: boolean, now: float64): boolean
+  if sleeping then self.quiet_until = now + BELL_QUIET end
+  if bells == self.seen then return false end
+  self.seen = bells
+  return now >= self.quiet_until
+end
