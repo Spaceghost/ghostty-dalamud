@@ -1,0 +1,478 @@
+-- Manual GPU probe for core/shaders/panel_depth.hlsl (not part of run.sh: it
+-- needs D3D11). Draws a curved, tilted, turned world panel the way the plugin
+-- does (world_transform_vertices + the embedded DXBC + world_depth_params)
+-- over D24S8 depth buffers written with known reversed-Z scene depths, reads
+-- the pixels back and checks every covered pixel: against a model built on
+-- world_panel_ray_depth (the Nelua mirror of the shader's ray maths) where the
+-- scene is flat, and for the expected shape where it is not (a surface flush
+-- with the panel, a dithered fade, a silhouette edge, the show mode).
+--
+-- Build (Windows x64):
+--   ZIG=... vendor/nelua-lang/nelua --cc "$PWD/tools/zig-cc-win.sh" -P nogc \
+--     --cflags="-O2 -I$PWD/vendor/gc-cimgui -I$PWD/vendor/lua/src -L$PWD/build/lua-win" \
+--     --cache-dir build/win/cache -L . -o build/probe_depthpass.exe tests/probe_depthpass.nelua
+-- Run with Wine and DXVK (d3d11.dll + dxgi.dll next to the exe), in a scratch prefix:
+--   WINEPREFIX=/tmp/pfx WINEDLLOVERRIDES="d3d11,dxgi=n,b" wine64 probe_depthpass.exe
+-- The last line is PASS or FAIL.
+require 'core.world'
+require 'core.depthpass'
+require 'math'
+require 'io'
+require 'os'
+require 'memory'
+
+## cdefine 'COBJMACROS'
+## cinclude '<d3d11.h>'
+## cinclude '<d3dcompiler.h>'
+## linklib 'd3d11'
+## linklib 'd3dcompiler_47'
+
+local HRESULT <cimport, nodecl> = @clong
+local ID3D11Device <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11DeviceContext <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11Resource <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11Texture2D <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11Buffer <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11RenderTargetView <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11DepthStencilView <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11ShaderResourceView <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11SamplerState <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11VertexShader <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11PixelShader <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11InputLayout <cimport, nodecl, forwarddecl> = @record{}
+local ID3D10Blob <cimport, nodecl, forwarddecl> = @record{}
+local DXGI_SAMPLE_DESC <cimport, nodecl> = @record{ Count: cuint, Quality: cuint }
+local D3D11_TEXTURE2D_DESC <cimport, nodecl> = @record{ Width: cuint, Height: cuint, MipLevels: cuint, ArraySize: cuint, Format: cint,
+  SampleDesc: DXGI_SAMPLE_DESC, Usage: cint, BindFlags: cuint, CPUAccessFlags: cuint, MiscFlags: cuint }
+local D3D11_SUBRESOURCE_DATA <cimport, nodecl> = @record{ pSysMem: pointer, SysMemPitch: cuint, SysMemSlicePitch: cuint }
+local D3D11_TEX2D_SRV <cimport, nodecl> = @record{ MostDetailedMip: cuint, MipLevels: cuint }
+local D3D11_SHADER_RESOURCE_VIEW_DESC <cimport, nodecl> = @record{ Format: cint, ViewDimension: cint, Texture2D: D3D11_TEX2D_SRV }
+local D3D11_DEPTH_STENCIL_VIEW_DESC <cimport, nodecl> = @record{ Format: cint, ViewDimension: cint, Flags: cuint }
+local D3D11_BUFFER_DESC <cimport, nodecl> = @record{ ByteWidth: cuint, Usage: cint, BindFlags: cuint, CPUAccessFlags: cuint, MiscFlags: cuint, StructureByteStride: cuint }
+local D3D11_MAPPED_SUBRESOURCE <cimport, nodecl> = @record{ pData: pointer, RowPitch: cuint, DepthPitch: cuint }
+local D3D11_SAMPLER_DESC <cimport, nodecl> = @record{ Filter: cint, AddressU: cint, AddressV: cint, AddressW: cint, MipLODBias: float32,
+  MaxAnisotropy: cuint, ComparisonFunc: cint, BorderColor: [4]float32, MinLOD: float32, MaxLOD: float32 }
+local D3D11_INPUT_ELEMENT_DESC <cimport, nodecl> = @record{ SemanticName: cstring, SemanticIndex: cuint, Format: cint, InputSlot: cuint,
+  AlignedByteOffset: cuint, InputSlotClass: cint, InstanceDataStepWidth: cuint }
+local D3D11_VIEWPORT <cimport, nodecl> = @record{ TopLeftX: float32, TopLeftY: float32, Width: float32, Height: float32, MinDepth: float32, MaxDepth: float32 }
+
+local function D3D11CreateDevice(adapter: pointer, driver: cint, sw: pointer, flags: cuint, levels: pointer, nlevels: cuint, sdk: cuint,
+  dev: **ID3D11Device, level: pointer, ctx: **ID3D11DeviceContext): HRESULT <cimport, nodecl> end
+local function D3DCompile(src: pointer, len: csize, name: cstring, defines: pointer, include: pointer, entry: cstring, target: cstring,
+  f1: cuint, f2: cuint, code: **ID3D10Blob, errors: **ID3D10Blob): HRESULT <cimport, nodecl> end
+local function ID3D10Blob_GetBufferPointer(this: *ID3D10Blob): pointer <cimport, nodecl> end
+local function ID3D10Blob_GetBufferSize(this: *ID3D10Blob): csize <cimport, nodecl> end
+local function ID3D11Device_CreateTexture2D(this: *ID3D11Device, desc: *D3D11_TEXTURE2D_DESC, data: *D3D11_SUBRESOURCE_DATA, out: **ID3D11Texture2D): HRESULT <cimport, nodecl> end
+local function ID3D11Device_CreateRenderTargetView(this: *ID3D11Device, res: *ID3D11Resource, desc: pointer, out: **ID3D11RenderTargetView): HRESULT <cimport, nodecl> end
+local function ID3D11Device_CreateShaderResourceView(this: *ID3D11Device, res: *ID3D11Resource, desc: *D3D11_SHADER_RESOURCE_VIEW_DESC, out: **ID3D11ShaderResourceView): HRESULT <cimport, nodecl> end
+local function ID3D11Device_CreateDepthStencilView(this: *ID3D11Device, res: *ID3D11Resource, desc: *D3D11_DEPTH_STENCIL_VIEW_DESC, out: **ID3D11DepthStencilView): HRESULT <cimport, nodecl> end
+local function ID3D11Device_CreateBuffer(this: *ID3D11Device, desc: *D3D11_BUFFER_DESC, data: *D3D11_SUBRESOURCE_DATA, out: **ID3D11Buffer): HRESULT <cimport, nodecl> end
+local function ID3D11Device_CreateSamplerState(this: *ID3D11Device, desc: *D3D11_SAMPLER_DESC, out: **ID3D11SamplerState): HRESULT <cimport, nodecl> end
+local function ID3D11Device_CreateVertexShader(this: *ID3D11Device, code: pointer, len: csize, linkage: pointer, out: **ID3D11VertexShader): HRESULT <cimport, nodecl> end
+local function ID3D11Device_CreatePixelShader(this: *ID3D11Device, code: pointer, len: csize, linkage: pointer, out: **ID3D11PixelShader): HRESULT <cimport, nodecl> end
+local function ID3D11Device_CreateInputLayout(this: *ID3D11Device, elems: *D3D11_INPUT_ELEMENT_DESC, n: cuint, code: pointer, len: csize, out: **ID3D11InputLayout): HRESULT <cimport, nodecl> end
+local function ID3D11DeviceContext_Map(this: *ID3D11DeviceContext, res: *ID3D11Resource, sub: cuint, kind: cint, flags: cuint, out: *D3D11_MAPPED_SUBRESOURCE): HRESULT <cimport, nodecl> end
+local function ID3D11DeviceContext_Unmap(this: *ID3D11DeviceContext, res: *ID3D11Resource, sub: cuint): void <cimport, nodecl> end
+local function ID3D11DeviceContext_ClearRenderTargetView(this: *ID3D11DeviceContext, rtv: *ID3D11RenderTargetView, rgba: *[4]float32): void <cimport, nodecl> end
+local function ID3D11DeviceContext_ClearDepthStencilView(this: *ID3D11DeviceContext, dsv: *ID3D11DepthStencilView, flags: cuint, depth: float32, stencil: uint8): void <cimport, nodecl> end
+local function ID3D11DeviceContext_OMSetRenderTargets(this: *ID3D11DeviceContext, n: cuint, rtvs: **ID3D11RenderTargetView, dsv: *ID3D11DepthStencilView): void <cimport, nodecl> end
+local function ID3D11DeviceContext_RSSetViewports(this: *ID3D11DeviceContext, n: cuint, vps: *D3D11_VIEWPORT): void <cimport, nodecl> end
+local function ID3D11DeviceContext_IASetPrimitiveTopology(this: *ID3D11DeviceContext, t: cint): void <cimport, nodecl> end
+local function ID3D11DeviceContext_IASetInputLayout(this: *ID3D11DeviceContext, il: *ID3D11InputLayout): void <cimport, nodecl> end
+local function ID3D11DeviceContext_IASetVertexBuffers(this: *ID3D11DeviceContext, slot: cuint, n: cuint, bufs: **ID3D11Buffer, strides: *cuint, offsets: *cuint): void <cimport, nodecl> end
+local function ID3D11DeviceContext_VSSetShader(this: *ID3D11DeviceContext, vs: *ID3D11VertexShader, inst: pointer, n: cuint): void <cimport, nodecl> end
+local function ID3D11DeviceContext_PSSetShader(this: *ID3D11DeviceContext, ps: *ID3D11PixelShader, inst: pointer, n: cuint): void <cimport, nodecl> end
+local function ID3D11DeviceContext_PSSetShaderResources(this: *ID3D11DeviceContext, slot: cuint, n: cuint, views: **ID3D11ShaderResourceView): void <cimport, nodecl> end
+local function ID3D11DeviceContext_PSSetSamplers(this: *ID3D11DeviceContext, slot: cuint, n: cuint, s: **ID3D11SamplerState): void <cimport, nodecl> end
+local function ID3D11DeviceContext_PSSetConstantBuffers(this: *ID3D11DeviceContext, slot: cuint, n: cuint, bufs: **ID3D11Buffer): void <cimport, nodecl> end
+local function ID3D11DeviceContext_Draw(this: *ID3D11DeviceContext, n: cuint, start: cuint): void <cimport, nodecl> end
+local function ID3D11DeviceContext_CopyResource(this: *ID3D11DeviceContext, dst: *ID3D11Resource, src: *ID3D11Resource): void <cimport, nodecl> end
+
+local W <comptime> = 320
+local H <comptime> = 180
+local ZNEAR <comptime> = 0.1
+
+local function check(hr: HRESULT, what: string): void
+  if hr < 0 then
+    io.printf('%s failed: 0x%08x\nFAIL\n', what, (@uint32)(hr))
+    os.exit(1)
+  end
+end
+
+-- the game's camera: row vectors, reversed Z, infinite far plane (as tests/test_world.nelua)
+local function game_camera(ex: float64, ey: float64, ez: float64, yaw: float64, pitch: float64): GuCamera
+  local c: GuCamera = { width = W, height = H }
+  local fx, fy, fz = math.sin(yaw) * math.cos(pitch), math.sin(pitch), math.cos(yaw) * math.cos(pitch)
+  local zx, zy, zz = -fx, -fy, -fz
+  local xl = math.sqrt(zz * zz + zx * zx)
+  local xx, xy, xz = zz / xl, 0.0, -zx / xl
+  local yx, yy, yz = zy * xz - zz * xy, zz * xx - zx * xz, zx * xy - zy * xx
+  local v: [16]float64 = {
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(ex * xx + ey * xy + ez * xz), -(ex * yx + ey * yy + ez * yz), -(ex * zx + ey * zy + ez * zz), 1,
+  }
+  local f = 1 / math.tan(0.78 / 2)
+  local p: [16]float64 = { f * H / W, 0, 0, 0, 0, f, 0, 0, 0, 0, 0, -1, 0, 0, ZNEAR, 0 }
+  for r = 0, < 4 do
+    for k = 0, < 4 do
+      local sum: float64 = 0
+      for j = 0, < 4 do sum = sum + v[r * 4 + j] * p[j * 4 + k] end
+      c.m[r * 4 + k] = sum
+    end
+  end
+  return c
+end
+
+local dev: *ID3D11Device
+local ctx: *ID3D11DeviceContext
+check(D3D11CreateDevice(nilptr, 1, nilptr, 0, nilptr, 0, 7, &dev, nilptr, &ctx), 'D3D11CreateDevice') -- hardware, SDK 7
+
+-- ImGui's pipeline in miniature: 2D pixel positions, uv, colour; same VS outputs as Dalamud's
+local VS_SRC: string = [[
+struct VI { float2 pos : POSITION; float2 uv : TEXCOORD0; float4 col : COLOR0; };
+struct VO { float4 pos : SV_POSITION; float4 col : COLOR0; float2 uv : TEXCOORD0; };
+VO main(VI i) { VO o; o.pos = float4(i.pos.x / 160.0 - 1.0, 1.0 - i.pos.y / 90.0, 0.0, 1.0); o.col = i.col; o.uv = i.uv; return o; }
+]]
+local vs_blob: *ID3D10Blob
+check(D3DCompile(VS_SRC.data, #VS_SRC, 'vs', nilptr, nilptr, 'main', 'vs_5_0', 0, 0, &vs_blob, nilptr), 'D3DCompile vs')
+local vs: *ID3D11VertexShader
+check(ID3D11Device_CreateVertexShader(dev, ID3D10Blob_GetBufferPointer(vs_blob), ID3D10Blob_GetBufferSize(vs_blob), nilptr, &vs), 'CreateVertexShader')
+local ps: *ID3D11PixelShader
+check(ID3D11Device_CreatePixelShader(dev, &PANEL_DEPTH_DXBC, #PANEL_DEPTH_DXBC, nilptr, &ps), 'CreatePixelShader (embedded DXBC)')
+local layout_desc: [3]D3D11_INPUT_ELEMENT_DESC = {
+  { SemanticName = 'POSITION', Format = 16, AlignedByteOffset = 0 },  -- R32G32_FLOAT
+  { SemanticName = 'TEXCOORD', Format = 16, AlignedByteOffset = 8 },
+  { SemanticName = 'COLOR', Format = 28, AlignedByteOffset = 16 },    -- R8G8B8A8_UNORM
+}
+local layout: *ID3D11InputLayout
+check(ID3D11Device_CreateInputLayout(dev, &layout_desc[0], 3, ID3D10Blob_GetBufferPointer(vs_blob), ID3D10Blob_GetBufferSize(vs_blob), &layout), 'CreateInputLayout')
+
+local rt_desc: D3D11_TEXTURE2D_DESC = { Width = W, Height = H, MipLevels = 1, ArraySize = 1, Format = 28, SampleDesc = { Count = 1 }, BindFlags = 0x20 } -- RENDER_TARGET
+local rt: *ID3D11Texture2D
+check(ID3D11Device_CreateTexture2D(dev, &rt_desc, nilptr, &rt), 'render target')
+local rtv: *ID3D11RenderTargetView
+check(ID3D11Device_CreateRenderTargetView(dev, (@*ID3D11Resource)(rt), nilptr, &rtv), 'render target view')
+local staging_desc = rt_desc
+staging_desc.Usage, staging_desc.BindFlags, staging_desc.CPUAccessFlags = 3, 0, 0x20000 -- STAGING, CPU_ACCESS_READ
+local staging: *ID3D11Texture2D
+check(ID3D11Device_CreateTexture2D(dev, &staging_desc, nilptr, &staging), 'staging texture')
+
+-- the game's depth: D24S8 bound as depth + shader resource, read through R24_UNORM_X8_TYPELESS
+local depth_desc: D3D11_TEXTURE2D_DESC = { Width = W, Height = H, MipLevels = 1, ArraySize = 1, Format = 44, SampleDesc = { Count = 1 }, BindFlags = 0x48 }
+local depth: *ID3D11Texture2D
+check(ID3D11Device_CreateTexture2D(dev, &depth_desc, nilptr, &depth), 'depth texture')
+local dsv_desc: D3D11_DEPTH_STENCIL_VIEW_DESC = { Format = 45, ViewDimension = 3 }  -- D24_UNORM_S8_UINT, TEXTURE2D
+local dsv: *ID3D11DepthStencilView
+check(ID3D11Device_CreateDepthStencilView(dev, (@*ID3D11Resource)(depth), &dsv_desc, &dsv), 'depth stencil view')
+local srv_desc: D3D11_SHADER_RESOURCE_VIEW_DESC = { Format = 46, ViewDimension = 4, Texture2D = { MipLevels = 1 } }
+local depth_srv: *ID3D11ShaderResourceView
+check(ID3D11Device_CreateShaderResourceView(dev, (@*ID3D11Resource)(depth), &srv_desc, &depth_srv), 'depth shader resource view')
+
+local white: uint32 = 0xFFFFFFFF
+local font_desc: D3D11_TEXTURE2D_DESC = { Width = 1, Height = 1, MipLevels = 1, ArraySize = 1, Format = 28, SampleDesc = { Count = 1 }, BindFlags = 0x8 }
+local font_data: D3D11_SUBRESOURCE_DATA = { pSysMem = &white, SysMemPitch = 4 }
+local font: *ID3D11Texture2D
+check(ID3D11Device_CreateTexture2D(dev, &font_desc, &font_data, &font), 'font texture')
+local font_srv: *ID3D11ShaderResourceView
+check(ID3D11Device_CreateShaderResourceView(dev, (@*ID3D11Resource)(font), nilptr, &font_srv), 'font view')
+local sampler_desc: D3D11_SAMPLER_DESC = { Filter = 0x15, AddressU = 1, AddressV = 1, AddressW = 1, ComparisonFunc = 8, MaxLOD = 3.4e38 } -- linear, wrap
+local sampler: *ID3D11SamplerState
+check(ID3D11Device_CreateSamplerState(dev, &sampler_desc, &sampler), 'sampler')
+local cb_desc: D3D11_BUFFER_DESC = { ByteWidth = #WorldDepthParams, Usage = 2, BindFlags = 4, CPUAccessFlags = 0x10000 }
+local cb: *ID3D11Buffer
+check(ID3D11Device_CreateBuffer(dev, &cb_desc, nilptr, &cb), 'constant buffer')
+
+-- a panel 4 yalms ahead, curved, tilted back and turned away a little
+local cam = game_camera(0, 1.5, 0, 0, 0)
+local pl: WorldPlacement = { x = 0.2, y = 1.4, z = 4, yaw = math.pi + 0.35, pitch = 0.25, width = 1800, height = 1040, ppm = 640, curve = 3 }
+local b = world_basis(pl)
+local COLS <comptime> = 36
+local ROWS <comptime> = 20
+local verts: [COLS * ROWS * 6]ImDrawVert
+local n = 0
+for r = 0, < ROWS do
+  for c = 0, < COLS do
+    local u0, u1 = (@float32)(1800 * c / COLS), (@float32)(1800 * (c + 1) / COLS)
+    local v0, v1 = (@float32)(1040 * r / ROWS), (@float32)(1040 * (r + 1) / ROWS)
+    local quad: [6]ImVec2 = { vec2(u0, v0), vec2(u1, v0), vec2(u1, v1), vec2(u0, v0), vec2(u1, v1), vec2(u0, v1) }
+    for k = 0, < 6 do
+      verts[n] = { pos = quad[k], uv = vec2(0, 0), col = 0xFFFFFFFF }
+      n = n + 1
+    end
+  end
+end
+local cmd: [1]ImDrawCmd
+local dl: ImDrawList
+dl.CmdBuffer = { Size = 1, Capacity = 1, Data = (@*[0]ImDrawCmd)(&cmd) }
+dl.VtxBuffer = { Size = n, Capacity = n, Data = (@*[0]ImDrawVert)(&verts) }
+world_transform_vertices(&dl, 1, 0, &cam, &b, vec2(0, 0), vec2(0, 0), 1, 0, 0, vec2(0, 0), nilptr)
+local vb_desc: D3D11_BUFFER_DESC = { ByteWidth = (@cuint)(n * #ImDrawVert), Usage = 0, BindFlags = 1 } -- VERTEX_BUFFER
+local vb_data: D3D11_SUBRESOURCE_DATA = { pSysMem = &verts }
+local vb: *ID3D11Buffer
+check(ID3D11Device_CreateBuffer(dev, &vb_desc, &vb_data, &vb), 'vertex buffer')
+
+local okf, frame = world_depth_frame(&cam)
+assert(okf, 'depth frame')
+local TOL: float32 <comptime> = 0.01
+local EDGE: float32 <comptime> = 1
+
+-- the comparison sampler the plugin binds at s1
+local cmp_desc: D3D11_SAMPLER_DESC = { Filter = 0x95, AddressU = 3, AddressV = 3, AddressW = 3, ComparisonFunc = 7, MaxLOD = 3.4e38 }
+local cmp_sampler: *ID3D11SamplerState
+check(ID3D11Device_CreateSamplerState(dev, &cmp_desc, &cmp_sampler), 'comparison sampler')
+
+-- Writing the scene depth: a full-screen triangle whose pixel shader copies an
+-- R32_FLOAT texture into SV_Depth, so any pattern lands in the real D24S8 target.
+local SCENE_VS_SRC: string = [[
+float4 main(uint id : SV_VertexID) : SV_Position { return float4(id == 2 ? 3.0 : -1.0, id == 1 ? 3.0 : -1.0, 0.5, 1.0); }
+]]
+local SCENE_PS_SRC: string = [[
+Texture2D<float> Src : register(t0);
+float main(float4 pos : SV_Position) : SV_Depth { return Src.Load(int3(pos.xy, 0)); }
+]]
+local scene_vs_blob: *ID3D10Blob
+check(D3DCompile(SCENE_VS_SRC.data, #SCENE_VS_SRC, 'scene_vs', nilptr, nilptr, 'main', 'vs_5_0', 0, 0, &scene_vs_blob, nilptr), 'D3DCompile scene vs')
+local scene_vs: *ID3D11VertexShader
+check(ID3D11Device_CreateVertexShader(dev, ID3D10Blob_GetBufferPointer(scene_vs_blob), ID3D10Blob_GetBufferSize(scene_vs_blob), nilptr, &scene_vs), 'scene vs')
+local scene_ps_blob: *ID3D10Blob
+check(D3DCompile(SCENE_PS_SRC.data, #SCENE_PS_SRC, 'scene_ps', nilptr, nilptr, 'main', 'ps_5_0', 0, 0, &scene_ps_blob, nilptr), 'D3DCompile scene ps')
+local scene_ps: *ID3D11PixelShader
+check(ID3D11Device_CreatePixelShader(dev, ID3D10Blob_GetBufferPointer(scene_ps_blob), ID3D10Blob_GetBufferSize(scene_ps_blob), nilptr, &scene_ps), 'scene ps')
+local src_desc: D3D11_TEXTURE2D_DESC = { Width = W, Height = H, MipLevels = 1, ArraySize = 1, Format = 41, SampleDesc = { Count = 1 },
+  Usage = 2, BindFlags = 0x8, CPUAccessFlags = 0x10000 } -- R32_FLOAT, DYNAMIC, SHADER_RESOURCE, CPU write
+local src: *ID3D11Texture2D
+check(ID3D11Device_CreateTexture2D(dev, &src_desc, nilptr, &src), 'scene source texture')
+local src_srv: *ID3D11ShaderResourceView
+check(ID3D11Device_CreateShaderResourceView(dev, (@*ID3D11Resource)(src), nilptr, &src_srv), 'scene source view')
+
+local _, base = world_depth_params(&frame, &cam, &b, W, H, W, H, TOL, EDGE, 1)
+local function panel_t(x: float64, y: float64): float64 return world_panel_ray_depth(&base, x, y) end
+
+-- depth range the panel covers, from the mirror
+local dmin, dmax = 1e9, 0.0
+for i = 0, < n do
+  local d = panel_t(verts[i].pos.x, verts[i].pos.y)
+  if d > 0 then dmin, dmax = math.min(dmin, d), math.max(dmax, d) end
+end
+io.printf('panel depth %.3f .. %.3f yalms\n', dmin, dmax)
+local cut_w = (dmin + dmax) / 2
+
+-- the scene for each case: view depth in yalms at texel (x, y), 0 = sky
+local SCENE_SKY <comptime> = 0
+local SCENE_UNIFORM <comptime> = 1
+local SCENE_FLUSH <comptime> = 2      -- the surface the panel lies on
+local SCENE_FLUSH_SHIFTED <comptime> = 3 -- the same, one pixel out of line (lower resolution, jitter)
+local SCENE_DITHER <comptime> = 4     -- a near character dithered at 50%
+local SCENE_SILHOUETTE <comptime> = 5 -- near on the left half, sky on the right
+local function scene_w(kind: integer, uniform: float64, x: integer, y: integer): float64
+  if kind == SCENE_UNIFORM then return uniform end
+  if kind == SCENE_FLUSH then return panel_t(x + 0.5, y + 0.5) end
+  if kind == SCENE_FLUSH_SHIFTED then return panel_t(x + 1.5, y + 0.5) end
+  if kind == SCENE_DITHER then return (x + y) % 2 == 0 and 2.5 or 0 end
+  if kind == SCENE_SILHOUETTE then return x < W // 2 and 2.5 or 0 end
+  return 0
+end
+
+local alphas: [W * H]float64
+local reds: [W * H]float64
+local greens: [W * H]float64
+local function draw(kind: integer, uniform: float64, strength: float32): void
+  -- the scene into the depth buffer
+  local mapped: D3D11_MAPPED_SUBRESOURCE
+  check(ID3D11DeviceContext_Map(ctx, (@*ID3D11Resource)(src), 0, 4, 0, &mapped), 'map scene source')
+  local texels = (@*[0]float32)(mapped.pData)
+  for y = 0, < H do
+    for x = 0, < W do
+      local w = scene_w(kind, uniform, x, y)
+      texels[y * (mapped.RowPitch // 4) + x] = w > 0 and (@float32)(ZNEAR / w) or 0
+    end
+  end
+  ID3D11DeviceContext_Unmap(ctx, (@*ID3D11Resource)(src), 0)
+  local no_rtv: [1]*ID3D11RenderTargetView = { nilptr }
+  ID3D11DeviceContext_OMSetRenderTargets(ctx, 0, &no_rtv[0], dsv)
+  ID3D11DeviceContext_ClearDepthStencilView(ctx, dsv, 1, 1, 0)
+  local vp: D3D11_VIEWPORT = { Width = W, Height = H, MaxDepth = 1 }
+  ID3D11DeviceContext_RSSetViewports(ctx, 1, &vp)
+  ID3D11DeviceContext_IASetPrimitiveTopology(ctx, 4) -- TRIANGLELIST
+  ID3D11DeviceContext_IASetInputLayout(ctx, nilptr)
+  ID3D11DeviceContext_VSSetShader(ctx, scene_vs, nilptr, 0)
+  ID3D11DeviceContext_PSSetShader(ctx, scene_ps, nilptr, 0)
+  ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &src_srv)
+  ID3D11DeviceContext_Draw(ctx, 3, 0)
+
+  -- the panel, the way Dalamud's pass draws it with the plugin's bindings
+  local _, params = world_depth_params(&frame, &cam, &b, W, H, W, H, TOL, EDGE, strength)
+  check(ID3D11DeviceContext_Map(ctx, (@*ID3D11Resource)(cb), 0, 4, 0, &mapped), 'map constants')
+  memory.copy(mapped.pData, &params.v, #WorldDepthParams)
+  ID3D11DeviceContext_Unmap(ctx, (@*ID3D11Resource)(cb), 0)
+  local clear: [4]float32 = { 0, 0, 0, 0 }
+  ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, &clear)
+  local rtvs: [1]*ID3D11RenderTargetView = { rtv }
+  ID3D11DeviceContext_OMSetRenderTargets(ctx, 1, &rtvs[0], nilptr) -- no depth target, like Dalamud's pass
+  ID3D11DeviceContext_IASetInputLayout(ctx, layout)
+  local stride: cuint, offset: cuint = #ImDrawVert, 0
+  ID3D11DeviceContext_IASetVertexBuffers(ctx, 0, 1, &vb, &stride, &offset)
+  ID3D11DeviceContext_VSSetShader(ctx, vs, nilptr, 0)
+  ID3D11DeviceContext_PSSetShader(ctx, ps, nilptr, 0)
+  ID3D11DeviceContext_PSSetShaderResources(ctx, 0, 1, &font_srv)
+  ID3D11DeviceContext_PSSetShaderResources(ctx, 1, 1, &depth_srv)
+  ID3D11DeviceContext_PSSetSamplers(ctx, 0, 1, &sampler)
+  ID3D11DeviceContext_PSSetSamplers(ctx, 1, 1, &cmp_sampler)
+  ID3D11DeviceContext_PSSetConstantBuffers(ctx, 0, 1, &cb)
+  ID3D11DeviceContext_Draw(ctx, (@cuint)(n), 0)
+  local no_srv: *ID3D11ShaderResourceView = nilptr
+  ID3D11DeviceContext_PSSetShaderResources(ctx, 1, 1, &no_srv)
+  ID3D11DeviceContext_CopyResource(ctx, (@*ID3D11Resource)(staging), (@*ID3D11Resource)(rt))
+  check(ID3D11DeviceContext_Map(ctx, (@*ID3D11Resource)(staging), 0, 1, 0, &mapped), 'map readback') -- READ
+  local rows = (@*[0]uint8)(mapped.pData)
+  for y = 0, < H do
+    for x = 0, < W do
+      local o = y * mapped.RowPitch + x * 4
+      reds[y * W + x] = rows[o] / 255.0
+      greens[y * W + x] = rows[o + 1] / 255.0
+      alphas[y * W + x] = rows[o + 3] / 255.0
+    end
+  end
+  ID3D11DeviceContext_Unmap(ctx, (@*ID3D11Resource)(staging), 0)
+end
+
+-- The shader's result over a flat scene at `sw` yalms (0 = sky), from the ray
+-- mirror, with the screen slope taken as `dir` = 1 forward or -1 backward
+-- differences (the GPU's 2x2 derivatives are one or the other).
+local TAPS: [8]float64 = { 0.25, 0.75, -0.75, 0.25, -0.25, -0.75, 0.75, -0.25 }
+local function model(x: integer, y: integer, sw: float64, strength: float64, dir: float64): float64
+  local cx, cy = x + 0.5, y + 0.5
+  local t = panel_t(cx, cy)
+  if t <= 0 or strength <= 0 then return 1 end
+  local dtdx, dtdy = (panel_t(cx + dir, cy) - t) * dir, (panel_t(cx, cy + dir) - t) * dir
+  local tol = TOL + 0.001 * t + (math.abs(dtdx) + math.abs(dtdy)) * (0.5 / 1 + 0.5)
+  local visible = 0.0
+  for k = 0, < 4 do
+    local tk = math.max(t + dtdx * TAPS[2 * k] * EDGE + dtdy * TAPS[2 * k + 1] * EDGE - tol, 1e-3)
+    if sw <= 0 or tk <= sw then visible = visible + 0.25 end
+  end
+  return 1 - math.min(strength, 1) * (1 - visible)
+end
+
+local failed = false
+local function covered(i: integer): boolean return reds[i] > 0 end
+
+local function run_flat(name: string, sw: float64, strength: float32): void
+  draw(sw > 0 and SCENE_UNIFORM or SCENE_SKY, sw, strength)
+  local count, hidden, partial, visible, bad, unsure = 0, 0, 0, 0, 0, 0
+  local worst = 0.0
+  for y = 1, < H - 1 do
+    for x = 1, < W - 1 do
+      local i = y * W + x
+      if covered(i) then
+        count = count + 1
+        local got = alphas[i]
+        if got < 0.01 then hidden = hidden + 1 elseif got > 0.99 then visible = visible + 1 else partial = partial + 1 end
+        local fwd, back = model(x, y, sw, strength, 1), model(x, y, sw, strength, -1)
+        if math.abs(fwd - back) > 0.01 then
+          unsure = unsure + 1 -- on the crossing line, where the derivative's choice decides a tap
+        else
+          local diff = math.abs(got - fwd)
+          if diff > worst then worst = diff end
+          if diff > 4 / 255 then bad = bad + 1 end
+        end
+      end
+    end
+  end
+  io.printf('%-30s covered %5d  hidden %5d  partial %4d  visible %5d  mismatched %d (worst %.3f, %d on the line)\n',
+    name, count, hidden, partial, visible, bad, worst, unsure)
+  if count < 1000 or bad > 0 or unsure > count // 50 then failed = true end
+end
+
+-- counts of covered pixels by alpha, away from the viewport border
+local function census(kind: integer, strength: float32): (integer, integer, integer, integer)
+  draw(kind, 0, strength)
+  local count, hidden, partial, visible = 0, 0, 0, 0
+  for y = 2, < H - 2 do
+    for x = 2, < W - 2 do
+      local i = y * W + x
+      if covered(i) then
+        count = count + 1
+        if alphas[i] < 0.01 then hidden = hidden + 1 elseif alphas[i] > 0.99 then visible = visible + 1 else partial = partial + 1 end
+      end
+    end
+  end
+  return count, hidden, partial, visible
+end
+
+local function expect(ok: boolean, name: string, count: integer, hidden: integer, partial: integer, visible: integer): void
+  io.printf('%-30s covered %5d  hidden %5d  partial %4d  visible %5d  %s\n', name, count, hidden, partial, visible, ok and 'ok' or 'WRONG')
+  if not ok or count < 1000 then failed = true end
+end
+
+run_flat('sky', 0, 1)
+run_flat('scene far behind (50)', 50, 1)
+run_flat('scene in front (2.5)', 2.5, 1)
+run_flat('scene cuts through the panel', cut_w, 1)
+run_flat('cut, test off (strength 0)', cut_w, 0)
+run_flat('cut, half strength', cut_w, 0.5)
+
+-- a surface the panel lies on: no z-fighting, even one pixel out of line
+do
+  local c, h, p, v = census(SCENE_FLUSH, 1)
+  expect(v == c, 'flush with a surface', c, h, p, v)
+  c, h, p, v = census(SCENE_FLUSH_SHIFTED, 1)
+  expect(v == c, 'flush, one pixel out of line', c, h, p, v)
+end
+
+-- a dithered fade reads as a fade, not as a checkerboard cut out of the panel
+do
+  local c, h, p, v = census(SCENE_DITHER, 1)
+  local lo, hi = 1.0, 0.0
+  for y = 2, < H - 2 do
+    for x = 2, < W - 2 do
+      local i = y * W + x
+      if covered(i) then lo, hi = math.min(lo, alphas[i]), math.max(hi, alphas[i]) end
+    end
+  end
+  io.printf('  dither alpha %.3f .. %.3f\n', lo, hi)
+  expect(lo > 0.2 and hi < 0.8, 'dithered character', c, h, p, v)
+end
+
+-- a silhouette edge blends over a pixel or two instead of stepping
+do
+  local c, h, p, v = census(SCENE_SILHOUETTE, 1)
+  local rows, widest = 0, 0
+  for y = 2, < H - 2 do
+    local blend = 0
+    local spans = true
+    for x = W // 2 - 4, < W // 2 + 4 do
+      local i = y * W + x
+      if not covered(i) then spans = false end
+      if alphas[i] > 0.01 and alphas[i] < 0.99 then blend = blend + 1 end
+    end
+    if spans then -- the panel covers the whole window around the edge in this row
+      rows = rows + 1
+      widest = math.max(widest, blend)
+      if blend == 0 then widest = 99 end
+    end
+  end
+  io.printf('  silhouette: %d rows cross the edge, widest blend %d px\n', rows, widest)
+  expect(rows > 20 and widest >= 1 and widest <= 3, 'silhouette edge', c, h, p, v)
+end
+
+-- /term depth show: red where the scene is in front, green where the panel is
+do
+  draw(SCENE_UNIFORM, cut_w, -1)
+  local count, wrong = 0, 0
+  for y = 1, < H - 1 do
+    for x = 1, < W - 1 do
+      local i = y * W + x
+      local t = panel_t(x + 0.5, y + 0.5)
+      if alphas[i] > 0.5 and t > 0 then
+        count = count + 1
+        if t - cut_w > 0.3 and not (reds[i] > 0.9 and greens[i] < 0.1) then wrong = wrong + 1 end
+        if cut_w - t > 0.3 and not (greens[i] > 0.9 and reds[i] < 0.1) then wrong = wrong + 1 end
+        if math.abs(alphas[i] - 0.6) > 0.01 then wrong = wrong + 1 end
+      end
+    end
+  end
+  io.printf('%-30s shown %5d  wrong %d\n', 'show the test', count, wrong)
+  if count < 1000 or wrong > 0 then failed = true end
+end
+io.printf('%s\n', failed and 'FAIL' or 'PASS')
