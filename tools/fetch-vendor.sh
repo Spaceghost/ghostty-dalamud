@@ -1,14 +1,12 @@
 #!/usr/bin/env bash
-# Fetch every third-party dependency at the revision pinned in toolchain.env.
-# Nothing here is modified by us; see docs/ARCHITECTURE.md for what each is for.
+# Fetch dependencies at the revisions pinned in toolchain.env.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-# shellcheck disable=SC1091
 source "$ROOT/toolchain.env"
 V="$ROOT/vendor"
 mkdir -p "$V"
 
-clone_pin() { # name repo commit
+clone_pin() {
   local dir="$V/$1"
   if [[ ! -d "$dir/.git" ]]; then
     git clone --filter=blob:none "$2" "$dir"
@@ -36,11 +34,10 @@ if [[ ! -f "$V/lua/src/lua.h" ]]; then
 fi
 echo "lua $LUA_VERSION"
 
-# Dalamud reference assemblies (for compiling the C# shim only).
-DD="${DALAMUD_LIB_PATH:-$HOME/.cache/dalamud-dev}"
-if [[ ! -f "$DD/Dalamud.dll" ]]; then
-  mkdir -p "$DD"
-  curl -fsSL "$DALAMUD_DISTRIB_URL" -o "$DD/latest.zip"
-  python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" "$DD/latest.zip" "$DD"
+# The installed runtime and these compile-time reference assemblies are separate.
+if [[ -n "${DALAMUD_LIB_PATH:-}" ]]; then
+  [[ -f "$DALAMUD_LIB_PATH/Dalamud.dll" ]] || { echo 'DALAMUD_LIB_PATH lacks Dalamud.dll' >&2; exit 1; }
+  echo "using explicit, unverified reference override: $DALAMUD_LIB_PATH"
+else
+  python3 "$ROOT/tools/fetch-dalamud.py" "$DALAMUD_DISTRIB_URL" "$DALAMUD_DISTRIB_BLOB_SHA1" "$ROOT/vendor/dalamud"
 fi
-echo "dalamud dev assemblies in $DD"

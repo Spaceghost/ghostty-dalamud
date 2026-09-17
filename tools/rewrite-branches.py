@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Publish an identity-only rewrite of all snapshotted branches atomically.
+"""Atomically publish identity-only rewrites of all snapshotted branches.
 
-Run from a disposable full clone after committing reviewed repairs to main.
-Concurrent changes, unexpected refs, roots, or tags cause a closed failure.
+Run only in a disposable full clone. Preserve branch-specific work. Ref changes,
+tags, unrelated roots, binary matches and stale leases stop publication.
 """
 from __future__ import annotations
 import importlib.util
-import os
 from pathlib import Path
 import subprocess
 import sys
@@ -41,8 +40,8 @@ def publish(snapshot: Path) -> str:
     if git('status', '--porcelain').strip():
         raise RuntimeError('Working tree is not clean.')
     head = git('rev-parse', 'HEAD').strip().decode()
-    if subprocess.run(['git', 'merge-base', '--is-ancestor', expected['refs/heads/main'], head]).returncode:
-        raise RuntimeError('Reviewed main is not based on the snapshotted main.')
+    if head != expected['refs/heads/main']:
+        raise RuntimeError('Checkout does not match the snapshotted main.')
     source = Path('tools/rewrite-identity.py').resolve()
     spec = importlib.util.spec_from_file_location('identity_rewrite', source)
     module = importlib.util.module_from_spec(spec)
@@ -50,12 +49,11 @@ def publish(snapshot: Path) -> str:
     original = module.root_identity(head)
     rewritten = {}
     for ref, old in sorted(expected.items()):
-        tip = head if ref == 'refs/heads/main' else old
-        if module.root_identity(tip) != original:
+        if module.root_identity(old) != original:
             raise RuntimeError('Branches have different original identities; review manually.')
-        new, commits, objects = module.rewrite(tip, b'Spaceghost', b'251370+Spaceghost@users.noreply.github.com')
+        new, commits, objects = module.rewrite(old, b'Spaceghost', b'251370+Spaceghost@users.noreply.github.com')
         rewritten[ref] = new
-        print(f'{ref}: {commits} commits rewritten, {objects} objects verified; 0 identity remnants.', flush=True)
+        print(f'{ref}: {commits} commits rewritten; {objects} objects checked; 0 original identity remnants.', flush=True)
     if remote_refs() != expected:
         raise RuntimeError('Remote refs moved during rewriting; no changes published.')
     command = ['git', 'push', '--atomic']
@@ -68,16 +66,12 @@ def publish(snapshot: Path) -> str:
     new_head = rewritten['refs/heads/main']
     git('update-ref', 'refs/heads/main', new_head, head)
     git('reset', '--hard', new_head)
-    if os.environ.get('GITHUB_OUTPUT'):
-        with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
-            out.write(f'head={new_head}\n')
-    if os.environ.get('GITHUB_STEP_SUMMARY'):
-        with open(os.environ['GITHUB_STEP_SUMMARY'], 'a') as out:
-            out.write(f'## Maintenance result\n\nPublished repaired main `{new_head}`.\n\nRewrote {len(rewritten)} branches with atomic leases, preserving their distinct work.\n\nGitHub-managed pull-request refs, cached old objects, workflow metadata and external clones are not purged by this operation.\n')
+    print('New main:', new_head)
+    print('External clones and GitHub-managed cached objects/workflow metadata were not purged.')
     return new_head
 
 
 if __name__ == '__main__':
     if len(sys.argv) != 2:
-        raise SystemExit('usage: publish_all.py EXPECTED_REF_SNAPSHOT')
-    print('New main:', publish(Path(sys.argv[1])))
+        raise SystemExit('usage: rewrite-branches.py EXPECTED_REF_SNAPSHOT')
+    publish(Path(sys.argv[1]))

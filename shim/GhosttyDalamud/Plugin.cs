@@ -1,9 +1,6 @@
-// GhosttyDalamud: an ordinary Dalamud plugin around the Nelua core. It loads
-// ghostty_core.dll from beside this assembly, forwards the draw tick and the
-// /xlplugins buttons, and hands Dalamud to the core through GuHostApi
-// (HostApi.cs). The core decides what to register and when; see
-// core/app/hostsurface.nelua.
-using System.IO;
+// Dalamud adapter. Configuration resolves against the original installation;
+// native loading uses an isolated writable cache owned by this plugin instance.
+using System;
 using System.Runtime.InteropServices;
 using Dalamud.Game.ClientState.Objects;
 using Dalamud.IoC;
@@ -29,51 +26,91 @@ public sealed unsafe class Plugin : IDalamudPlugin
     [PluginService] internal static IGameConfig GameConfig { get; private set; } = null!;
     [PluginService] internal static IFramework GameFramework { get; private set; } = null!;
 
+    private NativeCache? nativeCache;
+    private bool nativeLoaded;
+    private bool hostCreated;
+    private bool walkHooked;
+    private bool subscribed;
+    private bool disposed;
+
     public Plugin()
     {
-        // Dalamud loads the managed assembly from memory, but AssemblyLocation
-        // still names the plugin folder; the native core and lua/ sit there.
-        string install = Pi.AssemblyLocation.DirectoryName!;
-        Native.Load(Path.Combine(install, "ghostty_core.dll"));
-        HostApi.Create();
-
-        // the core copies these strings during init
-        nint installDir  = Marshal.StringToCoTaskMemUTF8(install);
-        nint configDir   = Marshal.StringToCoTaskMemUTF8(Pi.ConfigDirectory.FullName);
-        nint configsRoot = Marshal.StringToCoTaskMemUTF8(Pi.ConfigDirectory.Parent!.FullName);
-        var info = new GuInitInfo {
-            Size        = (nuint)sizeof(GuInitInfo),
-            HostKind    = Native.HostKindDalamud,
-            InstallDir  = (byte*)installDir,
-            ConfigDir   = (byte*)configDir,
-            ConfigsRoot = (byte*)configsRoot,
-        };
-        Native.InitEx(HostApi.Api, &info); // the core logs why it is not active yet, and retries
-        Marshal.FreeCoTaskMem(installDir);
-        Marshal.FreeCoTaskMem(configDir);
-        Marshal.FreeCoTaskMem(configsRoot);
-
-        HostApi.HookWalkInput();
-        Pi.UiBuilder.Draw         += OnDraw;
-        Pi.UiBuilder.OpenMainUi   += OnOpenMain;
-        Pi.UiBuilder.OpenConfigUi += OnOpenConfig;
-        Pi.ActivePluginsChanged   += OnPluginsChanged;
+        nint installDir = 0, configDir = 0, configsRoot = 0;
+        try
+        {
+            string install = Pi.AssemblyLocation.DirectoryName!;
+            nativeCache = new NativeCache(install, Pi.ConfigDirectory.FullName);
+            Native.Load(nativeCache.CorePath);
+            nativeLoaded = true;
+            HostApi.Create();
+            hostCreated = true;
+            installDir = Marshal.StringToCoTaskMemUTF8(install);
+            configDir = Marshal.StringToCoTaskMemUTF8(Pi.ConfigDirectory.FullName);
+            configsRoot = Marshal.StringToCoTaskMemUTF8(Pi.ConfigDirectory.Parent!.FullName);
+            var info = new GuInitInfo {
+                Size = (nuint)sizeof(GuInitInfo),
+                HostKind = Native.HostKindDalamud,
+                InstallDir = (byte*)installDir,
+                ConfigDir = (byte*)configDir,
+                ConfigsRoot = (byte*)configsRoot,
+            };
+            if (Native.InitEx(HostApi.Api, &info) == 1)
+                throw new InvalidOperationException("Native core rejected initialization arguments.");
+            walkHooked = true;
+            HostApi.HookWalkInput();
+            Pi.UiBuilder.Draw += OnDraw;
+            Pi.UiBuilder.OpenMainUi += OnOpenMain;
+            Pi.UiBuilder.OpenConfigUi += OnOpenConfig;
+            Pi.ActivePluginsChanged += OnPluginsChanged;
+            subscribed = true;
+        }
+        catch
+        {
+            Dispose();
+            throw;
+        }
+        finally
+        {
+            Marshal.FreeCoTaskMem(installDir);
+            Marshal.FreeCoTaskMem(configDir);
+            Marshal.FreeCoTaskMem(configsRoot);
+        }
     }
 
-    private static void OnDraw() => Native.Frame();
+    private void OnDraw()
+    {
+        string? error = nativeCache?.Refresh();
+        if (error != null) Log.Warning("Ghostty native cache update: " + error);
+        Native.Frame();
+    }
     private static void OnOpenMain() => Native.Post(GuEvent.OpenMain, 0, 0, 0, 0, string.Empty);
     private static void OnOpenConfig() => Native.Post(GuEvent.OpenConfig, 0, 0, 0, 0, string.Empty);
     private static void OnPluginsChanged(IActivePluginsChangedEventArgs args) => Native.Post(GuEvent.PluginsChanged, 0, 0, 0, 0, string.Empty);
 
     public void Dispose()
     {
-        Pi.UiBuilder.Draw         -= OnDraw;
-        Pi.UiBuilder.OpenMainUi   -= OnOpenMain;
-        Pi.UiBuilder.OpenConfigUi -= OnOpenConfig;
-        Pi.ActivePluginsChanged   -= OnPluginsChanged;
-        HostApi.UnhookWalkInput(); // before the core it calls goes away
-        Native.Shutdown();         // the core removes its commands, info bar entry and IPC first
-        Native.Unload();
-        HostApi.Free();
+        if (disposed) return;
+        disposed = true;
+        if (subscribed)
+        {
+            Pi.UiBuilder.Draw -= OnDraw;
+            Pi.UiBuilder.OpenMainUi -= OnOpenMain;
+            Pi.UiBuilder.OpenConfigUi -= OnOpenConfig;
+            Pi.ActivePluginsChanged -= OnPluginsChanged;
+        }
+        try
+        {
+            if (walkHooked) HostApi.UnhookWalkInput();
+            if (nativeLoaded)
+            {
+                Native.Shutdown();
+                Native.Unload();
+            }
+        }
+        finally
+        {
+            if (hostCreated) HostApi.Free();
+            nativeCache?.Dispose();
+        }
     }
 }
