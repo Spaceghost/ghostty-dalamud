@@ -14,8 +14,11 @@ C.releases = {
     blurb = 'Being built right now. These land here as they are verified in game.',
     items = {
       { 'next', 'Vote on what gets built next: the About tab in Settings opens the vote page in your browser, and a small dot on the settings button shows while there are ideas you have not looked at. The plugin itself never goes online for it.' },
+      { 'next', 'Local terminals (conpty) on Windows start their shell with the structure size Windows expects. Not yet verified on Windows or under Wine.' },
+      { 'next', 'Controller: the DualSense Create button can open the terminal while the game is in front (choose create in Settings). Not yet tried with a real controller in game.' },
       { 'next', 'Select text with the mouse — drag, double-click a word, triple-click a line — and copy it.' },
       { 'next', 'Screens cast real in-game light: their backlight glows on your face and the world around you.' },
+      { 'next', 'Experimental, off by default: screens cast shadows and block sunlight (Settings, Light). Not yet tried in game, and a game patch may crash it.' },
       { 'next', 'Click a screen and your character walks up to it while it floats out to meet you.' },
       { 'next', 'The terminal bell rings out as a ripple of light from your character; the screen that rang glows.' },
       { 'next', 'A Dalamud plugin of its own: /term, a server info bar entry with a popup terminal, Open and Settings in /xlplugins. Umbra adds its toolbar widget when installed, and your settings, token and screens move over by themselves.' },
