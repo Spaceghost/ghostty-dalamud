@@ -1,0 +1,222 @@
+-- Windows ConPTY transport (pseudo console). Compiled to stubs elsewhere so
+-- the host-side test build still links.
+require 'string'
+require 'vector'
+
+global ConPty = @record{
+  hpc: pointer,
+  in_write: pointer,
+  out_read: pointer,
+  process: pointer,
+  thread: pointer,
+  attr_list: pointer,
+  alive: boolean,
+  exit_code: uint32,
+  exited: boolean,
+}
+
+## if ccinfo.is_windows then
+## cinclude '<windows.h>'
+
+local COORD <cimport, nodecl> = @record{ X: int16, Y: int16 }
+local STARTUPINFOW <cimport, nodecl> = @record{ cb: uint32 }
+local STARTUPINFOEXW <cimport, nodecl> = @record{ StartupInfo: STARTUPINFOW, lpAttributeList: pointer }
+local PROCESS_INFORMATION <cimport, nodecl> = @record{ hProcess: pointer, hThread: pointer, dwProcessId: uint32, dwThreadId: uint32 }
+local SECURITY_ATTRIBUTES <cimport, nodecl> = @record{ nLength: uint32, lpSecurityDescriptor: pointer, bInheritHandle: cint }
+
+local function CreatePipe(hRead: *pointer, hWrite: *pointer, sa: *SECURITY_ATTRIBUTES, size: uint32): cint <cimport, nodecl> end
+local function CloseHandle(h: pointer): cint <cimport, nodecl> end
+local function ReadFile(h: pointer, buf: pointer, n: uint32, read: *uint32, ov: pointer): cint <cimport, nodecl> end
+local function WriteFile(h: pointer, buf: pointer, n: uint32, written: *uint32, ov: pointer): cint <cimport, nodecl> end
+local function PeekNamedPipe(h: pointer, buf: pointer, n: uint32, read: *uint32, avail: *uint32, left: *uint32): cint <cimport, nodecl> end
+local function InitializeProcThreadAttributeList(list: pointer, count: uint32, flags: uint32, size: *usize): cint <cimport, nodecl> end
+local function UpdateProcThreadAttribute(list: pointer, flags: uint32, attr: usize, value: pointer, size: usize, prev: pointer, ret: pointer): cint <cimport, nodecl> end
+local function DeleteProcThreadAttributeList(list: pointer): void <cimport, nodecl> end
+local function CreateProcessW(app: pointer, cmd: pointer, pa: pointer, ta: pointer, inherit: cint, flags: uint32, env: pointer, cwd: pointer, si: pointer, pi: *PROCESS_INFORMATION): cint <cimport, nodecl> end
+local function WaitForSingleObject(h: pointer, ms: uint32): uint32 <cimport, nodecl> end
+local function GetExitCodeProcess(h: pointer, code: *uint32): cint <cimport, nodecl> end
+local function TerminateProcess(h: pointer, code: uint32): cint <cimport, nodecl> end
+local function GetProcessHeap(): pointer <cimport, nodecl> end
+local function HeapAlloc(heap: pointer, flags: uint32, size: usize): pointer <cimport, nodecl> end
+local function HeapFree(heap: pointer, flags: uint32, p: pointer): cint <cimport, nodecl> end
+local function MultiByteToWideChar(cp: uint32, flags: uint32, src: cstring, srclen: cint, dst: *[0]uint16, dstlen: cint): cint <cimport, nodecl> end
+local function GetModuleHandleA(name: cstring): pointer <cimport, nodecl> end
+local function GetProcAddress(mod: pointer, name: cstring): pointer <cimport, nodecl> end
+local EXTENDED_STARTUPINFO_PRESENT: uint32 <cimport, nodecl, const>
+local CREATE_UNICODE_ENVIRONMENT: uint32 <cimport, nodecl, const>
+local PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize <cimport, nodecl, const>
+local WAIT_OBJECT_0: uint32 <cimport, nodecl, const>
+local CP_UTF8: uint32 <cimport, nodecl, const>
+
+-- ConPTY entry points are resolved at runtime so the DLL still loads on a
+-- Wine/Windows build that lacks them (we report "unavailable" instead).
+local CreatePseudoConsoleFn = @function(size: COORD, hInput: pointer, hOutput: pointer, flags: uint32, out: *pointer): int32
+local ResizePseudoConsoleFn = @function(hpc: pointer, size: COORD): int32
+local ClosePseudoConsoleFn = @function(hpc: pointer): void
+local create_pc: CreatePseudoConsoleFn = nilptr
+local resize_pc: ResizePseudoConsoleFn = nilptr
+local close_pc: ClosePseudoConsoleFn = nilptr
+local resolved: boolean = false
+
+global function conpty_available(): boolean
+  if not resolved then
+    resolved = true
+    local k32 = GetModuleHandleA('kernel32.dll')
+    if k32 ~= nilptr then
+      create_pc = (@CreatePseudoConsoleFn)(GetProcAddress(k32, 'CreatePseudoConsole'))
+      resize_pc = (@ResizePseudoConsoleFn)(GetProcAddress(k32, 'ResizePseudoConsole'))
+      close_pc = (@ClosePseudoConsoleFn)(GetProcAddress(k32, 'ClosePseudoConsole'))
+    end
+  end
+  return create_pc ~= nilptr and resize_pc ~= nilptr and close_pc ~= nilptr
+end
+
+local function to_wide(s: string): *[0]uint16
+  local n = MultiByteToWideChar(CP_UTF8, 0, (@cstring)(s.data), (@cint)(s.size), nilptr, 0)
+  local w = (@*[0]uint16)(HeapAlloc(GetProcessHeap(), 0, (@usize)(n + 1) * 2))
+  if w == nilptr then return nilptr end
+  MultiByteToWideChar(CP_UTF8, 0, (@cstring)(s.data), (@cint)(s.size), w, n)
+  w[n] = 0
+  return w
+end
+
+-- Quote argv into a Windows command line (CommandLineToArgvW rules).
+local function build_cmdline(argv: *vector(string)): string
+  local sb: stringbuilder
+  for i = 0, < #argv do
+    if i > 0 then sb:write(' ') end
+    local a = argv[i]
+    local needs = #a == 0 or a:find(' ', 1, true) > 0 or a:find('\t', 1, true) > 0 or a:find('"', 1, true) > 0
+    if not needs then
+      sb:write(a)
+    else
+      sb:write('"')
+      local bs = 0
+      for k = 1, #a do
+        local c = a:byte(k)
+        if c == 92 then
+          bs = bs + 1
+        elseif c == 34 then
+          for _ = 1, bs * 2 + 1 do sb:write('\\') end
+          bs = 0
+          sb:write('"')
+        else
+          for _ = 1, bs do sb:write('\\') end
+          bs = 0
+          sb:write(string.char(c))
+        end
+      end
+      for _ = 1, bs * 2 do sb:write('\\') end
+      sb:write('"')
+    end
+  end
+  return sb:promote()
+end
+
+require 'stringbuilder'
+
+function ConPty:open(argv: *vector(string), cwd: string, cols: uint16, rows: uint16): boolean
+  $self = {}
+  if not conpty_available() then return false end
+  local in_read: pointer
+  local out_write: pointer
+  if CreatePipe(&in_read, &self.in_write, nilptr, 0) == 0 then return false end
+  if CreatePipe(&self.out_read, &out_write, nilptr, 0) == 0 then return false end
+  local size: COORD = { X = (@int16)(cols), Y = (@int16)(rows) }
+  if create_pc(size, in_read, out_write, 0, &self.hpc) ~= 0 then
+    CloseHandle(in_read) CloseHandle(out_write)
+    return false
+  end
+  CloseHandle(in_read)
+  CloseHandle(out_write)
+
+  local attr_size: usize = 0
+  InitializeProcThreadAttributeList(nilptr, 1, 0, &attr_size)
+  self.attr_list = HeapAlloc(GetProcessHeap(), 0, attr_size)
+  if self.attr_list == nilptr or InitializeProcThreadAttributeList(self.attr_list, 1, 0, &attr_size) == 0 then return false end
+  if UpdateProcThreadAttribute(self.attr_list, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, self.hpc, #pointer, nilptr, nilptr) == 0 then return false end
+
+  local si: STARTUPINFOEXW
+  si.StartupInfo.cb = #STARTUPINFOEXW
+  si.lpAttributeList = self.attr_list
+  local pi: PROCESS_INFORMATION
+  local cmdline = build_cmdline(argv)
+  local wcmd = to_wide(cmdline)
+  cmdline:destroy()
+  local wcwd: *[0]uint16 = nilptr
+  if #cwd > 0 then wcwd = to_wide(cwd) end
+  local ok = CreateProcessW(nilptr, wcmd, nilptr, nilptr, 0, EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT, nilptr, wcwd, &si, &pi)
+  HeapFree(GetProcessHeap(), 0, wcmd)
+  if wcwd ~= nilptr then HeapFree(GetProcessHeap(), 0, wcwd) end
+  if ok == 0 then return false end
+  self.process = pi.hProcess
+  self.thread = pi.hThread
+  self.alive = true
+  return true
+end
+
+-- Non-blocking read; returns bytes read or 0.
+function ConPty:read(buf: pointer, cap: usize): usize
+  if not self.alive then return 0 end
+  local avail: uint32 = 0
+  if PeekNamedPipe(self.out_read, nilptr, 0, nilptr, &avail, nilptr) == 0 then
+    return 0
+  end
+  if avail == 0 then return 0 end
+  local want: uint32 = avail
+  if (@usize)(want) > cap then want = (@uint32)(cap) end
+  local got: uint32 = 0
+  if ReadFile(self.out_read, buf, want, &got, nilptr) == 0 then return 0 end
+  return got
+end
+
+function ConPty:write(buf: pointer, len: usize): void
+  if not self.alive or len == 0 then return end
+  local written: uint32 = 0
+  WriteFile(self.in_write, buf, (@uint32)(len), &written, nilptr)
+end
+
+function ConPty:resize(cols: uint16, rows: uint16): void
+  if not self.alive then return end
+  local size: COORD = { X = (@int16)(cols), Y = (@int16)(rows) }
+  resize_pc(self.hpc, size)
+end
+
+-- Poll the child; sets exited/exit_code once.
+function ConPty:poll_exit(): boolean
+  if not self.alive or self.exited then return self.exited end
+  if WaitForSingleObject(self.process, 0) == WAIT_OBJECT_0 then
+    local code: uint32 = 0
+    GetExitCodeProcess(self.process, &code)
+    self.exit_code = code
+    self.exited = true
+  end
+  return self.exited
+end
+
+function ConPty:close(): void
+  if not self.alive then return end
+  if not self.exited then TerminateProcess(self.process, 1) end
+  if self.hpc ~= nilptr then close_pc(self.hpc) end
+  if self.attr_list ~= nilptr then
+    DeleteProcThreadAttributeList(self.attr_list)
+    HeapFree(GetProcessHeap(), 0, self.attr_list)
+  end
+  if self.in_write ~= nilptr then CloseHandle(self.in_write) end
+  if self.out_read ~= nilptr then CloseHandle(self.out_read) end
+  if self.thread ~= nilptr then CloseHandle(self.thread) end
+  if self.process ~= nilptr then CloseHandle(self.process) end
+  $self = {}
+end
+
+## else
+
+global function conpty_available(): boolean return false end
+function ConPty:open(argv: *vector(string), cwd: string, cols: uint16, rows: uint16): boolean return false end
+function ConPty:read(buf: pointer, cap: usize): usize return 0 end
+function ConPty:write(buf: pointer, len: usize): void end
+function ConPty:resize(cols: uint16, rows: uint16): void end
+function ConPty:poll_exit(): boolean return true end
+function ConPty:close(): void end
+
+## end
