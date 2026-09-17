@@ -1,0 +1,111 @@
+-- The Create button of a DualSense read straight from its HID input reports,
+-- once per frame on the render thread and never waiting: Dalamud's gamepad
+-- state has no Create button. While no controller is open it looks for one
+-- every DS_RESCAN_S seconds, a few HID devices per frame; a failed read
+-- (unplugged) closes the device and lets go of the button.
+require 'string'
+require 'stringbuilder'
+require 'core.dualsense'
+require 'core.sys.hid'
+
+global DS_RESCAN_S: float64 <comptime> = 3.0
+global DS_SCAN_BUDGET: integer <comptime> = 4      -- HID devices looked at per frame while scanning
+global DS_READS_PER_FRAME: integer <comptime> = 64 -- reports collected per frame at most
+
+global DsLogFn = @function(level: cint, msg: string): void
+
+global DualSenseReader = @record{
+  dev: HidDevice,
+  scan: HidScan,
+  button: DsButtonState,     -- Create
+  scanned: boolean,          -- a scan pass finished (or could not start) at `scanned_at`
+  scanned_at: float64,
+  logged_layout: DsLayout,   -- report layout already logged for this device
+  logged_ignored: boolean,   -- an unreadable report already logged for this device
+  logged_open_error: uint32, -- open error already logged
+  quiet: boolean,            -- the last device failed before a single report: its reopen and failure are not logged again
+}
+
+local function ds_log(logfn: DsLogFn, level: cint, fmt: string, ...: varargs): void
+  if logfn == nilptr then return end
+  local sb: stringbuilder
+  sb:writef(fmt, ...)
+  local s = sb:promote()
+  logfn(level, s)
+  s:destroy()
+end
+
+local function layout_name(l: DsLayout): string
+  if l == DsLayout.Usb then return 'USB' end
+  if l == DsLayout.Bluetooth then return 'Bluetooth' end
+  if l == DsLayout.Simple then return 'Bluetooth simple' end
+  return 'none'
+end
+
+-- Let go of the controller and the button (the option was turned off, shutdown).
+global function dualsense_reader_close(r: *DualSenseReader): void
+  hid_scan_end(&r.scan)
+  hid_close(&r.dev)
+  $r = {}
+end
+
+global function dualsense_reader_poll(r: *DualSenseReader, now: float64, logfn: DsLogFn): void
+  if not hid_is_open(&r.dev) then
+    r.button.down, r.button.pressed = false, false
+    if r.scan.info == nilptr then
+      if r.scanned and now >= r.scanned_at and now - r.scanned_at < DS_RESCAN_S then return end
+      if not hid_scan_begin(&r.scan) then
+        r.scanned, r.scanned_at = true, now
+        return
+      end
+    end
+    local step = hid_scan_step(&r.scan, DS_SCAN_BUDGET, dualsense_is_controller, dualsense_caps_ok, &r.dev)
+    if step == HidStep.Finished then
+      r.scanned, r.scanned_at = true, now
+      return
+    elseif step == HidStep.OpenFailed then
+      if r.dev.last_error ~= r.logged_open_error then
+        r.logged_open_error = r.dev.last_error
+        ds_log(logfn, 2, 'DualSense %04x:%04x found but could not be opened (error %d)', r.dev.vid, r.dev.pid, r.dev.last_error)
+      end
+      return
+    elseif step ~= HidStep.Opened then
+      return
+    end
+    r.button = {}
+    r.logged_layout, r.logged_ignored = DsLayout.None, false
+    if not r.quiet then
+      ds_log(logfn, 1, 'DualSense %04x:%04x opened for the Create button (%d byte reports)', r.dev.vid, r.dev.pid, r.dev.input_len)
+    end
+  end
+  for _ = 1, DS_READS_PER_FRAME do
+    local n = hid_read(&r.dev)
+    if n < 0 then
+      if not r.quiet then
+        ds_log(logfn, 2, 'DualSense %04x:%04x closed: read failed (error %d)', r.dev.vid, r.dev.pid, r.dev.last_error)
+      end
+      r.quiet = r.button.reports == 0 -- reopened every few seconds and failing again: say it once
+      hid_close(&r.dev)
+      r.button.down, r.button.pressed = false, false
+      r.scanned, r.scanned_at = true, now
+      return
+    elseif n == 0 then
+      break
+    end
+    local ignored = r.button.ignored
+    dualsense_feed(&r.button, &r.dev.buf, (@usize)(n), DS_CREATE)
+    if r.button.ignored ~= ignored and not r.logged_ignored then
+      r.logged_ignored = true
+      ds_log(logfn, 2, 'DualSense sent a report this build does not read (id 0x%02x, %d bytes)', r.dev.buf[0], n)
+    elseif r.button.reports > 0 and r.button.layout ~= r.logged_layout then
+      r.quiet = false
+      r.logged_layout = r.button.layout
+      ds_log(logfn, 1, 'DualSense reports: %s (id 0x%02x, %d bytes)', layout_name(r.button.layout), r.dev.buf[0], n)
+    end
+  end
+end
+
+-- Create for this frame (see dualsense_take): false while no controller is open.
+global function dualsense_reader_take(r: *DualSenseReader): boolean
+  return dualsense_take(&r.button)
+end

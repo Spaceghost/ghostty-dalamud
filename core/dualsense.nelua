@@ -1,0 +1,149 @@
+-- DualSense (PS5 controller) input reports, parsed without any I/O so the host
+-- tests drive them byte by byte. core/sys/dualsense_reader.nelua reads the
+-- reports from the controller's HID device.
+--
+-- Byte layouts, from SDL's hidapi PS5 driver (SDL_hidapi_ps5.c), Linux's
+-- hid-playstation driver and Wine's winebus Bluetooth DualSense fixup:
+--
+--   USB, report 0x01, 64 bytes. data[1..] is the controller state; its button
+--     bytes are data[8] (hat, square, cross, circle, triangle), data[9] (L1 0x01,
+--     R1 0x02, L2 0x04, R2 0x08, Create 0x10, Options 0x20, L3 0x40, R3 0x80)
+--     and data[10] (PS 0x01, touchpad click 0x02, mute 0x04).
+--   Bluetooth, report 0x31, 78 bytes. One more byte in front, so the same
+--     buttons are data[9], data[10], data[11]. Bytes 74..77 are a CRC-32
+--     (little endian) over the byte 0xA1 followed by data[0..73].
+--   Bluetooth simple, report 0x01 of 10 bytes: what the controller sends over
+--     Bluetooth until a program enables its full reports, and what Wine's
+--     winebus turns report 0x31 into until a program talks to the controller.
+--     Buttons are data[5], data[6] (Create 0x10, Options 0x20) and data[7]
+--     (PS 0x01, touchpad click 0x02).
+--
+-- Windows and Wine's hidclass hand out every report padded to the longest
+-- input report of the device, so over Bluetooth a simple report arrives as 78
+-- bytes or more, and a USB report as exactly 64.
+
+global DS_VENDOR_SONY: uint16 <comptime> = 0x054C
+global DS_PRODUCT_DUALSENSE: uint16 <comptime> = 0x0CE6
+global DS_PRODUCT_DUALSENSE_EDGE: uint16 <comptime> = 0x0DF2
+
+global DS_USB_REPORT_SIZE: usize <comptime> = 64
+global DS_BT_REPORT_SIZE: usize <comptime> = 78
+global DS_SIMPLE_REPORT_SIZE: usize <comptime> = 10
+global DS_MAX_REPORT_SIZE: usize <comptime> = 1024 -- the longest input report a reader accepts
+
+-- Button bits dualsense_parse reports (ours, not the controller's).
+global DS_CREATE: uint32 <comptime> = 0x01
+global DS_OPTIONS: uint32 <comptime> = 0x02
+global DS_PS: uint32 <comptime> = 0x04
+global DS_TOUCHPAD: uint32 <comptime> = 0x08
+
+global DsLayout = @enum{ None = 0, Usb, Bluetooth, Simple }
+global DsEdge = @enum{ None = 0, Press, Release }
+
+-- A DualSense or DualSense Edge, by USB vendor and product id (the same over Bluetooth).
+global function dualsense_is_controller(vid: uint16, pid: uint16): boolean
+  return vid == DS_VENDOR_SONY and (pid == DS_PRODUCT_DUALSENSE or pid == DS_PRODUCT_DUALSENSE_EDGE)
+end
+
+-- The controller's HID collection: a gamepad (usage page 1, usage 5) whose
+-- reads are as long as a USB report, or long enough for a Bluetooth one.
+global function dualsense_caps_ok(usage_page: uint16, usage: uint16, input_len: uint16): boolean
+  if usage_page ~= 0x01 or usage ~= 0x05 then return false end
+  return input_len == DS_USB_REPORT_SIZE or (input_len >= DS_BT_REPORT_SIZE and input_len <= DS_MAX_REPORT_SIZE)
+end
+
+-- CRC-32 (IEEE 802.3, reflected, as zlib) continued over `n` more bytes; start with 0.
+global function crc32_update(crc: uint32, data: *[0]uint8, n: usize): uint32
+  crc = ~crc
+  for i: usize = 0, < n do
+    crc = crc ~ data[i]
+    for _ = 1, 8 do
+      if (crc & 1) ~= 0 then crc = (crc >> 1) ~ 0xEDB88320 else crc = crc >> 1 end
+    end
+  end
+  return ~crc
+end
+
+-- The CRC a Bluetooth report 0x31 carries in bytes 74..77. `data` holds at least 78 bytes.
+global function dualsense_bt_crc(data: *[0]uint8): uint32
+  local seed: [1]uint8 = { 0xA1 }
+  return crc32_update(crc32_update(0, &seed, 1), data, DS_BT_REPORT_SIZE - 4)
+end
+
+local function bt_crc_ok(data: *[0]uint8): boolean
+  local want = (@uint32)(data[74]) | ((@uint32)(data[75]) << 8) | ((@uint32)(data[76]) << 16) | ((@uint32)(data[77]) << 24)
+  return dualsense_bt_crc(data) == want
+end
+
+-- The buttons of one input report of `n` bytes as DS_* bits in `buttons`, and
+-- which layout it had. Anything else (other report ids, lengths that fit no
+-- layout, a Bluetooth report failing its CRC) is DsLayout.None and leaves
+-- `buttons` untouched.
+global function dualsense_parse(data: *[0]uint8, n: usize, buttons: *uint32): DsLayout
+  if data == nilptr or n == 0 then return DsLayout.None end
+  local layout = DsLayout.None
+  local b1: uint8, b2: uint8 = 0, 0
+  if data[0] == 0x01 then
+    if n == DS_SIMPLE_REPORT_SIZE or n >= DS_BT_REPORT_SIZE then
+      layout, b1, b2 = DsLayout.Simple, data[6], data[7]
+    elseif n >= DS_USB_REPORT_SIZE then
+      layout, b1, b2 = DsLayout.Usb, data[9], data[10]
+    end
+  elseif data[0] == 0x31 and n >= DS_BT_REPORT_SIZE and bt_crc_ok(data) then
+    layout, b1, b2 = DsLayout.Bluetooth, data[10], data[11]
+  end
+  if layout == DsLayout.None then return layout end
+  local b: uint32 = 0
+  if (b1 & 0x10) ~= 0 then b = b | DS_CREATE end
+  if (b1 & 0x20) ~= 0 then b = b | DS_OPTIONS end
+  if (b2 & 0x01) ~= 0 then b = b | DS_PS end
+  if (b2 & 0x02) ~= 0 then b = b | DS_TOUCHPAD end
+  if buttons ~= nilptr then $buttons = b end
+  return layout
+end
+
+-- Whether the `mask` buttons went down or up between the last state and `buttons`.
+global function dualsense_edge(was_down: boolean, buttons: uint32, mask: uint32): DsEdge
+  local down = (buttons & mask) ~= 0
+  if down and not was_down then return DsEdge.Press end
+  if was_down and not down then return DsEdge.Release end
+  return DsEdge.None
+end
+
+-- One button followed across reports (several arrive per frame) and frames.
+global DsButtonState = @record{
+  down: boolean,     -- held in the newest valid report
+  pressed: boolean,  -- went down since the last dualsense_take
+  layout: DsLayout,  -- layout of the newest valid report
+  reports: uint64,   -- valid reports seen
+  ignored: uint64,   -- reports that were not DualSense input reports
+}
+
+-- Feed one report; returns the edge it caused. Reports that do not parse
+-- change nothing, so a stray report never releases a held button.
+global function dualsense_feed(st: *DsButtonState, data: *[0]uint8, n: usize, mask: uint32): DsEdge
+  local buttons: uint32 = 0
+  local layout = dualsense_parse(data, n, &buttons)
+  if layout == DsLayout.None then
+    st.ignored = st.ignored + 1
+    return DsEdge.None
+  end
+  st.layout = layout
+  st.reports = st.reports + 1
+  local e = dualsense_edge(st.down, buttons, mask)
+  if e == DsEdge.Press then
+    st.down = true
+    st.pressed = true
+  elseif e == DsEdge.Release then
+    st.down = false
+  end
+  return e
+end
+
+-- The button for this frame: held, or pressed and released again since the
+-- last call, so a press shorter than a frame still shows for one frame.
+global function dualsense_take(st: *DsButtonState): boolean
+  local down = st.down or st.pressed
+  st.pressed = false
+  return down
+end

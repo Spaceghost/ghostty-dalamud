@@ -16,6 +16,7 @@ rm -rf build/test-scratch && mkdir -p build/test-scratch/surface/config
 run test_ghostty
 run test_render
 run test_session
+run test_dualsense
 run test_selection
 run test_bell "$ROOT"
 run test_policy "$ROOT"
