@@ -1,0 +1,85 @@
+--[[
+crash-restart.exe: answer the Dalamud Crash Handler dialog with
+"Restart normally" + "Restart".
+
+Runs inside the game's Wine prefix (same wineserver). The crash handler shows a
+TaskDialogIndirect titled "Dalamud Crash Handler" with radio 101 "Restart normally"
+and command link 201 "Restart", which starts disabled until a radio is picked.
+Wine's comctl32 task dialog (dlls/comctl32/taskdialog.c, wine-10.8) handles
+TDM_CLICK_RADIO_BUTTON by sending BM_CLICK to the radio BUTTON child (-> WM_COMMAND
+-> TDN_RADIO_BUTTON_CLICKED, which makes Dalamud enable 201), and TDM_CLICK_BUTTON by
+notifying TDN_BUTTON_CLICKED and ending the dialog with that id.
+
+Usage: crash-restart.exe [--timeout SECONDS] [--dry-run]
+Exit: 0 clicked (or found, with --dry-run), 2 no dialog within timeout,
+      3 dialog found but controls 101/201 missing.
+]]
+require 'arg'
+require 'os'
+require 'io'
+
+## cinclude '<windows.h>'
+local HWND = @pointer
+local function FindWindowA(cls: cstring, title: cstring): HWND <cimport, nodecl> end
+local function GetDlgItem(hwnd: HWND, id: cint): HWND <cimport, nodecl> end
+local function IsWindowEnabled(hwnd: HWND): cint <cimport, nodecl> end
+local function IsWindow(hwnd: HWND): cint <cimport, nodecl> end
+local function SendMessageA(hwnd: HWND, msg: cuint, wp: usize, lp: isize): isize <cimport, nodecl> end
+local function Sleep(ms: culong): void <cimport, nodecl> end
+local function GetTickCount(): culong <cimport, nodecl> end
+
+local WM_USER: cuint <comptime> = 0x0400
+local TDM_CLICK_BUTTON: cuint <comptime> = WM_USER + 102
+local TDM_CLICK_RADIO_BUTTON: cuint <comptime> = WM_USER + 110
+local ID_RADIO_RESTART_NORMAL: cint <comptime> = 101
+local ID_BUTTON_RESTART: cint <comptime> = 201
+local TITLE <const> = 'Dalamud Crash Handler'
+
+local function main(): integer
+  local timeout_s: integer = 0
+  local dry_run = false
+  local i = 1
+  while i <= #arg do
+    local a = arg[i]
+    if a == '--timeout' and i < #arg then timeout_s = tointeger(arg[i+1]) i = i + 1
+    elseif a == '--dry-run' then dry_run = true
+    else io.stderr:write('usage: crash-restart.exe [--timeout SECONDS] [--dry-run]\n') return 64 end
+    i = i + 1
+  end
+
+  local deadline: culong = GetTickCount() + (@culong)(timeout_s * 1000)
+  local dlg: HWND = nilptr
+  while true do
+    dlg = FindWindowA(nilptr, TITLE)
+    if dlg ~= nilptr or GetTickCount() >= deadline then break end
+    Sleep(250)
+  end
+  if dlg == nilptr then
+    print('crash-restart: no "Dalamud Crash Handler" window')
+    return 2
+  end
+
+  local radio = GetDlgItem(dlg, ID_RADIO_RESTART_NORMAL)
+  local restart = GetDlgItem(dlg, ID_BUTTON_RESTART)
+  if radio == nilptr or restart == nilptr then
+    print('crash-restart: dialog found but controls 101/201 missing')
+    return 3
+  end
+  if dry_run then
+    print('crash-restart: dialog found (dry run), restart enabled=', IsWindowEnabled(restart) ~= 0)
+    return 0
+  end
+
+  SendMessageA(dlg, TDM_CLICK_RADIO_BUTTON, (@usize)(ID_RADIO_RESTART_NORMAL), 0)
+  -- Dalamud enables 201 from its TDN_RADIO_BUTTON_CLICKED callback; wait briefly for it.
+  local n = 0
+  while IsWindowEnabled(restart) == 0 and n < 20 do Sleep(50) n = n + 1 end
+  if IsWindowEnabled(restart) == 0 then
+    print('crash-restart: warning: Restart still disabled after radio click; clicking anyway')
+  end
+  SendMessageA(dlg, TDM_CLICK_BUTTON, (@usize)(ID_BUTTON_RESTART), 0)
+  print('crash-restart: clicked Restart normally + Restart, dialog still open=', IsWindow(dlg) ~= 0)
+  return 0
+end
+
+os.exit(main())
