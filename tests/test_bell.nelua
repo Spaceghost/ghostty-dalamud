@@ -1,0 +1,322 @@
+-- The visual bell: BEL reaches the session counter (also after sleep/wake),
+-- the ring/shimmer/glow maths, coalescing, replay suppression, the Lua style,
+-- and the rings' triangles through a fake ImGui and a fake game.
+require 'core.session'
+require 'core.bell'
+require 'core.policy'
+require 'core.app.bell'
+require 'string'
+require 'math'
+require 'arg'
+
+local function near(a: float64, b: float64): boolean return math.abs(a - b) < 0.001 end
+
+-- BEL increments the counter; the terminal re-created by wake() keeps the callback.
+do
+  local p: Profile = { name = 'test', transport = 'superlogical' }
+  local s: Session
+  assert(s:init(1, &p, 80, 24, nilptr))
+  local before = s.bells
+  local seq: string = 'ding\a\a'
+  s:feed((@*[0]uint8)(seq.data), seq.size)
+  assert(s.bells == before + 2, 'two BELs counted')
+  local osc: string = '\27]2;title\7' -- BEL terminating an OSC is not a bell
+  s:feed((@*[0]uint8)(osc.data), osc.size)
+  assert(s.bells == before + 2, 'OSC terminator is not a bell')
+
+  local ac: AgentClient
+  s.kind = TransportKind.Agent
+  s.agent = &ac
+  s.sleeping = true
+  s.exited = false
+  s:wake()
+  assert(not s.sleeping)
+  local bel: string = '\a'
+  s:feed((@*[0]uint8)(bel.data), bel.size)
+  assert(s.bells == before + 3, 'bell callback survives sleep/wake')
+  s.kind = TransportKind.None
+  ac.outq:destroy()
+  s:destroy()
+  print('session bell OK')
+end
+
+-- Ring maths: starts small and invisible, spreads with ease-out, gone at the end.
+do
+  local ok, radius, alpha, band = bell_ring_at(0, 0.9, 3)
+  assert(ok and near(radius, 0.3) and near(alpha, 0), 't=0: at the feet, fading in')
+  local ok_m, r_m, a_m, band_m = bell_ring_at(0.45, 0.9, 3)
+  assert(ok_m and r_m > 0.3 + (3 - 0.3) * 0.5 and r_m < 3, 'mid: past halfway (ease-out)')
+  assert(a_m > 0.1 and a_m < 1, 'mid: fading')
+  assert(band_m > band, 'the trailing band widens')
+  local ok_l, r_l, a_l = bell_ring_at(0.89, 0.9, 3)
+  assert(ok_l and r_l > 2.99 and a_l < 0.01, 'near the end: full size, nearly gone')
+  assert(not bell_ring_at(0.9, 0.9, 3), 'end: gone')
+  assert(not bell_ring_at(-0.1, 0.9, 3), 'staggered ring not born yet')
+  local prev: float32 = 0
+  for i = 1, 89 do
+    local _, r = bell_ring_at(i / 100, 0.9, 3)
+    assert(r >= prev, 'radius grows monotonically')
+    prev = r
+  end
+  local sok, rise, salpha = bell_shimmer_at(0.5, 0.9)
+  assert(sok and rise > 0.05 and rise < 1.1 and salpha > 0 and salpha <= 0.5, 'shimmer rises, faint')
+  assert(not bell_shimmer_at(1.08, 0.9), 'shimmer ends')
+  print('ring maths OK')
+end
+
+-- Glow: full at once, decays, gone after the glow duration; the flash stays under it.
+do
+  assert(near(bell_glow_at(0, 1.2), 1), 'glow starts full')
+  local g1, g2 = bell_glow_at(0.3, 1.2), bell_glow_at(0.9, 1.2)
+  assert(g1 < 1 and g2 < g1 and g2 > 0, 'glow decays')
+  assert(bell_glow_at(1.25, 1.2) == 0 and bell_glow_at(-1, 1.2) == 0, 'glow ends')
+  for i = 0, 12 do
+    local t = i / 10
+    assert(bell_flash_at(t, 1.2) <= bell_glow_at(t, 1.2) + 1e-6)
+  end
+  print('glow OK')
+end
+
+-- Coalescing: bells within 0.25 s, or while the shimmer still rises, start
+-- nothing; at most three rings.
+do
+  local st: BellStyle = { from_character = true, rings = 3, max_radius = 3, duration = 0.9, glow_duration = 1.2, r = 1, g = 1, b = 1 }
+  local p: BellPulse
+  assert(p:ring(10.0, &st) == 3, 'first bell: three staggered rings')
+  assert(p.rings[1].born > p.rings[0].born, 'staggered')
+  assert(p:ring(10.1, &st) == 0 and p:ring(10.3, &st) == 0, 'bells 0.1 s apart coalesce')
+  assert(near(p.last, 10.3), 'the latest bell is remembered')
+  assert(p:active(10.3) == 3, 'still three rings')
+  assert(p:ring(10.8, &st) == 0 and near(p.start, 10), 'a bell while the shimmer rises starts nothing')
+  -- a freed slot takes a ring of the next pulse; one still spreading is kept
+  assert(p:ring(11.1, &st) == 2 and p:active(11.1) == 3)
+  assert(p:active(20) == 0, 'everything fades')
+  st.rings = 1
+  local q: BellPulse
+  assert(q:ring(1, &st) == 1, 'ring_count 1')
+  print('coalescing OK')
+end
+
+-- Steady bells 0.3 s apart (Tab at an empty prompt): a calm pulse, never a
+-- strobe; each pulse starts only once the previous shimmer has finished.
+do
+  local st: BellStyle = { from_character = true, rings = 3, max_radius = 3, duration = 0.9, glow_duration = 1.2, r = 1, g = 1, b = 1 }
+  local p: BellPulse
+  local pulses = 0
+  for i = 0, < 20 do
+    local t = 30.0 + i * 0.3
+    local prev = p.start
+    if p:ring(t, &st) > 0 then
+      assert(pulses == 0 or not bell_shimmer_at(t - prev, st.duration), 'the shimmer is never cut short')
+      pulses = pulses + 1
+    end
+    assert(p:active(t) <= BELL_MAX_RINGS)
+  end
+  assert(pulses == 5, 'one pulse per 1.2 s over 6 s')
+  print('steady bells OK')
+end
+
+-- Replay suppression: bells counted while asleep or right after waking are old output.
+do
+  local tr: BellTrack = { id = 1, seen = 0, quiet_until = 0 }
+  assert(not tr:update(0, false, 5), 'no change, no bell')
+  assert(tr:update(1, false, 5), 'a new BEL rings')
+  assert(not tr:update(1, true, 6), 'asleep')
+  assert(not tr:update(4, false, 6.5), 'replay right after waking is quiet')
+  assert(tr:update(5, false, 6 + BELL_QUIET + 0.1), 'later bells ring again')
+  print('replay quiet OK')
+end
+
+-- lua/bell.lua: defaults, then off.
+do
+  local root: string = arg[1]
+  assert(policy_load(root), policy.error)
+  local ok, st = policy_bell_style(1)
+  assert(ok and st.from_character and st.rings == 3, 'defaults')
+  assert(near(st.max_radius, 3) and near(st.duration, 0.9) and near(st.glow_duration, 1.2))
+  assert(near(st.r, 0.55) and near(st.g, 0.82) and near(st.b, 1), 'accent colour')
+  local L = policy.L
+  assert(luaL_loadstring(L, "CONFIG.bell.preset = 'custom' CONFIG.bell.ring_count = 7 CONFIG.bell.accent.r = 1") == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
+  ok, st = policy_bell_style(1)
+  assert(ok and st.rings == 3 and near(st.r, 1), 'custom: ring_count clamped, accent from config')
+  -- /term bell NAME picks a preset; demo steps through them all, then stops
+  local err = policy_bell_command('sonar')
+  assert(#err == 0, 'known preset')
+  ok, st = policy_bell_style(1)
+  assert(ok and st.rings == 1 and near(st.max_radius, 5.5), 'sonar preset')
+  err = policy_bell_command('nope')
+  assert(#err > 0, 'unknown preset explains usage')
+  local shown = 0
+  for i = 1, 10 do
+    local more, label = policy_bell_demo(i)
+    if not more then break end
+    assert(#label > 0)
+    shown = shown + 1
+  end
+  assert(shown == 5, 'demo shows every preset once')
+  err = policy_bell_command('ripple')
+  print('bell presets OK')
+  assert(luaL_loadstring(L, 'CONFIG.bell.enabled = false') == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
+  ok = policy_bell_style(1)
+  assert(not ok, 'disabled: bells ignored')
+  print('bell policy OK')
+end
+
+-- Drawing: camera at the origin looking down -Z (w = -z), 1000x500; the player
+-- stands 6 yalms ahead with its feet 1.5 below the eye.
+local player_z: float32 = -6
+local function fake_camera(cam: *GuCamera): cint
+  $cam = { width = 1000, height = 500 }
+  cam.m[0], cam.m[5], cam.m[11] = 1, 1, -1
+  return 1
+end
+local function fake_object(which: cint, id: uint64, out: *GuObject): cint
+  $out = { x = 0, y = -1.5, z = player_z, found = 1, height = 1.7, hitbox_radius = 0.5 }
+  return 1
+end
+local cam_for_test: GuCamera
+fake_camera(&cam_for_test)
+local viewport: ImGuiViewport
+local function fake_viewport(): *ImGuiViewport return &viewport end
+local function fake_bg(): *ImDrawList return nilptr end
+local function fake_uv(out: *ImVec2): void $out = vec2(0.5, 0.5) end
+local VtxRec = @record{ x: float32, y: float32, a: uint8 }
+local verts: vector(VtxRec)
+local reserved: integer = 0
+local bands: integer = 0 -- bell_band calls that drew something: shimmer + rings
+local function fake_reserve(dl: *ImDrawList, idx: cint, vtx: cint): void
+  assert(idx == vtx and vtx % 6 == 0, 'whole quads')
+  reserved = reserved + vtx
+  bands = bands + 1
+end
+-- summed alpha of the drawn vertices inside a screen rectangle
+local function alpha_in(x0: float32, y0: float32, x1: float32, y1: float32): integer
+  local sum = 0
+  for i = 0, < #verts do
+    local v = verts[i]
+    if v.x > x0 and v.x < x1 and v.y > y0 and v.y < y1 then sum = sum + v.a end
+  end
+  return sum
+end
+local function fake_vtx(dl: *ImDrawList, pos: ImVec2, uv: ImVec2, col: uint32): void
+  verts:push({ x = pos.x, y = pos.y, a = (@uint8)(col >> 24) })
+end
+
+do
+  imgui.GetMainViewport = fake_viewport
+  imgui.GetBackgroundDrawList = fake_bg
+  imgui.GetFontTexUvWhitePixel = fake_uv
+  imgui.DrawListPrimReserve = fake_reserve
+  imgui.DrawListPrimVtx = fake_vtx
+  host.api.get_camera = fake_camera
+  host.api.get_object = fake_object
+  local L = policy.L
+  assert(luaL_loadstring(L, 'CONFIG.bell.enabled = true CONFIG.bell.ring_count = 3') == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
+
+  local p: Profile = { name = 'bell', transport = 'superlogical' }
+  local s: Session
+  assert(s:init(9, &p, 80, 24, nilptr))
+  host.sessions:push(&s)
+  draw_bell(1.0)                      -- first sight of the terminal: quiet while it may be replaying
+  local bel: string = '\a'
+  s:feed((@*[0]uint8)(bel.data), bel.size)
+  draw_bell(3.0)                      -- the bell: rings start
+  verts:clear() reserved = 0 bands = 0
+  draw_bell(3.4)
+  assert(reserved > 0 and reserved == #verts, 'rings drawn as reserved triangles')
+  assert(bands == 4, 'the shimmer and three rings')
+
+  -- right below the character: the far side of each ring (higher on screen)
+  -- is cut out behind the character, the near side passes in front of it
+  local far_max, near_max = 0, 0
+  for i = 0, < #verts do
+    local v = verts[i]
+    if math.abs(v.x - 500) < 3 then
+      if v.y > 290 and v.y < 303 then far_max = math.max(far_max, v.a) end
+      if v.y > 320 then near_max = math.max(near_max, v.a) end
+    end
+  end
+  print('behind the character max alpha', far_max, 'in front', near_max)
+  assert(far_max <= 8, 'light behind the character is hidden')
+  assert(near_max > 76, 'light in front of the character shows')
+  local full = #verts
+
+  -- a world screen between the camera and the character (2 yalms out, 2x1
+  -- yalms, screen 250..750 x 312..438) hides the light behind it; one behind
+  -- everything hides nothing
+  do
+    local region = alpha_in(260, 320, 740, 430)
+    assert(region > 0)
+    local front: WorldPlacement = { x = 0, y = -1, z = -2, yaw = 0, width = 200, height = 100, ppm = 100, opacity = 1 }
+    local bf = world_basis(front)
+    local cover: WorldCover
+    assert(world_cover(&cam_for_test, &bf, 1, &cover))
+    host.world_covers:push(cover)
+    verts:clear() reserved = 0
+    draw_bell(3.4)
+    assert(alpha_in(260, 320, 740, 430) == 0, 'light behind a world screen is hidden')
+    assert(alpha_in(0, 0, 1000, 305) > 0, 'light above it still shows')
+    front.z = -12
+    bf = world_basis(front)
+    host.world_covers:clear()
+    assert(world_cover(&cam_for_test, &bf, 1, &cover))
+    host.world_covers:push(cover)
+    verts:clear() reserved = 0
+    draw_bell(3.4)
+    assert(#verts == full and alpha_in(260, 320, 740, 430) == region, 'a screen behind the light hides nothing')
+    host.world_covers:clear()
+  end
+
+  -- close to the camera the near half of the big rings is behind it: skipped;
+  -- the shimmer, which would rise through the camera, is not drawn at all
+  player_z = -1
+  verts:clear() reserved = 0 bands = 0
+  draw_bell(3.4)
+  assert(#verts > 0 and #verts < full, 'segments behind the camera are skipped')
+  assert(bands == 3, 'no shimmer with the camera at the character')
+  -- first person: the eye inside the character, rings on the ground below only
+  player_z = -0.2
+  verts:clear() reserved = 0 bands = 0
+  draw_bell(3.4)
+  assert(bands <= 3, 'no shimmer in first person')
+  for i = 0, < #verts do
+    assert(verts[i].x > -1e5 and verts[i].x < 1e5 and verts[i].y > -1e5 and verts[i].y < 1e5)
+  end
+  -- all behind the camera: nothing
+  player_z = 5
+  verts:clear() reserved = 0
+  draw_bell(3.4)
+  assert(reserved == 0, 'nothing behind the camera')
+  player_z = -6
+
+  -- the glow on the terminal that rang, and nothing once it decayed
+  host.last_time = 3.4
+  local pl: WorldPlacement = { width = 100, height = 50 }
+  local rects = 0
+  imgui.DrawListAddRectFilled = function(dl: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint): void end
+  bell_panel_glow(nilptr, vec2(0, 0), &pl, 9)
+  assert(pl.backlight > 0.3, 'a ringing world screen lifts its backlight')
+  host.last_time = 10
+  pl.backlight = 0
+  bell_panel_glow(nilptr, vec2(0, 0), &pl, 9)
+  assert(pl.backlight == 0, 'glow gone')
+
+  -- coalescing through the host: a burst of bells starts no new rings
+  s:feed((@*[0]uint8)(bel.data), bel.size)
+  draw_bell(20.0)
+  for i = 1, 5 do
+    s:feed((@*[0]uint8)(bel.data), bel.size)
+    draw_bell(20.0 + i * 0.1)
+  end
+  verts:clear() reserved = 0
+  draw_bell(20.55)
+  local burst = #verts
+  assert(burst > 0 and burst <= full * 2, 'a burst of bells: still one pulse')
+
+  host.sessions:clear()
+  s:destroy()
+  bell_reset()
+  verts:destroy()
+  print('drawing OK')
+end
+print('OK')
