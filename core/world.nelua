@@ -1356,7 +1356,26 @@ global WorldTuning = @record{
   drag_fit_margin: float32,
   drag_fit_min: float32,
   drag_fit_tolerance: float32,
+  -- CONFIG.world.shadows: a board behind each panel that casts its shadow (experimental)
+  shadows: boolean,
+  shadows_model: [256]cchar,     -- game path of the flat model, NUL-terminated ('' = none)
+  shadows_model_width: float32,  -- its size in yalms at scale 1
+  shadows_model_height: float32,
+  shadows_model_origin: float32, -- its origin above its bottom edge, as a share of its height
+  shadows_offset: float32,       -- yalms behind the panel
+  shadows_depth: float32,        -- Z scale
+  shadows_transparency: float32, -- 0 drawn .. 1 gone
 }
+
+global WORLD_SHADOW_MODEL: string <comptime> = 'bgcommon/hou/indoor/general/0766/bgparts/fun_b0_m0766.mdl'
+
+-- `s` into a fixed NUL-terminated buffer; too long for it = empty.
+local function copy_path(dst: *[256]cchar, s: string): void
+  dst[0] = 0
+  if #s >= 256 then return end
+  for i = 0, < #s do dst[i] = (@cchar)(s.data[i]) end
+  dst[#s] = 0
+end
 
 local function push_config_world(L: *lua_State): boolean
   lua_getglobal(L, 'CONFIG')
@@ -1374,7 +1393,10 @@ global function world_read_tuning(L: *lua_State): WorldTuning
     drag = true, drag_wheel_step = 0.35, drag_min_distance = 0.8, drag_max_distance = 40, drag_reach = 80,
     drag_offset = 0.02, drag_probe = 0.15, drag_fit_max = 3, drag_fit_step = 0.1, drag_fit_margin = 0.05,
     drag_fit_min = 0.4, drag_fit_tolerance = 0.05,
+    shadows = false, shadows_model_width = 4, shadows_model_height = 3, shadows_model_origin = 0,
+    shadows_offset = 0.05, shadows_depth = 0.1, shadows_transparency = 0,
   }
+  copy_path(&t.shadows_model, WORLD_SHADOW_MODEL)
   if L == nilptr or not push_config_world(L) then return t end
   local w = lua_gettop(L)
   lua_getfield(L, w, 'present')
@@ -1417,6 +1439,26 @@ global function world_read_tuning(L: *lua_State): WorldTuning
     t.drag_fit_margin = (@float32)(lua_field_number(L, k, 'fit_margin', t.drag_fit_margin))
     t.drag_fit_min = (@float32)(lua_field_number(L, k, 'fit_min', t.drag_fit_min))
     t.drag_fit_tolerance = (@float32)(lua_field_number(L, k, 'fit_tolerance', t.drag_fit_tolerance))
+  end
+  lua_pop(L, 1)
+  lua_getfield(L, w, 'shadows')
+  if lua_type(L, -1) == LUA_TTABLE then
+    local k = lua_gettop(L)
+    t.shadows = lua_field_boolean(L, k, 'enabled', t.shadows)
+    lua_getfield(L, k, 'model')
+    if lua_type(L, -1) == LUA_TSTRING then
+      local len: usize
+      local p = lua_tolstring(L, -1, &len)
+      copy_path(&t.shadows_model, string{ data = (@*[0]byte)(p), size = len })
+    end
+    lua_pop(L, 1)
+    -- a zero or negative size would scale the board by infinity
+    t.shadows_model_width = (@float32)(math.max(lua_field_number(L, k, 'model_width', t.shadows_model_width), 0.01))
+    t.shadows_model_height = (@float32)(math.max(lua_field_number(L, k, 'model_height', t.shadows_model_height), 0.01))
+    t.shadows_model_origin = (@float32)(lua_field_number(L, k, 'model_origin', t.shadows_model_origin))
+    t.shadows_offset = (@float32)(lua_field_number(L, k, 'offset', t.shadows_offset))
+    t.shadows_depth = (@float32)(math.max(lua_field_number(L, k, 'depth', t.shadows_depth), 0.001))
+    t.shadows_transparency = (@float32)(math.clamp(lua_field_number(L, k, 'transparency', t.shadows_transparency), 0, 1))
   end
   lua_pop(L, 3)
   return t

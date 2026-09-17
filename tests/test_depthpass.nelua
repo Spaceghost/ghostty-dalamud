@@ -406,8 +406,36 @@ do
   assert(depthpass_frame_begin(fake_scene_depth, &fr) and depthpass_panel_begin(&dl, &pb, 1), 'the pool is per frame')
 end
 
+-- shadow boards through draw_world: one behind the drawn panel, freed when the
+-- world derezzes and at shutdown (the lifecycle itself is tests/test_occluders)
+local board_live = 0
+local board_x: float32, board_z: float32 = 0, 0
+local function fake_bg_create(path: cstring): pointer board_live = board_live + 1 return (@pointer)(0x7000) end
+local function fake_bg_ready(obj: pointer): cint return 1 end
+local function fake_bg_transform(obj: pointer, x: float32, y: float32, z: float32, qx: float32, qy: float32, qz: float32, qw: float32,
+                                 sx: float32, sy: float32, sz: float32): cint
+  board_x, board_z = x, z
+  return 1
+end
+local function fake_bg_destroy(obj: pointer): cint board_live = board_live - 1 return 1 end
+host.api.bg_create, host.api.bg_ready, host.api.bg_set_transform, host.api.bg_destroy = fake_bg_create, fake_bg_ready, fake_bg_transform, fake_bg_destroy
+assert(luaL_loadstring(policy.L, 'CONFIG.world.shadows.enabled = true') == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+for _ = 1, 40 do frame() end -- the tuning is read twice a second
+do
+  local _, pl = policy_world_place(501, now, false)
+  assert(board_live == 1, 'draw_world makes a board for the panel')
+  assert(math.abs(board_x - pl.x) < 1e-3 and board_z > pl.z and board_z < pl.z + 0.1, 'behind the panel, which faces the camera')
+end
+host.world_visible = false
+for _ = 1, 60 do frame() end
+assert(board_live == 0, 'derezzed world: the board is freed')
+host.world_visible = true
+for _ = 1, 60 do frame() end
+assert(board_live == 1, 'rezzed again: a fresh board')
+
 host.world:clear()
 s:destroy()
 gu_shutdown()
 assert(not depthpass.ready and depthpass.used == 0, 'shutdown resets the depth pass')
+assert(board_live == 0, 'shutdown frees the board')
 print('depthpass OK')

@@ -144,6 +144,24 @@ M.light = {
   shadows = false,                -- the light casts shadows (expensive)
 }
 
+-- Shadows (experimental, off by default): each shown panel gets a thin board
+-- just behind it, a real scene object only you see, with no collision, so the
+-- panel casts a shadow and blocks sunlight like furniture does. It relies on
+-- a game function found by signature, so a game patch can break it; it has
+-- not been tried in game yet. Seen from behind, the depth test likely lets the
+-- board hide the panel.
+M.shadows = {
+  enabled = false,
+  -- a flat model that faces +/-Z; its size in yalms at scale 1 and where its origin sits
+  model = 'bgcommon/hou/indoor/general/0766/bgparts/fun_b0_m0766.mdl',
+  model_width = 4,
+  model_height = 3,
+  model_origin = 0,     -- origin above the bottom edge, as a share of the height (0.5 = centred)
+  offset = 0.05,        -- yalms behind the panel
+  depth = 0.1,          -- thickness scale
+  transparency = 0,     -- 0 fully drawn .. 1 invisible (what dithering does to shadows is unknown)
+}
+
 local function mix(a, b, t) return a + (b - a) * t end
 
 function M.lighting()

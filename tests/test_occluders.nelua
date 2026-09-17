@@ -1,0 +1,296 @@
+-- Shadow boards behind world panels against fake background object callbacks:
+-- where a board goes, created once, placed only after its model loaded, freed
+-- on hide, close, zone change, switching off, a model change, teardown and
+-- shutdown, never freed twice, and silently off with an older GuHostApi.
+require 'core.host'
+require 'string'
+require 'arg'
+require 'math'
+
+local function near(a: float64, b: float64, eps: float64): boolean return math.abs(a - b) < eps end
+
+-- Placement ------------------------------------------------------------------------
+-- q * v * conj(q)
+local function rotate(qx: float64, qy: float64, qz: float64, qw: float64, vx: float64, vy: float64, vz: float64): (float64, float64, float64)
+  local tx, ty, tz = 2 * (qy * vz - qz * vy), 2 * (qz * vx - qx * vz), 2 * (qx * vy - qy * vx)
+  return vx + qw * tx + (qy * tz - qz * ty), vy + qw * ty + (qz * tx - qx * tz), vz + qw * tz + (qx * ty - qy * tx)
+end
+do
+  -- 1800 x 1200 px at 600 px per yalm = 3 x 2 yalms, facing -Z (yaw pi)
+  local pl: WorldPlacement = { x = 5, y = 2, z = 7, yaw = (@float32)(math.pi), width = 1800, height = 1200, ppm = 600 }
+  local p = world_board_pose(&pl, 0.05, 0.1, 4, 3, 0)
+  assert(near(p.sx, 0.75, 1e-5) and near(p.sy, 2 / 3, 1e-5) and near(p.sz, 0.1, 1e-6), 'scale from the panel size')
+  assert(near(p.qx, 0, 1e-6) and near(p.qy, 1, 1e-6) and near(p.qz, 0, 1e-6) and near(p.qw, 0, 1e-6), 'yaw pi: half a turn about Y')
+  -- bottom centre, 0.05 behind the readable side (which faces -Z): toward +Z
+  assert(near(p.x, 5, 1e-5) and near(p.y, 1, 1e-5) and near(p.z, 7.05, 1e-5), 'bottom centre just behind the panel')
+  pl.yaw = 0
+  p = world_board_pose(&pl, 0.05, 0.1, 4, 3, 0)
+  assert(near(p.qw, 1, 1e-6) and near(p.qy, 0, 1e-6) and near(p.z, 6.95, 1e-5), 'yaw 0: identity, behind is -Z')
+  -- model centred on its origin: the board sits at the panel's centre height
+  p = world_board_pose(&pl, 0.05, 0.1, 4, 3, 0.5)
+  assert(near(p.y, 2, 1e-5), 'origin at mid height')
+  -- any yaw and pitch: +Z lands on the panel's front normal, +Y on its up (world_basis)
+  pl.yaw, pl.pitch = 0.7, 0.3
+  p = world_board_pose(&pl, 0.2, 0.1, 4, 3, 0)
+  local b = world_basis(pl)
+  local len = math.sqrt(p.qx * p.qx + p.qy * p.qy + p.qz * p.qz + p.qw * p.qw)
+  assert(near(len, 1, 1e-5), 'unit quaternion')
+  local nx, ny, nz = rotate(p.qx, p.qy, p.qz, p.qw, 0, 0, 1)
+  assert(near(nx, math.sin(0.7) * math.cos(0.3), 1e-5) and near(ny, math.sin(0.3), 1e-5) and near(nz, math.cos(0.7) * math.cos(0.3), 1e-5), 'model front on the panel normal')
+  local ux, uy, uz = rotate(p.qx, p.qy, p.qz, p.qw, 0, 1, 0)
+  local ul = math.sqrt(b.ux * b.ux + b.uy * b.uy + b.uz * b.uz)
+  assert(near(ux, b.ux / ul, 1e-5) and near(uy, b.uy / ul, 1e-5) and near(uz, b.uz / ul, 1e-5), 'model up on the panel up')
+  local rx, _, rz = rotate(p.qx, p.qy, p.qz, p.qw, 1, 0, 0)
+  assert(near(math.abs(rx), math.abs(b.rx), 1e-5) and near(math.abs(rz), math.abs(b.rz), 1e-5), 'model width along the panel width')
+  -- the bottom edge of the panel, pushed back along the normal
+  local cx, cy, cz = world_point(&b, b.hw, b.hh * 2)
+  assert(near(p.x, cx - nx * 0.2, 1e-4) and near(p.y, cy - ny * 0.2, 1e-4) and near(p.z, cz - nz * 0.2, 1e-4), 'tilted: bottom edge minus offset')
+  print('placement OK')
+end
+
+-- Fake shim -------------------------------------------------------------------------
+local MAX <comptime> = 64
+local objs: [MAX]boolean          -- live objects by index (pointer = index * 16)
+local loaded: [MAX]boolean
+local creates, destroys, transforms, transparencies, readies = 0, 0, 0, 0, 0
+local live = 0
+local create_fails = false
+local transform_fails = false
+local load_all = false
+local last_pose: WorldBoardPose
+local last_transparency: float32 = -1
+local last_path: string
+local territory: uint32 = 132
+
+local function index(obj: pointer): integer
+  local i = (@integer)((@usize)(obj) // 16)
+  assert(i >= 1 and i < MAX and (@usize)(obj) % 16 == 0, 'a pointer the fake made')
+  return i
+end
+local function fake_create(path: cstring): pointer
+  if create_fails then return nilptr end
+  creates = creates + 1
+  assert(creates < MAX)
+  last_path:destroy()
+  last_path = string.copy(path)
+  objs[creates], loaded[creates] = true, load_all
+  live = live + 1
+  return (@pointer)((@usize)(creates * 16))
+end
+local function fake_ready(obj: pointer): cint
+  local i = index(obj)
+  assert(objs[i], 'ready asked of a live object')
+  readies = readies + 1
+  return loaded[i] and 1 or 0
+end
+local function fake_transform(obj: pointer, x: float32, y: float32, z: float32, qx: float32, qy: float32, qz: float32, qw: float32,
+                              sx: float32, sy: float32, sz: float32): cint
+  local i = index(obj)
+  assert(objs[i] and loaded[i], 'placed only once loaded')
+  if transform_fails then return 0 end
+  transforms = transforms + 1
+  last_pose = { x = x, y = y, z = z, qx = qx, qy = qy, qz = qz, qw = qw, sx = sx, sy = sy, sz = sz }
+  return 1
+end
+local function fake_transparency(obj: pointer, t: float32): cint
+  assert(objs[index(obj)])
+  transparencies = transparencies + 1
+  last_transparency = t
+  return 1
+end
+local function fake_destroy(obj: pointer): cint
+  local i = index(obj)
+  assert(objs[i], 'never destroyed twice')
+  objs[i] = false
+  destroys = destroys + 1
+  live = live - 1
+  return 1
+end
+local function fake_object(which: cint, id: uint64, out: *GuObject): cint
+  $out = { x = 10, y = 0, z = 20, rotation = 0, entity_id = 7, territory = territory, found = 1 }
+  return 1
+end
+local warns = 0
+local function quiet(level: cint, msg: cstring): void
+  if level >= LOG_WARN then warns = warns + 1 end
+end
+
+local api: GuHostApi = {
+  size = #GuHostApi, log = quiet, get_object = fake_object,
+  bg_create = fake_create, bg_ready = fake_ready, bg_set_transform = fake_transform,
+  bg_set_transparency = fake_transparency, bg_destroy = fake_destroy,
+}
+local dir: string = arg[1]
+assert(gu_init(&api, (@cstring)(dir.data)) == 0)
+
+local function lua(code: cstring): void
+  assert(luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, code)
+end
+local function calls(): integer return creates + destroys + transforms + transparencies + readies end
+
+local s1: Session = { id = 101 }
+local s2: Session = { id = 102 }
+host.world:push(&s1)
+host.world:push(&s2)
+assert(#policy_world_command(101, 'here') == 0)
+assert(#policy_world_command(102, 'orbit 4 1') == 0)
+
+local t = 1.0
+local function frame(shown1: boolean, shown2: boolean): void
+  local tuning = world_read_tuning(policy.L)
+  for i = 0, < #host.world do
+    local id = host.world[i].id
+    local ok, pl = policy_world_place(id, t, false)
+    occluder_panel(id, ok and (id == 101 and shown1 or id == 102 and shown2), &pl, &tuning)
+  end
+  occluders_sync(&tuning)
+  t = t + 1 / 60
+end
+
+-- off by default: nothing is made
+do
+  local d = world_read_tuning(policy.L)
+  assert(not d.shadows and near(d.shadows_transparency, 0, 1e-6) and near(d.shadows_offset, 0.05, 1e-6), 'lua/world.lua defaults')
+  local model = string.copy((@cstring)(&d.shadows_model[0]))
+  assert(model == WORLD_SHADOW_MODEL, 'default model')
+  model:destroy()
+  assert(lua_gettop(policy.L) == 0, 'reading tuning leaves the Lua stack balanced')
+  for _ = 1, 10 do frame(true, true) end
+  assert(calls() == 0, 'shadows off: no calls at all')
+end
+
+-- on: one board per panel, placed only once its model has loaded
+lua('CONFIG.world.shadows.enabled = true')
+for _ = 1, 5 do frame(true, true) end
+assert(creates == 2 and live == 2 and transforms == 0 and transparencies == 0, 'created once each, not placed while loading')
+assert(last_path == WORLD_SHADOW_MODEL, 'made from the configured model')
+loaded[1], loaded[2] = true, true
+frame(true, true)
+assert(transforms == 2 and transparencies == 2 and last_transparency == 0, 'placed and fully drawn once loaded')
+local before_ready = readies
+for _ = 1, 5 do frame(true, true) end
+assert(creates == 2 and readies == before_ready, 'no new boards, no more load checks')
+assert(transparencies == 2, 'transparency sent only when it changes')
+do
+  local tr = world_read_tuning(policy.L)
+  local _, p1 = policy_world_place(101, t, false)
+  local want = world_board_pose(&p1, tr.shadows_offset, tr.shadows_depth, tr.shadows_model_width, tr.shadows_model_height, tr.shadows_model_origin)
+  -- a pinned panel does not move: its transform is not sent again
+  local n = transforms
+  occluder_panel(101, true, &p1, &tr)
+  assert(transforms == n, 'a still panel is not transformed again')
+  -- moving it sends the new pose
+  p1.x = p1.x + 1
+  occluder_panel(101, true, &p1, &tr)
+  assert(transforms == n + 1 and near(last_pose.x, want.x + 1, 1e-4) and near(last_pose.sy, want.sy, 1e-5), 'a moved panel is transformed')
+end
+
+-- transparency comes from Lua
+lua('CONFIG.world.shadows.transparency = 0.5')
+frame(true, true)
+assert(transparencies == 4 and near(last_transparency, 0.5, 1e-6), 'transparency from Lua')
+
+-- hidden: freed; shown again: a fresh board
+frame(true, false)
+assert(destroys == 1 and live == 1, 'hidden panel frees its board')
+load_all = true
+frame(true, true)
+assert(creates == 3 and live == 2, 'shown again: made again')
+
+-- closing a panel frees its board
+host.world:remove(1)
+frame(true, true)
+assert(destroys == 2 and live == 1, 'closed panel frees its board')
+
+-- zone change frees every board, the panel in the new zone makes a fresh one
+territory = 133
+frame(true, true)
+assert(live == 0, 'zone change frees every board')
+assert(#policy_world_command(101, 'me') == 0)
+frame(true, true)
+assert(live == 1 and creates == 4, 'a panel in the new zone makes a fresh board')
+
+-- another model: boards are made again from it
+lua("CONFIG.world.shadows.model = 'bg/other.mdl'")
+frame(true, true)
+assert(live == 0, 'model change frees the boards')
+frame(true, true)
+assert(live == 1 and last_path == 'bg/other.mdl', 'made from the new model')
+
+-- switched off: freed, and nothing is called afterwards
+lua('CONFIG.world.shadows.enabled = false')
+frame(true, true)
+assert(live == 0, 'switched off in Lua frees the board')
+local n = calls()
+for _ = 1, 5 do frame(true, true) end
+assert(calls() == n, 'no calls while shadows are off')
+lua('CONFIG.world.shadows.enabled = true')
+frame(true, true)
+assert(live == 1, 'back on')
+
+-- a failing create waits before trying again and warns once
+occluders_destroy_all()
+create_fails, warns = true, 0
+local c0 = creates
+for _ = 1, 50 do frame(true, true) end
+assert(live == 0 and creates == c0 and warns == 1, 'failed create: one warning')
+create_fails = false
+for _ = 1, 50 do frame(true, true) end
+assert(live == 0, 'no retry within the wait')
+for _ = 1, 300 do frame(true, true) end
+assert(live == 1, 'retried after the wait')
+
+-- a model that never loads is given up on
+occluders_destroy_all()
+load_all, warns = false, 0
+for _ = 1, 700 do frame(true, true) end
+assert(live == 0 and warns == 1, 'a model that never loads is freed with one warning')
+load_all = true
+
+-- a failed transform frees the board
+occluders_destroy_all()
+transform_fails = true
+frame(true, true)
+assert(live == 0 and creates > 0, 'failed transform frees the board')
+transform_fails = false
+occluders_destroy_all()
+frame(true, true)
+assert(live == 1)
+
+-- teardown (reload, kill switch) frees it; a second teardown frees nothing again
+teardown_effects()
+assert(live == 0, 'teardown frees every board')
+local d0 = destroys
+teardown_effects()
+occluders_destroy_all()
+assert(destroys == d0, 'no double destroy')
+
+-- shutdown frees what is left
+frame(true, true)
+assert(live == 1)
+host.world:clear()
+gu_shutdown()
+assert(live == 0, 'shutdown frees every board')
+print('lifecycle OK')
+
+-- An older shim: GuHostApi ends before bg_create, so the core never sees the
+-- callbacks that happen to follow in memory and the feature stays off.
+do
+  local old: GuHostApi = api
+  old.size = (@usize)((@usize)(&old.bg_create) - (@usize)(&old))
+  assert(old.size < #GuHostApi)
+  assert(gu_init(&old, (@cstring)(dir.data)) == 0)
+  assert(host.api.bg_create == nilptr and host.api.bg_destroy == nilptr, 'the core copied only the old fields')
+  lua('CONFIG.world.shadows.enabled = true')
+  host.world:push(&s1)
+  assert(#policy_world_command(101, 'here') == 0)
+  local n0 = calls()
+  for _ = 1, 20 do frame(true, true) end
+  assert(calls() == n0, 'older GuHostApi: shadows silently off')
+  host.world:clear()
+  gu_shutdown()
+  assert(calls() == n0 and live == 0)
+  print('older api OK')
+end
+last_path:destroy()
+print('occluders OK')
