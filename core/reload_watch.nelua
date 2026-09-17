@@ -1,0 +1,40 @@
+-- When ghostty_loader should swap in a rewritten core: the file is checked at
+-- most once per second, and a new write time must hold still for half a
+-- second before it counts, so a copy still in progress is never loaded.
+-- Pure bookkeeping; the caller supplies the clock and the file's write time.
+
+global RELOAD_POLL_SECONDS: float64 <comptime> = 1.0
+global RELOAD_SETTLE_SECONDS: float64 <comptime> = 0.5
+
+global ReloadWatch = @record{
+  stamp: uint64,        -- write time of the file the current core was loaded from
+  seen: uint64,         -- newest write time observed
+  seen_at: float64,     -- when `seen` was first observed
+  checked_at: float64,  -- last poll
+  polled: boolean,      -- checked_at is valid
+}
+
+-- A core was loaded (or failed to load) from a file with write time `stamp`;
+-- nothing happens again until the file changes.
+function ReloadWatch:loaded(stamp: uint64, now: float64): void
+  self.stamp, self.seen, self.seen_at = stamp, stamp, now
+  self.checked_at, self.polled = now, true
+end
+
+-- True when the file is due for a look (at most once per second).
+function ReloadWatch:due(now: float64): boolean
+  if self.polled and now - self.checked_at < RELOAD_POLL_SECONDS and now >= self.checked_at then return false end
+  self.checked_at, self.polled = now, true
+  return true
+end
+
+-- Record the write time just read (0 = file missing or unreadable). True once
+-- a changed write time has been stable for RELOAD_SETTLE_SECONDS.
+function ReloadWatch:observe(stamp: uint64, now: float64): boolean
+  if stamp == 0 then return false end
+  if stamp ~= self.seen then
+    self.seen, self.seen_at = stamp, now
+    return false
+  end
+  return stamp ~= self.stamp and now - self.seen_at >= RELOAD_SETTLE_SECONDS
+end

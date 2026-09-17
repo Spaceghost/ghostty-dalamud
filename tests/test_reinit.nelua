@@ -1,0 +1,86 @@
+-- Start, run, shut down and start the core again in one process, the way
+-- ghostty_loader swaps core copies: each shutdown destroys its game lights,
+-- lets go of the head, closes the Lua state and frees what it allocated (the
+-- heap in use comes back to the same size every cycle), and the next start
+-- works like the first.
+require 'core.host'
+require 'string'
+require 'arg'
+
+## if pragmas.glibc_heap then
+local mallinfo2_t <cimport 'struct mallinfo2', cinclude '<malloc.h>', nodecl> = @record{
+  arena: usize, ordblks: usize, smblks: usize, hblks: usize, hblkhd: usize,
+  usmblks: usize, fsmblks: usize, uordblks: usize, fordblks: usize, keepcost: usize,
+}
+local function mallinfo2(): mallinfo2_t <cimport, cinclude '<malloc.h>', nodecl> end
+local function heap_in_use(): usize
+  local mi = mallinfo2()
+  return mi.uordblks + mi.hblkhd
+end
+## end
+
+local live_lights = 0
+local look_releases = 0
+local function fake_create(shape: cint): pointer live_lights = live_lights + 1 return (@pointer)(16) end
+local function fake_update(light: pointer, x: float32, y: float32, z: float32, r: float32, g: float32, b: float32,
+                           intensity: float32, range: float32, visible: cint): cint return 1 end
+local function fake_destroy(light: pointer): cint live_lights = live_lights - 1 return 1 end
+local function fake_object(which: cint, id: uint64, out: *GuObject): cint
+  $out = { x = 10, y = 0, z = 20, entity_id = 7, territory = 132, found = 1 }
+  return 1
+end
+local function fake_look_at(active: cint, x: float32, y: float32, z: float32): cint
+  if active == 0 then look_releases = look_releases + 1 end
+  return 1
+end
+local function quiet(level: cint, msg: cstring): void end
+
+local api: GuHostApi = {
+  size = #GuHostApi, log = quiet, get_object = fake_object, set_look_at = fake_look_at,
+  light_create = fake_create, light_update = fake_update, light_destroy = fake_destroy,
+}
+local dir: string = arg[1]
+
+local function cycle(n: integer): void
+  assert(gu_init(&api, (@cstring)(dir.data)) == 0, 'init')
+  assert(host.initialized and policy.loaded and policy.L ~= nilptr, 'started with a Lua state')
+  gu_frame() -- no ImGui in this process: returns before drawing
+  assert(gu_command('new') == 0 and #host.sessions == 1, 'a terminal')
+  local buf: [64]cchar
+  assert(gu_status(&buf, 64) > 0, 'status')
+
+  -- a world panel with a game light, a head turned toward it, diagnostics
+  local panel: Session = { id = 900 }
+  host.world:push(&panel)
+  local err = policy_world_command(900, 'here')
+  assert(#err == 0, 'placed')
+  err:destroy()
+  local ok, pl = policy_world_place(900, 1.0, false)
+  light_panel(900, ok, &pl, 1)
+  assert(live_lights == 1, 'panel light created')
+  world_diag('reinit test')
+  host.look_at_on = true
+  host.world:clear()
+
+  gu_shutdown()
+  assert(not host.initialized, 'stopped')
+  assert(policy.L == nilptr and #policy.profiles == 0, 'Lua state closed, profiles freed')
+  assert(live_lights == 0, 'shutdown destroys game lights')
+  assert(look_releases == n, 'shutdown lets go of the head')
+  assert(#host.sessions == 0 and #host.status == 0, 'host state cleared')
+end
+
+local CYCLES <comptime> = 8
+## if pragmas.glibc_heap then
+local warm: usize = 0
+## end
+for n = 1, CYCLES do
+  cycle(n)
+  ## if pragmas.glibc_heap then
+    local used = heap_in_use()
+    print('cycle', n, 'heap in use', used)
+    if n == 2 then warm = used end
+    if n > 2 then assert(used == warm, 'heap in use changes across init/shutdown cycles: a leak') end
+  ## end
+end
+print('reinit OK')

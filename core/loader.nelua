@@ -1,0 +1,622 @@
+-- ghostty_loader.dll: the native module the GhosttyDalamud shim loads. It
+-- exports the same gu_* functions as ghostty_core.dll (core/host.nelua) and
+-- forwards each call to a private copy of that core,
+-- ghostty_core.live-<n>.dll, next to this file. When ghostty_core.dll changes
+-- on disk, or on `/term reload-core`, the copy is shut down, freed and
+-- replaced by a fresh one started with the same arguments. Core and Lua
+-- updates then never rewrite the managed plugin assembly, so Dalamud never
+-- hot-reloads managed code (each managed reload leaks memory the game never
+-- gets back).
+require 'string'
+require 'stringbuilder'
+require 'os'
+require 'io'
+require 'core.reload_watch'
+
+local LOG_INFO: cint <comptime> = 1
+local LOG_WARN: cint <comptime> = 2
+local LOG_ERROR: cint <comptime> = 3
+local CORE_FILE <comptime> = 'ghostty_core.dll'
+local LIVE_PROBE <comptime> = 64      -- live copies checked for leftovers at least up to this number
+local IDLE_WAIT_MS <comptime> = 2000  -- how long an unload waits for calls on other threads
+-- gu_init_ex / gu_init results (core/app/boot.nelua): only BAD_ARGS is a
+-- failure; BUSY and LEGACY mean the core retries activation by itself.
+local INIT_BAD_ARGS: cint <comptime> = 1
+local GU_EVENT_CHAT: cint <comptime> = 1 -- GuEventKind.Chat
+local INIT_EX <comptime> = 1          -- the shim called gu_init_ex
+local INIT_PLAIN <comptime> = 2       -- gu_init (tests, plain embedding)
+
+-- The head of GuHostApi (core/app/state.nelua): the loader only logs through
+-- it, and hands the shim's whole struct to every core it loads.
+local LoaderApi = @record{
+  size: usize,
+  log: function(level: cint, msg: cstring): void,
+}
+
+-- GuInitInfo (core/app/boot.nelua); fields past `size` are never read.
+local InitInfo = @record{
+  size: usize,
+  host_kind: cint,
+  install_dir: cstring,
+  config_dir: cstring,
+  configs_root: cstring,
+}
+
+-- The core's exports; nilptr where a core lacks one (that call is a no-op).
+local CoreFns = @record{
+  init_ex: function(api: pointer, info: *InitInfo): cint,
+  init: function(api: pointer, plugin_dir: cstring): cint,
+  event: function(kind: cint, a: cint, b: cint, x: float32, y: float32, text: cstring): void,
+  frame: function(): void,
+  popup_draw: function(dl: pointer, x1: float32, y1: float32, x2: float32, y2: float32, flags: cint): void,
+  popup_reset: function(): void,
+  popup_size: function(w: *cint, h: *cint): void,
+  toggle: function(): void,
+  command: function(text: cstring): cint,
+  status: function(buf: *[0]cchar, cap: usize): usize,
+  shutdown: function(): void,
+  version: function(): cstring,
+  walk_input: function(left: *float32, forward: *float32, allowed: cint, legacy: cint): void,
+}
+## local core_exports = {
+##   {'init_ex', 'gu_init_ex'}, {'init', 'gu_init'}, {'event', 'gu_event'}, {'frame', 'gu_frame'},
+##   {'popup_draw', 'gu_popup_draw'}, {'popup_reset', 'gu_popup_reset'}, {'popup_size', 'gu_popup_size'},
+##   {'toggle', 'gu_toggle'}, {'command', 'gu_command'}, {'status', 'gu_status'},
+##   {'shutdown', 'gu_shutdown'}, {'version', 'gu_version'}, {'walk_input', 'gu_walk_input'},
+## }
+
+local Loader = @record{
+  started: boolean,
+  api: *LoaderApi,      -- owned by the shim, alive until it unloads this module
+  -- the init call replayed for every core copy, strings copied
+  init_kind: integer,
+  info_size: usize,
+  host_kind: cint,
+  install_dir: string, has_install_dir: boolean, -- gu_init's plugin_dir too
+  config_dir: string, has_config_dir: boolean,
+  configs_root: string, has_configs_root: boolean,
+  dir: string,          -- directory of this module, with its trailing separator
+  core_path: string,    -- <dir>ghostty_core.dll
+  live_path: string,    -- the copy in use ('' = none)
+  next_live: integer,
+  lib: pointer,
+  fns: CoreFns,
+  watch: ReloadWatch,
+}
+
+local loader: Loader
+local ready: clong = 0            -- 1 while calls may enter the core
+local busy: clong = 0             -- calls currently inside the core
+local reload_requested: clong = 0 -- `/term reload-core` arrived (any thread); gu_frame swaps
+
+-- Platform -------------------------------------------------------------------
+## if ccinfo.is_windows then
+## cinclude '<windows.h>'
+local FILETIME <cimport, nodecl> = @record{ dwLowDateTime: uint32, dwHighDateTime: uint32 }
+local WIN32_FILE_ATTRIBUTE_DATA <cimport, nodecl> = @record{
+  dwFileAttributes: uint32,
+  ftCreationTime: FILETIME, ftLastAccessTime: FILETIME, ftLastWriteTime: FILETIME,
+  nFileSizeHigh: uint32, nFileSizeLow: uint32,
+}
+local function LoadLibraryA(path: cstring): pointer <cimport, nodecl> end
+local function FreeLibrary(lib: pointer): cint <cimport, nodecl> end
+local function GetProcAddress(lib: pointer, name: cstring): pointer <cimport, nodecl> end
+local function GetModuleHandleExA(flags: uint32, addr: pointer, out: pointer): cint <cimport, nodecl> end
+local function GetModuleFileNameA(mod: pointer, buf: pointer, cap: uint32): uint32 <cimport, nodecl> end
+local function GetFileAttributesExA(path: cstring, level: cint, info: pointer): cint <cimport, nodecl> end
+local function CopyFileA(src: cstring, dst: cstring, fail_if_exists: cint): cint <cimport, nodecl> end
+local function DeleteFileA(path: cstring): cint <cimport, nodecl> end
+local function GetLastError(): uint32 <cimport, nodecl> end
+local function Sleep(ms: uint32): void <cimport, nodecl> end
+local function InterlockedIncrement(v: pointer): clong <cimport, nodecl> end
+local function InterlockedDecrement(v: pointer): clong <cimport, nodecl> end
+local function InterlockedExchange(v: pointer, x: clong): clong <cimport, nodecl> end
+local GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: uint32 <comptime> = 4
+local GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT: uint32 <comptime> = 2
+## else
+local Dl_info <cimport, cinclude '<dlfcn.h>', nodecl> = @record{
+  dli_fname: cstring, dli_fbase: pointer, dli_sname: cstring, dli_saddr: pointer,
+}
+local function dlopen(path: cstring, flags: cint): pointer <cimport, cinclude '<dlfcn.h>', nodecl> end
+local function dlsym(lib: pointer, name: cstring): pointer <cimport, cinclude '<dlfcn.h>', nodecl> end
+local function dlclose(lib: pointer): cint <cimport, cinclude '<dlfcn.h>', nodecl> end
+local function dlerror(): cstring <cimport, cinclude '<dlfcn.h>', nodecl> end
+local function dladdr(addr: pointer, info: *Dl_info): cint <cimport, cinclude '<dlfcn.h>', nodecl> end
+local RTLD_NOW: cint <cimport, cinclude '<dlfcn.h>', nodecl, const>
+local timespec_t <cimport 'struct timespec', cinclude '<time.h>', nodecl> = @record{ tv_sec: clong, tv_nsec: clong }
+local stat_t <cimport 'struct stat', cinclude '<sys/stat.h>', nodecl> = @record{ st_mtim: timespec_t }
+local function stat(path: cstring, st: *stat_t): cint <cimport, cinclude '<sys/stat.h>', nodecl> end
+## end
+
+local function lib_open(path: string): pointer
+  ## if ccinfo.is_windows then
+    return LoadLibraryA((@cstring)(path.data))
+  ## else
+    return dlopen((@cstring)(path.data), RTLD_NOW)
+  ## end
+end
+
+local function lib_sym(lib: pointer, name: cstring): pointer
+  ## if ccinfo.is_windows then
+    return GetProcAddress(lib, name)
+  ## else
+    return dlsym(lib, name)
+  ## end
+end
+
+local function lib_close(lib: pointer): void
+  ## if ccinfo.is_windows then
+    FreeLibrary(lib)
+  ## else
+    dlclose(lib)
+  ## end
+end
+
+local function last_error(): string
+  local sb: stringbuilder
+  ## if ccinfo.is_windows then
+    sb:writef('error %d', GetLastError())
+  ## else
+    local e = dlerror()
+    if e ~= nilptr then sb:write(e) else sb:write('unknown error') end
+  ## end
+  return sb:promote()
+end
+
+-- Last write time of a file; 0 when it is missing.
+local function file_stamp(path: string): uint64
+  ## if ccinfo.is_windows then
+    local data: WIN32_FILE_ATTRIBUTE_DATA
+    if GetFileAttributesExA((@cstring)(path.data), 0, &data) == 0 then return 0 end
+    local t = ((@uint64)(data.ftLastWriteTime.dwHighDateTime) << 32) | data.ftLastWriteTime.dwLowDateTime
+  ## else
+    local st: stat_t
+    if stat((@cstring)(path.data), &st) ~= 0 then return 0 end
+    local t = (@uint64)(st.st_mtim.tv_sec) * 1000000000 + (@uint64)(st.st_mtim.tv_nsec)
+  ## end
+  if t == 0 then t = 1 end
+  return t
+end
+
+local function file_copy(src: string, dst: string): boolean
+  ## if ccinfo.is_windows then
+    return CopyFileA((@cstring)(src.data), (@cstring)(dst.data), 0) ~= 0
+  ## else
+    local fin = io.open(src, 'rb')
+    if not fin:isopen() then return false end
+    local content = fin:read('a')
+    fin:destroy()
+    local fout = io.open(dst, 'wb')
+    local ok = fout:isopen() and fout:write(content)
+    fout:destroy() -- close() alone keeps the stream record allocated (no GC)
+    content:destroy()
+    return ok
+  ## end
+end
+
+local function file_delete(path: string): boolean
+  ## if ccinfo.is_windows then
+    return DeleteFileA((@cstring)(path.data)) ~= 0
+  ## else
+    local ok = os.remove(path)
+    return ok
+  ## end
+end
+
+-- Directory of this module, with its trailing separator ('' if unknown).
+local function module_dir(): string
+  local path: string
+  ## if ccinfo.is_windows then
+    local mod: pointer = nilptr
+    local flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT
+    local buf: [1024]byte
+    if GetModuleHandleExA(flags, (@pointer)(&loader), (@pointer)(&mod)) == 0 then return path end
+    local n = GetModuleFileNameA(mod, &buf, 1024)
+    if n == 0 or n >= 1024 then return path end
+    path = string{data=(@*[0]byte)(&buf), size=n}
+  ## else
+    local info: Dl_info
+    if dladdr((@pointer)(&loader), &info) == 0 or info.dli_fname == nilptr then return path end
+    path = info.dli_fname
+  ## end
+  local cut: usize = 0
+  for i: usize = 0, < path.size do
+    if path.data[i] == 92 or path.data[i] == 47 then cut = i + 1 end -- '\' or '/'
+  end
+  return string.copy(string{data=path.data, size=cut})
+end
+
+-- Calls arrive from several threads (the draw loop, the framework tick
+-- posting chat commands, the walk-input hook). A call marks itself busy before
+-- it looks at `ready`; an unload clears `ready`, then waits for busy calls to
+-- leave before it frees the module.
+local function set_flag(flag: *clong, v: clong): clong
+  ## if ccinfo.is_windows then
+    return InterlockedExchange(flag, v)
+  ## else
+    local old = $flag
+    $flag = v
+    return old
+  ## end
+end
+
+local function enter(): boolean
+  ## if ccinfo.is_windows then
+    InterlockedIncrement(&busy)
+    if ready ~= 0 then return true end
+    InterlockedDecrement(&busy)
+  ## else
+    busy = busy + 1
+    if ready ~= 0 then return true end
+    busy = busy - 1
+  ## end
+  return false
+end
+
+local function leave(): void
+  ## if ccinfo.is_windows then
+    InterlockedDecrement(&busy)
+  ## else
+    busy = busy - 1
+  ## end
+end
+
+local function wait_idle(): boolean
+  ## if ccinfo.is_windows then
+    for i = 1, IDLE_WAIT_MS do
+      if busy == 0 then return true end
+      Sleep(1)
+    end
+  ## end
+  return busy == 0
+end
+
+-- Logging ----------------------------------------------------------------------
+local function log(level: cint, msg: string): void
+  local api = loader.api
+  if api == nilptr or api.size < #LoaderApi or api.log == nilptr then return end
+  local sb: stringbuilder
+  sb:write('loader: ', msg, '\0')
+  local z = sb:promote()
+  api.log(level, (@cstring)(z.data))
+  z:destroy()
+end
+
+local function logf(level: cint, fmt: string, ...: varargs): void
+  local sb: stringbuilder
+  sb:writef(fmt, ...)
+  local s = sb:promote()
+  log(level, s)
+  s:destroy()
+end
+
+-- Swapping the core ---------------------------------------------------------------
+local function live_name(n: integer): string
+  local sb: stringbuilder
+  sb:writef('%sghostty_core.live-%d.dll', loader.dir, n)
+  return sb:promote()
+end
+
+-- A saved argument as a C string: nilptr when the shim passed none, '' for an
+-- empty one (an empty Nelua string has no data at all).
+local function arg_cstr(s: string, present: boolean): cstring
+  if not present then return nilptr end
+  if s.size == 0 then return '' end
+  return (@cstring)(s.data)
+end
+
+-- Delete live copies left by earlier swaps or an earlier game session. A copy
+-- that is still mapped (a second game client, a module that did not unload)
+-- cannot be deleted and stays; new copies skip its number.
+local function delete_old_copies(): void
+  local upto = loader.next_live
+  if upto < LIVE_PROBE then upto = LIVE_PROBE end
+  for n = 1, upto do
+    local p = live_name(n)
+    if p ~= loader.live_path and file_stamp(p) ~= 0 then file_delete(p) end
+    p:destroy()
+  end
+end
+
+local function forget_core(): void
+  loader.lib = nilptr
+  loader.fns = {}
+  loader.live_path:destroy()
+end
+
+local function unload_core(why: string): boolean
+  if loader.lib == nilptr then return true end
+  set_flag(&ready, 0)
+  if not wait_idle() then
+    logf(LOG_ERROR, 'core busy on another thread for %d ms; keeping it (%s)', IDLE_WAIT_MS, why)
+    set_flag(&ready, 1)
+    return false
+  end
+  if loader.fns.shutdown ~= nilptr then loader.fns.shutdown() end
+  lib_close(loader.lib)
+  file_delete(loader.live_path) -- fails while the file is still mapped; a later swap retries
+  logf(LOG_INFO, 'unloaded %s (%s)', loader.live_path, why)
+  forget_core()
+  return true
+end
+
+-- Replay the shim's init call; false when the core lacks that entry point.
+local function core_init(fns: *CoreFns): (boolean, cint)
+  if loader.init_kind == INIT_EX then
+    if fns.init_ex == nilptr then return false, 0 end
+    local info: InitInfo = {
+      size = loader.info_size, host_kind = loader.host_kind,
+      install_dir = arg_cstr(loader.install_dir, loader.has_install_dir),
+      config_dir = arg_cstr(loader.config_dir, loader.has_config_dir),
+      configs_root = arg_cstr(loader.configs_root, loader.has_configs_root),
+    }
+    return true, fns.init_ex(loader.api, &info)
+  end
+  if fns.init == nilptr then return false, 0 end
+  return true, fns.init(loader.api, arg_cstr(loader.install_dir, loader.has_install_dir))
+end
+
+-- Copy ghostty_core.dll to a fresh name, load and start it. On any failure the
+-- loader runs with no core until the file changes or `reload-core` is sent.
+local function load_core(why: string): boolean
+  local stamp = file_stamp(loader.core_path)
+  loader.watch:loaded(stamp, os.now())
+  if stamp == 0 then
+    logf(LOG_ERROR, '%s not found; running without a core until it appears', loader.core_path)
+    return false
+  end
+  delete_old_copies()
+  -- never reuse a name: Windows hands back a module it still has mapped for a known path
+  local live: string
+  repeat
+    loader.next_live = loader.next_live + 1
+    live:destroy()
+    live = live_name(loader.next_live)
+  until file_stamp(live) == 0
+  if not file_copy(loader.core_path, live) then
+    local err = last_error()
+    logf(LOG_ERROR, 'copying %s to %s failed: %s', loader.core_path, live, err)
+    err:destroy()
+    file_delete(live)
+    live:destroy()
+    return false
+  end
+  local lib = lib_open(live)
+  if lib == nilptr then
+    local err = last_error()
+    logf(LOG_ERROR, 'loading %s failed: %s', live, err)
+    err:destroy()
+    file_delete(live)
+    live:destroy()
+    return false
+  end
+  local fns: CoreFns
+  ## for _, e in ipairs(core_exports) do
+    fns.#|e[1]|# = (@#[CoreFns.value.fields[e[1]].type]#)(lib_sym(lib, #[e[2]]#))
+  ## end
+  loader.lib, loader.fns, loader.live_path = lib, fns, live
+  local has_init, rc = core_init(&fns)
+  if not has_init or rc == INIT_BAD_ARGS then
+    if has_init then
+      logf(LOG_ERROR, 'starting %s failed (init returned %d); unloading it', live, rc)
+      if fns.shutdown ~= nilptr then fns.shutdown() end
+    else
+      logf(LOG_ERROR, '%s has no %s; unloading it', live, loader.init_kind == INIT_EX and 'gu_init_ex' or 'gu_init')
+    end
+    lib_close(lib)
+    file_delete(loader.live_path)
+    forget_core()
+    return false
+  end
+  ## for _, e in ipairs(core_exports) do
+    ## if e[1] ~= 'init' and e[1] ~= 'init_ex' then
+    if fns.#|e[1]|# == nilptr then logf(LOG_WARN, '%s has no %s; calls to it do nothing', live, #[e[2]]#) end
+    ## end
+  ## end
+  local version: cstring = 'a core without gu_version'
+  if fns.version ~= nilptr then version = fns.version() end
+  logf(LOG_INFO, 'loaded %s from %s (%s; init returned %d)', version, live, why, rc)
+  set_flag(&ready, 1)
+  return true
+end
+
+local function swap_core(why: string): boolean
+  if not unload_core(why) then return false end
+  return load_core(why)
+end
+
+-- `reload-core`, allowing surrounding spaces
+local function is_reload_core(text: cstring): boolean
+  if text == nilptr then return false end
+  local s: string = text
+  local i, j = 1, #s
+  while i <= j and s:byte(i) == 32 do i = i + 1 end
+  while j >= i and s:byte(j) == 32 do j = j - 1 end
+  return s:subview(i, j) == 'reload-core'
+end
+
+local function start(api: pointer): void
+  loader.api = (@*LoaderApi)(api)
+  loader.dir = module_dir()
+  loader.core_path = loader.dir .. CORE_FILE
+  loader.started = true
+  logf(LOG_INFO, 'watching %s', loader.core_path)
+  load_core('startup')
+end
+
+-- Exports: the gu_* surface of core/host.nelua ------------------------------------------
+
+global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
+  if not loader.started then return end
+  unload_core('shutdown')
+  log(LOG_INFO, 'stopped')
+  loader.install_dir:destroy()
+  loader.config_dir:destroy()
+  loader.configs_root:destroy()
+  loader.dir:destroy()
+  loader.core_path:destroy()
+  loader.live_path:destroy()
+  loader = {}
+  set_flag(&reload_requested, 0)
+end
+
+-- Saves `api` (the shim keeps it alive until it unloads this module) and a
+-- copy of `info` with its strings, then starts the core. Returns the core's
+-- result, or 0 when there is no core: the loader keeps watching for one.
+global function gu_init_ex(api: pointer, info: *InitInfo): cint <cexport, codename 'gu_init_ex'>
+  if loader.started then gu_shutdown() end
+  if api == nilptr or info == nilptr then return INIT_BAD_ARGS end
+  local inf: InitInfo
+  local n = info.size
+  if n > #InitInfo then n = #InitInfo end
+  local dst, src = (@*[0]uint8)(&inf), (@*[0]uint8)(info)
+  for i: usize = 0, < n do dst[i] = src[i] end
+  loader.init_kind, loader.info_size, loader.host_kind = INIT_EX, n, inf.host_kind
+  if inf.install_dir ~= nilptr then loader.install_dir, loader.has_install_dir = string.copy(inf.install_dir), true end
+  if inf.config_dir ~= nilptr then loader.config_dir, loader.has_config_dir = string.copy(inf.config_dir), true end
+  if inf.configs_root ~= nilptr then loader.configs_root, loader.has_configs_root = string.copy(inf.configs_root), true end
+  start(api)
+  return 0
+end
+
+-- The single-directory start (tests, plain embedding), replayed the same way.
+global function gu_init(api: pointer, plugin_dir: cstring): cint <cexport, codename 'gu_init'>
+  if loader.started then gu_shutdown() end
+  if api == nilptr then return INIT_BAD_ARGS end
+  loader.init_kind = INIT_PLAIN
+  if plugin_dir ~= nilptr then loader.install_dir, loader.has_install_dir = string.copy(plugin_dir), true end
+  start(api)
+  return 0
+end
+
+-- `/term reload-core` arrives here as a chat event, possibly on another
+-- thread: it is noted and gu_frame swaps. Everything else goes to the core.
+global function gu_event(kind: cint, a: cint, b: cint, x: float32, y: float32, text: cstring): void <cexport, codename 'gu_event'>
+  if kind == GU_EVENT_CHAT and is_reload_core(text) then
+    set_flag(&reload_requested, 1)
+    return
+  end
+  if enter() then
+    if loader.fns.event ~= nilptr then loader.fns.event(kind, a, b, x, y, text) end
+    leave()
+  end
+end
+
+global function gu_frame(): void <cexport, codename 'gu_frame'>
+  if not loader.started then return end
+  local now = os.now()
+  if set_flag(&reload_requested, 0) ~= 0 then
+    swap_core('reload-core')
+  elseif loader.watch:due(now) and loader.watch:observe(file_stamp(loader.core_path), now) then
+    swap_core('ghostty_core.dll changed')
+  end
+  if enter() then
+    if loader.fns.frame ~= nilptr then loader.fns.frame() end
+    leave()
+  end
+end
+
+global function gu_popup_draw(dl: pointer, x1: float32, y1: float32, x2: float32, y2: float32, flags: cint): void <cexport, codename 'gu_popup_draw'>
+  if enter() then
+    if loader.fns.popup_draw ~= nilptr then loader.fns.popup_draw(dl, x1, y1, x2, y2, flags) end
+    leave()
+  end
+end
+
+global function gu_popup_reset(): void <cexport, codename 'gu_popup_reset'>
+  if enter() then
+    if loader.fns.popup_reset ~= nilptr then loader.fns.popup_reset() end
+    leave()
+  end
+end
+
+global function gu_popup_size(w: *cint, h: *cint): void <cexport, codename 'gu_popup_size'>
+  if enter() then
+    if loader.fns.popup_size ~= nilptr then loader.fns.popup_size(w, h) end
+    leave()
+  end
+end
+
+global function gu_toggle(): void <cexport, codename 'gu_toggle'>
+  if enter() then
+    if loader.fns.toggle ~= nilptr then loader.fns.toggle() end
+    leave()
+  end
+end
+
+-- `reload-core` swaps the core now: 0 when a core is loaded afterwards, 2 when
+-- none is. Everything else goes to the core (1 when there is none). Call it
+-- from the draw thread, like gu_frame.
+global function gu_command(text: cstring): cint <cexport, codename 'gu_command'>
+  if not loader.started then return 1 end
+  if is_reload_core(text) then
+    swap_core('reload-core')
+    return loader.lib ~= nilptr and 0 or 2
+  end
+  local rc: cint = 1
+  if enter() then
+    if loader.fns.command ~= nilptr then rc = loader.fns.command(text) end
+    leave()
+  end
+  return rc
+end
+
+global function gu_status(buf: *[0]cchar, cap: usize): usize <cexport, codename 'gu_status'>
+  if enter() then
+    local n: usize = 0
+    if loader.fns.status ~= nilptr then n = loader.fns.status(buf, cap) end
+    leave()
+    return n
+  end
+  if buf == nilptr or cap == 0 then return 0 end
+  local label: cstring = 'ghostty (no core)'
+  local src = (@*[0]cchar)(label)
+  local n: usize = 0
+  while src[n] ~= 0 and n + 1 < cap do buf[n] = src[n] n = n + 1 end
+  buf[n] = 0
+  return n
+end
+
+global function gu_version(): cstring <cexport, codename 'gu_version'>
+  if enter() then
+    local v: cstring = 'ghostty-loader (a core without gu_version)'
+    if loader.fns.version ~= nilptr then v = loader.fns.version() end
+    leave()
+    return v
+  end
+  return 'ghostty-loader (no core)'
+end
+
+global function gu_walk_input(left: *float32, forward: *float32, allowed: cint, legacy: cint): void <cexport, codename 'gu_walk_input'>
+  if enter() then
+    if loader.fns.walk_input ~= nilptr then loader.fns.walk_input(left, forward, allowed, legacy) end
+    leave()
+  end
+end
+
+-- Nelua runtime errors inside the game: built like the core (`-P
+-- "writestderr='hooked'" -P "abort='hooked'"`), they go to the Dalamud log.
+## if pragmas.writestderr == 'hooked' then
+local stderr_buf: [512]byte
+local stderr_len: usize = 0
+local function nelua_write_stderr(msg: cstring, len: usize, flush: boolean): void <cexport, codename 'nelua_write_stderr'>
+  local src = (@*[0]byte)(msg)
+  for i: usize = 0, < len do
+    if stderr_len < #stderr_buf - 1 then
+      stderr_buf[stderr_len] = src[i]
+      stderr_len = stderr_len + 1
+    end
+  end
+  if not flush then return end
+  stderr_buf[stderr_len] = 0
+  local api = loader.api
+  if api ~= nilptr and api.log ~= nilptr then api.log(LOG_ERROR, (@cstring)(&stderr_buf)) end
+  stderr_len = 0
+end
+## end
+## if pragmas.abort == 'hooked' then
+local function c_abort(): void <cimport 'abort', cinclude '<stdlib.h>', nodecl> end
+local function nelua_abort(): void <cexport, codename 'nelua_abort'>
+  c_abort()
+end
+## end

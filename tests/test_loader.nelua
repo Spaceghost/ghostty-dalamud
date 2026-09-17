@@ -1,0 +1,241 @@
+-- ghostty_loader built for this host, driving the real core built for this
+-- host: it starts a private copy with the shim's arguments, forwards calls,
+-- swaps the copy on `reload-core` (command or chat event) and when
+-- ghostty_core.dll changes (once the file holds still), keeps running without
+-- a core when the file is broken or missing, and removes its copies on
+-- shutdown. The change-detection rules are checked on their own first.
+-- Arguments: <dir with ghostty_loader.dll + ghostty_core.dll> <install dir> <config dir> <core .so>
+require 'core.reload_watch'
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'io'
+require 'os'
+require 'arg'
+
+-- ReloadWatch ------------------------------------------------------------------
+do
+  local w: ReloadWatch
+  w:loaded(100, 10.0)
+  assert(not w:due(10.5), 'polls at most once per second')
+  assert(w:due(11.0), 'due after a second')
+  assert(not w:due(11.5), 'not again right away')
+  assert(not w:observe(100, 11.0), 'unchanged file')
+  assert(not w:observe(0, 11.0), 'a missing file never swaps')
+  assert(not w:observe(200, 12.0), 'a change starts settling')
+  assert(not w:observe(200, 12.25), 'still settling')
+  assert(w:observe(200, 12.5), 'stable for half a second')
+  assert(not w:observe(300, 12.75), 'another write restarts the clock')
+  assert(not w:observe(300, 13.0), 'settling again')
+  assert(w:observe(300, 13.25), 'stable again')
+  w:loaded(300, 13.25)
+  assert(not w:observe(300, 20.0), 'quiet after loading until the next change')
+  assert(not w:observe(200, 21.0) and not w:observe(300, 22.0), 'a change reverted before settling does nothing')
+  assert(w:due(5.0), 'a clock going backwards does not stop polling')
+  print('reload watch OK')
+end
+
+-- The loader ---------------------------------------------------------------------
+local function dlopen(path: cstring, flags: cint): pointer <cimport, cinclude '<dlfcn.h>', nodecl> end
+local function dlsym(lib: pointer, name: cstring): pointer <cimport, cinclude '<dlfcn.h>', nodecl> end
+local function dlclose(lib: pointer): cint <cimport, cinclude '<dlfcn.h>', nodecl> end
+local function dlerror(): cstring <cimport, cinclude '<dlfcn.h>', nodecl> end
+local RTLD_NOW: cint <cimport, cinclude '<dlfcn.h>', nodecl, const>
+local function usleep(us: cuint): cint <cimport, cinclude '<unistd.h>', nodecl> end
+
+-- GuInitInfo (core/app/boot.nelua)
+local InitInfo = @record{ size: usize, host_kind: cint, install_dir: cstring, config_dir: cstring, configs_root: cstring }
+local Fns = @record{
+  init_ex: function(api: pointer, info: *InitInfo): cint,
+  init: function(api: pointer, plugin_dir: cstring): cint,
+  event: function(kind: cint, a: cint, b: cint, x: float32, y: float32, text: cstring): void,
+  frame: function(): void,
+  popup_draw: function(dl: pointer, x1: float32, y1: float32, x2: float32, y2: float32, flags: cint): void,
+  popup_reset: function(): void,
+  popup_size: function(w: *cint, h: *cint): void,
+  toggle: function(): void,
+  command: function(text: cstring): cint,
+  status: function(buf: *[0]cchar, cap: usize): usize,
+  shutdown: function(): void,
+  version: function(): cstring,
+  walk_input: function(left: *float32, forward: *float32, allowed: cint, legacy: cint): void,
+}
+-- the head of GuHostApi: a core reads only the fields within `size`
+local Api = @record{ size: usize, log: function(level: cint, msg: cstring): void }
+
+local test_dir: string = arg[1]
+local install_dir: string = arg[2]
+local config_dir: string = arg[3]
+local core_so: string = arg[4]
+
+local lines: vector(string)
+local function log_cb(level: cint, msg: cstring): void
+  local s: string = msg
+  lines:push(s:copy())
+  io.write('  [log ', level, '] ', s, '\n')
+end
+local function logged(needle: string): integer
+  local n = 0
+  for i = 0, < #lines do
+    if lines[i]:find(needle, 1, true) > 0 then n = n + 1 end
+  end
+  return n
+end
+
+local function file(name: string): string
+  local sb: stringbuilder
+  sb:write(test_dir, '/', name)
+  return sb:promote()
+end
+local function exists(name: string): boolean
+  local p = file(name)
+  local f = io.open(p, 'rb')
+  p:destroy()
+  if not f:isopen() then return false end
+  f:close()
+  return true
+end
+local function write_atomic(name: string, content: string): void
+  local p = file(name)
+  local tmp = p .. '.tmp'
+  local f = io.open(tmp, 'wb')
+  assert(f:isopen(), 'open temp file')
+  f:write(content)
+  f:close()
+  local ok = os.rename(tmp, p)
+  assert(ok, 'rename')
+  tmp:destroy() p:destroy()
+end
+local function read_file(path: string): string
+  local f = io.open(path, 'rb')
+  assert(f:isopen(), 'read core')
+  local c = f:read('a')
+  f:close()
+  return c
+end
+local function sleep_s(s: number): void usleep((@cuint)(s * 1000000)) end
+
+-- gu_frame every 50 ms until `needle` has been logged `count` times; the time
+-- that took, or -1 after `limit` seconds
+local function frames_until(fns: *Fns, limit: number, needle: string, count: integer): number
+  local t0 = os.now()
+  while os.now() - t0 < limit do
+    fns.frame()
+    if logged(needle) >= count then return os.now() - t0 end
+    sleep_s(0.05)
+  end
+  return -1
+end
+
+local core_bytes = read_file(core_so)
+local loader_path = file('ghostty_loader.dll')
+local lib = dlopen((@cstring)(loader_path.data), RTLD_NOW)
+if lib == nilptr then error(dlerror()) end
+local fns: Fns
+## for _, name in ipairs{'init_ex', 'init', 'event', 'frame', 'popup_draw', 'popup_reset', 'popup_size', 'toggle', 'command', 'status', 'shutdown', 'version', 'walk_input'} do
+  fns.#|name|# = (@#[Fns.value.fields[name].type]#)(dlsym(lib, #['gu_' .. name]#))
+  assert(fns.#|name|# ~= nilptr, #['loader exports gu_' .. name]#)
+## end
+
+local api: Api = { size = #Api, log = log_cb }
+local buf: [64]cchar
+local function status(): string
+  local n = fns.status(&buf, 64)
+  return string.copy(string{data=(@*[0]byte)(&buf), size=n})
+end
+
+-- start: a private copy of the core, started with the shim's arguments (the
+-- loader keeps its own copies: these strings are gone right after the call)
+do
+  local inst, conf = install_dir:copy(), config_dir:copy()
+  local info: InitInfo = { size = #InitInfo, host_kind = 0, install_dir = (@cstring)(inst.data), config_dir = (@cstring)(conf.data), configs_root = '' }
+  assert(fns.init_ex(&api, &info) == 0, 'loader init')
+  inst:destroy() conf:destroy()
+end
+assert(logged('loader: loaded ghostty-dalamud') == 1, 'core loaded')
+assert(logged('ghostty core active') == 1, 'core activated')
+assert(exists('ghostty_core.live-1.dll'), 'running from a copy')
+local st = status()
+assert(st:find('ghostty', 1, true) == 1 and st:find('no core', 1, true) == 0, 'status comes from the core')
+assert(fns.command('bogus') == 3, 'commands reach the core')
+assert((@string)(fns.version()):find('ghostty-dalamud', 1, true) == 1, 'version comes from the core')
+local w: cint, h: cint = 0, 0
+fns.popup_size(&w, &h)
+assert(w > 0 and h > 0, 'popup size from the core')
+local left: float32, forward: float32 = 0, 0
+fns.walk_input(&left, &forward, 1, 0)
+fns.popup_draw(nilptr, 0, 0, 10, 10, 0)
+fns.popup_reset()
+fns.event(3, 0, 0, 0, 0, '') -- OpenConfig
+fns.frame()
+
+-- reload-core as a command: the copy is shut down, freed, deleted and replaced
+assert(fns.command('reload-core') == 0, 'reload-core')
+assert(logged('ghostty core stopped') == 1, 'old core shut down')
+assert(logged('loader: loaded ghostty-dalamud') == 2, 'new core loaded')
+assert(logged('ghostty core active') == 2, 'new core activated with the saved arguments')
+assert(not exists('ghostty_core.live-1.dll') and exists('ghostty_core.live-2.dll'), 'fresh copy, old one deleted')
+
+-- reload-core as a chat event (another thread in the game): swapped on the next frame
+fns.event(1, 0, 0, 0, 0, ' reload-core ')
+assert(logged('loader: loaded ghostty-dalamud') == 2, 'not swapped inside gu_event')
+fns.frame()
+assert(logged('loader: loaded ghostty-dalamud') == 3 and exists('ghostty_core.live-3.dll'), 'swapped on the next frame')
+
+-- a new ghostty_core.dll is picked up by gu_frame once it has held still
+sleep_s(1.1)
+write_atomic('ghostty_core.dll', core_bytes)
+local waited = frames_until(&fns, 4, 'loader: loaded ghostty-dalamud', 4)
+print('swap after the file changed took', waited)
+assert(waited >= RELOAD_SETTLE_SECONDS, 'swapped, but only after the file settled')
+assert(not exists('ghostty_core.live-3.dll') and exists('ghostty_core.live-4.dll'), 'swapped to a fresh copy')
+
+-- a broken core file: logged, the game keeps running with no core, no retries
+sleep_s(1.1)
+write_atomic('ghostty_core.dll', 'this is not a shared library')
+assert(frames_until(&fns, 4, 'live-5.dll failed', 1) >= 0, 'broken core reported')
+assert(logged('ghostty core stopped') == 4, 'the working core was shut down first')
+st:destroy() st = status()
+assert(st == 'ghostty (no core)', 'status without a core')
+assert(fns.command('bogus') == 1, 'commands without a core')
+assert((@string)(fns.version()) == 'ghostty-loader (no core)', 'version without a core')
+fns.popup_size(&w, &h)
+fns.walk_input(&left, &forward, 1, 0)
+fns.popup_draw(nilptr, 0, 0, 10, 10, 0)
+fns.event(3, 0, 0, 0, 0, '')
+fns.toggle()
+assert(frames_until(&fns, 1.5, 'dll failed', 2) < 0, 'no retry until the file changes again')
+assert(not exists('ghostty_core.live-5.dll'), 'the broken copy is deleted')
+
+-- the fixed file comes back
+write_atomic('ghostty_core.dll', core_bytes)
+assert(frames_until(&fns, 4, 'loader: loaded ghostty-dalamud', 5) >= 0, 'recovered after the file changed again')
+st:destroy() st = status()
+assert(st:find('no core', 1, true) == 0, 'core running again')
+
+-- a missing file: reload-core reports it, and a later reload-core recovers
+local dll = file('ghostty_core.dll')
+local away = file('ghostty_core.away')
+local ok = os.rename(dll, away) assert(ok)
+assert(fns.command('reload-core') == 2 and logged('ghostty_core.dll not found') == 1, 'missing core reported')
+ok = os.rename(away, dll) assert(ok)
+assert(fns.command('reload-core') == 0 and logged('loader: loaded ghostty-dalamud') == 6, 'reload-core after the file is back')
+
+-- shutdown removes the copy; gu_init starts over
+fns.shutdown()
+assert(logged('loader: stopped') == 1, 'loader stopped')
+for n = 1, 10 do
+  local sb: stringbuilder
+  sb:writef('ghostty_core.live-%d.dll', n)
+  local name = sb:promote()
+  assert(not exists(name), 'no live copies left after shutdown')
+  name:destroy()
+end
+st:destroy() st = status()
+assert(st == 'ghostty (no core)', 'nothing forwarded after shutdown')
+assert(fns.init(&api, (@cstring)(config_dir.data)) == 0 and logged('loader: loaded ghostty-dalamud') == 7, 'gu_init again')
+assert(fns.command('reload-core') == 0 and logged('ghostty core active') == 8, 'gu_init arguments replayed')
+fns.frame()
+fns.shutdown()
+dlclose(lib)
+print('loader OK')
