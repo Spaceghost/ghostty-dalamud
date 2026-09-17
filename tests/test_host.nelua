@@ -151,36 +151,58 @@ assert(gu_command('bogus') == 3)
 -- through the shim and lets go of the controller, shutdown closes it.
 local pad_bits: cint = 0
 local function fake_gamepad_down(mask: cint): cint return (pad_bits & mask) ~= 0 and 1 or 0 end
+local in_front = true
+local function fake_foreground(): boolean return in_front end
 do
   assert(policy.toggle_gamepad_mask == 0x4000 and not policy.toggle_gamepad_hid, 'shipped default: select')
-  local have, down, pressed = poll_toggle_pad(1.0)
+  assert(game_foreground(), 'no foreground check off Windows')
+  local have, down, pressed = poll_toggle_pad(1.0, fake_foreground)
   assert(not have and not down and not pressed, 'no gamepad callbacks: nothing')
   host.api.gamepad_down = fake_gamepad_down
   pad_bits = 0x4000
-  have, down = poll_toggle_pad(1.02)
+  have, down = poll_toggle_pad(1.02, fake_foreground)
   assert(have and down and hid_fake.scans == 0, 'select comes from the shim; no HID scan')
 
   hid_fake.devices[0] = { vid = 0x054C, pid = 0x0CE6, usage_page = 1, usage = 5, input_len = 64 }
   hid_fake.count = 1
   policy.toggle_gamepad_hid, policy.toggle_gamepad_mask = true, 0 -- what 'create' loads to (test_policy)
-  have, down = poll_toggle_pad(1.04)
-  assert(have and not down and hid_is_open(&host.dualsense.dev), 'create: the DualSense opens; the shim is not asked')
+  have, down = poll_toggle_pad(1.04, fake_foreground)
+  assert(have and not down and hid_is_open(&host.dualsense.dev) and hid_fake.watching, 'create: the DualSense opens; the shim is not asked')
   local report: [64]uint8
   report[0], report[9] = 0x01, 0x10
+  local idle: [64]uint8
+  idle[0] = 0x01
   hid_fake_push(&report, 64)
-  have, down = poll_toggle_pad(1.06)
+  have, down = poll_toggle_pad(1.06, fake_foreground)
   assert(have and down, 'Create held')
 
+  -- The controller is read whichever window is in front, and Create captures
+  -- screenshots elsewhere: its reports are drained there but never count.
+  in_front = false
+  have, down = poll_toggle_pad(1.07, fake_foreground)
+  assert(have and not down, 'held while another window comes to the front: let go')
+  hid_fake_push(&idle, 64)
+  hid_fake_push(&report, 64)
+  hid_fake_push(&idle, 64)
+  have, down = poll_toggle_pad(1.08, fake_foreground)
+  assert(have and not down and hid_fake.head == hid_fake.tail, 'a tap in another window: drained, ignored')
+  in_front = true
+  have, down = poll_toggle_pad(1.09, fake_foreground)
+  assert(have and not down, 'and nothing of it left when the game comes back to the front')
+  hid_fake_push(&report, 64)
+  have, down = poll_toggle_pad(1.10, fake_foreground)
+  assert(have and down, 'Create in front counts again')
+
   policy.toggle_gamepad_hid, policy.toggle_gamepad_mask = false, 0x4000
-  have, down = poll_toggle_pad(1.08)
-  assert(have and down and not hid_is_open(&host.dualsense.dev) and hid_fake.closes == 1, 'back to select: the controller is let go')
+  have, down = poll_toggle_pad(1.12, fake_foreground)
+  assert(have and down and not hid_is_open(&host.dualsense.dev) and hid_fake.closes == 1 and not hid_fake.watching, 'back to select: the controller is let go')
   policy.toggle_gamepad_hid, policy.toggle_gamepad_mask = true, 0
   pad_bits = 0
-  have, down = poll_toggle_pad(1.10)
+  have, down = poll_toggle_pad(1.14, fake_foreground)
   assert(have and not down and hid_is_open(&host.dualsense.dev), 'create again')
   host.api.gamepad_down = nilptr
 end
 gu_toggle()
 gu_shutdown()
-assert(hid_fake.closes == 2 and not hid_is_open(&host.dualsense.dev), 'shutdown closes the controller')
+assert(hid_fake.closes == 2 and not hid_is_open(&host.dualsense.dev) and not hid_fake.watching, 'shutdown closes the controller and its arrival watch')
 print('OK')

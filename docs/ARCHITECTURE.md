@@ -84,8 +84,13 @@
    it from the game via `IKeyState`. Poll the controller toggle: a Dalamud
    gamepad flag through the shim or, with `toggle_gamepad_button = 'create'`,
    the DualSense's own HID reports (`core/sys/hid.nelua`: setupapi and
-   hid.dll, an overlapped `ReadFile` collected with `GetOverlappedResult`,
-   never waiting; `core/dualsense.nelua` parses them). Not yet observed with a
+   hid.dll; `core/dualsense.nelua` parses them). Reads never wait: an
+   overlapped `ReadFile` collected with `GetOverlappedResult`, on a handle
+   whose report queue is cut to 2. Finding and opening the controller is
+   synchronous, and closing waits up to 1 s for the cancelled read, so
+   searches skip devices by the ids in their path, back off from 3 s to 30 s,
+   and start early on a `CM_Register_Notification` device arrival. Create
+   counts only while the game's window is in front. Not yet observed with a
    controller in game.
 5. Draw the drop-down: an ImGui window sliding from the top of the main
    viewport; tab bar of sessions; `InvisibleButton` over the terminal area for
@@ -184,12 +189,12 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_ghostty` | libghostty-vt binding: sized-struct sizes against `ghostty_type_json()` |
 | `test_render` | a terminal rendered through a fake ImGui, checked by its draw calls |
 | `test_session` | session behaviour without a transport, local sessions, agent LIST parsing, `/term send` escapes, gamepad gestures, key repeat |
-| `test_dualsense` | DualSense input reports (USB, Bluetooth with its CRC, Bluetooth simple, short and foreign reports), Create edges, the HID reader against fake devices: scan, open, unplug, rescan, close |
+| `test_dualsense` | DualSense input reports (USB, Bluetooth with its CRC, Bluetooth simple, short and foreign reports), Create edges, ids in HID interface paths, the HID reader against fake devices: scan, devices passed over by their path, open, report queue, unplug, rescans backing off, device arrivals, close |
 | `test_selection` | mouse selection: hit mapping, click counting, word and line units, copied text |
 | `test_bell` | the visual bell: BEL counting, ring and glow maths, the Lua style, its triangles |
 | `test_policy` | loading `lua/init.lua`: defaults, profiles, key actions, showcase entries |
 | `test_world`, `test_worldpanel`, `test_worlddrag` | world panels: projection and hit testing, the presented pose and walk-up, drag placement and snapping, all against a fake game |
-| `test_host` | the exported host surface without ImGui: init, status, commands, the controller toggle's source, shutdown |
+| `test_host` | the exported host surface without ImGui: init, status, commands, the controller toggle's source and its foreground check, shutdown |
 | `test_lights` | panel lights against fake game light callbacks |
 | `test_chrome` | the glass chrome of the drop-down and windows: colour, tint, glow, tab strip, buttons, the settings button's badge |
 | `test_migrate` (`.nelua` + `.lua`) | the one-time migration from the Umbra-hosted home |

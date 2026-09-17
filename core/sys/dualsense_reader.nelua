@@ -1,16 +1,31 @@
 -- The Create button of a DualSense read straight from its HID input reports,
--- once per frame on the render thread and never waiting: Dalamud's gamepad
--- state has no Create button. While no controller is open it looks for one
--- every DS_RESCAN_S seconds, a few HID devices per frame; a failed read
--- (unplugged) closes the device and lets go of the button.
+-- once per frame on the render thread: Dalamud's gamepad state has no Create
+-- button. Reading never waits (core/sys/hid.nelua). Finding the controller
+-- makes synchronous calls, so it is kept rare: a pass looks at a few HID
+-- device interfaces per frame and opens only those whose path does not name
+-- another device; after a pass that found nothing the next one waits
+-- DS_RESCAN_MIN_S, doubling up to DS_RESCAN_MAX_S, and straight to the
+-- maximum when the controller fails to open with the error already logged
+-- (another program holds it). A device arrival notification, where the system
+-- delivers one, starts a pass DS_ARRIVAL_DELAY_S after the last. A failed read
+-- (unplugged) closes the device and lets go of the button; closing waits up
+-- to a second for the cancelled read.
+require 'math'
 require 'string'
 require 'stringbuilder'
 require 'core.dualsense'
 require 'core.sys.hid'
 
-global DS_RESCAN_S: float64 <comptime> = 3.0
-global DS_SCAN_BUDGET: integer <comptime> = 4      -- HID devices looked at per frame while scanning
-global DS_READS_PER_FRAME: integer <comptime> = 64 -- reports collected per frame at most
+global DS_RESCAN_MIN_S: float64 <comptime> = 3.0
+global DS_RESCAN_MAX_S: float64 <comptime> = 30.0
+global DS_ARRIVAL_DELAY_S: float64 <comptime> = 1.0 -- a device arrived: the next pass this long after the last
+global DS_SCAN_BUDGET: integer <comptime> = 4       -- HID devices looked at per frame while scanning
+global DS_READS_PER_FRAME: integer <comptime> = 64  -- reports collected per frame at most
+-- Reports hidclass queues for the handle. Where every read completes later
+-- (Wine hands device reads to winedevice), about one report is collected per
+-- frame while the controller sends ~250 a second: a long queue would stay full
+-- of old reports.
+global DS_INPUT_BUFFERS: uint32 <comptime> = 2
 
 global DsLogFn = @function(level: cint, msg: string): void
 
@@ -18,8 +33,13 @@ global DualSenseReader = @record{
   dev: HidDevice,
   scan: HidScan,
   button: DsButtonState,     -- Create
-  scanned: boolean,          -- a scan pass finished (or could not start) at `scanned_at`
+  scanned: boolean,          -- a pass finished (or could not start), or the device closed, at `scanned_at`
   scanned_at: float64,
+  wait_s: float64,           -- from `scanned_at` to the next pass; 0 once a device worked
+  arrived: boolean,          -- a device arrived since the last pass began
+  failed_again: boolean,     -- this pass met the open error already logged
+  watch_tried: boolean,      -- hid_watch_begin was called
+  watching: boolean,         -- and succeeded
   logged_layout: DsLayout,   -- report layout already logged for this device
   logged_ignored: boolean,   -- an unreadable report already logged for this device
   logged_open_error: uint32, -- open error already logged
@@ -42,29 +62,57 @@ local function layout_name(l: DsLayout): string
   return 'none'
 end
 
--- Let go of the controller and the button (the option was turned off, shutdown).
+-- Nothing open from `now`: when the next pass may start.
+local function search_later(r: *DualSenseReader, now: float64): void
+  r.scanned, r.scanned_at = true, now
+  if r.failed_again then
+    r.wait_s = DS_RESCAN_MAX_S
+  elseif r.wait_s < DS_RESCAN_MIN_S then
+    r.wait_s = DS_RESCAN_MIN_S
+  else
+    r.wait_s = math.min(r.wait_s * 2, DS_RESCAN_MAX_S)
+  end
+  r.failed_again = false
+end
+
+-- Let go of the controller, the button and the arrival watch (the option was
+-- turned off, shutdown).
 global function dualsense_reader_close(r: *DualSenseReader): void
   hid_scan_end(&r.scan)
   hid_close(&r.dev)
+  if r.watching then hid_watch_end() end
   $r = {}
 end
 
 global function dualsense_reader_poll(r: *DualSenseReader, now: float64, logfn: DsLogFn): void
+  if not r.watch_tried then
+    r.watch_tried = true
+    r.watching = hid_watch_begin()
+  end
+  local arrived = r.watching and hid_arrived() -- taken every frame: one that came while open is stale
   if not hid_is_open(&r.dev) then
     r.button.down, r.button.pressed = false, false
+    if arrived then r.arrived, r.wait_s = true, 0 end
     if r.scan.info == nilptr then
-      if r.scanned and now >= r.scanned_at and now - r.scanned_at < DS_RESCAN_S then return end
+      if r.scanned and now >= r.scanned_at then
+        local wait = r.wait_s
+        if r.arrived then wait = DS_ARRIVAL_DELAY_S end
+        if now - r.scanned_at < wait then return end
+      end
+      r.arrived = false
       if not hid_scan_begin(&r.scan) then
-        r.scanned, r.scanned_at = true, now
+        search_later(r, now)
         return
       end
     end
     local step = hid_scan_step(&r.scan, DS_SCAN_BUDGET, dualsense_is_controller, dualsense_caps_ok, &r.dev)
     if step == HidStep.Finished then
-      r.scanned, r.scanned_at = true, now
+      search_later(r, now)
       return
     elseif step == HidStep.OpenFailed then
-      if r.dev.last_error ~= r.logged_open_error then
+      if r.dev.last_error == r.logged_open_error then
+        r.failed_again = true
+      else
         r.logged_open_error = r.dev.last_error
         ds_log(logfn, 2, 'DualSense %04x:%04x found but could not be opened (error %d)', r.dev.vid, r.dev.pid, r.dev.last_error)
       end
@@ -73,7 +121,9 @@ global function dualsense_reader_poll(r: *DualSenseReader, now: float64, logfn: 
       return
     end
     r.button = {}
+    r.failed_again = false
     r.logged_layout, r.logged_ignored = DsLayout.None, false
+    hid_set_input_buffers(&r.dev, DS_INPUT_BUFFERS) -- a failure only costs latency
     if not r.quiet then
       ds_log(logfn, 1, 'DualSense %04x:%04x opened for the Create button (%d byte reports)', r.dev.vid, r.dev.pid, r.dev.input_len)
     end
@@ -84,16 +134,19 @@ global function dualsense_reader_poll(r: *DualSenseReader, now: float64, logfn: 
       if not r.quiet then
         ds_log(logfn, 2, 'DualSense %04x:%04x closed: read failed (error %d)', r.dev.vid, r.dev.pid, r.dev.last_error)
       end
-      r.quiet = r.button.reports == 0 -- reopened every few seconds and failing again: say it once
+      r.quiet = r.button.reports == 0 -- reopened and failing again: say it once
       hid_close(&r.dev)
       r.button.down, r.button.pressed = false, false
-      r.scanned, r.scanned_at = true, now
+      search_later(r, now) -- DS_RESCAN_MIN_S after a device that worked, longer each time one fails before its first report
       return
     elseif n == 0 then
       break
     end
-    local ignored = r.button.ignored
+    local ignored, reports = r.button.ignored, r.button.reports
     dualsense_feed(&r.button, &r.dev.buf, (@usize)(n), DS_CREATE)
+    if reports == 0 and r.button.reports > 0 then
+      r.wait_s, r.logged_open_error = 0, 0 -- it works: searching starts quick again, a later open failure is news
+    end
     if r.button.ignored ~= ignored and not r.logged_ignored then
       r.logged_ignored = true
       ds_log(logfn, 2, 'DualSense sent a report this build does not read (id 0x%02x, %d bytes)', r.dev.buf[0], n)

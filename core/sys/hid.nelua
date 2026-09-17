@@ -1,8 +1,10 @@
--- HID devices read without blocking the render thread (Windows: setupapi and
--- hid.dll). A scan walks the HID device interfaces a few per call and opens
--- the first one both predicates accept; reads are overlapped, one ReadFile
--- in flight at a time, collected by GetOverlappedResult once it finished.
--- Host builds get a fake the tests fill through `hid_fake`.
+-- HID devices on the render thread (Windows: setupapi, hid.dll, cfgmgr32).
+-- Reads never wait: they are overlapped, one ReadFile in flight at a time,
+-- collected by GetOverlappedResult once it finished. Finding a device is
+-- synchronous: a scan walks the HID device interfaces a few per call, passes
+-- over those whose path names ids the predicate refuses without opening them,
+-- and opens the rest to check ids and caps. Closing waits up to a second for a
+-- cancelled read. Host builds get a fake the tests fill through `hid_fake`.
 require 'string'
 
 global HID_BUFFER_SIZE: usize <comptime> = 1024 -- devices with longer input reports are skipped
@@ -50,6 +52,63 @@ global function hid_is_open(dev: *HidDevice): boolean
   return dev.handle ~= nilptr
 end
 
+-- the value of hex digit `c`, -1 when it is none
+local function hex_digit(c: uint8): int32
+  if c >= 48 and c <= 57 then return (@int32)(c) - 48 end -- 0-9
+  c = c | 0x20
+  if c >= 97 and c <= 102 then return (@int32)(c) - 87 end -- a-f, A-F
+  return -1
+end
+
+-- the `n` characters of `s` from `i` (0-based) read as hex, when all are digits
+local function hex_at(s: string, i: usize, n: usize): (boolean, uint32)
+  if i + n > s.size then return false, 0 end
+  local v: uint32 = 0
+  for k: usize = i, < i + n do
+    local d = hex_digit(s.data[k])
+    if d < 0 then return false, 0 end
+    v = (v << 4) | (@uint32)(d)
+  end
+  return true, v
+end
+
+-- `word` (three lower-case letters) at `i` in `s`, in any case
+local function word_at(s: string, i: usize, word: string): boolean
+  if i + 3 > s.size then return false end
+  for k: usize = 0, < 3 do
+    if (s.data[i + k] | 0x20) ~= word.data[k] then return false end
+  end
+  return true
+end
+
+local function id_sep(c: uint8): boolean return c == 38 or c == 95 end -- '&' or '_'
+
+-- The vendor and product id a HID device interface path names, read without
+-- opening the device: 'vid_054c&pid_0ce6' (USB and most others) or
+-- 'vid&0002054c_pid&0ce6' (Bluetooth: a 4-digit id source, then the vendor),
+-- in any case. Returns false when the path names none.
+global function hid_path_ids(path: string): (boolean, uint16, uint16)
+  local i: usize = 0
+  while i + 3 <= path.size do
+    if word_at(path, i, 'vid') and i + 4 <= path.size then
+      local ok: boolean, vid: uint32, j: usize = false, 0, 0
+      if path.data[i + 3] == 95 then     -- vid_054c
+        ok, vid = hex_at(path, i + 4, 4)
+        j = i + 8
+      elseif path.data[i + 3] == 38 then -- vid&0002054c
+        ok, vid = hex_at(path, i + 4, 8)
+        j = i + 12
+      end
+      if ok and j + 9 <= path.size and id_sep(path.data[j]) and word_at(path, j + 1, 'pid') and id_sep(path.data[j + 4]) then
+        local pok, pid = hex_at(path, j + 5, 4)
+        if pok then return true, (@uint16)(vid & 0xffff), (@uint16)(pid) end
+      end
+    end
+    i = i + 1
+  end
+  return false, 0, 0
+end
+
 ## if ccinfo.is_windows then
 ## cinclude '<windows.h>'
 ## linklib 'setupapi'
@@ -78,6 +137,7 @@ local function HidD_GetAttributes(h: pointer, attrs: *HidAttributes): uint8 <cim
 local function HidD_GetPreparsedData(h: pointer, data: *pointer): uint8 <cimport> end
 local function HidD_FreePreparsedData(data: pointer): uint8 <cimport> end
 local function HidP_GetCaps(data: pointer, caps: *HidCaps): int32 <cimport> end
+local function HidD_SetNumInputBuffers(h: pointer, n: uint32): uint8 <cimport> end
 local function SetupDiGetClassDevsA(guid: *HidGuid, enumerator: pointer, parent: pointer, flags: uint32): pointer <cimport> end
 local function SetupDiEnumDeviceInterfaces(info: pointer, devinfo: pointer, guid: *HidGuid, index: uint32, data: *HidInterfaceData): cint <cimport> end
 local function SetupDiGetDeviceInterfaceDetailA(info: pointer, data: *HidInterfaceData, detail: pointer, size: uint32, required: pointer, devinfo: pointer): cint <cimport> end
@@ -111,6 +171,10 @@ local function open_interface(scan: *HidScan, iface: *HidInterfaceData, id_ok: H
   if SetupDiGetDeviceInterfaceDetailA(scan.info, iface, &detail, #HidDetail, nilptr, nilptr) == 0 then return HidStep.Running end
   detail.path[HID_PATH_MAX - 1] = 0
   local path = (@cstring)(&detail.path[0])
+  -- the path usually names the ids: other devices are passed over without a
+  -- CreateFileA (under Wine each call is a round trip through wineserver)
+  local named, path_vid, path_pid = hid_path_ids((@string)(path))
+  if named and not id_ok(path_vid, path_pid) then return HidStep.Running end
   -- no access rights: enough for attributes and caps, and for devices other programs hold exclusively
   local probe = CreateFileA(path, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, nilptr, OPEN_EXISTING, 0, nilptr)
   if probe == INVALID_HANDLE_VALUE then return HidStep.Running end
@@ -192,6 +256,74 @@ global function hid_read(dev: *HidDevice): isize
   return (@isize)(n)
 end
 
+-- How many input reports hidclass keeps queued for this handle (2 at least;
+-- the oldest is dropped when full). A short queue keeps reads current when
+-- they are collected more slowly than the device sends.
+global function hid_set_input_buffers(dev: *HidDevice, n: uint32): boolean
+  if dev.handle == nilptr then return false end
+  return HidD_SetNumInputBuffers(dev.handle, n) ~= 0
+end
+
+-- Device arrival notifications for HID interfaces (CM_Register_Notification,
+-- Windows 8 and later, resolved at runtime so the core still loads without
+-- it). One watch per process; the callback runs on a thread pool thread and
+-- only raises a flag hid_arrived takes.
+local CmNotifyFilter = @record{ -- CM_NOTIFY_FILTER with the DeviceInterface member of its union
+  cb_size: uint32, flags: uint32, filter_type: int32, reserved: uint32,
+  class_guid: HidGuid,
+  rest: [384]uint8, -- the rest of the union (DeviceInstance holds 200 WCHARs)
+}
+## static_assert(CmNotifyFilter.value.size == 416, 'CM_NOTIFY_FILTER')
+local CmNotifyCallback = @function(notify: pointer, context: pointer, action: uint32, data: pointer, size: uint32): uint32
+local CmRegisterFn = @function(filter: *CmNotifyFilter, context: pointer, callback: CmNotifyCallback, out: *pointer): uint32
+local CmUnregisterFn = @function(notify: pointer): uint32
+local CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE: int32 <comptime> = 0
+local CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL: uint32 <comptime> = 0
+local function LoadLibraryA(name: cstring): pointer <cimport, nodecl> end
+local function FreeLibrary(module: pointer): cint <cimport, nodecl> end
+local function GetProcAddress(module: pointer, name: cstring): pointer <cimport, nodecl> end
+local function InterlockedExchange(v: pointer, x: clong): clong <cimport, nodecl> end
+
+local watch_lib: pointer = nilptr
+local watch_handle: pointer = nilptr
+local watch_unregister: CmUnregisterFn = nilptr
+local watch_arrived: clong = 0
+
+local function on_cm_notify(notify: pointer, context: pointer, action: uint32, data: pointer, size: uint32): uint32
+  if action == CM_NOTIFY_ACTION_DEVICEINTERFACEARRIVAL then InterlockedExchange(&watch_arrived, 1) end
+  return 0 -- ERROR_SUCCESS
+end
+
+global function hid_watch_end(): void
+  -- documented to wait for a callback in progress, so none runs once this returns
+  if watch_handle ~= nilptr then watch_unregister(watch_handle) end
+  if watch_lib ~= nilptr then FreeLibrary(watch_lib) end
+  watch_lib, watch_handle, watch_unregister = nilptr, nilptr, nilptr
+end
+
+global function hid_watch_begin(): boolean
+  if watch_handle ~= nilptr then return true end
+  watch_lib = LoadLibraryA('cfgmgr32.dll')
+  if watch_lib == nilptr then return false end
+  local register = (@CmRegisterFn)(GetProcAddress(watch_lib, 'CM_Register_Notification'))
+  watch_unregister = (@CmUnregisterFn)(GetProcAddress(watch_lib, 'CM_Unregister_Notification'))
+  local filter: CmNotifyFilter = { cb_size = #CmNotifyFilter, filter_type = CM_NOTIFY_FILTER_TYPE_DEVICEINTERFACE }
+  HidD_GetHidGuid(&filter.class_guid)
+  InterlockedExchange(&watch_arrived, 0)
+  local h: pointer = nilptr
+  if register == nilptr or watch_unregister == nilptr or register(&filter, nilptr, on_cm_notify, &h) ~= 0 or h == nilptr then
+    hid_watch_end()
+    return false
+  end
+  watch_handle = h
+  return true
+end
+
+-- Whether a HID interface arrived since the last call.
+global function hid_arrived(): boolean
+  return InterlockedExchange(&watch_arrived, 0) ~= 0
+end
+
 global function hid_close(dev: *HidDevice): void
   local err = dev.last_error
   if dev.handle ~= nilptr then
@@ -213,15 +345,22 @@ end
 global HidFakeDevice = @record{
   vid: uint16, pid: uint16, usage_page: uint16, usage: uint16, input_len: uint16,
   open_error: uint32, -- nonzero: opening fails with this error
+  path: string,       -- its interface path: ids it names are checked before opening
 }
 global HID_FAKE_REPORTS <comptime> = 16
 global HidFake = @record{
   devices: [4]HidFakeDevice,
   count: integer,
   scans: integer,      -- hid_scan_begin calls
-  probes: integer,     -- device interfaces looked at
+  looked: integer,     -- device interfaces looked at
+  probes: integer,     -- of those, opened to check ids and caps (not passed over by their path)
   opens: integer,
   closes: integer,
+  input_buffers: uint32, -- the last hid_set_input_buffers
+  watching: boolean,   -- hid_watch_begin succeeded and no hid_watch_end followed
+  watch_begins: integer,
+  watch_fails: boolean, -- hid_watch_begin fails (no arrival notifications)
+  arrived: boolean,    -- an arrival hid_arrived reports while watching
   reports: [HID_FAKE_REPORTS][128]uint8, -- queued input reports of the open device
   lens: [HID_FAKE_REPORTS]usize,
   head: integer, tail: integer,
@@ -257,6 +396,9 @@ global function hid_scan_step(scan: *HidScan, budget: integer, id_ok: HidIdMatch
     end
     local d = hid_fake.devices[scan.index]
     scan.index = scan.index + 1
+    hid_fake.looked = hid_fake.looked + 1
+    local named, path_vid, path_pid = hid_path_ids(d.path)
+    if named and not id_ok(path_vid, path_pid) then continue end
     hid_fake.probes = hid_fake.probes + 1
     if id_ok(d.vid, d.pid) and d.input_len > 0 and d.input_len <= HID_BUFFER_SIZE and caps_ok(d.usage_page, d.usage, d.input_len) then
       $dev = {}
@@ -287,6 +429,29 @@ global function hid_read(dev: *HidDevice): isize
   local n = hid_fake.lens[slot]
   for i: usize = 0, < n do dev.buf[i] = hid_fake.reports[slot][i] end
   return (@isize)(n)
+end
+
+global function hid_set_input_buffers(dev: *HidDevice, n: uint32): boolean
+  if dev.handle == nilptr then return false end
+  hid_fake.input_buffers = n
+  return true
+end
+
+global function hid_watch_begin(): boolean
+  if hid_fake.watch_fails then return false end
+  if not hid_fake.watching then hid_fake.watch_begins = hid_fake.watch_begins + 1 end
+  hid_fake.watching = true
+  return true
+end
+
+global function hid_watch_end(): void
+  hid_fake.watching, hid_fake.arrived = false, false
+end
+
+global function hid_arrived(): boolean
+  local a = hid_fake.watching and hid_fake.arrived
+  hid_fake.arrived = false
+  return a
 end
 
 global function hid_close(dev: *HidDevice): void
