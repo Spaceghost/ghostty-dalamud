@@ -1,0 +1,491 @@
+-- World-space panels: projection math, hit testing, and lua/world.lua placement
+-- against a fake game.
+require 'core.world'
+require 'core.policy'
+require 'string'
+require 'math'
+require 'arg'
+require 'os'
+require 'vector'
+
+local function near(a: float32, b: float32): boolean return math.abs(a - b) < 0.01 end
+
+-- Camera at the origin looking down -Z with a symmetric perspective (w = -z).
+local cam: GuCamera = { width = 1000, height = 500 }
+cam.m[0] = 1  -- x
+cam.m[5] = 1  -- y
+cam.m[11] = -1 -- w = -z
+local ok, sx, sy = world_project(&cam, 0, 0, -5)
+assert(ok and near(sx, 500) and near(sy, 250), 'center projects to the middle')
+ok, sx, sy = world_project(&cam, 1, 1, -1)
+assert(ok and near(sx, 1000) and near(sy, 0), 'x=1,y=1 at depth 1 -> top right corner')
+ok = world_project(&cam, 0, 0, 3)
+assert(not ok, 'behind the camera')
+
+-- A panel 5 yalms in front, facing the camera (+Z), 100x50 px at 100 px/yalm.
+local pl: WorldPlacement = { x = 0, y = 0, z = -5, yaw = 0, width = 100, height = 50, ppm = 100 }
+local b = world_basis(pl)
+local x, y, z = world_point(&b, 0, 0)
+assert(near(x, -0.5) and near(y, 0.25) and near(z, -5), 'top-left pixel is left and up')
+local q: [4]ImVec2
+assert(world_corners(&cam, &b, &q))
+assert(q[0].x < q[1].x and q[0].y < q[3].y, 'corners are not mirrored when facing the viewer')
+assert(world_point_in_quad(&q, vec2(500, 250)))
+assert(not world_point_in_quad(&q, vec2(10, 10)))
+-- pitch tilts the top away from a viewer in front
+pl.pitch = 0.5
+b = world_basis(pl)
+x, y, z = world_point(&b, 50, 0)
+assert(z < -5, 'top edge leans back')
+print('math OK')
+
+-- Fake game: player at (10, 0, 20) facing +Z in zone 132; target entity 42.
+local function fake_object(which: cint, id: uint64, out: *GuObject): cint
+  $out = {}
+  if which == WORLD_PLAYER or (which == WORLD_BY_ID and id == 7) then
+    $out = { x = 10, y = 0, z = 20, rotation = 0, entity_id = 7, territory = 132, found = 1 }
+  elseif which == WORLD_TARGET or (which == WORLD_BY_ID and id == 42) then
+    $out = { x = 15, y = 0, z = 20, rotation = 1, entity_id = 42, territory = 132, found = 1 }
+  end
+  return 1
+end
+world_host.get_object = fake_object
+
+local root: string = arg[1]
+assert(policy_load(root), policy.error)
+
+local e = policy_world_command(1, 'here')
+assert(#e == 0, e)
+local pok, p = policy_world_place(1, 0, false)
+assert(pok and near(p.x, 10) and near(p.z, 22.5) and near(p.y, 1.7), 'here: 2.5 yalms in front, eye height')
+assert(near(p.yaw, math.pi), 'here: faces back toward the player')
+
+e = policy_world_command(2, 'target')
+assert(#e == 0, e)
+pok, p = policy_world_place(2, 0, false)
+assert(pok and near(p.x, 15) and near(p.y, 3.2))
+assert(near(p.yaw, -math.pi / 2), 'target: faces the player (-X)')
+
+e = policy_world_command(3, 'orbit 4 1')
+assert(#e == 0, e)
+pok, p = policy_world_place(3, 0, false)
+local d = math.sqrt((p.x - 10) ^ 2 + (p.z - 20) ^ 2)
+assert(pok and near(d, 4), 'orbit radius')
+local pok2, p2 = policy_world_place(3, 1.0, false)
+assert(pok2 and not near(p2.x, p.x), 'orbit moves with time')
+
+e = policy_world_command(4, 'bogus')
+assert(#e > 0, 'bad mode reports usage')
+e = policy_world_command(1, 'forget')
+pok = policy_world_place(1, 0, false)
+assert(not pok, 'forgotten anchor hides')
+print('OK')
+
+-- Animation hooks: deck out on show, restore on hide, taps rate-limited.
+local anim_log: stringbuilder
+local fake_base: uint16 = 0
+local function fake_anim_get(mode: *uint8, param: *uint8, base: *uint16, current: *uint16): cint
+  $mode = 1 $param = 0 $base = fake_base $current = fake_base
+  return 1
+end
+local function fake_anim_set(mode: uint8, param: uint8, base: uint16, use_set_mode: cint): cint
+  fake_base = base
+  anim_log:writef('set %d %d %d %d;', mode, param, base, use_set_mode)
+  return 1
+end
+local function fake_anim_play(id: uint16): cint
+  anim_log:writef('play %d;', id)
+  return 1
+end
+world_host.anim_get = fake_anim_get
+world_host.anim_set = fake_anim_set
+world_host.anim_play = fake_anim_play
+local function fake_anim_speed(slot: uint32, speed: float32): cint
+  anim_log:writef('speed %d %.1f;', slot, speed)
+  return 1
+end
+world_host.anim_speed = fake_anim_speed
+-- the shipped config keeps animation off; exercise it anyway
+assert(luaL_loadstring(policy.L, 'CONFIG.animation.enabled = true') == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+local ae = policy_anim_toggle(true)
+assert(#ae == 0, ae)
+policy_anim_frame(10.0)
+policy_anim_key(10.0)
+policy_anim_key(10.05)
+policy_anim_frame(10.1)   -- typing: faster loop
+fake_base = 3             -- the game swapped the pose
+policy_anim_frame(10.3)   -- guard puts the device back
+ae = policy_anim_toggle(false)
+assert(#ae == 0, ae)
+local alog = anim_log:promote()
+print(alog)
+assert(alog:find('set 1 0 0 1;play 3;set 255 0 6302 0;play 6302;', 1, true) == 1, 'SetMode(Normal) reset once, then device out without touching the mode')
+assert(alog:find('speed 0 1.8;', 1, true) > 0, 'typing speeds up the device loop')
+assert(alog:find('set 255 0 6302 0;play 6302;', 40, true) > 0, 'guard restores a swapped pose')
+assert(alog:find('speed 0 1.0;set 255 0 0 0;play 3;', 1, true) > 0, 'put away at normal speed, mode untouched')
+print('animation OK')
+
+-- Pets: around the character (camera plays no part), facing it, curved.
+e = policy_world_command(9, 'pet')
+assert(#e == 0, e)
+local petok, pet = policy_world_place(9, 5.0, false)
+assert(petok, 'pet placed')
+print('pet at', pet.x, pet.y, pet.z, 'yaw', pet.yaw, 'curve', pet.curve)
+local pdx, pdz = pet.x - 10, pet.z - 20
+local pr = math.sqrt(pdx * pdx + pdz * pdz)
+assert(pr >= 1520 / 660 / 2 + 0.6, 'pet keeps out of the character')
+assert(math.abs(pdx) > math.abs(pdz), 'pet sits beside a character facing +Z, not in front or behind')
+local fx, fz = math.sin(pet.yaw), math.cos(pet.yaw)
+assert(fx * -pdx + fz * -pdz > 0, 'pet faces the character')
+assert(pet.curve > 0, 'pets curve toward the character')
+print('pet OK')
+
+-- Screen -> panel pixels inverts the projection.
+do
+  local pl2: WorldPlacement = { x = 0.3, y = -0.2, z = -4, yaw = 0.4, pitch = 0.2, width = 800, height = 400, ppm = 300 }
+  local b2 = world_basis(pl2)
+  local q2: [4]ImVec2
+  assert(world_corners(&cam, &b2, &q2))
+  local px, py, pz = world_point(&b2, 600, 100)
+  local pok3, psx, psy = world_project(&cam, px, py, pz)
+  local uok, u, v = world_unproject(&q2, 800, 400, vec2(psx, psy))
+  print('unproject', u, v)
+  assert(pok3 and uok and math.abs(u - 600) < 0.5 and math.abs(v - 100) < 0.5, 'unproject round trip')
+end
+
+-- Resize and pet spacing.
+policy_world_resize(9, 1200, 700)
+local _, pet_r = policy_world_place(9, 6.0, false)
+assert(pet_r.width == 1200 and pet_r.height == 700, 'resize sticks')
+e = policy_world_command(10, 'pet')
+assert(#e == 0, e)
+for step = 0, 40 do
+  policy_world_place(9, 6.0 + step * 0.05, false)
+  policy_world_place(10, 6.0 + step * 0.05, false)
+end
+local _, pa = policy_world_place(9, 8.1, false)
+local _, pb = policy_world_place(10, 8.1, false)
+local sep = math.sqrt((pa.x - pb.x) ^ 2 + (pa.z - pb.z) ^ 2)
+print('pets separation', sep)
+assert(sep >= (1200 + 1520) / 660 / 2, 'pets do not overlap')
+assert(math.sqrt((pa.x - 10) ^ 2 + (pa.z - 20) ^ 2) >= 1200 / 660 / 2 + 0.6 - 0.01, 'pet 9 keeps clear of the character')
+assert(math.sqrt((pb.x - 10) ^ 2 + (pb.z - 20) ^ 2) >= 1520 / 660 / 2 + 0.6 - 0.01, 'pet 10 keeps clear of the character')
+print('resize/spacing OK')
+
+-- Persistence: the layout survives a reload keyed by agent session id.
+do
+  local entries: vector(LayoutEntry)
+  entries:push(LayoutEntry{ id = 9, agent = 77, view = 'world', font_scale = 1.2 })
+  entries:push(LayoutEntry{ id = 3, agent = 78, view = 'window', font_scale = 0 })
+  entries:push(LayoutEntry{ id = 4, agent = 79, view = 'min', font_scale = 0 })
+  policy_world_save(&entries)
+  entries:destroy()
+  assert(policy_load(root), policy.error) -- fresh Lua state, like a plugin reload
+  local v1, f1 = policy_world_restore(31, 77)
+  assert(v1 == 'world' and math.abs(f1 - 1.2) < 1e-6, 'agent 77 restored into the world with its zoom')
+  local v2 = policy_world_restore(32, 78)
+  assert(v2 == 'window', 'agent 78 restored as a floating window')
+  local v3 = policy_world_restore(33, 79)
+  assert(v3 == 'min', 'agent 79 restored minimized')
+  local v4 = policy_world_restore(34, 80)
+  assert(#v4 == 0, 'unknown agent: default placement')
+  local rok, rp = policy_world_place(31, 20.0, false)
+  assert(rok and rp.width == 1200, 'restored anchor keeps its size')
+  assert(not rp.run_occluded, 'screens sleep when unseen by default')
+  local e2 = policy_world_command(31, 'occluded on')
+  assert(#e2 == 0, e2)
+  local _, rp2 = policy_world_place(31, 20.1, false)
+  assert(rp2.run_occluded, 'run_occluded can be switched on')
+  print('persist OK')
+end
+
+-- Turning in place toward a pet must not move the pets (no spin feedback).
+do
+  e = policy_world_command(40, 'pet')
+  assert(#e == 0, e)
+  for step = 0, 60 do policy_world_place(40, 30 + step * 0.05, false) end
+  local _, before = policy_world_place(40, 33.1, false)
+  -- the character now turns in place (position unchanged)
+  local function turned(which: cint, id: uint64, out: *GuObject): cint
+    $out = { x = 10, y = 0, z = 20, rotation = 2.5, entity_id = 7, territory = 132, found = 1 }
+    return 1
+  end
+  world_host.get_object = turned
+  for step = 0, 60 do policy_world_place(40, 33.15 + step * 0.05, false) end
+  local _, after = policy_world_place(40, 36.3, false)
+  local moved = math.sqrt((after.x - before.x) ^ 2 + (after.z - before.z) ^ 2)
+  print('pet moved while turning in place', moved)
+  assert(moved < 0.5, 'pets hold their place when the character only turns')
+  world_host.get_object = fake_object
+  print('no spin OK')
+end
+
+-- Curved hit testing: a point on the curved surface maps back to its pixel.
+do
+  local plc: WorldPlacement = { x = 0, y = 0, z = -4, yaw = 0, width = 800, height = 400, ppm = 300, curve = 2.0 }
+  local bc = world_basis(plc)
+  local px, py, pz = world_point(&bc, 700, 300)
+  local _, sx2, sy2 = world_project(&cam, px, py, pz)
+  local ok2, hit, u, v = world_hit(&cam, &bc, vec2(sx2, sy2))
+  print('curved hit', hit, u, v)
+  assert(ok2 and hit and math.abs(u - 700) < 6 and math.abs(v - 300) < 6, 'curved hit test')
+  local _, hit2 = world_hit(&cam, &bc, vec2(5, 5))
+  assert(not hit2, 'miss off the panel')
+  print('curved hit OK')
+end
+
+-- Light: day is neutral, night is cool with a backlight.
+local env_day: float32 = 12 * 3600
+do
+  local function fake_env(day: *float32, rain: *float32, weather: *uint8): cint
+    $day = env_day $rain = 0 $weather = 1
+    return 1
+  end
+  world_host.get_environment = fake_env
+  local _, pday = policy_world_place(31, 40.0, false)
+  assert(math.abs(pday.tint_r - 1) < 0.01 and pday.backlight < 0.01, 'daylight is neutral')
+  env_day = 23 * 3600
+  local _, pnight = policy_world_place(31, 40.1, false)
+  print('night tint', pnight.tint_r, pnight.tint_g, pnight.tint_b, 'backlight', pnight.backlight)
+  assert(pnight.backlight > 0.3 and pnight.tint_b >= pnight.tint_r, 'night: cool light with a backlight')
+  print('light OK')
+end
+
+-- Settings persist: a value saved by lua/settings.lua overrides init.lua after a reload.
+do
+  local code: cstring = "CONFIG.settings.values['dropdown.height'] = 0.3 CONFIG.settings.values['world.pet.distance'] = 4.5 CONFIG.settings.save()"
+  assert(luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  assert(policy_load(root), policy.error)
+  assert(math.abs(policy.dropdown.height - 0.3) < 1e-6, 'saved dropdown height applied at load')
+  local probe: cstring = "assert(CONFIG.world.pet.distance == 4.5, 'saved pet distance applied')"
+  assert(luaL_loadstring(policy.L, probe) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, 'lua-side setting applied')
+  os.remove(root .. '/settings.lua')
+  print('settings OK')
+end
+
+-- Back faces read correctly: a panel facing away is mirrored back.
+do
+  local plb: WorldPlacement = { x = 0, y = 0, z = -5, yaw = math.pi, width = 100, height = 50, ppm = 100 }
+  local bb = world_basis(plb)
+  local qb: [4]ImVec2
+  assert(world_corners(&cam, &bb, &qb))
+  assert(world_backfacing(&qb), 'panel facing away is detected')
+  bb.mirror = true
+  assert(world_corners(&cam, &bb, &qb))
+  assert(not world_backfacing(&qb) and qb[0].x < qb[1].x, 'mirrored back reads left to right')
+  print('backface OK')
+end
+
+-- Character cut-out: panel pixels behind the character inside its silhouette fade.
+do
+  local occ_obj: GuObject = { x = 0, y = -1, z = -4, rotation = 0, found = 1, height = 1.6, hitbox_radius = 0.5 }
+  local occ = world_occluder(&cam, &occ_obj, vec2(0, 0))
+  assert(occ.active, 'occluder projected')
+  local _, cx, cy = world_project(&cam, 0, -0.2, -4)
+  assert(world_occluder_keep(&occ, cx, cy, 6) == 0, 'centre of the character is cut')
+  assert(world_occluder_keep(&occ, cx + 400, cy, 6) == 1, 'far to the side is kept')
+  assert(world_depth(&cam, 0, 0, -8) > occ.depth, 'a panel behind has larger depth')
+  print('occluder OK')
+end
+
+-- Selectable poses: switching the preset changes the held timeline.
+do
+  local code: cstring = "CONFIG.animation.preset = 'book' assert(CONFIG.animation.timeline() == 7357) CONFIG.animation.custom_timeline = 1234 assert(CONFIG.animation.timeline() == 1234) CONFIG.animation.custom_timeline = 0 CONFIG.animation.preset = 'device'"
+  assert(luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, 'pose presets')
+  print('poses OK')
+end
+
+-- Covers: light behind a (curved) panel is hidden, light in front of it or
+-- beside it is not.
+do
+  local cpl: WorldPlacement = { x = 0, y = 0, z = -4, yaw = 0, width = 300, height = 100, ppm = 100, curve = 1.5 }
+  local cb = world_basis(cpl)
+  local cover: WorldCover
+  assert(world_cover(&cam, &cb, 0.8, &cover))
+  local px, py, pz = world_point(&cb, 280, 50) -- near the edge, which wraps toward the camera
+  local _, sx2, sy2 = world_project(&cam, px, py, pz)
+  local d = world_depth(&cam, px, py, pz)
+  assert(near(world_cover_keep(&cam, &cover, sx2, sy2, d + 1), 0.2), 'behind: hidden by the opacity')
+  assert(world_cover_keep(&cam, &cover, sx2, sy2, d - 0.5) == 1, 'in front: shows')
+  assert(world_cover_keep(&cam, &cover, 5, 5, d + 1) == 1, 'beside: shows')
+  cpl.curve, cpl.yaw, cpl.width = 0, 1.2, 3000 -- turned and long enough to reach behind the camera
+  cb = world_basis(cpl)
+  assert(not world_cover(&cam, &cb, 1, &cover), 'a panel reaching behind the camera is no cover')
+  print('cover OK')
+end
+
+-- Depth test maths ------------------------------------------------------------------
+-- A camera like the game's: row vectors, reversed Z with an infinite far plane,
+-- near 0.1, FoV 0.78, at a 2560x1440 viewport.
+local function game_camera(ex: float64, ey: float64, ez: float64, yaw: float64, pitch: float64): GuCamera
+  local c: GuCamera = { width = 2560, height = 1440 }
+  local fx, fy, fz = math.sin(yaw) * math.cos(pitch), math.sin(pitch), math.cos(yaw) * math.cos(pitch)
+  local zx, zy, zz = -fx, -fy, -fz                  -- back
+  local xl = math.sqrt(zz * zz + zx * zx)
+  local xx, xy, xz = zz / xl, 0.0, -zx / xl         -- right = up x back
+  local yx, yy, yz = zy * xz - zz * xy, zz * xx - zx * xz, zx * xy - zy * xx
+  local v: [16]float64 = {
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(ex * xx + ey * xy + ez * xz), -(ex * yx + ey * yy + ez * yz), -(ex * zx + ey * zy + ez * zz), 1,
+  }
+  local f = 1 / math.tan(0.78 / 2)
+  local p: [16]float64 = { f * 1440 / 2560, 0, 0, 0, 0, f, 0, 0, 0, 0, 0, -1, 0, 0, 0.1, 0 }
+  for r = 0, < 4 do
+    for k = 0, < 4 do
+      local sum: float64 = 0
+      for j = 0, < 4 do sum = sum + v[r * 4 + j] * p[j * 4 + k] end
+      c.m[r * 4 + k] = sum
+    end
+  end
+  return c
+end
+
+do
+  local gc = game_camera(100, 5, -200, 0.6, -0.15)
+  -- (a) the inverse round-trips
+  local vp: [16]float64
+  for i = 0, < 16 do vp[i] = gc.m[i] end
+  local oki, inv = world_mat4_inverse(vp)
+  assert(oki, 'view-projection inverts')
+  for r = 0, < 4 do
+    for k = 0, < 4 do
+      local sum: float64 = 0
+      for j = 0, < 4 do sum = sum + vp[r * 4 + j] * inv[j * 4 + k] end
+      assert(math.abs(sum - (r == k and 1 or 0)) < 1e-6, 'M * inverse(M) = I')
+    end
+  end
+  local okc, ex, ey, ez = world_camera_position(&gc)
+  assert(okc and math.abs(ex - 100) < 1e-3 and math.abs(ey - 5) < 1e-3 and math.abs(ez + 200) < 1e-3, 'camera position from the matrix')
+  -- (b) reversed Z with an infinite far plane is recognised; standard Z is not
+  local okz, zn = world_reverse_infinite(&gc)
+  assert(okz and math.abs(zn - 0.1) < 1e-6, 'game camera: reversed Z, infinite, near 0.1')
+  local std = gc
+  std.m[2], std.m[6], std.m[10], std.m[14] = gc.m[3] * 1.0001, gc.m[7] * 1.0001, gc.m[11] * 1.0001, -0.1
+  assert(not world_reverse_infinite(&std), 'standard Z is rejected')
+  assert(not world_reverse_infinite(&cam), 'a matrix with no z column is rejected')
+  local okf = world_depth_frame(&std)
+  assert(not okf, 'no depth frame for a standard-Z camera')
+
+  -- (c) the shader's ray depth at every transformed vertex equals the vertex's
+  -- own depth: flat and curved panels, tilted, turned, and mirrored from behind
+  local verts: [1024]ImDrawVert
+  local uvs: [1024]ImVec2
+  local cmd: [1]ImDrawCmd
+  local okd, frame = world_depth_frame(&gc)
+  assert(okd, 'depth frame')
+  local curves: [3]float32 = { 0, 2, 8 }
+  local pitches: [2]float32 = { 0, 0.3 }
+  local turns: [4]float32 = { 0, 0.5, -0.7, math.pi }
+  local fwx, fwz = math.sin(0.6), math.cos(0.6)
+  local cases, mirrored = 0, 0
+  for ci = 0, < 3 do
+    for pi = 0, < 2 do
+      for ti = 0, < 4 do
+        -- 6 yalms ahead, facing back toward the camera, then turned
+        local pl3: WorldPlacement = { x = 100 + fwx * 6, y = 4.2, z = -200 + fwz * 6, yaw = 0.6 + math.pi + turns[ti],
+          pitch = pitches[pi], width = 1800, height = 1040, ppm = 640, curve = curves[ci] }
+        local b3 = world_basis(pl3)
+        local q3: [4]ImVec2
+        assert(world_corners(&gc, &b3, &q3), 'panel in view')
+        if world_backfacing(&q3) then b3.mirror = true mirrored = mirrored + 1 end
+        local n = 0
+        for gy = 0, 12 do
+          for gx = 0, 16 do
+            -- past the edges too, where the glow is drawn
+            local u, v = (@float32)(-60 + (1800 + 120) * gx / 16), (@float32)(-60 + (1040 + 120) * gy / 12)
+            uvs[n] = vec2(u, v)
+            verts[n] = { pos = vec2(u, v), col = 0xFFFFFFFF }
+            n = n + 1
+          end
+        end
+        local dl3: ImDrawList
+        cmd[0] = {}
+        dl3.CmdBuffer = { Size = 1, Capacity = 1, Data = (@*[0]ImDrawCmd)(&cmd) }
+        dl3.VtxBuffer = { Size = n, Capacity = 1024, Data = (@*[0]ImDrawVert)(&verts) }
+        world_transform_vertices(&dl3, 1, 0, &gc, &b3, vec2(0, 0), vec2(0, 0), 1, 0, 0, vec2(0, 0), nilptr)
+        local okp, params = world_depth_params(&frame, &gc, &b3, 2560, 1440, 1280, 720, 0.01, 1, 1)
+        assert(okp, 'params packed')
+        assert(params.v[36] == (@float32)(0.1) and params.v[39] == 1 and params.v[34] == 0.5 and params.v[32] == 2560, 'constants in their cbuffer slots')
+        assert(params.v[40] == 2560 and params.v[41] == 1440 and params.v[42] == 1280 and params.v[43] == 720, 'depth texture size in the last row')
+        for i = 0, < n do
+          local x3, y3, z3 = world_point(&b3, uvs[i].x, uvs[i].y)
+          local want = world_depth(&gc, x3, y3, z3)
+          local got = world_panel_ray_depth(&params, verts[i].pos.x, verts[i].pos.y)
+          if math.abs(got - want) > 1e-3 * want then
+            print('curve', curves[ci], 'pitch', pitches[pi], 'turn', turns[ti], 'mirror', b3.mirror, 'uv', uvs[i].x, uvs[i].y, 'want', want, 'got', got)
+            assert(false, 'ray depth matches the vertex depth')
+          end
+        end
+        cases = cases + 1
+      end
+    end
+  end
+  assert(cases == 24 and mirrored == 6, 'every case ran, the turned-away ones mirrored')
+  print('depth maths OK')
+end
+
+-- The per-panel projection world_transform_vertices uses matches projecting
+-- each world point: flat, gently curved (the series), strongly curved (sin and
+-- cos), mirrored, over a 33 x 17 grid reaching past the edges.
+do
+  local gc = game_camera(100, 5, -200, 0.6, -0.15)
+  local fwx, fwz = math.sin(0.6), math.cos(0.6)
+  local half_w: float32 = 1800 / 640 / 2
+  local curves: [3]float32 = { 0, 2.5 * half_w, 0.8 * half_w }
+  local worst_px, worst_w = 0.0, 0.0
+  for ci = 0, < 3 do
+    for mi = 0, 1 do
+      local pl: WorldPlacement = { x = 100 + fwx * 5, y = 4.6, z = -200 + fwz * 5, yaw = 0.6 + math.pi + 0.3,
+        pitch = 0.2, width = 1800, height = 1040, ppm = 640, curve = curves[ci] }
+      local b = world_basis(pl)
+      b.mirror = mi == 1
+      local pre = world_panel_projection(&gc, &b)
+      for gy = 0, 16 do
+        for gx = 0, 32 do
+          local u, v = (@float32)(-60 + 1920 * gx / 32), (@float32)(-60 + 1160 * gy / 16)
+          local x, y, z = world_point(&b, u, v)
+          local okw, wx, wy = world_project(&gc, x, y, z)
+          local okp, px, py, pw = world_project_uv(&pre, u, v)
+          assert(okw and okp, 'in front of the camera')
+          local dpx = math.max(math.abs(px - wx), math.abs(py - wy))
+          local dw = math.abs(pw - world_depth(&gc, x, y, z))
+          worst_px, worst_w = math.max(worst_px, dpx), math.max(worst_w, dw)
+          if dpx >= 0.25 or dw >= 1e-3 then
+            print('curve', curves[ci], 'mirror', b.mirror, 'uv', u, v, 'world', wx, wy, 'pre', px, py, 'w', pw)
+            assert(false, 'precomputed projection matches world_project(world_point)')
+          end
+        end
+      end
+    end
+  end
+  -- behind the camera: false, like world_project
+  local back: WorldPlacement = { x = 100 - fwx * 5, y = 4.6, z = -200 - fwz * 5, yaw = 0.6, width = 1800, height = 1040, ppm = 640 }
+  local bb = world_basis(back)
+  local preb = world_panel_projection(&gc, &bb)
+  assert(not world_project_uv(&preb, 900, 520), 'behind the camera')
+  print('panel projection OK: worst', worst_px, 'px', worst_w, 'w')
+end
+
+-- (d) CONFIG.world.occlusion: depth by default, capsule, off; anything else is depth
+do
+  assert(world_occlusion_mode('depth') == WORLD_OCCLUSION_DEPTH)
+  assert(world_occlusion_mode('capsule') == WORLD_OCCLUSION_CAPSULE)
+  assert(world_occlusion_mode('off') == WORLD_OCCLUSION_OFF)
+  assert(world_occlusion_mode('bogus') == WORLD_OCCLUSION_DEPTH)
+  assert(policy.world_occlusion == WORLD_OCCLUSION_DEPTH, 'lua/world.lua default is depth')
+  assert(math.abs(policy.world_occlusion_tolerance - 0.01) < 1e-6 and policy.world_occlusion_edge == 1, 'default tolerance and edge')
+  local function run_lua(code: cstring): void
+    assert(luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, code)
+    policy_refresh()
+  end
+  run_lua("CONFIG.world.occlusion = 'capsule' CONFIG.world.occlusion_edge = 2")
+  assert(policy.world_occlusion == WORLD_OCCLUSION_CAPSULE and policy.world_occlusion_edge == 2, 'settings changes apply live')
+  run_lua("CONFIG.world.occlusion_tolerance = 0 CONFIG.world.occlusion_edge = 9")
+  assert(math.abs(policy.world_occlusion_tolerance - 0.005) < 1e-6 and policy.world_occlusion_edge == 3, 'tolerance and edge are kept in range')
+  run_lua("CONFIG.world.occlusion_tolerance = 0.01 CONFIG.world.occlusion_edge = 1")
+  run_lua("CONFIG.world.occlusion = 'off'")
+  assert(policy.world_occlusion == WORLD_OCCLUSION_OFF)
+  run_lua("CONFIG.world.occlusion = 'nonsense'")
+  assert(policy.world_occlusion == WORLD_OCCLUSION_DEPTH, 'an unknown mode means depth')
+  print('occlusion config OK')
+end

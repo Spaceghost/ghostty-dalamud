@@ -1,0 +1,909 @@
+
+
+-- Terminals in the game world: pins and pets placed by lua/world.lua, layout
+-- persistence, sleeping unseen screens, hit testing, full screen, the
+-- double-click camera, occlusion by the scene (the depth test, or the
+-- character cut-out when that is unavailable) and derez in combat.
+require 'core.app.dropdown'
+require 'core.app.lights'
+require 'core.depthpass'
+
+-- World panels ------------------------------------------------------------------
+-- The camera DirH that looks along (dx, dz): DirH is calibrated against the
+-- real view direction, since its zero is not the world's.
+local function camera_heading_to(cam: *GuCamera, dir_h: float32, dx: float32, dz: float32): float32
+  local fx, _, fz = world_camera_forward(cam)
+  return dir_h - (@float32)(math.atan(fx, fz)) + (@float32)(math.atan(dx, dz))
+end
+
+-- /term showcase camera: steer to each shot in lua/showcase.lua, log when it has
+-- arrived (screenshots are taken then), hold, move on.
+local function showcase_camera(cam: *GuCamera, pc: *GuObject, now: float64): void
+  if host.showcase_moving then
+    if host.drop_focus or host.rmb_down then
+      logf(LOG_INFO, 'showcase: camera handed back to you')
+      host.showcase_shot, host.showcase_moving = 0, false
+    elseif not host.cam_active and now >= host.showcase_at then
+      logf(LOG_INFO, 'showcase: shot %d ready', host.showcase_shot)
+      host.showcase_moving = false
+      host.showcase_at = now + host.showcase_hold
+      host.showcase_shot = host.showcase_shot + 1
+    end
+    return
+  end
+  if now < host.showcase_at then return end
+  local ok, yaw, pitch, dist, hold = policy_showcase_shot(host.showcase_shot)
+  local ch: float32, cv: float32, cd: float32, cmin: float32 = 0, 0, 0, 0
+  if not ok or host.api.get_camera_state == nilptr or host.api.set_camera_state == nilptr
+     or host.api.get_camera_state(&ch, &cv, &cd, &cmin) == 0 then
+    logf(LOG_INFO, 'showcase: done')
+    host.showcase_shot = 0
+    return
+  end
+  local dir = pc.rotation + yaw
+  -- look from that side back at the character
+  host.cam_target_h = camera_heading_to(cam, ch, -(@float32)(math.sin(dir)), -(@float32)(math.cos(dir)))
+  host.cam_target_v = pitch
+  host.cam_target_d = dist
+  host.cam_active = true
+  host.cam_restore = false
+  host.showcase_hold = hold
+  host.showcase_moving = true
+  host.showcase_at = now + 1.0 -- let panels and pets settle after the move
+end
+
+-- Apply CONFIG.world_pins once the character is in the world (retried each
+-- second until the game reports a player).
+global function apply_world_pins(now: float64): void
+  if host.world_pins_done or now - host.world_pins_last_try < 1.0 then return end
+  host.world_pins_last_try = now
+  if #policy.world_pins == 0 or not (host.reattach_done or not host.agent_enabled) then
+    if #policy.world_pins == 0 then host.world_pins_done = true end
+    return
+  end
+  if not player_loaded() then return end -- title screen: try again later
+  for i = 0, < #policy.world_pins do
+    local s = session_new(policy.default_profile - 1, 80, 24)
+    if s == nilptr then break end
+    local err = policy_world_command(s.id, policy.world_pins[i])
+    if #err > 0 then
+      -- this pin cannot be placed (no target, bad arguments): the rest still can
+      logf(LOG_WARN, 'world pin "%s": %s', policy.world_pins[i], err)
+      err:destroy()
+      session_remove(s)
+      continue
+    end
+    host.world:push(s)
+    logf(LOG_INFO, 'session %d: pinned in world (%s)', s.id, policy.world_pins[i])
+  end
+  host.world_pins_done = true
+  set_world_visible(true)
+end
+
+-- The last counts draw_world logged (-1: log the next ones whatever they are).
+local diag_last_panels, diag_last_hidden, diag_last_behind = -1, -1, -1
+
+global function world_diag(msg: string): void
+  if msg == host.world_diag then return end
+  host.world_diag:destroy()
+  host.world_diag = msg:copy()
+  diag_last_panels = -1
+  logf(LOG_INFO, 'world: %s', msg)
+end
+
+-- Shells that exited (ctrl+d, `exit`) close their terminal shortly after, so
+-- the exit message flashes but nothing lingers.
+-- Close a terminal; world panels glitch out first (closed by draw_world).
+global function dismiss_terminal(s: *Session): void
+  for i = 0, < #host.world do
+    if host.world[i] == s then
+      if host.world_visible and host.world_rez > 0.01 and s.appear > 0.01 then
+        s.leaving = true
+        if host.world_focus == s.id then host.world_focus = 0 end
+        return
+      end
+      break
+    end
+  end
+  close_terminal(s)
+end
+
+global function reap_exited(now: float64): void
+  if not policy.close_on_exit then return end
+  local i: integer = #host.sessions - 1
+  while i >= 0 do
+    local s = host.sessions[i]
+    if s.process_exited then
+      if s.exited_at == 0 then
+        s.exited_at = now
+      elseif now - s.exited_at > 0.4 and s ~= host.popup_session and not s.leaving then
+        dismiss_terminal(s)
+      end
+    end
+    i = i - 1
+    if i >= #host.sessions then i = #host.sessions - 1 end
+  end
+end
+
+global function layout_push(out: *vector(LayoutEntry), list: *vector(*Session), view: cstring): void
+  for i = 0, < #$list do
+    local s = (@*vector(*Session))(list)[i]
+    if s.kind == TransportKind.Agent and not s.awaiting_open then
+      out:push(LayoutEntry{ id = s.id, agent = s.agent_id, view = view, font_scale = s.font_scale })
+    end
+  end
+end
+
+-- Save every terminal's place so a reload or game restart rebuilds the layout.
+global function save_world_state(): void
+  local entries: vector(LayoutEntry)
+  layout_push(&entries, &host.dropdown_tabs, 'tab')
+  layout_push(&entries, &host.windows, 'window')
+  layout_push(&entries, &host.minimized, 'min')
+  layout_push(&entries, &host.world, 'world')
+  policy_world_save(&entries)
+  entries:destroy()
+end
+
+-- World screens nobody can see stop streaming after a moment (unless marked
+-- run_occluded); they wake with their screen replayed when seen again.
+global function sleep_unseen(now: float64): void
+  for i = 0, < #host.world do
+    local s = host.world[i]
+    if s.last_seen == 0 then s.last_seen = now end
+    -- A woken screen is rebuilt from the agent's replay, which loses the
+    -- alternate screen and mouse modes of full-screen programs: those stay
+    -- awake, and the rest wait long enough that a camera turn does not rebuild them.
+    if not s.sleeping and not s.run_occluded and now - s.last_seen > 30.0
+       and (s.view.term == nilptr or not ghostty_terminal_mode_enabled(s.view.term, 1049, false)) then
+      s:sleep()
+    end
+  end
+end
+
+local function policy_lua(): *lua_State
+  if policy.loaded then return policy.L end
+  return nilptr
+end
+
+-- CONFIG.world tuning, read from Lua twice a second (and whenever the Lua
+-- state changes) instead of every frame.
+local tuning: WorldTuning
+local tuning_L: *lua_State = nilptr
+local tuning_at: float64 = -1
+local function read_tuning(now: float64): void
+  local L = policy_lua()
+  if tuning_at < 0 or L ~= tuning_L or now - tuning_at >= 0.5 or now < tuning_at then
+    tuning = world_read_tuning(L)
+    tuning_L, tuning_at = L, now
+  end
+  host.world_tuning = tuning
+end
+
+-- Walking up to a clicked panel -------------------------------------------------
+-- lua/world.lua decides which panels and how; world_walk_step decides each
+-- frame; the shim's hook on the game's walk input asks gu_walk_input (in
+-- core/host.nelua) which way to go while a walk holds, exactly as if the
+-- player steered, and leaves real player input untouched.
+local WALK_ENDS: [11]string = { '', 'arrived', 'player moved', 'focus lost', 'combat', 'mounted', 'no character', 'timed out', 'blocked', 'went the wrong way', 'cancelled' }
+
+-- W A S D Q E as the player holds them. GetAsyncKeyState reads the keyboard
+-- itself, so our hold in the game's key state never shows up here.
+local function movement_keys_down(): boolean
+  ## if ccinfo.is_windows then
+    local keys: [6]cint = { 0x57, 0x41, 0x53, 0x44, 0x51, 0x45 }
+    for i = 0, < 6 do
+      if (GetAsyncKeyState(keys[i]) & 0x8000) ~= 0 then return true end
+    end
+  ## end
+  return false
+end
+-- The keyboard read walk_tick uses; tests put a fake here.
+global world_movement_keys: function(): boolean = movement_keys_down
+
+local function end_walk(why: integer): void
+  if host.walk.id == 0 and not host.walk.holding then return end
+  world_walk_stop(&host.walk, why)
+  logf(LOG_INFO, 'walk: %s', WALK_ENDS[why])
+end
+
+-- Stop steering, whatever comes next (shutdown, reload).
+global function release_walk(): void
+  end_walk(WORLD_WALK_CANCELLED)
+end
+
+local function start_walk(id: integer, tx: float32, tz: float32, pc: *GuObject, now: float64): void
+  local tn = &host.world_tuning
+  if not tn.walk or pc.found == 0 or pc.in_combat ~= 0 or pc.mounted ~= 0 then return end
+  if not world_lua_walkable(policy_lua(), id) then return end
+  end_walk(WORLD_WALK_CANCELLED) -- another click restarts
+  world_walk_start(&host.walk, id, now, pc.x, pc.z, tx, tz)
+end
+
+-- Runs every frame before anything can return early.
+local function walk_tick(now: float64): void
+  local dt = (@float32)(math.clamp(now - host.walk_time, 0, 0.1))
+  host.walk_time = now
+  if host.walk.id == 0 then return end
+  local pc: GuObject
+  local found = host.api.get_object ~= nilptr and host.api.get_object(WORLD_PLAYER, 0, &pc) ~= 0 and pc.found ~= 0
+  local tn = &host.world_tuning
+  local inp: WorldWalkInput = {
+    now = now, dt = dt, focus_id = host.world_focus,
+    -- WASD typed into a focused terminal is text, not the player walking
+    user_input = host.drop_focus or host.walk_user_moved or (not host.terminal_focused and world_movement_keys()),
+    found = found, in_combat = pc.in_combat ~= 0, mounted = pc.mounted ~= 0,
+    x = pc.x, z = pc.z, rotation = pc.rotation,
+    approach = tn.walk_approach, max_seconds = tn.walk_max_seconds,
+    turn_speed = tn.walk_turn_speed, stuck_seconds = tn.walk_stuck_seconds,
+  }
+  local st = world_walk_step(&host.walk, inp)
+  if st.turn and host.api.set_rotation ~= nilptr then host.api.set_rotation(st.rotation) end
+  host.walk_user_moved = false
+  if host.walk.id == 0 then logf(LOG_INFO, 'walk: %s', WALK_ENDS[host.walk.ended]) end
+end
+
+-- Presenting the focused panel ----------------------------------------------------
+-- Eases toward the presented pose while the panel has focus and back after;
+-- walkable panels float toward where the character will stand, others toward
+-- a point in front of the camera.
+local function present_panel(s: *Session, pl: *WorldPlacement, cam: *GuCamera, occ: *WorldOccluder, pc: *GuObject, wdt: float32, full_this: boolean): void
+  local tn = &host.world_tuning
+  local target: float32 = (tn.present and host.world_focus == s.id and not full_this) and 1 or 0
+  s.present_t, s.present_v = world_ease(s.present_t, s.present_v, target, wdt, tn.present_ease)
+  if s.present_t <= 0.0001 then return end
+  local cok, cx, cy, cz = world_camera_position(cam)
+  if not cok then return end
+  local pr: WorldPresent = {
+    cam_x = cx, cam_y = cy, cam_z = cz,
+    fraction = tn.present_fraction, min_distance = tn.present_min_distance,
+    curve_relax = tn.present_curve_relax, margin = tn.present_margin,
+  }
+  if occ.active then pr.occ_depth = occ.depth end
+  local eye = pc.found ~= 0 and pc.y + tn.present_eye_height or cy
+  local ax, az = pc.x - pl.x, pc.z - pl.z
+  local alen = math.sqrt(ax * ax + az * az)
+  if pc.found ~= 0 and alen > 0.01 and tn.walk and world_lua_walkable(policy_lua(), s.id) then
+    pr.vx, pr.vy, pr.vz = pl.x + ax / alen * tn.walk_approach, eye, pl.z + az / alen * tn.walk_approach
+    pr.gx, pr.gy, pr.gz = pr.vx, pr.vy, pr.vz
+  else
+    local fx, _, fz = world_camera_forward(cam)
+    local fl = math.sqrt(fx * fx + fz * fz)
+    if fl < 1e-3 then fx, fz, fl = 0, 1, 1 end
+    pr.vx, pr.vy, pr.vz = cx, cy, cz
+    pr.gx, pr.gy, pr.gz = cx + fx / fl * tn.present_distance, eye, cz + fz / fl * tn.present_distance
+  end
+  $pl = world_present_pose(cam, $pl, &pr, s.present_t)
+end
+
+-- Head and eyes follow the focused panel, when the shim provides it.
+local function update_look_at(active: boolean, x: float32, y: float32, z: float32): void
+  if host.api.set_look_at == nilptr or (not active and not host.look_at_on) then return end
+  host.look_at_on = active
+  host.api.set_look_at(active and 1 or 0, x, y, z)
+end
+
+-- Let the head go on shutdown: the game must not keep aiming at a panel of a
+-- core that is gone.
+global function release_look_at(): void
+  update_look_at(false, 0, 0, 0)
+end
+
+-- Let go of what the core makes the game show or do: panel lights, the
+-- character animation, the walk and the head aim. gu_shutdown, /term reload
+-- and the kill switch all do this.
+global function teardown_effects(): void
+  lights_destroy_all()
+  local anim_err = policy_anim_toggle(false)
+  anim_err:destroy()
+  host.anim_out = false
+  release_walk() -- stop steering before the hook can call a core that is gone
+  release_look_at()
+end
+
+-- Title button: a moon when the screen sleeps unseen, play when it keeps running.
+local function draw_occluded_icon(dl: *ImDrawList, x: float32, y: float32, running: boolean, ink: uint32): void
+  if running then
+    imgui.DrawListAddTriangleFilled(dl, vec2(x + 9, y + 6), vec2(x + 9, y + 20), vec2(x + 20, y + 13), ink)
+    return
+  end
+  -- crescent: an arc open to the upper right, thick in the middle
+  local SEG <comptime> = 10
+  local a0, a1 = math.pi / 12, 17 * math.pi / 12
+  for k = 0, < SEG do
+    local ta, tb = a0 + (a1 - a0) * k / SEG, a0 + (a1 - a0) * (k + 1) / SEG
+    local w = 1.2 + 3.5 * math.sin(math.pi * (k + 0.5) / SEG)
+    imgui.DrawListAddLine(dl, vec2(x + 13 + 7 * math.cos(ta), y + 13 + 7 * math.sin(ta)),
+      vec2(x + 13 + 7 * math.cos(tb), y + 13 + 7 * math.sin(tb)), ink, w)
+  end
+end
+
+-- Placing panels by dragging ------------------------------------------------------
+-- Alt + left-drag carries a panel along the cursor ray; world_drag_step (in
+-- core/world.nelua) runs the gesture, lua/world.lua drop() pins it on release.
+
+-- Alt, Shift, Ctrl as held (raw on Windows: the game may have the keyboard).
+local function drag_mods(): (boolean, boolean, boolean)
+  ## if ccinfo.is_windows then
+    return (GetAsyncKeyState(0x12) & 0x8000) ~= 0, (GetAsyncKeyState(0x10) & 0x8000) ~= 0, (GetAsyncKeyState(0x11) & 0x8000) ~= 0
+  ## else
+    local io = imgui.GetIO()
+    return io.KeyAlt, io.KeyShift, io.KeyCtrl
+  ## end
+end
+
+local function draw_crosshair(dl: *ImDrawList, x: float32, y: float32, r: float32, col: uint32, thick: float32): void
+  local gap = r * 0.3
+  imgui.DrawListAddLine(dl, vec2(x - r, y), vec2(x - gap, y), col, thick)
+  imgui.DrawListAddLine(dl, vec2(x + gap, y), vec2(x + r, y), col, thick)
+  imgui.DrawListAddLine(dl, vec2(x, y - r), vec2(x, y - gap), col, thick)
+  imgui.DrawListAddLine(dl, vec2(x, y + gap), vec2(x, y + r), col, thick)
+end
+
+-- The grip on a panel under Alt (or being carried), in panel pixels: an outline
+-- in short segments so it bends with a curved panel, and a crosshair where it is held.
+local function draw_drag_grip(dl: *ImDrawList, o: ImVec2, w: float32, h: float32, u: float32, v: float32): void
+  local col, shade = im_col32(120, 220, 255, 240), im_col32(0, 20, 30, 160)
+  local SEG <comptime> = 24
+  for pass = 0, 1 do
+    local c, t = pass == 0 and shade or col, (@float32)(pass == 0 and 12 or 6)
+    for k = 0, < SEG do
+      local xa, xb = o.x + w * k / SEG, o.x + w * (k + 1) / SEG
+      imgui.DrawListAddLine(dl, vec2(xa, o.y + 3), vec2(xb, o.y + 3), c, t)
+      imgui.DrawListAddLine(dl, vec2(xa, o.y + h - 3), vec2(xb, o.y + h - 3), c, t)
+    end
+    imgui.DrawListAddLine(dl, vec2(o.x + 3, o.y), vec2(o.x + 3, o.y + h), c, t)
+    imgui.DrawListAddLine(dl, vec2(o.x + w - 3, o.y), vec2(o.x + w - 3, o.y + h), c, t)
+    draw_crosshair(dl, o.x + u, o.y + v, 56, c, t + 1)
+  end
+end
+
+-- Where a snapped panel will land, over the world: outline, faint fill, and
+-- the point under the cursor.
+local function draw_drop_ghost(dl: *ImDrawList, cam: *GuCamera, vp: ImVec2, pl: WorldPlacement, s: *WorldSnap, fitted: boolean): void
+  local b = world_basis(pl)
+  local q: [4]ImVec2
+  if not world_corners(cam, &b, &q) then return end
+  local col = fitted and im_col32(140, 240, 150, 240) or im_col32(120, 220, 255, 240)
+  local fill = fitted and im_col32(140, 240, 150, 40) or im_col32(120, 220, 255, 32)
+  for i = 0, < 4 do q[i] = vec2(q[i].x + vp.x, q[i].y + vp.y) end
+  imgui.DrawListAddTriangleFilled(dl, q[0], q[1], q[2], fill)
+  imgui.DrawListAddTriangleFilled(dl, q[0], q[2], q[3], fill)
+  for i = 0, < 4 do imgui.DrawListAddLine(dl, q[i], q[(i + 1) % 4], col, 2.5) end
+  local ok, sx, sy = world_project(cam, s.x, s.y, s.z)
+  if ok then draw_crosshair(dl, sx + vp.x, sy + vp.y, 12, col, 2) end
+end
+
+-- After the panels: advance the gesture, show where a snap lands, pin on release.
+local function drag_tick(dl: *ImDrawList, cam: *GuCamera, vp: ImVec2, inp: WorldDragInput, carried: WorldPlacement,
+                         ray_ok: boolean, ox: float32, oy: float32, oz: float32, dx: float32, dy: float32, dz: float32, now: float64): void
+  local tn = &host.world_tuning
+  local d = &host.drag
+  local st = world_drag_step(d, inp)
+  if st.started then
+    host.click_used = true
+    logf(LOG_INFO, 'session %d: picked up', st.id)
+  end
+  -- keep the press from the game (a left press there turns the camera and hides the cursor)
+  if (st.armed and not host.lmb_down and not host.rmb_down) or st.dragging then imgui.SetNextFrameWantCaptureMouse(true) end
+  if not st.dragging and not st.dropped then return end
+  local pose = carried
+  local fit_w: float32, fit_h: float32 = 0, 0
+  if st.snap and ray_ok and host.api.raycast ~= nilptr then
+    local snap = world_snap(host.api.raycast, ox, oy, oz, dx, dy, dz, tn.drag_reach, tn.drag_probe)
+    if snap.ok then
+      pose = world_snap_pose(carried, &snap, ox, oz, tn.drag_offset)
+      if st.fit then
+        -- measuring the surface costs many rays: again only once the snap point moves
+        local moved = (snap.x - d.fit_x) ^ 2 + (snap.y - d.fit_y) ^ 2 + (snap.z - d.fit_z) ^ 2 > 0.02 * 0.02
+        if d.fit_time <= 0 or (moved and (st.dropped or now - d.fit_time > 0.15)) then
+          d.fit = world_fit(host.api.raycast, &snap, pose.yaw, pose.pitch, tn.drag_fit_max, tn.drag_fit_step,
+                            tn.drag_fit_margin, tn.drag_fit_min, tn.drag_fit_tolerance)
+          d.fit_x, d.fit_y, d.fit_z, d.fit_time = snap.x, snap.y, snap.z, now
+        end
+        if d.fit.ok then
+          pose = world_fit_pose(pose, &d.fit)
+          fit_w, fit_h = d.fit.w, d.fit.h
+        end
+      end
+      if st.dragging then draw_drop_ghost(dl, cam, vp, pose, &snap, fit_w > 0) end
+    end
+  end
+  if st.dropped then
+    local err = policy_world_drop(st.id, pose, fit_w, fit_h)
+    if #err > 0 then
+      logf(LOG_WARN, 'session %d: drop failed: %s', st.id, err)
+    else
+      logf(LOG_INFO, 'session %d: pinned at (%.2f, %.2f, %.2f) yaw %.2f pitch %.2f%s', st.id, pose.x, pose.y, pose.z,
+        pose.yaw, pose.pitch, fit_w > 0 and ', stretched to fit' or '')
+      save_world_state()
+    end
+    err:destroy()
+  end
+end
+
+-- Ease the camera toward the double-clicked panel, or its zoom back out
+-- afterwards. Runs with no panels too: closing the last one still gives the
+-- zoom back. Turning the camera yourself takes it over.
+local cam_written_h: float32 = 0 -- heading written last frame
+local cam_written = false
+local function camera_tick(wdt: float32): void
+  if not host.cam_active then cam_written = false end
+  -- leaving full screen after a double-click: give the camera its zoom back
+  if host.world_full_id == 0 and host.cam_saved_d > 0 and not host.cam_restore then
+    host.cam_active = false
+    host.cam_restore = true
+  end
+  -- the player takes the camera back by moving or turning it themselves
+  if host.drop_focus or host.rmb_down then host.cam_active = false end
+  if host.api.get_camera_state == nilptr or host.api.set_camera_state == nilptr or not (host.cam_active or host.cam_restore) then
+    cam_written = false
+    return
+  end
+  local ch: float32, cv: float32, cd: float32, cmin: float32 = 0, 0, 0, 0
+  if host.api.get_camera_state(&ch, &cv, &cd, &cmin) == 0 then return end
+  local e = (@float32)(1 - math.exp(-wdt * 8))
+  if host.cam_active and cam_written
+     and math.abs(((ch - cam_written_h) + (@float32)(math.pi)) % (@float32)(2 * math.pi) - (@float32)(math.pi)) > 0.05 then
+    -- not where we left it: the player is turning it (left drag, controller)
+    host.cam_active = false
+    cam_written = false
+  end
+  if host.cam_active then
+    local dh = host.cam_target_h - ch
+    dh = (dh + (@float32)(math.pi)) % (@float32)(2 * math.pi) - (@float32)(math.pi)
+    local nh, nv, nd = ch + dh * e, cv + (host.cam_target_v - cv) * e, cd + (host.cam_target_d - cd) * e
+    host.api.set_camera_state(nh, nv, nd)
+    cam_written_h, cam_written = nh, true
+    if math.abs(dh) < 0.01 and math.abs(nd - host.cam_target_d) < 0.05 then
+      host.cam_active = false
+      cam_written = false
+    end
+  elseif host.cam_restore then
+    local nd = cd + (host.cam_saved_d - cd) * e
+    host.api.set_camera_state(ch, cv, nd)
+    if math.abs(nd - host.cam_saved_d) < 0.05 then host.cam_restore = false host.cam_saved_d = 0 end
+  end
+end
+
+global function draw_world(now: float64): void
+  defer lights_sync() end -- panel lights: however this frame ends
+  sleep_unseen(now)
+  host.world_covers:clear()
+  read_tuning(now)
+  walk_tick(now)
+  if host.world_focus == 0 then update_look_at(false, 0, 0, 0) end
+  local wdt = (@float32)(math.clamp(now - host.world_last_time, 0, 0.1))
+  host.world_last_time = now
+  camera_tick(wdt)
+  if #host.world == 0 then return end
+  if host.api.get_camera == nilptr then world_diag('shim has no camera callback') return end
+  local cam: GuCamera
+  if host.api.get_camera(&cam) == 0 or cam.width < 1 or cam.height < 1 then world_diag('no camera') return end
+  local vp = imgui.GetMainViewport().Pos
+  local dl = imgui.GetBackgroundDrawList()
+  local mouse: ImVec2
+  imgui.GetMousePos(&mouse)
+  local rel = vec2(mouse.x - vp.x, mouse.y - vp.y)
+  -- a click that no ImGui window took decides world focus
+  -- derez in combat, rez back afterwards
+  local pc: GuObject
+  local in_combat = host.api.get_object ~= nilptr and host.api.get_object(WORLD_PLAYER, 0, &pc) ~= 0 and pc.found ~= 0 and pc.in_combat ~= 0
+  -- combat and hiding (ctrl+shift+`) glitch the panels out; showing glitches them in
+  local rez_target: float32 = (in_combat or not host.world_visible) and 0 or 1
+  local rez_speed: float32 = rez_target == 0 and 2.2 or 1.6 -- per second
+  if host.world_rez < rez_target then host.world_rez = math.min(rez_target, host.world_rez + wdt * rez_speed)
+  elseif host.world_rez > rez_target then host.world_rez = math.max(rez_target, host.world_rez - wdt * rez_speed) end
+  if host.world_rez <= 0.001 then
+    host.world_focus = 0
+    host.drag.id = 0
+    return
+  end
+
+  -- World panels never take the mouse from the game (so camera turns, mouse
+  -- movement and autorun keep working over them); clicks are read raw.
+  -- full-screen transition: fly out of the world onto the screen and back
+  if host.world_full_id ~= 0 and (host.drop_focus or host.world_rez < 0.9) then host.world_full_id = 0 end
+  if host.showcase_shot > 0 and pc.found ~= 0 then showcase_camera(&cam, &pc, now) end
+  do
+    local target: float32 = host.world_full_id ~= 0 and 1 or 0
+    -- a critically damped spring: starts gently, arrives without a bump
+    host.world_full_t, host.world_full_v = world_ease(host.world_full_t, host.world_full_v, target, wdt, host.world_tuning.full_ease)
+    host.world_full_t = math.clamp(host.world_full_t, 0, 1)
+    if host.world_full_t <= 0 and host.world_full_id == 0 then host.world_full_last = 0 end
+  end
+  local FULL_MARGIN: float32 <comptime> = 36
+
+  -- what hides panel pixels behind the scene: the game's depth when it can be
+  -- used, else your character as a screen-space cut-out
+  local occlusion = depthpass_select(policy.world_occlusion, host.api.get_scene_depth, &cam, log)
+  -- your character, as a screen-space cut-out (also keeps presented panels in front of it)
+  local occ = world_occluder(&cam, &pc, vp)
+
+  local click = host.lmb_pressed
+  local over_window = imgui.IsWindowHovered(ImGuiHoveredFlags_AnyWindow)
+  if click and over_window then host.world_focus = 0 end -- clicking an ImGui window moves focus there
+  -- Alt + drag carries a panel: those presses are the gesture's, not the panels'
+  local tuning = &host.world_tuning
+  local alt, shift, ctrl = drag_mods()
+  local ray_ok, ray_ox, ray_oy, ray_oz, ray_dx, ray_dy, ray_dz = world_cursor_ray(&cam, rel.x, rel.y)
+  local drag_alt = tuning.drag and alt
+  if host.drag.id ~= 0 or drag_alt then click = false end
+  local drag_in: WorldDragInput = {
+    enabled = tuning.drag, alt = alt, shift = shift, ctrl = ctrl,
+    lmb_down = host.lmb_down, lmb_pressed = host.lmb_pressed, rmb_down = host.rmb_down,
+    over_window = over_window, wheel = imgui.GetIO().MouseWheel,
+    wheel_step = tuning.drag_wheel_step, min_distance = tuning.drag_min_distance, max_distance = tuning.drag_max_distance,
+  }
+  local carried_pl: WorldPlacement
+  local clicked = click and not over_window
+  local clicked_any = false
+  local diag_hidden, diag_behind = 0, 0
+  local diag_drawn = false -- the first drawn panel, for the log line
+  local diag_pl: WorldPlacement
+  local diag_q: [4]ImVec2
+  local look_on = false
+  local look_x: float32, look_y: float32, look_z: float32 = 0, 0, 0
+  for i = 0, < #host.world do
+    local s = host.world[i]
+    -- each panel glitches in when it appears or wakes, and out before it closes
+    local appear_target: float32 = s.leaving and 0 or 1
+    if s.appear < appear_target then s.appear = math.min(appear_target, s.appear + wdt * 2.0)
+    elseif s.appear > appear_target then s.appear = math.max(appear_target, s.appear - wdt * 2.6) end
+    local prez = host.world_rez * s.appear
+    local ok, pl = policy_world_place(s.id, now, host.world_focus == s.id)
+    if not ok then diag_hidden = diag_hidden + 1 end
+    -- the full-screen terminal (or the one flying back) takes the screen's size
+    local full_this = s.id == host.world_full_id or (host.world_full_id == 0 and s.id == host.world_full_last)
+    local ft: float32 = full_this and host.world_full_t or 0
+    -- carried by the cursor: follows the ray instead of its anchor (light and all)
+    local carried = ok and host.drag.id == s.id
+    if carried then
+      drag_in.shown = ft <= 0
+      if ray_ok then pl = world_drag_pose(pl, ray_ox, ray_oy, ray_oz, ray_dx, ray_dy, ray_dz, host.drag.dist, host.drag.u, host.drag.v) end
+      carried_pl = pl
+    end
+    light_panel(s.id, ok and not s.sleeping, &pl, prez * (1 - ft))
+    -- a double-clicked panel flies to a centred rectangle covering full_screen of the view
+    local fsz = host.world_tuning.full_screen
+    local fw = math.max(cam.width * fsz, 320)
+    local fh = math.max(cam.height * fsz, 200)
+    if fsz >= 0.999 then fw, fh = cam.width - 2 * FULL_MARGIN, cam.height - 2 * FULL_MARGIN end
+    local full_at = vec2(vp.x + (cam.width - fw) * 0.5, vp.y + (cam.height - fh) * 0.5)
+    -- where it was placed (walk target), then the presented pose on top
+    local placed_x, placed_z = pl.x, pl.z
+    if ok then
+      if host.walk.id == s.id then host.walk.tx, host.walk.tz = placed_x, placed_z end
+      if not carried then present_panel(s, &pl, &cam, &occ, &pc, wdt, full_this) end
+    end
+    -- mid-flight the terminal keeps the grid of its world size, so the shell is
+    -- resized once when the flight ends instead of on every frame of it
+    local grid_w, grid_h = pl.width, pl.height
+    if ok and full_this and ft > 0 then
+      local nw, nh = pl.width + (fw - pl.width) * ft, pl.height + (fh - pl.height) * ft
+      pl.ppm = pl.ppm * nw / pl.width -- keep the world-space size while the pixels grow
+      pl.width, pl.height = nw, nh
+      pl.curve = pl.curve * (1 - ft)
+    end
+    if ok then
+      local b = world_basis(pl)
+      local q: [4]ImVec2
+      local visible = world_corners(&cam, &b, &q)
+      -- seen from behind: flip so it reads the same as the front, and fade it
+      if visible and world_backfacing(&q) then
+        b.mirror = true
+        visible = world_corners(&cam, &b, &q)
+        pl.opacity = pl.opacity * 0.55
+      end
+      local minx, maxx, miny, maxy = q[0].x, q[0].x, q[0].y, q[0].y
+      if visible then
+        for ci = 1, < 4 do
+          minx, maxx = math.min(minx, q[ci].x), math.max(maxx, q[ci].x)
+          miny, maxy = math.min(miny, q[ci].y), math.max(maxy, q[ci].y)
+        end
+        -- a little slack for the curve bulging past the corners
+        local slack = (maxx - minx) * 0.1
+        if maxx < -slack or minx > cam.width + slack or maxy < -slack or miny > cam.height + slack then
+          visible = false -- off screen: sleep (no layout, no drawing)
+        end
+      end
+      if ft >= 0.999 then visible = true end -- full screen: independent of the world view
+      if not visible then
+        diag_behind = diag_behind + 1
+      elseif not diag_drawn then
+        diag_drawn, diag_pl, diag_q = true, pl, q
+      end
+      s.run_occluded = pl.run_occluded
+      if visible then
+        s.last_seen = now
+        if s.sleeping then
+          s:wake()
+          s.woke_at = now
+        end
+        local uok, hovered, mu, mv = world_hit(&cam, &b, rel)
+        if ft >= 0.5 then
+          uok = true
+          mu, mv = mouse.x - full_at.x, mouse.y - full_at.y
+          hovered = mu >= 0 and mv >= 0 and mu < pl.width and mv < pl.height
+        end
+        -- the panel an Alt press would pick up, and how far out along the ray it is held
+        if hovered and ft <= 0 and prez > 0.9 and host.world_visible and not over_window and ray_ok then
+          local gx, gy, gz = world_point(&b, mu, mv)
+          drag_in.hover_id, drag_in.hover_u, drag_in.hover_v = s.id, mu, mv
+          drag_in.hover_dist = math.sqrt((gx - ray_ox) ^ 2 + (gy - ray_oy) ^ 2 + (gz - ray_oz) ^ 2)
+        end
+        -- resize grips: right edge, bottom edge, bottom-right corner (panel pixels)
+        local GRIP: float32 <comptime> = 28
+        local grip = 0
+        if uok and mu > -GRIP and mv > -GRIP and mu < pl.width + GRIP and mv < pl.height + GRIP then
+          if mu > pl.width - GRIP then grip = grip | 1 end
+          if mv > pl.height - GRIP then grip = grip | 2 end
+        end
+        -- title buttons along the top-right edge
+        local button = uok and world_title_button(pl.width, mu, mv) or WORLD_BUTTON_NONE
+        local on_close = button == WORLD_BUTTON_CLOSE
+        local on_full = button == WORLD_BUTTON_FULL
+        local on_popin = button == WORLD_BUTTON_POPIN
+        local on_occluded = button == WORLD_BUTTON_OCCLUDED
+        if button ~= WORLD_BUTTON_NONE then grip = 0 end
+        if ft > 0 then grip = 0 end -- no resizing while full screen
+        -- text selection on the grid (drawn 16 px in); grips and buttons win
+        local tx, ty = mu - 16, mv - 16
+        local on_grid = hovered and grip == 0 and button == WORLD_BUTTON_NONE and not over_window
+          and prez > 0.9 and host.world_visible and tx >= 0 and ty >= 0 and tx < pl.width - 32 and ty < pl.height - 32
+        -- only the focused panel starts a selection: the press that focuses one is the game's too
+        local selected_unit = terminal_mouse(s, tx, ty, uok, click and on_grid and host.world_focus == s.id, host.lmb_down, now)
+        -- the wheel reaches us only over the focused panel (it claims the mouse);
+        -- elsewhere it stays the game's camera zoom
+        if host.world_focus == s.id and on_grid then terminal_wheel(s, tx, ty) end
+        if s.sel.dragging then imgui.SetNextFrameWantCaptureMouse(true) end -- our own drag
+        -- A focused panel claims the mouse while hovered and no button is held, so
+        -- a left press selects text instead of starting a camera turn (the game
+        -- would otherwise get the press first and lock the cursor). Unfocused
+        -- panels never claim it: camera turns and mouse walking stay the game's.
+        if host.world_focus == s.id and (hovered or grip ~= 0) and not over_window and prez > 0.9
+           and host.world_visible and not host.lmb_down and not host.rmb_down then
+          imgui.SetNextFrameWantCaptureMouse(true)
+        end
+        if (hovered or grip ~= 0) and not over_window and prez > 0.9 and host.world_visible then
+          if click then host.click_used = true end
+          if click and on_close then
+            host.world_close_id = s.id
+          elseif click and on_full then
+            host.world_full_toggle_id = s.id
+          elseif click and on_popin then
+            host.world_popin_id = s.id
+          elseif click and on_occluded then
+            host.world_occluded_toggle_id = s.id
+          end
+          if click and grip ~= 0 and host.world_focus == s.id then
+            host.world_drag_id = s.id
+            host.world_drag_mode = grip
+            host.world_drag_u0, host.world_drag_v0 = mu, mv
+            host.world_drag_w0, host.world_drag_h0 = pl.width, pl.height
+          end
+          if clicked then
+            host.world_focus = s.id
+            -- the keyboard is the panel's alone: no ImGui terminal keeps focus beside it
+            if imgui.SetWindowFocusNil ~= nilptr then imgui.SetWindowFocusNil() end
+            clicked_any = true
+            if button == WORLD_BUTTON_NONE and grip == 0 then
+              if selected_unit then
+                host.last_click_id = 0 -- a double click on text selects a word instead
+              elseif host.last_click_id == s.id and now - host.last_click_time < 0.35 then
+                -- double-click: first person, facing the panel, full screen
+                host.last_click_id = 0
+                end_walk(WORLD_WALK_CANCELLED)
+                host.world_full_toggle_id = s.id
+                local ch: float32, cv: float32, cd: float32, cmin: float32 = 0, 0, 0, 0
+                if host.api.get_camera_state ~= nilptr and host.api.set_camera_state ~= nilptr and host.world_full_id ~= s.id
+                   and host.api.get_camera_state(&ch, &cv, &cd, &cmin) ~= 0 then
+                  host.cam_target_h = camera_heading_to(&cam, ch, pl.x - pc.x, pl.z - pc.z)
+                  host.cam_target_v = 0
+                  host.cam_target_d = cmin
+                  host.cam_saved_d = cd
+                  host.cam_active = true
+                  host.cam_restore = false
+                end
+              else
+                -- single click: present it, walk up to it and turn the camera to face it
+                host.last_click_id = s.id
+                host.last_click_time = now
+                local ch: float32, cv: float32, cd: float32, cmin: float32 = 0, 0, 0, 0
+                if host.world_full_id == 0 and host.api.get_camera_state ~= nilptr and host.api.set_camera_state ~= nilptr
+                   and host.api.get_camera_state(&ch, &cv, &cd, &cmin) ~= 0 then
+                  host.cam_target_h = camera_heading_to(&cam, ch, pl.x - pc.x, pl.z - pc.z)
+                  host.cam_target_v = cv
+                  host.cam_target_d = cd
+                  host.cam_active = true
+                end
+                start_walk(s.id, placed_x, placed_z, &pc, now)
+              end
+            end
+          end
+        end
+        if host.world_drag_id == s.id then
+          imgui.SetNextFrameWantCaptureMouse(true) -- our own drag
+          if not host.lmb_down then
+            host.world_drag_id = 0
+          elseif uok then
+            -- panels are placed by their centre, so an edge moves half the size change
+            local nw, nh = host.world_drag_w0, host.world_drag_h0
+            if host.world_drag_mode & 1 ~= 0 then nw = host.world_drag_w0 + (mu - host.world_drag_u0) * 2 end
+            if host.world_drag_mode & 2 ~= 0 then nh = host.world_drag_h0 + (mv - host.world_drag_v0) * 2 end
+            policy_world_resize(s.id, nw, nh)
+          end
+        end
+        local focused = host.world_focus == s.id
+        -- the depth test goes in before the panel's first draw command (the glow
+        -- included); off once the full-screen flight starts moving the vertices
+        -- away from the surface the shader intersects
+        local depth_on = occlusion == WORLD_OCCLUSION_DEPTH and depthpass_panel_begin(dl, &b, ft > 0 and 0 or 1)
+        local panel_occ: *WorldOccluder = nilptr
+        if occlusion ~= WORLD_OCCLUSION_OFF and not depth_on then panel_occ = &occ end
+        local first = dl.VtxBuffer.Size
+        local first_cmd = dl.CmdBuffer.Size
+        bell_panel_glow(dl, vp, &pl, s.id) -- the visual bell lifts the backlight below
+        -- backlight: a soft glow around the panel when the world is dim
+        if pl.backlight > 0.02 then
+          for gi = 1, 4 do
+            local pad = (@float32)(gi * 10)
+            local ga = (@uint8)(math.clamp(pl.backlight * 34 / gi, 0, 255))
+            imgui.DrawListAddRectFilled(dl, vec2(vp.x - pad, vp.y - pad), vec2(vp.x + pl.width + pad, vp.y + pl.height + pad),
+              im_col32(90, 150, 220, ga), pad + 8, 0)
+          end
+        end
+        -- background as a grid: follows the curve, and gives the character
+        -- cut-out enough vertices to follow its silhouette; backlight lifts it
+        local bgl = (@uint8)(10 + 26 * math.clamp(pl.backlight, 0, 1))
+        local bg_col = im_col32(bgl, (@uint8)(bgl + 3), (@uint8)(bgl + 8), (@uint8)(math.clamp(pl.opacity, 0, 1) * 255))
+        local STRIPS <comptime> = 24
+        local ROWS <comptime> = 32
+        for k = 0, < STRIPS do
+          local x0 = vp.x + pl.width * k / STRIPS
+          local x1 = vp.x + pl.width * (k + 1) / STRIPS
+          for rr = 0, < ROWS do
+            local y0 = vp.y + pl.height * rr / ROWS
+            local y1 = vp.y + pl.height * (rr + 1) / ROWS
+            imgui.DrawListAddRectFilled(dl, vec2(x0, y0), vec2(x1, y1), bg_col, 0, 0)
+          end
+        end
+        -- draw in panel pixels at the viewport origin, then bend onto the panel;
+        -- font size 0 = the font's native size, the crispest after projection
+        render_max_run_px = pl.width / STRIPS
+        render_world = true
+        host.drawing_world = true
+        local content_first = dl.VtxBuffer.Size
+        if ft <= 0 or ft >= 1 then grid_w, grid_h = pl.width, pl.height end
+        -- level of detail: text under 3 screen pixels a line is not drawn (the
+        -- background, title and border still are)
+        local cell_px = s.cell_h * (maxy - miny) / math.max(pl.height, 1)
+        if focused or ft > 0 or s.cell_h <= 0 or cell_px >= 3 then
+          draw_terminal(s, dl, vec2(vp.x + 16, vp.y + 16), grid_w - 32, grid_h - 32, policy.world_font_size, focused, false, 0, 0)
+        else
+          s:pump()
+        end
+        world_fade_vertices(dl, content_first, world_wake_fade(s.woke_at, now, 0.25))
+        host.drawing_world = false
+        render_max_run_px = 0
+        render_world = false
+        do -- title buttons: sleep unseen, pop-in, full screen, close (brighter when hovered)
+          local ink = im_col32(240, 230, 220, 255)
+          local cy0 = vp.y + 4
+          -- close ×
+          local cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_CLOSE)
+          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_close and not over_window) and im_col32(190, 60, 50, 235) or im_col32(90, 40, 36, 180), 5, 0)
+          imgui.DrawListAddLine(dl, vec2(cx0 + 7, cy0 + 7), vec2(cx0 + 19, cy0 + 19), ink, 2.5)
+          imgui.DrawListAddLine(dl, vec2(cx0 + 19, cy0 + 7), vec2(cx0 + 7, cy0 + 19), ink, 2.5)
+          -- full screen: a frame (filled corners when already full screen)
+          cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_FULL)
+          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_full and not over_window) and im_col32(70, 110, 160, 235) or im_col32(40, 50, 70, 180), 5, 0)
+          imgui.DrawListAddRect(dl, vec2(cx0 + 6, cy0 + 7), vec2(cx0 + 20, cy0 + 19), ink, 2, 0, 2.0)
+          if ft > 0.5 then imgui.DrawListAddRectFilled(dl, vec2(cx0 + 10, cy0 + 11), vec2(cx0 + 16, cy0 + 15), ink, 0, 0) end
+          -- pop-in: arrow into a tab
+          cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_POPIN)
+          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_popin and not over_window) and im_col32(120, 100, 60, 235) or im_col32(60, 52, 40, 180), 5, 0)
+          imgui.DrawListAddLine(dl, vec2(cx0 + 6, cy0 + 8), vec2(cx0 + 20, cy0 + 8), ink, 2.0)
+          imgui.DrawListAddLine(dl, vec2(cx0 + 13, cy0 + 12), vec2(cx0 + 13, cy0 + 21), ink, 2.0)
+          imgui.DrawListAddTriangleFilled(dl, vec2(cx0 + 8, cy0 + 12), vec2(cx0 + 18, cy0 + 12), vec2(cx0 + 13, cy0 + 7), ink)
+          -- keep running when unseen: moon (sleeps) or play (keeps running)
+          cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_OCCLUDED)
+          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_occluded and not over_window) and im_col32(80, 90, 130, 235) or im_col32(44, 46, 66, 180), 5, 0)
+          draw_occluded_icon(dl, cx0, cy0, s.run_occluded, ink)
+        end
+        imgui.DrawListAddTriangleFilled(dl, vec2(vp.x + pl.width - 22, vp.y + pl.height - 4),
+          vec2(vp.x + pl.width - 4, vp.y + pl.height - 22), vec2(vp.x + pl.width - 4, vp.y + pl.height - 4),
+          im_col32(200, 160, 90, (host.world_drag_id == s.id) and 255 or 150))
+        if focused then
+          -- drawn as short segments so it bends with the panel's curve
+          local col = im_col32(200, 160, 90, 220)
+          local SEG <comptime> = 32
+          for k = 0, < SEG do
+            local xa = vp.x + pl.width * k / SEG
+            local xb = vp.x + pl.width * (k + 1) / SEG
+            imgui.DrawListAddLine(dl, vec2(xa, vp.y + 1.5), vec2(xb, vp.y + 1.5), col, 3.0)
+            imgui.DrawListAddLine(dl, vec2(xa, vp.y + pl.height - 1.5), vec2(xb, vp.y + pl.height - 1.5), col, 3.0)
+          end
+          imgui.DrawListAddLine(dl, vec2(vp.x + 1.5, vp.y), vec2(vp.x + 1.5, vp.y + pl.height), col, 3.0)
+          imgui.DrawListAddLine(dl, vec2(vp.x + pl.width - 1.5, vp.y), vec2(vp.x + pl.width - 1.5, vp.y + pl.height), col, 3.0)
+        end
+        bell_panel_border(dl, vp, pl.width, pl.height, s.id)
+        if carried then
+          draw_drag_grip(dl, vp, pl.width, pl.height, host.drag.u, host.drag.v)
+        elseif drag_alt and host.drag.id == 0 and drag_in.hover_id == s.id then
+          draw_drag_grip(dl, vp, pl.width, pl.height, mu, mv)
+        end
+        world_transform_vertices(dl, first_cmd, first, &cam, &b, vp, vp, prez, now, ft, full_at, panel_occ)
+        if depth_on then depthpass_panel_end(dl) end
+        if focused then look_on, look_x, look_y, look_z = true, pl.x, pl.y, pl.z end
+        -- the bell's light behind this panel is hidden (not while it flies to full screen)
+        local cover: WorldCover
+        if ft <= 0 and world_cover(&cam, &b, math.clamp(pl.opacity, 0, 1) * prez, &cover) then
+          host.world_covers:push(cover)
+        end
+      end
+    end
+  end
+  update_look_at(look_on, look_x, look_y, look_z)
+  drag_tick(dl, &cam, vp, drag_in, carried_pl, ray_ok, ray_ox, ray_oy, ray_oz, ray_dx, ray_dy, ray_dz, now)
+  if host.world_occluded_toggle_id ~= 0 then
+    local oid = host.world_occluded_toggle_id
+    host.world_occluded_toggle_id = 0
+    local ts = find_session(oid)
+    if ts ~= nilptr then
+      local e = policy_world_command(oid, ts.run_occluded and 'occluded off' or 'occluded on')
+      e:destroy()
+    end
+  end
+  if host.world_full_toggle_id ~= 0 then
+    local fid = host.world_full_toggle_id
+    host.world_full_toggle_id = 0
+    if host.world_full_id == fid then
+      host.world_full_id = 0
+    else
+      host.world_full_id = fid
+      host.world_full_last = fid
+      host.world_focus = fid
+    end
+  end
+  if host.world_popin_id ~= 0 then
+    local pid = host.world_popin_id
+    host.world_popin_id = 0
+    if host.world_full_id == pid then host.world_full_id = 0 end
+    for i = 0, < #host.world do
+      if host.world[i].id == pid then restore(host.world[i]) break end
+    end
+  end
+  -- one summary, formatted and logged only when the counts change (positions
+  -- change every frame)
+  if #host.world ~= diag_last_panels or diag_hidden ~= diag_last_hidden or diag_behind ~= diag_last_behind or #host.world_diag == 0 then
+    diag_last_panels, diag_last_hidden, diag_last_behind = #host.world, diag_hidden, diag_behind
+    local sb: stringbuilder
+    sb:writef('%d panels: %d hidden by lua, %d behind camera or off screen', #host.world, diag_hidden, diag_behind)
+    local key = sb:promote()
+    host.world_diag:destroy()
+    host.world_diag = key
+    if diag_drawn then
+      logf(LOG_INFO, 'world: %s; drawing at (%.1f,%.1f,%.1f) -> corners (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f) (%.0f,%.0f) on %.0fx%.0f',
+        key, diag_pl.x, diag_pl.y, diag_pl.z, diag_q[0].x, diag_q[0].y, diag_q[1].x, diag_q[1].y, diag_q[2].x, diag_q[2].y,
+        diag_q[3].x, diag_q[3].y, cam.width, cam.height)
+    else
+      logf(LOG_INFO, 'world: %s', key)
+    end
+  end
+  -- close after the loop (it edits host.world)
+  if host.world_close_id ~= 0 then
+    local cid = host.world_close_id
+    host.world_close_id = 0
+    for i = 0, < #host.world do
+      if host.world[i].id == cid then dismiss_terminal(host.world[i]) break end
+    end
+  end
+  -- panels that finished glitching out close now (after the loop: it edits host.world)
+  local k: integer = #host.world - 1
+  while k >= 0 do
+    local s = host.world[k]
+    if s.leaving and s.appear <= 0 then close_terminal(s) end
+    k = k - 1
+  end
+end
