@@ -1,0 +1,361 @@
+-- The glass chrome of the dropdown and floating windows: colour, world-light
+-- tint, glow and easing maths, the tab strip layout, button ids to actions,
+-- the icons through a fake ImGui, and every tab bar and window button driving
+-- the host.
+require 'core.host'
+require 'string'
+require 'arg'
+require 'math'
+
+local function near(a: float32, b: float32, eps: float32): boolean return math.abs(a - b) <= eps end
+local function ch(c: uint32, shift: uint32): integer return (@integer)((c >> shift) & 0xFF) end
+local function brightness(c: uint32): integer return ch(c, 0) + ch(c, 8) + ch(c, 16) end
+
+-- Colours ------------------------------------------------------------------------------
+do
+  local black = im_col32(0, 0, 0, 255)
+  local clear_white = im_col32(255, 255, 255, 0)
+  assert(chrome_lerp(black, clear_white, 0) == black and chrome_lerp(black, clear_white, 1) == clear_white, 'lerp ends')
+  assert(chrome_lerp(black, clear_white, 7) == clear_white and chrome_lerp(black, clear_white, -3) == black, 'lerp clamps')
+  local mid = chrome_lerp(black, clear_white, 0.5)
+  assert(math.abs(ch(mid, 0) - 128) <= 1 and math.abs(ch(mid, 24) - 128) <= 1, 'lerp midpoint, alpha included')
+  local t = chrome_tint(im_col32(200, 100, 50, 77), 0.5, 1, 0)
+  assert(ch(t, 0) == 100 and ch(t, 8) == 100 and ch(t, 16) == 0 and ch(t, 24) == 77, 'tint multiplies colour, keeps alpha')
+  assert(ch(chrome_tint(im_col32(200, 200, 200, 255), 2, 2, 2), 0) == 255, 'tint saturates')
+  assert(ch(chrome_fade_alpha(im_col32(1, 2, 3, 200), 0.5), 24) == 100 and ch(chrome_fade_alpha(black, 0.5), 0) == 0, 'fade scales alpha only')
+  assert(CHROME_GOLD == im_col32(200, 160, 90, 255) and CHROME_INK == im_col32(240, 230, 220, 255), "the panels' gold and ink")
+  print('colours OK')
+end
+
+-- World light and palette ---------------------------------------------------------------
+do
+  local off = chrome_light(0.6, 0.7, 0.9, 0.8, 0)
+  assert(off.r == 1 and off.g == 1 and off.b == 1 and off.backlight == 0, 'strength 0 ignores the world')
+  local full = chrome_light(0.6, 0.7, 0.9, 0.8, 1)
+  assert(near(full.r, 0.6, 1e-5) and near(full.b, 0.9, 1e-5) and near(full.backlight, 0.8, 1e-5), 'strength 1 matches a panel')
+  local half = chrome_light(0.6, 0.7, 0.9, 0.8, 0.5)
+  assert(near(half.r, 0.8, 1e-5) and near(half.backlight, 0.4, 1e-5), 'strength blends')
+
+  local day = chrome_light(1, 1, 1, 0, 1)
+  local glass = chrome_palette(0.94, true, day)
+  assert(brightness(glass.body_top) > brightness(glass.body_bottom), 'glass is lighter at the top')
+  assert(ch(glass.body_bottom, 24) == 240 and ch(glass.body_top, 24) < ch(glass.body_bottom, 24), 'opacity at the bottom, clearer at the top')
+  assert(ch(glass.edge_top, 24) > ch(glass.edge_bottom, 24) and ch(glass.sheen, 24) > 0, 'highlight catches the light from above')
+  local flat = chrome_palette(0.5, false, day)
+  assert(flat.body_top == flat.body_bottom and flat.sheen == 0 and ch(flat.body_top, 24) == 128, 'flat is one even tone at the opacity')
+  local night = chrome_palette(0.94, true, chrome_light(0.62, 0.70, 0.95, 0, 1))
+  assert(ch(night.body_top, 0) < ch(glass.body_top, 0) and ch(night.body_top, 16) <= ch(glass.body_top, 16), 'night tints the glass cool')
+  local lit = chrome_palette(0.94, true, chrome_light(1, 1, 1, 1, 1))
+  assert(brightness(lit.body_bottom) > brightness(glass.body_bottom) and ch(lit.body_bottom, 16) - ch(glass.body_bottom, 16) > ch(lit.body_bottom, 0) - ch(glass.body_bottom, 0),
+    'the backlight lifts the body toward blue')
+  print('palette OK')
+end
+
+-- Glow ----------------------------------------------------------------------------------
+do
+  local N <comptime> = 6
+  local last_off: float32 = -1
+  local last_a: integer = 256
+  for i = 1, N do
+    local off, w, a = chrome_glow_ring(i, N, 18, 0.6, 0)
+    local _, _, a_lit = chrome_glow_ring(i, N, 18, 0.6, 1)
+    local _, _, a_none = chrome_glow_ring(i, N, 18, 0, 1)
+    assert(off > last_off and near(w, 3, 1e-5), 'rings step outward')
+    assert(a <= last_a and a_lit >= a and a_none == 0, 'falls off outward, rises with the backlight, off at strength 0')
+    if i == 1 then assert(a > 0 and a_lit > a, 'visible by day, brighter in the dark') end
+    if i == N then assert(near(off + w * 0.5, 18, 1e-4), 'the last ring ends at the spread') end
+    last_off, last_a = off, a
+  end
+  print('glow OK')
+end
+
+-- Vertical shading keeps the antialiased fringe ------------------------------------------
+do
+  local verts: [5]ImDrawVert
+  local ys: [5]float32 = { 0, 0, 50, 100, 100 }
+  for i = 0, < 5 do verts[i] = { pos = vec2(3, ys[i]), col = 0xFFFFFFFF } end
+  verts[4].col = 0x00FFFFFF -- fringe
+  local dl: ImDrawList
+  dl.VtxBuffer.Data = (@*[0]ImDrawVert)(&verts)
+  dl.VtxBuffer.Size = 5
+  local top, bottom = im_col32(40, 40, 40, 200), im_col32(0, 20, 60, 100)
+  chrome_shade_vertical(&dl, 1, 0, 100, top, bottom)
+  assert(verts[0].col == 0xFFFFFFFF, 'vertices before `first` are untouched')
+  assert(verts[1].col == top and verts[3].col == bottom, 'ends take the gradient ends')
+  assert(ch(verts[2].col, 0) == 20 and ch(verts[2].col, 8) == 30 and ch(verts[2].col, 16) == 50 and ch(verts[2].col, 24) == 150, 'middle is halfway')
+  assert(ch(verts[4].col, 24) == 0 and ch(verts[4].col, 16) == 60, 'a transparent fringe stays transparent')
+  -- a long title trails off: opaque before the tail, half way through it, gone past it
+  local xs: [4]float32 = { 10, 90, 95, 120 }
+  for i = 0, < 4 do verts[i] = { pos = vec2(xs[i], 0), col = im_col32(200, 200, 200, 255) } end
+  dl.VtxBuffer.Size = 4
+  chrome_fade_tail(&dl, 0, 90, 100)
+  assert(ch(verts[0].col, 24) == 255 and ch(verts[1].col, 24) == 255, 'untouched before the tail')
+  assert(math.abs(ch(verts[2].col, 24) - 128) <= 1 and ch(verts[2].col, 0) == 200, 'half way through it, colour kept')
+  assert(ch(verts[3].col, 24) == 0, 'gone past it')
+  print('shade OK')
+end
+
+-- Easing ---------------------------------------------------------------------------------
+do
+  local function run(fps: float32, seconds: float32, ms: float32): (float32, boolean)
+    local x: float32, v: float32 = 0, 0
+    local dt = 1 / fps
+    local monotonic = true
+    for i = 1, (@integer)(math.floor(seconds * fps + 0.5)) do
+      local nx, nv = chrome_ease(x, v, 1, dt, ms)
+      if nx < x or nx > 1 then monotonic = false end
+      x, v = nx, nv
+    end
+    return x, monotonic
+  end
+  local x60, mono60 = run(60, 0.1, 200)
+  local x144, mono144 = run(144, 0.1, 200)
+  assert(mono60 and mono144, 'opening never overshoots')
+  assert(x60 > 0.5 and x60 < 1 and near(x60, x144, 0.02), 'the same motion at any frame rate')
+  local at_ms = run(60, 0.2, 200)
+  local settled = run(60, 0.6, 200)
+  assert(at_ms > 0.95 and settled == 1, 'settles in about the configured time, exactly on 1')
+  local instant = chrome_ease(0, 0, 1, 1 / 60, 0)
+  assert(instant == 1, '0 ms is instant')
+  -- reversing mid-slide with speed toward the top stops at the edge
+  local x: float32, v: float32 = 0.9, 8
+  local peak: float32 = 0
+  for i = 1, 120 do
+    x, v = chrome_ease(x, v, 0, 1 / 60, 200)
+    peak = math.max(peak, x)
+    assert(x >= 0 and x <= 1, 'stays within the slide')
+  end
+  assert(x == 0 and peak <= 1, 'lands exactly on hidden')
+  -- the eased tail is still short of 1 at animation_ms, so keys must not wait for it
+  assert(at_ms < 1, 'still landing at the configured time')
+  assert(chrome_takes_keys(true, false), 'keys as soon as it is summoned, mid-slide')
+  assert(not chrome_takes_keys(true, true), 'not on the frame the summoning press arrived')
+  assert(not chrome_takes_keys(false, false), 'never while it slides away')
+  assert(chrome_fade(0) == 0 and chrome_fade(1) == 1, 'fade ends')
+  local last: float32 = 0
+  for i = 1, 20 do
+    local f = chrome_fade((@float32)(i) / 20)
+    assert(f >= last, 'fade only grows')
+    last = f
+  end
+  print('easing OK')
+end
+
+-- Tab strip ------------------------------------------------------------------------------
+do
+  assert(chrome_tab_width(10, 40, 96, 240) == 96 and chrome_tab_width(400, 40, 96, 240) == 240 and chrome_tab_width(100, 40, 96, 240) == 140, 'natural width within limits')
+  assert(chrome_tab_fit(300, 3, 800, 4) == 1 and chrome_tab_fit(0, 0, 10, 4) == 1, 'fits: no squeeze')
+  local s = chrome_tab_fit(1000, 5, 516, 4)
+  assert(near(1000 * s + 4 * 4, 516, 1e-3), 'squeezed exactly into the area')
+  assert(chrome_scroll_to(0, 900, 1000, 400, 1200) == 600, 'a tab past the right edge scrolls in')
+  assert(chrome_scroll_to(600, 100, 200, 400, 1200) == 100, 'a tab past the left edge scrolls in')
+  assert(chrome_scroll_to(300, 400, 500, 400, 1200) == 300, 'a visible tab keeps the scroll')
+  assert(chrome_scroll_to(300, 0, 100, 400, 350) == 0, 'no scroll when everything fits')
+  assert(chrome_drag_swap(40, 1, 3, 50, 250) == -1 and chrome_drag_swap(260, 1, 3, 50, 250) == 1 and chrome_drag_swap(150, 1, 3, 50, 250) == 0, 'swap past a neighbour middle')
+  assert(chrome_drag_swap(-100, 0, 3, 0, 250) == 0 and chrome_drag_swap(900, 2, 3, 50, 0) == 0, 'no neighbour past the ends')
+  print('tab strip OK')
+end
+
+-- Buttons: ids, actions, layout -------------------------------------------------------------
+do
+  local seen: [11]integer
+  for i = 0, < CHROME_TAB_BUTTONS do
+    local b = chrome_tab_buttons[i]
+    assert(#b.tip > 0 and #b.id > 0, 'every button explains itself')
+    assert(chrome_action(b.id) == b.action, b.id)
+    seen[b.action] = seen[b.action] + 1
+    for k = i + 1, < CHROME_TAB_BUTTONS do assert(chrome_tab_buttons[k].id ~= b.id, 'ids are unique') end
+  end
+  local wants: [8]ChromeAction = {
+    ChromeAction.NewTab, ChromeAction.Profiles, ChromeAction.Window, ChromeAction.Pin,
+    ChromeAction.Pet, ChromeAction.Minimize, ChromeAction.Settings, ChromeAction.Hide,
+  }
+  for i = 0, < 8 do assert(seen[wants[i]] == 1, 'each tab bar action has exactly one button') end
+  for i = 0, < CHROME_WINDOW_BUTTONS do
+    local b = chrome_window_buttons[i]
+    assert(#b.tip > 0 and chrome_action(b.id) == b.action, b.id)
+  end
+  assert(chrome_action('dock') == ChromeAction.Dock and chrome_action('close') == ChromeAction.Close and chrome_action('+') == ChromeAction.None, 'window ids; unknown ids do nothing')
+
+  local row = (@*[0]ChromeButton)(&chrome_tab_buttons)
+  local n = CHROME_TAB_BUTTONS
+  local right: float32, top: float32, size: float32, gap: float32, group_gap: float32 = 1000, 10, 24, 2, 13
+  local prev_x1: float32 = -1
+  for i = 0, < n do
+    local x = chrome_button_x(row, n, i, right, size, gap, group_gap)
+    assert(x >= prev_x1, 'left to right without overlap')
+    if i > 0 and row[i - 1].group ~= row[i].group then assert(near(x - prev_x1, group_gap, 1e-4), 'groups sit apart') end
+    if i > 0 and row[i - 1].group == row[i].group then assert(near(x - prev_x1, gap, 1e-4), 'neighbours sit close') end
+    assert(chrome_button_at(row, n, right, top, size, gap, group_gap, x + size * 0.5, top + size * 0.5) == i, 'its centre is itself')
+    prev_x1 = x + size
+  end
+  assert(near(prev_x1, right, 1e-4), 'the row ends at the right edge')
+  local x3 = chrome_button_x(row, n, 2, right, size, gap, group_gap)
+  assert(chrome_button_at(row, n, right, top, size, gap, group_gap, x3 - group_gap * 0.5, top + 5) == -1, 'nothing between groups')
+  assert(chrome_button_at(row, n, right, top, size, gap, group_gap, x3 + 5, top + size + 1) == -1, 'nothing below the row')
+  print('buttons OK')
+end
+
+-- Icons through a fake ImGui: every icon draws, inside its button ----------------------------
+local prims = 0
+local minx: float32, miny: float32, maxx: float32, maxy: float32 = 1e9, 1e9, -1e9, -1e9
+local function grow(p: ImVec2, pad: float32): void
+  prims = prims + 1
+  minx, miny = math.min(minx, p.x - pad), math.min(miny, p.y - pad)
+  maxx, maxy = math.max(maxx, p.x + pad), math.max(maxy, p.y + pad)
+end
+local function fake_line(dl: *ImDrawList, a: ImVec2, b: ImVec2, c: uint32, t: float32): void grow(a, 0) grow(b, 0) end
+local function fake_rect(dl: *ImDrawList, a: ImVec2, b: ImVec2, c: uint32, r: float32, f: cint, t: float32): void grow(a, 0) grow(b, 0) end
+local function fake_rect_filled(dl: *ImDrawList, a: ImVec2, b: ImVec2, c: uint32, r: float32, f: cint): void grow(a, 0) grow(b, 0) end
+local function fake_tri(dl: *ImDrawList, a: ImVec2, b: ImVec2, c: ImVec2, col: uint32): void grow(a, 0) grow(b, 0) grow(c, 0) end
+local function fake_circle(dl: *ImDrawList, c: ImVec2, r: float32, col: uint32, n: cint, t: float32): void grow(c, r) end
+local function fake_circle_filled(dl: *ImDrawList, c: ImVec2, r: float32, col: uint32, n: cint): void grow(c, r) end
+local function fake_polyline(dl: *ImDrawList, pts: *ImVec2, n: cint, col: uint32, f: cint, t: float32): void
+  local p = (@*[0]ImVec2)(pts)
+  for i = 0, < n do grow(p[i], 0) end
+end
+local function resolver(name: cstring): pointer
+  local n: string = name
+  if n == 'ImDrawList_AddLine' then return (@pointer)(fake_line) end
+  if n == 'ImDrawList_AddRect' then return (@pointer)(fake_rect) end
+  if n == 'ImDrawList_AddRectFilled' then return (@pointer)(fake_rect_filled) end
+  if n == 'ImDrawList_AddTriangleFilled' then return (@pointer)(fake_tri) end
+  if n == 'ImDrawList_AddCircle' then return (@pointer)(fake_circle) end
+  if n == 'ImDrawList_AddCircleFilled' then return (@pointer)(fake_circle_filled) end
+  if n == 'ImDrawList_AddPolyline' then return (@pointer)(fake_polyline) end
+  return nilptr
+end
+imgui_bind(resolver, nilptr)
+do
+  local dl: ImDrawList
+  for k = ChromeIcon.Plus, ChromeIcon.Close do
+    local icon = (@ChromeIcon)(k)
+    prims = 0
+    minx, miny, maxx, maxy = 1e9, 1e9, -1e9, -1e9
+    chrome_draw_icon(&dl, icon, 100, 50, 24, CHROME_INK, 0)
+    assert(prims > 0, 'every icon draws')
+    assert(minx >= 88 and maxx <= 112 and miny >= 38 and maxy <= 62, 'inside its button')
+  end
+  print('icons OK')
+end
+imgui = {} -- the host below runs without ImGui
+
+-- Every button drives the host -----------------------------------------------------------
+local player = false
+local function fake_player(which: cint, id: uint64, out: *GuObject): cint
+  if not player then return 0 end
+  $out = { x = 10, y = 0, z = 20, rotation = 0, entity_id = 7, territory = 132, found = 1 }
+  return 1
+end
+local day_seconds: float32 = 12 * 3600
+local function fake_env(day: *float32, rain: *float32, weather: *uint8): cint
+  $day, $rain, $weather = day_seconds, 0, 1
+  return 1
+end
+local function quiet(level: cint, msg: cstring): void end
+
+local api: GuHostApi = { size = #GuHostApi, log = quiet, get_object = fake_player, get_environment = fake_env }
+local dir: string = arg[1]
+assert(gu_init(&api, (@cstring)(dir.data)) == 0)
+
+do
+  local ok, r, g, b, bl = policy_world_lighting()
+  assert(ok and r == 1 and g == 1 and b == 1 and bl == 0, 'noon: neutral, no backlight')
+  day_seconds = 2 * 3600
+  ok, r, g, b, bl = policy_world_lighting()
+  assert(ok and r < 0.95 and b > r and bl > 0, 'night: cool tint and the backlight, from CONFIG.world.lighting()')
+  assert(lua_gettop(policy.L) == 0, 'the Lua stack stays balanced')
+  assert(policy.dropdown.glass and near((@float32)(policy.dropdown.glow), 0.6, 1e-5) and policy.dropdown.world_tint == 1, 'style options from lua/init.lua')
+  print('world light OK')
+end
+
+local used: [11]integer
+local function press(id: string): void
+  local a = chrome_action(id)
+  assert(a ~= ChromeAction.None, id)
+  used[a] = used[a] + 1
+  dropdown_run(a)
+end
+local function tab_id(i: integer): integer return host.dropdown_tabs[i].id end
+
+set_visible(true)
+press('new')
+press('new')
+assert(#host.dropdown_tabs == 2 and host.dropdown_active == 1, 'new tab: added and active')
+press('profiles')
+assert(host.show_profiles, 'profiles opens the menu')
+press('profiles')
+assert(not host.show_profiles, 'and closes it')
+dropdown_new_tab(1)
+assert(#host.dropdown_tabs == 3 and host.dropdown_active == 2 and host.dropdown_tabs[2].label == policy.profiles[1].name, 'a picked profile opens as the active tab')
+press('cfg')
+assert(host.settings_open, 'cfg opens settings')
+press('cfg')
+assert(not host.settings_open, 'and closes them')
+
+-- reorder and close keep the same terminal active
+local a_id, b_id, c_id = tab_id(0), tab_id(1), tab_id(2)
+dropdown_move_tab(2, -1)
+assert(tab_id(1) == c_id and tab_id(2) == b_id and host.dropdown_active == 1, 'drag left: the active tab follows')
+dropdown_move_tab(0, 1)
+assert(tab_id(0) == c_id and tab_id(1) == a_id and host.dropdown_active == 0, 'swapping into the active slot moves it')
+dropdown_move_tab(0, -1)
+assert(tab_id(0) == c_id, 'no neighbour past the end')
+host.dropdown_active = 2
+dropdown_close_tab(0)
+assert(#host.dropdown_tabs == 2 and tab_id(1) == b_id and host.dropdown_active == 1, 'closing a tab to the left keeps the active one')
+local sessions_before = #host.sessions
+dropdown_close_tab(1)
+assert(#host.dropdown_tabs == 1 and host.dropdown_active == 0 and #host.sessions == sessions_before - 1, 'closing the active tab ends its session')
+
+-- window, minimize
+press('new')
+press('window')
+assert(#host.windows == 1 and #host.dropdown_tabs == 1 and host.dropdown_active == 0, 'window pops the active tab out')
+press('min')
+assert(#host.minimized == 1 and #host.dropdown_tabs == 0 and not host.dropdown_open, 'min tucks it away; the last one hides the dropdown')
+local tab_only: [4]string = { 'window', 'pin', 'pet', 'min' }
+for i = 0, < 4 do press(tab_only[i]) end
+assert(#host.windows == 1 and #host.minimized == 1 and #host.world == 0, 'tab actions without a tab do nothing')
+
+-- pet and pin need a character in the world
+set_visible(true)
+press('new')
+press('pet')
+press('pin')
+assert(#host.dropdown_tabs == 1 and host.dropdown_active == 0 and #host.world == 0, 'without a player the tab stays')
+player = true
+press('pet')
+assert(#host.world == 1 and #host.dropdown_tabs == 0 and host.world_visible, 'pet sends it beside you')
+press('new')
+set_world_visible(false)
+press('pin')
+assert(#host.world == 2 and #host.dropdown_tabs == 0 and host.world_visible, 'pin places it in the world and shows it')
+
+press('hide')
+assert(not host.dropdown_open, 'hide')
+for i = 0, < CHROME_TAB_BUTTONS do assert(used[chrome_tab_buttons[i].action] > 0, chrome_tab_buttons[i].id) end
+
+-- floating window header
+do
+  local function wpress(i: integer, id: string): boolean return window_run(i, chrome_action(id)) end
+  dropdown_run(ChromeAction.NewTab)
+  dropdown_run(ChromeAction.Window)
+  dropdown_run(ChromeAction.NewTab)
+  dropdown_run(ChromeAction.Window)
+  assert(#host.windows == 3)
+  player = false
+  assert(not wpress(1, 'pet') and #host.windows == 3, 'pet without a player keeps the window in place')
+  player = true
+  local pet_id = host.windows[1].id
+  assert(wpress(1, 'pet') and #host.windows == 2 and host.world[#host.world - 1].id == pet_id, 'pet from a window')
+  local dock_id = host.windows[0].id
+  assert(wpress(0, 'dock') and host.dropdown_open and host.dropdown_tabs[host.dropdown_active].id == dock_id, 'dock: back as the active tab, dropdown shown')
+  local n = #host.sessions
+  assert(wpress(0, 'close') and #host.windows == 0 and #host.sessions == n - 1, 'close ends the terminal')
+  assert(not window_run(5, ChromeAction.Close), 'no such window')
+  print('actions OK')
+end
+
+gu_shutdown()
+print('OK')

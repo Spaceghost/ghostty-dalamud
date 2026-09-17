@@ -1,0 +1,150 @@
+-- Exercise the exported host surface without ImGui: init loads the Lua
+-- policy, status/commands work, shutdown is clean.
+require 'core.host'
+require 'string'
+require 'io'
+require 'os'
+require 'arg'
+
+local logged: integer = 0
+local function log_cb(level: cint, msg: cstring): void
+  logged = logged + 1
+  io.write('[log ', level, '] ', msg, '\n')
+end
+local consumed: cint = 0
+local function consume_cb(vk: cint): void consumed = vk end
+
+local api: GuHostApi = { size = #GuHostApi, log = log_cb, consume_key = consume_cb }
+local dir: string = arg[1]
+assert(gu_init(&api, (@cstring)(dir.data)) == 0)
+assert(logged >= 2, 'init logs')
+print('version:', gu_version())
+
+local buf: [64]cchar
+local n = gu_status(&buf, 64)
+print('status:', (@string)((@cstring)(&buf)))
+assert(n > 0)
+
+-- No ImGui in this process: gu_frame must be a safe no-op.
+gu_frame()
+gu_popup_draw(nilptr, 0, 0, 10, 10, 0)
+
+local w: cint, h: cint
+gu_popup_size(&w, &h)
+assert(w == 900 and h == 480)
+
+-- Words where a number belongs are unknown commands, not a tointeger abort.
+assert(gu_command('minimize') == 3)
+assert(gu_command('restore all') == 3)
+assert(gu_command('new tab') == 3)
+assert(gu_command('window two') == 3)
+assert(gu_command('send #abc hi') == 3)
+assert(gu_command('new -') == 3 and gu_command('window +') == 3 and gu_command('min -') == 3)
+assert(gu_command('new  1') == 3 and gu_command('focus # 1') == 3)
+assert(gu_command('focus #x') == 3 and gu_command('min 1x') == 3)
+assert(gu_command('focus') == 5 and gu_command('focus #99') == 5 and gu_command('send #99 hi') == 5)
+
+-- No character (this API has no get_object): no pet or pin shell is opened.
+do
+  local n = #host.sessions
+  assert(gu_command('pet') == 4 and #host.sessions == n, 'pet needs a player')
+  assert(gu_command('pin') == 4 and #host.sessions == n, 'pin of a new shell needs a player')
+end
+
+-- A popup chip click on a minimized terminal restores it, which removes it from
+-- host.minimized: the click is applied after the chip loops, not inside them.
+-- This checks only the deferred-apply half (popup_request_click/popup_apply_click).
+-- popup_chip and popup_body need ImGui, which the host test does not have, so
+-- that the chip loop records the click instead of calling bring_forward was
+-- checked by reading popup.nelua, not by this test.
+assert(gu_command('new') == 0 and gu_command('new') == 0)
+assert(gu_command('min') == 0 and gu_command('min') == 0)
+assert(#host.minimized == 2, 'two minimized')
+popup_request_click(host.minimized[0].id)
+popup_apply_click()
+assert(#host.minimized == 1, 'chip click restored one')
+popup_apply_click() -- the click is consumed
+assert(#host.minimized == 1)
+local left = host.minimized[0].id
+assert(gu_command('min #99') == 5)
+do
+  local c1 = string.format('restore #%d', left)
+  assert(gu_command(c1) == 0 and #host.minimized == 0, 'restore #id')
+  local c2 = string.format('min %d', left)
+  assert(gu_command(c2) == 0 and #host.minimized == 1, 'min id')
+  c1:destroy() c2:destroy()
+end
+
+-- /term reload detaches agent shells instead of closing them (even when the new
+-- config fails to load), lets go of the full-screen panel, drag, camera, walk
+-- and animation, and saves the layout only when LISTR has restored it.
+local state_file = string.format('%s/world-state.lua', dir)
+local function state_saved(): boolean
+  local f = io.open(state_file)
+  local found = f:isopen()
+  if found then f:close() end
+  return found
+end
+do
+  local s = host.sessions[0]
+  s.awaiting_open = false -- as if the agent had OPENED it
+  s.agent_id = 4242
+  host.agent.state = AgentState.Ready -- frames are only queued on a live connection
+  host.world_full_id, host.drag.id, host.cam_saved_d = s.id, s.id, 3
+  host.walk.id, host.anim_out = s.id, true
+  host.layout_restored = false -- no LISTR yet: what is on screen is not the saved layout
+  os.remove(state_file)
+  local good_dir, good_install = host.dir, boot.install_dir
+  host.dir = string.copy('build/test-scratch/no-such-config')
+  boot.install_dir = string.copy('build/test-scratch/no-such-config')
+  local before = host.agent.outq:len()
+  assert(gu_command('reload') == 2, 'reload without lua/init.lua fails')
+  local detached, closed = 0, 0
+  local p = host.agent.outq:peek()
+  local pos: usize = before
+  while pos + 9 <= host.agent.outq:len() do
+    local typ = p[pos]
+    local len = proto.get_u32((@*[0]uint8)(&p[pos + 1]))
+    if len == 4 and proto.get_u32((@*[0]uint8)(&p[pos + 5])) == 4242 then
+      if typ == PROTO_DETACH then detached = detached + 1 end
+      if typ == PROTO_CLOSE then closed = closed + 1 end
+    end
+    pos = pos + 5 + len
+  end
+  assert(detached == 1 and closed == 0, 'reload detaches')
+  assert(#host.sessions == 0 and #host.minimized == 0)
+  assert(host.world_full_id == 0 and host.drag.id == 0 and host.cam_restore, 'full screen, drag and camera released')
+  assert(host.walk.id == 0 and not host.anim_out, 'walk and animation released')
+  assert(not state_saved(), 'reload before LISTR saves no layout')
+  host.agent.state = AgentState.Disconnected -- nothing behind it
+  host.dir:destroy() boot.install_dir:destroy()
+  host.dir, boot.install_dir = good_dir, good_install
+end
+-- Once LISTR restored the layout, reload saves it first. Even when the new
+-- config fails to load, the (now empty) layout waits for the next LISTR: the
+-- periodic save must not write it over the saved one.
+assert(gu_command('reload') == 0, 'reload')
+do
+  assert(gu_command('new') == 0 and #host.sessions == 1)
+  local s = host.sessions[0]
+  s.awaiting_open = false
+  s.agent_id = 4243
+  host.agent.state = AgentState.Ready
+  host.layout_restored = true
+  local good_dir, good_install = host.dir, boot.install_dir
+  host.dir = string.copy('build/test-scratch/no-such-config')
+  boot.install_dir = string.copy('build/test-scratch/no-such-config')
+  assert(gu_command('reload') == 2, 'failed reload after LISTR')
+  assert(state_saved(), 'reload after LISTR saves the layout')
+  assert(not host.layout_restored, 'the layout waits for the next LISTR')
+  host.agent.state = AgentState.Disconnected
+  host.dir:destroy() boot.install_dir:destroy()
+  host.dir, boot.install_dir = good_dir, good_install
+  os.remove(state_file)
+end
+state_file:destroy()
+assert(gu_command('reload') == 0, 'reload after a failed one')
+assert(gu_command('bogus') == 3)
+gu_toggle()
+gu_shutdown()
+print('OK')

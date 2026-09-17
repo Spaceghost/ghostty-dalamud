@@ -1,0 +1,143 @@
+-- Render a TermView through a fake ImGui and check the draw calls.
+require 'core.ghostty'
+require 'core.imgui'
+require 'core.termview'
+require 'core.render'
+require 'core.input'
+require 'core.selection'
+require 'string'
+require 'stringbuilder'
+require 'io'
+require 'os'
+
+local log: stringbuilder
+local rect_count: integer = 0
+local text_count: integer = 0
+local cell_width: float32 = 8.0
+
+local function fake_calc(pOut: *ImVec2, font: *ImFont, size: float32, max_width: float32, wrap_width: float32, text_begin: cstring, text_end: cstring, remaining: *cstring): void
+  pOut.x = cell_width
+  pOut.y = 16.0
+end
+local function fake_rect(dl: *ImDrawList, p_min: ImVec2, p_max: ImVec2, col: uint32, rounding: float32, flags: cint): void
+  rect_count = rect_count + 1
+  log:writef('rect %.0f,%.0f-%.0f,%.0f col=%08x\n', p_min.x, p_min.y, p_max.x, p_max.y, col)
+end
+local function fake_rect_outline(dl: *ImDrawList, p_min: ImVec2, p_max: ImVec2, col: uint32, rounding: float32, flags: cint, thickness: float32): void
+  log:writef('rectline %.0f,%.0f-%.0f,%.0f\n', p_min.x, p_min.y, p_max.x, p_max.y)
+end
+local function fake_line(dl: *ImDrawList, p1: ImVec2, p2: ImVec2, col: uint32, thickness: float32): void
+  log:writef('line %.0f,%.0f-%.0f,%.0f\n', p1.x, p1.y, p2.x, p2.y)
+end
+local function fake_text(dl: *ImDrawList, font: *ImFont, font_size: float32, pos: ImVec2, col: uint32, text_begin: cstring, text_end: cstring, wrap_width: float32, clip: *ImVec4): void
+  text_count = text_count + 1
+  local s = string{data=(@*[0]byte)(text_begin), size=(@usize)((@isize)(text_end) - (@isize)(text_begin))}
+  log:writef('text %.0f,%.0f "%s" col=%08x\n', pos.x, pos.y, s, col)
+end
+
+local function resolver(name: cstring): pointer
+  local n: string = name
+  if n == 'ImFont_CalcTextSizeA' then return (@pointer)(fake_calc) end
+  if n == 'ImDrawList_AddRectFilled' then return (@pointer)(fake_rect) end
+  if n == 'ImDrawList_AddRect' then return (@pointer)(fake_rect_outline) end
+  if n == 'ImDrawList_AddLine' then return (@pointer)(fake_line) end
+  if n == 'ImDrawList_AddText_FontPtr' then return (@pointer)(fake_text) end
+  return nilptr
+end
+
+local missing = imgui_bind(resolver, nilptr)
+print('unresolved (expected, fake backend):', missing)
+
+local v: TermView
+assert(v:init(10, 3))
+local input: string = "Hi \27[44mblue\27[0m\r\n\27[4mu\27[0m"
+v:feed((@*[0]uint8)(input.data), input.size)
+assert(v:update())
+local m = render_measure(nilptr, 16.0)
+assert(m.cell_w == 8.0 and m.cell_h == 16.0)
+local cols, rows = render_grid_size(m, 800.0, 480.0)
+assert(cols == 100 and rows == 30)
+render_termview(nilptr, &v, vec2(100.0, 200.0), m, true, true, 255, 6.0)
+local out = log:promote()
+io.write(out)
+-- a whole-pixel cell width: same-colour neighbours go out as one call
+assert(out:find('text 100,200 "Hi"', 1, true) > 0, 'merged text run')
+assert(out:find('text 124,200 "blue"', 1, true) > 0, 'merged text run over a background run')
+-- "blue" background run: 4 cells from x=124 to 156, one merged rect
+assert(out:find('rect 124,200-156,216', 1, true) > 0, 'merged background run')
+assert(out:find('line 100,230-108,230', 1, true) > 0, 'underline')
+-- regression: a background run must be drawn before the glyphs on top of it,
+-- otherwise the run rect covers them (in-game: MOTD code spans became blank bars)
+assert(out:find('rect 124,200-156,216', 1, true) < out:find('text 124,200 "blue"', 1, true), 'run drawn before its glyphs')
+-- cursor block after "u" at col 1 row 1
+assert(out:find('rect 108,216-116,232', 1, true) > 0, 'cursor block')
+print('rects', rect_count, 'texts', text_count)
+
+-- A selection installed on the terminal comes back through the render state
+-- and draws inverted: one run behind "Hi", glyphs in the background color.
+do
+  local st: SelectionState
+  selection_press(&v, &st, 0, 0, 1, false)
+  selection_drag(&v, &st, 1, 0)
+  selection_release(&v, &st)
+  assert(v:update())
+  local at = out:find('text 100,200 "Hi"', 1, true)
+  local plain_h = out:subview(at, out:find('\n', at, true) - 1)
+  render_termview(nilptr, &v, vec2(100.0, 200.0), m, true, true, 255, 6.0)
+  local sel_out = log:promote()
+  io.write(sel_out)
+  assert(sel_out:find('rect 100,200-116,216', 1, true) > 0, 'selected cells get one background run')
+  assert(sel_out:find(plain_h, 1, true) == 0, 'selected glyph is recolored')
+  assert(sel_out:find('rect 100,200-116,216', 1, true) < sel_out:find('text 100,200 "Hi"', 1, true), 'run under the glyph')
+  sel_out:destroy()
+end
+v:destroy()
+
+-- Text calls: written spaces draw nothing, bold draws twice, and glyphs merge
+-- into runs only where that cannot move them.
+do
+  local tv: TermView
+  assert(tv:init(12, 3))
+  local rows: string = "          \r\n\27[1mB\27[0m x\r\nab\27[31mc\27[0md\27[4me\27[0m"
+  tv:feed((@*[0]uint8)(rows.data), rows.size)
+  assert(tv:update())
+  local mw = render_measure(nilptr, 16.0)
+  text_count = 0
+  render_termview(nilptr, &tv, vec2(0.0, 0.0), mw, false, true, 255, 0.0)
+  local t1 = log:promote()
+  io.write(t1)
+  assert(t1:find('text 0,0 ', 1, true) == 0, 'a row of written spaces makes no text calls')
+  assert(t1:find('text 0,16 "B"', 1, true) > 0 and t1:find('text 1,16 "B"', 1, true) > 0, 'a bold glyph draws twice')
+  assert(t1:find('text 16,16 "x"', 1, true) > 0, 'a glyph after a space starts its own run')
+  assert(t1:find('text 0,32 "ab"', 1, true) > 0 and t1:find('text 16,32 "c"', 1, true) > 0 and t1:find('text 24,32 "d"', 1, true) > 0,
+    'a colour change ends a run')
+  assert(t1:find('text 32,32 "e"', 1, true) > 0 and t1:find('line 32,46-40,46', 1, true) > 0, 'an underlined glyph stays its own call')
+  assert(text_count == 7, 'B twice, x, ab, c, d, e')
+  t1:destroy()
+  -- a fractional cell width: one call per glyph, as ImGui snaps each call's start
+  cell_width = 8.5
+  local mf = render_measure(nilptr, 16.0)
+  text_count = 0
+  render_termview(nilptr, &tv, vec2(0.0, 0.0), mf, false, true, 255, 0.0)
+  local t2 = log:promote()
+  assert(t2:find('"ab"', 1, true) == 0 and text_count == 8, 'no runs at a fractional cell width')
+  t2:destroy()
+  -- on a world panel the vertices are projected anyway: runs again
+  render_world = true
+  text_count = 0
+  render_termview(nilptr, &tv, vec2(0.0, 0.0), mf, false, true, 255, 0.0)
+  render_world = false
+  local t3 = log:promote()
+  assert(t3:find('"ab"', 1, true) > 0 and text_count == 7, 'world panels merge at any cell width')
+  t3:destroy()
+  cell_width = 8.0
+  tv:destroy()
+  print('text runs OK')
+end
+
+-- Regression: a focused terminal must set WantTextInput, or Dalamud passes the
+-- keystrokes to the game (in-game: typing opened the chat box).
+local io: ImGuiIO
+input_claim_keyboard(&io)
+assert(io.WantTextInput and io.WantCaptureKeyboard, 'terminal claims text input')
+print('OK')

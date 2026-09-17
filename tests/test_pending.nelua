@@ -1,0 +1,490 @@
+-- Agent sessions against a fake agent on a socketpair: OPENED answers stay in
+-- order while terminals close waiting for them, a reconnect re-attaches (same
+-- agent) or ends (restarted agent) the terminals, version 1 agents still work,
+-- replayed output gets no answers, errors show once. Plus what shutdown and
+-- the kill switch must let go of.
+require 'core.host'
+require 'string'
+require 'vector'
+require 'io'
+require 'os'
+require 'arg'
+
+## cinclude '<sys/socket.h>'
+## cinclude '<fcntl.h>'
+## cinclude '<unistd.h>'
+local function socketpair(domain: cint, typ: cint, protocol: cint, fds: *[2]cint): cint <cimport, nodecl> end
+local function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
+local function read(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function write(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function close(fd: cint): cint <cimport, nodecl> end
+local AF_UNIX: cint <cimport, nodecl, const>
+local SOCK_STREAM: cint <cimport, nodecl, const>
+local F_GETFL: cint <cimport, nodecl, const>
+local F_SETFL: cint <cimport, nodecl, const>
+local O_NONBLOCK: cint <cimport, nodecl, const>
+
+## if pragmas.glibc_heap then
+local mallinfo2_t <cimport 'struct mallinfo2', cinclude '<malloc.h>', nodecl> = @record{
+  arena: usize, ordblks: usize, smblks: usize, hblks: usize, hblkhd: usize,
+  usmblks: usize, fsmblks: usize, uordblks: usize, fordblks: usize, keepcost: usize,
+}
+local function mallinfo2(): mallinfo2_t <cimport, cinclude '<malloc.h>', nodecl> end
+local function heap_in_use(): usize
+  local mi = mallinfo2()
+  return mi.uordblks + mi.hblkhd
+end
+## end
+
+local capture = true
+local log_lines: vector(string)
+local function log_cb(level: cint, msg: cstring): void
+  if not capture then return end
+  io.write('[log ', level, '] ', msg, '\n')
+  log_lines:push(string.copy(msg))
+end
+local function logged(needle: string): integer
+  local n = 0
+  for i = 0, < #log_lines do
+    if log_lines[i]:find(needle, 1, true) > 0 then n = n + 1 end
+  end
+  return n
+end
+
+local live_lights = 0
+local look_releases = 0
+local function fake_create(shape: cint): pointer live_lights = live_lights + 1 return (@pointer)(16) end
+local function fake_update(light: pointer, x: float32, y: float32, z: float32, r: float32, g: float32, b: float32,
+                           intensity: float32, range: float32, visible: cint): cint return 1 end
+local function fake_destroy(light: pointer): cint live_lights = live_lights - 1 return 1 end
+local function fake_object(which: cint, id: uint64, out: *GuObject): cint
+  $out = { x = 10, y = 0, z = 20, entity_id = 7, territory = 132, found = 1 }
+  return 1
+end
+local function fake_look_at(active: cint, x: float32, y: float32, z: float32): cint
+  if active == 0 then look_releases = look_releases + 1 end
+  return 1
+end
+
+local api: GuHostApi = {
+  size = #GuHostApi, log = log_cb, get_object = fake_object, set_look_at = fake_look_at,
+  light_create = fake_create, light_update = fake_update, light_destroy = fake_destroy,
+}
+local dir: string = arg[1]
+
+-- A fake agent on a socketpair ------------------------------------------------------
+local Frame = @record{ typ: uint8, id: uint32, len: usize, fed: uint64 }
+local peer: cint = -1
+local peer_q: ByteQueue
+local frames: vector(Frame)
+
+-- A new connection, as connect() leaves it once the socket is up.
+local function fake_connect(): void
+  local fds: [2]cint
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
+  fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK)
+  fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL, 0) | O_NONBLOCK)
+  if peer >= 0 then close(peer) end
+  net.close(host.agent.sock)
+  host.agent.sock = fds[0]
+  host.agent.inq:destroy()
+  host.agent.outq:destroy()
+  host.agent.state = AgentState.Handshake
+  peer = fds[1]
+  peer_q:destroy()
+  frames:clear()
+end
+
+local function peer_raw(typ: uint8, id: uint32, with_id: boolean, data: *[0]uint8, n: usize): void
+  local q: ByteQueue
+  if with_id then proto.write_frame_id(&q, typ, id, data, n) else proto.write_frame(&q, typ, data, n) end
+  assert(write(peer, q:peek(), q:len()) == (@isize)(q:len()), 'peer write')
+  q:destroy()
+end
+local function peer_text(typ: uint8, text: string): void
+  peer_raw(typ, 0, false, (@*[0]uint8)(text.data), text.size)
+end
+local function peer_id(typ: uint8, id: uint32, text: string): void
+  peer_raw(typ, id, true, (@*[0]uint8)(text.data), text.size)
+end
+
+-- Read what the client sent.
+local function peer_collect(): void
+  local buf: [65536]uint8
+  while peer >= 0 do
+    local n = read(peer, &buf, 65536)
+    if n <= 0 then break end
+    peer_q:push(&buf, (@usize)(n))
+  end
+  while true do
+    local ok, typ, payload, len = proto.read_frame(&peer_q)
+    if not ok then break end
+    local f: Frame = { typ = typ, len = len }
+    if len >= 4 then f.id = proto.get_u32(payload) end
+    if len >= 12 then f.fed = proto.get_u64((@*[0]uint8)(&payload[4])) end
+    frames:push(f)
+    proto.frame_consume(&peer_q, len)
+  end
+end
+local function sent(typ: uint8, id: uint32): integer
+  peer_collect()
+  local n = 0
+  for i = 0, < #frames do if frames[i].typ == typ and frames[i].id == id then n = n + 1 end end
+  return n
+end
+local function sent_any(typ: uint8): integer
+  peer_collect()
+  local n = 0
+  for i = 0, < #frames do if frames[i].typ == typ then n = n + 1 end end
+  return n
+end
+local FED_UNKNOWN: uint64 <comptime> = 0xffffffffffffffff_u64
+local function attach_fed(id: uint32): uint64 -- the last ATTACH for `id` (0 when none)
+  peer_collect()
+  local fed: uint64 = 0
+  for i = 0, < #frames do if frames[i].typ == PROTO_ATTACH and frames[i].id == id then fed = frames[i].fed end end
+  return fed
+end
+local function peer_attached(id: uint32, total: uint64): void
+  local b: [8]uint8
+  proto.put_u64(&b, total)
+  peer_raw(PROTO_ATTACHED, id, true, &b, 8)
+end
+local function forget(): void
+  peer_collect()
+  frames:clear()
+end
+
+local now: float64 = 100.0
+local function pump(): void
+  agent_pump(now)
+  now = now + 0.016
+end
+
+local function cursor_y(s: *Session): integer
+  local y: uint16 = 0
+  ghostty_terminal_get(s.view.term, GHOSTTY_TERMINAL_DATA_CURSOR_Y, &y)
+  return y
+end
+
+-- The kill switch lets go of what the game shows or does for us, once --------------
+do
+  assert(gu_init(&api, (@cstring)(dir.data)) == 0, 'init')
+  host.agent_last_try = 1e9 -- never dial out
+  fake_connect()
+  peer_text(PROTO_OK, 'ghostty-agent 2 42')
+  pump()
+  assert(host.agent:ready())
+  local streaming = session_new(0, 80, 24)
+  local asleep = session_new(0, 80, 24)
+  pump()
+  peer_id(PROTO_OPENED, 5, '')
+  peer_id(PROTO_OPENED, 6, '')
+  pump()
+  asleep:sleep()
+  pump()
+  assert(streaming.agent_id == 5 and asleep.agent_id == 6 and asleep.sleeping)
+  forget()
+  local panel: Session = { id = 900 }
+  host.world:push(&panel)
+  local err = policy_world_command(900, 'here')
+  assert(#err == 0, 'placed')
+  err:destroy()
+  local ok, pl = policy_world_place(900, 1.0, false)
+  light_panel(900, ok, &pl, 1)
+  host.world:clear()
+  assert(live_lights == 1, 'panel light created')
+  host.look_at_on = true
+  host.anim_out = true
+  host.world_focus = 900
+  policy.disabled = true
+  gu_frame()
+  assert(live_lights == 0 and look_releases == 1, 'kill switch: lights and head released')
+  assert(not host.anim_out and host.world_focus == 0 and host.disabled_teardown, 'kill switch: animation and focus released')
+  -- nothing reads the connection now: an agent would stop reading shells whose output piles up
+  assert(sent(PROTO_DETACH, 5) == 1 and sent(PROTO_DETACH, 6) == 0, 'kill switch: streaming shells detached')
+  assert(streaming.sleeping and streaming.held and not asleep.held)
+  gu_frame()
+  assert(look_releases == 1 and sent_any(PROTO_DETACH) == 1, 'kill switch: torn down once')
+  policy.disabled = false
+  gu_frame() -- no ImGui here: returns before drawing
+  assert(not host.disabled_teardown, 'kill switch off: armed again')
+  pump()
+  assert(sent(PROTO_ATTACH, 5) == 1 and sent(PROTO_ATTACH, 6) == 0, 'kill switch off: the held shell attaches again')
+  assert(not streaming.sleeping and not streaming.held and asleep.sleeping, 'the one asleep before stays asleep')
+
+  -- no layout was restored (the agent never answered): shutdown must not
+  -- overwrite the saved one, even though the dropdown stopped waiting for it
+  local path: string = '/world-state.lua'
+  local sb: stringbuilder
+  sb:write(dir, path)
+  local state_path = sb:promote()
+  local f = io.open(state_path, 'wb')
+  f:write('return nil -- saved layout\n')
+  f:close()
+  host.reattach_done = true
+  assert(not host.layout_restored)
+  gu_shutdown()
+  f = io.open(state_path, 'rb')
+  local content = f:read('a')
+  f:close()
+  assert(content == 'return nil -- saved layout\n', 'shutdown before the layout came back keeps the saved layout')
+  content:destroy()
+  os.remove(state_path)
+  state_path:destroy()
+end
+
+-- Shutdown frees the demo state (bell demo label, showcase lists) and the shown error
+## if pragmas.glibc_heap then
+do
+  capture = false -- the captured log lines would grow the heap
+  local warm: usize = 0
+  for n = 1, 4 do
+    assert(gu_init(&api, (@cstring)(dir.data)) == 0, 'init')
+    host.bell_demo_label = string.copy('bell style: glow')
+    host.showcase_ids:push(41)
+    host.showcase_hidden:push(42)
+    host.agent_error_shown = string.copy('agent unreachable')
+    gu_shutdown()
+    local used = heap_in_use()
+    print('cycle', n, 'heap in use', used)
+    if n == 2 then warm = used end
+    if n > 2 then assert(used == warm, 'shutdown leaks demo or error state') end
+  end
+  capture = true
+end
+## end
+
+-- Agent sessions against the fake agent ----------------------------------------------
+assert(policy_load(dir), 'policy')
+host.api.log = log_cb
+policy.agent.token:destroy()
+policy.agent.token = string.copy('test-token') -- never the real token file
+agent_setup()
+host.agent_last_try = 1e9 -- agent_pump must never dial out: the agent here is a socketpair
+
+-- connection 1: a version 1 agent (this core loaded against one still running) -------
+fake_connect()
+peer_text(PROTO_OK, 'ghostty-agent 1')
+pump()
+assert(host.agent:ready() and host.agent.version == 1 and host.agent.nonce == 0, 'version 1 greeting')
+pump()
+assert(sent_any(PROTO_LIST) == 1 and not host.layout_restored, 'LIST sent, layout not restored yet')
+peer_text(PROTO_LISTR, '')
+pump()
+assert(host.layout_restored and host.reattach_done, 'LISTR restores the layout')
+local s0 = session_new(0, 80, 24)
+pump()
+peer_id(PROTO_OPENED, 1, '')
+pump()
+assert(not s0.awaiting_open and s0.agent_id == 1, 'opened on the version 1 agent')
+pump() -- its RESIZE goes out before the peer closes
+
+-- S3: that agent is restarted as version 2 and numbers its shells from 1 again.
+-- The old terminal must not take the new shell 1's output, input or CLOSE.
+close(peer)
+peer = -1
+pump()
+fake_connect()
+peer_text(PROTO_OK, 'ghostty-agent 2 5')
+pump()
+assert(host.agent:ready() and host.agent.nonce == 5)
+assert(s0.exited and s0.agent == nilptr and s0.agent_id == 0, 'no nonce, then a nonce: a restart')
+forget()
+session_remove(s0)
+pump()
+assert(sent_any(PROTO_CLOSE) == 0, 'closing the old terminal sends no CLOSE')
+
+-- connection 2: a version 2 agent -----------------------------------------------------
+close(peer)
+peer = -1
+pump()
+fake_connect()
+peer_text(PROTO_OK, 'ghostty-agent 2 42')
+pump()
+assert(host.agent:ready() and host.agent.version == 2 and host.agent.nonce == 42, 'version 2 greeting')
+forget()
+
+-- S2: a terminal closed before its OPENED keeps its place in the queue
+local s1 = session_new(0, 80, 24)
+local s2 = session_new(0, 80, 24)
+assert(s1 ~= nilptr and s2 ~= nilptr and s1.awaiting_open and s2.awaiting_open)
+pump()
+assert(sent_any(PROTO_OPEN) == 2, 'two OPENs')
+session_remove(s1)
+peer_id(PROTO_OPENED, 7, '')
+pump()
+assert(s2.awaiting_open, 'the answer for the closed terminal does not go to the next one')
+pump()
+assert(sent(PROTO_CLOSE, 7) == 1, 'the closed terminal\'s shell is closed')
+peer_id(PROTO_OPENED, 8, '')
+pump()
+assert(not s2.awaiting_open and s2.agent_id == 8, 'the next answer is its own')
+
+-- ERR is only logged: it takes no waiting terminal
+local s3 = session_new(0, 80, 24)
+peer_text(PROTO_ERR, 'clipboard unavailable')
+pump()
+assert(s3.awaiting_open and #host.pending_open == 1 and host.pending_open[0] == s3, 'ERR leaves the queue alone')
+peer_id(PROTO_OPENED, 0, 'forkpty failed') -- version 2: a failed OPEN
+pump()
+assert(s3.exited and #host.pending_open == 0, 'OPENED 0 ends the waiting terminal')
+session_remove(s3)
+
+-- S5: replayed output gets no answers from libghostty
+local dsr: string = '\27[6n'
+forget()
+s2:feed((@*[0]uint8)(dsr.data), dsr.size)
+pump()
+assert(sent(PROTO_DATA, 8) == 1, 'a live cursor position query is answered')
+forget()
+s2.replaying = true
+s2:feed((@*[0]uint8)(dsr.data), dsr.size)
+pump()
+assert(sent(PROTO_DATA, 8) == 0, 'a replayed one is not')
+peer_attached(8, 5000)
+pump()
+assert(not s2.replaying and s2.fed == 5000, 'ATTACHED ends the replay and says how much output there was')
+
+-- LISTR: a shell this client already shows is not attached twice
+local n0 = #host.sessions
+peer_text(PROTO_LISTR, '8\t80\t24\t0\t/bin/bash -l\n9\t80\t24\t0\t/bin/bash -l\n10\t80\t24\t0\tsh\n')
+pump()
+assert(#host.sessions == n0 + 2, 'only the unknown shells came back')
+local s9 = host.sessions[#host.sessions - 2]
+local s10 = host.sessions[#host.sessions - 1]
+assert(s9.agent_id == 9 and s9.replaying, 'reattached, replay answers suppressed')
+pump()
+assert(sent(PROTO_ATTACH, 9) == 1 and sent(PROTO_ATTACH, 10) == 1, 'ATTACH for the reattached shells')
+
+-- S7: woken while its replay is still on the way. That replay may reset the
+-- screen, so what was fed says nothing: ask for a reset, not a tail.
+s10:sleep()
+s10:wake()
+pump()
+assert(sent(PROTO_ATTACH, 10) == 2 and attach_fed(10) == FED_UNKNOWN, 'a second ATTACH during a replay asks for a reset')
+peer_attached(10, 300)
+pump()
+assert(s10.replaying, 'the first ATTACHED does not end the second replay')
+
+-- the connection drops: waiting terminals show why, once
+local s4 = session_new(0, 80, 24)
+local s5 = session_new(0, 80, 24)
+s9:sleep()
+pump()
+session_remove(s5) -- its OPEN went out: a tombstone
+assert(#host.pending_open == 2 and host.pending_open[1] == nilptr, 'tombstone')
+local y0 = cursor_y(s4)
+close(peer)
+peer = -1
+pump() pump() pump()
+assert(host.agent.state == AgentState.Failed and host.agent_error_shown == 'connection closed', 'failure noted')
+assert(cursor_y(s4) == y0 + 1, 'the failure is shown once, not every frame')
+local s6 = session_new(0, 80, 24) -- no connection: nothing goes out for it
+session_remove(s6)
+assert(#host.pending_open == 2, 'no tombstone for an OPEN that never went out')
+
+-- S3: reconnect to the same agent. Streaming terminals attach again for what
+-- they missed, sleeping ones stay asleep, waiting ones ask again.
+fake_connect()
+peer_text(PROTO_OK, 'ghostty-agent 2 42')
+pump()
+assert(host.agent:ready(), 'reconnected')
+assert(#host.pending_open == 1 and host.pending_open[0] == s4, 'tombstones dropped')
+assert(s2.replaying and #host.agent_error_shown == 0, 'replaying until ATTACHED; the next failure shows again')
+pump()
+assert(sent(PROTO_ATTACH, 8) == 1 and attach_fed(8) == 5000, 'reattached from where it was')
+assert(sent(PROTO_ATTACH, 10) == 1 and attach_fed(10) == FED_UNKNOWN, 'a replay the drop cut short: reattached with a reset')
+assert(sent(PROTO_ATTACH, 9) == 0, 'a sleeping terminal stays detached')
+assert(sent_any(PROTO_OPEN) == 1, 'the waiting terminal asks again')
+assert(sent_any(PROTO_LIST) == 0, 'LIST once per load')
+
+-- S3: the agent restarted. Its session ids mean other shells now.
+close(peer)
+peer = -1
+pump()
+fake_connect()
+peer_text(PROTO_OK, 'ghostty-agent 2 43')
+pump()
+assert(s2.exited and s2.process_exited and s9.exited and s10.exited, 'terminals of the old agent end')
+assert(s2.agent == nilptr and s2.agent_id == 0, 'and let go of their ids')
+forget()
+session_remove(s2)
+session_remove(s9)
+session_remove(s10)
+pump()
+assert(sent_any(PROTO_CLOSE) == 0 and sent_any(PROTO_DETACH) == 0, 'closing them sends nothing to the new agent')
+assert(sent_any(PROTO_OPEN) == 1, 'the waiting terminal asks the new agent')
+
+-- A version 1 agent: no nonce, ERR texts where version 2 has frames -----------------
+close(peer)
+peer = -1
+pump()
+fake_connect()
+peer_text(PROTO_OK, 'ghostty-agent 1')
+pump()
+assert(host.agent:ready() and host.agent.version == 1 and host.agent.nonce == 0, 'version 1 greeting accepted')
+peer_id(PROTO_OPENED, 3, '')
+pump()
+assert(not s4.awaiting_open and s4.agent_id == 3, 'opened on the version 1 agent')
+s4:sleep()
+s4:wake()
+assert(s4.replaying, 'waking replays')
+peer_text(PROTO_OK, 'attached')
+pump()
+assert(not s4.replaying, 'OK "attached" ends the replay')
+s4:sleep()
+s4:wake()
+peer_text(PROTO_ERR, 'no such session')
+pump()
+assert(s4.exited and s4.exit_status == -1, 'ERR "no such session" ends the terminal')
+local s7 = session_new(0, 80, 24)
+peer_text(PROTO_ERR, 'bad open')
+pump()
+assert(s7.exited and #host.pending_open == 0, 'ERR "bad open" ends the waiting terminal')
+local s8 = session_new(0, 80, 24)
+peer_id(PROTO_OPENED, 4, '')
+pump()
+assert(s8.agent_id == 4)
+
+-- clipboard frames the agent does not know: said once, then not sent again
+forget()
+host.agent:clip_set('copied')
+host.paste_target = s8.id
+host.agent:clip_get()
+pump()
+assert(sent_any(PROTO_CLIP_SET) == 1 and sent_any(PROTO_CLIP_GET) == 1)
+peer_text(PROTO_ERR, 'unknown frame')
+peer_text(PROTO_ERR, 'unknown frame')
+pump()
+assert(host.agent.clip_off and logged('clipboard sync off') == 1, 'logged once')
+assert(host.paste_target == 0, 'the paste got its (empty) answer')
+forget()
+host.agent:clip_set('copied again')
+host.paste_target = s8.id
+host.agent:clip_get()
+pump()
+assert(sent_any(PROTO_CLIP_SET) == 0 and sent_any(PROTO_CLIP_GET) == 0, 'no more clipboard frames')
+assert(host.paste_target == 0 and logged('clipboard sync off') == 1, 'answered at once, not logged again')
+
+-- S4: a refused handshake closes the socket
+close(peer)
+peer = -1
+pump()
+fake_connect()
+peer_text(PROTO_ERR, 'bad token')
+pump()
+assert(host.agent.state == AgentState.Failed and host.agent.last_error == 'bad token', 'refused')
+assert(not net.is_valid(host.agent.sock), 'socket closed')
+
+-- S11: the shutdown flush delivers nothing
+fake_connect()
+peer_text(PROTO_OK, 'ghostty-agent 2 43')
+pump()
+assert(host.agent:ready())
+local n1 = #host.sessions
+peer_text(PROTO_LISTR, '77\t80\t24\t0\tsh\n')
+agent_final_flush()
+assert(#host.sessions == n1, 'a LISTR during shutdown creates no session')
+close(peer)
+print('pending OK')
