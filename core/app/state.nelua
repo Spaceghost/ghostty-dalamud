@@ -72,6 +72,15 @@ global GuHostApi = @record{
   get_scene_depth: function(out: *GuSceneDepth): cint,
   -- hand a link to the system browser; the core only passes https links (ghostty.open_url)
   open_url: function(url: cstring): cint,
+  -- shadow boards behind world panels (core/app/occluders.nelua, experimental):
+  -- client-side background objects; 1 = ok
+  bg_create: function(model_path: cstring): pointer, -- nilptr on failure
+  bg_ready: function(obj: pointer): cint,            -- 1 once its model has loaded
+  bg_set_transform: function(obj: pointer, x: float32, y: float32, z: float32,
+                             qx: float32, qy: float32, qz: float32, qw: float32,
+                             sx: float32, sy: float32, sz: float32): cint,
+  bg_set_transparency: function(obj: pointer, transparency: float32): cint, -- 0 drawn .. 1 gone
+  bg_destroy: function(obj: pointer): cint,
 }
 
 global LOG_INFO: cint <comptime> = 1

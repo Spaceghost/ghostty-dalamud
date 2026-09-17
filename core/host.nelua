@@ -161,6 +161,8 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     apply_world_pins(now)
     draw_world(now)
     draw_bell(now) -- after the world screens: light behind one is cut out, not painted over it
+  else
+    occluders_destroy_all() -- no character (loading screen, logout): boards go before the scene they sit in
   end
   bell_demo_tick(now)
   -- a click on the game world (not an ImGui window, not a panel) unfocuses

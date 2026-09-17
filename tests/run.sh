@@ -33,6 +33,7 @@ echo "--- test_pending"
 "$NELUA" --cc gcc -P nogc $HEAP --cflags="$INC $LIBS" --cache-dir build/nelua-cache -L . -b tests/test_pending.nelua
 GLIBC_TUNABLES=$HEAP_ENV build/nelua-cache/test_pending "$ROOT"
 run test_lights "$ROOT"
+run test_occluders "$ROOT"
 run test_chrome "$ROOT"
 run test_migrate "$ROOT" "$ROOT/build/test-scratch"
 run test_vote "$ROOT" "$ROOT/build/test-scratch"

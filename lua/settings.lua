@@ -93,6 +93,7 @@ S.schema = {
     { 'world.light.light_by_day', 'slider', 0, 1, 'Cast light in daylight (share)' },
     { 'world.light.light_color_from_tint', 'checkbox', 'Cast light takes the time-of-day tint' },
     { 'world.light.shadows', 'checkbox', 'Cast light throws shadows (expensive)' },
+    { 'world.shadows.enabled', 'checkbox', 'Screens cast shadows (experimental)' },
   } },
   { 'Character animation', {
     { 'animation.enabled', 'checkbox', 'Hold a pose while a terminal is out or focused' },

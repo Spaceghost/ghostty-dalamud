@@ -1,0 +1,191 @@
+-- World panels as shadow casters (experimental, CONFIG.world.shadows, off by
+-- default): every shown world panel owns one client-side background object, a
+-- flat board the size of the panel just behind it, so the panel throws a
+-- shadow and blocks sunlight like other scene objects. The game draws it for
+-- this client only and it has no collision. lua/world.lua decides whether and
+-- with which model; this module creates, places and frees the boards.
+require 'math'
+require 'vector'
+require 'core.app.state'
+
+local CREATE_RETRY_FRAMES: uint64 <comptime> = 300  -- after a failed create or transform
+local LOAD_TIMEOUT_FRAMES: uint64 <comptime> = 600  -- a model that never loads (wrong path)
+local LOAD_RETRY_FRAMES: uint64 <comptime> = 1800
+
+-- Transform of one board, as bg_set_transform takes it.
+global WorldBoardPose = @record{
+  x: float32, y: float32, z: float32,
+  qx: float32, qy: float32, qz: float32, qw: float32,
+  sx: float32, sy: float32, sz: float32,
+}
+
+-- Where the board of a panel goes. The model faces +/-Z and is `model_w` x
+-- `model_h` yalms at scale 1 with its origin `origin` (a share of its height)
+-- above its bottom edge; the board is stretched to the panel's size, turned
+-- by its yaw, tilted back by its pitch like world_basis, and pushed `offset`
+-- yalms behind it along the front normal. Curved panels get a flat board.
+global function world_board_pose(pl: *WorldPlacement, offset: float32, depth: float32,
+                                 model_w: float32, model_h: float32, origin: float32): WorldBoardPose
+  local ppm = pl.ppm > 0 and pl.ppm or 300
+  local w, h = pl.width / ppm, pl.height / ppm
+  local sy, cy = math.sin(pl.yaw), math.cos(pl.yaw)
+  local sp, cp = math.sin(pl.pitch), math.cos(pl.pitch)
+  -- front normal and up of the tilted panel (world_basis)
+  local nx, ny, nz = sy * cp, sp, cy * cp
+  local ux, uy, uz = -sy * sp, cp, -cy * sp
+  local down = h * (0.5 - origin)
+  -- yaw about +Y, then a tilt of -pitch about +X: +Z lands on the normal, +Y on up
+  local a, b = math.sin(pl.yaw * 0.5), math.cos(pl.yaw * 0.5)
+  local c, d = -math.sin(pl.pitch * 0.5), math.cos(pl.pitch * 0.5)
+  return WorldBoardPose{
+    x = (@float32)(pl.x - ux * down - nx * offset),
+    y = (@float32)(pl.y - uy * down - ny * offset),
+    z = (@float32)(pl.z - uz * down - nz * offset),
+    qx = (@float32)(b * c), qy = (@float32)(a * d), qz = (@float32)(-a * c), qw = (@float32)(b * d),
+    sx = (@float32)(w / model_w), sy = (@float32)(h / model_h), sz = depth,
+  }
+end
+
+local Board = @record{
+  id: integer,          -- session id of the panel
+  obj: pointer,         -- the game object
+  born: uint64,         -- frame it was created (load timeout)
+  frame: uint64,        -- last frame its panel was shown
+  ready: boolean,       -- model loaded: transforms may be sent
+  placed: boolean,      -- `pose` was sent
+  pose: WorldBoardPose,
+  transparency: float32, -- last sent, -1 = none yet
+}
+
+local boards: vector(Board)
+local boards_frame: uint64 = 1
+local boards_territory: uint32 = 0 -- zone the boards were made in (0 = none yet)
+local boards_model: [256]cchar     -- model path the boards were made from
+local retry_at: uint64 = 0         -- after a failure, wait before creating again
+local warned = false               -- one warning until a board works again
+
+local function available(): boolean
+  return host.api.bg_create ~= nilptr and host.api.bg_ready ~= nilptr
+    and host.api.bg_set_transform ~= nilptr and host.api.bg_destroy ~= nilptr
+end
+
+local function warn_once(msg: string): void
+  if warned then return end
+  warned = true
+  log(LOG_WARN, msg)
+end
+
+local function same_path(a: *[256]cchar, b: *[256]cchar): boolean
+  for i = 0, < 256 do
+    if a[i] ~= b[i] then return false end
+    if a[i] == 0 then return true end
+  end
+  return true
+end
+
+local function same_pose(p: *WorldBoardPose, q: *WorldBoardPose): boolean
+  local EPS <comptime> = 1e-4
+  return math.abs(p.x - q.x) < EPS and math.abs(p.y - q.y) < EPS and math.abs(p.z - q.z) < EPS
+    and math.abs(p.qx - q.qx) < EPS and math.abs(p.qy - q.qy) < EPS and math.abs(p.qz - q.qz) < EPS
+    and math.abs(p.qw - q.qw) < EPS and math.abs(p.sx - q.sx) < EPS and math.abs(p.sy - q.sy) < EPS
+    and math.abs(p.sz - q.sz) < EPS
+end
+
+local function board_free(b: *Board): void
+  if b.obj ~= nilptr and host.api.bg_destroy ~= nilptr then host.api.bg_destroy(b.obj) end
+  b.obj = nilptr
+end
+
+local function drop(i: integer, wait: uint64): void
+  board_free(&boards[i])
+  boards:remove(i)
+  retry_at = boards_frame + wait
+end
+
+-- Free every board (shutdown, reload, kill switch, zone change, switched off).
+global function occluders_destroy_all(): void
+  for i = 0, < #boards do board_free(&boards[i]) end
+  boards:destroy()
+  boards_territory = 0
+  retry_at = 0
+  warned = false
+end
+
+-- Called for each world panel after placement. `shown` is false while Lua
+-- hides the panel, it sleeps unseen, or it is derezzed or flown full screen.
+global function occluder_panel(id: integer, shown: boolean, pl: *WorldPlacement, t: *WorldTuning): void
+  if not shown or not t.shadows or not available() then return end
+  local i: integer = -1
+  for j = 0, < #boards do
+    if boards[j].id == id then i = j break end
+  end
+  if i < 0 then
+    if boards_frame < retry_at or t.shadows_model[0] == 0 then return end
+    local obj = host.api.bg_create((@cstring)(&t.shadows_model[0]))
+    if obj == nilptr then
+      retry_at = boards_frame + CREATE_RETRY_FRAMES
+      warn_once('world: could not create a shadow board (CONFIG.world.shadows)')
+      return
+    end
+    if #boards == 0 then boards_model = t.shadows_model end
+    boards:push(Board{ id = id, obj = obj, born = boards_frame, transparency = -1 })
+    i = #boards - 1
+  end
+  local b = &boards[i]
+  b.frame = boards_frame
+  if not b.ready then
+    if host.api.bg_ready(b.obj) == 0 then
+      if boards_frame - b.born >= LOAD_TIMEOUT_FRAMES then
+        warn_once('world: the shadow board model did not load (CONFIG.world.shadows.model)')
+        drop(i, LOAD_RETRY_FRAMES)
+      end
+      return
+    end
+    b.ready = true
+    warned = false
+  end
+  local pose = world_board_pose(pl, t.shadows_offset, t.shadows_depth, t.shadows_model_width,
+                                t.shadows_model_height, t.shadows_model_origin)
+  if not b.placed or not same_pose(&pose, &b.pose) then
+    if host.api.bg_set_transform(b.obj, pose.x, pose.y, pose.z, pose.qx, pose.qy, pose.qz, pose.qw,
+                                 pose.sx, pose.sy, pose.sz) == 0 then
+      warn_once('world: could not place a shadow board')
+      drop(i, CREATE_RETRY_FRAMES)
+      return
+    end
+    b.pose, b.placed = pose, true
+  end
+  if host.api.bg_set_transparency ~= nilptr and b.transparency ~= t.shadows_transparency then
+    host.api.bg_set_transparency(b.obj, t.shadows_transparency)
+    b.transparency = t.shadows_transparency
+  end
+end
+
+-- Once per frame after the panels: boards no panel asked for this frame
+-- (closed, hidden, asleep, derezzed, world toggled off) are freed, and so are
+-- all of them when the option goes off, the model changes or the zone changes.
+global function occluders_sync(t: *WorldTuning): void
+  defer boards_frame = boards_frame + 1 end
+  if #boards == 0 then boards_territory = 0 return end
+  if not t.shadows or not same_path(&t.shadows_model, &boards_model) then
+    occluders_destroy_all()
+    return
+  end
+  local pc: GuObject
+  if host.api.get_object ~= nilptr and host.api.get_object(WORLD_PLAYER, 0, &pc) ~= 0 and pc.found ~= 0 then
+    if boards_territory ~= 0 and pc.territory ~= boards_territory then
+      logf(LOG_INFO, 'world: zone %d -> %d, freeing shadow boards', boards_territory, pc.territory)
+      occluders_destroy_all()
+      return
+    end
+    boards_territory = pc.territory
+  end
+  local i: integer = #boards - 1
+  while i >= 0 do
+    if boards[i].frame ~= boards_frame then
+      board_free(&boards[i])
+      boards:remove(i)
+    end
+    i = i - 1
+  end
+end

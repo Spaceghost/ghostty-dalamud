@@ -11,6 +11,7 @@ using Dalamud.Game.Gui.Dtr;
 using Dalamud.Interface.ManagedFontAtlas;
 using RenderLightFlags = FFXIVClientStructs.FFXIV.Client.Graphics.Render.LightFlags;
 using SceneLight = FFXIVClientStructs.FFXIV.Client.Graphics.Scene.Light;
+using BgObject = FFXIVClientStructs.FFXIV.Client.Graphics.Scene.BgObject;
 
 namespace GhosttyDalamud;
 
@@ -65,6 +66,13 @@ internal static unsafe class HostApi
         Api->Raycast        = &Raycast;
         Api->GetSceneDepth  = &GetSceneDepth;
         Api->OpenUrl        = &OpenUrl;
+        // BgObject.Create is found once, here; without it the core leaves shadow boards off
+        Api->BgCreate       = null;
+        if (ResolveBgCreate()) Api->BgCreate = &BgCreate;
+        Api->BgReady        = &BgReady;
+        Api->BgSetTransform = &BgSetTransform;
+        Api->BgSetTransparency = &BgSetTransparency;
+        Api->BgDestroy      = &BgDestroy;
     }
 
     public static void Free()
@@ -455,6 +463,82 @@ internal static unsafe class HostApi
             var l = (SceneLight*)light;
             l->CleanupRender();
             l->Dtor(1);
+            return 1;
+        } catch { return 0; }
+    }
+
+    // Shadow boards behind world panels: a client-side BgObject, made and freed
+    // the way Stagehand (LiveObjectService, LiveBgObject), Anyder and Brio do.
+    // BgObject.Create(path, pool, existing) as FFXIVClientStructs signs it.
+    private const string BgCreateSignature = "E8 ?? ?? ?? ?? 48 89 43 30 48 8B D7";
+    private static delegate* unmanaged<byte*, byte*, BgObject*, BgObject*> _bgCreate;
+
+    private static bool ResolveBgCreate()
+    {
+        try {
+            if (!Plugin.Sigs.TryScanText(BgCreateSignature, out nint address)) {
+                Plugin.Log.Warning("BgObject.Create not found; world panel shadows stay off");
+                return false;
+            }
+            _bgCreate = (delegate* unmanaged<byte*, byte*, BgObject*, BgObject*>)address;
+            return true;
+        } catch { return false; }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static nint BgCreate(byte* path)
+    {
+        try {
+            if (path == null || _bgCreate == null) return 0;
+            fixed (byte* pool = "Ghostty.PanelShadow\0"u8) return (nint)_bgCreate(path, pool, null);
+        } catch { return 0; }
+    }
+
+    // 1 once the model has loaded (ResourceHandle.LoadState 7): only then may transforms be applied
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int BgReady(nint obj)
+    {
+        try {
+            var o = (BgObject*)obj;
+            return o != null && o->ModelResourceHandle != null && o->ModelResourceHandle->LoadState == 7 ? 1 : 0;
+        } catch { return 0; }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int BgSetTransform(nint obj, float x, float y, float z, float qx, float qy, float qz, float qw, float sx, float sy, float sz)
+    {
+        try {
+            var o = (BgObject*)obj;
+            if (o == null || o->ModelResourceHandle == null || o->ModelResourceHandle->LoadState != 7) return 0;
+            o->Position = new System.Numerics.Vector3(x, y, z);
+            o->Rotation = new System.Numerics.Quaternion(qx, qy, qz, qw);
+            o->Scale = new System.Numerics.Vector3(sx, sy, sz);
+            o->UpdateTransforms(false);
+            o->UpdateCulling();
+            return 1;
+        } catch { return 0; }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int BgSetTransparency(nint obj, float transparency)
+    {
+        try {
+            var o = (BgObject*)obj;
+            if (o == null) return 0;
+            o->SetTransparency(transparency);
+            return 1;
+        } catch { return 0; }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int BgDestroy(nint obj)
+    {
+        try {
+            // the game tears its scene down itself when it exits
+            if (obj == 0 || Plugin.GameFramework.IsFrameworkUnloading) return 0;
+            var o = (BgObject*)obj;
+            o->CleanupRender();
+            o->Dtor(1);
             return 1;
         } catch { return 0; }
     }

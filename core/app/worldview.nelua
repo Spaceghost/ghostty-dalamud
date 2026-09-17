@@ -6,6 +6,7 @@
 -- character cut-out when that is unavailable) and derez in combat.
 require 'core.app.dropdown'
 require 'core.app.lights'
+require 'core.app.occluders'
 require 'core.depthpass'
 
 -- World panels ------------------------------------------------------------------
@@ -289,11 +290,12 @@ global function release_look_at(): void
   update_look_at(false, 0, 0, 0)
 end
 
--- Let go of what the core makes the game show or do: panel lights, the
--- character animation, the walk and the head aim. gu_shutdown, /term reload
--- and the kill switch all do this.
+-- Let go of what the core makes the game show or do: panel lights, shadow
+-- boards, the character animation, the walk and the head aim. gu_shutdown,
+-- /term reload and the kill switch all do this.
 global function teardown_effects(): void
   lights_destroy_all()
+  occluders_destroy_all()
   local anim_err = policy_anim_toggle(false)
   anim_err:destroy()
   host.anim_out = false
@@ -468,6 +470,7 @@ end
 
 global function draw_world(now: float64): void
   defer lights_sync() end -- panel lights: however this frame ends
+  defer occluders_sync(&host.world_tuning) end -- and shadow boards
   sleep_unseen(now)
   host.world_covers:clear()
   read_tuning(now)
@@ -564,6 +567,7 @@ global function draw_world(now: float64): void
       carried_pl = pl
     end
     light_panel(s.id, ok and not s.sleeping, &pl, prez * (1 - ft))
+    occluder_panel(s.id, ok and not s.sleeping and prez * (1 - ft) > 0, &pl, &host.world_tuning)
     -- a double-clicked panel flies to a centred rectangle covering full_screen of the view
     local fsz = host.world_tuning.full_screen
     local fw = math.max(cam.width * fsz, 320)
