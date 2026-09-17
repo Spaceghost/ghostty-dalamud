@@ -1,0 +1,125 @@
+-- A TermView owns one libghostty-vt terminal plus the render-state objects
+-- needed to read it back for drawing. Sessions embed one of these.
+require 'core.ghostty'
+require 'vector'
+require 'string'
+require 'math'
+
+-- One glyph queued while a row's background runs are still being merged; its
+-- UTF-8 bytes live in TermView.glyph_bytes at [off, off+len).
+global GlyphDraw = @record{
+  x: float32,
+  col: uint32,
+  off: usize,
+  len: usize,
+  bold: boolean,
+  underline: boolean,
+  strike: boolean,
+}
+
+global TermView = @record{
+  term: GhosttyTerminal,
+  state: GhosttyRenderState,
+  iter: GhosttyRenderStateRowIterator,
+  cells: GhosttyRenderStateRowCells,
+  cols: uint16,
+  rows: uint16,
+  ok: boolean,
+  glyphs: vector(GlyphDraw),
+  glyph_bytes: vector(byte),
+}
+
+function TermView:init(cols: uint16, rows: uint16): boolean
+  if cols < 2 then cols = 2 end
+  if rows < 1 then rows = 1 end
+  if ghostty_terminal_new(nilptr, &self.term, cols, rows) ~= GHOSTTY_SUCCESS then return false end
+  if ghostty_render_state_new(nilptr, &self.state) ~= GHOSTTY_SUCCESS then return false end
+  if ghostty_render_state_row_iterator_new(nilptr, &self.iter) ~= GHOSTTY_SUCCESS then return false end
+  if ghostty_render_state_row_cells_new(nilptr, &self.cells) ~= GHOSTTY_SUCCESS then return false end
+  self.cols = cols
+  self.rows = rows
+  self.ok = true
+  return true
+end
+
+function TermView:destroy(): void
+  if self.cells ~= nilptr then ghostty_render_state_row_cells_free(self.cells) end
+  if self.iter ~= nilptr then ghostty_render_state_row_iterator_free(self.iter) end
+  if self.state ~= nilptr then ghostty_render_state_free(self.state) end
+  if self.term ~= nilptr then ghostty_terminal_free(self.term) end
+  self.glyphs:destroy()
+  self.glyph_bytes:destroy()
+  $self = {}
+end
+
+function TermView:feed(data: *[0]uint8, len: usize): void
+  if len == 0 then return end
+  ghostty_terminal_vt_write(self.term, data, len)
+end
+
+function TermView:resize(cols: uint16, rows: uint16, cell_w_px: uint32, cell_h_px: uint32): boolean
+  if cols < 2 then cols = 2 end
+  if rows < 1 then rows = 1 end
+  if cols == self.cols and rows == self.rows then return false end
+  if ghostty_terminal_resize(self.term, cols, rows, cell_w_px, cell_h_px) ~= GHOSTTY_SUCCESS then return false end
+  self.cols = cols
+  self.rows = rows
+  return true
+end
+
+-- Refresh the render-state snapshot from the terminal. Call once per frame
+-- before drawing.
+function TermView:update(): boolean
+  return ghostty_render_state_update(self.state, self.term) == GHOSTTY_SUCCESS
+end
+
+function TermView:scroll_delta(delta: isize): void
+  local sv: GhosttyTerminalScrollViewport = { tag = GHOSTTY_SCROLL_VIEWPORT_DELTA }
+  sv.value.delta = delta
+  ghostty_terminal_scroll_viewport(self.term, sv)
+end
+
+local function put_byte(out: *[32]byte, n: integer, b: integer): integer
+  if n < 32 then out[n] = (@byte)(b) end
+  return n + 1
+end
+
+-- What one wheel notch sends the program, as bytes in `out` (0 = nothing: scroll
+-- the viewport instead). A program tracking the mouse gets a wheel report (SGR
+-- 1006 form, else the legacy X10 form); on the alternate screen with alternate
+-- scroll (1007) it gets arrow keys, so less, man and vim scroll their own view.
+-- `col` and `row` are 0-based cells.
+function TermView:wheel_bytes(up: boolean, col: integer, row: integer, out: *[32]byte): integer
+  local t = self.term
+  local n = 0
+  if ghostty_terminal_mode_enabled(t, 1000, false) or ghostty_terminal_mode_enabled(t, 1002, false)
+     or ghostty_terminal_mode_enabled(t, 1003, false) or ghostty_terminal_mode_enabled(t, 9, false) then
+    local button = up and 64 or 65
+    if ghostty_terminal_mode_enabled(t, 1006, false) then
+      local s = string.format('\27[<%d;%d;%dM', button, col + 1, row + 1)
+      for i = 0, < math.min(#s, 32) do n = put_byte(out, n, s.data[i]) end
+      s:destroy()
+    else
+      n = put_byte(out, n, 27) n = put_byte(out, n, 91) n = put_byte(out, n, 77) -- ESC [ M
+      n = put_byte(out, n, 32 + button)
+      n = put_byte(out, n, math.min(32 + col + 1, 255))
+      n = put_byte(out, n, math.min(32 + row + 1, 255))
+    end
+    return math.min(n, 32)
+  end
+  local alt = ghostty_terminal_mode_enabled(t, 1049, false) or ghostty_terminal_mode_enabled(t, 1047, false)
+    or ghostty_terminal_mode_enabled(t, 47, false)
+  if alt and ghostty_terminal_mode_enabled(t, 1007, false) then
+    local ss3 = ghostty_terminal_mode_enabled(t, 1, false) -- DECCKM: application cursor keys
+    for _ = 1, 3 do
+      n = put_byte(out, n, 27) n = put_byte(out, n, ss3 and 79 or 91) n = put_byte(out, n, up and 65 or 66)
+    end
+    return n
+  end
+  return 0
+end
+
+function TermView:scroll_bottom(): void
+  local sv: GhosttyTerminalScrollViewport = { tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM }
+  ghostty_terminal_scroll_viewport(self.term, sv)
+end
