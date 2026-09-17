@@ -1,0 +1,406 @@
+-- Client side of the ghostty-agent protocol: one TCP connection multiplexing
+-- many PTY sessions. Fully non-blocking; call `pump` every frame.
+require 'string'
+require 'vector'
+require 'core.sys.net'
+require 'core.protocol'
+
+global AgentState = @enum(cint){ Disconnected = 0, Connecting, Handshake, Ready, Failed }
+
+global AgentEvent = @record{
+  typ: uint8,       -- PROTO_* from the agent
+  id: uint32,
+  status: int32,    -- EXIT: exit status; CLIP: -1 when the agent has no clipboard for us
+  data: *[0]uint8,  -- valid only during the callback
+  len: usize,
+  offset: uint64,   -- ATTACHED: the session's output bytes so far
+  has_offset: boolean,
+}
+
+global AgentEventFn = @function(ctx: pointer, ev: *AgentEvent): void
+
+global AgentClient = @record{
+  sock: NetSocket,
+  conn: NetConn,
+  state: AgentState,
+  host: string,
+  port: uint16,
+  token: string,
+  inq: ByteQueue,
+  outq: ByteQueue,
+  on_event: AgentEventFn,
+  ctx: pointer,
+  last_error: string,
+  next_open_seq: uint32,
+  connect_started: float64,
+  -- per connection, from the handshake reply "ghostty-agent <version> <nonce>"
+  version: integer,            -- 1 for agents that send no version 2 frames
+  nonce: uint64,               -- changes when the agent restarts; 0 = unknown (version 1)
+  attach_fifo: vector(uint32), -- version 1: ATTACH ids waiting for OK "attached" / ERR "no such session"
+  clip_fifo: vector(uint8),    -- CLIP_SET / CLIP_GET waiting for their reply
+  clip_off: boolean,           -- the agent does not know clipboard frames: stop sending them
+}
+
+function AgentClient:init(host: string, port: uint16, token: string): void
+  $self = {}
+  self.sock = net.invalid()
+  self.host = host:copy()
+  self.port = port
+  self.token = token:copy()
+end
+
+function AgentClient:destroy(): void
+  net.close(self.sock)
+  self.sock = net.invalid()
+  self.inq:destroy()
+  self.outq:destroy()
+  self.host:destroy()
+  self.token:destroy()
+  self.last_error:destroy()
+  self.attach_fifo:destroy()
+  self.clip_fifo:destroy()
+  self.state = AgentState.Disconnected
+end
+
+local function set_error(self: *AgentClient, msg: string): void
+  local copy = msg:copy() -- `msg` may be last_error itself
+  self.last_error:destroy()
+  self.last_error = copy
+end
+
+function AgentClient:disconnect(): void
+  net.close(self.sock)
+  self.sock = net.invalid()
+  self.state = AgentState.Disconnected
+end
+
+function AgentClient:connect(now: float64): void
+  if self.state == AgentState.Connecting or self.state == AgentState.Handshake or self.state == AgentState.Ready then return end
+  if net.is_valid(self.sock) then self:disconnect() end
+  self.inq:destroy()
+  self.outq:destroy()
+  self.version = 0
+  self.nonce = 0
+  self.attach_fifo:clear()
+  self.clip_fifo:clear()
+  self.clip_off = false
+  self.conn = net.connect(self.host, self.port)
+  if not net.is_valid(self.conn.sock) then
+    self.state = AgentState.Failed
+    set_error(self, 'connect failed')
+    return
+  end
+  self.sock = self.conn.sock
+  self.connect_started = now
+  if self.conn.connected then
+    self.state = AgentState.Handshake
+    proto.write_frame(&self.outq, PROTO_HELLO, (@*[0]uint8)(self.token.data), self.token.size)
+  else
+    self.state = AgentState.Connecting
+  end
+end
+
+function AgentClient:ready(): boolean
+  return self.state == AgentState.Ready
+end
+
+local function emit(self: *AgentClient, ev: *AgentEvent): void
+  if self.on_event ~= nilptr then self.on_event(self.ctx, ev) end
+end
+
+-- Session frames go out only on an authenticated connection: the agent drops
+-- a client whose first frame is not HELLO, and every connection starts with an
+-- empty queue anyway. Callers send again what matters once Ready.
+
+-- Request a new session; false when not connected (nothing was sent). The
+-- agent answers with OPENED carrying the real session id, in request order.
+function AgentClient:open(cols: uint16, rows: uint16, argv: *vector(string), env: *vector(string)): boolean
+  if self.state ~= AgentState.Ready then return false end
+  local payload: ByteQueue
+  local b: [4]uint8
+  proto.put_u16(&b, cols)
+  proto.put_u16((@*[0]uint8)(&b[2]), rows)
+  payload:push(&b, 4)
+  for i = 0, < #argv do
+    payload:push_string(argv[i])
+    local z: [1]uint8
+    payload:push(&z, 1)
+  end
+  local zz: [1]uint8
+  payload:push(&zz, 1)
+  if env ~= nilptr then
+    for i = 0, < #env do
+      payload:push_string(env[i])
+      local z: [1]uint8
+      payload:push(&z, 1)
+    end
+  end
+  proto.write_frame(&self.outq, PROTO_OPEN, payload:peek(), payload:len())
+  payload:destroy()
+  return true
+end
+
+function AgentClient:write(id: uint32, data: *[0]uint8, len: usize): void
+  if self.state ~= AgentState.Ready then return end
+  proto.write_frame_id(&self.outq, PROTO_DATA, id, data, len)
+end
+
+function AgentClient:resize(id: uint32, cols: uint16, rows: uint16): void
+  if self.state ~= AgentState.Ready then return end
+  local b: [4]uint8
+  proto.put_u16(&b, cols)
+  proto.put_u16((@*[0]uint8)(&b[2]), rows)
+  proto.write_frame_id(&self.outq, PROTO_RESIZE, id, &b, 4)
+end
+
+function AgentClient:close_session(id: uint32): void
+  if self.state ~= AgentState.Ready then return end
+  proto.write_frame_id(&self.outq, PROTO_CLOSE, id, nilptr, 0)
+end
+
+-- Subscribe to a session. `fed` is how many of its output bytes this client
+-- already fed to its terminal: a version 2 agent replays only the rest while
+-- it still has them. True when the ATTACH was sent; ATTACHED (or EXIT for an
+-- unknown id) follows.
+function AgentClient:attach(id: uint32, fed: uint64): boolean
+  if self.state ~= AgentState.Ready then return false end
+  local b: [8]uint8
+  proto.put_u64(&b, fed)
+  proto.write_frame_id(&self.outq, PROTO_ATTACH, id, &b, 8)
+  if self.version < 2 then self.attach_fifo:push(id) end
+  return true
+end
+
+function AgentClient:detach(id: uint32): void
+  if self.state ~= AgentState.Ready then return end
+  proto.write_frame_id(&self.outq, PROTO_DETACH, id, nilptr, 0)
+end
+
+-- The host's system clipboard (the desktop the agent runs on). An agent that
+-- answers these with ERR "unknown frame" gets no more of them on this connection.
+function AgentClient:clip_set(text: string): void
+  if self.state ~= AgentState.Ready or self.clip_off then return end
+  proto.write_frame(&self.outq, PROTO_CLIP_SET, (@*[0]uint8)(text.data), text.size)
+  self.clip_fifo:push(PROTO_CLIP_SET)
+end
+
+-- Answered by a CLIP event; its status is -1 (and no text) when the agent has
+-- no clipboard for us, so the caller can fall back to its own.
+function AgentClient:clip_get(): void
+  if self.state ~= AgentState.Ready then return end
+  if self.clip_off then
+    local ev: AgentEvent = { typ = PROTO_CLIP, status = -1 }
+    emit(self, &ev)
+    return
+  end
+  proto.write_frame(&self.outq, PROTO_CLIP_GET, nilptr, 0)
+  self.clip_fifo:push(PROTO_CLIP_GET)
+end
+
+function AgentClient:list(): void
+  if self.state ~= AgentState.Ready then return end
+  proto.write_frame(&self.outq, PROTO_LIST, nilptr, 0)
+end
+
+-- One row of a LISTR reply: "id\tcols\trows\tattached\tcommand\n".
+global AgentListEntry = @record{ id: uint32, cols: uint16, rows: uint16, attached: integer, command: string }
+
+-- Parse a LISTR payload. Entries borrow `data` for `command`.
+global function agent_parse_list(data: *[0]uint8, len: usize): vector(AgentListEntry)
+  local out: vector(AgentListEntry)
+  local text = string{data=(@*[0]byte)(data), size=len}
+  local line_start: usize = 0
+  for pos: usize = 0, < len do
+    if data[pos] == 10 then
+      local fields: [5]string
+      local nf: integer = 0
+      local fs: usize = line_start
+      for k: usize = line_start, < pos + 1 do
+        if nf < 4 and (k == pos or data[k] == 9) then
+          fields[nf] = string{data=(@*[0]byte)(&data[fs]), size=k - fs}
+          nf = nf + 1
+          fs = k + 1
+        end
+      end
+      if nf == 4 then
+        fields[4] = string{data=(@*[0]byte)(&data[fs]), size=pos - fs}
+        local id, ok1 = tointeger(fields[0])
+        out:push(AgentListEntry{
+          id = (@uint32)(id), cols = (@uint16)(tointeger(fields[1])), rows = (@uint16)(tointeger(fields[2])),
+          attached = tointeger(fields[3]), command = fields[4],
+        })
+      end
+      line_start = pos + 1
+    end
+  end
+  return out
+end
+
+local function parse_digits(text: string, i: usize): (uint64, usize)
+  local v: uint64 = 0
+  while i < text.size and text.data[i] >= '0'_b and text.data[i] <= '9'_b do
+    v = v * 10 + (text.data[i] - '0'_b)
+    i = i + 1
+  end
+  return v, i
+end
+
+-- "ghostty-agent <version> [<nonce>]"; anything else counts as version 1.
+local function parse_greeting(self: *AgentClient, text: string): void
+  self.version = 1
+  self.nonce = 0
+  local prefix: string = 'ghostty-agent '
+  if text.size <= prefix.size or text:subview(1, prefix.size) ~= prefix then return end
+  local v, i = parse_digits(text, prefix.size)
+  if i == prefix.size or v > 1000 then return end
+  self.version = (@integer)(v)
+  if i < text.size and text.data[i] == ' '_b then
+    local n, j = parse_digits(text, i + 1)
+    if j > i + 1 then self.nonce = n end
+  end
+end
+
+-- A clipboard request got its reply: which kind it was (0 when none waited).
+local function clip_reply(self: *AgentClient): uint8
+  if #self.clip_fifo == 0 then return 0 end
+  local kind = self.clip_fifo[0]
+  self.clip_fifo:remove(0)
+  return kind
+end
+
+local function dispatch(self: *AgentClient): void
+  while true do
+    local ok, typ, payload, len = proto.read_frame(&self.inq)
+    if not ok then break end
+    local ev: AgentEvent = { typ = typ, data = payload, len = len }
+    local text = string{data=(@*[0]byte)(payload), size=len}
+    local deliver = true
+    local handshake_failed = false
+    if typ == PROTO_OK then
+      if self.state == AgentState.Handshake then
+        parse_greeting(self, text)
+        self.state = AgentState.Ready
+      elseif self.version < 2 and text == 'attached' and #self.attach_fifo > 0 then
+        ev = { typ = PROTO_ATTACHED, id = self.attach_fifo[0] }
+        self.attach_fifo:remove(0)
+      elseif text == 'clipboard set' then
+        clip_reply(self)
+      end
+    elseif typ == PROTO_ERR then
+      if self.state == AgentState.Handshake then
+        set_error(self, text)
+        handshake_failed = true
+      elseif (text == 'unknown frame' or text == 'clipboard unavailable') and #self.clip_fifo > 0 then
+        local kind = clip_reply(self)
+        if text == 'unknown frame' then
+          deliver = false -- said once below, not for every request still on its way
+          if not self.clip_off then
+            self.clip_off = true
+            local note: string = 'agent does not know clipboard frames; clipboard sync off until it reconnects'
+            local nev: AgentEvent = { typ = PROTO_ERR, data = (@*[0]uint8)(note.data), len = note.size }
+            emit(self, &nev)
+          end
+        end
+        if kind == PROTO_CLIP_GET then
+          if deliver then emit(self, &ev) end
+          ev = { typ = PROTO_CLIP, status = -1 } -- the paste still gets its answer
+          deliver = true
+        end
+      elseif self.version < 2 and text == 'no such session' and #self.attach_fifo > 0 then
+        ev = { typ = PROTO_EXIT, id = self.attach_fifo[0], status = (@int32)(PROTO_NO_SESSION) }
+        self.attach_fifo:remove(0)
+      elseif self.version < 2 and (text == 'bad open' or text == 'forkpty failed') then
+        ev = { typ = PROTO_OPENED, id = 0, data = payload, len = len }
+      end
+    elseif typ == PROTO_OPENED or typ == PROTO_SDATA or typ == PROTO_EXIT or typ == PROTO_ATTACHED then
+      if len >= 4 then
+        ev.id = proto.get_u32(payload)
+        ev.data = (@*[0]uint8)(&payload[4])
+        ev.len = len - 4
+        if typ == PROTO_EXIT and ev.len >= 4 then
+          ev.status = (@int32)(proto.get_u32(ev.data))
+        elseif typ == PROTO_ATTACHED and ev.len >= 8 then
+          ev.offset = proto.get_u64(ev.data)
+          ev.has_offset = true
+        end
+      else
+        deliver = false -- malformed: an OPENED without an id must not take a waiting session
+      end
+    elseif typ == PROTO_CLIP then
+      clip_reply(self)
+    end
+    if deliver then emit(self, &ev) end
+    proto.frame_consume(&self.inq, len)
+    if handshake_failed then
+      -- refused (bad token): close the socket now, the retry opens a new one
+      self:disconnect()
+      self.state = AgentState.Failed
+      self.inq:destroy()
+      break
+    end
+  end
+end
+
+-- Send what is queued, as far as the socket takes it now. False when the
+-- connection broke (or there is none).
+function AgentClient:flush(): boolean
+  if self.state ~= AgentState.Handshake and self.state ~= AgentState.Ready then return false end
+  while self.outq:len() > 0 do
+    local n = net.send(self.sock, self.outq:peek(), self.outq:len())
+    if n < 0 then
+      self:disconnect()
+      self.state = AgentState.Failed
+      set_error(self, 'connection lost')
+      return false
+    elseif n == 0 then
+      break
+    else
+      self.outq:consume((@usize)(n))
+    end
+  end
+  return true
+end
+
+-- Drive I/O. `now` is a monotonic clock in seconds (ImGui time is fine).
+function AgentClient:pump(now: float64): void
+  if self.state == AgentState.Connecting then
+    local r = net.connect_poll(&self.conn)
+    if r == 1 then
+      self.state = AgentState.Handshake
+      -- HELLO must be the first frame the agent sees, whatever got queued
+      local q: ByteQueue
+      proto.write_frame(&q, PROTO_HELLO, (@*[0]uint8)(self.token.data), self.token.size)
+      if self.outq:len() > 0 then q:push(self.outq:peek(), self.outq:len()) end
+      self.outq:destroy()
+      self.outq = q
+    elseif r == -1 or now - self.connect_started > 5.0 then
+      self:disconnect()
+      self.state = AgentState.Failed
+      set_error(self, 'agent unreachable')
+      return
+    else
+      return
+    end
+  end
+  if self.state ~= AgentState.Handshake and self.state ~= AgentState.Ready then return end
+
+  if not self:flush() then return end
+
+  -- read input, a bounded amount per frame: a flood waits in the socket (and
+  -- the agent stops reading the shell) instead of stalling the game
+  local buf: [16384]uint8
+  for _ = 1, 8 do
+    local n = net.recv(self.sock, &buf, 16384)
+    if n > 0 then
+      self.inq:push(&buf, (@usize)(n))
+    elseif n == 0 then
+      break
+    else
+      self:disconnect()
+      self.state = AgentState.Failed
+      set_error(self, 'connection closed')
+      break
+    end
+  end
+  dispatch(self)
+end
