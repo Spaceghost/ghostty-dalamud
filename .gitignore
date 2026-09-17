@@ -1,0 +1,15 @@
+# build outputs and pinned third-party checkouts (tools/build.sh, tools/fetch-vendor.sh)
+build/
+vendor/
+!vendor/.keep
+bin/
+obj/
+.zig-cache/
+
+# editor swap files
+*.swp
+
+# state the Lua modules write to the working directory when GHOSTTY_PLUGIN_DIR is unset (tests/run.sh removes them)
+/world-state.lua
+/animation-reset-done
+/settings.lua
