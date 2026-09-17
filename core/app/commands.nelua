@@ -1,0 +1,333 @@
+
+
+-- Chat / hotbar commands (/term ...), shared by the shim and keymap actions.
+require 'core.app.popup'
+local strconv: type = require 'detail.strconv'
+
+-- A terminal or profile number, optionally written "#3". False for anything
+-- else ("tab", "all", "#abc"); tointeger would abort the game on those.
+-- str2int alone accepts a bare sign ("-" is 0) and leading spaces, so the
+-- text must start with a digit.
+local function parse_id(s: string): (boolean, integer)
+  if #s > 0 and s.data[0] == '#'_b then s = s:subview(2) end
+  if #s == 0 or s.data[0] < '0'_b or s.data[0] > '9'_b then return false, 0 end
+  return strconv.str2int(s, 10)
+end
+
+-- Chat command / shim command entry: "reload", "toggle", "new [profile#]",
+-- "window [profile#]".
+-- Something to ring for a preview: the active terminal, else any terminal.
+local function bell_preview_target(): *Session
+  local s = active_terminal()
+  if s == nilptr and #host.sessions > 0 then s = host.sessions[0] end
+  return s
+end
+
+-- /term bell [name|demo]
+global function bell_command(args: string): cint
+  local err = policy_bell_command(args)
+  if #err > 0 then
+    logf(LOG_WARN, '%s', err)
+    err:destroy()
+    return 4
+  end
+  local word = args:gsub('^%s*', '')
+  if word:subview(1, 4) == 'demo' then
+    host.bell_demo_step = 1
+    host.bell_demo_at = 0
+  else
+    local s = bell_preview_target()
+    if s ~= nilptr then bell_ring(s) end
+  end
+  word:destroy()
+  return 0
+end
+
+-- Per frame: advance the demo and show its caption at the top of the screen.
+global function bell_demo_tick(now: float64): void
+  if host.bell_demo_step > 0 and now >= host.bell_demo_at then
+    local ok, label = policy_bell_demo(host.bell_demo_step)
+    if ok then
+      local s = bell_preview_target()
+      if s ~= nilptr then bell_ring(s) end
+      host.bell_demo_label:destroy()
+      host.bell_demo_label = label
+      host.bell_demo_label_until = now + 2.4
+      host.bell_demo_step = host.bell_demo_step + 1
+      host.bell_demo_at = now + 2.6
+    else
+      label:destroy()
+      host.bell_demo_step = 0
+    end
+  end
+  if now < host.bell_demo_label_until and #host.bell_demo_label > 0 then
+    local vp = imgui.GetMainViewport()
+    local dl = imgui.GetForegroundDrawList()
+    local size = imgui.GetFontSize() * 1.25
+    local tsz: ImVec2
+    imgui.FontCalcTextSizeA(&tsz, imgui.GetFont(), size, 3.4e38, 0, (@cstring)(host.bell_demo_label.data), nilptr, nilptr)
+    local x = vp.Pos.x + (vp.Size.x - tsz.x) * 0.5
+    local y = vp.Pos.y + vp.Size.y * 0.18
+    local a = (@uint8)(math.clamp((host.bell_demo_label_until - now) / 0.4, 0, 1) * 230)
+    imgui.DrawListAddRectFilled(dl, vec2(x - 16, y - 10), vec2(x + tsz.x + 16, y + tsz.y + 10), im_col32(12, 16, 22, a), 10, 0)
+    imgui.DrawListAddText(dl, imgui.GetFont(), size, vec2(x, y), im_col32(230, 222, 200, a), (@cstring)(host.bell_demo_label.data), nilptr, 0, nilptr)
+  end
+end
+
+-- /term showcase off: close the demo terminals and show the player's own again.
+global function showcase_stop(): void
+  for i = 0, < #host.showcase_ids do
+    local s = find_session(host.showcase_ids[i])
+    if s ~= nilptr then close_terminal(s) end
+  end
+  for i = 0, < #host.showcase_hidden do
+    local err = policy_world_command(host.showcase_hidden[i], 'hide off')
+    err:destroy()
+  end
+  host.showcase_ids:clear()
+  host.showcase_hidden:clear()
+  host.showcase_shot = 0
+  host.showcase_moving = false
+  host.cam_active = false
+end
+
+-- /term showcase: hide the player's terminals, open the demo ones from
+-- lua/showcase.lua and start the camera shots.
+local function showcase_start(): cint
+  showcase_stop()
+  for i = 0, < #host.world do
+    local id = host.world[i].id
+    local err = policy_world_command(id, 'hide on')
+    if #err == 0 then host.showcase_hidden:push(id) end
+    err:destroy()
+  end
+  set_visible(false)
+  local i = 1
+  while true do
+    local ok, view, send, show = policy_showcase_terminal(i)
+    if not ok then view:destroy() send:destroy() show:destroy() break end
+    -- `show` text needs no shell: a local terminal displays it as is
+    local s: *Session
+    if #show > 0 then s = session_new_local('showcase', 100, 30) else s = session_new(policy.default_profile - 1, 100, 30) end
+    if s ~= nilptr then
+      local err = policy_world_command(s.id, view)
+      if #err > 0 then
+        logf(LOG_WARN, 'showcase %d: %s', i, err)
+        session_remove(s)
+      else
+        host.world:push(s)
+        host.showcase_ids:push(s.id)
+        if #show > 0 then s:feed_text(show) end
+        if #send > 0 then s:write_string(send) s:write_string('\r') end
+      end
+      err:destroy()
+    end
+    view:destroy() send:destroy() show:destroy()
+    i = i + 1
+  end
+  set_world_visible(true)
+  host.world_focus = 0
+  host.showcase_shot = 1
+  host.showcase_moving = false
+  host.showcase_at = imgui.GetTime() + policy_showcase_delay()
+  logf(LOG_INFO, 'showcase: %d terminals, %d of yours hidden', #host.showcase_ids, #host.showcase_hidden)
+  return 0
+end
+
+global function run_command(cmd: string): cint
+  -- "verb arg...": verbs match whole words ("minimize" is not "min")
+  local verb: string = cmd
+  local arg: string
+  local sp = cmd:find(' ', 1, true)
+  if sp > 0 then
+    verb = cmd:subview(1, sp - 1)
+    arg = cmd:subview(sp + 1)
+  end
+  if cmd == 'reload' then
+    -- the same teardown as gu_shutdown: nothing may keep steering the game
+    showcase_stop()
+    teardown_effects()
+    -- DETACH, never CLOSE: the shells survive, and a reload that fails before
+    -- agent_setup must not leave CLOSE frames queued for every one of them
+    for i = 0, < #host.sessions do host.sessions[i].keep_on_agent = true end
+    -- before LISTR the terminals on screen are not the saved layout
+    if host.layout_restored then save_world_state() end
+    for i = #host.sessions - 1, 0, -1 do session_remove(host.sessions[i]) end
+    host.world_full_id, host.world_full_last = 0, 0
+    host.cam_active = false
+    host.cam_restore = host.cam_saved_d > 0 -- give the camera its zoom back
+    host.world_drag_id = 0
+    host.drag.id = 0
+    host.dropdown_tabs:clear()
+    host.windows:clear()
+    host.minimized:clear()
+    host.world:clear()
+    host.world_focus = 0
+    host.world_pins_done = false
+    host.popup_session = nilptr
+    host.dropdown_active = -1
+    host.agent_listed = false
+    host.reattach_done = false
+    host.layout_restored = false -- the layout is gone until the next LISTR
+    return load_policy() and 0 or 2
+  elseif cmd == 'showcase' then
+    return showcase_start()
+  elseif cmd == 'showcase off' then
+    showcase_stop()
+    return 0
+  elseif cmd == 'toggle' or #cmd == 0 then
+    toggle_visible()
+    return 0
+  elseif verb == 'pin' then
+    -- pin the active dropdown tab (or a new session) into the world
+    local s: *Session = nilptr
+    local from_tab = host.dropdown_active >= 0 and host.dropdown_active < #host.dropdown_tabs
+    if from_tab then
+      s = host.dropdown_tabs[host.dropdown_active]
+    else
+      if not player_loaded() then logf(LOG_WARN, 'pin: no player (log in first)') return 4 end
+      s = session_new(policy.default_profile - 1, 80, 24)
+    end
+    if s == nilptr then return 2 end
+    local err = policy_world_command(s.id, arg)
+    if #err > 0 then
+      logf(LOG_WARN, 'pin: %s', err)
+      err:destroy()
+      if not from_tab then session_remove(s) end
+      return 4
+    end
+    if from_tab then
+      host.dropdown_tabs:remove(host.dropdown_active)
+      if host.dropdown_active >= #host.dropdown_tabs then host.dropdown_active = #host.dropdown_tabs - 1 end
+    end
+    host.world:push(s)
+    set_world_visible(true)
+    return 0
+  elseif verb == 'send' or verb == 'type' then
+    -- /term send [#id] text   (Enter appended)   /term type [#id] text (no Enter)
+    local enter = verb == 'send'
+    local rest: string = arg
+    local s: *Session = nilptr
+    if #rest > 1 and rest.data[0] == '#'_b then
+      local idtxt: string = rest
+      local tail: string
+      local rsp = rest:find(' ', 1, true)
+      if rsp > 0 then
+        idtxt = rest:subview(1, rsp - 1)
+        tail = rest:subview(rsp + 1)
+      end
+      local ok, id = parse_id(idtxt)
+      if not ok then return 3 end
+      s = find_session(id)
+      rest = tail
+    else
+      s = active_terminal()
+    end
+    if s == nilptr then return 5 end
+    local bytes = term_unescape(rest)
+    if #bytes > 0 then s:write_string(bytes) end
+    if enter then s:write_string('\r') end
+    bytes:destroy()
+    s.view:scroll_bottom()
+    return 0
+  elseif verb == 'min' then
+    local s: *Session = nilptr
+    if #arg > 0 then
+      local ok, id = parse_id(arg)
+      if not ok then return 3 end
+      s = find_session(id)
+    else
+      s = active_terminal()
+    end
+    if s == nilptr then return 5 end
+    minimize(s)
+    if #host.dropdown_tabs == 0 then set_visible(false) end
+    return 0
+  elseif verb == 'restore' then
+    local s: *Session = nilptr
+    if #arg > 0 then
+      local ok, id = parse_id(arg)
+      if not ok then return 3 end
+      s = find_session(id)
+    elseif #host.minimized > 0 then
+      s = host.minimized[#host.minimized - 1]
+    end
+    if s == nilptr then return 5 end
+    restore(s)
+    return 0
+  elseif verb == 'focus' then
+    local ok, id = parse_id(arg)
+    if not ok then
+      if #arg > 0 then return 3 end
+      return 5
+    end
+    local s = find_session(id)
+    if s == nilptr then return 5 end
+    bring_forward(s)
+    return 0
+  elseif verb == 'occluded' then
+    -- /term occluded on|off: whether the focused world screen keeps running unseen
+    local s = find_session(host.world_focus)
+    if s == nilptr then return 5 end
+    local e = policy_world_command(s.id, cmd)
+    e:destroy()
+    return 0
+  elseif verb == 'bell' then
+    -- /term bell [ripple|sonar|burst|aura|calm|custom|demo]
+    return bell_command(arg)
+  elseif cmd == 'depth' or cmd == 'depth retry' or cmd == 'depth show' then
+    -- /term depth [retry|show]: how world panels are occluded, and why (retry
+    -- forgets a latched failure; show toggles colouring panels by the test)
+    if cmd == 'depth retry' then depthpass_retry() end
+    if cmd == 'depth show' then depthpass.show = not depthpass.show end
+    local d = depthpass_describe(policy.world_occlusion)
+    logf(LOG_INFO, 'world: %s', d)
+    d:destroy()
+    return 0
+  elseif cmd == 'config' or cmd == 'settings' then
+    host.settings_open = not host.settings_open
+    return 0
+  elseif cmd == 'pet' then
+    -- a shell opened with no character to follow would be left behind
+    if not player_loaded() then logf(LOG_WARN, 'pet: no player (log in first)') return 4 end
+    local s = session_new(policy.default_profile - 1, 80, 24)
+    if s ~= nilptr and not make_pet(s) then session_remove(s) return 4 end
+    return 0
+  elseif cmd == 'unpin' then
+    -- focused (else most recent) world terminal goes back to the dropdown
+    local s = find_session(host.world_focus)
+    if s == nilptr and #host.world > 0 then s = host.world[#host.world - 1] end
+    if s == nilptr then return 0 end
+    restore(s)
+    return 0
+  elseif verb == 'window' then
+    local n = policy.default_profile
+    if #arg > 0 then
+      local ok, id = parse_id(arg)
+      if not ok then return 3 end
+      n = id
+    end
+    local s = session_new(n - 1, 80, 24)
+    if s ~= nilptr then
+      host.windows:push(s)
+      set_visible(true)
+    end
+    return 0
+  elseif verb == 'new' then
+    local n = policy.default_profile
+    if #arg > 0 then
+      local ok, id = parse_id(arg)
+      if not ok then return 3 end
+      n = id
+    end
+    local s = session_new(n - 1, 80, 24)
+    if s ~= nilptr then
+      host.dropdown_tabs:push(s)
+      host.dropdown_active = #host.dropdown_tabs - 1
+      set_visible(true)
+      host.dropdown_focus_next = true
+    end
+    return 0
+  end
+  return 3
+end
