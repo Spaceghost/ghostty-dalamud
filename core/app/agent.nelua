@@ -1,0 +1,335 @@
+
+
+-- The ghostty-agent connection and session lifetime: open, reattach (LIST /
+-- ATTACH after a reload), and removal.
+require 'core.app.state'
+require 'core.sys.conpty'
+
+-- A character is loaded (not the title screen or character select): pets and
+-- pins follow it, so they are not opened without one.
+global function player_loaded(): boolean
+  local pc: GuObject
+  return host.api.get_object ~= nilptr and host.api.get_object(WORLD_PLAYER, 0, &pc) ~= 0 and pc.found ~= 0
+end
+
+-- Agent ----------------------------------------------------------------------
+-- Paste text into a terminal: bracketed when the application asked for it
+-- (DEC 2004), plain otherwise; libghostty does the wrapping and newlines.
+global function paste_text(s: *Session, str: string): void
+  if #str == 0 then return end
+  local bracketed = ghostty_terminal_mode_enabled(s.view.term, 2004, false)
+  local cap = str.size + 32
+  local buf = (@*[0]cchar)(default_allocator:alloc(cap))
+  if buf == nilptr then return end
+  local written: usize = 0
+  if ghostty_paste_encode((@cstring)(str.data), str.size, bracketed, buf, cap, &written) == GHOSTTY_SUCCESS and written > 0 then
+    s:write((@*[0]uint8)(buf), written)
+  else
+    s:write_string(str)
+  end
+  default_allocator:dealloc(buf)
+  s.view:scroll_bottom()
+end
+
+-- The open terminal streaming agent session `id`, if any.
+local function find_agent_session(id: uint32): *Session
+  if id == 0 then return nilptr end
+  for i = 0, < #host.sessions do
+    local s = host.sessions[i]
+    if s.kind == TransportKind.Agent and s.agent ~= nilptr and not s.awaiting_open and s.agent_id == id then return s end
+  end
+  return nilptr
+end
+
+global function agent_event(ctx: pointer, ev: *AgentEvent): void
+  if ev.typ == PROTO_OPENED then
+    -- OPENED answers the OPENs in order. A closed terminal leaves a nilptr in
+    -- its place, so the answers after it still reach the right terminals.
+    local s: *Session = nilptr
+    local waited = #host.pending_open > 0
+    if waited then
+      s = host.pending_open[0]
+      host.pending_open:remove(0)
+    end
+    if s == nilptr then
+      -- nobody wants this shell any more: don't leave it running
+      if ev.id ~= 0 then host.agent:close_session(ev.id) end
+    elseif ev.id == 0 then
+      local sb: stringbuilder -- no `..` chain: its intermediate strings would leak
+      sb:write('\r\n[ghostty] agent refused: ', string{data=(@*[0]byte)(ev.data), size=ev.len}, '\r\n')
+      local msg = sb:promote()
+      s:feed_text(msg)
+      msg:destroy()
+      s.exited = true
+    else
+      s:agent_opened(ev.id)
+    end
+  elseif ev.typ == PROTO_SDATA then
+    local s = find_agent_session(ev.id)
+    if s ~= nilptr then s:feed(ev.data, ev.len) end
+  elseif ev.typ == PROTO_EXIT then
+    for i = 0, < #host.sessions do
+      local s = host.sessions[i]
+      if s.kind == TransportKind.Agent and not s.awaiting_open and s.agent_id == ev.id and ev.id ~= 0 then
+        s:mark_exited(ev.status)
+      end
+    end
+  elseif ev.typ == PROTO_ATTACHED then
+    local s = find_agent_session(ev.id)
+    if s ~= nilptr then s:attached(ev.has_offset, ev.offset) end
+  elseif ev.typ == PROTO_ERR then
+    -- only logged: failed OPENs and unknown ATTACH ids come as OPENED / EXIT
+    logf(LOG_WARN, 'agent: %s', string{data=(@*[0]byte)(ev.data), size=ev.len})
+  elseif ev.typ == PROTO_OK then
+    -- handshake / attach acks
+  elseif ev.typ == PROTO_CLIP then
+    -- the system clipboard arrived for a paste
+    local target = host.paste_target
+    host.paste_target = 0
+    for i = 0, < #host.sessions do
+      local s = host.sessions[i]
+      if s.id == target then
+        if ev.status >= 0 then
+          paste_text(s, string{data=(@*[0]byte)(ev.data), size=ev.len})
+        elseif host.imgui_ok then
+          -- the agent has no clipboard for us: the game's (Wine) clipboard
+          local txt = imgui.GetClipboardText()
+          if txt ~= nilptr then paste_text(s, txt) end
+        end
+        break
+      end
+    end
+  elseif ev.typ == PROTO_LISTR then
+    -- Reattach every shell nobody is attached to, so restarting the game (or
+    -- reloading the plugin) brings the same terminals back.
+    local entries = agent_parse_list(ev.data, ev.len)
+    for i = 0, < #entries do
+      local e = entries[i]
+      if e.attached == 0 and e.id ~= 0 and find_agent_session(e.id) == nilptr then
+        local s = new(@Session)
+        if s:init_attach(host.next_session_id, e.command, e.cols, e.rows, &host.agent, e.id) then
+          host.next_session_id = host.next_session_id + 1
+          host.sessions:push(s)
+          -- put it back where it was: world (with its anchor), window, minimized or tab
+          local view, fs = policy_world_restore(s.id, e.id)
+          s.font_scale = fs
+          if view == 'world' then
+            host.world:push(s)
+            host.world_visible = true
+            host.world_pins_done = true
+          elseif view == 'window' then
+            host.windows:push(s)
+          elseif view == 'min' then
+            host.minimized:push(s)
+          else
+            host.dropdown_tabs:push(s)
+            host.dropdown_active = #host.dropdown_tabs - 1
+          end
+          logf(LOG_INFO, 'session %d: reattached agent session %d as %s', s.id, e.id, #view > 0 and view or 'tab')
+          view:destroy()
+        else
+          s:destroy()
+          delete(s)
+        end
+      end
+    end
+    entries:destroy()
+    host.reattach_done = true
+    host.layout_restored = true -- saving the layout can no longer overwrite the one just restored
+  end
+end
+
+global function read_token(): string
+  if #policy.agent.token > 0 then return policy.agent.token:copy() end
+  if #policy.agent.token_file > 0 then
+    require 'io'
+    local f = io.open(policy.agent.token_file, 'rb')
+    if f:isopen() then
+      local content = f:read('a')
+      f:destroy() -- close() alone keeps the stream record allocated (no GC)
+      local e = #content
+      while e > 0 and (content:byte(e) == 10 or content:byte(e) == 13 or content:byte(e) == 32) do e = e - 1 end
+      local tok = content:sub(1, e)
+      content:destroy()
+      return tok
+    end
+    logf(LOG_WARN, 'agent token file not readable: %s', policy.agent.token_file)
+  end
+  return string.copy('')
+end
+
+global function agent_setup(): void
+  host.agent:destroy()
+  local tok = read_token()
+  host.agent:init(policy.agent.host, (@uint16)(policy.agent.port), tok)
+  tok:destroy()
+  host.agent.on_event = agent_event
+  host.agent.ctx = nilptr
+  host.agent_enabled = true
+  host.agent_last_try = -100.0
+  host.agent_prev_state = AgentState.Disconnected -- a fresh client: its first Ready is a (re)connect
+  host.layout_restored = false -- until LISTR: the terminals on screen are not the whole layout
+end
+
+-- The connection became Ready (first connect or a reconnect).
+global function agent_on_ready(): void
+  local nonce = host.agent.nonce
+  -- a different agent process: its session ids mean other shells (or none).
+  -- That includes a version 1 agent (nonce 0) replaced by a version 2 one:
+  -- the new agent numbers its shells from 1 again.
+  local restarted = host.agent_seen and nonce ~= host.agent_nonce
+  -- the same agent: the shells still run, subscribe again. Two agents without
+  -- a nonce (version 1) cannot be told apart; their terminals stay as they are.
+  local same = nonce ~= 0 and nonce == host.agent_nonce
+  for i = 0, < #host.sessions do
+    local s = host.sessions[i]
+    if s.kind == TransportKind.Agent and s.agent == &host.agent then
+      s:connection_lost() -- an ATTACHED of the old connection never comes
+      if not s.awaiting_open and not s.exited then
+        if restarted then
+          s:mark_exited(-1)
+          s.agent = nilptr -- closing it must not CLOSE a new shell that got its id
+          s.agent_id = 0
+        elseif same and not s.sleeping then
+          s:reattach()
+        end
+      end
+    end
+  end
+  host.agent_seen = true
+  host.agent_nonce = nonce
+  -- OPENs of the old connection got no answer: forget closed terminals, ask again
+  local j = 0
+  for i = 0, < #host.pending_open do
+    local s = host.pending_open[i]
+    if s ~= nilptr then
+      host.pending_open[j] = s
+      j = j + 1
+    end
+  end
+  host.pending_open:resize(j)
+  for i = 0, < #host.pending_open do host.pending_open[i]:reopen() end
+  host.agent_error_shown:destroy() -- the next failure is news again
+end
+
+global function agent_pump(now: float64): void
+  if not host.agent_enabled then return end
+  local st = host.agent.state
+  if st == AgentState.Disconnected or st == AgentState.Failed then
+    if now - host.agent_last_try > 3.0 then
+      host.agent_last_try = now
+      host.agent:connect(now)
+    end
+  end
+  host.agent:pump(now)
+  st = host.agent.state
+  if st == AgentState.Ready and host.agent_prev_state ~= AgentState.Ready then agent_on_ready() end
+  host.agent_prev_state = st
+  if st == AgentState.Ready and not host.agent_listed then
+    host.agent_listed = true
+    host.layout_restored = false
+    host.agent:list()
+  elseif st == AgentState.Failed then
+    host.reattach_done = true -- don't hold the first tab back forever
+    if host.agent.last_error ~= host.agent_error_shown then
+      -- surface the failure in the waiting tabs, once per distinct error
+      local sb: stringbuilder -- no `..` chain: its intermediate strings would leak
+      sb:write('[ghostty] ', host.agent.last_error, ' (retrying)\r\n')
+      local msg = sb:promote()
+      for i = 0, < #host.pending_open do
+        local s = host.pending_open[i]
+        if s ~= nilptr then s:feed_text(msg) end
+      end
+      msg:destroy()
+      host.agent_error_shown:destroy()
+      host.agent_error_shown = host.agent.last_error:copy()
+    end
+  end
+end
+
+-- Kill switch on: nothing reads the connection any more, and the agent stops
+-- reading every shell whose output this client leaves unread (a build in a
+-- tab would freeze). Detach the streaming shells instead; they keep running.
+global function agent_hold_sessions(): void
+  if not host.agent_enabled then return end
+  for i = 0, < #host.sessions do
+    local s = host.sessions[i]
+    if s.kind == TransportKind.Agent and s.agent == &host.agent and not s.sleeping then
+      s:sleep()
+      s.held = s.sleeping
+    end
+  end
+  host.agent:flush() -- the DETACHes: no pump runs until the switch is off
+end
+
+-- Kill switch off: the held shells stream again; the agent sends what they missed.
+global function agent_release_sessions(): void
+  for i = 0, < #host.sessions do
+    local s = host.sessions[i]
+    if s.held then
+      s.held = false
+      s:wake()
+    end
+  end
+end
+
+-- Shutdown: send what is still queued (DETACH / CLOSE) one last time. Nothing
+-- that arrives now reaches agent_event: a LISTR would create sessions after
+-- the session list is gone.
+global function agent_final_flush(): void
+  host.agent.on_event = nilptr
+  if host.agent_enabled then host.agent:pump(0.0) end
+end
+
+-- Sessions -------------------------------------------------------------------
+global function session_new(profile_index: integer, cols: uint16, rows: uint16): *Session
+  local p = policy_profile(profile_index)
+  if p == nilptr then
+    if #policy.profiles == 0 then return nilptr end
+    p = policy_profile(0)
+  end
+  local s = new(@Session)
+  local agent: *AgentClient = nilptr
+  if host.agent_enabled then agent = &host.agent end
+  if not s:init(host.next_session_id, p, cols, rows, agent) then
+    s:destroy()
+    delete(s)
+    return nilptr
+  end
+  host.next_session_id = host.next_session_id + 1
+  if s.kind == TransportKind.Agent and s.awaiting_open then host.pending_open:push(s) end
+  host.sessions:push(s)
+  logf(LOG_INFO, 'session %d: %s (%s)', s.id, p.name, p.transport)
+  return s
+end
+
+-- A session without a transport, for text the core writes into it itself.
+global function session_new_local(label: string, cols: uint16, rows: uint16): *Session
+  local s = new(@Session)
+  if not s:init_local(host.next_session_id, label, cols, rows) then
+    delete(s)
+    return nilptr
+  end
+  host.next_session_id = host.next_session_id + 1
+  host.sessions:push(s)
+  logf(LOG_INFO, 'session %d: %s (local)', s.id, label)
+  return s
+end
+
+global function session_remove(s: *Session): void
+  for i = 0, < #host.pending_open do
+    if host.pending_open[i] == s then
+      if host.agent.state == AgentState.Ready then
+        host.pending_open[i] = nilptr -- its OPEN is on the way: keep its place for the answer
+      else
+        host.pending_open:remove(i) -- nothing on the way; Ready sends the others again
+      end
+      break
+    end
+  end
+  for i = 0, < #host.sessions do
+    if host.sessions[i] == s then host.sessions:remove(i) break end
+  end
+  s:destroy()
+  delete(s)
+end
