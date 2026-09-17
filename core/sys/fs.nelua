@@ -1,0 +1,142 @@
+-- The file operations plain Lua lacks, for lua/migrate.lua:
+-- ghostty.mkdir(path), ghostty.listdir(path) and ghostty.make_private(path).
+require 'string'
+require 'core.lua'
+
+## if ccinfo.is_windows then
+## cinclude '<windows.h>'
+local WIN32_FIND_DATAA <cimport, nodecl> = @record{ dwFileAttributes: uint32, cFileName: [260]cchar }
+local function CreateDirectoryA(path: cstring, sa: pointer): cint <cimport, nodecl> end
+local function GetLastError(): uint32 <cimport, nodecl> end
+local function FindFirstFileA(pattern: cstring, data: *WIN32_FIND_DATAA): pointer <cimport, nodecl> end
+local function FindNextFileA(h: pointer, data: *WIN32_FIND_DATAA): cint <cimport, nodecl> end
+local function FindClose(h: pointer): cint <cimport, nodecl> end
+local ERROR_ALREADY_EXISTS: uint32 <cimport, nodecl, const>
+local INVALID_HANDLE_VALUE: pointer <cimport, nodecl, const>
+## linklib 'advapi32'
+local function GetCurrentProcess(): pointer <cimport, nodecl> end
+local function OpenProcessToken(process: pointer, access: uint32, token: *pointer): cint <cimport, nodecl> end
+local function GetTokenInformation(token: pointer, class: cint, info: pointer, len: uint32, retlen: *uint32): cint <cimport, nodecl> end
+local function CloseHandle(h: pointer): cint <cimport, nodecl> end
+local function InitializeAcl(acl: pointer, len: uint32, revision: uint32): cint <cimport, nodecl> end
+local function AddAccessAllowedAce(acl: pointer, revision: uint32, mask: uint32, sid: pointer): cint <cimport, nodecl> end
+local function InitializeSecurityDescriptor(sd: pointer, revision: uint32): cint <cimport, nodecl> end
+local function SetSecurityDescriptorDacl(sd: pointer, present: cint, acl: pointer, defaulted: cint): cint <cimport, nodecl> end
+local function SetSecurityDescriptorControl(sd: pointer, mask: uint16, bits: uint16): cint <cimport, nodecl> end
+local function SetFileSecurityA(path: cstring, info: uint32, sd: pointer): cint <cimport, nodecl> end
+local TOKEN_QUERY: uint32 <cimport, nodecl, const>
+local TokenUser: cint <cimport, nodecl, const>
+local ACL_REVISION: uint32 <cimport, nodecl, const>
+local FILE_ALL_ACCESS: uint32 <cimport, nodecl, const>
+local SECURITY_DESCRIPTOR_REVISION: uint32 <cimport, nodecl, const>
+local SE_DACL_PROTECTED: uint16 <cimport, nodecl, const>
+local DACL_SECURITY_INFORMATION: uint32 <cimport, nodecl, const>
+## else
+## cinclude '<sys/stat.h>'
+## cinclude '<dirent.h>'
+## cinclude '<errno.h>'
+local dirent <cimport, nodecl, ctypedef> = @record{ d_name: [256]cchar }
+local DIR <cimport, nodecl> = @record{}
+local function c_mkdir(path: cstring, mode: cuint): cint <cimport 'mkdir', nodecl> end
+local function chmod(path: cstring, mode: cuint): cint <cimport, nodecl> end
+local function opendir(path: cstring): *DIR <cimport, nodecl> end
+local function readdir(d: *DIR): *dirent <cimport, nodecl> end
+local function closedir(d: *DIR): cint <cimport, nodecl> end
+local errno: cint <cimport, nodecl>
+local EEXIST: cint <cimport, nodecl, const>
+## end
+
+-- true when the directory now exists (created or already there)
+global function fs_mkdir(path: cstring): boolean
+  ## if ccinfo.is_windows then
+    return CreateDirectoryA(path, nilptr) ~= 0 or GetLastError() == ERROR_ALREADY_EXISTS
+  ## else
+    return c_mkdir(path, 493) == 0 or errno == EEXIST -- 0755
+  ## end
+end
+
+-- true when only the current user can open the file: mode 0600, or on Windows
+-- a protected DACL naming just the user, which Wine maps onto the unix mode
+global function fs_make_private(path: cstring): boolean
+  ## if ccinfo.is_windows then
+    local token: pointer
+    if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) == 0 then return false end
+    local user: [64]usize -- TOKEN_USER: the SID pointer first, then the SID itself
+    local len: uint32 = 0
+    local got = GetTokenInformation(token, TokenUser, &user, #user * #usize, &len)
+    CloseHandle(token)
+    if got == 0 then return false end
+    local acl: [32]usize
+    local sd: [8]usize
+    return InitializeAcl(&acl, #acl * #usize, ACL_REVISION) ~= 0
+      and AddAccessAllowedAce(&acl, ACL_REVISION, FILE_ALL_ACCESS, (@pointer)(user[0])) ~= 0
+      and InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION) ~= 0
+      and SetSecurityDescriptorDacl(&sd, 1, &acl, 0) ~= 0
+      and SetSecurityDescriptorControl(&sd, SE_DACL_PROTECTED, SE_DACL_PROTECTED) ~= 0
+      and SetFileSecurityA(path, DACL_SECURITY_INFORMATION, &sd) ~= 0
+  ## else
+    return chmod(path, 384) == 0 -- 0600
+  ## end
+end
+
+local function push_name(L: *lua_State, name: cstring, n: *integer): void
+  local s: string = name
+  if s == '.' or s == '..' then return end
+  $n = $n + 1
+  lua_pushstring(L, name)
+  lua_rawseti(L, -2, $n)
+end
+
+-- ghostty.mkdir(path) -> true, or nil
+local function l_mkdir(L: *lua_State): cint
+  local p = lua_tolstring(L, 1, nilptr)
+  if p == nilptr or not fs_mkdir(p) then lua_pushnil(L) else lua_pushboolean(L, 1) end
+  return 1
+end
+
+-- ghostty.make_private(path) -> true, or nil
+local function l_make_private(L: *lua_State): cint
+  local p = lua_tolstring(L, 1, nilptr)
+  if p == nilptr or not fs_make_private(p) then lua_pushnil(L) else lua_pushboolean(L, 1) end
+  return 1
+end
+
+-- ghostty.listdir(path) -> { entry names, unsorted }, or nil when unreadable
+local function l_listdir(L: *lua_State): cint
+  local p = lua_tolstring(L, 1, nilptr)
+  if p == nilptr then lua_pushnil(L) return 1 end
+  local n: integer = 0
+  ## if ccinfo.is_windows then
+    local pattern = (@string)(p) .. '\\*\0'
+    local fd: WIN32_FIND_DATAA
+    local h = FindFirstFileA((@cstring)(pattern.data), &fd)
+    pattern:destroy()
+    if h == INVALID_HANDLE_VALUE then lua_pushnil(L) return 1 end
+    lua_createtable(L, 8, 0)
+    repeat
+      push_name(L, (@cstring)(&fd.cFileName), &n)
+    until FindNextFileA(h, &fd) == 0
+    FindClose(h)
+  ## else
+    local d = opendir(p)
+    if d == nilptr then lua_pushnil(L) return 1 end
+    lua_createtable(L, 8, 0)
+    while true do
+      local e = readdir(d)
+      if e == nilptr then break end
+      push_name(L, (@cstring)(&e.d_name), &n)
+    end
+    closedir(d)
+  ## end
+  return 1
+end
+
+-- Adds mkdir/listdir/make_private to the global `ghostty` table (world_lua_register makes it).
+global function fs_lua_register(L: *lua_State): void
+  lua_getglobal(L, 'ghostty')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return end
+  lua_pushcclosure(L, l_mkdir, 0) lua_setfield(L, -2, 'mkdir')
+  lua_pushcclosure(L, l_listdir, 0) lua_setfield(L, -2, 'listdir')
+  lua_pushcclosure(L, l_make_private, 0) lua_setfield(L, -2, 'make_private')
+  lua_pop(L, 1)
+end

@@ -1,0 +1,158 @@
+-- A small ImGui surface for Lua (ghostty.ui.*), so settings screens are
+-- written in Lua. Only valid while the core is drawing a window.
+require 'string'
+require 'core.lua'
+require 'core.imgui'
+
+local function arg_string(L: *lua_State, idx: cint): cstring
+  local s: cstring = lua_tolstring(L, idx, nilptr)
+  if s == nilptr then s = '' end
+  return s
+end
+
+-- ui.header(label[, open_by_default]) -> open
+local function l_header(L: *lua_State): cint
+  local flags: cint = lua_toboolean(L, 2) ~= 0 and ImGuiTreeNodeFlags_DefaultOpen or 0
+  lua_pushboolean(L, imgui.CollapsingHeader(arg_string(L, 1), flags) and 1 or 0)
+  return 1
+end
+
+-- Did the slider just drawn finish an edit (released after dragging, or
+-- ctrl+click input committed)? Without the export every change counts.
+local function push_edit_done(L: *lua_State, changed: boolean): void
+  local done = changed
+  if imgui.IsItemDeactivatedAfterEdit ~= nilptr then done = imgui.IsItemDeactivatedAfterEdit() end
+  lua_pushboolean(L, done and 1 or 0)
+end
+
+-- ui.slider(label, value, min, max[, format]) -> changed, value, done
+-- `done` is true once, when the edit ends: save then, not every dragged frame.
+-- Values typed with ctrl+click are clamped to the range.
+local function l_slider(L: *lua_State): cint
+  local v = (@float32)(lua_tonumberx(L, 2, nilptr))
+  local fmt: cstring = '%.2f'
+  if lua_type(L, 5) == LUA_TSTRING then fmt = arg_string(L, 5) end
+  local changed = imgui.SliderFloat(arg_string(L, 1), &v, (@float32)(lua_tonumberx(L, 3, nilptr)), (@float32)(lua_tonumberx(L, 4, nilptr)), fmt, ImGuiSliderFlags_AlwaysClamp)
+  lua_pushboolean(L, changed and 1 or 0)
+  lua_pushnumber(L, v)
+  push_edit_done(L, changed)
+  return 3
+end
+
+-- ui.slider_int(label, value, min, max) -> changed, value, done
+local function l_slider_int(L: *lua_State): cint
+  local v = (@cint)(lua_tointegerx(L, 2, nilptr))
+  local changed = imgui.SliderInt(arg_string(L, 1), &v, (@cint)(lua_tointegerx(L, 3, nilptr)), (@cint)(lua_tointegerx(L, 4, nilptr)), '%d', ImGuiSliderFlags_AlwaysClamp)
+  lua_pushboolean(L, changed and 1 or 0)
+  lua_pushinteger(L, v)
+  push_edit_done(L, changed)
+  return 3
+end
+
+-- ui.checkbox(label, value) -> changed, value
+local function l_checkbox(L: *lua_State): cint
+  local v = lua_toboolean(L, 2) ~= 0
+  local changed = imgui.Checkbox(arg_string(L, 1), &v)
+  lua_pushboolean(L, changed and 1 or 0)
+  lua_pushboolean(L, v and 1 or 0)
+  return 2
+end
+
+-- ui.combo(label, current, { options }) -> changed, value
+local function l_combo(L: *lua_State): cint
+  local current = arg_string(L, 2)
+  local changed = false
+  local chosen_idx: lua_Integer = 0
+  if imgui.BeginCombo(arg_string(L, 1), current, 0) then
+    if lua_type(L, 3) == LUA_TTABLE then
+      local n = (@lua_Integer)(lua_rawlen(L, 3))
+      for i = 1, n do
+        lua_rawgeti(L, 3, i)
+        local opt = arg_string(L, -1)
+        if imgui.Selectable(opt, (@string)(opt) == (@string)(current), 0, vec2(0, 0)) then
+          changed = true
+          chosen_idx = i
+        end
+        lua_pop(L, 1)
+      end
+    end
+    imgui.EndCombo()
+  end
+  lua_pushboolean(L, changed and 1 or 0)
+  if changed then lua_rawgeti(L, 3, chosen_idx) else lua_pushvalue(L, 2) end
+  return 2
+end
+
+local function l_text(L: *lua_State): cint
+  local len: usize = 0
+  local s = lua_tolstring(L, 1, &len)
+  if s ~= nilptr then imgui.TextUnformatted(s, (@cstring)(&(@*[0]byte)(s)[len])) end
+  return 0
+end
+
+local function l_separator(L: *lua_State): cint
+  imgui.Separator()
+  return 0
+end
+
+local function l_button(L: *lua_State): cint
+  lua_pushboolean(L, imgui.Button(arg_string(L, 1), vec2(0, 0)) and 1 or 0)
+  return 1
+end
+
+local function l_same_line(L: *lua_State): cint
+  imgui.SameLine(0, -1)
+  return 0
+end
+
+-- ui.tabs(id) -> open; ui.tab(label) -> selected; ui.end_tab(); ui.end_tabs()
+local function l_tabs(L: *lua_State): cint
+  lua_pushboolean(L, imgui.BeginTabBar(arg_string(L, 1), 0) and 1 or 0)
+  return 1
+end
+local function l_tab(L: *lua_State): cint
+  lua_pushboolean(L, imgui.BeginTabItem(arg_string(L, 1), nilptr, 0) and 1 or 0)
+  return 1
+end
+local function l_end_tab(L: *lua_State): cint imgui.EndTabItem() return 0 end
+local function l_end_tabs(L: *lua_State): cint imgui.EndTabBar() return 0 end
+
+-- ui.wrapped(text[, r, g, b]) — word-wrapped paragraph, optionally coloured (0..1)
+local function l_wrapped(L: *lua_State): cint
+  local len: usize = 0
+  local s = lua_tolstring(L, 1, &len)
+  if s == nilptr then return 0 end
+  local coloured = lua_type(L, 2) == LUA_TNUMBER
+  if coloured then
+    imgui.PushStyleColorVec4(ImGuiCol_Text, ImVec4{
+      (@float32)(lua_tonumberx(L, 2, nilptr)), (@float32)(lua_tonumberx(L, 3, nilptr)), (@float32)(lua_tonumberx(L, 4, nilptr)), 1 })
+  end
+  imgui.PushTextWrapPos(0)
+  imgui.TextUnformatted(s, (@cstring)(&(@*[0]byte)(s)[len]))
+  imgui.PopTextWrapPos()
+  if coloured then imgui.PopStyleColor(1) end
+  return 0
+end
+
+local function l_spacing(L: *lua_State): cint imgui.Spacing() return 0 end
+
+-- Adds `ui` to the table on top of the stack.
+global function ui_lua_register(L: *lua_State): void
+  lua_createtable(L, 0, 15)
+  lua_pushcclosure(L, l_tabs, 0) lua_setfield(L, -2, 'tabs')
+  lua_pushcclosure(L, l_tab, 0) lua_setfield(L, -2, 'tab')
+  lua_pushcclosure(L, l_end_tab, 0) lua_setfield(L, -2, 'end_tab')
+  lua_pushcclosure(L, l_end_tabs, 0) lua_setfield(L, -2, 'end_tabs')
+  lua_pushcclosure(L, l_wrapped, 0) lua_setfield(L, -2, 'wrapped')
+  lua_pushcclosure(L, l_spacing, 0) lua_setfield(L, -2, 'spacing')
+  lua_pushcclosure(L, l_header, 0) lua_setfield(L, -2, 'header')
+  lua_pushcclosure(L, l_slider, 0) lua_setfield(L, -2, 'slider')
+  lua_pushcclosure(L, l_slider_int, 0) lua_setfield(L, -2, 'slider_int')
+  lua_pushcclosure(L, l_checkbox, 0) lua_setfield(L, -2, 'checkbox')
+  lua_pushcclosure(L, l_combo, 0) lua_setfield(L, -2, 'combo')
+  lua_pushcclosure(L, l_text, 0) lua_setfield(L, -2, 'text')
+  lua_pushcclosure(L, l_separator, 0) lua_setfield(L, -2, 'separator')
+  lua_pushcclosure(L, l_button, 0) lua_setfield(L, -2, 'button')
+  lua_pushcclosure(L, l_same_line, 0) lua_setfield(L, -2, 'same_line')
+  lua_setfield(L, -2, 'ui')
+end

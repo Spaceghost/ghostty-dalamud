@@ -1,0 +1,98 @@
+-- Lua 5.4 C API subset (vendor/lua compiled into the same binary).
+## cinclude '<lua.h>'
+## cinclude '<lauxlib.h>'
+## cinclude '<lualib.h>'
+## linklib 'lua'
+
+global lua_State <cimport, nodecl> = @record{}
+global lua_Integer = @int64
+global lua_Number = @float64
+global lua_CFunction = @function(L: *lua_State): cint
+
+global LUA_OK: cint <cimport, nodecl, const>
+global LUA_TNIL: cint <cimport, nodecl, const>
+global LUA_TBOOLEAN: cint <cimport, nodecl, const>
+global LUA_TNUMBER: cint <cimport, nodecl, const>
+global LUA_TSTRING: cint <cimport, nodecl, const>
+global LUA_TTABLE: cint <cimport, nodecl, const>
+global LUA_TFUNCTION: cint <cimport, nodecl, const>
+global LUA_REGISTRYINDEX: cint <cimport, nodecl, const>
+
+global function luaL_newstate(): *lua_State <cimport, nodecl> end
+global function luaL_openlibs(L: *lua_State): void <cimport, nodecl> end
+global function lua_close(L: *lua_State): void <cimport, nodecl> end
+global function luaL_loadfilex(L: *lua_State, filename: cstring, mode: cstring): cint <cimport, nodecl> end
+global function luaL_loadstring(L: *lua_State, s: cstring): cint <cimport, nodecl> end
+global function lua_pcallk(L: *lua_State, nargs: cint, nresults: cint, errfunc: cint, ctx: isize, k: pointer): cint <cimport, nodecl> end
+global function lua_gettop(L: *lua_State): cint <cimport, nodecl> end
+global function lua_settop(L: *lua_State, idx: cint): void <cimport, nodecl> end
+global function lua_type(L: *lua_State, idx: cint): cint <cimport, nodecl> end
+global function lua_getfield(L: *lua_State, idx: cint, k: cstring): cint <cimport, nodecl> end
+global function lua_setfield(L: *lua_State, idx: cint, k: cstring): void <cimport, nodecl> end
+global function lua_getglobal(L: *lua_State, name: cstring): cint <cimport, nodecl> end
+global function lua_setglobal(L: *lua_State, name: cstring): void <cimport, nodecl> end
+global function lua_rawgeti(L: *lua_State, idx: cint, n: lua_Integer): cint <cimport, nodecl> end
+global function lua_rawseti(L: *lua_State, idx: cint, n: lua_Integer): void <cimport, nodecl> end
+global function lua_rawlen(L: *lua_State, idx: cint): culong <cimport, nodecl> end
+global function lua_next(L: *lua_State, idx: cint): cint <cimport, nodecl> end
+global function lua_tolstring(L: *lua_State, idx: cint, len: *usize): cstring <cimport, nodecl> end
+global function lua_tointegerx(L: *lua_State, idx: cint, isnum: *cint): lua_Integer <cimport, nodecl> end
+global function lua_tonumberx(L: *lua_State, idx: cint, isnum: *cint): lua_Number <cimport, nodecl> end
+global function lua_toboolean(L: *lua_State, idx: cint): cint <cimport, nodecl> end
+global function lua_pushstring(L: *lua_State, s: cstring): cstring <cimport, nodecl> end
+global function lua_pushlstring(L: *lua_State, s: cstring, len: usize): cstring <cimport, nodecl> end
+global function lua_pushinteger(L: *lua_State, n: lua_Integer): void <cimport, nodecl> end
+global function lua_pushnumber(L: *lua_State, n: lua_Number): void <cimport, nodecl> end
+global function lua_pushboolean(L: *lua_State, b: cint): void <cimport, nodecl> end
+global function lua_pushnil(L: *lua_State): void <cimport, nodecl> end
+global function lua_pushcclosure(L: *lua_State, fn: lua_CFunction, n: cint): void <cimport, nodecl> end
+global function lua_createtable(L: *lua_State, narr: cint, nrec: cint): void <cimport, nodecl> end
+global function lua_pushvalue(L: *lua_State, idx: cint): void <cimport, nodecl> end
+global function lua_isstring(L: *lua_State, idx: cint): cint <cimport, nodecl> end
+
+global function lua_pop(L: *lua_State, n: cint): void
+  lua_settop(L, -n - 1)
+end
+
+global function lua_pcall(L: *lua_State, nargs: cint, nresults: cint, errfunc: cint): cint
+  return lua_pcallk(L, nargs, nresults, errfunc, 0, nilptr)
+end
+
+-- Convenience: read a string field from the table at `idx` (copy), or `def`.
+global function lua_field_string(L: *lua_State, idx: cint, k: cstring, def: string): string
+  lua_getfield(L, idx, k)
+  local r: string
+  if lua_isstring(L, -1) ~= 0 then
+    local len: usize
+    local p = lua_tolstring(L, -1, &len)
+    r = string{data=(@*[0]byte)(p), size=len}:copy()
+  else
+    r = def:copy()
+  end
+  lua_pop(L, 1)
+  return r
+end
+
+global function lua_field_integer(L: *lua_State, idx: cint, k: cstring, def: integer): integer
+  lua_getfield(L, idx, k)
+  local r = def
+  if lua_type(L, -1) == LUA_TNUMBER then r = lua_tointegerx(L, -1, nilptr) end
+  lua_pop(L, 1)
+  return r
+end
+
+global function lua_field_number(L: *lua_State, idx: cint, k: cstring, def: float64): float64
+  lua_getfield(L, idx, k)
+  local r = def
+  if lua_type(L, -1) == LUA_TNUMBER then r = lua_tonumberx(L, -1, nilptr) end
+  lua_pop(L, 1)
+  return r
+end
+
+global function lua_field_boolean(L: *lua_State, idx: cint, k: cstring, def: boolean): boolean
+  lua_getfield(L, idx, k)
+  local r = def
+  if lua_type(L, -1) == LUA_TBOOLEAN then r = lua_toboolean(L, -1) ~= 0 end
+  lua_pop(L, 1)
+  return r
+end
