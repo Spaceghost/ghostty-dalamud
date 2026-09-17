@@ -239,11 +239,36 @@ the terminal.
 
 ## Controller
 
-`toggle_gamepad_button` (default `select`: PS5 Create / Xbox View). Tap shows
-or hides the drop-down; hold steps to the next terminal and repeats while
-held; double tap goes to the previous one. Valid names: `dpad_up dpad_down
-dpad_left dpad_right north south west east l1 l2 l3 r1 r2 r3 select start`.
-An empty string disables it.
+`toggle_gamepad_button` (default `select`: the Xbox View button; on a
+DualSense, Dalamud reports the touchpad click as `select`). Tap shows or hides
+the drop-down; hold steps to the next terminal and repeats while held; double
+tap goes to the previous one. Valid names: `dpad_up dpad_down dpad_left
+dpad_right north south west east l1 l2 l3 r1 r2 r3 select start create`. An
+empty string disables it.
+
+`create` is the Create button of a DualSense or DualSense Edge, which the game
+leaves unused. Dalamud's gamepad state has no such button, so the core reads
+the controller's HID input reports itself (`core/sys/dualsense_reader.nelua`):
+USB report `0x01` and Bluetooth reports `0x31` and `0x01` (simple mode),
+vendor `054C`, products `0CE6` and `0DF2`. It opens the controller read-only
+and shared, reads it without waiting (one overlapped read, collected once per
+frame), looks for a controller every 3 s while none is open (a few HID devices
+per frame), and closes it on unplug, when you pick another button, and when
+the plugin unloads. The default stays
+`select`, so nothing changes without a DualSense. To switch, pick `create`
+under Settings → Keys & controller, or set it in your `lua/init.lua` copy:
+
+```lua
+toggle_gamepad_button = 'create',
+```
+
+The log shows `DualSense 054c:0ce6 opened for the Create button` and, with the
+first report, which layout it sends. **This HID path has only been tested on
+the host with fake devices; it has not been observed in game, on Windows or
+under Wine.** Under Wine it relies on winebus exposing the controller through
+its hidraw backend, which needs read access to the controller's
+`/dev/hidraw*` node. Whether the search for a controller (every 3 s while none
+is open) costs a visible hitch on some systems has not been measured.
 
 ## Privacy
 
@@ -261,8 +286,8 @@ At build time only, `tools/fetch-vendor.sh` downloads the pinned sources
 ## Limitations and unverified behaviour
 
 Tested on the host (`tests/run.sh`): the libghostty-vt binding, cell renderer,
-key encoding, Lua policy, agent protocol and server, the plugin's activation
-state machine, its command / info bar / IPC registration and the config
+key encoding, DualSense report parsing, Lua policy, agent protocol and server,
+the plugin's activation state machine, its command / info bar / IPC registration and the config
 migration (`tests/test_hostsurface.nelua`, `tests/test_migrate.*`). Both C#
 projects and the Windows DLL compile.
 
@@ -286,9 +311,11 @@ not been observed in game.** What they assume:
 | Per-frame IPC (status and popup draw every frame, exceptions while offline) is cheap enough | frame time rises with the widget; a cheaper status channel is needed |
 | The info bar popup has no Esc-to-close, so Esc reaches the terminal | see `popup.close_on_blur` |
 
-Also: the `conpty` transport under Wine is untested; the Superlogical
-transport is a placeholder until its protocol is public; the agent stream is
-not encrypted.
+Also: the DualSense Create button (`toggle_gamepad_button = 'create'`) is
+tested only against fake HID devices, not with a controller, on Windows or
+under Wine (see Controller); the `conpty` transport under Wine is untested;
+the Superlogical transport is a placeholder until its protocol is public; the
+agent stream is not encrypted.
 
 ## Troubleshooting
 

@@ -81,7 +81,12 @@
 3. Bind cimgui exports once; pump the agent socket (non-blocking) and any
    ConPTY pipes (`PeekNamedPipe`), feeding bytes into each session's terminal.
 4. Poll the toggle key (unless another ImGui text field wants input); swallow
-   it from the game via `IKeyState`.
+   it from the game via `IKeyState`. Poll the controller toggle: a Dalamud
+   gamepad flag through the shim or, with `toggle_gamepad_button = 'create'`,
+   the DualSense's own HID reports (`core/sys/hid.nelua`: setupapi and
+   hid.dll, an overlapped `ReadFile` collected with `GetOverlappedResult`,
+   never waiting; `core/dualsense.nelua` parses them). Not yet observed with a
+   controller in game.
 5. Draw the drop-down: an ImGui window sliding from the top of the main
    viewport; tab bar of sessions; `InvisibleButton` over the terminal area for
    focus; if focused, `SetNextFrameWantCaptureKeyboard(true)` and
@@ -148,7 +153,7 @@ behaviour in gpose and cutscenes.
 ```
 core/         Nelua plugin core (compiled to ghostty_core.dll)
 core/app/     the app modules; hostsurface.nelua is the plugin's side of the host
-core/sys/     net (POSIX + Winsock), conpty (Windows), procguard, fs
+core/sys/     net (POSIX + Winsock), conpty (Windows), procguard, fs, hid and dualsense_reader (Windows HID)
 core/shaders/ HLSL sources and the committed DXBC the core embeds
 agent/        ghostty-agent PTY server (Nelua, POSIX)
 lua/          shipped policy: init.lua, keymap.lua, migrate.lua, ...
@@ -179,11 +184,12 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_ghostty` | libghostty-vt binding: sized-struct sizes against `ghostty_type_json()` |
 | `test_render` | a terminal rendered through a fake ImGui, checked by its draw calls |
 | `test_session` | session behaviour without a transport, local sessions, agent LIST parsing, `/term send` escapes, gamepad gestures, key repeat |
+| `test_dualsense` | DualSense input reports (USB, Bluetooth with its CRC, Bluetooth simple, short and foreign reports), Create edges, the HID reader against fake devices: scan, open, unplug, rescan, close |
 | `test_selection` | mouse selection: hit mapping, click counting, word and line units, copied text |
 | `test_bell` | the visual bell: BEL counting, ring and glow maths, the Lua style, its triangles |
 | `test_policy` | loading `lua/init.lua`: defaults, profiles, key actions, showcase entries |
 | `test_world`, `test_worldpanel`, `test_worlddrag` | world panels: projection and hit testing, the presented pose and walk-up, drag placement and snapping, all against a fake game |
-| `test_host` | the exported host surface without ImGui: init, status, commands, shutdown |
+| `test_host` | the exported host surface without ImGui: init, status, commands, the controller toggle's source, shutdown |
 | `test_lights` | panel lights against fake game light callbacks |
 | `test_chrome` | the glass chrome of the drop-down and windows: colour, tint, glow, tab strip, buttons, the settings button's badge |
 | `test_migrate` (`.nelua` + `.lua`) | the one-time migration from the Umbra-hosted home |
