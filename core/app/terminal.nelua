@@ -1,0 +1,224 @@
+
+
+-- One terminal on screen: key/text input into its session, plugin actions
+-- (copy, paste, tabs, zoom, toggles) and drawing the grid.
+require 'core.app.views'
+local strconv: type = require 'detail.strconv'
+
+local ImGuiHoveredFlags_AllowWhenBlockedByActiveItem: cint <cimport, nodecl, const>
+
+-- Input plumbing ---------------------------------------------------------
+global function sink_write(ctx: pointer, data: *[0]uint8, len: usize): void
+  local s = (@*Session)(ctx)
+  s:write(data, len)
+  policy_anim_key(imgui.GetTime())
+  s.view:scroll_bottom()
+  selection_clear(&s.view, &s.sel) -- typing ends the selection, as in any terminal
+end
+
+global ActionCtx = @record{ s: *Session, in_dropdown: boolean }
+
+-- A dropdown tab its own key asked to close. Closing it inside input_poll
+-- would free the session the rest of the frame still draws, so the dropdown
+-- closes it after drawing (dropdown_apply_close_request).
+global terminal_close_request: integer = 0
+
+-- Paste the system clipboard. With the agent connected the text comes from
+-- the desktop (wl-paste / xclip) and lands when the reply arrives; without it,
+-- Dalamud's clipboard (Windows / Wine) is used.
+global function paste_into(s: *Session): void
+  if host.agent_enabled and host.agent:ready() then
+    host.paste_target = s.id
+    host.agent:clip_get()
+    return
+  end
+  local txt = imgui.GetClipboardText()
+  if txt ~= nilptr then paste_text(s, txt) end
+end
+
+-- Copy the mouse selection to the clipboard.
+global function copy_from(s: *Session): void
+  local text = selection_text(&s.view)
+  if #text > 0 then
+    imgui.SetClipboardText((@cstring)(text.data)) -- the game's (Wine) clipboard
+    if host.agent_enabled and host.agent:ready() then host.agent:clip_set(text) end -- the desktop's
+  end
+  text:destroy()
+end
+
+-- Mouse selection on one terminal. (x, y) is the pointer in pixels from the
+-- grid origin (`valid` is false when it maps nowhere, e.g. off a world panel),
+-- `press` is true on the frame the left button went down over the grid and
+-- `down` while it is held. Returns true when the press selected a word or line.
+global function terminal_mouse(s: *Session, x: float32, y: float32, valid: boolean, press: boolean, down: boolean, now: float64): boolean
+  local col, row = selection_cell_at(x, y, s.cell_w, s.cell_h, s.cols, s.rows)
+  local unit = false
+  if press and valid then
+    local clicks = selection_click(&s.sel, now, col, row)
+    unit = selection_press(&s.view, &s.sel, col, row, clicks, imgui.GetIO().KeyShift)
+  elseif s.sel.dragging and down and valid then
+    selection_drag(&s.view, &s.sel, col, row)
+  end
+  if s.sel.dragging and not down and selection_release(&s.view, &s.sel) and policy.copy_on_select then
+    copy_from(s)
+  end
+  return unit
+end
+
+global function do_action(ctx: pointer, action: string, key: *KeyInfo): boolean
+  local a = (@*ActionCtx)(ctx)
+  local s = a.s
+  if action == 'toggle' then
+    toggle_visible()
+    return true
+  elseif action == 'toggle_world' then
+    toggle_world()
+    return true
+  elseif action == 'paste' then
+    paste_into(s) return true
+  elseif action == 'copy' then
+    copy_from(s) return true
+  elseif action == 'new_tab' then
+    if a.in_dropdown then
+      local ns = session_new(policy.default_profile - 1, s.cols, s.rows)
+      if ns ~= nilptr then host.dropdown_tabs:push(ns) host.dropdown_active = #host.dropdown_tabs - 1 end
+    end
+    return true
+  elseif action == 'close_tab' then
+    if a.in_dropdown then terminal_close_request = s.id end
+    return true
+  elseif action == 'next_tab' then
+    if #host.dropdown_tabs > 0 then host.dropdown_active = (host.dropdown_active + 1) % #host.dropdown_tabs end
+    return true
+  elseif action == 'prev_tab' then
+    if #host.dropdown_tabs > 0 then host.dropdown_active = (host.dropdown_active + #host.dropdown_tabs - 1) % #host.dropdown_tabs end
+    return true
+  elseif action == 'scroll_up' then
+    s.view:scroll_delta(-(@isize)(s.rows // 2)) return true
+  elseif action == 'scroll_down' then
+    s.view:scroll_delta((@isize)(s.rows // 2)) return true
+  elseif action == 'scroll_bottom' then
+    s.view:scroll_bottom() return true
+  elseif action == 'font_bigger' or action == 'font_smaller' or action == 'font_reset' then
+    local sc = s.font_scale > 0 and s.font_scale or 1.0
+    if action == 'font_bigger' then sc = sc * 1.1
+    elseif action == 'font_smaller' then sc = sc / 1.1
+    else sc = 1.0 end
+    s.font_scale = math.clamp(sc, 0.4, 4.0)
+    return true
+  elseif action:subview(1, 8) == 'profile:' then
+    local ok, n = strconv.str2int(action:subview(9), 10) -- tointeger aborts on a word
+    if not ok then return true end
+    if a.in_dropdown then
+      local ns = session_new(n - 1, s.cols, s.rows)
+      if ns ~= nilptr then host.dropdown_tabs:push(ns) host.dropdown_active = #host.dropdown_tabs - 1 end
+    end
+    return true
+  end
+  return false
+end
+
+global function key_action(ctx: pointer, name: string, key: *KeyInfo): boolean
+  local io = imgui.GetIO()
+  -- The toggle chords from the settings (toggle_mods, world_toggle_mods) work
+  -- from inside a terminal too. Bare and shift-only toggles stay typeable.
+  if name == policy.toggle_key and not io.KeySuper then
+    if (policy.toggle_ctrl or policy.toggle_alt) and io.KeyCtrl == policy.toggle_ctrl
+       and io.KeyShift == policy.toggle_shift and io.KeyAlt == policy.toggle_alt then
+      return do_action(ctx, 'toggle', key)
+    elseif (policy.world_toggle_ctrl or policy.world_toggle_alt) and io.KeyCtrl == policy.world_toggle_ctrl
+       and io.KeyShift == policy.world_toggle_shift and io.KeyAlt == policy.world_toggle_alt then
+      return do_action(ctx, 'toggle_world', key)
+    end
+  end
+  local buf: [64]cchar
+  local n = policy_key_action(name, io.KeyCtrl, io.KeyShift, io.KeyAlt, io.KeySuper, &buf, 64)
+  if n == 0 then return false end
+  return do_action(ctx, string{data=(@*[0]byte)(&buf), size=n}, key)
+end
+
+-- One wheel movement over a terminal at (x, y) in its pixels: ctrl zooms the
+-- font; otherwise the program gets wheel reports or arrow keys when it wants
+-- them (TermView:wheel_bytes), else the scrollback moves.
+global function terminal_wheel(s: *Session, x: float32, y: float32): void
+  local io = imgui.GetIO()
+  local wheel = io.MouseWheel
+  if wheel == 0 then return end
+  if io.KeyCtrl then
+    local sc = s.font_scale > 0 and s.font_scale or 1.0
+    s.font_scale = math.clamp(sc * (wheel > 0 and 1.1 or 1 / 1.1), 0.4, 4.0)
+    return
+  end
+  local col, row = selection_cell_at(x, y, s.cell_w, s.cell_h, s.cols, s.rows)
+  local notches = math.max(1, (@integer)(math.abs(wheel) + 0.5))
+  local out: [32]byte
+  local n = s.view:wheel_bytes(wheel > 0, col, row, &out)
+  if n > 0 then
+    for _ = 1, notches do s:write(&out, (@usize)(n)) end
+  else
+    s.view:scroll_delta((@isize)(-wheel * 3.0))
+  end
+end
+
+-- Only one terminal takes the keyboard per frame: the first focused one drawn.
+-- Two focused terminals (a world panel and an ImGui window) would both type
+-- every key. Returns whether this one has it.
+global function terminal_claim_keyboard(focused: boolean): boolean
+  if not focused or host.terminal_focused_now then return false end
+  host.terminal_focused_now = true
+  return true
+end
+
+-- Draw one session into `dl` at `origin` with the given pixel box, handling
+-- resize and (when `focused`) keyboard input.
+global function draw_terminal(s: *Session, dl: *ImDrawList, origin: ImVec2, width: float32, height: float32, font_size: float64, focused: boolean, in_dropdown: boolean, bg_alpha: uint8, rounding: float32): void
+  if host.drawing_world and host.api.push_world_font ~= nilptr then host.api.push_world_font()
+  elseif host.api.push_mono_font ~= nilptr then host.api.push_mono_font() end
+  local font = imgui.GetFont()
+  local size = (@float32)(font_size)
+  if size <= 0 then size = imgui.GetFontSize() end
+  if s.font_scale > 0 then size = size * (@float32)(s.font_scale) end
+  local m = render_measure(font, size)
+  local cols, rows = render_grid_size(m, width, height)
+  s:resize(cols, rows, (@uint32)(m.cell_w), (@uint32)(m.cell_h))
+  s:pump()
+  s.cell_w, s.cell_h = m.cell_w, m.cell_h
+  -- ImGui views see their own clicks; world panels call terminal_mouse
+  -- themselves. The raw button state ends a drag even if ImGui misses the
+  -- release outside its windows.
+  if not host.drawing_world then
+    local mouse: ImVec2
+    imgui.GetMousePos(&mouse)
+    local inside = mouse.x >= origin.x and mouse.y >= origin.y and mouse.x < origin.x + width and mouse.y < origin.y + height
+    -- the terminal's own InvisibleButton is already active on the press frame
+    local press = inside and imgui.IsMouseClicked(ImGuiMouseButton_Left, false)
+      and imgui.IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)
+    terminal_mouse(s, mouse.x - origin.x, mouse.y - origin.y, true, press, host.lmb_down, imgui.GetTime())
+    if s.sel.dragging then imgui.SetNextFrameWantCaptureMouse(true) end
+  end
+  focused = terminal_claim_keyboard(focused)
+  if focused then
+    imgui.SetNextFrameWantCaptureKeyboard(true)
+    local io = imgui.GetIO()
+    input_claim_keyboard(io)
+    local actx: ActionCtx = { s = s, in_dropdown = in_dropdown }
+    input_poll(io, s.encoder, s.event, sink_write, s, key_action, &actx)
+  end
+  -- the wheel scrolls a hovered dropdown or window terminal even unfocused
+  -- (ImGui owns the mouse over its windows); world panels call terminal_wheel
+  if not host.drawing_world and imgui.GetIO().MouseWheel ~= 0.0 and imgui.IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows) then
+    local mouse: ImVec2
+    imgui.GetMousePos(&mouse)
+    if mouse.x >= origin.x and mouse.y >= origin.y and mouse.x < origin.x + width and mouse.y < origin.y + height then
+      terminal_wheel(s, mouse.x - origin.x, mouse.y - origin.y)
+    end
+  end
+  s.view:update()
+  s.unread = false
+  local t = imgui.GetTime()
+  local blink_on = (not policy.cursor_blink) or ((t - (t // 1.0)) < 0.5)
+  imgui.DrawListPushClipRect(dl, origin, vec2(origin.x + width, origin.y + height), true)
+  render_termview(dl, &s.view, origin, m, focused, blink_on, bg_alpha, rounding)
+  imgui.DrawListPopClipRect(dl)
+  if host.api.pop_font ~= nilptr then host.api.pop_font() end
+end

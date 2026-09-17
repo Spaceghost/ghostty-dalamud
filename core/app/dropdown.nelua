@@ -1,0 +1,682 @@
+-- The Quake-style dropdown and the floating windows, in glass: a rounded body
+-- with a vertical gradient, an inner edge highlight and a soft glow that take
+-- on the world's light like the panels do; a drawn tab bar with icon buttons
+-- and a profiles menu; an eased slide and fade. Only colours are ever
+-- adjusted after drawing, never positions, so terminal text stays crisp.
+require 'core.app.terminal'
+require 'core.chrome'
+require 'core.app.bell'
+require 'C.stdio'
+
+local GLOW_SPREAD: float32 <comptime> = 18
+local GLOW_RINGS <comptime> = 6
+local TAB_GAP: float32 <comptime> = 4
+local TAB_PAD: float32 <comptime> = 9
+local TAB_DOT: float32 <comptime> = 10     -- room for the unread dot
+local TAB_CLOSE_R: float32 <comptime> = 8
+local TAB_MIN: float32 <comptime> = 96
+local TAB_MAX: float32 <comptime> = 240
+local TAB_SQUEEZED: float32 <comptime> = 64
+local BUTTON_GAP: float32 <comptime> = 2
+local GROUP_GAP: float32 <comptime> = 13
+local TIP_DELAY <comptime> = 0.45
+local UNDERLINE_EASE: float32 <comptime> = 0.22
+local CLOSE_HOT: uint32 <comptime> = 0xDC323CBE   -- im_col32(190, 60, 50, 220), the panels' close red
+
+-- Actions ------------------------------------------------------------------------------
+-- Everything the chrome's buttons do, free of ImGui so tests can drive it.
+
+local function active_tab(): *Session
+  if host.dropdown_active >= 0 and host.dropdown_active < #host.dropdown_tabs then return host.dropdown_tabs[host.dropdown_active] end
+  return nilptr
+end
+
+local function clamp_active(): void
+  if host.dropdown_active >= #host.dropdown_tabs then host.dropdown_active = #host.dropdown_tabs - 1 end
+end
+
+global function dropdown_new_tab(profile: integer): void
+  local ns = session_new(profile, 80, 24)
+  if ns ~= nilptr then host.dropdown_tabs:push(ns) host.dropdown_active = #host.dropdown_tabs - 1 end
+end
+
+-- A tab bar button: acts on the dropdown and its active tab.
+global function dropdown_run(action: ChromeAction): void
+  local s = active_tab()
+  if action == ChromeAction.NewTab then
+    dropdown_new_tab(policy.default_profile - 1)
+  elseif action == ChromeAction.Profiles then
+    host.show_profiles = not host.show_profiles
+  elseif action == ChromeAction.Hide then
+    -- hide without the toggle key: in controller mode (or with a chat input
+    -- focused) the key never reaches us
+    set_visible(false)
+  elseif action == ChromeAction.Settings then
+    host.settings_open = not host.settings_open
+  elseif s == nilptr then
+    return
+  elseif action == ChromeAction.Minimize then
+    minimize(s)
+    if #host.dropdown_tabs == 0 then set_visible(false) end
+  elseif action == ChromeAction.Pet then
+    host.dropdown_tabs:remove(host.dropdown_active)
+    if not make_pet(s) then host.dropdown_tabs:insert(host.dropdown_active, s) end
+    clamp_active()
+  elseif action == ChromeAction.Pin then
+    local err = policy_world_command(s.id, 'here')
+    if #err == 0 then
+      host.world:push(s)
+      host.dropdown_tabs:remove(host.dropdown_active)
+      clamp_active()
+      set_world_visible(true)
+    else
+      logf(LOG_WARN, 'pin: %s', err)
+    end
+    err:destroy()
+  elseif action == ChromeAction.Window then
+    -- pop the active tab out into its own floating window
+    host.windows:push(s)
+    host.dropdown_tabs:remove(host.dropdown_active)
+    clamp_active()
+  end
+end
+
+-- Close tab `i` (its × or a middle click); the same terminal stays active
+-- unless it was the one closed.
+global function dropdown_close_tab(i: integer): void
+  if i < 0 or i >= #host.dropdown_tabs then return end
+  local s = host.dropdown_tabs[i]
+  host.dropdown_tabs:remove(i)
+  if host.popup_session == s then host.popup_session = nilptr end
+  session_remove(s)
+  if host.dropdown_active > i then host.dropdown_active = host.dropdown_active - 1 end
+  clamp_active()
+end
+
+-- Close the tab whose close_tab key was pressed while it drew (see
+-- terminal_close_request).
+global function dropdown_apply_close_request(): void
+  local id = terminal_close_request
+  terminal_close_request = 0
+  if id == 0 then return end
+  for i = 0, < #host.dropdown_tabs do
+    if host.dropdown_tabs[i].id == id then dropdown_close_tab(i) return end
+  end
+end
+
+-- Swap tab `i` with its neighbour `dir` (-1 left, 1 right); the active tab follows.
+global function dropdown_move_tab(i: integer, dir: integer): void
+  local j = i + dir
+  if i < 0 or j < 0 or i >= #host.dropdown_tabs or j >= #host.dropdown_tabs then return end
+  local t = host.dropdown_tabs[i]
+  host.dropdown_tabs[i] = host.dropdown_tabs[j]
+  host.dropdown_tabs[j] = t
+  if host.dropdown_active == i then host.dropdown_active = j elseif host.dropdown_active == j then host.dropdown_active = i end
+end
+
+-- A floating window's header button; true when the window left the list.
+global function window_run(i: integer, action: ChromeAction): boolean
+  if i < 0 or i >= #host.windows then return false end
+  local s = host.windows[i]
+  if action == ChromeAction.Close then
+    host.windows:remove(i)
+    if host.popup_session == s then host.popup_session = nilptr end
+    session_remove(s)
+    return true
+  elseif action == ChromeAction.Pet then
+    host.windows:remove(i)
+    if make_pet(s) then return true end
+    host.windows:insert(i, s)
+  elseif action == ChromeAction.Dock then
+    -- back into the dropdown as a tab
+    host.windows:remove(i)
+    host.dropdown_tabs:push(s)
+    host.dropdown_active = #host.dropdown_tabs - 1
+    set_visible(true)
+    return true
+  end
+  return false
+end
+
+-- Drawing helpers -----------------------------------------------------------------------
+
+local function frame_light(): ChromeLight
+  if policy.dropdown.world_tint <= 0 then return chrome_light(1, 1, 1, 0, 0) end
+  local ok, r, g, b, bl = policy_world_lighting()
+  if not ok then return chrome_light(1, 1, 1, 0, 0) end
+  return chrome_light(r, g, b, bl, (@float32)(policy.dropdown.world_tint))
+end
+
+local function text_width(font: *ImFont, fs: float32, s: string): float32
+  if #s == 0 then return 0 end
+  local sz: ImVec2
+  imgui.FontCalcTextSizeA(&sz, font, fs, 3.4e38, 0, (@cstring)(s.data), (@cstring)(&s.data[s.size]), nilptr)
+  return sz.x
+end
+
+local function add_text(dl: *ImDrawList, font: *ImFont, fs: float32, x: float32, y: float32, col: uint32, s: string): void
+  if #s == 0 then return end
+  imgui.DrawListAddText(dl, font, fs, vec2(math.floor(x), math.floor(y)), col, (@cstring)(s.data), (@cstring)(&s.data[s.size]), 0, nilptr)
+end
+
+-- The glass body, `sheen_h` of soft light across its top, and the glow
+-- around it. The caller's clip must leave room for the glow.
+local function draw_glass(dl: *ImDrawList, x0: float32, y0: float32, x1: float32, y1: float32, rounding: float32, pal: ChromePalette, light: ChromeLight, sheen_h: float32): void
+  local glow = (@float32)(policy.dropdown.glow)
+  if glow > 0 then
+    for i = 1, GLOW_RINGS do
+      local off, w, a = chrome_glow_ring(i, GLOW_RINGS, GLOW_SPREAD, glow, light.backlight)
+      if a > 0 then
+        imgui.DrawListAddRect(dl, vec2(x0 - off, y0 - off), vec2(x1 + off, y1 + off),
+          (pal.glow & 0x00FFFFFF) | ((@uint32)(a) << 24), rounding + off, 0, w)
+      end
+    end
+  end
+  -- everything below is drawn white and recoloured by height
+  local inner = math.max(rounding - 1, 0)
+  local first = dl.VtxBuffer.Size
+  imgui.DrawListAddRectFilled(dl, vec2(x0, y0), vec2(x1, y1), 0xFFFFFFFF, rounding, 0)
+  chrome_shade_vertical(dl, first, y0, y1, pal.body_top, pal.body_bottom)
+  if sheen_h > 0 and (pal.sheen >> 24) ~= 0 then
+    first = dl.VtxBuffer.Size
+    imgui.DrawListAddRectFilled(dl, vec2(x0 + 1, y0 + 1), vec2(x1 - 1, y0 + sheen_h), 0xFFFFFFFF, inner, ImDrawFlags_RoundCornersTop)
+    chrome_shade_vertical(dl, first, y0, y0 + sheen_h, pal.sheen, pal.sheen & 0x00FFFFFF)
+  end
+  first = dl.VtxBuffer.Size
+  imgui.DrawListAddRect(dl, vec2(x0 + 1, y0 + 1), vec2(x1 - 1, y1 - 1), 0xFFFFFFFF, inner, 0, 1)
+  chrome_shade_vertical(dl, first, y0, y1, pal.edge_top, pal.edge_bottom)
+  imgui.DrawListAddRect(dl, vec2(x0, y0), vec2(x1, y1), pal.rim, rounding, 0, 1)
+end
+
+-- Glass over everything in the current window: the clip opens to the viewport.
+local function draw_window_glass(dl: *ImDrawList, x0: float32, y0: float32, x1: float32, y1: float32, rounding: float32, pal: ChromePalette, light: ChromeLight, sheen_h: float32): void
+  local vp = imgui.GetMainViewport()
+  imgui.DrawListPushClipRect(dl, vp.Pos, vec2(vp.Pos.x + vp.Size.x, vp.Pos.y + vp.Size.y), false)
+  draw_glass(dl, x0, y0, x1, y1, rounding, pal, light, sheen_h)
+  imgui.DrawListPopClipRect(dl)
+end
+
+-- A press on this window belongs to it: without this the click-off-to-unfocus
+-- in gu_frame sees the button it just activated block the hover, drops focus
+-- and cancels the press before its release.
+local function claim_click(): void
+  if host.lmb_pressed and imgui.IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows) then host.click_used = true end
+end
+
+-- The tooltip of button `key` once the pointer has rested on it.
+local function chrome_tooltip(key: integer, hot: boolean, tip: string, now: float64): void
+  if not hot then return end
+  if host.chrome_tip_key ~= key or host.chrome_tip_frame + 1 < host.frame then
+    host.chrome_tip_key = key
+    host.chrome_tip_since = now
+  end
+  host.chrome_tip_frame = host.frame
+  if now - host.chrome_tip_since < TIP_DELAY then return end
+  imgui.PushStyleVarVec2(ImGuiStyleVar_WindowPadding, vec2(9, 5))
+  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowRounding, 6)
+  imgui.PushStyleVarFloat(ImGuiStyleVar_PopupBorderSize, 1)
+  imgui.PushStyleColorU32(ImGuiCol_PopupBg, im_col32(16, 18, 24, 242))
+  imgui.PushStyleColorU32(ImGuiCol_Border, chrome_fade_alpha(CHROME_GOLD, 0.4))
+  imgui.PushStyleColorU32(ImGuiCol_Text, CHROME_INK)
+  imgui.BeginTooltip()
+  imgui.TextUnformatted((@cstring)(tip.data), (@cstring)(&tip.data[tip.size]))
+  imgui.EndTooltip()
+  imgui.PopStyleColor(3)
+  imgui.PopStyleVar(3)
+end
+
+-- One square icon button; true when clicked. `on` marks a toggle that is on.
+local function icon_button(dl: *ImDrawList, b: *ChromeButton, key: integer, x: float32, y: float32, size: float32, on: boolean, pal: ChromePalette, now: float64): boolean
+  imgui.SetCursorScreenPos(vec2(x, y))
+  imgui.PushIDInt((@cint)(key))
+  local pressed = imgui.InvisibleButton('##chrome_button', vec2(size, size), 0)
+  local hot = imgui.IsItemHovered(0)
+  local held = imgui.IsItemActive()
+  imgui.PopID()
+  local fill: uint32 = 0
+  if held then fill = chrome_fade_alpha(CHROME_GOLD, 0.35)
+  elseif hot and b.action == ChromeAction.Close then fill = CLOSE_HOT
+  elseif on then fill = pal.pill
+  elseif hot then fill = pal.pill_hover end
+  if fill ~= 0 then imgui.DrawListAddRectFilled(dl, vec2(x, y), vec2(x + size, y + size), fill, size * 0.3, 0) end
+  local ink = CHROME_INK_DIM
+  if on then ink = CHROME_GOLD elseif hot or held then ink = CHROME_INK end
+  chrome_draw_icon(dl, b.icon, x + size * 0.5, y + size * 0.5, size, ink, pal.body_top | 0xFF000000)
+  chrome_tooltip(key, hot, b.tip, now)
+  return pressed
+end
+
+-- Tab bar ------------------------------------------------------------------------------
+
+local TabBar = @record{
+  action: ChromeAction,           -- button clicked this frame
+  menu_x0: float32, menu_x1: float32, menu_y0: float32, menu_y1: float32, -- the profiles button
+}
+
+local function tab_label(s: *Session): string
+  local sb: stringbuilder
+  local name = s:display_name()
+  if #name == 0 then name = 'terminal' end
+  if s.exited then sb:write('(', name, ')') else sb:write(name) end
+  return sb:promote()
+end
+
+-- Pill tabs on the left (click selects, drag reorders, × or middle click
+-- closes), icon buttons on the right.
+local function draw_tab_bar(dl: *ImDrawList, x0: float32, y0: float32, x1: float32, bar_h: float32, pal: ChromePalette, now: float64, dt: float64): TabBar
+  local bar: TabBar
+  local font = imgui.GetFont()
+  local fs = imgui.GetFontSize()
+  local mouse: ImVec2
+  imgui.GetMousePos(&mouse)
+
+  -- buttons first: they win the pointer over a tab scrolled beneath them
+  local buttons = (@*[0]ChromeButton)(&chrome_tab_buttons)
+  local bsize = math.floor(bar_h - 4)
+  local by = math.floor(y0 + (bar_h - bsize) * 0.5)
+  for i = 0, < CHROME_TAB_BUTTONS do
+    local b = &chrome_tab_buttons[i]
+    local bx = math.floor(chrome_button_x(buttons, CHROME_TAB_BUTTONS, i, x1, bsize, BUTTON_GAP, GROUP_GAP))
+    if i > 0 and chrome_tab_buttons[i - 1].group ~= b.group then
+      local sx = bx - GROUP_GAP * 0.5
+      imgui.DrawListAddLine(dl, vec2(sx, by + bsize * 0.25), vec2(sx, by + bsize * 0.75), pal.edge_top, 1)
+    end
+    local on = (b.action == ChromeAction.Profiles and host.show_profiles) or (b.action == ChromeAction.Settings and host.settings_open)
+    if icon_button(dl, b, (@integer)(b.action), bx, by, bsize, on, pal, now) then bar.action = b.action end
+    if b.action == ChromeAction.Profiles then
+      bar.menu_x0, bar.menu_x1, bar.menu_y0, bar.menu_y1 = bx, bx + bsize, by, by + bsize
+    end
+  end
+
+  local strip_x1 = math.floor(chrome_button_x(buttons, CHROME_TAB_BUTTONS, 0, x1, bsize, BUTTON_GAP, GROUP_GAP) - GROUP_GAP)
+  local area = strip_x1 - x0
+  local n = #host.dropdown_tabs
+  if n == 0 or area < 24 then
+    host.dropdown_ul_w = 0
+    return bar
+  end
+
+  -- layout: natural widths, squeezed together when they overflow, then scrolled
+  local labels: vector(string)
+  local text_ws: vector(float32)
+  local xs: vector(float32)
+  local ws: vector(float32)
+  local extra = TAB_PAD * 2 + TAB_DOT + TAB_CLOSE_R * 2 + 4
+  local total: float32 = 0
+  for i = 0, < n do
+    labels:push(tab_label(host.dropdown_tabs[i]))
+    text_ws:push(text_width(font, fs, labels[i]))
+    ws:push(chrome_tab_width(text_ws[i], extra, TAB_MIN, TAB_MAX))
+    total = total + ws[i]
+  end
+  -- the active tab keeps its natural width; the others make room
+  local a = host.dropdown_active
+  local scale: float32
+  if a >= 0 and a < n then
+    scale = chrome_tab_fit(total - ws[a], n - 1, area - ws[a] - TAB_GAP, TAB_GAP)
+  else
+    scale = chrome_tab_fit(total, n, area, TAB_GAP)
+  end
+  local content: float32 = 0
+  for i = 0, < n do
+    if i ~= a then ws[i] = math.max(ws[i] * scale, TAB_SQUEEZED) end
+    ws[i] = math.floor(ws[i])
+    xs:push(content)
+    content = content + ws[i] + TAB_GAP
+  end
+  content = content - TAB_GAP
+  if a >= 0 and a < n then
+    host.dropdown_tab_scroll = chrome_scroll_to(host.dropdown_tab_scroll, xs[a], xs[a] + ws[a], area, content)
+  else
+    host.dropdown_tab_scroll = chrome_scroll_to(host.dropdown_tab_scroll, 0, 0, area, content)
+  end
+  local scroll = math.floor(host.dropdown_tab_scroll)
+
+  local ty0 = y0 + 3
+  local ty1 = y0 + bar_h - 3
+  local th = ty1 - ty0
+  local cy = (ty0 + ty1) * 0.5
+  local close_i, swap_i, swap_dir = -1, -1, 0
+  local ul_on = false
+  local ul_x: float32, ul_w: float32 = 0, 0
+  imgui.DrawListPushClipRect(dl, vec2(x0, y0), vec2(strip_x1, y0 + bar_h), true)
+  for i = 0, < n do
+    local s = host.dropdown_tabs[i]
+    local tx0 = x0 + xs[i] - scroll
+    local tx1 = tx0 + ws[i]
+    local vx0, vx1 = math.max(tx0, x0), math.min(tx1, strip_x1)
+    if vx1 - vx0 >= 1 then
+      local active = i == host.dropdown_active
+      local over = mouse.x >= vx0 and mouse.x < vx1 and mouse.y >= ty0 and mouse.y < ty1
+      local show_close = active or over
+      local ccx = tx1 - TAB_PAD - TAB_CLOSE_R + 2
+      local close_hot = false
+      imgui.PushIDInt((@cint)(s.id))
+      bell_chip_glow(dl, vec2(tx0, ty0), vec2(tx1, ty1), s.id) -- a tab that rang glows
+      -- the × first, so it wins the pointer over its own tab
+      if show_close and ccx - TAB_CLOSE_R >= vx0 and ccx + TAB_CLOSE_R <= vx1 then
+        imgui.SetCursorScreenPos(vec2(ccx - TAB_CLOSE_R, cy - TAB_CLOSE_R))
+        if imgui.InvisibleButton('##close', vec2(TAB_CLOSE_R * 2, TAB_CLOSE_R * 2), 0) then close_i = i end
+        close_hot = imgui.IsItemHovered(0)
+      else
+        show_close = false
+      end
+      imgui.SetCursorScreenPos(vec2(vx0, ty0))
+      imgui.InvisibleButton('##tab', vec2(vx1 - vx0, th), ImGuiButtonFlags_MouseButtonLeft | ImGuiButtonFlags_MouseButtonMiddle)
+      if imgui.IsItemActivated() and imgui.IsMouseClicked(ImGuiMouseButton_Left, false) then
+        host.dropdown_active = i
+        active = true
+      end
+      if imgui.IsItemHovered(0) and imgui.IsMouseClicked(ImGuiMouseButton_Middle, false) then close_i = i end
+      if imgui.IsItemActive() and imgui.IsMouseDragging(ImGuiMouseButton_Left, 4) then
+        local prev_mid: float32, next_mid: float32 = 0, 0
+        if i > 0 then prev_mid = x0 + xs[i - 1] + ws[i - 1] * 0.5 - scroll end
+        if i < n - 1 then next_mid = x0 + xs[i + 1] + ws[i + 1] * 0.5 - scroll end
+        local d = chrome_drag_swap(mouse.x, i, n, prev_mid, next_mid)
+        if d ~= 0 then swap_i, swap_dir = i, d end
+      end
+      imgui.PopID()
+
+      if active then
+        imgui.DrawListAddRectFilled(dl, vec2(tx0, ty0), vec2(tx1, ty1), pal.pill, th * 0.5, 0)
+      elseif over then
+        imgui.DrawListAddRectFilled(dl, vec2(tx0, ty0), vec2(tx1, ty1), pal.pill_hover, th * 0.5, 0)
+      end
+      if s.unread and not active then
+        imgui.DrawListAddCircleFilled(dl, vec2(tx0 + TAB_PAD + 3, cy), 3, CHROME_GOLD, 12)
+      end
+      local tx = tx0 + TAB_PAD + TAB_DOT
+      local text_x1 = tx1 - TAB_PAD
+      if show_close then text_x1 = ccx - TAB_CLOSE_R - 3 end
+      local ink = CHROME_INK_DIM
+      if s.exited then ink = CHROME_INK_FAINT elseif active or over then ink = CHROME_INK end
+      imgui.DrawListPushClipRect(dl, vec2(tx, ty0), vec2(math.max(math.min(text_x1, vx1), tx), ty1), true)
+      local text_first = dl.VtxBuffer.Size
+      add_text(dl, font, fs, tx, cy - fs * 0.5, ink, labels[i])
+      if tx + text_ws[i] > text_x1 then chrome_fade_tail(dl, text_first, text_x1 - 14, text_x1) end
+      imgui.DrawListPopClipRect(dl)
+      if active then
+        ul_on = true
+        ul_x, ul_w = tx, math.max(math.min(text_ws[i], text_x1 - tx), 8)
+      end
+      if show_close then
+        if close_hot then imgui.DrawListAddCircleFilled(dl, vec2(ccx, cy), TAB_CLOSE_R, CLOSE_HOT, 16) end
+        chrome_draw_icon(dl, ChromeIcon.Close, ccx, cy, TAB_CLOSE_R * 2.2, close_hot and CHROME_INK or CHROME_INK_DIM, 0)
+      end
+    end
+  end
+  -- the gold underline glides to the active tab
+  if ul_on then
+    if host.dropdown_ul_w <= 0 then
+      host.dropdown_ul_x, host.dropdown_ul_w, host.dropdown_ul_vx, host.dropdown_ul_vw = ul_x, ul_w, 0, 0
+    else
+      host.dropdown_ul_x, host.dropdown_ul_vx = world_ease(host.dropdown_ul_x, host.dropdown_ul_vx, ul_x, (@float32)(dt), UNDERLINE_EASE)
+      host.dropdown_ul_w, host.dropdown_ul_vw = world_ease(host.dropdown_ul_w, host.dropdown_ul_vw, ul_w, (@float32)(dt), UNDERLINE_EASE)
+    end
+    local ux, uw, uy = host.dropdown_ul_x, host.dropdown_ul_w, ty1 - 4
+    imgui.DrawListAddRectFilled(dl, vec2(ux - 3, uy - 2), vec2(ux + uw + 3, uy + 4), chrome_fade_alpha(CHROME_GOLD, 0.16), 3, 0)
+    imgui.DrawListAddRectFilled(dl, vec2(ux, uy), vec2(ux + uw, uy + 2), CHROME_GOLD, 1, 0)
+  else
+    host.dropdown_ul_w = 0
+  end
+  imgui.DrawListPopClipRect(dl)
+
+  if swap_i >= 0 then
+    dropdown_move_tab(swap_i, swap_dir)
+  elseif close_i >= 0 then
+    dropdown_close_tab(close_i)
+  end
+  for i = 0, < #labels do labels[i]:destroy() end
+  labels:destroy()
+  text_ws:destroy()
+  xs:destroy()
+  ws:destroy()
+  return bar
+end
+
+-- Profiles menu: its own window under the profiles button, so the terminal
+-- beneath never sees its clicks.
+local function draw_profiles_menu(bar: TabBar, pal: ChromePalette, light: ChromeLight, fade: float32): void
+  if not host.show_profiles then return end
+  local n = #policy.profiles
+  if not host.dropdown_open or n == 0 then host.show_profiles = false return end
+  local font = imgui.GetFont()
+  local fs = imgui.GetFontSize()
+  local row_h = math.floor(fs + 12)
+  local pad: float32 = 6
+  local name_w: float32, kind_w: float32 = 0, 0
+  for pi = 0, < n do
+    local p = policy_profile(pi)
+    name_w = math.max(name_w, text_width(font, fs, p.name))
+    kind_w = math.max(kind_w, text_width(font, fs, p.transport))
+  end
+  local w = math.floor(math.max(name_w + kind_w + 60 + pad * 2, 220))
+  local h = row_h * n + pad * 2
+  local rounding = (@float32)(math.min(policy.dropdown.rounding, row_h * 0.5 + pad))
+  imgui.SetNextWindowPos(vec2(bar.menu_x1, bar.menu_y1 + 6), ImGuiCond_Always, vec2(1, 0))
+  imgui.SetNextWindowSize(vec2(w, h), ImGuiCond_Always)
+  imgui.PushStyleVarVec2(ImGuiStyleVar_WindowPadding, vec2(0, 0))
+  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowRounding, rounding)
+  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowBorderSize, 0)
+  local flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground
+  local visible = imgui.Begin('##ghostty_profiles', nilptr, flags)
+  imgui.PopStyleVar(3)
+  if visible then
+    claim_click()
+    local wp: ImVec2
+    imgui.GetWindowPos(&wp)
+    local dl = imgui.GetWindowDrawList()
+    local first = dl.VtxBuffer.Size
+    draw_window_glass(dl, wp.x, wp.y, wp.x + w, wp.y + h, rounding, pal, light, row_h)
+    local mouse: ImVec2
+    imgui.GetMousePos(&mouse)
+    for pi = 0, < n do
+      local p = policy_profile(pi)
+      local rx0, rx1 = wp.x + pad, wp.x + w - pad
+      local ry = wp.y + pad + row_h * pi
+      imgui.SetCursorScreenPos(vec2(rx0, ry))
+      imgui.PushIDInt((@cint)(pi))
+      local picked = imgui.InvisibleButton('##profile', vec2(rx1 - rx0, row_h), 0)
+      local hot = imgui.IsItemHovered(0)
+      imgui.PopID()
+      if hot then imgui.DrawListAddRectFilled(dl, vec2(rx0, ry + 1), vec2(rx1, ry + row_h - 1), pal.pill, (row_h - 2) * 0.5, 0) end
+      -- the gold dot marks the profile + opens
+      if pi == policy.default_profile - 1 then
+        imgui.DrawListAddCircleFilled(dl, vec2(rx0 + 10, ry + row_h * 0.5), 3, CHROME_GOLD, 12)
+      end
+      local ty = ry + (row_h - fs) * 0.5
+      add_text(dl, font, fs, rx0 + 22, ty, hot and CHROME_INK or CHROME_INK_DIM, p.name)
+      add_text(dl, font, fs, rx1 - 10 - text_width(font, fs, p.transport), ty, CHROME_INK_FAINT, p.transport)
+      if picked then
+        dropdown_new_tab(pi)
+        host.show_profiles = false
+        host.dropdown_focus_next = true
+      end
+    end
+    -- a click anywhere else closes it (the profiles button toggles it itself);
+    -- by rectangle, since a row pressed this frame blocks the window's hover
+    local inside = mouse.x >= wp.x and mouse.x < wp.x + w and mouse.y >= wp.y and mouse.y < wp.y + h
+    local on_button = mouse.x >= bar.menu_x0 and mouse.x < bar.menu_x1 and mouse.y >= bar.menu_y0 and mouse.y < bar.menu_y1
+    if (imgui.IsMouseClicked(ImGuiMouseButton_Left, false) or host.lmb_pressed) and not inside and not on_button then
+      host.show_profiles = false
+    end
+    world_fade_vertices(dl, first, fade)
+  end
+  imgui.End()
+end
+
+-- Dropdown -------------------------------------------------------------------------------
+
+global function draw_dropdown(now: float64, dt: float64): void
+  local target: float32 = host.dropdown_open and 1 or 0
+  local anim, vel = chrome_ease((@float32)(host.dropdown_anim), host.dropdown_anim_v, target, (@float32)(dt), (@float32)(policy.dropdown.animation_ms))
+  host.dropdown_anim, host.dropdown_anim_v = anim, vel
+  if host.dropdown_anim <= 0.0 then
+    host.show_profiles = false
+    return
+  end
+
+  local vp = imgui.GetMainViewport()
+  local h = math.floor((@float32)(vp.WorkSize.y * policy.dropdown.height))
+  local margin = (@float32)(policy.dropdown.margin)
+  local full = vp.WorkSize.x - 2 * margin
+  local w = (@float32)(vp.WorkSize.x * policy.dropdown.width)
+  if w < policy.dropdown.min_width then w = (@float32)(policy.dropdown.min_width) end
+  if w > full then w = full end
+  w = math.floor(w)
+  local x = vp.WorkPos.x + margin
+  if policy.dropdown.align == 'center' then x = vp.WorkPos.x + (vp.WorkSize.x - w) * 0.5
+  elseif policy.dropdown.align == 'right' then x = vp.WorkPos.x + vp.WorkSize.x - margin - w end
+  x = math.floor(x)
+  -- whole pixels even mid-slide, so the text never smears
+  local y = math.floor(vp.WorkPos.y + (@float32)(policy.dropdown.y_offset) - h * (1 - anim))
+  imgui.SetNextWindowPos(vec2(x, y), ImGuiCond_Always, vec2(0, 0))
+  imgui.SetNextWindowSize(vec2(w, h), ImGuiCond_Always)
+  if host.dropdown_focus_next then
+    imgui.SetNextWindowFocus()
+    host.dropdown_focus_next = false
+  end
+  local pad = math.floor((@float32)(policy.dropdown.padding))
+  local rounding = (@float32)(policy.dropdown.rounding)
+  local flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground
+  imgui.PushStyleVarVec2(ImGuiStyleVar_WindowPadding, vec2(pad, pad))
+  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowRounding, rounding)
+  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowBorderSize, 0)
+  if not imgui.Begin('##ghostty_dropdown', nilptr, flags) then
+    imgui.End()
+    imgui.PopStyleVar(3)
+    return
+  end
+  imgui.PopStyleVar(3)
+  claim_click()
+  bell_dropdown_glow()
+
+  -- make sure there is a tab (after existing agent shells had a chance to reattach)
+  if #host.dropdown_tabs == 0 and (host.reattach_done or not host.agent_enabled) then
+    dropdown_new_tab(policy.default_profile - 1)
+  end
+
+  local dl = imgui.GetWindowDrawList()
+  local first = dl.VtxBuffer.Size
+  local fade = chrome_fade(anim)
+  local light = frame_light()
+  local pal = chrome_palette((@float32)(policy.dropdown.opacity), policy.dropdown.glass, light)
+  local bar_h = math.floor(imgui.GetFontSize() + 14)
+  draw_window_glass(dl, x, y, x + w, y + h, rounding, pal, light, pad + bar_h)
+
+  local bar = draw_tab_bar(dl, x + pad + 2, y + pad, x + w - pad - 2, bar_h, pal, now, dt)
+  if bar.action ~= ChromeAction.None then dropdown_run(bar.action) end
+  local sep_y = y + pad + bar_h + 1
+  imgui.DrawListAddLine(dl, vec2(x + pad + rounding * 0.5, sep_y), vec2(x + w - pad - rounding * 0.5, sep_y), pal.edge_bottom, 1)
+
+  -- terminal area
+  local origin = vec2(x + pad, sep_y + 3)
+  local avail = vec2(w - 2 * pad, y + h - pad - origin.y)
+  local s = active_tab()
+  if avail.x > 10 and avail.y > 10 and s ~= nilptr then
+    imgui.SetCursorScreenPos(origin)
+    imgui.InvisibleButton('##ghostty_term', avail, 0)
+    local focused = imgui.IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)
+      and chrome_takes_keys(host.dropdown_open, host.last_toggle_frame == host.frame)
+    draw_terminal(s, dl, origin, avail.x, avail.y, host.dropdown_font_size, focused, true, 0, 0.0)
+    dropdown_apply_close_request()
+  end
+  world_fade_vertices(dl, first, fade)
+  imgui.End()
+
+  draw_profiles_menu(bar, pal, light, fade)
+end
+
+-- Floating windows ------------------------------------------------------------------------
+global function draw_windows(): void
+  if not host.dropdown_open or #host.windows == 0 then return end
+  local now = imgui.GetTime()
+  local light = frame_light()
+  local pal = chrome_palette((@float32)(policy.dropdown.opacity), policy.dropdown.glass, light)
+  local rounding = (@float32)(policy.dropdown.rounding)
+  local pad = math.floor((@float32)(policy.dropdown.padding))
+  local font = imgui.GetFont()
+  local fs = imgui.GetFontSize()
+  local header = math.floor(fs + 14)
+  local fade = chrome_fade((@float32)(host.dropdown_anim))
+  local buttons = (@*[0]ChromeButton)(&chrome_window_buttons)
+  local i: integer = 0
+  while i < #host.windows do
+    local s = host.windows[i]
+    local label: [32]cchar -- the window's ImGui id, formatted without a heap string each frame
+    C.snprintf((@cstring)(&label), #label, '###ghostty_win%d', (@cint)(s.id))
+    local offset = (@float32)(40 + 30 * (i % 8))
+    imgui.SetNextWindowPos(vec2(offset + 60, offset + 80), ImGuiCond_FirstUseEver, vec2(0, 0))
+    imgui.SetNextWindowSize(vec2(760, 420), ImGuiCond_FirstUseEver)
+    imgui.PushStyleVarVec2(ImGuiStyleVar_WindowPadding, vec2(0, 0))
+    imgui.PushStyleVarFloat(ImGuiStyleVar_WindowRounding, rounding)
+    imgui.PushStyleVarFloat(ImGuiStyleVar_WindowBorderSize, 0)
+    -- ImGui's resize grip still works; the glass draws its own
+    imgui.PushStyleColorU32(ImGuiCol_ResizeGrip, 0)
+    imgui.PushStyleColorU32(ImGuiCol_ResizeGripHovered, 0)
+    imgui.PushStyleColorU32(ImGuiCol_ResizeGripActive, 0)
+    local flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoScrollbar |
+      ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking |
+      ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoNav
+    local visible = imgui.Begin((@cstring)(&label), nilptr, flags)
+    imgui.PopStyleColor(3)
+    imgui.PopStyleVar(3)
+    local acted = ChromeAction.None
+    if visible then
+      claim_click()
+      bell_window_glow(s.id)
+      local wp: ImVec2
+      local wsz: ImVec2
+      imgui.GetWindowPos(&wp)
+      imgui.GetWindowSize(&wsz)
+      local x0, y0, x1, y1 = wp.x, wp.y, wp.x + wsz.x, wp.y + wsz.y
+      local dl = imgui.GetWindowDrawList()
+      local first = dl.VtxBuffer.Size
+      local focused = imgui.IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)
+      draw_window_glass(dl, x0, y0, x1, y1, rounding, pal, light, header)
+
+      -- header: title, buttons; dragging its empty space moves the window
+      local bsize = header - 8
+      local right = x1 - 6
+      local title_x1 = chrome_button_x(buttons, CHROME_WINDOW_BUTTONS, 0, right, bsize, BUTTON_GAP, GROUP_GAP) - 8
+      local ty = y0 + (header - fs) * 0.5
+      local tx = x0 + 12 + rounding * 0.3
+      local name = s:display_name()
+      imgui.DrawListPushClipRect(dl, vec2(tx, y0), vec2(math.max(title_x1, tx), y0 + header), true)
+      local text_first = dl.VtxBuffer.Size
+      local name_w = text_width(font, fs, name)
+      add_text(dl, font, fs, tx, ty, focused and CHROME_INK or CHROME_INK_DIM, name)
+      if s.exited then add_text(dl, font, fs, tx + name_w + 8, ty, CHROME_INK_FAINT, 'exited') end
+      if tx + name_w > title_x1 then chrome_fade_tail(dl, text_first, title_x1 - 18, title_x1) end
+      imgui.DrawListPopClipRect(dl)
+      if focused then
+        imgui.DrawListAddLine(dl, vec2(x0 + rounding, y0 + header - 0.5), vec2(x1 - rounding, y0 + header - 0.5), chrome_fade_alpha(CHROME_GOLD, 0.55), 1)
+      end
+      for k = 0, < CHROME_WINDOW_BUTTONS do
+        local b = &chrome_window_buttons[k]
+        local bx = math.floor(chrome_button_x(buttons, CHROME_WINDOW_BUTTONS, k, right, bsize, BUTTON_GAP, GROUP_GAP))
+        if icon_button(dl, b, 1000 * s.id + (@integer)(b.action), bx, y0 + 4, bsize, false, pal, now) then acted = b.action end
+      end
+      -- resize corner hint
+      local inset = 4 + rounding * 0.3
+      imgui.DrawListAddTriangleFilled(dl, vec2(x1 - inset - 10, y1 - inset), vec2(x1 - inset, y1 - inset - 10), vec2(x1 - inset, y1 - inset),
+        chrome_fade_alpha(CHROME_GOLD, 0.35))
+
+      local origin = vec2(x0 + pad, y0 + header)
+      local tw, th = wsz.x - 2 * pad, wsz.y - header - pad
+      if tw > 10 and th > 10 then
+        imgui.SetCursorScreenPos(origin)
+        imgui.InvisibleButton('##ghostty_term', vec2(tw, th), 0)
+        draw_terminal(s, dl, origin, tw, th, host.dropdown_font_size, focused, false, 0, 0.0)
+      end
+      world_fade_vertices(dl, first, fade)
+    end
+    imgui.End()
+    -- a window that left the list leaves the next one at i
+    if not (acted ~= ChromeAction.None and window_run(i, acted)) then i = i + 1 end
+  end
+end

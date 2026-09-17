@@ -1,0 +1,412 @@
+-- Translate ImGui keyboard state into libghostty key events and PTY bytes.
+require 'string'
+require 'math'
+require 'core.ghostty'
+require 'core.imgui'
+
+-- Key presses and repeat. Two sources describe each key and neither is
+-- enough alone:
+-- * ImGui's edge (IsKeyPressed) counts every press exactly once, but it lags:
+--   events are handled at NewFrame, and when several arrive together ImGui
+--   spreads them over later frames. A key released while the game had the
+--   keyboard stays down in ImGui, so its next press brings no edge at all.
+-- * The OS state (GetAsyncKeyState) is current but misses a tap that begins
+--   and ends between two frames, and cannot tell a press from a key held
+--   since before the terminal took the keyboard.
+-- So ImGui's edge is the press. The OS state only adds the press ImGui cannot
+-- report (it still holds the key from a release it never heard), decides how
+-- long a key is held, and ends a hold. Repeat counts held frames rather than
+-- wall time, each frame adding at most KEY_REPEAT_MAX_STEP: ImGui's own repeat
+-- uses wall time, so a tap across a game hitch would look held.
+global KEY_REPEAT_DELAY <comptime> = 0.3
+global KEY_REPEAT_RATE <comptime> = 0.035
+global KEY_REPEAT_MAX_STEP <comptime> = 1 / 30
+global KeyRepeat = @record{
+  down: boolean,       -- physically held as of the last frame
+  armed: boolean,      -- seen released while polled: a later hold is a real press
+  passive: boolean,    -- held with no press counted for it: never repeats
+  early: boolean,      -- passive since before polling began (not armed)
+  early_n: integer,    -- frames polled since `early` began
+  imgui_seen: boolean, -- ImGui showed the key down while `early`
+  owes_up: boolean,    -- ImGui shows the key down from a press already seen; its release is still coming
+  edge_up: boolean,    -- last frame counted an edge while the OS showed the key up
+  held: float32, next_at: float32,
+}
+
+-- Presses to send this frame (0 or 1). `down`: the key is physically held
+-- now; `edge`: ImGui handled a new press this frame; `imgui_down`: ImGui thinks
+-- the key is held. Whichever of the OS state and ImGui's edge comes first, and
+-- however far apart, a tap is one press. A key already held when a terminal
+-- takes the keyboard (the ctrl+` that opened it) sends nothing until released.
+global function key_repeat_step(r: *KeyRepeat, down: boolean, edge: boolean, imgui_down: boolean, dt: float32): integer
+  if edge then imgui_down = true end
+  local owes = r.owes_up and imgui_down
+  r.owes_up = imgui_down and (owes or down or edge)
+  local edge_up = r.edge_up
+  r.edge_up = false
+  if r.early then
+    -- A key held since before polling: ImGui's edge is a press right after
+    -- polling began (it raced the first poll) or once ImGui had shown the key
+    -- down (a release came in between). Later it is the OS autorepeat of the
+    -- held key, which ImGui never saw go down.
+    if edge and r.early_n > 0 and not r.imgui_seen then edge = false end
+    r.early_n = r.early_n + 1
+    r.imgui_seen = r.imgui_seen or imgui_down
+  end
+  if edge then
+    r.down, r.passive, r.early, r.held, r.next_at = down, false, false, 0, KEY_REPEAT_DELAY
+    if not down then r.armed, r.edge_up = true, true end
+    return 1
+  end
+  if not down then
+    r.down, r.armed, r.passive, r.early, r.held = false, true, false, false, 0
+    return 0
+  end
+  if not r.down then
+    r.down = true
+    if r.armed and edge_up and owes then
+      return 0 -- the OS state caught up with last frame's press: the same press, held
+    end
+    if r.armed and imgui_down and not owes then
+      -- ImGui still holds the key from a release it never heard: this press
+      -- brings no edge, so it counts here
+      r.passive, r.held, r.next_at = false, 0, KEY_REPEAT_DELAY
+      return 1
+    end
+    -- a press whose edge is still coming, or a key held before polling began
+    r.passive, r.early, r.early_n, r.imgui_seen = true, not r.armed, 0, imgui_down
+    return 0
+  end
+  if r.passive then return 0 end
+  r.held = r.held + math.clamp(dt, 0, KEY_REPEAT_MAX_STEP)
+  if r.held >= r.next_at then
+    r.next_at = r.held + KEY_REPEAT_RATE
+    return 1
+  end
+  return 0
+end
+
+## if ccinfo.is_windows then
+local function win_key_state(vk: cint): int16 <cimport 'GetAsyncKeyState', nodecl> end
+## end
+
+-- Is the key physically held? The OS state, because ImGui only hears key
+-- messages while a terminal claims text input: a key released while the game
+-- had the keyboard stays "down" in ImGui. Off Windows (tests) ImGui is the
+-- only source.
+local function key_physically_down(vk: cint, imkey: cint): boolean
+  ## if ccinfo.is_windows then
+    if vk > 0 then return (win_key_state(vk) & 0x8000) ~= 0 end
+  ## end
+  return imgui.IsKeyDown(imkey)
+end
+
+-- ImGui named key -> (ghostty key, lowercase name used by the Lua keymap, unshifted codepoint)
+## local keymap = {
+##  {'Tab','TAB','tab',9,0x09},{'LeftArrow','ARROW_LEFT','left',0,0x25},{'RightArrow','ARROW_RIGHT','right',0,0x27},
+##  {'UpArrow','ARROW_UP','up',0,0x26},{'DownArrow','ARROW_DOWN','down',0,0x28},{'PageUp','PAGE_UP','pageup',0,0x21},
+##  {'PageDown','PAGE_DOWN','pagedown',0,0x22},{'Home','HOME','home',0,0x24},{'End','END','end',0,0x23},
+##  {'Insert','INSERT','insert',0,0x2D},{'Delete','DELETE','delete',0,0x2E},{'Backspace','BACKSPACE','backspace',0,0x08},
+##  {'Space','SPACE','space',32,0x20},{'Enter','ENTER','enter',13,0x0D},{'Escape','ESCAPE','escape',27,0x1B},
+##  {'Apostrophe','QUOTE','apostrophe',39,0xDE},{'Comma','COMMA','comma',44,0xBC},{'Minus','MINUS','minus',45,0xBD},
+##  {'Period','PERIOD','period',46,0xBE},{'Slash','SLASH','slash',47,0xBF},{'Semicolon','SEMICOLON','semicolon',59,0xBA},
+##  {'Equal','EQUAL','equal',61,0xBB},{'LeftBracket','BRACKET_LEFT','leftbracket',91,0xDB},{'Backslash','BACKSLASH','backslash',92,0xDC},
+##  {'RightBracket','BRACKET_RIGHT','rightbracket',93,0xDD},{'GraveAccent','BACKQUOTE','grave',96,0xC0},
+##  {'F1','F1','f1',0,0x70},{'F2','F2','f2',0,0x71},{'F3','F3','f3',0,0x72},{'F4','F4','f4',0,0x73},{'F5','F5','f5',0,0x74},{'F6','F6','f6',0,0x75},
+##  {'F7','F7','f7',0,0x76},{'F8','F8','f8',0,0x77},{'F9','F9','f9',0,0x78},{'F10','F10','f10',0,0x79},{'F11','F11','f11',0,0x7A},{'F12','F12','f12',0,0x7B},
+##  {'Keypad0','NUMPAD_0','kp0',48,0x60},{'Keypad1','NUMPAD_1','kp1',49,0x61},{'Keypad2','NUMPAD_2','kp2',50,0x62},{'Keypad3','NUMPAD_3','kp3',51,0x63},
+##  {'Keypad4','NUMPAD_4','kp4',52,0x64},{'Keypad5','NUMPAD_5','kp5',53,0x65},{'Keypad6','NUMPAD_6','kp6',54,0x66},{'Keypad7','NUMPAD_7','kp7',55,0x67},
+##  {'Keypad8','NUMPAD_8','kp8',56,0x68},{'Keypad9','NUMPAD_9','kp9',57,0x69},{'KeypadDecimal','NUMPAD_DECIMAL','kpdecimal',46,0x6E},
+##  {'KeypadDivide','NUMPAD_DIVIDE','kpdivide',47,0x6F},{'KeypadMultiply','NUMPAD_MULTIPLY','kpmultiply',42,0x6A},
+##  {'KeypadSubtract','NUMPAD_SUBTRACT','kpsubtract',45,0x6D},{'KeypadAdd','NUMPAD_ADD','kpadd',43,0x6B},
+##  {'KeypadEnter','NUMPAD_ENTER','kpenter',13,0},{'KeypadEqual','NUMPAD_EQUAL','kpequal',61,0x00},
+## }
+## for i = 0, 9 do keymap[#keymap+1] = {tostring(i), 'DIGIT_'..i, tostring(i), 48 + i, 48 + i} end
+## for i = 0, 25 do local c = string.char(65 + i) keymap[#keymap+1] = {c, c, c:lower(), 97 + i, 65 + i} end
+-- The character with shift on a US layout, by keymap name (alt+shift+<key>).
+-- A stopgap until the layout is asked (ToUnicode).
+## local shifted = { apostrophe = 34, comma = 60, minus = 95, period = 62, slash = 63, semicolon = 58, equal = 43,
+##   leftbracket = 123, backslash = 124, rightbracket = 125, grave = 126 }
+## for i = 0, 9 do shifted[tostring(i)] = (')!@#$%^&*('):byte(i + 1) end
+## for i = 0, 25 do shifted[string.char(97 + i)] = 65 + i end
+
+global KeyInfo = @record{ imkey: cint, gkey: cint, name: string, codepoint: uint32, shifted: uint32, vk: cint, rep: KeyRepeat, presses: integer }
+
+global input_keys: [#[#keymap]#]KeyInfo
+local input_repeat_frame: cint = -1
+
+local keys_ready: boolean = false
+local function ensure_keys(): void
+  if keys_ready then return end
+  ## for i, k in ipairs(keymap) do
+    input_keys[#[i-1]#] = { imkey = #|'ImGuiKey_'..k[1]|#, gkey = #|'GHOSTTY_KEY_'..k[2]|#, name = #[k[3]]#, codepoint = #[k[4]]#, shifted = #[shifted[k[3]] or 0]#, vk = #[k[5]]# }
+  ## end
+  keys_ready = true
+end
+
+global function input_key_count(): integer
+  ensure_keys()
+  return #input_keys
+end
+
+global function input_key(i: integer): *KeyInfo
+  ensure_keys()
+  return &input_keys[i]
+end
+
+-- Modifier state from ImGuiIO, as libghostty mods.
+global function input_mods(io: *ImGuiIO): uint16
+  local mods: uint16 = 0
+  if io.KeyShift then mods = mods | GHOSTTY_MODS_SHIFT end
+  if io.KeyCtrl then mods = mods | GHOSTTY_MODS_CTRL end
+  if io.KeyAlt then mods = mods | GHOSTTY_MODS_ALT end
+  if io.KeySuper then mods = mods | GHOSTTY_MODS_SUPER end
+  return mods
+end
+
+-- A key press decision for one frame.
+global InputSink = @function(ctx: pointer, data: *[0]uint8, len: usize): void
+global ActionSink = @function(ctx: pointer, action: string, key: *KeyInfo): boolean
+
+local function encode_utf8(cp: uint32, out: *[0]uint8): usize
+  if cp < 0x80 then
+    out[0] = (@uint8)(cp)
+    return 1
+  elseif cp < 0x800 then
+    out[0] = (@uint8)(0xC0 | (cp >> 6))
+    out[1] = (@uint8)(0x80 | (cp & 0x3F))
+    return 2
+  elseif cp < 0x10000 then
+    out[0] = (@uint8)(0xE0 | (cp >> 12))
+    out[1] = (@uint8)(0x80 | ((cp >> 6) & 0x3F))
+    out[2] = (@uint8)(0x80 | (cp & 0x3F))
+    return 3
+  else
+    out[0] = (@uint8)(0xF0 | (cp >> 18))
+    out[1] = (@uint8)(0x80 | ((cp >> 12) & 0x3F))
+    out[2] = (@uint8)(0x80 | ((cp >> 6) & 0x3F))
+    out[3] = (@uint8)(0x80 | (cp & 0x3F))
+    return 4
+  end
+end
+
+-- Keep keystrokes away from the game while a terminal has focus. Dalamud's
+-- WndProc only withholds WM_KEYDOWN/WM_CHAR from the game while WantTextInput
+-- is set; WantCaptureKeyboard alone lets Enter and letters open the chat box
+-- (notably in controller mode). ImGui recomputes the flag in NewFrame, so
+-- setting it during draw covers the messages until the next frame.
+global function input_claim_keyboard(io: *ImGuiIO): void
+  io.WantCaptureKeyboard = true
+  io.WantTextInput = true
+end
+
+-- Queue a release for a key ImGui holds down, so its own state agrees from
+-- the next NewFrame on (and the key's next press is an edge again).
+local function queue_release(io: *ImGuiIO, key: cint): void
+  if imgui.IOAddKeyEvent ~= nilptr then imgui.IOAddKeyEvent(io, key, false) end
+end
+
+-- Polling resumes after the game had the keyboard: modifiers released
+-- meanwhile are still down in ImGui (a stuck ctrl turns backspace into
+-- delete-word). Drop each one ImGui holds that the keyboard (`ctrl`..`super`,
+-- the OS state) does not, for this frame and in ImGui. Modifiers are otherwise
+-- left as ImGui has them: it applies each change in order with the key events,
+-- so a queued key keeps the modifiers it was typed with.
+global function input_release_stuck_mods(io: *ImGuiIO, ctrl: boolean, shift: boolean, alt: boolean, super: boolean): void
+  if io.KeyCtrl and not ctrl then
+    io.KeyCtrl = false
+    queue_release(io, ImGuiKey_ModCtrl) queue_release(io, ImGuiKey_LeftCtrl) queue_release(io, ImGuiKey_RightCtrl)
+  end
+  if io.KeyShift and not shift then
+    io.KeyShift = false
+    queue_release(io, ImGuiKey_ModShift) queue_release(io, ImGuiKey_LeftShift) queue_release(io, ImGuiKey_RightShift)
+  end
+  if io.KeyAlt and not alt then
+    io.KeyAlt = false
+    queue_release(io, ImGuiKey_ModAlt) queue_release(io, ImGuiKey_LeftAlt) queue_release(io, ImGuiKey_RightAlt)
+  end
+  if io.KeySuper and not super then
+    io.KeySuper = false
+    queue_release(io, ImGuiKey_ModSuper) queue_release(io, ImGuiKey_LeftSuper) queue_release(io, ImGuiKey_RightSuper)
+  end
+end
+
+-- Poll ImGui for this frame's keyboard input and emit bytes for the PTY.
+--
+-- `on_action` is asked first for every named key press (with the Lua keymap
+-- behind it); if it returns true the key is consumed by the plugin.
+-- Text characters arrive through the ImGui character queue; control keys
+-- and chords are encoded with libghostty's key encoder so the terminal sees
+-- exactly what a native Ghostty would send (including kitty keyboard mode).
+-- `right_alt`: the right Alt key is physically down; with ctrl and alt both
+-- reported it is AltGr, which types characters rather than chords.
+global function input_poll_keys(io: *ImGuiIO, encoder: GhosttyKeyEncoder, event: GhosttyKeyEvent,
+                                sink: InputSink, sink_ctx: pointer,
+                                on_action: ActionSink, action_ctx: pointer, right_alt: boolean): void
+  ensure_keys()
+  -- repeat state advances once per frame even when several terminals poll
+  local frame = imgui.GetFrameCount()
+  local fresh = frame ~= input_repeat_frame
+  local resumed = fresh and frame ~= input_repeat_frame + 1
+  input_repeat_frame = frame
+  ## if ccinfo.is_windows then
+    if resumed then
+      input_release_stuck_mods(io, (win_key_state(0x11) & 0x8000) ~= 0, (win_key_state(0x10) & 0x8000) ~= 0,
+        (win_key_state(0x12) & 0x8000) ~= 0, (win_key_state(0x5B) & 0x8000) ~= 0 or (win_key_state(0x5C) & 0x8000) ~= 0)
+    end
+  ## end
+  local altgr = right_alt and io.KeyCtrl and io.KeyAlt -- Windows reports AltGr as ctrl+alt
+  local mods = input_mods(io)
+  local buf: [64]cchar
+  local outlen: usize = 0
+  local eaten_cp: uint32 = 0 -- character of a printable key an action consumed
+
+  -- 1. Named keys (control keys always; printable keys only when a chord
+  --    modifier is held, otherwise the character queue below handles them).
+  for i = 0, < #input_keys do
+    local k = &input_keys[i]
+    if fresh then
+      local down = key_physically_down(k.vk, k.imkey)
+      local imgui_down = imgui.IsKeyDown(k.imkey)
+      if resumed then
+        -- polling resumes after frames without a focused terminal: forget old
+        -- state, and release in ImGui what the game heard go up
+        k.rep = {}
+        if imgui_down and not down then queue_release(io, k.imkey) end
+      end
+      k.presses = key_repeat_step(&k.rep, down, imgui.IsKeyPressed(k.imkey, false), imgui_down, io.DeltaTime)
+    end
+    if k.presses > 0 then
+      if on_action ~= nilptr and on_action(action_ctx, k.name, k) then
+        if k.codepoint >= 32 then eaten_cp = k.codepoint end
+        continue
+      end
+      local printable = k.codepoint >= 32 and k.codepoint ~= 127
+      -- AltGr+<key> types a character (@ on a German layout), not a chord
+      local chord = (io.KeyCtrl or io.KeyAlt or io.KeySuper) and not (altgr and printable)
+      if printable and not chord then
+        continue -- comes through InputQueueCharacters with proper layout/IME handling
+      end
+      ghostty_key_event_set_action(event, GHOSTTY_KEY_ACTION_PRESS)
+      ghostty_key_event_set_key(event, k.gkey)
+      ghostty_key_event_set_mods(event, mods)
+      ghostty_key_event_set_consumed_mods(event, 0)
+      ghostty_key_event_set_unshifted_codepoint(event, k.codepoint)
+      ghostty_key_event_set_utf8(event, nilptr, 0)
+      if printable and not io.KeyCtrl and not io.KeySuper and k.codepoint ~= 0 then
+        -- alt+<key>: give the encoder the character so it can ESC-prefix it
+        local cp = k.codepoint
+        if io.KeyShift and k.shifted ~= 0 then
+          cp = k.shifted
+          ghostty_key_event_set_consumed_mods(event, GHOSTTY_MODS_SHIFT)
+        end
+        local u: [8]uint8
+        local n = encode_utf8(cp, &u)
+        ghostty_key_event_set_utf8(event, (@cstring)(&u), n)
+      end
+      if ghostty_key_encoder_encode(encoder, event, &buf, 64, &outlen) == GHOSTTY_SUCCESS and outlen > 0 then
+        sink(sink_ctx, (@*[0]uint8)(&buf), outlen)
+      end
+    end
+  end
+
+  -- 2. Text input.
+  local q = &io.InputQueueCharacters
+  for i = 0, < q.Size do
+    local cp: uint32 = q.Data[i]
+    if eaten_cp ~= 0 and (cp == eaten_cp or (eaten_cp >= 97 and eaten_cp <= 122 and cp == eaten_cp - 32)) then
+      eaten_cp = 0 -- drop it once (shift makes the letter uppercase)
+    elseif cp >= 32 and cp ~= 127 and not ((io.KeyCtrl and not altgr) or io.KeySuper) then
+      local u: [8]uint8
+      local n = encode_utf8(cp, &u)
+      -- Send through the encoder so kitty keyboard protocol text events are right.
+      ghostty_key_event_set_action(event, GHOSTTY_KEY_ACTION_PRESS)
+      ghostty_key_event_set_key(event, GHOSTTY_KEY_UNIDENTIFIED)
+      -- the layout already applied shift (and AltGr's ctrl+alt)
+      local consumed: uint16 = GHOSTTY_MODS_SHIFT
+      if altgr then consumed = consumed | GHOSTTY_MODS_CTRL | GHOSTTY_MODS_ALT end
+      ghostty_key_event_set_mods(event, mods & ~consumed)
+      ghostty_key_event_set_consumed_mods(event, mods & consumed)
+      ghostty_key_event_set_unshifted_codepoint(event, cp)
+      ghostty_key_event_set_utf8(event, (@cstring)(&u), n)
+      if ghostty_key_encoder_encode(encoder, event, &buf, 64, &outlen) == GHOSTTY_SUCCESS and outlen > 0 then
+        sink(sink_ctx, (@*[0]uint8)(&buf), outlen)
+      else
+        sink(sink_ctx, &u, n)
+      end
+    end
+  end
+  q.Size = 0 -- consumed
+end
+
+global function input_poll(io: *ImGuiIO, encoder: GhosttyKeyEncoder, event: GhosttyKeyEvent,
+                           sink: InputSink, sink_ctx: pointer,
+                           on_action: ActionSink, action_ctx: pointer): void
+  local right_alt = false
+  ## if ccinfo.is_windows then
+    right_alt = (win_key_state(0xA5) & 0x8000) ~= 0
+  ## end
+  input_poll_keys(io, encoder, event, sink, sink_ctx, on_action, action_ctx, right_alt)
+end
+
+-- Gamepad button gestures ----------------------------------------------------------
+-- One button, three meanings: a quick press, a double tap, and a hold that
+-- repeats while held. A single tap is only reported once the double-tap window
+-- (from its release to the next press) has passed, so it never fires before a
+-- double tap; a press or hold after the window reports the tap first.
+global PadGesture = @enum{ None = 0, Tap, DoubleTap, HoldStep }
+
+global PadGestureState = @record{
+  down: boolean,
+  down_at: float64,
+  last_step: float64,
+  holding: boolean,
+  taps: integer,
+  tap_at: float64,
+}
+
+global PAD_HOLD_S: float64 <comptime> = 0.4
+global PAD_REPEAT_S: float64 <comptime> = 0.7
+global PAD_DOUBLE_S: float64 <comptime> = 0.3
+
+global function pad_gesture_update(st: *PadGestureState, down: boolean, t: float64): PadGesture
+  local ev = PadGesture.None
+  if down and not st.down then
+    st.down_at = t
+    st.holding = false
+    if st.taps == 1 and t - st.tap_at > PAD_DOUBLE_S then
+      st.taps = 0 -- the samples skipped the window (a hitch): the last tap stands alone
+      ev = PadGesture.Tap
+    end
+  elseif down and st.down then
+    if not st.holding and t - st.down_at >= PAD_HOLD_S then
+      if st.taps == 1 then
+        st.taps = 0 -- a tap, then this hold: the tap first, the hold from the next frame
+        ev = PadGesture.Tap
+      else
+        st.holding = true
+        st.last_step = t
+        ev = PadGesture.HoldStep
+      end
+    elseif st.holding and t - st.last_step >= PAD_REPEAT_S then
+      st.last_step = t
+      ev = PadGesture.HoldStep
+    end
+  elseif not down and st.down then
+    if not st.holding then
+      if st.taps == 1 and st.down_at - st.tap_at <= PAD_DOUBLE_S then
+        st.taps = 0
+        ev = PadGesture.DoubleTap
+      else
+        st.taps = 1
+        st.tap_at = t
+      end
+    end
+    st.holding = false
+  elseif not down and st.taps == 1 and t - st.tap_at > PAD_DOUBLE_S then
+    st.taps = 0
+    ev = PadGesture.Tap
+  end
+  st.down = down
+  return ev
+end
