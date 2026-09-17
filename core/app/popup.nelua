@@ -1,0 +1,72 @@
+
+
+-- The popup terminal (Umbra toolbar widget, or our own anchored window): a
+-- taskbar of every terminal plus a terminal.
+require 'core.app.lifecycle'
+
+local POPUP_BAR: float32 <comptime> = 30
+
+-- A chip click is applied after the chip loops: bring_forward can restore a
+-- minimized terminal, which removes it from the vector a loop is walking.
+local popup_click_id: integer = 0
+
+global function popup_request_click(id: integer): void
+  popup_click_id = id
+end
+
+global function popup_apply_click(): void
+  local id = popup_click_id
+  popup_click_id = 0
+  if id == 0 then return end
+  local c = find_session(id)
+  if c ~= nilptr then bring_forward(c) end
+end
+
+global function popup_chip(dl: *ImDrawList, cx: float32, x2: float32, y1: float32, mouse: ImVec2, t: *Session, where: cstring): float32
+  local sb: stringbuilder
+  sb:writef('%s #%d %s', where, t.id, t:display_name())
+  local label = sb:promote()
+  local tsz: ImVec2
+  imgui.FontCalcTextSizeA(&tsz, imgui.GetFont(), imgui.GetFontSize(), 3.4e38, 0, (@cstring)(label.data), nilptr, nilptr)
+  local w = math.min(tsz.x + 14, 260)
+  if cx + w <= x2 - 4 then
+    local hot = mouse.x >= cx and mouse.x < cx + w and mouse.y >= y1 + 3 and mouse.y < y1 + POPUP_BAR - 3
+    imgui.DrawListAddRectFilled(dl, vec2(cx, y1 + 3), vec2(cx + w, y1 + POPUP_BAR - 3), hot and im_col32(120, 90, 50, 240) or im_col32(50, 44, 40, 220), 6, 0)
+    bell_chip_glow(dl, vec2(cx, y1 + 3), vec2(cx + w, y1 + POPUP_BAR - 3), t.id)
+    imgui.DrawListPushClipRect(dl, vec2(cx, y1), vec2(cx + w - 4, y1 + POPUP_BAR), true)
+    imgui.DrawListAddText(dl, imgui.GetFont(), imgui.GetFontSize(), vec2(cx + 7, y1 + (POPUP_BAR - imgui.GetFontSize()) * 0.5), im_col32(235, 225, 210, 255), (@cstring)(label.data), nilptr, 0, nilptr)
+    imgui.DrawListPopClipRect(dl)
+    if hot and host.lmb_pressed then
+      host.click_used = true
+      popup_click_id = t.id
+    end
+    cx = cx + w + 4
+  end
+  label:destroy()
+  return cx
+end
+
+-- The popup body into `dl` at the given rectangle, inside whichever ImGui
+-- window hosts it (Umbra's popup node or core/app/anchored_popup.nelua).
+global function popup_body(dl: *ImDrawList, x1: float32, y1: float32, x2: float32, y2: float32): void
+  if host.popup_session == nilptr then
+    host.popup_session = session_new(policy.default_profile - 1, 80, 24)
+    if host.popup_session == nilptr then return end
+  end
+  -- an exited session stays visible until the user reopens
+  local s = host.popup_session
+
+  -- taskbar: every terminal as a chip; click to bring it forward / restore
+  local mouse: ImVec2
+  imgui.GetMousePos(&mouse)
+  local cx = x1 + 4
+  for i = 0, < #host.minimized do cx = popup_chip(dl, cx, x2, y1, mouse, host.minimized[i], 'min') end
+  for i = 0, < #host.dropdown_tabs do cx = popup_chip(dl, cx, x2, y1, mouse, host.dropdown_tabs[i], 'tab') end
+  for i = 0, < #host.windows do cx = popup_chip(dl, cx, x2, y1, mouse, host.windows[i], 'win') end
+  for i = 0, < #host.world do cx = popup_chip(dl, cx, x2, y1, mouse, host.world[i], 'pet') end
+  popup_apply_click()
+
+  local focused = imgui.IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows)
+  draw_terminal(s, dl, vec2(x1, y1 + POPUP_BAR), x2 - x1, y2 - y1 - POPUP_BAR, host.popup_font_size, focused, false, 255, (@float32)(policy.popup_rounding))
+  bell_rect_glow(dl, vec2(x1, y1 + POPUP_BAR), vec2(x2, y2), (@float32)(policy.popup_rounding), s.id)
+end

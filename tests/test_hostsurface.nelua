@@ -1,0 +1,308 @@
+-- The standalone plugin's side of the core against a recording fake GuHostApi:
+-- exports before init, refusals (legacy core, busy mutex) and their retries,
+-- the single-init guard, registration and shutdown order, suspension while
+-- the legacy core is loaded, the event queue, info bar visibility and failed
+-- command retries.
+require 'core.host'
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'arg'
+require 'io'
+
+local root: string = arg[1]
+local scratch: string = arg[2]
+local config = scratch .. '/config'
+
+local calls: vector(string)
+local fail_command: string       -- command_add refuses this name
+local umbra_loaded: cint = 0
+local dtr_last_text: string
+local dtr_last_title: string
+
+local function rec(what: string, arg1: cstring): void
+  local sb: stringbuilder
+  sb:write(what)
+  if arg1 ~= nilptr then sb:write(' ', arg1) end
+  calls:push(sb:promote())
+end
+
+local function reset_calls(): void
+  for i = 0, < #calls do calls[i]:destroy() end
+  calls:clear()
+end
+
+local function joined(): string
+  local sb: stringbuilder
+  for i = 0, < #calls do
+    if i > 0 then sb:write('|') end
+    sb:write(calls[i])
+  end
+  return sb:promote()
+end
+
+local function expect(want: string, why: string): void
+  local got = joined()
+  if got ~= want then
+    io.stderr:write('expected: ', want, '\n     got: ', got, '\n')
+    assert(false, why)
+  end
+  got:destroy()
+  reset_calls()
+end
+
+local function quiet(level: cint, msg: cstring): void end
+local function consume(vk: cint): void end
+local function command_add(name: cstring, help: cstring): cint
+  assert(help ~= nilptr and #(@string)(help) > 0, 'help text')
+  rec('add', name)
+  return (@string)(name) == fail_command and 0 or 1
+end
+local function command_remove(name: cstring): cint rec('remove', name) return 1 end
+local function dtr_set(title: cstring, text: cstring, tooltip: cstring, shown: cint): cint
+  rec(shown ~= 0 and 'dtr shown' or 'dtr hidden', nilptr)
+  dtr_last_text:destroy() dtr_last_text = string.copy(text)
+  dtr_last_title:destroy() dtr_last_title = string.copy(title)
+  return 1
+end
+local function dtr_remove(): void rec('dtr_remove', nilptr) end
+local function set_ui_hide(mask: cint): void
+  local sb: stringbuilder
+  sb:writef('ui_hide %d', mask)
+  calls:push(sb:promote())
+end
+local function plugin_loaded(name: cstring): cint
+  assert((@string)(name) == 'Umbra')
+  return umbra_loaded
+end
+local function ipc_register(): cint rec('ipc_register', nilptr) return 1 end
+local function ipc_unregister(): void rec('ipc_unregister', nilptr) end
+
+local api: GuHostApi = {
+  size = #GuHostApi, log = quiet, consume_key = consume,
+  command_add = command_add, command_remove = command_remove,
+  dtr_set = dtr_set, dtr_remove = dtr_remove, set_ui_hide = set_ui_hide,
+  plugin_loaded = plugin_loaded, ipc_register = ipc_register, ipc_unregister = ipc_unregister,
+}
+local info: GuInitInfo = {
+  size = #GuInitInfo, host_kind = HOST_KIND_DALAMUD,
+  install_dir = (@cstring)(root.data), config_dir = (@cstring)(config.data), configs_root = (@cstring)(scratch.data),
+}
+
+local REGISTERED <comptime> = 'ipc_register|add /term|add /tomestone|add /tome|ui_hide 14|dtr shown'
+local UNREGISTERED <comptime> = 'ipc_unregister|remove /term|remove /tomestone|remove /tome|dtr_remove'
+
+local function advance(ms: uint64): void procguard_fake.now_ms = procguard_fake.now_ms + ms end
+local function status(): string
+  local buf: [64]cchar
+  local n = gu_status(&buf, 64)
+  return string.copy(string{data=(@*[0]byte)(&buf), size=n})
+end
+local function lua(code: cstring): void
+  assert(luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, code)
+end
+
+-- Every export is a safe no-op before init ------------------------------------------
+do
+  local s = status()
+  assert(s == 'ghostty off', 'status before init')
+  local w: cint, h: cint = 0, 0
+  gu_popup_size(&w, &h)
+  assert(w == 900 and h == 480, 'popup size defaults')
+  gu_frame()
+  gu_toggle()
+  gu_popup_draw(nilptr, 0, 0, 10, 10, 0)
+  gu_popup_reset()
+  assert(gu_command('toggle') == 1)
+  gu_event(GuEventKind.OpenConfig, 0, 0, 0, 0, nilptr)
+  gu_shutdown()
+  assert(#calls == 0 and not host.initialized and boot.state == HostState.Inactive)
+  surface.widget_seen = false
+end
+
+-- Legacy core loaded: refused without registering anything, retried from gu_frame ----
+do
+  procguard_fake.legacy_loaded = true
+  assert(gu_init_ex(&api, &info) == INIT_LEGACY)
+  assert(boot.state == HostState.Pending and not host.initialized and #calls == 0, 'no callbacks while refused')
+  advance(1000) gu_frame()
+  advance(1000) gu_frame()
+  assert(boot.state == HostState.Pending and #calls == 0, 'still refused while the legacy core is there')
+  procguard_fake.legacy_loaded = false
+  advance(1000) gu_frame()
+  assert(boot.state == HostState.Pending, 'retries every 2 s, not every frame')
+  advance(1000) gu_frame()
+  assert(boot.state == HostState.Active and host.initialized, 'activated by the frame retry')
+  expect(REGISTERED, 'registration order')
+  assert(dtr_last_title == 'Ghostty' and #dtr_last_text > 0)
+  assert(procguard_fake.acquired, 'holds the process mutex')
+
+  -- the Lua side sees two homes and the host
+  lua([[assert(GHOSTTY_PLUGIN_DIR == GHOSTTY_CONFIG_DIR and GHOSTTY_HOST == 'dalamud')
+    local i = ghostty.host_info()
+    assert(i.state == 'active' and i.host == 'dalamud' and i.commands['/term'] == true and i.dtr_shown)]])
+  local pd: string = host.dir
+  assert(pd == config, 'config dir')
+end
+
+-- Single-init guard: a second init changes nothing ------------------------------------
+do
+  local other: GuInitInfo = info
+  other.config_dir = '/nonexistent'
+  assert(gu_init_ex(&api, &other) == INIT_BUSY)
+  assert(boot.state == HostState.Active and host.dir == config and #calls == 0)
+end
+
+-- The event queue ------------------------------------------------------------------------
+do
+  gu_event(GuEventKind.Chat, 0, 0, 0, 0, 'config')
+  assert(not host.settings_open, 'handled on the next frame, not the caller thread')
+  gu_frame()
+  assert(host.settings_open, 'chat command ran')
+  gu_event(GuEventKind.Chat, 0, 0, 0, 0, 'config')
+  gu_event(GuEventKind.OpenConfig, 0, 0, 0, 0, nilptr)
+  gu_frame()
+  assert(host.settings_open, 'in order: closed by the command, reopened by /xlplugins Settings')
+
+  -- info bar clicks go through CONFIG.host.dtr.on_click
+  assert(not host.dropdown_open and not surface.popup_open)
+  gu_event(GuEventKind.DtrClick, 0, 0, 100, 20, nilptr) -- left
+  gu_event(GuEventKind.DtrClick, 1, 0, 100, 20, nilptr) -- right
+  gu_frame()
+  assert(host.dropdown_open and surface.popup_open and surface.last_action == 'popup')
+  assert(surface.popup_x == 100 and surface.popup_y == 20, 'popup anchored at the click')
+  local a = surface_click_action(0, 4) assert(a == 'window', 'shift+click') a:destroy()
+  a = surface_click_action(0, 1) assert(a == 'world', 'ctrl+click') a:destroy()
+  lua("CONFIG.host.dtr.on_click = function(button, mods) return button == 'left' and mods.alt and 'settings' or 'none' end")
+  gu_event(GuEventKind.DtrClick, 0, 2, 0, 0, nilptr) -- alt+left
+  gu_event(GuEventKind.DtrClick, 1, 0, 0, 0, nilptr)
+  gu_frame()
+  assert(not host.settings_open and surface.last_action == 'none', 'user policy decides')
+  -- an init.lua from before CONFIG.host: the documented defaults
+  lua('CONFIG.host = nil')
+  a = surface_click_action(1, 0) assert(a == 'popup') a:destroy()
+  a = surface_click_action(0, 4) assert(a == 'window') a:destroy()
+  a = surface_click_action(0, 0) assert(a == 'toggle') a:destroy()
+  assert(gu_command('reload') == 0) -- CONFIG.host back
+  reset_calls()
+
+  -- overflow: 32 queued, the rest dropped and counted
+  umbra_loaded = 1
+  for i = 1, 40 do gu_event(GuEventKind.PluginsChanged, 0, 0, 0, 0, nilptr) end
+  assert(surface.events_dropped == 8, 'dropped count')
+  gu_frame()
+  assert(surface.umbra_loaded, 'plugins changed -> Umbra looked up')
+  lua("assert(ghostty.host_info().umbra and ghostty.host_info().events_dropped == 8)")
+  expect('', 'no host calls for queue handling')
+end
+
+-- Info bar entry: hidden while the Umbra widget polls, back 5 s after it stops --------------
+do
+  advance(2000) gu_frame() reset_calls()
+  gu_frame() gu_frame()
+  expect('', 'pushed only on change')
+  local s = status() s:destroy() -- the widget polls
+  gu_frame()
+  expect('dtr hidden', 'auto mode steps aside for the widget')
+  for i = 1, 4 do
+    advance(1000)
+    s = status() s:destroy()
+    gu_frame()
+  end
+  expect('', 'still polled: stays hidden')
+  advance(4000) gu_frame()
+  expect('', 'within 5 s of the last poll')
+  advance(1000) gu_frame()
+  expect('dtr shown', 'widget gone for 5 s')
+  host.status:destroy()
+  host.status = string.copy('ghostty 3')
+  gu_frame()
+  expect('dtr shown', 'text change pushed')
+  assert(dtr_last_text == 'ghostty 3')
+  lua("CONFIG.host.dtr.mode = 'never'")
+  gu_frame()
+  expect('', 'config re-read on the guard period')
+  advance(2000) gu_frame()
+  expect('dtr hidden', 'never')
+  lua("CONFIG.host.dtr.mode = 'auto'; CONFIG.host.keep_visible.gpose = false")
+  advance(2000) gu_frame()
+  expect('ui_hide 6|dtr shown', 'keep_visible and mode re-read')
+end
+
+-- Suspended while the legacy core is loaded ------------------------------------------------
+do
+  host.settings_open = false
+  procguard_fake.legacy_loaded = true
+  advance(2000) gu_frame()
+  assert(boot.state == HostState.Suspended and host.initialized, 'suspended, sessions kept')
+  expect('dtr shown', 'info bar says why')
+  assert(dtr_last_text == 'ghostty: legacy core loaded')
+  gu_event(GuEventKind.OpenConfig, 0, 0, 0, 0, nilptr)
+  gu_frame()
+  assert(not host.settings_open, 'UI events ignored while suspended')
+  gu_event(GuEventKind.Chat, 0, 0, 0, 0, 'config')
+  gu_frame()
+  assert(host.settings_open, 'chat commands still run')
+  lua("assert(ghostty.host_info().state == 'suspended')")
+  procguard_fake.legacy_loaded = false
+  advance(2000) gu_frame()
+  assert(boot.state == HostState.Active, 'resumed')
+  expect('dtr shown', 'status text back')
+end
+
+-- Shutdown unregisters before the callbacks are forgotten ----------------------------------------
+do
+  gu_shutdown()
+  expect(UNREGISTERED, 'shutdown order')
+  assert(not host.initialized and boot.state == HostState.Inactive and host.api.log == nilptr)
+  assert(not procguard_fake.acquired, 'mutex released')
+  gu_event(GuEventKind.OpenConfig, 0, 0, 0, 0, nilptr) -- nobody is listening any more
+  gu_frame()
+  assert(#calls == 0)
+end
+
+-- Busy mutex, then init -> shutdown -> init again ------------------------------------------------
+do
+  procguard_fake.mutex_held = true
+  assert(gu_init_ex(&api, &info) == INIT_BUSY and boot.state == HostState.Pending and #calls == 0)
+  procguard_fake.mutex_held = false
+  advance(2000) gu_frame()
+  assert(boot.state == HostState.Active)
+  expect(REGISTERED, 'second activation registers again')
+  host.settings_open = false
+  gu_event(GuEventKind.OpenConfig, 0, 0, 0, 0, nilptr)
+  gu_frame()
+  assert(host.settings_open, 'no stale events from the previous run; new ones work')
+  gu_shutdown()
+  expect(UNREGISTERED, 'second shutdown')
+end
+
+-- A command another plugin holds is retried every 5 s --------------------------------------------
+do
+  fail_command = '/tome'
+  assert(gu_init_ex(&api, &info) == INIT_OK)
+  expect(REGISTERED, 'first attempt includes the taken name')
+  lua("assert(ghostty.host_info().commands['/tome'] == false)")
+  advance(4000) gu_frame()
+  expect('', 'not before 5 s')
+  fail_command = ''
+  advance(1000) gu_frame()
+  expect('add /tome', 'retried')
+  advance(5000) gu_frame()
+  expect('', 'registered names are not added again')
+  gu_shutdown()
+  expect(UNREGISTERED, 'all three removed')
+end
+
+-- gu_init (tests, plain embedding) without the surface callbacks registers nothing ----------------
+do
+  local plain: GuHostApi = { size = #GuHostApi, log = quiet }
+  assert(gu_init(&plain, (@cstring)(config.data)) == INIT_OK)
+  assert(boot.state == HostState.Active and #calls == 0)
+  local w: cint, h: cint = 0, 0
+  gu_popup_size(&w, &h)
+  assert(w == 900 and h == 480)
+  gu_shutdown()
+end
+
+print('OK')
