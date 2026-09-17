@@ -1,0 +1,192 @@
+# Architecture
+
+```
+ FFXIV process (Windows / Wine)                     Linux or macOS host
+ ┌───────────────────────────────────────────┐      ┌────────────────────────┐
+ │ Dalamud ── GhosttyDalamud.dll (C#)        │      │ ghostty-agent (Nelua)  │
+ │   │ Draw / OpenMainUi / commands / DTR    │      │  poll() loop            │
+ │   ▼ ghostty_loader.dll (swaps the core)   │ TCP  │  forkpty per session    │
+ │ ghostty_core.dll (Nelua)  ◄───────────────┼──────┤  256 KiB replay ring    │
+ │  app/hostsurface activation, events, IPC  │      │  token handshake        │
+ │  session.nelua   terminal ⇄ transport     │      └────────────────────────┘
+ │  render.nelua    cells → ImDrawList       │
+ │  input.nelua     ImGui keys → key encoder │      ConPTY (Windows only)
+ │  policy.nelua    embedded Lua 5.4 VM      │ ◄──► pwsh / cmd / ssh.exe
+ │  ghostty.nelua   libghostty-vt bindings   │
+ │  imgui.nelua     cimgui.dll via GetProc   │
+ │  lua/init.lua    profiles, keys, layout   │
+ │   ▲ IPC GhosttyDalamud.v1.*               │
+ │ Umbra ── Umbra.Ghostty.dll (C#, optional) │
+ │           toolbar widget + popup node     │
+ └───────────────────────────────────────────┘
+```
+
+## Why this shape
+
+* **Dalamud only loads .NET assemblies.** `GhosttyDalamud.dll` is an ordinary
+  plugin kept to forwarding: it loads `ghostty_core.dll` from beside itself,
+  calls `gu_init_ex` with the install and config directories, forwards
+  `UiBuilder.Draw` to `gu_frame` and the /xlplugins buttons, chat commands and
+  info bar clicks to `gu_event`, and fills `GuHostApi` with callbacks (log,
+  fonts, key state, camera, objects, animation, lights, commands, info bar,
+  UI-hide flags, IPC). The core decides what to register, when, and under
+  which names (`core/app/hostsurface.nelua`, `CONFIG.host` in lua/init.lua).
+* **Umbra is optional.** `Umbra.Ghostty.dll` keeps its file, assembly name and
+  widget id but holds no native code: the widget label and popup call
+  `GhosttyDalamud.v1.Status / PopupSize / PopupDraw / PopupReset / Post` over
+  IPC and show "ghostty offline" when the plugin is absent. While the widget
+  polls, the info bar entry hides itself (`host.dtr.mode = 'auto'`).
+* **One core per process.** Activation goes INACTIVE → PENDING → ACTIVE ⇄
+  SUSPENDED: init is refused (and retried every 2 s) while the legacy
+  Umbra-hosted `ghostty_umbra.dll` is mapped or another core holds the
+  per-process mutex; an active core suspends its UI if the legacy one appears.
+* **Two homes.** The shipped `lua/` sits read-only beside the plugin; settings,
+  world state and the user's `lua/` overrides live in the config directory,
+  which comes first on `package.path`. `lua/migrate.lua` copies the old
+  Umbra-hosted home over once (marker `migrated-from-umbra.txt`): copies are
+  owner-only (mode 0600, or a user-only DACL on Windows), changed copies of
+  shipped modules are parked in `legacy-lua/`, and `ghostty_umbra.dll` is
+  renamed to `ghostty_umbra.dll.migrated`.
+* **ImGui is called from Nelua, not C#.** Dalamud ships `cimgui.dll`
+  (Dear ImGui 1.88 docking, `ig*` exports). The core resolves the ~60 exports
+  it needs with `GetProcAddress` at runtime (`core/imgui.nelua`), so the shims
+  never touch ImGui and tests can substitute a fake table. Types and enum
+  values come from the vendored `cimgui.h` at Dalamud's pinned commit; the C
+  compiler owns every struct layout.
+* **libghostty-vt** is built with Zig for both the host (tests) and
+  `x86_64-windows-gnu`, and linked statically into `ghostty_core.dll`.
+  Bindings are `nodecl` records + imported enum names, never hardcoded values;
+  `tests/test_ghostty.nelua` asserts sized-struct sizes against
+  `ghostty_type_json()`.
+* **Transports stream raw bytes.** The terminal never knows where bytes come
+  from: `Session` owns a `TermView` (terminal + render state) and a transport.
+  The agent protocol (`core/protocol.nelua`) is a 5-byte framed stream
+  multiplexing many sessions on one socket. Terminal replies (DA, DSR, kitty
+  responses) flow back through libghostty's `WRITE_PTY` callback into the same
+  transport.
+* **Lua decides, Nelua executes.** `policy.nelua` embeds Lua 5.4, loads
+  `lua/init.lua`, and exposes typed config records; `keymap.lua`'s `on_key`
+  is consulted for every named key press before the terminal sees it.
+* **No GC.** The core is compiled with `-P nogc` because it runs inside a
+  foreign process on the render thread; allocations are explicit and short
+  lived (`stringbuilder`/`vector` with `destroy`).
+
+## Frame flow
+
+1. Dalamud's `UiBuilder.Draw` calls `gu_frame` on the render thread.
+2. Retry a pending activation or suspend/resume (every 2 s); drain queued
+   events (chat commands, info bar clicks), retry commands another plugin
+   held, push the info bar entry when it changed.
+3. Bind cimgui exports once; pump the agent socket (non-blocking) and any
+   ConPTY pipes (`PeekNamedPipe`), feeding bytes into each session's terminal.
+4. Poll the toggle key (unless another ImGui text field wants input); swallow
+   it from the game via `IKeyState`.
+5. Draw the drop-down: an ImGui window sliding from the top of the main
+   viewport; tab bar of sessions; `InvisibleButton` over the terminal area for
+   focus; if focused, `SetNextFrameWantCaptureKeyboard(true)` and
+   `input_poll` translates ImGui named keys + the character queue into
+   libghostty key events, encoded by the key encoder (kitty/legacy aware).
+6. `render_termview` walks the render-state rows/cells: merged background
+   runs, one `AddText` per glyph cell, underline/strike lines, cursor.
+7. World panels, pets, the character animation and world pins only once a
+   character is loaded.
+8. The popup terminal is drawn from our own anchored window (info bar click),
+   or on demand from the Umbra popup node's `OnDraw` through IPC.
+9. World panels (`core/app/worldview.nelua`) are drawn in panel pixels into
+   the background draw list and every vertex is mapped onto the panel through
+   the game's view-projection matrix (`core/world.nelua`).
+
+## World panels behind game geometry
+
+ImGui draws after the game, so a world panel would cover everything. With
+`CONFIG.world.occlusion = 'depth'` (the default) each panel is depth-tested
+per pixel against the game's own depth buffer (`core/depthpass.nelua`):
+
+* The shim forwards `RenderTargetManager.DepthStencil`'s shader resource view,
+  its rendered/allocated size and Dalamud's `UiBuilder.DeviceHandle`
+  (`get_scene_depth`, borrowed pointers).
+* Around each panel the core adds draw-list callbacks: before the panel's
+  first command one binds `core/shaders/panel_depth.hlsl` (precompiled DXBC,
+  embedded as a Nelua byte array), the depth view at `t1`, a comparison
+  sampler at `s1` and the panel's constants at `b0`; after it one unbinds
+  them, then Dalamud's reset
+  sentinel (`-8`, not ImGui's `-1`, which is Dalamud's blur) restores the
+  renderer's state.
+* ImGui vertices are 2D, so the shader recomputes the panel's depth per pixel:
+  the pixel's camera ray against the panel's plane or cylinder slice, compared
+  with the scene depth (reversed Z, infinite far plane: view depth = near / z).
+  Four comparison taps around each pixel, each carrying the panel's depth
+  along its screen slope, antialias covered edges over about a pixel
+  (`CONFIG.world.occlusion_edge`) and average a dithered fade instead of
+  showing its pattern. The tolerance grows with distance and with the panel's
+  depth slope, so a panel lying on a wall does not shimmer. Degenerate cases
+  draw the panel unchanged. `world_panel_ray_depth` mirrors the ray maths for
+  the host tests.
+* When any piece is missing (old shim, no depth view, unexpected format, a
+  different device, a non-reversed-Z camera, shader creation failing, or
+  callbacks that never run) the frame uses the older screen-space character
+  capsule instead, and the reason is logged once. Callbacks that run but
+  bind nothing count as not run. `/term depth` reports the state;
+  `/term depth retry` forgets a latched failure; `/term depth show` colours
+  panels by the test (red where the scene is in front, green where the panel
+  is, blue where a pixel has no ray), to check edge alignment by eye.
+
+The shader is rebuilt with `vendor/nelua-lang/nelua-lua tools/build-shaders.lua`
+(vkd3d-compiler 1.17 in a disposable Fedora 44 container); normal builds use the
+committed `.dxbc`. `tests/probe_depthpass.nelua` (manual, Wine + DXVK) draws a
+curved panel with that bytecode over D24S8 depth written with known scenes and
+checks every pixel: flat scenes against a model built on `world_panel_ray_depth`,
+plus a surface flush with the panel (also one pixel out of line), a dithered
+character, a silhouette edge and the show mode. Not yet observed in the game: whether the depth buffer
+still holds the frame's depth when ImGui draws, the texel mapping under dynamic
+resolution or upscalers, edge alignment during fast camera turns, and
+behaviour in gpose and cutscenes.
+
+## Repository layout
+
+```
+core/         Nelua plugin core (compiled to ghostty_core.dll)
+core/app/     the app modules; hostsurface.nelua is the plugin's side of the host
+core/sys/     net (POSIX + Winsock), conpty (Windows), procguard, fs
+core/shaders/ HLSL sources and the committed DXBC the core embeds
+agent/        ghostty-agent PTY server (Nelua, POSIX)
+lua/          shipped policy: init.lua, keymap.lua, migrate.lua, ...
+shim/         GhosttyDalamud (plugin) and Umbra.Ghostty (widget) C# projects
+tests/        host tests + run.sh
+tools/        fetch-vendor.sh, build.sh, install-dev.sh, zig-cc-win.sh, build-shaders.lua, crash-restart.{nelua,sh}
+vendor/       pinned third-party checkouts (git-ignored, see toolchain.env)
+```
+
+## Pins
+
+`toolchain.env` pins Nelua (the project's fork, `NELUA_REPOSITORY`), ghostty,
+gc-cimgui (Dalamud's submodule commit), umbra-dist, Lua, Zig and .NET. Dalamud's ImGui uses 16-bit
+`ImWchar` (verified against `Dalamud.Bindings.ImGui`'s generated `ImGuiIO`),
+so `InputQueueCharacters` holds BMP code points.
+
+## Contributing constraints and tests
+
+* New code is Nelua or Lua. The C# shims (`shim/GhosttyDalamud`,
+  `shim/Umbra.Ghostty`) stay logic-free forwarders.
+* C and Zig only as vendored code; no new `.c` files.
+* Pins live in `toolchain.env`, and `tools/fetch-vendor.sh` honours them.
+* `tests/run.sh` runs on the host (Nelua + gcc, no game, no Windows) and must
+  end with `ALL OK`. Suites, in `tests/`:
+
+| Suite | Covers |
+|---|---|
+| `test_ghostty` | libghostty-vt binding: sized-struct sizes against `ghostty_type_json()` |
+| `test_render` | a terminal rendered through a fake ImGui, checked by its draw calls |
+| `test_session` | session behaviour without a transport, local sessions, agent LIST parsing, `/term send` escapes, gamepad gestures, key repeat |
+| `test_selection` | mouse selection: hit mapping, click counting, word and line units, copied text |
+| `test_bell` | the visual bell: BEL counting, ring and glow maths, the Lua style, its triangles |
+| `test_policy` | loading `lua/init.lua`: defaults, profiles, key actions, showcase entries |
+| `test_world`, `test_worldpanel`, `test_worlddrag` | world panels: projection and hit testing, the presented pose and walk-up, drag placement and snapping, all against a fake game |
+| `test_host` | the exported host surface without ImGui: init, status, commands, shutdown |
+| `test_lights` | panel lights against fake game light callbacks |
+| `test_chrome` | the glass chrome of the drop-down and windows: colour, tint, glow, tab strip, buttons |
+| `test_migrate` (`.nelua` + `.lua`) | the one-time migration from the Umbra-hosted home |
+| `test_hostsurface` | the plugin side against a recording fake host: activation and refusals, registration and shutdown order, suspension, events, info bar |
+| `test_agent` | `ghostty-agent` end to end over TCP |
+
+The last step checks that the core also compiles as a native host module.
