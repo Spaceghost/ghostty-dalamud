@@ -1,0 +1,487 @@
+-- Session-level behavior that does not need a transport.
+require 'core.session'
+require 'string'
+
+-- Regression: the title-changed callback takes (terminal, userdata) only. The
+-- core used to read two extra arguments as the title, which crashed the game
+-- in memcpy as soon as bash set the window title from its prompt.
+local p: Profile = { name = 'test', transport = 'superlogical' }
+local s: Session
+assert(s:init(1, &p, 80, 24, nilptr))
+local seq: string = '\27]2;hello from osc\7\27]0;second\27\\'
+s:feed((@*[0]uint8)(seq.data), seq.size)
+print('title', s.title)
+assert(s.title == 'second', 'title read back from libghostty')
+assert(not s.process_exited)
+s.exited = false -- superlogical placeholder sessions start exited
+s:mark_exited(0)
+assert(s.process_exited, 'shell exit (ctrl+d) marks the session for closing')
+s:destroy()
+print('OK')
+
+-- A local session has no transport: the core feeds it text (/term showcase)
+-- and whatever is typed into it goes nowhere.
+do
+  local l: Session
+  assert(l:init_local(2, 'showcase', 80, 24))
+  assert(l.kind == TransportKind.None and not l.exited and l.label == 'showcase')
+  l:feed_text('\27[2J\27[H\27[?25l\27]2;banner\7hello\r\n')
+  assert(l.title == 'banner', 'local text reaches the terminal')
+  l:write_string('typed\r')
+  assert(not l.exited and l.pending_out:len() == 0 and not l.awaiting_open, 'no transport to write to')
+  l:close()
+  l:destroy()
+  print('local session OK')
+end
+
+-- LISTR parsing drives reattach after a game restart.
+require 'core.agent_client'
+local listr: string = "3\t120\t40\t0\t/bin/bash -l\n7\t80\t24\t1\ttmux new-session -A -s ghostty\n"
+local entries = agent_parse_list((@*[0]uint8)(listr.data), listr.size)
+assert(#entries == 2, 'two sessions')
+assert(entries[0].id == 3 and entries[0].cols == 120 and entries[0].rows == 40 and entries[0].attached == 0)
+assert(entries[0].command == '/bin/bash -l')
+assert(entries[1].id == 7 and entries[1].attached == 1 and entries[1].command == 'tmux new-session -A -s ghostty')
+entries:destroy()
+print('listr OK')
+
+-- /term send escapes
+require 'core.sendtext'
+do
+  local u = term_unescape('ls -la\\n^C\\e[A \\\\ \\^C')
+  assert(u == 'ls -la\n\3\27[A \\ ^C', 'unescape')
+  print('sendtext OK')
+end
+
+-- gamepad gestures
+require 'core.input'
+do
+  local st: PadGestureState
+  local function run(st: *PadGestureState, seq: [4]float64, n: usize): string
+    -- seq: alternating press time, release time; then poll until 3.0
+    local sb: stringbuilder
+    local down = false
+    local idx: usize = 0
+    local t: float64 = 0
+    while t < 3.0 do
+      if idx < n and t >= seq[idx] then down = not down idx = idx + 1 end
+      local ev = pad_gesture_update(st, down, t)
+      if ev == PadGesture.Tap then sb:write('T') elseif ev == PadGesture.DoubleTap then sb:write('D') elseif ev == PadGesture.HoldStep then sb:write('H') end
+      t = t + 0.01
+    end
+    return sb:promote()
+  end
+  assert(run(&st, {0.1, 0.2, 0, 0}, 2) == 'T', 'tap')
+  st = {}
+  assert(run(&st, {0.1, 0.18, 0.28, 0.36}, 4) == 'D', 'double tap')
+  st = {}
+  local h = run(&st, {0.1, 1.95, 0, 0}, 2)
+  assert(h == 'HHH', 'hold steps and repeats: '..h)
+  st = {}
+  local d = run(&st, {0.1, 0.2, 0.45, 0.55}, 4)
+  assert(d == 'D', 'a slow second press inside the window (release to press) is a double tap: '..d)
+  st = {}
+  local th = run(&st, {0.1, 0.2, 0.35, 1.0}, 4)
+  assert(th == 'TH', 'a tap, then a hold: the tap is not lost: '..th)
+  st = {}
+  assert(pad_gesture_update(&st, true, 0.1) == PadGesture.None)
+  assert(pad_gesture_update(&st, false, 0.2) == PadGesture.None)
+  assert(pad_gesture_update(&st, true, 0.9) == PadGesture.Tap, 'a tap whose window passed during a hitch still counts')
+  assert(pad_gesture_update(&st, false, 1.0) == PadGesture.None)
+  assert(pad_gesture_update(&st, false, 1.5) == PadGesture.Tap)
+  print('pad gestures OK')
+end
+
+-- Key repeat counts held frames, not wall time: a tap across a game hitch
+-- sends one key, a real hold repeats, a tap inside a hitch still counts.
+-- Arguments: OS down, ImGui edge, ImGui down.
+do
+  local r: KeyRepeat
+  local sent = key_repeat_step(&r, true, false, true, 0.016)
+  for _ = 1, 40 do sent = sent + key_repeat_step(&r, true, false, true, 1 / 60) end
+  assert(sent == 0, 'a key held before polling began (the ctrl+` that opened it) sends nothing')
+  sent = key_repeat_step(&r, false, false, false, 0.016)
+  sent = key_repeat_step(&r, true, true, true, 0.016)
+  sent = sent + key_repeat_step(&r, true, false, true, 0.45) -- one hitched frame, key still down
+  sent = sent + key_repeat_step(&r, false, false, false, 0.016)
+  assert(sent == 1, 'a tap during a hitch is one press')
+  sent = 0
+  for i = 1, 60 do sent = sent + key_repeat_step(&r, true, i == 1, true, 1 / 60) end -- held one second
+  assert(sent > 10 and sent < 25, 'a real hold repeats')
+  sent = key_repeat_step(&r, false, false, false, 0.016)
+  sent = sent + key_repeat_step(&r, false, true, false, 0.5) -- down and up between two frames
+  sent = sent + key_repeat_step(&r, false, false, false, 0.016)
+  assert(sent == 1, 'a tap inside a hitch is one press')
+  sent = key_repeat_step(&r, true, true, true, 0.016) + key_repeat_step(&r, true, true, true, 0.3)
+  assert(sent == 2, 'two taps queued across frames are two presses')
+  sent = key_repeat_step(&r, false, false, false, 0.016) + key_repeat_step(&r, true, false, true, 0.016)
+  assert(sent == 1, 'a press ImGui missed (it still thought the key was down) is seen from the OS state')
+  print('key repeat OK')
+end
+
+-- Every ordering of the OS key state and ImGui's events. Each frame is three
+-- letters: OS state (d down, u up), ImGui edge (e or .), ImGui down (i or .).
+-- `polled` starts from a key seen released while polled; otherwise the state
+-- is fresh, as when a terminal takes the keyboard.
+local function key_frames(frames: string, polled: boolean): integer
+  local r: KeyRepeat
+  if polled then key_repeat_step(&r, false, false, false, 1 / 60) end
+  local sent = 0
+  local i: usize = 0
+  while i + 2 < #frames do
+    sent = sent + key_repeat_step(&r, frames.data[i] == 'd'_b, frames.data[i + 1] == 'e'_b, frames.data[i + 2] == 'i'_b, 1 / 60)
+    i = i + 4
+  end
+  return sent
+end
+do
+  -- the OS state leads ImGui's edge by a frame (without this, one tap types two backspaces)
+  assert(key_frames('d.. dei d.i u.i u..', true) == 1, 'lagged edge')
+  assert(key_frames('d.. d.. d.. dei d.i u..', true) == 1, 'edge several frames late')
+  assert(key_frames('d.. u.. uei u..', true) == 1, 'released before the edge arrived')
+  assert(key_frames('d.. u.. u.. u.. uei u.i u..', true) == 1, 'released long before the edge arrived')
+  -- ImGui's edge leads the OS state
+  assert(key_frames('uei d.i d.i u..', true) == 1, 'edge before the OS state')
+  assert(key_frames('uei u.. u..', true) == 1, 'tap inside a hitch: edge only')
+  -- ImGui still holds the key from a release the game heard: no edge comes
+  assert(key_frames('u.i d.i d.i u.i u..', false) == 1, 'stuck in ImGui: the OS state is the press')
+  assert(key_frames('u.i d.i u.i d.i d.. dei u..', false) == 2, 'stuck, then a second press while ImGui catches up')
+  -- ImGui lags a whole press behind: each press still counts once
+  assert(key_frames('d.. u.. d.. dei u.i u.. uei u..', true) == 2, 'two taps, ImGui two frames behind')
+  assert(key_frames('dei u.i d.i d.. dei u..', true) == 2, 'second tap while ImGui has not seen the first release')
+  -- a key held when polling began
+  assert(key_frames('d.. d.. d.. d.. d.. d.. d.. u..', false) == 0, 'held before focus')
+  assert(key_frames('d.. d.. d.. d.. dei d.i d.i u.i', false) == 0, "held before focus: the OS autorepeat's edge")
+  assert(key_frames('d.. dei d.i u.i', false) == 1, 'a press that raced the first poll')
+  assert(key_frames('d.i d.i d.. dei d.i u..', false) == 1, 'held before focus, released and pressed between two frames')
+  assert(key_frames('d.. d.. u.. d.. dei u..', false) == 1, 'held before focus, then a real press')
+  -- Enter's row while numpad Enter is pressed: Windows reports VK_RETURN for both
+  assert(key_frames('d.. d.. d.. u..', true) == 0, 'the numpad twin of a key sends nothing on its row')
+  -- holds repeat by frame-capped time, whichever source led
+  assert(key_frames('uei d.i d.i d.i d.i d.i d.i d.i d.i d.i d.i d.i d.i d.i d.i d.i d.i d.i d.i d.i d.i d.i d.i u..', true) > 1, 'edge first, then held: repeats')
+  local r: KeyRepeat
+  local sent = key_repeat_step(&r, false, false, false, 1 / 60) + key_repeat_step(&r, true, true, true, 1 / 60)
+  for _ = 1, 3 do sent = sent + key_repeat_step(&r, true, false, true, 2.0) end -- three frames of a long hitch
+  assert(sent == 1, 'hitched frames count at most KEY_REPEAT_MAX_STEP')
+  print('key orderings OK')
+end
+
+-- Modifiers ImGui still holds from a release the game heard are dropped when
+-- polling resumes, for this frame and in ImGui's queue.
+require 'core.imgui'
+local released: [8]cint
+local released_n: integer = 0
+local function fake_add_key_event(io: *ImGuiIO, key: cint, down: boolean): void
+  assert(not down)
+  released[released_n] = key
+  released_n = released_n + 1
+end
+do
+  local io: ImGuiIO
+  io.KeyCtrl, io.KeyShift, io.KeyAlt = true, true, false
+  imgui.IOAddKeyEvent = fake_add_key_event
+  input_release_stuck_mods(&io, false, true, false, false) -- ctrl is up on the keyboard, shift still held
+  assert(not io.KeyCtrl and io.KeyShift and not io.KeyAlt)
+  assert(released_n == 3 and released[0] == ImGuiKey_ModCtrl and released[1] == ImGuiKey_LeftCtrl and released[2] == ImGuiKey_RightCtrl)
+  imgui.IOAddKeyEvent = nilptr
+  io.KeyAlt = true
+  input_release_stuck_mods(&io, false, false, false, false) -- without the export only this frame is fixed
+  assert(not io.KeyShift and not io.KeyAlt and released_n == 3)
+  print('stuck modifiers OK')
+end
+
+-- Encoding: alt+shift sends the shifted character, a consumed chord drops its
+-- (shifted) character, AltGr types a character instead of a chord.
+local fake_frame: cint = 100
+local fake_key: cint = -1 -- held and newly pressed this frame
+local function fake_frame_count(): cint return fake_frame end
+local function fake_key_down(key: cint): boolean return key == fake_key end
+local function fake_key_pressed(key: cint, rep: boolean): boolean return key == fake_key end
+local typed: stringbuilder
+local function typed_sink(ctx: pointer, data: *[0]uint8, len: usize): void
+  typed:write(string{data=(@*[0]byte)(data), size=len})
+end
+local function eat_a(ctx: pointer, action: string, key: *KeyInfo): boolean return action == 'a' end
+do
+  imgui.GetFrameCount, imgui.IsKeyDown, imgui.IsKeyPressed = fake_frame_count, fake_key_down, fake_key_pressed
+  local ks: Session -- its encoder follows the terminal's options (alt sends ESC)
+  assert(ks:init(2, &p, 80, 24, nilptr))
+  ks:pump()
+  local enc, ev = ks.encoder, ks.event
+  local chars: [4]uint16
+  local io: ImGuiIO
+  io.InputQueueCharacters.Data = &chars
+  -- one frame with key `key` newly down, modifiers and queued characters as given
+  local function frame(io: *ImGuiIO, enc: GhosttyKeyEncoder, ev: GhosttyKeyEvent, key: cint, ctrl: boolean, shift: boolean, alt: boolean,
+                       ch: uint16, right_alt: boolean, on_action: ActionSink): string
+    fake_frame = fake_frame + 1
+    fake_key = ImGuiKey_None
+    input_poll_keys(io, enc, ev, typed_sink, nilptr, nilptr, nilptr, false) -- a frame with nothing held
+    fake_frame = fake_frame + 1
+    fake_key = key
+    io.KeyCtrl, io.KeyShift, io.KeyAlt, io.KeySuper = ctrl, shift, alt, false
+    io.InputQueueCharacters.Data[0] = ch
+    io.InputQueueCharacters.Size = ch ~= 0 and 1 or 0
+    io.DeltaTime = 1 / 60
+    typed:clear()
+    input_poll_keys(io, enc, ev, typed_sink, nilptr, on_action, nilptr, right_alt)
+    fake_frame = fake_frame + 100 -- the next call resumes polling
+    return typed:view()
+  end
+  assert(frame(&io, enc, ev, ImGuiKey_A, false, false, true, 0, false, nilptr) == '\27a', 'alt+a')
+  assert(frame(&io, enc, ev, ImGuiKey_A, false, true, true, 0, false, nilptr) == '\27A', 'alt+shift+a sends A')
+  assert(frame(&io, enc, ev, ImGuiKey_2, false, true, true, 0, false, nilptr) == '\27@', 'alt+shift+2 sends @')
+  assert(frame(&io, enc, ev, ImGuiKey_A, false, true, false, 65, false, eat_a) == '', 'a consumed shift+a drops its A')
+  assert(frame(&io, enc, ev, ImGuiKey_Q, true, false, true, 64, true, nilptr) == '@', 'AltGr+q types @')
+  assert(frame(&io, enc, ev, ImGuiKey_Q, true, false, true, 64, false, nilptr) == '\27\17', 'ctrl+alt+q is a chord')
+  ks:destroy()
+  typed:destroy()
+  imgui.GetFrameCount, imgui.IsKeyDown, imgui.IsKeyPressed = nilptr, nilptr, nilptr
+  print('key encoding OK')
+end
+
+-- close_tab from a tab's own key used to free the session inside input_poll,
+-- while the rest of the frame still drew it. The tab now closes after drawing.
+require 'core.app.dropdown'
+do
+  local s = new(@Session) -- zeroed: destroy tolerates a session that never started
+  s.id = 41
+  host.sessions:push(s)
+  host.dropdown_tabs:push(s)
+  host.dropdown_active = 0
+  host.popup_session = s
+  local ctx: ActionCtx = { s = s, in_dropdown = true }
+  assert(do_action(&ctx, 'close_tab', nilptr))
+  assert(#host.sessions == 1 and #host.dropdown_tabs == 1 and terminal_close_request == s.id, 'still alive after the key')
+  dropdown_apply_close_request()
+  assert(#host.sessions == 0 and #host.dropdown_tabs == 0 and terminal_close_request == 0)
+  assert(host.popup_session == nilptr, 'a closed tab is not left as the popup session')
+  dropdown_apply_close_request() -- nothing pending: no-op
+  -- a keymap action "profile:<word>" used to abort in tointeger
+  local w = new(@Session)
+  local wctx: ActionCtx = { s = w, in_dropdown = true }
+  assert(do_action(&wctx, 'profile:x', nilptr) and do_action(&wctx, 'profile:', nilptr))
+  assert(#host.sessions == 0 and #host.dropdown_tabs == 0, 'no tab from a malformed profile number')
+  delete(w)
+  print('close_tab OK')
+end
+
+-- One keyboard owner: showing the dropdown unfocuses world panels, bringing a
+-- world panel forward unfocuses ImGui windows, and only the first focused
+-- terminal drawn in a frame polls keys.
+local focus_nil_calls: integer = 0
+local function fake_focus_nil(): void focus_nil_calls = focus_nil_calls + 1 end
+do
+  host.world_focus = 7
+  host.dropdown_open = false
+  set_visible(true)
+  assert(host.dropdown_open and host.world_focus == 0, 'the dropdown takes focus from a world panel')
+  set_visible(false)
+  local s = new(@Session)
+  s.id = 9
+  host.world:push(s)
+  imgui.SetWindowFocusNil = fake_focus_nil
+  bring_forward(s)
+  assert(host.world_focus == 9 and focus_nil_calls == 1, 'a world panel brought forward takes focus from ImGui windows')
+  imgui.SetWindowFocusNil = nilptr
+  host.world:clear()
+  host.world_focus = 0
+  set_world_visible(false)
+  delete(s)
+  host.terminal_focused_now = false
+  assert(not terminal_claim_keyboard(false))
+  assert(terminal_claim_keyboard(true), 'the first focused terminal polls')
+  assert(not terminal_claim_keyboard(true), 'a second focused terminal in the same frame does not')
+  host.terminal_focused_now = false
+  print('keyboard owner OK')
+end
+
+-- The toggle chords come from the settings, not from chords hard-coded in the
+-- keymap: with toggle_mods = alt, ctrl+` is typed and alt+` toggles.
+local chord_io: ImGuiIO
+local function fake_get_io(): *ImGuiIO return &chord_io end
+do
+  assert(policy_load('.'))
+  local buf: [64]cchar
+  assert(policy_key_action('grave', true, false, false, false, &buf, 64) == 0, 'the keymap has no hard-coded ctrl+`')
+  assert(policy_key_action('grave', true, true, false, false, &buf, 64) == 0, 'nor ctrl+shift+`')
+  imgui.GetIO = fake_get_io
+  policy.toggle_ctrl, policy.toggle_shift, policy.toggle_alt = false, false, true
+  policy.world_toggle_ctrl, policy.world_toggle_shift, policy.world_toggle_alt = false, false, false
+  local s = new(@Session)
+  local ctx: ActionCtx = { s = s, in_dropdown = true }
+  host.dropdown_open = false
+  host.frame = 1
+  chord_io.KeyCtrl, chord_io.KeyAlt = true, false
+  assert(not key_action(&ctx, 'grave', nilptr) and not host.dropdown_open, 'ctrl+` goes to the shell when the toggle is alt+`')
+  chord_io.KeyCtrl, chord_io.KeyAlt = false, false
+  assert(not key_action(&ctx, 'grave', nilptr), 'a bare ` is typed')
+  chord_io.KeyAlt = true
+  assert(key_action(&ctx, 'grave', nilptr) and host.dropdown_open, 'alt+` toggles')
+  chord_io.KeyShift = true
+  assert(not key_action(&ctx, 'grave', nilptr), 'alt+shift+` is not the toggle')
+  host.frame = 2
+  policy.world_toggle_ctrl, policy.world_toggle_shift = true, true
+  host.world_visible = true
+  host.world:push(s) -- so toggling hides instead of summoning a pet
+  chord_io.KeyCtrl, chord_io.KeyShift, chord_io.KeyAlt = true, true, false
+  assert(key_action(&ctx, 'grave', nilptr) and not host.world_visible, 'ctrl+shift+` toggles the world terminals')
+  host.world:clear()
+  host.dropdown_open = false
+  imgui.GetIO = nilptr
+  delete(s)
+  print('toggle chords OK')
+end
+
+-- The world toggle summons a pet only with a character loaded: on the title
+-- screen it used to start a shell no panel would ever show.
+local function fake_no_player(which: cint, entity_id: uint64, out: *GuObject): cint
+  $out = {}
+  return 1
+end
+do
+  host.world_visible = false
+  host.world:clear()
+  local n, next_id = #host.sessions, host.next_session_id
+  host.frame = 10
+  toggle_world() -- no get_object at all (tests, early load)
+  assert(#host.sessions == n and host.next_session_id == next_id and not host.world_visible, 'no shell started without get_object')
+  host.api.get_object = fake_no_player
+  host.frame = 11
+  toggle_world()
+  assert(#host.sessions == n and host.next_session_id == next_id and not host.world_visible, 'no shell started without a player')
+  host.api.get_object = nilptr
+  print('world toggle without a player OK')
+end
+
+-- Closing or moving the full-screen world panel clears the full-screen state.
+do
+  local s = new(@Session)
+  s.id = 12
+  host.world_full_id, host.world_full_last = 12, 12
+  take_out_of_views(s)
+  assert(host.world_full_id == 0 and host.world_full_last == 0)
+  host.world_full_id, host.world_full_last = 13, 14
+  take_out_of_views(s)
+  assert(host.world_full_id == 13 and host.world_full_last == 14, 'another panel stays full screen')
+  host.world_full_id, host.world_full_last = 0, 0
+  delete(s)
+  print('full screen cleared OK')
+end
+
+-- Settings: a dragged slider applies every frame but saves once, on release;
+-- saved values are clamped to the slider range; an error inside a tab is
+-- logged once and the tab is still closed.
+do
+  local L = luaL_newstate()
+  luaL_openlibs(L)
+  local chunk: string = [[
+    package.path = 'lua/?.lua;' .. package.path
+    GHOSTTY_PLUGIN_DIR = 'build'
+    local f = assert(io.open('build/settings.lua', 'w'))
+    f:write("return { ['world.pet.pixels_per_yalm'] = 0, ['dropdown.height'] = 0/0, ['world.pet.width'] = 'wide',",
+            " ['cursor_blink'] = false, ['dropdown.opacity'] = 5, ['dropdown.min_width'] = 512.7 }")
+    f:close()
+    local S = dofile('lua/settings.lua')
+    local config = { world = { pet = { pixels_per_yalm = 600, width = 900 } }, dropdown = { height = 0.45, opacity = 0.9 } }
+    S.apply(config)
+    os.remove('build/settings.lua')
+    assert(config.world.pet.pixels_per_yalm == 200, 'a saved 0 is clamped to the slider minimum')
+    assert(config.dropdown.height == 0.45, 'a saved NaN is ignored')
+    assert(config.world.pet.width == 900, 'a saved non-number is ignored')
+    assert(config.cursor_blink == false and config.dropdown.opacity == 1 and config.dropdown.min_width == 512)
+
+    local saves = 0
+    S.save = function() saves = saves + 1 end
+    local frames = 0
+    local ui = {
+      text = function() end, separator = function() end, wrapped = function() end,
+      header = function(label) return label == 'Dropdown' end,
+      slider = function(label, v)
+        if label:find('##dropdown.height', 1, true) then
+          frames = frames + 1
+          return true, 0.5, frames == 61
+        end
+        return false, v, false
+      end,
+      slider_int = function(label, v) return false, v, false end,
+      checkbox = function(label, v) return false, v end,
+      combo = function(label, v) return false, v end,
+      button = function() return false end,
+    }
+    for _ = 1, 60 do S.draw_settings(ui) end
+    assert(saves == 0, 'nothing saved while dragging')
+    assert(config.dropdown.height == 0.5 and S.values['dropdown.height'] == 0.5, 'the value applies while dragging')
+    S.draw_settings(ui)
+    assert(saves == 1, 'released: saved once')
+    ui.checkbox = function(label, v)
+      if label:find('##dropdown.glass', 1, true) then return true, false end
+      return false, v
+    end
+    S.draw_settings(ui)
+    assert(saves == 2, 'a checkbox saves at once')
+
+    local ends, logs = 0, 0
+    ghostty = { ui = ui, log = function() logs = logs + 1 end }
+    ui.tabs = function() return true end
+    ui.tab = function(label) return label == 'Settings' end
+    ui.end_tab = function() ends = ends + 1 end
+    ui.end_tabs = function() end
+    ui.header = function() error('boom') end
+    S.draw()
+    S.draw()
+    assert(ends == 2 and logs == 1, 'tab closed each frame, error logged once')
+  ]]
+  if luaL_loadstring(L, (@cstring)(chunk.data)) ~= LUA_OK or lua_pcall(L, 0, 0, 0) ~= LUA_OK then
+    print((@string)(lua_tolstring(L, -1, nilptr)))
+    assert(false, 'settings')
+  end
+  lua_close(L)
+  print('settings OK')
+end
+
+-- ghostty.ui.slider: clamps typed values and reports when the edit ends.
+require 'core.ui'
+local slider_flags: cint = -1
+local edit_done: boolean = false
+local function fake_slider_float(label: cstring, v: *float32, lo: float32, hi: float32, fmt: cstring, flags: cint): boolean
+  slider_flags = flags
+  $v = hi
+  return true
+end
+local function fake_slider_int(label: cstring, v: *cint, lo: cint, hi: cint, fmt: cstring, flags: cint): boolean
+  slider_flags = flags
+  return false
+end
+local function fake_deactivated_after_edit(): boolean return edit_done end
+do
+  imgui.SliderFloat, imgui.SliderInt = fake_slider_float, fake_slider_int
+  imgui.IsItemDeactivatedAfterEdit = fake_deactivated_after_edit
+  local L = luaL_newstate()
+  luaL_openlibs(L)
+  lua_createtable(L, 0, 1)
+  ui_lua_register(L)
+  lua_setglobal(L, 'g')
+  local chunk: string = [[
+    local c, v, done = g.ui.slider('x', 0.5, 0, 2)
+    assert(c and v == 2 and done == false, 'dragging: not done')
+  ]]
+  assert(luaL_loadstring(L, (@cstring)(chunk.data)) == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
+  assert(slider_flags == ImGuiSliderFlags_AlwaysClamp)
+  edit_done = true
+  local chunk2: string = [[
+    local c, v, done = g.ui.slider_int('y', 3, 0, 9)
+    assert(not c and v == 3 and done == true, 'released: done')
+  ]]
+  assert(luaL_loadstring(L, (@cstring)(chunk2.data)) == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
+  assert(slider_flags == ImGuiSliderFlags_AlwaysClamp)
+  imgui.IsItemDeactivatedAfterEdit = nilptr
+  local chunk3: string = [[
+    local c, v, done = g.ui.slider('x', 0.5, 0, 2)
+    assert(c and done, 'without the export every change counts as done')
+  ]]
+  assert(luaL_loadstring(L, (@cstring)(chunk3.data)) == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
+  lua_close(L)
+  imgui.SliderFloat, imgui.SliderInt = nilptr, nilptr
+  print('ui slider OK')
+end
