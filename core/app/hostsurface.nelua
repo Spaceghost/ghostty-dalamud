@@ -1,0 +1,456 @@
+-- The standalone plugin's side of the host: activation (one core per process,
+-- stepping aside while the legacy Umbra-hosted core is loaded), the events the
+-- shim forwards (chat commands, /xlplugins buttons, info bar clicks) and the
+-- surfaces the core registers through GuHostApi: chat commands, the server
+-- info bar entry, UI-hide flags and the IPC providers the Umbra widget calls.
+-- CONFIG.host (lua/init.lua) decides names, modes and click actions.
+require 'os'
+require 'core.app.anchored_popup'
+
+global GuEventKind = @enum{ None = 0, Chat, OpenMain, OpenConfig, DtrClick, PluginsChanged }
+
+local EVENT_CAP <comptime> = 32
+local EVENT_TEXT <comptime> = 256
+local GUARD_MS: uint64 <comptime> = 2000        -- activation retry / legacy check period
+local COMMAND_RETRY_MS: uint64 <comptime> = 5000
+
+local DEFAULT_HELP: string <comptime> = 'Show/hide the terminal. window [n] | new [n] | pin [here|me|target|orbit] | unpin | config | reload'
+local DEFAULT_TOOLTIP: string <comptime> = 'Ghostty terminal. Click: dropdown, right-click: popup, shift+click: new window, ctrl+click: world screens'
+
+-- Chat commands and info bar clicks arrive from other threads (the framework
+-- tick, native UI events); the frame drains them in order.
+local QueuedEvent = @record{ kind: cint, a: cint, b: cint, x: float32, y: float32, len: usize, text: [EVENT_TEXT]byte }
+local queue: [EVENT_CAP]QueuedEvent
+local queue_head: integer = 0
+local queue_count: integer = 0
+
+-- a C string for the shim; empty Nelua strings have no data at all
+local function cstr(s: string): cstring
+  if s.size == 0 then return '' end
+  return (@cstring)(s.data)
+end
+
+local function replace(dst: *string, v: string): void
+  dst:destroy()
+  $dst = v
+end
+
+-- Events ----------------------------------------------------------------------
+
+global function surface_post(kind: cint, a: cint, b: cint, x: float32, y: float32, text: cstring): void
+  -- nothing registered yet (or any more): nobody should be clicking
+  if boot.state ~= HostState.Active and boot.state ~= HostState.Suspended then return end
+  procguard_lock()
+  if queue_count >= EVENT_CAP then
+    surface.events_dropped = surface.events_dropped + 1
+  else
+    local e = &queue[(queue_head + queue_count) % EVENT_CAP]
+    e.kind, e.a, e.b, e.x, e.y, e.len = kind, a, b, x, y, 0
+    if text ~= nilptr then
+      local src = (@*[0]byte)(text)
+      while e.len < EVENT_TEXT - 1 and src[e.len] ~= 0 do
+        e.text[e.len] = src[e.len]
+        e.len = e.len + 1
+      end
+    end
+    e.text[e.len] = 0
+    queue_count = queue_count + 1
+  end
+  procguard_unlock()
+end
+
+local function pop_event(out: *QueuedEvent): boolean
+  procguard_lock()
+  local ok = queue_count > 0
+  if ok then
+    $out = queue[queue_head]
+    queue_head = (queue_head + 1) % EVENT_CAP
+    queue_count = queue_count - 1
+  end
+  procguard_unlock()
+  return ok
+end
+
+-- CONFIG.host -----------------------------------------------------------------
+
+-- CONFIG[a][b] on the stack when it is a table (plus the tables above it);
+-- returns how many values were pushed, 0 when the path is missing.
+local function push_config_table(L: *lua_State, a: cstring, b: cstring): cint
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return 0 end
+  lua_getfield(L, -1, a)
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return 0 end
+  if b == nilptr then return 2 end
+  lua_getfield(L, -1, b)
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 3) return 0 end
+  return 3
+end
+
+global function surface_read_config(): void
+  local c = &surface.cfg
+  replace(&c.help, string.copy(DEFAULT_HELP))
+  replace(&c.dtr_mode, string.copy('auto'))
+  replace(&c.dtr_title, string.copy('Ghostty'))
+  replace(&c.dtr_tooltip, string.copy(DEFAULT_TOOLTIP))
+  c.keep_mask = UI_KEEP_USER | UI_KEEP_CUTSCENE | UI_KEEP_GPOSE
+  c.close_on_blur = true
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return end
+  local n = push_config_table(L, 'host', nilptr)
+  if n > 0 then
+    local v = lua_field_string(L, -1, 'help', c.help)
+    replace(&c.help, v)
+    lua_pop(L, n)
+  end
+  n = push_config_table(L, 'host', 'dtr')
+  if n > 0 then
+    local d = lua_gettop(L)
+    local mode, title, tip = lua_field_string(L, d, 'mode', c.dtr_mode), lua_field_string(L, d, 'title', c.dtr_title), lua_field_string(L, d, 'tooltip', c.dtr_tooltip)
+    replace(&c.dtr_mode, mode)
+    replace(&c.dtr_title, title)
+    replace(&c.dtr_tooltip, tip)
+    lua_pop(L, n)
+  end
+  n = push_config_table(L, 'host', 'keep_visible')
+  if n > 0 then
+    local k = lua_gettop(L)
+    local m: cint = 0
+    if lua_field_boolean(L, k, 'always', false) then m = m | UI_KEEP_ALWAYS end
+    if lua_field_boolean(L, k, 'user_hidden', true) then m = m | UI_KEEP_USER end
+    if lua_field_boolean(L, k, 'cutscene', true) then m = m | UI_KEEP_CUTSCENE end
+    if lua_field_boolean(L, k, 'gpose', true) then m = m | UI_KEEP_GPOSE end
+    c.keep_mask = m
+    lua_pop(L, n)
+  end
+  n = push_config_table(L, 'popup', nilptr)
+  if n > 0 then
+    c.close_on_blur = lua_field_boolean(L, -1, 'close_on_blur', true)
+    lua_pop(L, n)
+  end
+end
+
+-- CONFIG.host.commands, or the three names every earlier version answered to.
+local function read_commands(): void
+  for i = 0, < #surface.commands do surface.commands[i]:destroy() end
+  surface.commands:clear()
+  surface.command_ok:clear()
+  local L = policy.L
+  local found = false
+  if L ~= nilptr and policy.loaded then
+    local n = push_config_table(L, 'host', nilptr)
+    if n > 0 then
+      lua_getfield(L, -1, 'commands')
+      if lua_type(L, -1) == LUA_TTABLE then
+        found = true
+        local len = (@integer)(lua_rawlen(L, -1))
+        for i = 1, len do
+          lua_rawgeti(L, -1, i)
+          if lua_type(L, -1) == LUA_TSTRING then
+            local sz: usize = 0
+            local p = lua_tolstring(L, -1, &sz)
+            surface.commands:push(string.copy(string{data=(@*[0]byte)(p), size=sz}))
+          end
+          lua_pop(L, 1)
+        end
+      end
+      lua_pop(L, n + 1)
+    end
+  end
+  if not found then
+    surface.commands:push(string.copy('/term'))
+    surface.commands:push(string.copy('/tomestone'))
+    surface.commands:push(string.copy('/tome'))
+  end
+  for i = 0, < #surface.commands do surface.command_ok:push(false) end
+end
+
+-- CONFIG.host.dtr.on_click(button, mods) -> 'toggle' | 'popup' | 'window' |
+-- 'world' | 'settings' | 'none'. `button` is Dalamud's MouseClickType (0 left,
+-- 1 right), `mods` its ClickModifierKeys (ctrl 1, alt 2, shift 4).
+global function surface_click_action(button: cint, mods: cint): string
+  local btn: cstring = button == 1 and 'right' or 'left'
+  local L = policy.L
+  if L ~= nilptr and policy.loaded then
+    local n = push_config_table(L, 'host', 'dtr')
+    if n > 0 then
+      lua_getfield(L, -1, 'on_click')
+      if lua_type(L, -1) == LUA_TFUNCTION then
+        lua_pushstring(L, btn)
+        lua_createtable(L, 0, 3)
+        lua_pushboolean(L, (mods & 1) ~= 0 and 1 or 0) lua_setfield(L, -2, 'ctrl')
+        lua_pushboolean(L, (mods & 2) ~= 0 and 1 or 0) lua_setfield(L, -2, 'alt')
+        lua_pushboolean(L, (mods & 4) ~= 0 and 1 or 0) lua_setfield(L, -2, 'shift')
+        local r: string
+        if lua_pcall(L, 2, 1, 0) ~= LUA_OK then
+          local msg: cstring = lua_tolstring(L, -1, nilptr)
+          if msg == nilptr then msg = 'error' end
+          logf(LOG_WARN, 'host.dtr.on_click: %s', msg)
+        elseif lua_type(L, -1) == LUA_TSTRING then
+          local sz: usize = 0
+          local p = lua_tolstring(L, -1, &sz)
+          r = string.copy(string{data=(@*[0]byte)(p), size=sz})
+        end
+        lua_pop(L, n + 1)
+        if #r == 0 then return string.copy('none') end
+        return r
+      end
+      lua_pop(L, n + 1)
+    end
+  end
+  -- no policy (an init.lua from before CONFIG.host): the documented defaults
+  if button == 1 then return string.copy('popup') end
+  if (mods & 4) ~= 0 then return string.copy('window') end
+  return string.copy('toggle')
+end
+
+-- Surfaces --------------------------------------------------------------------
+
+local function register_commands(now: uint64, loud: boolean): void
+  surface.command_retry_ms = now
+  if host.api.command_add == nilptr then return end
+  for i = 0, < #surface.commands do
+    if not surface.command_ok[i] then
+      local name = surface.commands[i]
+      local ok = host.api.command_add(cstr(name), cstr(surface.cfg.help)) ~= 0
+      surface.command_ok[i] = ok
+      if ok then logf(LOG_INFO, 'command %s registered', name)
+      elseif loud then logf(LOG_WARN, 'command %s not registered (taken?); retrying every %d s', name, COMMAND_RETRY_MS // 1000) end
+    end
+  end
+end
+
+local function push_keep_mask(): void
+  if host.api.set_ui_hide == nilptr or surface.keep_mask_pushed == surface.cfg.keep_mask then return end
+  host.api.set_ui_hide(surface.cfg.keep_mask)
+  surface.keep_mask_pushed = surface.cfg.keep_mask
+end
+
+-- The info bar entry: shown per CONFIG.host.dtr.mode ('auto' hides it while the
+-- Umbra widget is polling, which already shows the same status); pushed only
+-- when something changed.
+local function dtr_push(now: uint64): void
+  if host.api.dtr_set == nilptr then return end
+  local mode = surface.cfg.dtr_mode
+  local shown = mode == 'always' or (mode == 'auto' and not surface_widget_recent(now))
+  local text: string = host.status
+  if boot.state == HostState.Suspended then text = 'ghostty: legacy core loaded' end
+  if surface.dtr_pushed and shown == surface.dtr_shown and text == surface.dtr_text then return end
+  host.api.dtr_set(cstr(surface.cfg.dtr_title), cstr(text), cstr(surface.cfg.dtr_tooltip), shown and 1 or 0)
+  surface.dtr_pushed = true
+  surface.dtr_shown = shown
+  replace(&surface.dtr_text, string.copy(text))
+end
+
+local function refresh_plugins(): void
+  if host.api.plugin_loaded == nilptr then return end
+  surface.umbra_loaded = host.api.plugin_loaded('Umbra') ~= 0
+end
+
+local function surfaces_start(): void
+  local now = procguard_now_ms()
+  surface_read_config()
+  if host.api.ipc_register ~= nilptr then
+    surface.ipc = true
+    if host.api.ipc_register() == 0 then log(LOG_WARN, 'IPC providers not registered: the Umbra widget will show "ghostty offline"') end
+  end
+  read_commands()
+  register_commands(now, true)
+  surface.keep_mask_pushed = -1
+  push_keep_mask()
+  surface.dtr_pushed = false
+  dtr_push(now)
+  refresh_plugins()
+  boot.last_guard_ms = now
+end
+
+-- Unregister everything before the shim's callbacks go away.
+local function surfaces_stop(): void
+  if surface.ipc and host.api.ipc_unregister ~= nilptr then host.api.ipc_unregister() end
+  surface.ipc = false
+  if host.api.command_remove ~= nilptr then
+    for i = 0, < #surface.commands do
+      if surface.command_ok[i] then host.api.command_remove(cstr(surface.commands[i])) end
+    end
+  end
+  if surface.dtr_pushed and host.api.dtr_remove ~= nilptr then host.api.dtr_remove() end
+  surface.dtr_pushed = false
+end
+
+-- Activation --------------------------------------------------------------------
+
+local function refuse(code: cint): cint
+  if code ~= boot.reason then
+    boot.reason = code
+    if code == INIT_LEGACY then
+      log(LOG_WARN, 'waiting: the Umbra-hosted core (ghostty_umbra.dll) is loaded; replace Umbra.Ghostty.dll with the widget-only build and restart Umbra')
+    else
+      log(LOG_WARN, 'waiting: another ghostty core is active in this game process')
+    end
+  end
+  return code
+end
+
+-- ghostty.log from Lua
+global function lua_log(msg: cstring): void
+  if host.api.log ~= nilptr then host.api.log(LOG_INFO, msg) end
+end
+
+-- The old gu_init body: a fresh `host`, Lua policy, first status.
+local function core_start(): void
+  host = {}
+  host.api = boot.api
+  host.dir = boot.config_dir:copy()
+  world_host = {
+    get_camera = host.api.get_camera, get_object = host.api.get_object,
+    anim_get = host.api.anim_get, anim_set = host.api.anim_set, anim_play = host.api.anim_play,
+    anim_speed = host.api.anim_speed, get_environment = host.api.get_environment,
+    log = lua_log, set_rotation = host.api.set_rotation,
+  }
+  host.next_session_id = 1
+  host.dropdown_active = -1
+  if boot.install_dir == host.dir then
+    logf(LOG_INFO, 'ghostty core starting from %s', host.dir)
+  else
+    logf(LOG_INFO, 'ghostty core starting: install=%s config=%s', boot.install_dir, host.dir)
+  end
+  load_policy()
+  if policy.dropdown.open_on_start then
+    set_visible(true)
+    host.dropdown_focus_next = true
+  end
+  host.initialized = true
+  update_status()
+end
+
+global function surface_try_activate(): cint
+  boot.last_try_ms = procguard_now_ms()
+  if host.initialized then return INIT_BUSY end
+  if procguard_legacy_loaded() then return refuse(INIT_LEGACY) end
+  if not procguard_acquire() then return refuse(INIT_BUSY) end
+  boot.mutex = true
+  core_start()
+  boot.state = HostState.Active
+  boot.reason = INIT_OK
+  surfaces_start()
+  log(LOG_INFO, 'ghostty core active')
+  return INIT_OK
+end
+
+global function surface_init(api: *GuHostApi, info: *GuInitInfo): cint
+  if boot.state ~= HostState.Inactive or host.initialized then
+    log(LOG_WARN, 'init refused: this core is already initialised')
+    return INIT_BUSY
+  end
+  if api == nilptr or info == nilptr then return INIT_BAD_ARGS end
+  -- read only the prefixes the caller declared: older or newer shims both work
+  local inf: GuInitInfo
+  do
+    local n = info.size
+    if n > #GuInitInfo then n = #GuInitInfo end
+    local dst, src = (@*[0]uint8)(&inf), (@*[0]uint8)(info)
+    for i: usize = 0, < n do dst[i] = src[i] end
+  end
+  if inf.install_dir == nilptr or inf.config_dir == nilptr then return INIT_BAD_ARGS end
+  boot = {}
+  do
+    local n = api.size
+    if n > #GuHostApi then n = #GuHostApi end
+    local dst, src = (@*[0]uint8)(&boot.api), (@*[0]uint8)(api)
+    for i: usize = 0, < n do dst[i] = src[i] end
+    boot.api.size = #GuHostApi
+  end
+  boot.host_kind = inf.host_kind
+  boot.install_dir = string.copy(inf.install_dir)
+  boot.config_dir = string.copy(inf.config_dir)
+  if inf.configs_root ~= nilptr then boot.configs_root = string.copy(inf.configs_root) end
+  if boot.host_kind == HOST_KIND_DALAMUD then
+    local home = os.getenv('GHOSTTY_HOME') -- a config home of your own choosing
+    if #home > 0 then replace(&boot.config_dir, home) else home:destroy() end
+  end
+  boot.reason = -1
+  boot.state = HostState.Pending
+  host.api = boot.api -- logging while pending
+  surface.keep_mask_pushed = -1
+  return surface_try_activate()
+end
+
+-- Per frame, before anything needs ImGui: retry a pending activation, and step
+-- aside (or back) when the legacy core comes and goes.
+global function surface_tick(): void
+  if boot.state == HostState.Inactive then return end
+  local now = procguard_now_ms()
+  if boot.state == HostState.Pending then
+    if now - boot.last_try_ms >= GUARD_MS then surface_try_activate() end
+    return
+  end
+  if now - boot.last_guard_ms < GUARD_MS then return end
+  boot.last_guard_ms = now
+  local legacy = procguard_legacy_loaded()
+  if legacy and boot.state == HostState.Active then
+    boot.state = HostState.Suspended
+    surface.popup_open = false
+    log(LOG_WARN, 'suspended: the Umbra-hosted core (ghostty_umbra.dll) is loaded; its terminals take over until it unloads')
+  elseif not legacy and boot.state == HostState.Suspended then
+    boot.state = HostState.Active
+    log(LOG_INFO, 'resumed: the Umbra-hosted core is gone')
+  end
+  surface_read_config()
+  push_keep_mask()
+end
+
+local function handle_event(e: *QueuedEvent): void
+  if e.kind == GuEventKind.Chat then
+    local text = string{data=&e.text, size=e.len}
+    if run_command(text) == 3 then logf(LOG_WARN, 'unknown command: %s', text) end
+    return
+  end
+  if boot.state ~= HostState.Active then return end -- suspended: the legacy core owns the UI
+  if e.kind == GuEventKind.OpenMain then
+    toggle_visible()
+  elseif e.kind == GuEventKind.OpenConfig then
+    host.settings_open = true
+  elseif e.kind == GuEventKind.DtrClick then
+    replace(&surface.last_action, surface_click_action(e.a, e.b))
+    local action = surface.last_action
+    if action == 'toggle' then toggle_visible()
+    elseif action == 'popup' then anchored_popup_toggle(e.x, e.y)
+    elseif action == 'window' then run_command('window')
+    elseif action == 'world' then toggle_world()
+    elseif action == 'settings' then host.settings_open = not host.settings_open end
+  elseif e.kind == GuEventKind.PluginsChanged then
+    refresh_plugins()
+  end
+end
+
+-- Per frame once initialised (ImGui not needed): queued events, command
+-- retries, the info bar entry.
+global function surface_events(): void
+  local now = procguard_now_ms()
+  local e: QueuedEvent
+  while pop_event(&e) do handle_event(&e) end
+  if now - surface.command_retry_ms >= COMMAND_RETRY_MS then register_commands(now, false) end
+  dtr_push(now)
+end
+
+global function surface_shutdown(): void
+  if host.initialized then surfaces_stop() end
+end
+
+-- After the core's own teardown: forget the shim entirely.
+global function surface_reset(): void
+  procguard_lock()
+  queue_head, queue_count = 0, 0
+  procguard_unlock()
+  if boot.mutex then procguard_release() end
+  for i = 0, < #surface.commands do surface.commands[i]:destroy() end
+  surface.commands:destroy()
+  surface.command_ok:destroy()
+  surface.cfg.help:destroy() surface.cfg.dtr_mode:destroy() surface.cfg.dtr_title:destroy() surface.cfg.dtr_tooltip:destroy()
+  surface.dtr_text:destroy()
+  surface.last_action:destroy()
+  surface = {}
+  boot.install_dir:destroy() boot.config_dir:destroy() boot.configs_root:destroy()
+  boot = {}
+  host.api = {}
+  world_host = {}
+end

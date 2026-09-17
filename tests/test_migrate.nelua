@@ -1,0 +1,140 @@
+-- The config move to the standalone plugin: tests/test_migrate.lua drives
+-- lua/migrate.lua; here the two-home policy loader: the config directory
+-- comes before the shipped one on package.path, its init.lua wins,
+-- GHOSTTY_PLUGIN_DIR is the config directory, and the migration runs before
+-- init.lua reads settings.lua.
+require 'core.policy'
+require 'string'
+require 'io'
+require 'os'
+require 'arg'
+
+## cinclude '<sys/stat.h>'
+local stat_t <cimport 'struct stat', nodecl, cincomplete> = @record{ st_mode: cuint }
+local function c_stat(path: cstring, buf: *stat_t): cint <cimport 'stat', nodecl> end
+
+-- file_mode(path) -> the permission bits in octal, e.g. '600'
+local function l_file_mode(L: *lua_State): cint
+  local st: stat_t
+  if c_stat(lua_tolstring(L, 1, nilptr), &st) ~= 0 then lua_pushnil(L) return 1 end
+  local m = string.format('%o', (@integer)(st.st_mode & 511))
+  lua_pushlstring(L, (@cstring)(m.data), m.size)
+  return 1
+end
+
+local root: string = arg[1]
+local scratch: string = arg[2]
+
+local function write(path: string, data: string): void
+  local f = io.open(path, 'wb')
+  assert(f:isopen(), path)
+  f:write(data)
+  f:close()
+end
+
+local function exists(path: string): boolean
+  local f = io.open(path, 'rb')
+  if not f:isopen() then return false end
+  f:close()
+  return true
+end
+
+local function lua_global_string(name: cstring): string
+  lua_getglobal(policy.L, name)
+  local len: usize = 0
+  local p = lua_tolstring(policy.L, -1, &len)
+  local s: string
+  if p ~= nilptr then s = string.copy(string{data=(@*[0]byte)(p), size=len}) end
+  lua_pop(policy.L, 1)
+  return s
+end
+
+local function config_string(field: cstring): string
+  local ok = luaL_loadstring(policy.L, 'return tostring(CONFIG[...])') == LUA_OK
+  assert(ok)
+  lua_pushstring(policy.L, field)
+  assert(lua_pcall(policy.L, 1, 1, 0) == LUA_OK)
+  local len: usize = 0
+  local p = lua_tolstring(policy.L, -1, &len)
+  local s = string.copy(string{data=(@*[0]byte)(p), size=len})
+  lua_pop(policy.L, 1)
+  return s
+end
+
+-- lua/migrate.lua itself ----------------------------------------------------------
+do
+  local L = luaL_newstate()
+  luaL_openlibs(L)
+  world_lua_register(L)
+  fs_lua_register(L)
+  lua_pushcclosure(L, l_file_mode, 0) lua_setglobal(L, 'file_mode')
+  local script = root .. '/tests/test_migrate.lua'
+  if luaL_loadfilex(L, (@cstring)(script.data), nilptr) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_pushlstring(L, (@cstring)(root.data), root.size)
+  lua_pushlstring(L, (@cstring)(scratch.data), scratch.size)
+  if lua_pcall(L, 2, 0, 0) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_close(L)
+end
+
+-- config before install ---------------------------------------------------------------
+do
+  local base = scratch .. '/homes'
+  local config = base .. '/config'
+  assert(fs_mkdir((@cstring)(base.data)) and fs_mkdir((@cstring)(config.data)))
+  local lua_dir = config .. '/lua'
+  assert(fs_mkdir((@cstring)(lua_dir.data)))
+  write(config .. '/lua/world.lua', "return 'config world'\n")
+  write(config .. '/lua/init.lua', [[
+local keymap = require('keymap') -- only shipped: found beside the plugin
+return {
+  toggle_key = 'f12',
+  probe_world = require('world'), -- the config copy shadows the shipped module
+  plugin_dir = GHOSTTY_PLUGIN_DIR,
+  on_key = keymap.on_key,
+  profiles = { { name = 'probe', command = 'true' } },
+  dropdown = {}, popup = {}, agent = {}, -- the core reads these without checking
+}
+]])
+  assert(policy_load_dirs(root, config, '', 'test'), policy.error)
+  assert(policy.toggle_key == 'f12', 'init.lua from the config directory')
+  assert(config_string('probe_world') == 'config world', 'config/lua comes first on package.path')
+  assert(config_string('plugin_dir') == config, 'GHOSTTY_PLUGIN_DIR is the config directory')
+  assert(lua_global_string('GHOSTTY_INSTALL_DIR') == root and lua_global_string('GHOSTTY_CONFIG_DIR') == config)
+  assert(#policy.profiles == 1 and policy.profiles[0].name == 'probe')
+  local buf: [16]cchar
+  assert(policy_key_action('c', true, true, false, false, &buf, 16) == 4, 'shipped keymap through the fallback path')
+
+  -- without an override the shipped init.lua loads (still seeing config/lua/world.lua)
+  assert(os.remove(config .. '/lua/init.lua'))
+  assert(policy_load_dirs(root, config, '', 'test'), policy.error)
+  assert(policy.toggle_key == 'grave' and #policy.profiles >= 3, 'shipped init.lua')
+  print('homes OK')
+end
+
+-- migration runs before init.lua -------------------------------------------------------
+do
+  local base = scratch .. '/boot'
+  local configs_root = base .. '/pluginConfigs'
+  local umbra = configs_root .. '/Umbra'
+  local legacy = umbra .. '/ghostty'
+  local config = configs_root .. '/GhosttyDalamud'
+  local dirs: [5]string = { base, configs_root, umbra, legacy, config }
+  for i = 0, < 5 do assert(fs_mkdir((@cstring)(dirs[i].data))) end
+  write(legacy .. '/settings.lua', "return { ['dropdown.height'] = 0.77 }\n")
+  assert(policy_load_dirs(root, config, configs_root, 'dalamud'), policy.error)
+  assert(exists(config .. '/settings.lua') and exists(config .. '/migrated-from-umbra.txt'), 'migrated on load')
+  assert(math.abs(policy.dropdown.height - 0.77) < 1e-9, 'init.lua saw the migrated settings')
+  -- tests never migrate
+  local other = base .. '/other'
+  assert(fs_mkdir((@cstring)(other.data)))
+  assert(policy_load_dirs(root, other, configs_root, 'test'), policy.error)
+  assert(not exists(other .. '/migrated-from-umbra.txt'))
+  print('boot migration OK')
+end
+print('OK')

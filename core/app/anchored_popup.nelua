@@ -1,0 +1,61 @@
+-- The popup terminal without Umbra: our own ImGui window, opened from the
+-- server info bar entry and anchored where it was clicked. Same body as the
+-- Umbra toolbar popup; closes on a second click or when it loses focus.
+require 'core.app.commands'
+require 'core.app.boot'
+
+local POPUP_GAP: float32 <comptime> = 8
+
+global function anchored_popup_toggle(x: float32, y: float32): void
+  surface.popup_open = not surface.popup_open
+  surface.popup_x, surface.popup_y = x, y
+  surface.popup_frames = 0
+end
+
+-- Top-left corner for a w*h popup anchored at (ax, ay): centred under the
+-- click, flipped above it near the bottom, always inside the work area.
+global function anchored_popup_place(ax: float32, ay: float32, w: float32, h: float32, vp: *ImGuiViewport): (float32, float32)
+  local left, top = vp.WorkPos.x, vp.WorkPos.y
+  local right, bottom = left + vp.WorkSize.x, top + vp.WorkSize.y
+  local x = ax - w * 0.5
+  local y = ay + POPUP_GAP
+  if y + h > bottom then y = ay - h - POPUP_GAP end
+  x = math.max(left, math.min(x, right - w))
+  y = math.max(top, math.min(y, bottom - h))
+  return x, y
+end
+
+global function draw_anchored_popup(): void
+  if not surface.popup_open then return end
+  local vp = imgui.GetMainViewport()
+  local w, h = (@float32)(policy.popup_width), (@float32)(policy.popup_height)
+  local ax, ay = surface.popup_x, surface.popup_y
+  if ax == 0 and ay == 0 then -- a click without a position: the mouse
+    local m: ImVec2
+    imgui.GetMousePos(&m)
+    ax, ay = m.x, m.y
+  end
+  local x, y = anchored_popup_place(ax, ay, w, h, vp)
+  imgui.SetNextWindowPos(vec2(x, y), ImGuiCond_Always, vec2(0, 0))
+  imgui.SetNextWindowSize(vec2(w, h), ImGuiCond_Always)
+  if surface.popup_frames == 0 then imgui.SetNextWindowFocus() end
+  local flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoNav
+  imgui.PushStyleVarVec2(ImGuiStyleVar_WindowPadding, vec2(0, 0))
+  local open = true
+  if imgui.Begin('##ghostty-popup', &open, flags) then
+    local pos: ImVec2
+    local size: ImVec2
+    imgui.GetWindowPos(&pos)
+    imgui.GetWindowSize(&size)
+    popup_body(imgui.GetWindowDrawList(), pos.x, pos.y, pos.x + size.x, pos.y + size.y)
+    -- focus lands during the first Begin; judge blur from the next frame on
+    if surface.cfg.close_on_blur and surface.popup_frames > 1 and not imgui.IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) then
+      surface.popup_open = false
+    end
+  end
+  imgui.End()
+  imgui.PopStyleVar(1)
+  surface.popup_frames = surface.popup_frames + 1
+end
