@@ -1,0 +1,324 @@
+-- Settings window (/term config, or "cfg" in the tab bar).
+--
+-- Every entry edits a value inside the CONFIG table by path. Changes apply
+-- immediately and are saved to settings.lua in the config directory (a slider
+-- when it is released), which init.lua layers over its own defaults at load,
+-- clamped to each slider's range. Add an entry here to expose a new
+-- option; no core change is needed.
+
+local changelog = require('changelog')
+
+local S = {}
+
+local ALIGN = { 'left', 'center', 'right' }
+local MODS = { 'ctrl', 'ctrl+shift', 'ctrl+alt', 'alt', 'shift', '' }
+local PAD = { 'select', 'start', 'l3', 'r3', 'dpad_up', 'dpad_down', 'dpad_left', 'dpad_right', 'north', 'south', 'west', 'east', 'l1', 'r1', 'l2', 'r2', '' }
+local DTR_MODES = { 'auto', 'always', 'never' }
+
+S.schema = {
+  { 'Keys & controller', {
+    { 'toggle_mods', 'combo', MODS, 'Dropdown toggle modifiers (+ `)' },
+    { 'world_toggle_mods', 'combo', MODS, 'World terminals toggle modifiers (+ `)' },
+    { 'toggle_gamepad_button', 'combo', PAD, 'Controller button (tap / hold / double tap)' },
+  } },
+  { 'Dropdown', {
+    { 'dropdown.height', 'slider', 0.15, 1.0, 'Height (fraction of screen)' },
+    { 'dropdown.width', 'slider', 0.25, 1.0, 'Width (fraction of screen)' },
+    { 'dropdown.min_width', 'slider_int', 400, 3000, 'Minimum width (px)' },
+    { 'dropdown.align', 'combo', ALIGN, 'Alignment' },
+    { 'dropdown.y_offset', 'slider_int', 0, 200, 'Top offset (px, e.g. toolbar height)' },
+    { 'dropdown.opacity', 'slider', 0.3, 1.0, 'Opacity' },
+    { 'dropdown.rounding', 'slider', 0, 24, 'Corner rounding' },
+    { 'dropdown.margin', 'slider_int', 0, 80, 'Side margin (px)' },
+    { 'dropdown.font_size', 'slider', 8, 32, 'Font size' },
+    { 'dropdown.animation_ms', 'slider_int', 0, 600, 'Slide animation (ms)' },
+    { 'dropdown.open_on_start', 'checkbox', 'Open when the plugin loads' },
+    { 'dropdown.glass', 'checkbox', 'Glass (gradient body, edge highlight)' },
+    { 'dropdown.glow', 'slider', 0, 1, 'Outer glow' },
+    { 'dropdown.world_tint', 'slider', 0, 1, "Take on the world's light (time of day, weather)" },
+  } },
+  { 'Terminals', {
+    { 'close_on_exit', 'checkbox', 'Close a terminal when its shell exits (ctrl+d)' },
+    { 'copy_on_select', 'checkbox', 'Copy selected text when the mouse button is released' },
+    { 'cursor_blink', 'checkbox', 'Blinking cursor' },
+    { 'popup.font_size', 'slider', 8, 32, 'Toolbar popup font size' },
+  } },
+  { 'Pets (terminals around your character)', {
+    { 'world.pet.distance', 'slider', 1.5, 8, 'Distance (yalms)' },
+    { 'world.pet.height_above', 'slider', 0.5, 4, 'Height above feet (yalms)' },
+    { 'world.pet.side', 'slider', 0.6, 3.0, 'Angle from facing (radians)' },
+    { 'world.pet.step', 'slider', 0.2, 1.5, 'Spacing between pets (radians)' },
+    { 'world.pet.stiffness', 'slider', 1, 20, 'Follow stiffness' },
+    { 'world.pet.damping', 'slider', 0.3, 1.5, 'Damping (lower swings more)' },
+    { 'world.pet.bob', 'slider', 0, 0.3, 'Bob (yalms)' },
+    { 'world.pet.curve', 'slider', 0, 20, 'Curve radius (yalms, 0 = flat)' },
+    { 'world.pet.pixels_per_yalm', 'slider_int', 200, 1400, 'Pixel density' },
+    { 'world.pet.width', 'slider_int', 600, 4000, 'Default width (px)' },
+    { 'world.pet.height', 'slider_int', 320, 3000, 'Default height (px)' },
+    { 'world.pet.turn_speed', 'slider', 0, 12, 'Turn to face selected (rad/s, 0 = off)' },
+    { 'world.defaults.opacity', 'slider', 0.3, 1.0, 'Panel opacity' },
+    { 'world.occlusion', 'combo', { 'depth', 'capsule', 'off' }, 'Occlusion (depth = game geometry hides panels)' },
+    { 'world.occlusion_tolerance', 'slider', 0.005, 0.2, 'Occlusion tolerance (yalms)' },
+    { 'world.occlusion_edge', 'slider', 0, 3, 'Occlusion edge softness (px)' },
+  } },
+  { 'Clicked world panels', {
+    { 'world.present.enabled', 'checkbox', 'Float a clicked panel toward you' },
+    { 'world.present.full_screen', 'slider', 0.3, 1.0, 'Double-click: how much of the screen it fills' },
+    { 'world.present.fraction', 'slider', 0, 1, 'How far it floats (fraction of the way)' },
+    { 'world.present.distance', 'slider', 0.8, 4, 'Goal in front of the camera (yalms)' },
+    { 'world.present.min_distance', 'slider', 0.5, 3, 'Never nearer than (yalms)' },
+    { 'world.present.ease', 'slider', 0.05, 1.5, 'Float time (seconds)' },
+    { 'world.present.curve_relax', 'slider', 0, 2, 'Flatten while presented' },
+    { 'world.walk.enabled', 'checkbox', 'Walk up to a clicked panel' },
+    { 'world.walk.approach_distance', 'slider', 0.8, 5, 'Stop this far from it (yalms)' },
+    { 'world.walk.max_seconds', 'slider', 0.5, 8, 'Give up after (seconds)' },
+    { 'world.walk.turn_speed', 'slider', 1, 20, 'Turn speed (rad/s)' },
+  } },
+  { 'Placing world panels (Alt + drag)', {
+    { 'world.drag.enabled', 'checkbox', 'Alt + drag moves a panel (Shift snaps to surfaces, + Ctrl stretches)' },
+    { 'world.drag.wheel_step', 'slider', -1, 1, 'Wheel while dragging (yalms per notch)' },
+    { 'world.drag.offset', 'slider', 0, 0.2, 'Gap to the surface when snapped (yalms)' },
+    { 'world.drag.fit_max', 'slider', 0.5, 10, 'Stretch at most (yalms each way)' },
+    { 'world.drag.fit_margin', 'slider', 0, 0.5, 'Stretch: keep clear of edges (yalms)' },
+    { 'world.drag.fit_tolerance', 'slider', 0.01, 0.2, 'Stretch: bumps that still count as flat (yalms)' },
+  } },
+  { 'Light', {
+    { 'world.light.enabled', 'checkbox', 'React to time of day and weather' },
+    { 'world.light.backlight_below', 'slider', 0.5, 1.2, 'Backlight when dimmer than' },
+    { 'world.light.rain_dim', 'slider', 0, 0.5, 'Rain darkening' },
+    { 'world.light.cast_light', 'checkbox', 'Panels light up your character and the world' },
+    { 'world.light.light_intensity', 'slider', 0, 4, 'Cast light intensity' },
+    { 'world.light.light_range', 'slider', 1, 20, 'Cast light range (yalms)' },
+    { 'world.light.light_by_day', 'slider', 0, 1, 'Cast light in daylight (share)' },
+    { 'world.light.light_color_from_tint', 'checkbox', 'Cast light takes the time-of-day tint' },
+    { 'world.light.shadows', 'checkbox', 'Cast light throws shadows (expensive)' },
+  } },
+  { 'Character animation', {
+    { 'animation.enabled', 'checkbox', 'Hold a pose while a terminal is out or focused' },
+    { 'animation.preset', 'combo', { 'device', 'book', 'pen', 'photograph', 'think', 'lookout' }, 'Pose' },
+    { 'animation.custom_timeline', 'slider_int', 0, 40000, 'Custom ActionTimeline id (0 = use the pose)' },
+    { 'animation.typing_speed', 'slider', 1, 4, 'Pose animation speed while typing' },
+    { 'animation.energy_decay', 'slider', 0.5, 6, 'How fast typing energy fades' },
+    { 'animation.lock_movement', 'checkbox', 'Lock movement while holding (not recommended)' },
+  } },
+  { 'Bell', {
+    { 'bell.enabled', 'checkbox', 'Visual bell when a program rings (BEL)' },
+    { 'bell.preset', 'combo', { 'ripple', 'sonar', 'burst', 'aura', 'calm', 'custom' }, 'Style (custom uses the values below)' },
+    { 'bell.from_character', 'checkbox', 'Rings of light around your character' },
+    { 'bell.ring_count', 'slider_int', 1, 3, 'Rings per bell' },
+    { 'bell.max_radius', 'slider', 1, 6, 'Ring radius (yalms)' },
+    { 'bell.duration', 'slider', 0.3, 2.5, 'Ring duration (s)' },
+    { 'bell.glow_duration', 'slider', 0.3, 3, 'Terminal glow duration (s)' },
+    { 'bell.follow_tint', 'checkbox', 'World screens tint it with their light' },
+    { 'bell.accent.r', 'slider', 0, 1, 'Accent colour: red' },
+    { 'bell.accent.g', 'slider', 0, 1, 'Accent colour: green' },
+    { 'bell.accent.b', 'slider', 0, 1, 'Accent colour: blue' },
+  } },
+  { 'Info bar & hidden UI', {
+    { 'host.dtr.mode', 'combo', DTR_MODES, 'Server info bar entry (auto: only without the Umbra widget)' },
+    { 'popup.close_on_blur', 'checkbox', 'Info bar popup closes when you click elsewhere' },
+    { 'host.keep_visible.user_hidden', 'checkbox', 'Stay visible when you hide the game UI' },
+    { 'host.keep_visible.cutscene', 'checkbox', 'Stay visible in cutscenes' },
+    { 'host.keep_visible.gpose', 'checkbox', 'Stay visible in group pose' },
+  } },
+}
+
+local function get(root, path)
+  local t = root
+  for part in path:gmatch('[^.]+') do
+    if type(t) ~= 'table' then return nil end
+    t = t[part]
+  end
+  return t
+end
+
+local function set(root, path, value)
+  local parts = {}
+  for part in path:gmatch('[^.]+') do parts[#parts + 1] = part end
+  local t = root
+  for i = 1, #parts - 1 do
+    if type(t[parts[i]]) ~= 'table' then t[parts[i]] = {} end
+    t = t[parts[i]]
+  end
+  t[parts[#parts]] = value
+end
+
+local function file()
+  return (GHOSTTY_PLUGIN_DIR or '.') .. '/settings.lua'
+end
+
+S.values = {}   -- path -> value, what settings.lua stores
+
+-- path -> schema entry, built on first use
+local entries
+local function entry(path)
+  if not entries then
+    entries = {}
+    for _, section in ipairs(S.schema) do
+      for _, e in ipairs(section[2]) do entries[e[1]] = e end
+    end
+  end
+  return entries[path]
+end
+
+-- A saved value as the schema allows it: sliders clamped to their range (a
+-- pixel density of 0 or NaN breaks every pet), nil when it cannot be used.
+local function sanitize(path, value)
+  local e = entry(path)
+  if not e or (e[2] ~= 'slider' and e[2] ~= 'slider_int') then return value end
+  if type(value) ~= 'number' or value ~= value then return nil end
+  if e[2] == 'slider_int' then value = math.floor(value) end
+  return math.min(math.max(value, e[3]), e[4])
+end
+
+-- Layer saved values over the config (called from init.lua before returning).
+function S.apply(config)
+  local chunk = loadfile(file())
+  if chunk then
+    local ok, saved = pcall(chunk)
+    if ok and type(saved) == 'table' then
+      for path, value in pairs(saved) do
+        value = sanitize(path, value)
+        if value ~= nil then
+          S.values[path] = value
+          set(config, path, value)
+        end
+      end
+    end
+  end
+  S.config = config
+  return config
+end
+
+function S.save()
+  local keys = {}
+  for k in pairs(S.values) do keys[#keys + 1] = k end
+  table.sort(keys)
+  local out = { '-- Written by the Ghostty settings window.\nreturn {\n' }
+  for _, k in ipairs(keys) do
+    local v = S.values[k]
+    local lit = type(v) == 'string' and string.format('%q', v) or tostring(v)
+    out[#out + 1] = string.format('  [%q] = %s,\n', k, lit)
+  end
+  out[#out + 1] = '}\n'
+  local f = io.open(file(), 'w')
+  if f then f:write(table.concat(out)) f:close() end
+end
+
+-- An error inside a tab is logged once (it repeats every frame) and the tab
+-- is still closed, so ImGui's tab stack stays balanced.
+local last_error
+local function report(err)
+  err = tostring(err)
+  if err == last_error then return end
+  last_error = err
+  if ghostty and ghostty.log then ghostty.log('settings: ' .. err) end
+end
+
+-- The window body: Settings, Changelog and About tabs. Returns true when a
+-- setting changed.
+function S.draw()
+  local ui = ghostty.ui
+  local changed = false
+  if ui.tabs('##ghostty_settings_tabs') then
+    if ui.tab('Settings') then
+      local ok, r = pcall(S.draw_settings, ui)
+      ui.end_tab()
+      if ok then changed = r else report(r) end
+    end
+    if ui.tab('Changelog') then
+      local ok, err = pcall(changelog.draw_changelog, ui)
+      ui.end_tab()
+      if not ok then report(err) end
+    end
+    if ui.tab('About') then
+      local ok, err = pcall(changelog.draw_about, ui)
+      ui.end_tab()
+      if not ok then report(err) end
+    end
+    ui.end_tabs()
+  end
+  return changed
+end
+
+function S.draw_settings(ui)
+  local config = S.config or CONFIG
+  local changed = false
+  local save_now = false -- toggles and choices save at once, sliders when released
+  ui.text('Changes apply immediately and are saved to settings.lua.')
+  ui.separator()
+  for si, section in ipairs(S.schema) do
+    if ui.header(section[1], si == 1) then
+      for _, e in ipairs(section[2]) do
+        local path, kind = e[1], e[2]
+        local cur = get(config, path)
+        local c, v, done = false, cur, false
+        if kind == 'slider' then
+          c, v, done = ui.slider(e[5] .. '##' .. path, tonumber(cur) or e[3], e[3], e[4])
+        elseif kind == 'slider_int' then
+          c, v, done = ui.slider_int(e[5] .. '##' .. path, math.floor(tonumber(cur) or e[3]), e[3], e[4])
+        elseif kind == 'checkbox' then
+          c, v = ui.checkbox(e[3] .. '##' .. path, cur and true or false)
+        elseif kind == 'combo' then
+          c, v = ui.combo(e[4] .. '##' .. path, tostring(cur or ''), e[3])
+        end
+        if c then
+          set(config, path, v)
+          S.values[path] = v
+          changed = true
+          if kind == 'checkbox' or kind == 'combo' then save_now = true end
+        end
+        if done then save_now = true end
+      end
+    end
+  end
+  S.draw_status(ui)
+  ui.separator()
+  if ui.button('Reset all to defaults') then
+    S.values = {}
+    S.save()
+    ui.text('Defaults restore on the next reload (/term reload).')
+  end
+  if save_now then S.save() end
+  return changed
+end
+
+-- Read-only: how the core is hosted, what it registered, and which lua files
+-- in the config directory override or were set aside by the migration.
+local function lua_files(dir)
+  local out = {}
+  for _, name in ipairs((ghostty.listdir and ghostty.listdir(dir)) or {}) do
+    if name:match('%.lua$') then out[#out + 1] = name end
+  end
+  table.sort(out)
+  return #out > 0 and table.concat(out, ', ') or 'none'
+end
+
+function S.draw_status(ui)
+  if not ui.header('Plugin status') then return end
+  local info = ghostty.host_info and ghostty.host_info()
+  if not info then ui.text('No host information (old core).') return end
+  ui.text('Core: ' .. info.state .. (info.reason ~= '' and (' (' .. info.reason .. ')') or ''))
+  ui.text('Umbra loaded: ' .. (info.umbra and 'yes' or 'no') .. ', toolbar widget seen: ' .. (info.widget and 'yes' or 'no'))
+  ui.text('Info bar entry shown: ' .. (info.dtr_shown and 'yes' or 'no'))
+  local names = {}
+  for name, ok in pairs(info.commands) do names[#names + 1] = name .. (ok and '' or ' (not registered)') end
+  table.sort(names)
+  ui.text('Commands: ' .. (#names > 0 and table.concat(names, ' ') or 'none'))
+  if info.events_dropped > 0 then ui.text('Dropped events: ' .. info.events_dropped) end
+  local config = GHOSTTY_CONFIG_DIR or info.config_dir
+  ui.wrapped('Config: ' .. config, 0.72, 0.74, 0.78)
+  ui.wrapped('Shipped files: ' .. (GHOSTTY_INSTALL_DIR or info.install_dir), 0.72, 0.74, 0.78)
+  ui.text('Your overrides (lua/): ' .. lua_files(config .. '/lua'))
+  local legacy = lua_files(config .. '/legacy-lua')
+  if legacy ~= 'none' then
+    ui.wrapped('Kept from the Umbra install, not loaded (legacy-lua/): ' .. legacy, 0.92, 0.74, 0.40)
+  end
+  local f = io.open(config .. '/migrated-from-umbra.txt', 'r')
+  if f then
+    ui.wrapped(f:read('l') or 'Migrated from the Umbra install.', 0.66, 0.62, 0.78)
+    f:close()
+  end
+end
+
+return S
