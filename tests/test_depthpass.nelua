@@ -89,6 +89,12 @@ local function fake_font_size(): float32 return 16 end
 local function fake_time(): float64 return now end
 local function fake_io(): *ImGuiIO return &io_state end
 local function fake_clicked(button: cint, rep: boolean): boolean return false end
+-- what a focused panel asks for (keyboard input)
+local function fake_focus_nil(): void end
+local function fake_frame_count(): cint return 0 end
+local function fake_key_down(key: cint): boolean return false end
+local function fake_key_pressed(key: cint, rep: boolean): boolean return false end
+local function fake_set_clipboard(text: cstring): void end
 
 local function resolver(name: cstring): pointer
   local n: string = name
@@ -112,6 +118,11 @@ local function resolver(name: cstring): pointer
   if n == 'igGetTime' then return (@pointer)(fake_time) end
   if n == 'igGetIO' then return (@pointer)(fake_io) end
   if n == 'igIsMouseClicked' then return (@pointer)(fake_clicked) end
+  if n == 'igSetWindowFocus_Nil' then return (@pointer)(fake_focus_nil) end
+  if n == 'igGetFrameCount' then return (@pointer)(fake_frame_count) end
+  if n == 'igIsKeyDown' then return (@pointer)(fake_key_down) end
+  if n == 'igIsKeyPressed' then return (@pointer)(fake_key_pressed) end
+  if n == 'igSetClipboardText' then return (@pointer)(fake_set_clipboard) end
   return nilptr
 end
 
@@ -406,8 +417,9 @@ do
   assert(depthpass_frame_begin(fake_scene_depth, &fr) and depthpass_panel_begin(&dl, &pb, 1), 'the pool is per frame')
 end
 
--- shadow boards through draw_world: one behind the drawn panel, freed when the
--- world derezzes and at shutdown (the lifecycle itself is tests/test_occluders)
+-- shadow boards through draw_world: one behind the drawn panel (presented
+-- included), freed when the world derezzes and at shutdown (the lifecycle
+-- itself is tests/test_occluders)
 local board_live = 0
 local board_x: float32, board_z: float32 = 0, 0
 local function fake_bg_create(path: cstring): pointer board_live = board_live + 1 return (@pointer)(0x7000) end
@@ -432,6 +444,33 @@ assert(board_live == 0, 'derezzed world: the board is freed')
 host.world_visible = true
 for _ = 1, 60 do frame() end
 assert(board_live == 1, 'rezzed again: a fresh board')
+
+-- a focused panel floats out to meet you: its board goes with it, just behind
+-- the panel as drawn, and back to the anchor once focus leaves
+do
+  assert(luaL_loadstring(policy.L, 'CONFIG.world.present.enabled = true') == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  assert(run_command('depth retry') == 0) -- the frames above ran no callbacks
+  local _, anchor = policy_world_place(501, now, false)
+  host.world_focus = 501
+  for _ = 1, 240 do
+    frame()
+    render() -- keep the depth test live: its constants tell where the panel is drawn
+  end
+  assert(s.present_t > 0.99 and depthpass.ready, 'presented')
+  assert(board_live == 1, 'the focused panel keeps one board')
+  local drawn_z = EYE_Z + world_panel_ray_depth(&depthpass.pool[0], verts[0].pos.x, verts[0].pos.y)
+  print('presented panel z', drawn_z, 'board z', board_z, 'anchor z', anchor.z)
+  assert(drawn_z < anchor.z - 0.3, 'the presented panel is drawn nearer the camera than its anchor')
+  assert(board_z > drawn_z and board_z < drawn_z + 0.1, 'the board is behind the presented panel')
+  assert(board_z < anchor.z - 0.3, 'no board left standing at the anchor')
+  host.world_focus = 0
+  for _ = 1, 240 do
+    frame()
+    render()
+  end
+  assert(s.present_t < 0.01 and board_live == 1, 'back at the anchor')
+  assert(math.abs(board_x - anchor.x) < 1e-3 and board_z > anchor.z and board_z < anchor.z + 0.1, 'the board is back behind the anchor')
+end
 
 host.world:clear()
 s:destroy()
