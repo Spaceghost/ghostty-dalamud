@@ -567,7 +567,6 @@ global function draw_world(now: float64): void
       carried_pl = pl
     end
     light_panel(s.id, ok and not s.sleeping, &pl, prez * (1 - ft))
-    occluder_panel(s.id, ok and not s.sleeping and prez * (1 - ft) > 0, &pl, &host.world_tuning)
     -- a double-clicked panel flies to a centred rectangle covering full_screen of the view
     local fsz = host.world_tuning.full_screen
     local fw = math.max(cam.width * fsz, 320)
@@ -580,6 +579,9 @@ global function draw_world(now: float64): void
       if host.walk.id == s.id then host.walk.tx, host.walk.tz = placed_x, placed_z end
       if not carried then present_panel(s, &pl, &cam, &occ, &pc, wdt, full_this) end
     end
+    -- the shadow board follows the pose the panel is drawn at (carried or
+    -- presented); full screen leaves the world, so the board goes
+    occluder_panel(s.id, ok and not s.sleeping and prez * (1 - ft) > 0, &pl, &host.world_tuning)
     -- mid-flight the terminal keeps the grid of its world size, so the shell is
     -- resized once when the flight ends instead of on every frame of it
     local grid_w, grid_h = pl.width, pl.height
