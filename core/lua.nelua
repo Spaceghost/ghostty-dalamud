@@ -1,4 +1,5 @@
 -- Lua 5.4 C API subset (vendor/lua compiled into the same binary).
+require 'string'
 ## cinclude '<lua.h>'
 ## cinclude '<lauxlib.h>'
 ## cinclude '<lualib.h>'
@@ -19,7 +20,7 @@ global LUA_TFUNCTION: cint <cimport, nodecl, const>
 global LUA_REGISTRYINDEX: cint <cimport, nodecl, const>
 
 global function luaL_newstate(): *lua_State <cimport, nodecl> end
-global function luaL_openlibs(L: *lua_State): void <cimport, nodecl> end
+local function lua_open_standard_libraries(L: *lua_State): void <cimport 'luaL_openlibs', nodecl> end
 global function lua_close(L: *lua_State): void <cimport, nodecl> end
 global function luaL_loadfilex(L: *lua_State, filename: cstring, mode: cstring): cint <cimport, nodecl> end
 global function luaL_loadstring(L: *lua_State, s: cstring): cint <cimport, nodecl> end
@@ -50,6 +51,25 @@ global function lua_createtable(L: *lua_State, narr: cint, nrec: cint): void <ci
 global function lua_pushvalue(L: *lua_State, idx: cint): void <cimport, nodecl> end
 global function lua_isstring(L: *lua_State, idx: cint): cint <cimport, nodecl> end
 
+## if ccinfo.is_windows then
+local function platform_GetModuleHandleA(name: cstring): pointer <cimport 'GetModuleHandleA', cinclude '<windows.h>', nodecl> end
+local function platform_GetProcAddress(mod: pointer, name: cstring): pointer <cimport 'GetProcAddress', cinclude '<windows.h>', nodecl> end
+## end
+
+-- Publish runtime capability information before any configuration is evaluated.
+-- Wine also compiles as Windows; its native marker distinguishes the two.
+global function luaL_openlibs(L: *lua_State): void <codename 'ghostty_lua_openlibs'>
+  lua_open_standard_libraries(L)
+  local platform: cstring = 'posix'
+  ## if ccinfo.is_windows then
+    platform = 'windows'
+    local ntdll = platform_GetModuleHandleA('ntdll.dll')
+    if ntdll ~= nilptr and platform_GetProcAddress(ntdll, 'wine_get_version') ~= nilptr then platform = 'wine' end
+  ## end
+  lua_pushstring(L, platform)
+  lua_setglobal(L, 'GHOSTTY_PLATFORM')
+end
+
 global function lua_pop(L: *lua_State, n: cint): void
   lua_settop(L, -n - 1)
 end
@@ -58,7 +78,6 @@ global function lua_pcall(L: *lua_State, nargs: cint, nresults: cint, errfunc: c
   return lua_pcallk(L, nargs, nresults, errfunc, 0, nilptr)
 end
 
--- Convenience: read a string field from the table at `idx` (copy), or `def`.
 global function lua_field_string(L: *lua_State, idx: cint, k: cstring, def: string): string
   lua_getfield(L, idx, k)
   local r: string

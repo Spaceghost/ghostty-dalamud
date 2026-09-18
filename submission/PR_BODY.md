@@ -1,52 +1,32 @@
-# DRAFT — Ghostty initial testing submission
+# Ghostty initial testing submission (draft only)
 
-Do not submit this template unchanged. Complete docs/PUBLISHING.md first.
+Do not send this upstream until docs/D17_READINESS.md is complete. Replace this
+notice with the exact reviewed commit, package hash and actual testing results.
 
-## What the plugin does
+## Purpose and execution model
 
-A libghostty-vt terminal with a Nelua core and Lua configuration, hosted by a
-small Dalamud shim. It supports local Windows ConPTY sessions and a separately
-started Linux/macOS PTY agent (macOS requires validation). The optional Umbra
-widget is independent. The release archive excludes the native hot-reload
-loader, host/game assemblies, user configuration and the agent executable.
+Ghostty embeds a libghostty-vt terminal in FFXIV. The native core is Nelua, policy
+and configuration are Lua, and the managed shim integrates with Dalamud. Shells
+run using local Windows ConPTY or a separately configured, token-authenticated
+POSIX agent. The agent stream is plaintext and requires loopback or a secure
+tunnel. Lua and shell commands execute with the user's privileges, not in a
+sandbox. The optional Umbra widget is not a hard dependency of the main ZIP.
 
-## Features requiring explicit approval review
+## Required review notes
 
-Please review the world-pinned screens, camera/showcase controls, character
-animation/speed/rotation functionality, input hooks and experimental shadow
-objects. Include the actual constraints and code locations after review.
-This template does not assert that these features already comply.
+Document the Plogon source-build path, generated NuGet lock and shipped licenses.
+Explain Windowing API integration and all remaining movement, camera, animation,
+input, clipboard, lighting and shadow functionality, including what was removed
+from the actual submitted build. Do not equate a default-off switch with approval.
+Attach actual personal test results and reviewed icon/screenshots, not fixture
+outputs or promised testing. New submission channel: testing/live only.
 
-## Build and provenance
+## AI usage disclosure
 
-- Exact source commit: TODO
-- Clean build and native dependency provenance: TODO
-- Supported Plogon native build path and generated NuGet lock file: TODO
-- Runtime package SHA-256 and retained build/test evidence: TODO
-- License and required third-party notices: TODO
-
-## Personal test results
-
-Not yet recorded. Replace with actual results for the exact submitted commit:
-Windows and Linux/Wine, API/game versions, clean installation, transport/token
-setup, ordinary use, settings, unload/reload, relaunch, read-only installation,
-missing dependencies, and Umbra absent/present. Do not infer runtime results
-from packaging unit tests or source review.
-
-## AI disclosure
-
-AI-generated implementation was used for this release-preparation change in
-response to the maintainer's high-level request, including packaging scripts,
-tests and documentation. For that session the applicable disclosure is Auto:
-the agent investigated and implemented autonomously; human review and in-game
-testing have not been established. The repository also contains prior
-AI-coauthored work. The maintainer must accurately describe the full history,
-actual human involvement, personal review and testing before submission.
-Do not downgrade disclosure or claim testing merely because a tool generated
-this template. No icon or marketing artwork was generated in this change.
-
-- [ ] All outstanding gates in docs/PUBLISHING.md are resolved.
-- [ ] The maintainer understands and personally tested the submitted code.
-- [ ] The source, exact commit and dependencies are public and auditable.
-- [ ] The icon is provided and AI involvement is accurately disclosed.
-- [ ] Only testing/live/GhosttyDalamud is changed in this D17 PR.
+This preparation was implemented by an AI agent from high-level maintainer
+direction (Auto for this preparation). Existing project history also includes
+AI-coauthored work. No personal in-game testing or meaningful human code review
+has been established by this preparation. Describe the actual subsequent human
+review and testing here before submission; do not silently relabel the work as
+unassisted or remove attribution to conceal AI involvement. The maintainer must
+understand and be able to explain the code being submitted.

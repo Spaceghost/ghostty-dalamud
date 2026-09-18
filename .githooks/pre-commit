@@ -1,0 +1,9 @@
+#!/bin/sh
+# Opt-in maintainer identity check. Contributors keep their own attribution.
+set -eu
+for kind in GIT_AUTHOR_IDENT GIT_COMMITTER_IDENT; do
+  [ "$(git var "$kind" | sed 's/>.*/>/')" = 'Spaceghost <251370+Spaceghost@users.noreply.github.com>' ] || {
+    echo 'Use the repository pseudonymous author and committer identity before committing.' >&2
+    exit 1
+  }
+done
