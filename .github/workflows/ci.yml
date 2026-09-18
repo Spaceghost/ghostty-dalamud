@@ -1,53 +1,84 @@
-name: CI
-on: [push, pull_request, workflow_dispatch]
+name: Plugin candidate
+on:
+  pull_request:
+  push:
+    branches: [main, release/dalamud-submission-prep]
+  workflow_dispatch:
+    inputs:
+      runner:
+        description: 'Build runner (self-hosted must be registered and online for this repo)'
+        type: choice
+        default: hosted
+        options: [hosted, self-hosted]
 permissions:
   contents: read
+concurrency:
+  group: plugin-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   source-checks:
-    runs-on: ubuntu-24.04
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || fromJSON('["ubuntu-24.04"]') }}
+    timeout-minutes: 10
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
       - run: python3 -m unittest discover -s tests -p 'test_*.py' -v
-  linux-build:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 35
+      - run: for script in tools/*.sh tests/run.sh; do bash -n "$script"; done
+  candidate:
+    needs: source-checks
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || fromJSON('["ubuntu-24.04"]') }}
+    timeout-minutes: 45
+    env:
+      DOTNET_CLI_TELEMETRY_OPTOUT: '1'
+      DOTNET_NOLOGO: '1'
+      PYTHONDONTWRITEBYTECODE: '1'
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        env:
+          DOTNET_INSTALL_DIR: ${{ runner.temp }}/ghostty-dotnet
         with:
           dotnet-version: '10.0.x'
-      - name: Test native-cache file isolation without loading the game
-        run: dotnet run --project tests/cache/CacheTests.csproj -c Release
-      - name: Install pinned Zig from the official distribution
+      - name: Install the pinned Zig version with its official checksum
         shell: bash
         run: |
+          source toolchain.env
+          export ZIG_VERSION
           python3 - <<'PY'
-          import hashlib, json, os, pathlib, shutil, tarfile, urllib.request
-          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ghostty-zig'
-          root.mkdir(parents=True, exist_ok=True)
-          version = next(line.split('=', 1)[1].strip() for line in pathlib.Path('toolchain.env').read_text().splitlines() if line.startswith('ZIG_VERSION='))
+          import hashlib, json, os, pathlib, tempfile, tarfile, urllib.request
           with urllib.request.urlopen('https://ziglang.org/download/index.json', timeout=60) as response:
-              release = json.load(response)[version]['x86_64-linux']
-          assert release['tarball'].startswith('https://ziglang.org/'), 'unexpected toolchain origin'
-          archive = root / 'zig.tar.xz'
-          with urllib.request.urlopen(release['tarball'], timeout=120) as response, archive.open('wb') as output:
-              shutil.copyfileobj(response, output)
-          with archive.open('rb') as stream:
-              assert hashlib.file_digest(stream, 'sha256').hexdigest() == release['shasum'], 'toolchain checksum mismatch'
-          with tarfile.open(archive) as tar:
-              tar.extractall(root, filter='data')
-          binaries = list(root.glob('*/zig'))
-          assert len(binaries) == 1, 'unexpected toolchain layout'
+              release = json.load(response)[os.environ['ZIG_VERSION']]['x86_64-linux']
+          if not release['tarball'].startswith('https://ziglang.org/'):
+              raise SystemExit('Unexpected Zig download origin')
+          directory = pathlib.Path(tempfile.mkdtemp(prefix='ghostty-zig-', dir=os.environ['RUNNER_TEMP']))
+          archive = directory / 'zig.tar.xz'
+          with urllib.request.urlopen(release['tarball'], timeout=120) as response:
+              archive.write_bytes(response.read())
+          if hashlib.sha256(archive.read_bytes()).hexdigest() != release['shasum']:
+              raise SystemExit('Zig checksum mismatch')
+          with tarfile.open(archive) as bundle:
+              bundle.extractall(directory, filter='data')
+          binary = next(directory.glob('*/zig'))
           with open(os.environ['GITHUB_PATH'], 'a') as output:
-              output.write(str(binaries[0].parent) + '\n')
+              output.write(str(binary.parent) + '\n')
           PY
-      - run: tools/fetch-vendor.sh
-      - run: tools/build.sh
-      - run: vendor/nelua-lang/nelua-lua tests/test_defaults.lua
-      - run: tests/run.sh
+      - name: Build, host-test and validate the private candidate
+        run: tools/build-release.sh
+      - name: Retain private candidate and generated restore evidence
+        if: success()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: GhosttyDalamud-candidate-${{ github.event.pull_request.head.sha || github.sha }}
+          if-no-files-found: error
+          retention-days: 7
+          path: |
+            build/release/
+            shim/GhosttyDalamud/packages.lock.json

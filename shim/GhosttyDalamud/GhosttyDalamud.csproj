@@ -1,31 +1,45 @@
 <?xml version="1.0" encoding="utf-8"?>
 <Project Sdk="Microsoft.NET.Sdk">
-  <!-- The native core and Lua modules are assembled by tools/build.sh. -->
+  <!-- Native dependencies must be built from the pinned sources first.
+       See tools/build.sh and docs/PUBLISHING.md; never fetch release DLLs here. -->
   <PropertyGroup>
+    <DalamudLibPath Condition="'$(DalamudLibPath)' == '' and '$(DALAMUD_HOME)' != ''">$(DALAMUD_HOME)/</DalamudLibPath>
     <DalamudLibPath Condition="'$(DalamudLibPath)' == ''">$(APPDATA)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
-  </PropertyGroup>
-  <PropertyGroup>
+    <DalamudLibPath>$([MSBuild]::EnsureTrailingSlash('$(DalamudLibPath)'))</DalamudLibPath>
     <TargetFramework>net10.0-windows</TargetFramework>
     <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
     <Nullable>enable</Nullable>
-    <LangVersion>latest</LangVersion>
+    <LangVersion>14.0</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
     <EnableWindowsTargeting>true</EnableWindowsTargeting>
-    <OutputPath>..\..\build\plugin\GhosttyDalamud\</OutputPath>
+    <OutputPath>../../build/plugin/GhosttyDalamud/</OutputPath>
     <RootNamespace>GhosttyDalamud</RootNamespace>
     <AssemblyName>GhosttyDalamud</AssemblyName>
     <Version>0.2.0.0</Version>
+    <AssemblyVersion>0.2.0.0</AssemblyVersion>
+    <FileVersion>0.2.0.0</FileVersion>
     <Authors>Spaceghost</Authors>
+    <RepositoryUrl>https://github.com/Spaceghost/ghostty-dalamud</RepositoryUrl>
     <Description>Ghostty terminal inside FFXIV (libghostty-vt core written in Nelua, policy in Lua).</Description>
     <IsPackable>false</IsPackable>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
+    <Deterministic>true</Deterministic>
+    <EnableDefaultNoneItems>false</EnableDefaultNoneItems>
   </PropertyGroup>
+
   <ItemGroup>
+    <PackageReference Include="DalamudPackager" Version="15.0.0" PrivateAssets="all" />
+    <GhosttyLua Include="../../lua/*.lua" />
     <None Include="GhosttyDalamud.json" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="../../build/dist/ghostty_core.dll" Link="ghostty_core.dll" CopyToOutputDirectory="PreserveNewest" />
+    <None Include="@(GhosttyLua)" Link="lua/%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
+
   <ItemGroup>
     <Reference Include="Dalamud"><HintPath>$(DalamudLibPath)Dalamud.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Dalamud.Bindings.ImGui"><HintPath>$(DalamudLibPath)Dalamud.Bindings.ImGui.dll</HintPath><Private>false</Private></Reference>
@@ -34,4 +48,8 @@
     <Reference Include="Lumina"><HintPath>$(DalamudLibPath)Lumina.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Lumina.Excel"><HintPath>$(DalamudLibPath)Lumina.Excel.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
+  <Target Name="RequireGhosttyNativeBuild" BeforeTargets="PrepareForBuild">
+    <Error Condition="!Exists('$(MSBuildProjectDirectory)/../../build/dist/ghostty_core.dll')"
+           Text="Build the pinned native core first: SKIP_SHIM=1 SKIP_UMBRA=1 tools/build.sh. See docs/PUBLISHING.md for the upstream build prerequisite." />
+  </Target>
 </Project>
