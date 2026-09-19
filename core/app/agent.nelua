@@ -60,6 +60,11 @@ global function agent_event(ctx: pointer, ev: *AgentEvent): void
       local msg = sb:promote()
       s:feed_text(msg)
       msg:destroy()
+      if s.assistant then -- e.g. the Windows agent could not start the command
+        local note = policy_assistant_exit(0, true)
+        s:feed_text(note)
+        note:destroy()
+      end
       s.exited = true
     else
       s:agent_opened(ev.id)
@@ -219,6 +224,15 @@ local function agent_use_fallbacks(): void
   for i = 0, < #host.pending_open do
     local s = host.pending_open[i]
     local f: *Profile = nilptr
+    if s ~= nilptr and s.local_fallback and s.awaiting_open and not s.exited then
+      -- no fallback profile: the same command, here over ConPTY
+      logf(LOG_INFO, 'session %d: no agent, running it locally', s.id)
+      local lp: Profile = { name = s.label:copy(), transport = string.copy('conpty') }
+      for k = 0, < #s.open_argv do lp.argv:push(s.open_argv[k]:copy()) end
+      s:use_fallback(&lp) -- frees open_argv: lp holds its own copies
+      profile_free(&lp)
+      continue
+    end
     if s ~= nilptr then
       local asked: Profile = { transport = 'agent', fallback = s.fallback }
       f = policy_open_profile(&asked, true)
@@ -310,14 +324,8 @@ global function agent_final_flush(): void
 end
 
 -- Sessions -------------------------------------------------------------------
-global function session_new(profile_index: integer, cols: uint16, rows: uint16): *Session
-  local p = policy_profile(profile_index)
-  if p == nilptr then
-    if #policy.profiles == 0 then return nilptr end
-    p = policy_profile(0)
-  end
-  -- no agent answered the last attempt: a profile with a local fallback opens that
-  p = policy_open_profile(p, not host.agent_enabled or host.agent_down)
+-- A session for profile `p` as given (no fallback choice).
+global function session_open(p: *Profile, cols: uint16, rows: uint16): *Session
   local s = new(@Session)
   local agent: *AgentClient = nilptr
   if host.agent_enabled then agent = &host.agent end
@@ -330,6 +338,33 @@ global function session_new(profile_index: integer, cols: uint16, rows: uint16):
   if s.kind == TransportKind.Agent and s.awaiting_open then host.pending_open:push(s) end
   host.sessions:push(s)
   logf(LOG_INFO, 'session %d: %s (%s)', s.id, p.name, p.transport)
+  return s
+end
+
+global function session_new(profile_index: integer, cols: uint16, rows: uint16): *Session
+  local p = policy_profile(profile_index)
+  if p == nilptr then
+    if #policy.profiles == 0 then return nilptr end
+    p = policy_profile(0)
+  end
+  -- no agent answered the last attempt: a profile with a local fallback opens that
+  p = policy_open_profile(p, not host.agent_enabled or host.agent_down)
+  return session_open(p, cols, rows)
+end
+
+-- /term ask: a session running what lua/assistant.lua chose. It stays open
+-- after the assistant exits. With `local_fallback` and no agent answering,
+-- the same argv runs over ConPTY instead.
+global function session_new_assistant(spec: *AssistantOpen, cols: uint16, rows: uint16): *Session
+  local p: Profile = { name = spec.label, transport = spec.transport }
+  if spec.transport == 'agent' and spec.local_fallback and (not host.agent_enabled or host.agent_down) then
+    p.transport = 'conpty'
+  end
+  p.argv = spec.argv -- borrowed: Session:init copies what it keeps
+  local s = session_open(&p, cols, rows)
+  if s == nilptr then return nilptr end
+  s.assistant = true
+  s.local_fallback = spec.local_fallback and s.kind == TransportKind.Agent
   return s
 end
 

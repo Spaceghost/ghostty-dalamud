@@ -43,6 +43,7 @@ run test_chrome "$ROOT"
 run test_migrate "$ROOT" "$ROOT/build/test-scratch"
 run test_vote "$ROOT" "$ROOT/build/test-scratch"
 run test_platform "$ROOT" "$ROOT/build/test-scratch"
+run test_assistant "$ROOT"
 run test_hostsurface "$ROOT" "$ROOT/build/test-scratch/surface"
 run test_depthpass "$ROOT"
 

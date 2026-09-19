@@ -166,15 +166,17 @@ local function read_profile(L: *lua_State, idx: cint): Profile
   return p
 end
 
+-- Free what a profile owns (the configured ones, and ones the core builds).
+global function profile_free(p: *Profile): void
+  p.name:destroy() p.transport:destroy() p.host:destroy() p.cwd:destroy() p.fallback:destroy()
+  for k = 0, < #p.argv do p.argv[k]:destroy() end
+  p.argv:destroy()
+  for k = 0, < #p.env do p.env[k]:destroy() end
+  p.env:destroy()
+end
+
 local function clear_profiles(): void
-  for i = 0, < #policy.profiles do
-    local p = &policy.profiles[i]
-    p.name:destroy() p.transport:destroy() p.host:destroy() p.cwd:destroy() p.fallback:destroy()
-    for k = 0, < #p.argv do p.argv[k]:destroy() end
-    p.argv:destroy()
-    for k = 0, < #p.env do p.env[k]:destroy() end
-    p.env:destroy()
-  end
+  for i = 0, < #policy.profiles do profile_free(&policy.profiles[i]) end
   policy.profiles:clear()
 end
 
@@ -870,4 +872,94 @@ global function policy_showcase_delay(): float64
   if lua_type(L, -1) == LUA_TTABLE then d = lua_field_number(L, lua_gettop(L), 'start_delay', 4) end
   lua_pop(L, 2)
   return d
+end
+
+-- /term ask -----------------------------------------------------------------------
+-- CONFIG.assistant (lua/assistant.lua) decides what the assistant terminal
+-- runs; the core only opens it. The question travels as one argv element.
+global AssistantOpen = @record{
+  argv: vector(string),
+  transport: string,        -- "agent" | "conpty"
+  local_fallback: boolean,  -- agent: run the same argv over ConPTY while no agent answers
+  view: string,             -- "pet" | "tab" | "window"
+  label: string,
+}
+
+function AssistantOpen:destroy(): void
+  for i = 0, < #self.argv do self.argv[i]:destroy() end
+  self.argv:destroy()
+  self.transport:destroy()
+  self.view:destroy()
+  self.label:destroy()
+end
+
+local function push_assistant_fn(L: *lua_State, name: cstring): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'assistant')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, name)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  return true -- stack: CONFIG, assistant, fn
+end
+
+local function lua_string_at(L: *lua_State, idx: cint): string
+  local len: usize = 0
+  local p = lua_tolstring(L, idx, &len)
+  if p == nilptr then return string.copy('error object is not a string') end
+  return string.copy(string{data=(@*[0]byte)(p), size=len})
+end
+
+-- CONFIG.assistant.core_open(question): true and what to open, or false and
+-- why nothing opens (turned off, a bad command, no lua/assistant.lua).
+global function policy_assistant_open(question: string): (boolean, AssistantOpen, string)
+  local spec: AssistantOpen
+  local err: string
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_assistant_fn(L, 'core_open') then
+    err = string.copy('no assistant configuration (CONFIG.assistant, lua/assistant.lua)')
+    return false, spec, err
+  end
+  lua_pushlstring(L, (@cstring)(question.data), question.size)
+  if lua_pcall(L, 1, 2, 0) ~= LUA_OK then
+    err = lua_string_at(L, -1)
+    lua_pop(L, 3)
+    return false, spec, err
+  end
+  local ok = false
+  if lua_type(L, -2) == LUA_TTABLE then
+    local r: cint = lua_gettop(L) - 1
+    lua_getfield(L, r, 'argv')
+    read_string_list(L, -1, &spec.argv)
+    lua_pop(L, 1)
+    spec.transport = lua_field_string(L, r, 'transport', 'agent')
+    spec.local_fallback = lua_field_boolean(L, r, 'local_fallback', false)
+    spec.view = lua_field_string(L, r, 'view', 'pet')
+    spec.label = lua_field_string(L, r, 'label', 'assistant')
+    ok = #spec.argv > 0
+    if not ok then err = string.copy('assistant: empty command') end
+  elseif lua_type(L, -1) == LUA_TSTRING then
+    err = lua_string_at(L, -1)
+  else
+    err = string.copy('assistant.core_open returned nothing')
+  end
+  lua_pop(L, 4)
+  return ok, spec, err
+end
+
+-- CONFIG.assistant.core_exit(status, refused): the text shown when the
+-- assistant ends (or never started); a plain line when Lua has none.
+global function policy_assistant_exit(status: int32, refused: boolean): string
+  local L = policy.L
+  if L ~= nilptr and policy.loaded and push_assistant_fn(L, 'core_exit') then
+    lua_pushinteger(L, status)
+    lua_pushboolean(L, refused and 1 or 0)
+    if lua_pcall(L, 2, 1, 0) == LUA_OK and lua_type(L, -1) == LUA_TSTRING then
+      local text = lua_string_at(L, -1)
+      lua_pop(L, 3)
+      return text
+    end
+    lua_pop(L, 3)
+  end
+  return string.copy('\r\n[assistant exited]\r\n')
 end
