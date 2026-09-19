@@ -28,6 +28,10 @@
 -- ignore `fed`; the client translates those into the version 2 events.
 --   CLIP_SET text -> OK            CLIP_GET -> CLIP text   (host system clipboard)
 --   TITLE   id, text (forwarded from OSC title changes seen by the agent; optional)
+--
+-- Version 3 adds remote desktop windows (docs/REMOTE_WINDOWS.md): WLIST,
+-- WOPEN, WACK, WINPUT, WCLOSE from the client; WLISTR, WOPENED, WFRAME, WEND
+-- from the agent. Clients send them only to agents greeting with version 3+.
 
 global proto = @record{}
 
@@ -41,6 +45,11 @@ global PROTO_DETACH: uint8 <comptime> = 7
 global PROTO_LIST: uint8 <comptime> = 8
 global PROTO_CLIP_SET: uint8 <comptime> = 9   -- text: put on the host's system clipboard
 global PROTO_CLIP_GET: uint8 <comptime> = 10  -- ask for the host's system clipboard
+global PROTO_WLIST: uint8 <comptime> = 11     -- version 3: desktop windows the agent can capture
+global PROTO_WOPEN: uint8 <comptime> = 12     -- req u32, wid u32, max_w u16, max_h u16, fps u8 [, match text]
+global PROTO_WACK: uint8 <comptime> = 13      -- sid, seq u32: frame presented
+global PROTO_WINPUT: uint8 <comptime> = 14    -- sid, kind u8, body
+global PROTO_WCLOSE: uint8 <comptime> = 15    -- sid
 
 global PROTO_OK: uint8 <comptime> = 16
 global PROTO_ERR: uint8 <comptime> = 17
@@ -50,8 +59,24 @@ global PROTO_EXIT: uint8 <comptime> = 20
 global PROTO_LISTR: uint8 <comptime> = 21
 global PROTO_CLIP: uint8 <comptime> = 22      -- reply to CLIP_GET: the clipboard text
 global PROTO_ATTACHED: uint8 <comptime> = 23  -- version 2: ATTACH replayed
+global PROTO_WLISTR: uint8 <comptime> = 24    -- lines "wid\tw\th\tapp\ttitle\n"
+global PROTO_WOPENED: uint8 <comptime> = 25   -- req u32, sid, w u16, h u16, title (sid 0: failed, text says why)
+global PROTO_WFRAME: uint8 <comptime> = 26    -- sid, seq u32, w u16, h u16, flags u8, nrect u16, rects
+global PROTO_WEND: uint8 <comptime> = 27      -- sid, reason
 
-global PROTO_VERSION: integer <comptime> = 2
+-- WINPUT kinds
+global WIN_INPUT_MOVE: uint8 <comptime> = 1   -- x i16, y i16
+global WIN_INPUT_BUTTON: uint8 <comptime> = 2 -- x i16, y i16, button u8, down u8
+global WIN_INPUT_WHEEL: uint8 <comptime> = 3  -- x i16, y i16, dx i16, dy i16 (1/120 notches)
+global WIN_INPUT_KEY: uint8 <comptime> = 4    -- hid u16, down u8, mods u8
+global WIN_INPUT_TEXT: uint8 <comptime> = 5   -- UTF-8
+global WIN_INPUT_FOCUS: uint8 <comptime> = 6
+global WIN_MOD_CTRL: uint8 <comptime> = 1
+global WIN_MOD_SHIFT: uint8 <comptime> = 2
+global WIN_MOD_ALT: uint8 <comptime> = 4
+global WIN_MOD_SUPER: uint8 <comptime> = 8
+
+global PROTO_VERSION: integer <comptime> = 3
 global PROTO_NO_SESSION: uint32 <comptime> = 0xFFFFFFFF -- EXIT status for an unknown id
 
 global PROTO_HEADER: usize <comptime> = 5

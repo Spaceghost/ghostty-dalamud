@@ -1,0 +1,1160 @@
+-- The Linux window backend (`--windows wayland`): ghostty-agent is itself a
+-- headless Wayland compositor built on wlroots, and the game is its only
+-- display. The plugin runs inside FFXIV under Wine, a Windows PE process that
+-- can neither host a Unix-socket Wayland server nor load Linux libraries, so
+-- the compositor lives here in the Linux-native agent. Apps started into it
+-- (WOPEN "run:CMD") or any client pointed at its socket become windows;
+-- their pixels stream to the game as world panels and the game's pointer and
+-- keys come back through the compositor's wlr_seat. Nothing touches the host
+-- desktop: no portal, no picker, no host compositor involvement.
+--
+-- Pieces: one wl_display whose event loop the agent's main loop polls; the
+-- headless backend; the pixman renderer (software: frames land in CPU memory,
+-- which is what we stream, and no GPU is needed); compositor, subcompositor,
+-- data device, primary selection, viewporter, xdg-shell and xdg-decoration
+-- (always server side: the game panel draws the chrome). Every xdg_toplevel
+-- gets its own wlr_scene and its own headless output sized to the window's
+-- geometry; rendering that output yields the window's pixels. Popups render
+-- into their toplevel's scene, constrained to the window and clipped to it.
+--
+-- Limits (docs/REMOTE_WINDOWS.md): Wayland clients only (no Xwayland yet;
+-- DISPLAY is unset for launched apps), popups clipped to the window, TEXT
+-- typed through keymap lookup (levels 1 and 2 of the layout; other characters
+-- are dropped), software rendering only.
+--
+-- Loaded by agent/capture.nelua when the agent was built with -D WAYLAND
+-- (tools/wayland-flags.sh: vendor/wayland-sdk headers, host libwlroots-0.20).
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'memory'
+require 'io'
+require 'os'
+require 'math'
+require 'core.protocol'
+require 'agent.wayland_keys'
+
+## cdefine 'WLR_USE_UNSTABLE'
+## cinclude '<time.h>'
+## cinclude '<unistd.h>'
+## cinclude '<fcntl.h>'
+## cinclude '<signal.h>'
+## cinclude '<sys/types.h>'
+## cinclude '<sys/wait.h>'
+## cinclude '<wayland-server-core.h>'
+## cinclude '<wlr/util/log.h>'
+## cinclude '<wlr/backend.h>'
+## cinclude '<wlr/backend/headless.h>'
+## cinclude '<wlr/render/allocator.h>'
+## cinclude '<wlr/render/pixman.h>'
+## cinclude '<wlr/render/wlr_renderer.h>'
+## cinclude '<wlr/interfaces/wlr_keyboard.h>'
+## cinclude '<wlr/types/wlr_buffer.h>'
+## cinclude '<wlr/types/wlr_compositor.h>'
+## cinclude '<wlr/types/wlr_subcompositor.h>'
+## cinclude '<wlr/types/wlr_data_device.h>'
+## cinclude '<wlr/types/wlr_primary_selection_v1.h>'
+## cinclude '<wlr/types/wlr_viewporter.h>'
+## cinclude '<wlr/types/wlr_output.h>'
+## cinclude '<wlr/types/wlr_scene.h>'
+## cinclude '<wlr/types/wlr_seat.h>'
+## cinclude '<wlr/types/wlr_keyboard.h>'
+## cinclude '<wlr/types/wlr_xdg_shell.h>'
+## cinclude '<wlr/types/wlr_xdg_decoration_v1.h>'
+## linklib 'wlroots-0.20'
+## linklib 'wayland-server'
+## linklib 'pixman-1'
+
+-- libc
+local timespec <cimport, nodecl, ctypedef> = @record{ tv_sec: clong, tv_nsec: clong }
+local function clock_gettime(clk: cint, ts: *timespec): cint <cimport, nodecl> end
+local CLOCK_MONOTONIC: cint <cimport, nodecl, const>
+local function fork(): cint <cimport, nodecl> end
+local function setsid(): cint <cimport, nodecl> end
+local function execl(path: cstring, arg0: cstring, ...: cvarargs): cint <cimport, nodecl> end
+local function _exit(status: cint): void <cimport, nodecl> end
+local function close(fd: cint): cint <cimport, nodecl> end
+local function open(path: cstring, flags: cint, ...: cvarargs): cint <cimport, nodecl> end
+local function dup2(a: cint, b: cint): cint <cimport, nodecl> end
+local function setenv(name: cstring, value: cstring, overwrite: cint): cint <cimport, nodecl> end
+local function unsetenv(name: cstring): cint <cimport, nodecl> end
+local function waitpid(pid: cint, status: *cint, options: cint): cint <cimport, nodecl> end
+local function kill(pid: cint, sig: cint): cint <cimport, nodecl> end
+local function usleep(us: cuint): cint <cimport, nodecl> end
+local O_RDWR: cint <cimport, nodecl, const>
+local WNOHANG: cint <cimport, nodecl, const>
+local SIGTERM: cint <cimport, nodecl, const>
+local SIGKILL: cint <cimport, nodecl, const>
+local function WIFEXITED(s: cint): boolean <cimport, nodecl> end
+local function WEXITSTATUS(s: cint): cint <cimport, nodecl> end
+local function WTERMSIG(s: cint): cint <cimport, nodecl> end
+
+-- libwayland-server. Records declare only the fields used here; their C
+-- layouts come from the real headers (vendor/wayland-sdk).
+local wl_list <cimport, nodecl, ctypedef> = @record{ prev: *wl_list, next: *wl_list }
+local wl_listener <cimport, nodecl, ctypedef> = @record{ link: wl_list, notify: function(*wl_listener, pointer): void }
+local wl_signal <cimport, nodecl, ctypedef> = @record{ listener_list: wl_list }
+local wl_display <cimport, nodecl, ctypedef> = @record{}
+local wl_event_loop <cimport, nodecl, ctypedef> = @record{}
+local wl_client <cimport, nodecl, ctypedef> = @record{}
+local wl_resource <cimport, nodecl, ctypedef> = @record{}
+local function wl_display_create(): *wl_display <cimport, nodecl> end
+local function wl_display_destroy(d: *wl_display): void <cimport, nodecl> end
+local function wl_display_destroy_clients(d: *wl_display): void <cimport, nodecl> end
+local function wl_display_get_event_loop(d: *wl_display): *wl_event_loop <cimport, nodecl> end
+local function wl_display_add_socket(d: *wl_display, name: cstring): cint <cimport, nodecl> end
+local function wl_display_add_socket_auto(d: *wl_display): cstring <cimport, nodecl> end
+local function wl_display_flush_clients(d: *wl_display): void <cimport, nodecl> end
+local function wl_event_loop_dispatch(l: *wl_event_loop, timeout: cint): cint <cimport, nodecl> end
+local function wl_event_loop_get_fd(l: *wl_event_loop): cint <cimport, nodecl> end
+local function wl_signal_add(s: *wl_signal, l: *wl_listener): void <cimport, nodecl> end
+local function wl_list_remove(l: *wl_list): void <cimport, nodecl> end
+local function wl_resource_get_client(r: *wl_resource): *wl_client <cimport, nodecl> end
+local function wl_client_get_credentials(c: *wl_client, pid: *cint, uid: *cuint, gid: *cuint): void <cimport, nodecl> end
+local WL_SEAT_CAPABILITY_POINTER: uint32 <cimport, nodecl, const>
+local WL_SEAT_CAPABILITY_KEYBOARD: uint32 <cimport, nodecl, const>
+local WL_POINTER_BUTTON_STATE_PRESSED: uint32 <cimport, nodecl, const>
+local WL_POINTER_BUTTON_STATE_RELEASED: uint32 <cimport, nodecl, const>
+local WL_POINTER_AXIS_VERTICAL_SCROLL: uint32 <cimport, nodecl, const>
+local WL_POINTER_AXIS_HORIZONTAL_SCROLL: uint32 <cimport, nodecl, const>
+local WL_POINTER_AXIS_SOURCE_WHEEL: uint32 <cimport, nodecl, const>
+local WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL: uint32 <cimport, nodecl, const>
+local WL_KEYBOARD_KEY_STATE_PRESSED: uint32 <cimport, nodecl, const>
+local WL_KEYBOARD_KEY_STATE_RELEASED: uint32 <cimport, nodecl, const>
+
+-- wlroots 0.20
+local wlr_box <cimport, nodecl, ctypedef> = @record{ x: cint, y: cint, width: cint, height: cint }
+local wlr_backend <cimport, nodecl, ctypedef> = @record{}
+local wlr_renderer <cimport, nodecl, ctypedef> = @record{}
+local wlr_allocator <cimport, nodecl, ctypedef> = @record{}
+local wlr_buffer <cimport, nodecl, ctypedef> = @record{}
+local wlr_surface <cimport, nodecl, ctypedef> = @record{
+  resource: *wl_resource,
+  events: record{ commit: wl_signal, map: wl_signal, unmap: wl_signal, destroy: wl_signal },
+}
+local wlr_output <cimport, nodecl, ctypedef> = @record{ width: int32, height: int32, frame_pending: boolean }
+local wlr_output_state <cimport, nodecl, ctypedef> = @record{ committed: uint32, buffer: *wlr_buffer }
+local wlr_scene_node <cimport, nodecl, ctypedef> = @record{ type: cint }
+local wlr_scene_tree <cimport, nodecl, ctypedef> = @record{ node: wlr_scene_node }
+local wlr_scene <cimport, nodecl, ctypedef> = @record{ tree: wlr_scene_tree }
+local wlr_scene_output <cimport, nodecl, ctypedef> = @record{}
+local wlr_scene_buffer <cimport, nodecl, ctypedef> = @record{}
+local wlr_scene_surface <cimport, nodecl, ctypedef> = @record{ surface: *wlr_surface }
+local wlr_xdg_shell <cimport, nodecl, ctypedef> = @record{
+  events: record{ new_surface: wl_signal, new_toplevel: wl_signal, new_popup: wl_signal },
+}
+local wlr_xdg_toplevel <cimport, nodecl, forwarddecl, ctypedef> = @record{}
+local wlr_xdg_popup <cimport, nodecl, forwarddecl, ctypedef> = @record{}
+local wlr_xdg_surface <cimport, nodecl, ctypedef> = @record{
+  resource: *wl_resource,
+  surface: *wlr_surface,
+  role: cint,
+  toplevel: *wlr_xdg_toplevel, -- member of an anonymous union with `popup`
+  popup: *wlr_xdg_popup,
+  initialized: boolean,
+  initial_commit: boolean,
+  geometry: wlr_box,
+  data: pointer,
+}
+wlr_xdg_toplevel = @record{
+  resource: *wl_resource,
+  base: *wlr_xdg_surface,
+  title: cstring,
+  app_id: cstring,
+  events: record{ destroy: wl_signal, request_maximize: wl_signal, request_fullscreen: wl_signal },
+}
+wlr_xdg_popup = @record{
+  base: *wlr_xdg_surface,
+  parent: *wlr_surface,
+  events: record{ destroy: wl_signal },
+}
+local wlr_xdg_decoration_manager_v1 <cimport, nodecl, ctypedef> = @record{
+  events: record{ new_toplevel_decoration: wl_signal },
+}
+local wlr_xdg_toplevel_decoration_v1 <cimport, nodecl, ctypedef> = @record{
+  toplevel: *wlr_xdg_toplevel,
+  events: record{ destroy: wl_signal, request_mode: wl_signal },
+}
+local wlr_seat <cimport, nodecl, ctypedef> = @record{}
+local wlr_keyboard_modifiers <cimport, nodecl, ctypedef> = @record{ depressed: uint32, latched: uint32, locked: uint32, group: uint32 }
+local wlr_keyboard <cimport, nodecl, ctypedef> = @record{
+  keycodes: [32]uint32,
+  num_keycodes: usize,
+  modifiers: wlr_keyboard_modifiers,
+}
+local wlr_keyboard_impl <cimport, nodecl, ctypedef> = @record{ name: cstring, led_update: pointer }
+local wlr_keyboard_key_event <cimport, nodecl, ctypedef> = @record{ time_msec: uint32, keycode: uint32, update_state: boolean, state: uint32 }
+local WLR_ERROR: cint <comptime> = 1
+local WLR_DEBUG: cint <comptime> = 3
+local WLR_OUTPUT_STATE_BUFFER: uint32 <comptime> = 1
+local WLR_BUFFER_DATA_PTR_ACCESS_READ: uint32 <comptime> = 1
+local WLR_SCENE_NODE_BUFFER: cint <comptime> = 2
+local WLR_XDG_SURFACE_ROLE_TOPLEVEL: cint <comptime> = 1
+local WLR_XDG_SURFACE_ROLE_POPUP: cint <comptime> = 2
+local WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE: cint <comptime> = 2
+local DRM_FORMAT_XRGB8888: uint32 <comptime> = 0x34325258 -- 'XR24': B G R X in memory
+local DRM_FORMAT_ARGB8888: uint32 <comptime> = 0x34325241 -- 'AR24'
+local DRM_FORMAT_XBGR8888: uint32 <comptime> = 0x34324258 -- 'XB24': R G B X
+local DRM_FORMAT_ABGR8888: uint32 <comptime> = 0x34324241 -- 'AB24'
+
+local function wlr_log_init(level: cint, cb: pointer): void <cimport, nodecl> end
+local function wlr_headless_backend_create(l: *wl_event_loop): *wlr_backend <cimport, nodecl> end
+local function wlr_headless_add_output(b: *wlr_backend, w: cuint, h: cuint): *wlr_output <cimport, nodecl> end
+local function wlr_backend_start(b: *wlr_backend): boolean <cimport, nodecl> end
+local function wlr_backend_destroy(b: *wlr_backend): void <cimport, nodecl> end
+local function wlr_pixman_renderer_create(): *wlr_renderer <cimport, nodecl> end
+local function wlr_renderer_init_wl_display(r: *wlr_renderer, d: *wl_display): boolean <cimport, nodecl> end
+local function wlr_renderer_destroy(r: *wlr_renderer): void <cimport, nodecl> end
+local function wlr_allocator_autocreate(b: *wlr_backend, r: *wlr_renderer): *wlr_allocator <cimport, nodecl> end
+local function wlr_allocator_destroy(a: *wlr_allocator): void <cimport, nodecl> end
+local function wlr_compositor_create(d: *wl_display, version: uint32, r: *wlr_renderer): pointer <cimport, nodecl> end
+local function wlr_subcompositor_create(d: *wl_display): pointer <cimport, nodecl> end
+local function wlr_data_device_manager_create(d: *wl_display): pointer <cimport, nodecl> end
+local function wlr_primary_selection_v1_device_manager_create(d: *wl_display): pointer <cimport, nodecl> end
+local function wlr_viewporter_create(d: *wl_display): pointer <cimport, nodecl> end
+local function wlr_xdg_shell_create(d: *wl_display, version: uint32): *wlr_xdg_shell <cimport, nodecl> end
+local function wlr_xdg_decoration_manager_v1_create(d: *wl_display): *wlr_xdg_decoration_manager_v1 <cimport, nodecl> end
+local function wlr_xdg_toplevel_decoration_v1_set_mode(d: *wlr_xdg_toplevel_decoration_v1, mode: cint): uint32 <cimport, nodecl> end
+local function wlr_xdg_toplevel_set_size(t: *wlr_xdg_toplevel, w: int32, h: int32): uint32 <cimport, nodecl> end
+local function wlr_xdg_toplevel_set_activated(t: *wlr_xdg_toplevel, on: boolean): uint32 <cimport, nodecl> end
+local function wlr_xdg_toplevel_set_wm_capabilities(t: *wlr_xdg_toplevel, caps: uint32): uint32 <cimport, nodecl> end
+local function wlr_xdg_toplevel_send_close(t: *wlr_xdg_toplevel): void <cimport, nodecl> end
+local function wlr_xdg_surface_schedule_configure(s: *wlr_xdg_surface): uint32 <cimport, nodecl> end
+local function wlr_xdg_surface_try_from_wlr_surface(s: *wlr_surface): *wlr_xdg_surface <cimport, nodecl> end
+local function wlr_xdg_popup_unconstrain_from_box(p: *wlr_xdg_popup, box: *wlr_box): void <cimport, nodecl> end
+local function wlr_output_init_render(o: *wlr_output, a: *wlr_allocator, r: *wlr_renderer): boolean <cimport, nodecl> end
+local function wlr_output_create_global(o: *wlr_output, d: *wl_display): void <cimport, nodecl> end
+local function wlr_output_destroy(o: *wlr_output): void <cimport, nodecl> end
+local function wlr_output_state_init(s: *wlr_output_state): void <cimport, nodecl> end
+local function wlr_output_state_finish(s: *wlr_output_state): void <cimport, nodecl> end
+local function wlr_output_state_set_enabled(s: *wlr_output_state, on: boolean): void <cimport, nodecl> end
+local function wlr_output_state_set_custom_mode(s: *wlr_output_state, w: int32, h: int32, refresh: int32): void <cimport, nodecl> end
+local function wlr_output_commit_state(o: *wlr_output, s: *wlr_output_state): boolean <cimport, nodecl> end
+local function wlr_buffer_begin_data_ptr_access(b: *wlr_buffer, flags: uint32, data: *pointer, format: *uint32, stride: *usize): boolean <cimport, nodecl> end
+local function wlr_buffer_end_data_ptr_access(b: *wlr_buffer): void <cimport, nodecl> end
+local function wlr_scene_create(): *wlr_scene <cimport, nodecl> end
+local function wlr_scene_xdg_surface_create(parent: *wlr_scene_tree, s: *wlr_xdg_surface): *wlr_scene_tree <cimport, nodecl> end
+local function wlr_scene_output_create(s: *wlr_scene, o: *wlr_output): *wlr_scene_output <cimport, nodecl> end
+local function wlr_scene_output_needs_frame(so: *wlr_scene_output): boolean <cimport, nodecl> end
+local function wlr_scene_output_build_state(so: *wlr_scene_output, s: *wlr_output_state, opts: pointer): boolean <cimport, nodecl> end
+local function wlr_scene_output_send_frame_done(so: *wlr_scene_output, now: *timespec): void <cimport, nodecl> end
+local function wlr_scene_node_destroy(n: *wlr_scene_node): void <cimport, nodecl> end
+local function wlr_scene_node_at(n: *wlr_scene_node, lx: float64, ly: float64, nx: *float64, ny: *float64): *wlr_scene_node <cimport, nodecl> end
+local function wlr_scene_buffer_from_node(n: *wlr_scene_node): *wlr_scene_buffer <cimport, nodecl> end
+local function wlr_scene_surface_try_from_buffer(b: *wlr_scene_buffer): *wlr_scene_surface <cimport, nodecl> end
+local function wlr_seat_create(d: *wl_display, name: cstring): *wlr_seat <cimport, nodecl> end
+local function wlr_seat_set_capabilities(s: *wlr_seat, caps: uint32): void <cimport, nodecl> end
+local function wlr_seat_set_keyboard(s: *wlr_seat, kb: *wlr_keyboard): void <cimport, nodecl> end
+local function wlr_seat_pointer_notify_enter(s: *wlr_seat, surf: *wlr_surface, sx: float64, sy: float64): void <cimport, nodecl> end
+local function wlr_seat_pointer_notify_clear_focus(s: *wlr_seat): void <cimport, nodecl> end
+local function wlr_seat_pointer_notify_motion(s: *wlr_seat, t: uint32, sx: float64, sy: float64): void <cimport, nodecl> end
+local function wlr_seat_pointer_notify_button(s: *wlr_seat, t: uint32, button: uint32, state: uint32): uint32 <cimport, nodecl> end
+local function wlr_seat_pointer_notify_axis(s: *wlr_seat, t: uint32, orientation: uint32, value: float64, discrete: int32, source: uint32, dir: uint32): void <cimport, nodecl> end
+local function wlr_seat_pointer_notify_frame(s: *wlr_seat): void <cimport, nodecl> end
+local function wlr_seat_keyboard_notify_enter(s: *wlr_seat, surf: *wlr_surface, keycodes: *[0]uint32, n: usize, mods: *wlr_keyboard_modifiers): void <cimport, nodecl> end
+local function wlr_seat_keyboard_notify_key(s: *wlr_seat, t: uint32, key: uint32, state: uint32): void <cimport, nodecl> end
+local function wlr_seat_keyboard_notify_modifiers(s: *wlr_seat, mods: *wlr_keyboard_modifiers): void <cimport, nodecl> end
+local function wlr_keyboard_init(kb: *wlr_keyboard, impl: *wlr_keyboard_impl, name: cstring): void <cimport, nodecl> end
+local function wlr_keyboard_set_keymap(kb: *wlr_keyboard, km: *xkb_keymap): boolean <cimport, nodecl> end
+local function wlr_keyboard_finish(kb: *wlr_keyboard): void <cimport, nodecl> end
+local function wlr_keyboard_notify_key(kb: *wlr_keyboard, ev: *wlr_keyboard_key_event): void <cimport, nodecl> end
+
+global WAYLAND_DEFAULT_W: integer <comptime> = 1280
+global WAYLAND_DEFAULT_H: integer <comptime> = 800
+local WAYLAND_OPEN_TIMEOUT: float64 <comptime> = 30.0 -- s, for a launched app or a match to show up
+local BTN_LEFT: uint32 <comptime> = 0x110 -- then BTN_RIGHT 0x111, BTN_MIDDLE 0x112
+local AXIS_PER_NOTCH: float64 <comptime> = 15.0 -- wl_pointer.axis units per wheel notch (libinput's)
+
+-- A wl_listener with a way back to what it belongs to: the listener is the
+-- first field, so the pointer a signal hands over is the Hook's.
+local Hook = @record{ l: wl_listener, owner: pointer, on: boolean }
+
+local function hook(h: *Hook, sig: *wl_signal, fn: function(*wl_listener, pointer): void, owner: pointer): void
+  h.owner = owner
+  h.l.notify = fn
+  wl_signal_add(sig, &h.l)
+  h.on = true
+end
+
+-- Every listener comes off its signal before its owner goes: a listener left
+-- on a destroyed object's list is the classic wlroots crash.
+local function unhook(h: *Hook): void
+  if h.on then wl_list_remove(&h.l.link) h.on = false end
+end
+
+local function owner_of(l: *wl_listener): pointer
+  return (@*Hook)(l).owner
+end
+
+-- One xdg_toplevel: its scene, its output, its latest pixels.
+local Top = @record{
+  id: uint32,
+  xdg: *wlr_xdg_toplevel,
+  pid: cint,                 -- the client process
+  scene: *wlr_scene,
+  output: *wlr_output,       -- made on the first map, sized to the window
+  sout: *wlr_scene_output,
+  deco: pointer,             -- *Deco while the client has one
+  mapped: boolean,
+  sized: boolean,            -- asked for the default size once already
+  pixels: vector(uint8),     -- BGRA top-down, w*4 a row
+  w: integer, h: integer,
+  serial: uint64,
+  on_commit: Hook, on_map: Hook, on_unmap: Hook, on_destroy: Hook,
+  on_maximize: Hook, on_fullscreen: Hook,
+}
+
+local Deco = @record{
+  d: *wlr_xdg_toplevel_decoration_v1,
+  top: *Top,
+  on_destroy: Hook, on_mode: Hook,
+}
+
+local Popup = @record{
+  p: *wlr_xdg_popup,
+  on_commit: Hook, on_destroy: Hook,
+}
+
+-- A capture handle: one WOPEN.
+local Cap = @record{
+  top: *Top,               -- nilptr while pending and after the window went
+  state: integer,
+  why: string,             -- owned
+  title: string,           -- owned, refreshed by title()
+  match: string,           -- owned, lower case: wid 0 + text
+  pid: cint,               -- the app launched for this open, 0 for none
+  deadline: float64,       -- os.now() by which a pending open must settle
+}
+
+local Child = @record{ pid: cint, done: boolean, status: cint }
+
+-- The virtual keyboard sits outside `wc`: Nelua only knows the fields
+-- declared above, not the C size, so it cannot be a record member.
+local keyboard: wlr_keyboard
+local kb_impl: wlr_keyboard_impl
+
+local wc: record{
+  started: boolean,
+  display: *wl_display,
+  loop: *wl_event_loop,
+  backend: *wlr_backend,
+  renderer: *wlr_renderer,
+  allocator: *wlr_allocator,
+  seat: *wlr_seat,
+  xdg_shell: *wlr_xdg_shell,
+  deco_mgr: *wlr_xdg_decoration_manager_v1,
+  xkb_ctx: *xkb_context,
+  keymap: *xkb_keymap,
+  socket: string,
+  runtime_dir: string,
+  tops: vector(*Top),
+  caps: vector(*Cap),
+  children: vector(Child),
+  focused: *Top,             -- keyboard focus
+  held_mods: uint8,          -- WIN_MOD_* pressed by us
+  next_id: uint32,
+  on_new_toplevel: Hook, on_new_popup: Hook, on_new_deco: Hook,
+  warned_format: boolean,
+  warned_text: boolean,
+}
+
+-- Options the agent may set before capture_wayland_backend (flags
+-- --wayland-socket NAME and --xkb-layout LAYOUT); the environment variables
+-- GHOSTTY_WAYLAND_SOCKET and GHOSTTY_XKB_LAYOUT are the fallback.
+local opt_socket: string
+local opt_layout: string
+
+global function capture_wayland_configure(socket: string, layout: string): void
+  opt_socket = socket
+  opt_layout = layout
+end
+
+local function log(msg: string): void
+  io.stderr:write('[ghostty-agent] wayland: ', msg, '\n')
+end
+
+local function now_ms(): uint32
+  local ts: timespec
+  clock_gettime(CLOCK_MONOTONIC, &ts)
+  return (@uint32)(((@int64)(ts.tv_sec) * 1000 + ts.tv_nsec // 1000000) & 0xffffffff)
+end
+
+local function set_why(c: *Cap, state: integer, why: string): void
+  c.state = state
+  c.why:destroy()
+  c.why = string.copy(why)
+end
+
+--------------------------------------------------------------------------------
+-- Pure helpers (tests/test_capture_wayland.nelua)
+
+-- "run:CMD ARGS" -> true and "CMD ARGS" (trimmed); false for anything else
+-- or an empty command. The command runs through `sh -c`.
+global function wayland_parse_run(match: string): (boolean, string)
+  if #match < 4 or match:byte(1) ~= 0x72 or match:byte(2) ~= 0x75 or match:byte(3) ~= 0x6E or match:byte(4) ~= 0x3A then -- 'run:'
+    return false, (@string){}
+  end
+  local i, j = 5, #match
+  while i <= j and (match:byte(i) == 32 or match:byte(i) == 9) do i = i + 1 end
+  while j >= i and (match:byte(j) == 32 or match:byte(j) == 9 or match:byte(j) == 10 or match:byte(j) == 13) do j = j - 1 end
+  if j < i then return false, (@string){} end
+  return true, match:sub(i, j)
+end
+
+-- A WLIST field: tabs and newlines would break the line format.
+local function write_field(sb: *stringbuilder, s: string): void
+  for i = 1, #s do
+    local b = s:byte(i)
+    if b == 9 or b == 10 or b == 13 then b = 32 end
+    sb:writebyte(b)
+  end
+end
+
+-- One WLISTR line: "wid\tw\th\tapp\ttitle\n".
+global function wayland_list_line(sb: *stringbuilder, wid: uint32, w: integer, h: integer, app: string, title: string): void
+  sb:writef('%d\t%d\t%d\t', wid, w, h)
+  write_field(sb, app)
+  sb:writebyte(9)
+  write_field(sb, title)
+  sb:writebyte(10)
+end
+
+global WAYLAND_LAUNCH_LINE: string <comptime> = '0\t0\t0\tlaunch\trun:COMMAND to start an app in the game\n'
+
+-- Case-insensitive (ASCII) "haystack contains needle"; an empty needle matches.
+global function wayland_contains(hay: string, needle_lower: string): boolean
+  if #needle_lower == 0 then return true end
+  local low = hay:lower()
+  local found = low:find(needle_lower, 1, true) > 0
+  low:destroy()
+  return found
+end
+
+--------------------------------------------------------------------------------
+-- Processes
+
+-- `pid` or one of its ancestors (a few levels up, through /proc) is `root`:
+-- the app may be a child of the `sh -c` it was started with.
+local function descends_from(pid: cint, root: cint): boolean
+  local p = pid
+  for _ = 1, 8 do
+    if p == root then return true end
+    if p <= 1 then return false end
+    local path: stringbuilder
+    path:writef('/proc/%d/stat', p)
+    local ps = path:promote()
+    local f = io.open(ps, 'r')
+    ps:destroy()
+    if not f:isopen() then return false end
+    local line = f:read('l')
+    f:close()
+    -- "pid (comm) state ppid ...": comm may hold spaces, so start after the last ')'
+    local close_at = 0
+    for i = #line, 1, -1 do if line:byte(i) == 41 then close_at = i break end end
+    if close_at == 0 then line:destroy() return false end
+    local rest = line:sub(close_at + 2)
+    local sp1 = rest:find(' ', 1, true)
+    if sp1 == 0 then rest:destroy() line:destroy() return false end
+    local sp2 = rest:find(' ', sp1 + 1, true)
+    if sp2 == 0 then sp2 = #rest + 1 end
+    local ppid_s = rest:sub(sp1 + 1, sp2 - 1)
+    p = (@cint)(tointeger(ppid_s))
+    ppid_s:destroy() rest:destroy() line:destroy()
+  end
+  return false
+end
+
+-- Start `cmd` through `sh -c` as a client of our display only: its own
+-- session (so shutdown can end the whole group), no DISPLAY, toolkits told
+-- to use Wayland. Returns the pid, or -1.
+local function spawn(cmd: string): cint
+  local pid = fork()
+  if pid ~= 0 then return pid end
+  -- child: only async-signal-safe-ish work from here to exec
+  setsid()
+  local null = open('/dev/null', O_RDWR)
+  if null >= 0 then dup2(null, 0) end
+  for fd = 3, 1023 do close(fd) end
+  unsetenv('DISPLAY')
+  unsetenv('WAYLAND_SOCKET')
+  setenv('WAYLAND_DISPLAY', (@cstring)(wc.socket.data), 1)
+  if #wc.runtime_dir > 0 then setenv('XDG_RUNTIME_DIR', (@cstring)(wc.runtime_dir.data), 1) end
+  setenv('XDG_SESSION_TYPE', 'wayland', 1)
+  setenv('GDK_BACKEND', 'wayland', 1)
+  setenv('QT_QPA_PLATFORM', 'wayland', 1)
+  setenv('SDL_VIDEODRIVER', 'wayland', 1)
+  setenv('MOZ_ENABLE_WAYLAND', '1', 1)
+  setenv('ELECTRON_OZONE_PLATFORM_HINT', 'wayland', 1)
+  execl('/bin/sh', 'sh', '-c', (@cstring)(cmd.data), (@cstring)(nilptr))
+  _exit(127)
+  return -1
+end
+
+-- Collect our own children (never the agent's PTY shells: by pid only).
+local function reap_children(): void
+  for i = 0, < #wc.children do
+    local ch = &wc.children[i]
+    if not ch.done then
+      local st: cint = 0
+      if waitpid(ch.pid, &st, WNOHANG) == ch.pid then
+        ch.done = true
+        ch.status = WIFEXITED(st) and WEXITSTATUS(st) or 128 + WTERMSIG(st)
+      end
+    end
+  end
+end
+
+local function child_of(pid: cint): *Child
+  for i = 0, < #wc.children do
+    if wc.children[i].pid == pid then return &wc.children[i] end
+  end
+  return nilptr
+end
+
+--------------------------------------------------------------------------------
+-- Toplevels
+
+local function top_title(t: *Top): string
+  if t.xdg.title ~= nilptr then return (@string)(t.xdg.title) end
+  return ''
+end
+
+local function top_app(t: *Top): string
+  if t.xdg.app_id ~= nilptr then return (@string)(t.xdg.app_id) end
+  return ''
+end
+
+-- Give `t` the keyboard (and xdg "activated"). One toplevel has it at a time.
+local function focus(t: *Top): void
+  if wc.focused == t or not t.mapped then return end
+  wc.focused = t
+  wlr_seat_keyboard_notify_enter(wc.seat, t.xdg.base.surface, (@*[0]uint32)(&keyboard.keycodes), keyboard.num_keycodes, &keyboard.modifiers)
+end
+
+-- The window's size: its xdg geometry (the surface's extent when unset).
+local function top_size(t: *Top): (integer, integer)
+  local g = t.xdg.base.geometry
+  return math.max(1, (@integer)(g.width)), math.max(1, (@integer)(g.height))
+end
+
+local function end_caps_of(t: *Top, why: string): void
+  for i = 0, < #wc.caps do
+    local c = wc.caps[i]
+    if c.top == t then
+      c.top = nilptr
+      set_why(c, CAPTURE_ENDED, why)
+    end
+  end
+end
+
+local function on_commit(l: *wl_listener, data: pointer): void
+  local t = (@*Top)(owner_of(l))
+  local base = t.xdg.base
+  if base.initial_commit then
+    -- first configure: the client picks its size (0x0), no maximize/minimize
+    -- buttons (the game's panel has the chrome), always shown as active
+    wlr_xdg_toplevel_set_size(t.xdg, 0, 0)
+    wlr_xdg_toplevel_set_activated(t.xdg, true)
+    wlr_xdg_toplevel_set_wm_capabilities(t.xdg, 0)
+    if t.deco ~= nilptr then
+      wlr_xdg_toplevel_decoration_v1_set_mode((@*Deco)(t.deco).d, WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE)
+    end
+  end
+  -- later commits: wlr_scene_xdg_surface_create's tree already puts the
+  -- window geometry's corner at (0,0); CSD shadows fall outside the output
+end
+
+local function on_map(l: *wl_listener, data: pointer): void
+  local t = (@*Top)(owner_of(l))
+  t.mapped = true
+  local w, h = top_size(t)
+  if (w <= 1 or h <= 1) and not t.sized then
+    -- a client that commits no size of its own gets the default
+    t.sized = true
+    wlr_xdg_toplevel_set_size(t.xdg, WAYLAND_DEFAULT_W, WAYLAND_DEFAULT_H)
+    w, h = WAYLAND_DEFAULT_W, WAYLAND_DEFAULT_H
+  end
+  if t.output == nilptr then
+    t.output = wlr_headless_add_output(wc.backend, (@cuint)(w), (@cuint)(h))
+    if t.output == nilptr then log('cannot add an output for window ' .. tostring(t.id)) return end
+    wlr_output_init_render(t.output, wc.allocator, wc.renderer)
+    local st: wlr_output_state
+    wlr_output_state_init(&st)
+    wlr_output_state_set_enabled(&st, true)
+    wlr_output_state_set_custom_mode(&st, (@int32)(w), (@int32)(h), 0)
+    wlr_output_commit_state(t.output, &st)
+    wlr_output_state_finish(&st)
+    wlr_output_create_global(t.output, wc.display)
+    t.sout = wlr_scene_output_create(t.scene, t.output)
+  end
+  if wc.focused == nilptr then focus(t) end
+  log('window ' .. tostring(t.id) .. ' mapped: ' .. top_app(t) .. ' "' .. top_title(t) .. '"')
+end
+
+local function on_unmap(l: *wl_listener, data: pointer): void
+  local t = (@*Top)(owner_of(l))
+  t.mapped = false
+  end_caps_of(t, 'window closed')
+  if wc.focused == t then wc.focused = nilptr end
+end
+
+-- A state request must be answered with a configure, even when nothing changes.
+local function on_state_request(l: *wl_listener, data: pointer): void
+  local t = (@*Top)(owner_of(l))
+  if t.xdg.base.initialized then wlr_xdg_surface_schedule_configure(t.xdg.base) end
+end
+
+local function on_top_destroy(l: *wl_listener, data: pointer): void
+  local t = (@*Top)(owner_of(l))
+  unhook(&t.on_commit) unhook(&t.on_map) unhook(&t.on_unmap) unhook(&t.on_destroy)
+  unhook(&t.on_maximize) unhook(&t.on_fullscreen)
+  end_caps_of(t, 'window closed')
+  if wc.focused == t then wc.focused = nilptr end
+  if t.deco ~= nilptr then (@*Deco)(t.deco).top = nilptr end
+  if t.output ~= nilptr then wlr_output_destroy(t.output) end -- takes the scene output along
+  wlr_scene_node_destroy(&t.scene.tree.node)
+  t.xdg.base.data = nilptr
+  for i = 0, < #wc.tops do
+    if wc.tops[i] == t then wc.tops:remove(i) break end
+  end
+  t.pixels:destroy()
+  delete(t)
+end
+
+local function on_new_toplevel(l: *wl_listener, data: pointer): void
+  local xdg = (@*wlr_xdg_toplevel)(data)
+  local t = new(@Top)
+  t.id = wc.next_id
+  wc.next_id = wc.next_id + 1
+  t.xdg = xdg
+  local uid: cuint, gid: cuint = 0, 0
+  wl_client_get_credentials(wl_resource_get_client(xdg.resource), &t.pid, &uid, &gid)
+  -- No direct scan-out: with one surface covering the output, the scene would
+  -- hand the client's own buffer (shadows and all) to the output instead of
+  -- rendering, and that is not the window's pixels. wlroots reads this
+  -- variable when the scene is created.
+  setenv('WLR_SCENE_DISABLE_DIRECT_SCANOUT', '1', 1)
+  t.scene = wlr_scene_create()
+  unsetenv('WLR_SCENE_DISABLE_DIRECT_SCANOUT')
+  -- popups find their parent's tree through wlr_xdg_surface.data
+  xdg.base.data = wlr_scene_xdg_surface_create(&t.scene.tree, xdg.base)
+  hook(&t.on_commit, &xdg.base.surface.events.commit, on_commit, t)
+  hook(&t.on_map, &xdg.base.surface.events.map, on_map, t)
+  hook(&t.on_unmap, &xdg.base.surface.events.unmap, on_unmap, t)
+  hook(&t.on_destroy, &xdg.events.destroy, on_top_destroy, t)
+  hook(&t.on_maximize, &xdg.events.request_maximize, on_state_request, t)
+  hook(&t.on_fullscreen, &xdg.events.request_fullscreen, on_state_request, t)
+  wc.tops:push(t)
+end
+
+--------------------------------------------------------------------------------
+-- Popups: into the parent's scene tree, kept inside the toplevel's window
+
+-- The toplevel a popup chain hangs off, or nilptr.
+local function popup_root(p: *wlr_xdg_popup): *wlr_xdg_toplevel
+  local parent = p.parent
+  for _ = 1, 16 do
+    if parent == nilptr then return nilptr end
+    local xs = wlr_xdg_surface_try_from_wlr_surface(parent)
+    if xs == nilptr then return nilptr end
+    if xs.role == WLR_XDG_SURFACE_ROLE_TOPLEVEL then return xs.toplevel end
+    if xs.role ~= WLR_XDG_SURFACE_ROLE_POPUP or xs.popup == nilptr then return nilptr end
+    parent = xs.popup.parent
+  end
+  return nilptr
+end
+
+local function on_popup_commit(l: *wl_listener, data: pointer): void
+  local pp = (@*Popup)(owner_of(l))
+  if not pp.p.base.initial_commit then return end
+  local root = popup_root(pp.p)
+  if root ~= nilptr then
+    local box = root.base.geometry -- the window, in the toplevel surface's coordinates
+    wlr_xdg_popup_unconstrain_from_box(pp.p, &box)
+  end
+  wlr_xdg_surface_schedule_configure(pp.p.base)
+end
+
+local function on_popup_destroy(l: *wl_listener, data: pointer): void
+  local pp = (@*Popup)(owner_of(l))
+  unhook(&pp.on_commit) unhook(&pp.on_destroy)
+  delete(pp)
+end
+
+local function on_new_popup(l: *wl_listener, data: pointer): void
+  local p = (@*wlr_xdg_popup)(data)
+  local parent = wlr_xdg_surface_try_from_wlr_surface(p.parent)
+  if parent == nilptr or parent.data == nilptr then return end -- e.g. a layer surface: not ours
+  p.base.data = wlr_scene_xdg_surface_create((@*wlr_scene_tree)(parent.data), p.base)
+  local pp = new(@Popup)
+  pp.p = p
+  hook(&pp.on_commit, &p.base.surface.events.commit, on_popup_commit, pp)
+  hook(&pp.on_destroy, &p.events.destroy, on_popup_destroy, pp)
+end
+
+--------------------------------------------------------------------------------
+-- Decorations: always server side (that is, none: the game panel has chrome)
+
+local function deco_apply(d: *Deco): void
+  if d.d.toplevel ~= nilptr and d.d.toplevel.base.initialized then
+    wlr_xdg_toplevel_decoration_v1_set_mode(d.d, WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE)
+  end
+end
+
+local function on_deco_mode(l: *wl_listener, data: pointer): void
+  deco_apply((@*Deco)(owner_of(l)))
+end
+
+local function on_deco_destroy(l: *wl_listener, data: pointer): void
+  local d = (@*Deco)(owner_of(l))
+  unhook(&d.on_destroy) unhook(&d.on_mode)
+  if d.top ~= nilptr then d.top.deco = nilptr end
+  delete(d)
+end
+
+local function on_new_deco(l: *wl_listener, data: pointer): void
+  local d = new(@Deco)
+  d.d = (@*wlr_xdg_toplevel_decoration_v1)(data)
+  for i = 0, < #wc.tops do
+    if wc.tops[i].xdg == d.d.toplevel then d.top = wc.tops[i] d.top.deco = d break end
+  end
+  hook(&d.on_destroy, &d.d.events.destroy, on_deco_destroy, d)
+  hook(&d.on_mode, &d.d.events.request_mode, on_deco_mode, d)
+  deco_apply(d) -- before the initial commit this waits for on_commit
+end
+
+--------------------------------------------------------------------------------
+-- Rendering: each mapped window's output, when its scene has damage
+
+-- The rendered buffer, into t.pixels as BGRA top-down.
+local function grab(t: *Top, buf: *wlr_buffer, w: integer, h: integer): void
+  local data: pointer
+  local fmt: uint32 = 0
+  local stride: usize = 0
+  if not wlr_buffer_begin_data_ptr_access(buf, WLR_BUFFER_DATA_PTR_ACCESS_READ, &data, &fmt, &stride) then return end
+  local swap = fmt == DRM_FORMAT_XBGR8888 or fmt == DRM_FORMAT_ABGR8888
+  if not swap and fmt ~= DRM_FORMAT_XRGB8888 and fmt ~= DRM_FORMAT_ARGB8888 then
+    if not wc.warned_format then wc.warned_format = true log('unexpected output format ' .. tostring(fmt)) end
+    wlr_buffer_end_data_ptr_access(buf)
+    return
+  end
+  local row = (@usize)(w) * 4
+  t.pixels:resize(row * (@usize)(h))
+  local src = (@*[0]uint8)(data)
+  for y = 0, < h do
+    local s = (@*[0]uint8)(&src[(@usize)(y) * stride])
+    local d = (@*[0]uint8)(&t.pixels[(@usize)(y) * row])
+    memory.copy(d, s, row)
+    if swap then
+      for x = 0, < w do
+        local o = x * 4
+        d[o], d[o + 2] = d[o + 2], d[o]
+      end
+    end
+  end
+  wlr_buffer_end_data_ptr_access(buf)
+  t.w, t.h = w, h
+  t.serial = t.serial + 1
+end
+
+local function render(t: *Top): void
+  if not t.mapped or t.sout == nilptr or t.output.frame_pending then return end
+  local w, h = top_size(t)
+  local resize = w ~= t.output.width or h ~= t.output.height
+  if not resize and not wlr_scene_output_needs_frame(t.sout) then return end
+  local st: wlr_output_state
+  wlr_output_state_init(&st)
+  if resize then wlr_output_state_set_custom_mode(&st, (@int32)(w), (@int32)(h), 0) end
+  if wlr_scene_output_build_state(t.sout, &st, nilptr) then
+    if (st.committed & WLR_OUTPUT_STATE_BUFFER) ~= 0 and st.buffer ~= nilptr then grab(t, st.buffer, w, h) end
+    wlr_output_commit_state(t.output, &st)
+  end
+  wlr_output_state_finish(&st)
+  local ts: timespec
+  clock_gettime(CLOCK_MONOTONIC, &ts)
+  wlr_scene_output_send_frame_done(t.sout, &ts)
+end
+
+--------------------------------------------------------------------------------
+-- Input
+
+local function key(code: uint32, down: boolean): void
+  local t = now_ms()
+  local st = down and WL_KEYBOARD_KEY_STATE_PRESSED or WL_KEYBOARD_KEY_STATE_RELEASED
+  local ev: wlr_keyboard_key_event = { time_msec = t, keycode = code, update_state = true, state = st }
+  wlr_keyboard_notify_key(&keyboard, &ev) -- xkb state and pressed keys
+  wlr_seat_keyboard_notify_key(wc.seat, t, code, st)
+  wlr_seat_keyboard_notify_modifiers(wc.seat, &keyboard.modifiers)
+end
+
+local mod_keys: [4]uint32 = { WL_KEY_LEFTCTRL, WL_KEY_LEFTSHIFT, WL_KEY_LEFTALT, WL_KEY_LEFTMETA }
+
+-- Press and release modifier keys until the held set is `mods` (WIN_MOD_*).
+local function sync_mods(mods: uint8): void
+  for i = 0, < 4 do
+    local bit: uint8 = 1 << i
+    if (mods & bit) ~= (wc.held_mods & bit) then key(mod_keys[i], (mods & bit) ~= 0) end
+  end
+  wc.held_mods = mods
+end
+
+-- Pointer onto window pixel (x, y): whatever surface is there gets it.
+local function pointer_to(t: *Top, x: integer, y: integer, time: uint32): void
+  local sx: float64, sy: float64 = 0, 0
+  local node = wlr_scene_node_at(&t.scene.tree.node, x, y, &sx, &sy)
+  local surf: *wlr_surface = nilptr
+  if node ~= nilptr and node.type == WLR_SCENE_NODE_BUFFER then
+    local ss = wlr_scene_surface_try_from_buffer(wlr_scene_buffer_from_node(node))
+    if ss ~= nilptr then surf = ss.surface end
+  end
+  if surf == nilptr then wlr_seat_pointer_notify_clear_focus(wc.seat) return end
+  wlr_seat_pointer_notify_enter(wc.seat, surf, sx, sy)
+  wlr_seat_pointer_notify_motion(wc.seat, time, sx, sy)
+end
+
+-- UTF-8 -> keys through the keymap; characters the layout cannot type at
+-- level 1 or 2 are dropped (logged once).
+local function type_text(text: string): void
+  sync_mods(0)
+  local i = 1
+  while i <= #text do
+    local b = text:byte(i)
+    local cp: uint32 = b
+    local n = 1
+    if b >= 0xF0 then cp, n = b & 0x07, 4
+    elseif b >= 0xE0 then cp, n = b & 0x0F, 3
+    elseif b >= 0xC0 then cp, n = b & 0x1F, 2 end
+    for k = 1, n - 1 do
+      if i + k <= #text then cp = (cp << 6) | (text:byte(i + k) & 0x3F) end
+    end
+    i = i + n
+    local ok, code, shift = wayland_key_for_codepoint(wc.keymap, cp)
+    if ok then
+      if shift then key(WL_KEY_LEFTSHIFT, true) end
+      key(code, true)
+      key(code, false)
+      if shift then key(WL_KEY_LEFTSHIFT, false) end
+    elseif not wc.warned_text then
+      wc.warned_text = true
+      log('the keymap cannot type U+' .. tostring(cp) .. ' (and maybe more); dropped')
+    end
+  end
+end
+
+--------------------------------------------------------------------------------
+-- The backend
+
+local function wl_list(): string
+  local sb: stringbuilder
+  sb:write(WAYLAND_LAUNCH_LINE)
+  for i = 0, < #wc.tops do
+    local t = wc.tops[i]
+    if t.mapped then
+      local w, h = top_size(t)
+      wayland_list_line(&sb, t.id, w, h, top_app(t), top_title(t))
+    end
+  end
+  return sb:promote()
+end
+
+local function find_top(id: uint32): *Top
+  for i = 0, < #wc.tops do
+    if wc.tops[i].id == id and wc.tops[i].mapped then return wc.tops[i] end
+  end
+  return nilptr
+end
+
+-- A pending open finds its window: the launched app's (by client pid, or a
+-- descendant of it) or the first whose title or app id contains the match.
+local function settle(c: *Cap, now: float64): void
+  for i = 0, < #wc.tops do
+    local t = wc.tops[i]
+    if t.mapped then
+      local hit = false
+      if c.pid ~= 0 then hit = descends_from(t.pid, c.pid)
+      else hit = wayland_contains(top_title(t), c.match) or wayland_contains(top_app(t), c.match) end
+      if hit then
+        c.top = t
+        set_why(c, CAPTURE_LIVE, '')
+        focus(t)
+        return
+      end
+    end
+  end
+  if c.pid ~= 0 then
+    local ch = child_of(c.pid)
+    if ch ~= nilptr and ch.done then
+      local sb: stringbuilder
+      sb:writef('the app exited (status %d) without opening a window here', ch.status)
+      local why = sb:promote()
+      set_why(c, CAPTURE_ENDED, why)
+      why:destroy()
+      return
+    end
+  end
+  if now >= c.deadline then
+    set_why(c, CAPTURE_ENDED, c.pid ~= 0 and 'the app opened no window' or 'no such window')
+  end
+end
+
+local function wl_open(wid: uint32, match: string): (pointer, string)
+  if wid ~= 0 then
+    local t = find_top(wid)
+    if t == nilptr then return nilptr, string.copy('no such window') end
+    local c = new(@Cap)
+    c.top = t
+    c.state = CAPTURE_LIVE
+    wc.caps:push(c)
+    focus(t)
+    return c, (@string){}
+  end
+  local c = new(@Cap)
+  c.state = CAPTURE_PENDING
+  c.deadline = os.now() + WAYLAND_OPEN_TIMEOUT
+  local is_run, cmd = wayland_parse_run(match)
+  if is_run then
+    c.pid = spawn(cmd)
+    if c.pid < 0 then
+      cmd:destroy()
+      delete(c)
+      return nilptr, string.copy('cannot start the app (fork failed)')
+    end
+    wc.children:push(Child{ pid = c.pid })
+    log('started "' .. cmd .. '" (pid ' .. tostring(c.pid) .. ') on ' .. wc.socket)
+    cmd:destroy()
+  else
+    c.match = match:lower()
+  end
+  wc.caps:push(c)
+  settle(c, os.now())
+  return c, (@string){}
+end
+
+local function wl_state(h: pointer): (integer, string)
+  local c = (@*Cap)(h)
+  return c.state, c.why
+end
+
+local function wl_title(h: pointer): string
+  local c = (@*Cap)(h)
+  c.title:destroy()
+  if c.top ~= nilptr then c.title = string.copy(top_title(c.top))
+  elseif c.pid ~= 0 then c.title = string.copy('starting…')
+  else c.title = string.copy('waiting for a window') end
+  return c.title
+end
+
+local function wl_frame(h: pointer, out: *CaptureFrame): boolean
+  local c = (@*Cap)(h)
+  local t = c.top
+  if t == nilptr or t.serial == 0 then return false end
+  $out = { pixels = (@*[0]uint8)(&t.pixels[0]), w = t.w, h = t.h, stride = (@usize)(t.w) * 4, serial = t.serial }
+  return true
+end
+
+local function wl_input(h: pointer, ev: *CaptureInput): void
+  local c = (@*Cap)(h)
+  local t = c.top
+  if t == nilptr or not t.mapped then return end
+  focus(t)
+  local time = now_ms()
+  if ev.kind == WIN_INPUT_MOVE then
+    pointer_to(t, ev.x, ev.y, time)
+    wlr_seat_pointer_notify_frame(wc.seat)
+  elseif ev.kind == WIN_INPUT_BUTTON then
+    pointer_to(t, ev.x, ev.y, time)
+    local b = BTN_LEFT + (@uint32)(math.clamp(ev.button, 0, 2))
+    wlr_seat_pointer_notify_button(wc.seat, time, b, ev.down and WL_POINTER_BUTTON_STATE_PRESSED or WL_POINTER_BUTTON_STATE_RELEASED)
+    wlr_seat_pointer_notify_frame(wc.seat)
+  elseif ev.kind == WIN_INPUT_WHEEL then
+    pointer_to(t, ev.x, ev.y, time)
+    -- +dy is away from the user (scroll up); Wayland's positive vertical axis
+    -- scrolls down, so the sign flips. Discrete values are in 1/120 notches.
+    if ev.dy ~= 0 then
+      wlr_seat_pointer_notify_axis(wc.seat, time, WL_POINTER_AXIS_VERTICAL_SCROLL, -ev.dy * AXIS_PER_NOTCH / 120.0,
+        (@int32)(-ev.dy), WL_POINTER_AXIS_SOURCE_WHEEL, WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL)
+    end
+    if ev.dx ~= 0 then -- +dx is to the right, as on Wayland
+      wlr_seat_pointer_notify_axis(wc.seat, time, WL_POINTER_AXIS_HORIZONTAL_SCROLL, ev.dx * AXIS_PER_NOTCH / 120.0,
+        (@int32)(ev.dx), WL_POINTER_AXIS_SOURCE_WHEEL, WL_POINTER_AXIS_RELATIVE_DIRECTION_IDENTICAL)
+    end
+    wlr_seat_pointer_notify_frame(wc.seat)
+  elseif ev.kind == WIN_INPUT_KEY then
+    -- modifiers travel in `mods`; lone modifier keys are not played
+    if ev.hid >= 0xE0 and ev.hid <= 0xE7 then return end
+    local code = wayland_hid_to_evdev(ev.hid)
+    if code == 0 then return end
+    sync_mods(ev.mods)
+    key(code, ev.down)
+    if not ev.down then sync_mods(0) end
+  elseif ev.kind == WIN_INPUT_TEXT then
+    type_text(ev.text)
+  end
+  wl_display_flush_clients(wc.display)
+end
+
+local function wl_close(h: pointer): void
+  local c = (@*Cap)(h)
+  -- an app launched for this stream is asked to close with it
+  if c.pid ~= 0 and c.top ~= nilptr then wlr_xdg_toplevel_send_close(c.top.xdg) end
+  for i = 0, < #wc.caps do
+    if wc.caps[i] == c then wc.caps:remove(i) break end
+  end
+  c.why:destroy() c.title:destroy() c.match:destroy()
+  delete(c)
+end
+
+local function wl_pump(): void
+  wl_event_loop_dispatch(wc.loop, 0)
+  reap_children()
+  local now = os.now()
+  for i = 0, < #wc.caps do
+    if wc.caps[i].state == CAPTURE_PENDING then settle(wc.caps[i], now) end
+  end
+  for i = 0, < #wc.tops do render(wc.tops[i]) end
+  -- forget launched processes that ended and no pending open waits for
+  local i = #wc.children - 1
+  while i >= 0 do
+    local ch = wc.children[i]
+    local waited = false
+    for k = 0, < #wc.caps do
+      if wc.caps[k].pid == ch.pid and wc.caps[k].state == CAPTURE_PENDING then waited = true end
+    end
+    if ch.done and not waited then wc.children:remove((@usize)(i)) end
+    i = i - 1
+  end
+  wl_display_flush_clients(wc.display)
+end
+
+local function wl_poll_fds(fds: *[0]cint, max: integer): integer
+  if max < 1 then return 0 end
+  fds[0] = wl_event_loop_get_fd(wc.loop)
+  return 1
+end
+
+local function wl_wait_ms(): integer
+  for i = 0, < #wc.tops do
+    local t = wc.tops[i]
+    -- damage waiting for the output's next frame (its timer wakes the loop fd too)
+    if t.mapped and t.sout ~= nilptr and wlr_scene_output_needs_frame(t.sout) then return 16 end
+  end
+  for i = 0, < #wc.caps do
+    if wc.caps[i].state == CAPTURE_PENDING then return 250 end -- timeouts, exits of launched apps
+  end
+  return -1
+end
+
+-- The socket clients connect to (WAYLAND_DISPLAY), empty before start.
+global function capture_wayland_socket(): string
+  return wc.socket
+end
+
+local function start(): (boolean, string)
+  local level = WLR_ERROR
+  if #os.getenv('GHOSTTY_WAYLAND_DEBUG') > 0 then level = WLR_DEBUG end
+  wlr_log_init(level, nilptr)
+  wc.runtime_dir = os.getenv('XDG_RUNTIME_DIR')
+  if #wc.runtime_dir == 0 then return false, 'XDG_RUNTIME_DIR is not set' end
+  wc.display = wl_display_create()
+  if wc.display == nilptr then return false, 'cannot create a Wayland display' end
+  wc.loop = wl_display_get_event_loop(wc.display)
+  wc.backend = wlr_headless_backend_create(wc.loop)
+  if wc.backend == nilptr then return false, 'cannot create the headless backend' end
+  wc.renderer = wlr_pixman_renderer_create()
+  if wc.renderer == nilptr then return false, 'cannot create the pixman renderer' end
+  wlr_renderer_init_wl_display(wc.renderer, wc.display) -- wl_shm and friends
+  wc.allocator = wlr_allocator_autocreate(wc.backend, wc.renderer)
+  if wc.allocator == nilptr then return false, 'cannot create a buffer allocator' end
+  wlr_compositor_create(wc.display, 6, wc.renderer)
+  wlr_subcompositor_create(wc.display)
+  wlr_data_device_manager_create(wc.display)
+  wlr_primary_selection_v1_device_manager_create(wc.display)
+  wlr_viewporter_create(wc.display)
+  wc.xdg_shell = wlr_xdg_shell_create(wc.display, 6)
+  hook(&wc.on_new_toplevel, &wc.xdg_shell.events.new_toplevel, on_new_toplevel, nilptr)
+  hook(&wc.on_new_popup, &wc.xdg_shell.events.new_popup, on_new_popup, nilptr)
+  wc.deco_mgr = wlr_xdg_decoration_manager_v1_create(wc.display)
+  hook(&wc.on_new_deco, &wc.deco_mgr.events.new_toplevel_decoration, on_new_deco, nilptr)
+
+  local layout = #opt_layout > 0 and opt_layout or os.getenv('GHOSTTY_XKB_LAYOUT')
+  wc.xkb_ctx, wc.keymap = wayland_keymap(layout)
+  if wc.keymap == nilptr then return false, 'cannot compile an xkb keymap (is xkeyboard-config installed?)' end
+  kb_impl.name = 'ghostty-agent'
+  wlr_keyboard_init(&keyboard, &kb_impl, 'ghostty-agent keyboard')
+  wlr_keyboard_set_keymap(&keyboard, wc.keymap)
+  wc.seat = wlr_seat_create(wc.display, 'seat0')
+  wlr_seat_set_capabilities(wc.seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD)
+  wlr_seat_set_keyboard(wc.seat, &keyboard)
+
+  -- a fixed name first, so apps and scripts can find it; the next free one after
+  local want = #opt_socket > 0 and opt_socket or os.getenv('GHOSTTY_WAYLAND_SOCKET')
+  if #want > 0 then
+    if wl_display_add_socket(wc.display, (@cstring)(want.data)) ~= 0 then return false, 'the Wayland socket name is taken' end
+    wc.socket = string.copy(want)
+  else
+    for n = 0, 9 do
+      local name = 'ghostty-' .. tostring(n)
+      if wl_display_add_socket(wc.display, (@cstring)(name.data)) == 0 then wc.socket = name break end
+      name:destroy()
+    end
+    if #wc.socket == 0 then
+      local auto = wl_display_add_socket_auto(wc.display)
+      if auto == nilptr then return false, 'cannot add a Wayland socket' end
+      wc.socket = string.copy((@string)(auto))
+    end
+  end
+  if not wlr_backend_start(wc.backend) then return false, 'cannot start the headless backend' end
+  wc.next_id = 1
+  wc.started = true
+  log('compositor on WAYLAND_DISPLAY=' .. wc.socket .. ' (' .. wc.runtime_dir .. ')')
+  return true, ''
+end
+
+-- The backend; the compositor starts on the first call. False and a literal
+-- why when it cannot.
+global function capture_wayland_backend(): (boolean, CaptureBackend, string)
+  if not wc.started then
+    local ok, why = start()
+    if not ok then return false, (@CaptureBackend){}, why end
+  end
+  return true, (@CaptureBackend){
+    name = 'wayland',
+    list = wl_list, open = wl_open, state = wl_state, title = wl_title,
+    frame = wl_frame, input = wl_input, close = wl_close,
+    pump = wl_pump, poll_fds = wl_poll_fds, wait_ms = wl_wait_ms,
+  }, ''
+end
+
+-- End every app we launched (their whole process groups) and the compositor.
+-- For agent exit and tests; the backend cannot be used afterwards.
+global function capture_wayland_shutdown(): void
+  if not wc.started then return end
+  for i = 0, < #wc.children do
+    if not wc.children[i].done then kill(-wc.children[i].pid, SIGTERM) end
+  end
+  for _ = 1, 20 do
+    reap_children()
+    local left = false
+    for i = 0, < #wc.children do if not wc.children[i].done then left = true end end
+    if not left then break end
+    usleep(50000)
+  end
+  for i = 0, < #wc.children do
+    if not wc.children[i].done then
+      kill(-wc.children[i].pid, SIGKILL)
+      local st: cint = 0
+      waitpid(wc.children[i].pid, &st, 0)
+      wc.children[i].done = true
+    end
+  end
+  wl_display_destroy_clients(wc.display) -- toplevels go, and their hooks with them
+  unhook(&wc.on_new_toplevel) unhook(&wc.on_new_popup) unhook(&wc.on_new_deco)
+  wlr_keyboard_finish(&keyboard)
+  wlr_backend_destroy(wc.backend)
+  wlr_allocator_destroy(wc.allocator)
+  wlr_renderer_destroy(wc.renderer)
+  wl_display_destroy(wc.display)
+  xkb_keymap_unref(wc.keymap)
+  xkb_context_unref(wc.xkb_ctx)
+  wc.started = false
+end

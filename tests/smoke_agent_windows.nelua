@@ -2,7 +2,7 @@
 -- part of tests/run.sh: it needs the agent running on Windows or under Wine).
 --
 --   ghostty-agent.exe --listen 127.0.0.1:PORT --token-file TOKENFILE   (on Windows / under Wine)
---   vendor/nelua-lang/nelua --cc gcc -P nogc -L . tests/smoke_agent_windows.nelua PORT TOKEN
+--   vendor/nelua-lang/nelua --cc tools/zig-cc.sh -P nogc -L . tests/smoke_agent_windows.nelua PORT TOKEN
 --
 -- Each step prints PASS or FAIL and the run goes on; the exit code is the
 -- number of failed steps. It opens cmd.exe, types into it, reads the output,

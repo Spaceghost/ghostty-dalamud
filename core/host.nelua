@@ -142,6 +142,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
   end
   host.terminal_focused = host.terminal_focused_now
   host.terminal_focused_now = false
+  remotewin_tick(now, live and in_world) -- window streams: lost connections, closing, auto pulls
   if live then
     poll_toggle_key()
     draw_dropdown(now, dt)
@@ -242,6 +243,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   for i = 0, < #host.sessions do host.sessions[i].keep_on_agent = true end
   if host.layout_restored then save_world_state() end
   for i = #host.sessions - 1, 0, -1 do session_remove(host.sessions[i]) end
+  remotewin_shutdown() -- its panels went with their sessions (WCLOSE queued)
   agent_final_flush() -- the queued DETACH/CLOSE frames, before the socket goes away
   host.sessions:destroy()
   host.dropdown_tabs:destroy()

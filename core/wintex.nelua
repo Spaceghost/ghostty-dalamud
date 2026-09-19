@@ -1,0 +1,189 @@
+-- The GPU side of a remote window (docs/REMOTE_WINDOWS.md): one BGRA8 D3D11
+-- texture per stream on the device Dalamud draws ImGui with, and its shader
+-- resource view, which is what Dalamud's DX11 ImGui backend takes as an
+-- ImTextureID. core/app/remotewin.nelua decodes WFRAMEs into a CPU copy of
+-- the window and hands the changed rectangles here once a frame.
+--
+-- Why UpdateSubresource with a box per dirty rectangle, not a DYNAMIC texture
+-- mapped WRITE_DISCARD: a window changes a little at a time (a caret, a
+-- scrolled list), and WRITE_DISCARD throws the whole texture away, so every
+-- frame would copy all of it (9 MB at 1920x1200) through the mapping. A
+-- DEFAULT texture keeps its contents; UpdateSubresource copies only the boxes
+-- (the runtime stages them and the GPU copy is ordered before this frame's
+-- ImGui draw on the same immediate context). A key frame is one box of the
+-- whole window, which costs what the mapped copy would.
+--
+-- The texture is created lazily on the render thread, recreated when the
+-- window's size or Dalamud's device changes, and released on close and on
+-- shutdown. The D3D11 calls sit behind `wintex_fake`: host tests put a
+-- recording table there and never touch a GPU (the same split as
+-- core/depthpass.nelua keeps).
+require 'core.wincodec'
+
+global WinTexApi = @record{
+  -- create a w x h texture and its view on `device`; returns an HRESULT (< 0 failed)
+  create: function(device: pointer, w: uint32, h: uint32, tex: *pointer, srv: *pointer): clong,
+  -- copy the rectangle `r` of the window from `src` (the rectangle's first
+  -- pixel, `pitch` bytes a row) into the texture
+  update: function(device: pointer, tex: pointer, r: WinRect, src: pointer, pitch: uint32): void,
+  release: function(tex: pointer, srv: pointer): void,
+}
+
+-- Tests: a fake here replaces the D3D11 calls (nilptr: D3D11 on Windows, and
+-- nothing at all on the host).
+global wintex_fake: *WinTexApi = nilptr
+
+global WinTex = @record{
+  device: pointer,  -- borrowed: Dalamud's ID3D11Device the objects below belong to
+  tex: pointer,     -- ID3D11Texture2D (ours)
+  srv: pointer,     -- ID3D11ShaderResourceView (ours): the ImTextureID
+  w: uint32, h: uint32,
+  hresult: clong,   -- last failed creation (kept for the panel's message and the log)
+  failed: boolean,  -- creation failed for this device and size: not retried every frame
+}
+
+## if ccinfo.is_windows then
+-- D3D11 through the C COM macros, each imported as a typed function (see core/depthpass.nelua).
+## cdefine 'COBJMACROS'
+## cinclude '<d3d11.h>'
+
+local HRESULT <cimport, nodecl> = @clong
+local ID3D11Device <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11DeviceContext <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11Resource <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11Texture2D <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11ShaderResourceView <cimport, nodecl, forwarddecl> = @record{}
+local DXGI_SAMPLE_DESC <cimport, nodecl> = @record{ Count: cuint, Quality: cuint }
+local D3D11_TEXTURE2D_DESC <cimport, nodecl> = @record{
+  Width: cuint, Height: cuint, MipLevels: cuint, ArraySize: cuint, Format: cint, SampleDesc: DXGI_SAMPLE_DESC,
+  Usage: cint, BindFlags: cuint, CPUAccessFlags: cuint, MiscFlags: cuint,
+}
+local D3D11_BOX <cimport, nodecl> = @record{ left: cuint, top: cuint, front: cuint, right: cuint, bottom: cuint, back: cuint }
+local D3D11_SUBRESOURCE_DATA <cimport, nodecl> = @record{ pSysMem: pointer, SysMemPitch: cuint, SysMemSlicePitch: cuint }
+
+local function ID3D11Device_CreateTexture2D(this: *ID3D11Device, desc: *D3D11_TEXTURE2D_DESC, data: *D3D11_SUBRESOURCE_DATA, out: **ID3D11Texture2D): HRESULT <cimport, nodecl> end
+local function ID3D11Device_CreateShaderResourceView(this: *ID3D11Device, res: *ID3D11Resource, desc: pointer, out: **ID3D11ShaderResourceView): HRESULT <cimport, nodecl> end
+local function ID3D11Device_GetImmediateContext(this: *ID3D11Device, out: **ID3D11DeviceContext): void <cimport, nodecl> end
+local function ID3D11DeviceContext_UpdateSubresource(this: *ID3D11DeviceContext, res: *ID3D11Resource, sub: cuint, box: *D3D11_BOX, src: pointer, pitch: cuint, depth_pitch: cuint): void <cimport, nodecl> end
+local function ID3D11DeviceContext_Release(this: *ID3D11DeviceContext): culong <cimport, nodecl> end
+local function ID3D11Texture2D_Release(this: *ID3D11Texture2D): culong <cimport, nodecl> end
+local function ID3D11ShaderResourceView_Release(this: *ID3D11ShaderResourceView): culong <cimport, nodecl> end
+
+local DXGI_FORMAT_B8G8R8A8_UNORM <comptime> = 87
+local D3D11_USAGE_DEFAULT <comptime> = 0
+local D3D11_BIND_SHADER_RESOURCE <comptime> = 8
+
+-- The immediate context of the device last uploaded to (our reference).
+local ctx_device: *ID3D11Device
+local ctx: *ID3D11DeviceContext
+
+local function context_for(dev: *ID3D11Device): *ID3D11DeviceContext
+  if dev ~= ctx_device then
+    if ctx ~= nilptr then ID3D11DeviceContext_Release(ctx) ctx = nilptr end
+    ctx_device = dev
+    ID3D11Device_GetImmediateContext(dev, &ctx)
+  end
+  return ctx
+end
+
+local function d3d_create(device: pointer, w: uint32, h: uint32, tex: *pointer, srv: *pointer): clong
+  local dev = (@*ID3D11Device)(device)
+  local desc: D3D11_TEXTURE2D_DESC = {
+    Width = w, Height = h, MipLevels = 1, ArraySize = 1, Format = DXGI_FORMAT_B8G8R8A8_UNORM,
+    SampleDesc = { Count = 1, Quality = 0 }, Usage = D3D11_USAGE_DEFAULT, BindFlags = D3D11_BIND_SHADER_RESOURCE,
+  }
+  local t: *ID3D11Texture2D
+  local hr = ID3D11Device_CreateTexture2D(dev, &desc, nilptr, &t)
+  if hr < 0 then return hr end
+  local v: *ID3D11ShaderResourceView
+  hr = ID3D11Device_CreateShaderResourceView(dev, (@*ID3D11Resource)(t), nilptr, &v)
+  if hr < 0 then
+    ID3D11Texture2D_Release(t)
+    return hr
+  end
+  $tex, $srv = t, v
+  return 0
+end
+
+local function d3d_update(device: pointer, tex: pointer, r: WinRect, src: pointer, pitch: uint32): void
+  local c = context_for((@*ID3D11Device)(device))
+  if c == nilptr then return end
+  local box: D3D11_BOX = { left = r.x, top = r.y, front = 0, right = r.x + r.w, bottom = r.y + r.h, back = 1 }
+  ID3D11DeviceContext_UpdateSubresource(c, (@*ID3D11Resource)(tex), 0, &box, src, pitch, 0)
+end
+
+local function d3d_release(tex: pointer, srv: pointer): void
+  if srv ~= nilptr then ID3D11ShaderResourceView_Release((@*ID3D11ShaderResourceView)(srv)) end
+  if tex ~= nilptr then ID3D11Texture2D_Release((@*ID3D11Texture2D)(tex)) end
+end
+## end
+
+local function api_create(device: pointer, w: uint32, h: uint32, tex: *pointer, srv: *pointer): clong
+  if wintex_fake ~= nilptr then return wintex_fake.create(device, w, h, tex, srv) end
+  ## if ccinfo.is_windows then
+    return d3d_create(device, w, h, tex, srv)
+  ## else
+    return -1 -- no GPU on the host without a fake
+  ## end
+end
+
+local function api_update(device: pointer, tex: pointer, r: WinRect, src: pointer, pitch: uint32): void
+  if wintex_fake ~= nilptr then wintex_fake.update(device, tex, r, src, pitch) return end
+  ## if ccinfo.is_windows then
+    d3d_update(device, tex, r, src, pitch)
+  ## end
+end
+
+local function api_release(tex: pointer, srv: pointer): void
+  if wintex_fake ~= nilptr then wintex_fake.release(tex, srv) return end
+  ## if ccinfo.is_windows then
+    d3d_release(tex, srv)
+  ## end
+end
+
+-- Let go of the texture and its view (close, size or device change, shutdown).
+global function wintex_release(t: *WinTex): void
+  if t.tex ~= nilptr or t.srv ~= nilptr then api_release(t.tex, t.srv) end
+  t.tex, t.srv = nilptr, nilptr
+  t.w, t.h = 0, 0
+  t.failed = false
+end
+
+-- A texture of w x h on `device`, creating (or recreating) it when needed.
+-- True when it exists; the caller then uploads the whole window, since a new
+-- texture starts undefined. `fresh` says whether it was just made.
+global function wintex_ensure(t: *WinTex, device: pointer, w: uint32, h: uint32): (boolean, boolean)
+  if device == nilptr or w == 0 or h == 0 then return false, false end
+  if t.device ~= device or t.w ~= w or t.h ~= h then
+    wintex_release(t)
+    t.device = device
+    t.w, t.h = w, h
+  end
+  if t.srv ~= nilptr then return true, false end
+  if t.failed then return false, false end
+  local tex: pointer, srv: pointer = nilptr, nilptr
+  local hr = api_create(device, w, h, &tex, &srv)
+  if hr < 0 or srv == nilptr then
+    t.hresult = hr
+    t.failed = true
+    return false, false
+  end
+  t.tex, t.srv = tex, srv
+  return true, true
+end
+
+-- Upload rectangle `r` of `pixels` (the whole window, `stride` bytes a row).
+global function wintex_upload(t: *WinTex, r: WinRect, pixels: *[0]uint8, stride: usize): void
+  if t.tex == nilptr or r.w == 0 or r.h == 0 then return end
+  if (@uint32)(r.x) + r.w > t.w or (@uint32)(r.y) + r.h > t.h then return end
+  local src = &pixels[(@usize)(r.y) * stride + (@usize)(r.x) * 4]
+  api_update(t.device, t.tex, r, src, (@uint32)(stride))
+end
+
+-- Shutdown: the cached immediate context goes too (textures are released by their streams).
+global function wintex_shutdown(): void
+  ## if ccinfo.is_windows then
+    if ctx ~= nilptr then ID3D11DeviceContext_Release(ctx) ctx = nilptr end
+    ctx_device = nilptr
+  ## end
+end

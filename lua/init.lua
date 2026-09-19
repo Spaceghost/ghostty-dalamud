@@ -16,6 +16,7 @@ local platform = require('platform')
 local assistant = require('assistant')
 local themes = require('themes')
 local tooltips = require('tooltips')
+local windows = require('windows')
 
 -- The agent connection and profiles for where the game runs (native Windows,
 -- or Wine/Proton on Linux): see lua/platform.lua.
@@ -92,7 +93,7 @@ local config = {
   -- What the plugin registers with Dalamud.
   host = {
     commands = { '/term', '/tomestone', '/tome' },
-    help = 'Show/hide the terminal. window [n] | new [n] | pin [here|me|target|orbit] | unpin | ask [question] | theme [name] | config | reload',
+    help = 'Show/hide the terminal. window [n|list|pull [match]|close] | new [n] | pin [here|me|target|orbit] | unpin | ask [question] | theme [name] | config | reload',
     -- Server info bar entry. 'auto' shows it only while no Umbra toolbar
     -- widget is showing ghostty's status; 'always' | 'never'.
     dtr = {
@@ -157,6 +158,10 @@ local config = {
   -- (e.g. assistant.view = 'tab') rather than replacing the table: the core
   -- calls its functions.
   assistant = assistant,
+  -- Desktop windows streamed by ghostty-agent onto world panels: /term window
+  -- list | pull [match|#wid|run CMD] | close. Sizes, frame rate and windows
+  -- pulled at login: lua/windows.lua.
+  windows = windows,
   -- The settings window (/term config) and its saved overrides (settings.lua).
   settings = settings,
   -- Pinned automatically once your character is loaded, e.g. { 'orbit 4 0.2', 'me' }.

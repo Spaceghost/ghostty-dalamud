@@ -140,6 +140,14 @@
 9. World panels (`core/app/worldview.nelua`) are drawn in panel pixels into
    the background draw list and every vertex is mapped onto the panel through
    the game's view-projection matrix (`core/world.nelua`).
+10. Remote windows (docs/REMOTE_WINDOWS.md): WFRAMEs read in step 3 are
+   decoded into each stream's CPU copy (`core/app/remotewin.nelua`) and
+   acknowledged; `remotewin_tick` ends streams whose connection went and
+   closes ended panels; a window panel's content, where a terminal would be
+   drawn in step 9, uploads the dirty rectangles to its D3D11 texture on
+   Dalamud's device (`core/wintex.nelua`), draws it as textured quads and
+   sends the focused panel's pointer and keys back as WINPUT. Not yet
+   observed in game.
 
 ## World panels behind game geometry
 
@@ -241,7 +249,13 @@ vendor/       pinned third-party checkouts (git-ignored, see toolchain.env)
 ## Pins
 
 `toolchain.env` pins Nelua (the project's fork, `NELUA_REPOSITORY`), ghostty,
-gc-cimgui (Dalamud's submodule commit), umbra-dist, Lua, Zig and .NET. Dalamud's ImGui uses 16-bit
+gc-cimgui (Dalamud's submodule commit), umbra-dist, Lua, Zig and .NET, and the
+Wayland SDK: the Fedora 44 `-devel` RPMs of wlroots 0.20.2, wayland 1.26.0,
+wayland-protocols 1.48, pixman 0.46.2, libxkbcommon 1.13.1 and libdrm, fetched
+from Koji by NVR with their sha256 and unpacked (headers only) into
+`vendor/wayland-sdk/include`. The agent links the host's own libraries against
+them (`tools/wayland-flags.sh`); without them it builds without the Linux
+window backend. Dalamud's ImGui uses 16-bit
 `ImWchar` (verified against `Dalamud.Bindings.ImGui`'s generated `ImGuiIO`),
 so `InputQueueCharacters` holds BMP code points.
 
@@ -264,6 +278,7 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_bell` | the visual bell: BEL counting, ring and glow maths, the Lua style, its triangles |
 | `test_policy` | loading `lua/init.lua`: defaults, profiles, key actions, showcase entries |
 | `test_world`, `test_worldpanel`, `test_worlddrag` | world panels: projection and hit testing, the presented pose and walk-up, drag placement and snapping, all against a fake game |
+| `test_remotewin` | remote window panels against a fake version 3 agent, a fake ImGui and a fake texture table: open, KEY and delta frames, dirty-box uploads, WACK (held while asleep), the textured quads over the letterboxed picture, pointer / button / wheel / key / text input with the chrome keeping its clicks, WEND, WCLOSE, an older shim, a version 2 agent refused |
 | `test_host` | the exported host surface without ImGui: init, status, commands, the controller toggle's source and its foreground check, shutdown |
 | `test_lights` | panel lights against fake game light callbacks |
 | `test_occluders` | panel shadow boards against fake background object callbacks: placement, lifecycle, an older `GuHostApi` |
@@ -277,7 +292,14 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_selftest` | `/term selftest`'s pure parts: suite selection, the JSON report and summary, the state handed across a core swap, the fingerprint, a terminal read back through recorded draw calls, the render hash, the world round trip against a game-like camera |
 | `test_selftest_run` | `/term selftest` in an embedded core: every suite in order (game-only ones skip), the Lua suites, the report files, a run carried on from a state file, stale and unreadable state, a run cut short by shutdown |
 | `test_agent_logic` | the agent's pure parts: OPEN parsing, replay plans, ring indexes, CRLF for the Windows clipboard, env entries, default shells, the Windows wait timeout, command line quoting |
+| `test_capture_win32` | the Win32 window capture backend's pure parts: USB HID → virtual key, key message lParams, the characters keys stand for, mouse and wheel words, SendInput absolute coordinates, blank (all-black) captures, UTF-8 → UTF-16 for WM_CHAR, WLISTR lines, window matching |
 | `test_agent` | `ghostty-agent` end to end over TCP |
+| `test_wincodec` | remote window frames: changed tiles, QOI both ways, banding, WFRAME write/parse/apply, malformed input, downscaling |
+| `test_capture_mac` | the macOS capture backend's pure parts: HID to kVK keycodes, key flags, mouse event types and click counts, frame pixels to global points, the Block literal layout, `run:APP`, window picking and WLISTR lines, UTF-16 text chunks, CGImage layouts to BGRA (the backend itself has never run on a Mac) |
+| `test_agent_windows` | remote windows end to end over TCP against `--windows test`: list, open by id and match, KEY and delta frames rebuilt, scaling, flow control, every input kind, close, WEND, failures, streams per connection, `--windows off` |
+| `test_capture_wayland` | the Wayland backend's pure parts: USB HID to evdev, codepoint to key and Shift in real xkb keymaps (us, de), `run:` parsing, WLIST lines, matching (only with `vendor/wayland-sdk`) |
+| `test_wayland_compositor` | the agent's Wayland compositor with a real client (`yad`, GTK3): launch through `run:`, map, frame size and content, click and TEXT/KEY/WHEEL input changing the pixels, WLIST, close, a launch that exits without a window; writes `first.png` and `typed.png` to `build/test-scratch/wayland` (only with `vendor/wayland-sdk`; skipped without yad) |
+| `test_e2e_wayland` | the plugin's agent client against a real `ghostty-agent --windows wayland`: `run:yad`, KEY and delta frames with WACK pacing, click and TEXT reaching the app, SIGTERM ending the apps the agent launched (only with `vendor/wayland-sdk` and yad) |
 
 The last step checks that the core also compiles as a native host module.
 
@@ -285,3 +307,11 @@ The last step checks that the core also compiles as a native host module.
 `ghostty-agent.exe` (on Windows, or under Wine in a throwaway prefix) that
 opens `cmd.exe`, types into it and checks replay, LIST, clipboard and exit
 status, printing PASS / FAIL per step (see the README for what it showed).
+
+Two more manual smokes cover the Win32 window capture backend (on Windows or
+under Wine; docs/REMOTE_WINDOWS.md records what they showed):
+`tests/smoke_capture_win32.nelua`, built as a Windows exe, drives the backend
+directly against a window picked by name (list, frames, a picture as PPM,
+click and typing, the Edit control read back); `tests/smoke_windows_win32.nelua`
+is a host client for `ghostty-agent.exe --windows win32` (WLIST, WOPEN by
+match, frames rebuilt into a PPM, input, WCLOSE).

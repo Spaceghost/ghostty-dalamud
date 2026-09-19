@@ -44,6 +44,7 @@ global ImGuiIO <cimport, nodecl> = @record{
   WantCaptureKeyboard: boolean,
   WantTextInput: boolean,
   MouseWheel: float32,
+  MouseWheelH: float32,
   KeyCtrl: boolean,
   KeyShift: boolean,
   KeyAlt: boolean,
@@ -195,6 +196,8 @@ global ImGuiApi = @record{
   CloseCurrentPopup: function(): void,
   -- callback: function(list: *ImDrawList, cmd: *ImDrawCmd): void, or IMDRAW_CALLBACK_RESET
   DrawListAddCallback: function(dl: *ImDrawList, callback: pointer, callback_data: pointer): void,
+  -- a textured rectangle (remote windows: the ImTextureID is Dalamud's D3D11 shader resource view)
+  DrawListAddImage: function(dl: *ImDrawList, tex: pointer, p_min: ImVec2, p_max: ImVec2, uv_min: ImVec2, uv_max: ImVec2, col: uint32): void,
 }
 
 -- Draw-list callback that makes the renderer restore its own state. Dalamud's
@@ -237,6 +240,7 @@ global imgui: ImGuiApi
 ##  {'BeginTooltip','igBeginTooltip'},{'EndTooltip','igEndTooltip'},{'IsMouseDragging','igIsMouseDragging'},{'IsItemActivated','igIsItemActivated'},{'IsItemDeactivatedAfterEdit','igIsItemDeactivatedAfterEdit',true},
 ##  {'OpenPopup','igOpenPopup_Str'},{'BeginPopup','igBeginPopup'},{'EndPopup','igEndPopup'},{'CloseCurrentPopup','igCloseCurrentPopup'},
 ##  {'DrawListAddCallback','ImDrawList_AddCallback'},
+##  {'DrawListAddImage','ImDrawList_AddImage',true},
 ## }
 
 global ImGuiResolver = @function(name: cstring): pointer

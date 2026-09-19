@@ -33,14 +33,32 @@ local WNOHANG: cint <cimport, nodecl, const>
 local SIGKILL: cint <cimport, nodecl, const>
 local SIGPIPE: cint <cimport, nodecl, const>
 local SIG_IGN: pointer <cimport, nodecl, const>
+local SIGTERM: cint <cimport, nodecl, const>
+local SIGINT: cint <cimport, nodecl, const>
+local SIGHUP: cint <cimport, nodecl, const>
 
 local function WIFEXITED(s: cint): boolean <cimport, nodecl> end
 local function WEXITSTATUS(s: cint): cint <cimport, nodecl> end
 
 global AGENT_CLIP_MAX: usize <comptime> = 1024 * 1024
 
+-- Set by SIGTERM / SIGINT / SIGHUP: the main loop ends its turn and shuts
+-- down cleanly (the Wayland compositor closes the apps it launched).
+local stop_requested: cint <volatile> = 0
+
+local function on_stop_signal(sig: cint): void
+  stop_requested = 1
+end
+
 global function agent_sys_init(): void
   signal(SIGPIPE, SIG_IGN)
+  signal(SIGTERM, (@pointer)(on_stop_signal))
+  signal(SIGINT, (@pointer)(on_stop_signal))
+  signal(SIGHUP, (@pointer)(on_stop_signal))
+end
+
+global function agent_stop_requested(): boolean
+  return stop_requested ~= 0
 end
 
 global function agent_pid(): int64

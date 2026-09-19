@@ -1,0 +1,115 @@
+-- Window capture backends for ghostty-agent (docs/REMOTE_WINDOWS.md).
+--
+-- A backend finds desktop windows, hands over their latest pixels and plays
+-- input into them. agent/windows.nelua does everything else (streams, scaling,
+-- rate, diffing, encoding, flow control), so a backend is only the platform.
+-- Handles are the backend's own; every string a backend returns is a copy the
+-- caller frees unless marked borrowed.
+--
+-- Choosing one (`--windows NAME`, capture_select at the end): 'off', 'test'
+-- (agent/capture_test.nelua), or 'auto' for the platform's own: 'wayland'
+-- (Linux, agent/capture_wayland.nelua), 'win32' (agent/capture_win32.nelua),
+-- 'mac' (agent/capture_mac.nelua). A platform backend joins the build by
+-- flipping its entry in CAPTURE_BUILT below to true (one line): that requires
+-- its file and calls its `capture_<name>_backend()`. Until then asking for it
+-- answers 'backend not built', and the agent runs without windows.
+require 'string'
+
+global CaptureFrame = @record{
+  pixels: *[0]uint8,   -- BGRA, top-down, alpha ignored; borrowed until the next call on the handle
+  w: integer,
+  h: integer,
+  stride: usize,       -- bytes a row
+  serial: uint64,      -- changes whenever the pixels do (0: no frame yet)
+}
+
+-- One WINPUT, decoded. Coordinates are pixels of the window as captured (the
+-- generic layer has already undone any scaling).
+global CaptureInput = @record{
+  kind: uint8,         -- WIN_INPUT_*
+  x: integer, y: integer,
+  button: integer,     -- 0 left, 1 right, 2 middle
+  down: boolean,
+  dx: integer, dy: integer, -- wheel, 1/120 notches, +dy = away from the user
+  hid: uint16,         -- USB HID usage (keyboard page)
+  mods: uint8,         -- WIN_MOD_*
+  text: string,        -- borrowed, valid during the call
+}
+
+global CAPTURE_PENDING: integer <comptime> = 0 -- being set up (e.g. the desktop's picker is open)
+global CAPTURE_LIVE: integer <comptime> = 1
+global CAPTURE_ENDED: integer <comptime> = 2   -- closed, refused or failed; `why` says which
+
+global CaptureBackend = @record{
+  name: string,
+  -- WLISTR text, "wid\tw\th\tapp\ttitle\n" lines
+  list: function(): string,
+  -- start capturing window `wid` (0: let the user pick, or the first whose
+  -- title/app contains `match`); nilptr and why on an immediate failure
+  open: function(wid: uint32, match: string): (pointer, string),
+  state: function(h: pointer): (integer, string),  -- CAPTURE_*, why (borrowed)
+  title: function(h: pointer): string,             -- borrowed
+  frame: function(h: pointer, out: *CaptureFrame): boolean,
+  input: function(h: pointer, ev: *CaptureInput): void,
+  close: function(h: pointer): void,
+  -- once per main loop turn: dispatch D-Bus / PipeWire, take due snapshots
+  pump: function(): void,
+  -- POSIX: descriptors whose readability should wake the loop; returns the count
+  poll_fds: function(fds: *[0]cint, max: integer): integer,
+  -- the longest the main loop may sleep while streams are open (ms), -1 for no limit
+  wait_ms: function(): integer,
+}
+
+require 'agent.capture_test'
+
+-- Platform backends compiled into this agent. Flip one to true when its file lands.
+## CAPTURE_BUILT = { wayland = WAYLAND and true or false, -- -D WAYLAND: tools/wayland-flags.sh
+##    win32 = true, mac = true } -- each is also limited to its platform below
+## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
+require 'agent.capture_wayland'
+## end
+## if CAPTURE_BUILT.win32 and ccinfo.is_windows then
+require 'agent.capture_win32'
+## end
+## if CAPTURE_BUILT.mac and ccinfo.is_apple then
+require 'agent.capture_mac'
+## end
+
+-- The backend `name` names, or false and why. `why` is a literal (not freed).
+global function capture_select(name: string): (boolean, CaptureBackend, string)
+  if name == 'auto' then
+    ## if ccinfo.is_windows then
+    name = 'win32'
+    ## elseif ccinfo.is_apple then
+    name = 'mac'
+    ## elseif ccinfo.is_linux then
+    name = 'wayland'
+    ## else
+    return false, (@CaptureBackend){}, 'no window capture on this platform'
+    ## end
+  end
+  if name == 'off' then
+    return false, (@CaptureBackend){}, 'window capture is off (--windows off)'
+  elseif name == 'test' then
+    return capture_test_backend()
+  elseif name == 'wayland' then
+    ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
+    return capture_wayland_backend()
+    ## else
+    return false, (@CaptureBackend){}, 'wayland backend not built (no vendor/wayland-sdk or libwlroots-0.20 at build time)'
+    ## end
+  elseif name == 'win32' then
+    ## if CAPTURE_BUILT.win32 and ccinfo.is_windows then
+    return capture_win32_backend()
+    ## else
+    return false, (@CaptureBackend){}, 'win32 backend not built'
+    ## end
+  elseif name == 'mac' then
+    ## if CAPTURE_BUILT.mac and ccinfo.is_apple then
+    return capture_mac_backend()
+    ## else
+    return false, (@CaptureBackend){}, 'mac backend not built'
+    ## end
+  end
+  return false, (@CaptureBackend){}, 'unknown window backend'
+end

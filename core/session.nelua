@@ -10,7 +10,10 @@ require 'core.agent_client'
 require 'core.sys.conpty'
 require 'core.policy'
 
-global TransportKind = @enum(cint){ None = 0, Agent, ConPty, Superlogical }
+-- Window: a desktop window streamed by the agent (core/app/remotewin.nelua).
+-- Its terminal is a small local one that only shows status text; nothing
+-- typed into it goes anywhere.
+global TransportKind = @enum(cint){ None = 0, Agent, ConPty, Superlogical, Window }
 
 global Session = @record{
   id: integer,
@@ -57,6 +60,7 @@ global Session = @record{
   fallback: string,         -- the profile to switch to if the agent turns out to be down (Profile.fallback)
   assistant: boolean,       -- /term ask: stays open after its process exits, which it announces itself
   local_fallback: boolean,  -- agent down: run open_argv over ConPTY (an assistant on native Windows)
+  window_close: function(s: *Session): void, -- Window: let go of the stream (remotewin), once
 }
 
 
@@ -239,6 +243,11 @@ end
 -- running there). wake() reattaches; the agent sends what the terminal missed
 -- (or, when too much went by, resets it and replays what it kept).
 function Session:sleep(): void
+  if self.kind == TransportKind.Window then
+    -- a window stream sleeps by not acknowledging frames (remotewin): the agent stops sending
+    if not self.exited then self.sleeping = true end
+    return
+  end
   if self.kind ~= TransportKind.Agent or self.agent == nilptr or self.awaiting_open or self.sleeping or self.exited then return end
   self.agent:detach(self.agent_id)
   self.sleeping = true
@@ -363,6 +372,10 @@ function Session:close(): void
     end
   elseif self.kind == TransportKind.ConPty then
     self.conpty:close()
+  elseif self.kind == TransportKind.Window and self.window_close ~= nilptr then
+    local f = self.window_close
+    self.window_close = nilptr
+    f(self)
   end
   self.exited = true
 end

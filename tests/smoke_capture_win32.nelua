@@ -1,0 +1,160 @@
+-- Manual smoke test of the Win32 capture backend (agent/capture_win32.nelua),
+-- run on Windows or under Wine (not part of tests/run.sh). Build it with the
+-- Windows cross compiler like ghostty-agent.exe:
+--
+--   ZIG=... vendor/nelua-lang/nelua --cc tools/zig-cc-win.sh -P nogc --cflags=-O2 \
+--     --cache-dir build/win/cache-smoke -L . -o build/smoke_capture_win32.exe tests/smoke_capture_win32.nelua
+--   smoke_capture_win32.exe MATCH FIRST.ppm [AFTER.ppm]
+--
+-- Lists the windows, opens the first matching MATCH, grabs frames for 3 s
+-- and reports the rates and size, writes the first frame to FIRST.ppm, clicks
+-- the window's centre and types into it (window message path: TEXT, KEY
+-- enter, TEXT, KEY backspace), captures
+-- again (AFTER.ppm), reads back an Edit control's text if it has one, prints
+-- the title and closes. Each step prints PASS or FAIL; the exit code is the
+-- number of failures.
+require 'core.protocol'
+require 'agent.capture' -- pulls in agent/capture_win32.nelua (requiring that first would cycle)
+require 'string'
+require 'io'
+require 'arg'
+require 'os'
+
+## cinclude '<windows.h>'
+local function Sleep(ms: uint32): void <cimport, nodecl> end
+local function GetTickCount64(): uint64 <cimport, nodecl> end
+local function FindWindowExA(parent: pointer, after: pointer, class: cstring, title: cstring): pointer <cimport, nodecl> end
+local function SendMessageW(hwnd: pointer, msg: uint32, wp: usize, lp: isize): isize <cimport, nodecl> end
+local function WideCharToMultiByte(cp: uint32, flags: uint32, src: *[0]uint16, srclen: cint, dst: *[0]cchar, dstlen: cint, def: cstring, used: pointer): cint <cimport, nodecl> end
+local WM_GETTEXT: uint32 <cimport, nodecl, const>
+local CP_UTF8: uint32 <cimport, nodecl, const>
+
+local failures = 0
+local function step(name: string, ok: boolean, detail: string): void
+  if ok then print('PASS', name, detail) else print('FAIL', name, detail) failures = failures + 1 end
+end
+
+-- binary PPM (P6) from BGRA
+local function write_ppm(path: string, f: *CaptureFrame): boolean
+  local file = io.open(path, 'wb')
+  if not file:isopen() then return false end
+  file:write(string.format('P6\n%d %d\n255\n', f.w, f.h))
+  local row = string.create((@usize)(f.w * 3))
+  for y = 0, < f.h do
+    for x = 0, < f.w do
+      local o = (@usize)(y) * f.stride + (@usize)(x * 4)
+      row.data[x*3], row.data[x*3+1], row.data[x*3+2] = f.pixels[o+2], f.pixels[o+1], f.pixels[o]
+    end
+    file:write(row)
+  end
+  row:destroy()
+  file:close()
+  return true
+end
+
+local match: string = #arg >= 1 and arg[1] or 'notepad'
+local first_path: string = #arg >= 2 and arg[2] or 'first.ppm'
+local after_path: string = #arg >= 3 and arg[3] or ''
+
+local ok, be, why = capture_win32_backend()
+step('backend', ok, why)
+
+local listing = be.list()
+io.write(listing)
+step('list', #listing > 0, '')
+listing:destroy()
+
+local h, err = be.open(0, '')
+step('open without id or match refuses', h == nilptr and #err > 0, err)
+err:destroy()
+
+h, err = be.open(0, match)
+step('open '..match, h ~= nilptr, err)
+if h == nilptr then os.exit(failures) end
+print('title', be.title(h))
+
+-- 3 s of frames at the generic layer's pace (one frame() per ~16 ms)
+local f: CaptureFrame
+local calls, changes = 0, 0
+local last_serial: uint64 = 0
+local t0 = GetTickCount64()
+local wrote = false
+local spent: uint64 = 0
+while GetTickCount64() - t0 < 3000 do
+  local c0 = GetTickCount64()
+  local got = be.frame(h, &f)
+  spent = spent + (GetTickCount64() - c0)
+  if got then
+    calls = calls + 1
+    if f.serial ~= last_serial then changes = changes + 1 last_serial = f.serial end
+    if not wrote then wrote = write_ppm(first_path, &f) end
+  end
+  Sleep(16)
+end
+local secs = (GetTickCount64() - t0) / 1000.0
+step('frames', calls > 0 and f.w > 0 and f.h > 0,
+  string.format('%dx%d, %.1f frame()/s, %d distinct (serial %d)', f.w, f.h, calls / secs, changes, f.serial))
+step('first frame written', wrote, first_path)
+print('info', string.format('%d ms spent in frame() over %d calls, %d captures', spent, calls, cw32_stats.captures))
+
+-- click in the middle, then type (window message path: no FOCUS)
+local before = f.serial
+local w, hh = f.w, f.h
+local ev: CaptureInput
+ev.kind = WIN_INPUT_BUTTON ev.x = w // 2 ev.y = hh // 2 ev.button = 0 ev.down = true
+be.input(h, &ev)
+ev.down = false
+be.input(h, &ev)
+local typed: string = 'hello from ghostty é😀'
+ev = {}
+ev.kind = WIN_INPUT_TEXT ev.text = typed
+be.input(h, &ev)
+-- enter as a KEY (HID 0x28), then a second line
+ev = {}
+ev.kind = WIN_INPUT_KEY ev.hid = 0x28 ev.down = true
+be.input(h, &ev)
+ev.down = false
+be.input(h, &ev)
+ev = {}
+ev.kind = WIN_INPUT_TEXT ev.text = 'line two'
+be.input(h, &ev)
+-- backspace as a KEY (HID 0x2A): takes the 'o' back
+ev = {}
+ev.kind = WIN_INPUT_KEY ev.hid = 0x2A ev.down = true
+be.input(h, &ev)
+ev.down = false
+be.input(h, &ev)
+Sleep(500)
+local changed = false
+for _ = 1, 20 do
+  if be.frame(h, &f) and f.serial ~= before then changed = true break end
+  Sleep(20)
+end
+step('frame changed after typing', changed, string.format('serial %d -> %d', before, f.serial))
+if #after_path > 0 then step('after frame written', write_ppm(after_path, &f), after_path) end
+
+-- read back an Edit control (notepad's) through WM_GETTEXT
+local hwnd = (@*[0]pointer)(h)[0] -- CW32Win.hwnd is the first field
+local edit = FindWindowExA(hwnd, nilptr, 'Edit', nilptr)
+if edit ~= nilptr then
+  local buf: [512]uint16
+  local n = SendMessageW(edit, WM_GETTEXT, #buf, (@isize)((@usize)(&buf)))
+  local out: [1024]cchar
+  local len = WideCharToMultiByte(CP_UTF8, 0, &buf, (@cint)(n), &out, #out, nilptr, nilptr)
+  local text = string{data=(@*[0]byte)(&out), size=(@usize)(len)}
+  print('edit text', text)
+  step('TEXT arrived', text:find(typed, 1, true) > 0 and text:find('line tw', 1, true) > 0, '')
+  step('KEY enter arrived in order', text:find(typed..'\r\nline tw', 1, true) > 0, '')
+  step('KEY backspace arrived in order', text:find('line two', 1, true) == 0 and text:find('line tw', 1, true) > 0, '')
+else
+  print('info', 'no Edit child: text not read back')
+end
+
+print('info', string.format('captures %d: PrintWindow %d, window BitBlt %d, screen BitBlt %d',
+  cw32_stats.captures, cw32_stats.printed, cw32_stats.window_blits, cw32_stats.screen_blits))
+print('title', be.title(h))
+local st, swhy = be.state(h)
+step('still live', st == CAPTURE_LIVE, swhy)
+be.close(h)
+print(failures == 0 and 'ALL PASS' or string.format('%d FAILED', failures))
+os.exit(failures)
