@@ -138,17 +138,86 @@ settles.
   next due frame of a stream that may send; POSIX also polls the backend's
   `poll_fds`. The Windows loop has only the timeout.
 
+## The plugin side (core/app/remotewin.nelua)
+
+* A window panel is a `Session` of kind `Window` in `host.world`, so pets,
+  pins, Alt + drag, resizing, full screen, close, the depth test, the shadow
+  board and sleeping unseen are the terminal code's. Its terminal is a small
+  local one that shows status text ("waiting for the window…", "window
+  refused: …", "window closed: …") until there is a picture.
+  `core/app/worldview.nelua` calls `remotewin_panel` where it would draw a
+  terminal; nothing else there knows about windows.
+* Requests go only to an agent that greeted with version 3
+  (`AgentClient:windows_ok`); to an older one `wlist`/`wopen` return false
+  and emit an ERR event, and the command says "agent too old for windows:
+  update ghostty-agent". Only the `CONFIG.agent` connection streams windows
+  so far.
+* WFRAMEs are decoded as they arrive into a CPU copy of the window (at most
+  `max_w`×`max_h`×4 bytes; larger frames and size changes that are not KEY
+  frames are dropped) and their rectangles noted as dirty (more than 32
+  collapse into their bounding box). The frame's END is acknowledged at once,
+  unless the panel sleeps unseen (30 s, as terminals) or has not been drawn
+  for 2 s: then the WACK waits for the next draw and the agent stops sending.
+  While a stream is live the socket is read up to 1 MiB a frame instead of
+  128 KiB.
+* `core/wintex.nelua` keeps one `DXGI_FORMAT_B8G8R8A8_UNORM` texture per
+  stream (`D3D11_USAGE_DEFAULT`, shader resource) on Dalamud's device
+  (`GuSceneDepth.ui_device` from `get_scene_depth`), created on the render
+  thread when the panel is first drawn with a frame, recreated when the size
+  or the device changes, released with the panel and at shutdown. Dirty
+  rectangles go up with `UpdateSubresource` and a box each (a DYNAMIC
+  texture mapped `WRITE_DISCARD` would copy the whole window every frame).
+  Its shader resource view is the `ImTextureID`. Without the callback or the
+  device the panel says it needs a newer plugin shim; the shim is unchanged.
+* The picture is fitted to the panel below a 34 px title strip (the window's
+  title on the left, the panel's buttons on the right) and centred, the
+  panel background showing around it, as 24 × 16 textured quads
+  (`ImDrawList_AddImage`) so it bends with the curve and the character
+  cut-out has vertices. The first frame gives the panel the window's aspect
+  (`CONFIG.windows.size`); resizing the panel later only letterboxes, the
+  remote window keeps its size.
+* Input, only while the panel is focused: the panel's chrome first, exactly as
+  for terminals (title buttons, resize grips and Alt + drag are decided by
+  worldview before the window sees the frame), and the click that focuses a
+  panel stays the panel's. Over the picture, panel pixels are mapped to window
+  pixels (letterbox removed): MOVE when the window pixel changes, left and
+  right BUTTON down/up (a held button keeps the mouse and sends the release
+  wherever the pointer is), WHEEL as ImGui's wheel × 120. A click forwarded
+  to the window never counts toward the panel's double click, so double
+  clicks reach the window. Keys: the panel claims the keyboard like a
+  terminal (`SetNextFrameWantCaptureKeyboard`, `WantTextInput`); named keys
+  (and letters, digits and punctuation under ctrl, alt or super, but not
+  AltGr) go as KEY with their USB HID usage and modifiers, down and up;
+  typed characters from `InputQueueCharacters` as TEXT. The toggle chords
+  stay the plugin's. Losing focus releases every key and button still held
+  on the window.
+* WEND, a refused WOPENED or a lost connection: the panel shows why and
+  closes 2 s later. A panel closed while the desktop is still choosing gets
+  its late WOPENED answered with WCLOSE. Closing a live panel sends WCLOSE.
+* Window panels are not saved with the layout and do not survive
+  `/term reload` (their streams belong to the connection, which a reload
+  replaces). Popped into a tab or minimized, a window panel goes back into
+  the world as a pet.
+
 ## Using it
 
 ```
-/term window list [agent]     windows the agent can see (wid, size, title)
-/term window pull [match]     open one as a pet (no match: the desktop's picker)
-/term window pull #wid        by id from the list
-/term pin …                   pins work on window panels like on terminals
+/term window list [@agent]           windows the agent can see (in the log: wid, size, app, title)
+/term window pull [match] [@agent]   open one as a pet (no match: the agent's own choice)
+/term window pull #wid               by id from the list
+/term window pull run CMD...         the agent starts CMD and streams its window (match text "run:CMD...")
+/term window close                   the focused window panel (else the newest)
+/term pin …                          on a focused window panel: moves it, keeping its size
 ```
 
+`@agent` may only name `default` so far. `lua/windows.lua` (`CONFIG.windows`)
+holds the sizes asked for (`max_w`, `max_h`, default 1920×1200), `fps` (30),
+the panel's `pixels_per_yalm` (700), `width` (1600 panel pixels), `opacity`,
+and `auto`: `/term window pull` arguments run once the character is loaded.
+
 Clicking a window panel focuses it; while focused the mouse and keyboard go
-to the remote window. Esc twice (or clicking outside) gives them back.
+to the remote window. Esc twice within half a second (or clicking outside)
+gives them back; the first Esc reaches the window.
 
 ## Verified
 
@@ -167,3 +236,20 @@ Host tests only (`tests/run.sh`), nothing in game or on a real desktop:
 
 The Windows agent (`ghostty-agent.exe`) cross-compiles with the window layer;
 no real backend exists yet, and the Windows loop's window path has not run.
+
+* `test_remotewin`: the plugin side against a fake version 3 agent on a
+  socketpair, a fake ImGui and a fake texture table: WLISTR in the log,
+  WOPEN fields (and `run:`), a pending pet, WOPENED, a KEY and a delta frame
+  rebuilt in the CPU copy, texture creation on the reported device and one
+  upload per dirty box, WACK after END and held while asleep, the panel
+  taking the window's aspect, the 24 × 16 textured quads covering exactly the
+  letterboxed picture with the view as texture id, MOVE / BUTTON / WHEEL /
+  KEY / TEXT mapping, the focusing click and the resize grip keeping their
+  clicks, double clicks reaching the window, Esc twice, an older shim, WEND
+  closing after 2 s with the texture released, WCLOSE for a closed panel and
+  a late WOPENED, a lost connection, and a version 2 agent refused.
+
+`ghostty_core.dll` cross-compiles with the window code. Not yet observed in
+game: the texture on Dalamud's device, the view accepted as `ImTextureID` by
+Dalamud's DX11 ImGui renderer, the depth test's shader sampling it, upload
+cost and frame pacing, and input played back into a real window.
