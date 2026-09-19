@@ -353,6 +353,9 @@ global function run_command(cmd: string): cint
   elseif verb == 'theme' or verb == 'themes' then
     -- /term theme [name]: list or switch
     return theme_command(arg)
+  elseif verb == 'share' then
+    -- /term share [on|off|gallery|path]: offer the latest screenshot to the gallery (lua/gallery.lua)
+    return gallery_command(arg)
   elseif verb == 'selftest' then
     -- /term selftest [list | all | suite...]: checks inside the live game (core/app/selftest.nelua)
     return selftest_command(arg)

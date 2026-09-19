@@ -10,6 +10,7 @@ local changelog = require('changelog')
 local vote = require('vote')
 local themes = require('themes')
 local tooltips = require('tooltips')
+local gallery = require('gallery')
 
 local S = {}
 
@@ -138,6 +139,9 @@ S.schema = {
   { 'Remote windows', {
     { 'windows.auto_open', 'combo', { 'all', 'related', 'none' }, 'New windows of the agent become panels (related: dialogs and windows of apps you have out)' },
     { 'windows.never', 'list', 'Never show in game (app id, desktop id or part of a title; * matches anything)' },
+  { 'Gallery', {
+    { 'gallery.prompt', 'checkbox', 'Offer to share screenshots taken while a terminal is on screen' },
+    { 'gallery.credit', 'checkbox', 'Credit shared screenshots to my character' },
   } },
   { 'Info bar & hidden UI', {
     { 'host.dtr.mode', 'combo', DTR_MODES, 'Server info bar entry (auto: only without the Umbra widget)' },
@@ -215,6 +219,8 @@ function S.apply(config)
   -- an init.lua copied before themes and tooltips existed still gets them
   if config.themes == nil then config.themes = themes end
   if config.tooltips == nil then config.tooltips = tooltips end
+  -- ...and the gallery prompt, whose saved choices land in its module
+  if config.gallery == nil then config.gallery = gallery end
   if type(config.theme) ~= 'string' or config.theme == '' then config.theme = themes.DEFAULT end
   capture_defaults(config)
   local chunk = loadfile(file())

@@ -7,7 +7,7 @@
 require 'os'
 require 'core.app.anchored_popup'
 
-global GuEventKind = @enum{ None = 0, Chat, OpenMain, OpenConfig, DtrClick, PluginsChanged }
+global GuEventKind = @enum{ None = 0, Chat, OpenMain, OpenConfig, DtrClick, PluginsChanged, HttpDone }
 
 local EVENT_CAP <comptime> = 32
 local EVENT_TEXT <comptime> = 256
@@ -471,6 +471,11 @@ local function handle_event(e: *QueuedEvent): void
     elseif run_command(text) == 3 then
       logf(LOG_WARN, 'unknown command: %s', text)
     end
+    return
+  end
+  if e.kind == GuEventKind.HttpDone then
+    -- a gallery upload finished: `a` its id, `b` the HTTP status, the text the answer
+    gallery_uploaded(e.a, e.b, string{data=&e.text, size=e.len})
     return
   end
   if boot.state ~= HostState.Active then return end -- suspended: the legacy core owns the UI

@@ -20,6 +20,7 @@ M['tab.pet'] = 'Let this tab float beside you as a pet'
 M['tab.min'] = 'Minimize this tab to the toolbar'
 M['tab.cfg'] = 'Settings'
 M['tab.cfg.badge'] = 'Settings (new ideas to vote on, see About)'
+M['tab.share'] = 'Share your latest screenshot to the gallery'
 M['tab.hide'] = 'Hide the dropdown'
 M['tab.close'] = 'Close this tab'
 
@@ -53,7 +54,7 @@ M['chip.pet'] = 'In the world: click to focus it'
 -- The settings window.
 M.theme = 'Colours for the terminals and the glass around them; your own go in themes/ in the config folder.'
 M.theme_item = 'Hover to see it, click to use it.'
-M.vote = 'Opens the vote page in your browser; the plugin itself never goes online.'
+M.vote = 'Opens the vote page in your browser; the plugin itself sends nothing for the vote.'
 M.reset = 'Forget every change made here; the defaults return on the next /term reload.'
 
 M.sections = {
@@ -70,6 +71,7 @@ M.sections = {
   ['Assistant (/term ask)'] = 'Ask a local AI assistant from chat: /term ask <question>. Not yet tried in game.',
   ['Flat windows in the world'] = 'Plugin windows and the chat as world panels; hold Alt over a window to pull it in. Not yet tried in game.',
   ['Remote windows'] = 'Desktop windows from ghostty-agent on world panels (/window).',
+  ['Gallery'] = 'Share screenshots of your terminals to the gallery on spacegho.st; /term share offers your latest.',
   ['Info bar & hidden UI'] = 'The server info bar entry, and staying visible when the game hides its UI.',
 }
 
@@ -167,6 +169,8 @@ M.settings = {
   ['assistant.transport'] = 'Where the assistant runs; default follows your first profile.',
   ['assistant.chat'] = 'What /term ask runs on its own; change it in lua/assistant.lua.',
   ['assistant.ask'] = 'What /term ask <question> runs, with the question added; change it in lua/assistant.lua.',
+  ['gallery.prompt'] = 'After you take a screenshot with a terminal on screen, a small prompt asks whether to share it. Nothing is uploaded until you click Share.',
+  ['gallery.credit'] = 'Shared screenshots carry your character\'s name and world; off, they are anonymous.',
   ['host.dtr.mode'] = 'When the server info bar entry shows; auto hides it while the Umbra widget is there.',
   ['popup.close_on_blur'] = 'The info bar popup closes when you click elsewhere.',
   ['host.keep_visible.user_hidden'] = 'Terminals stay when you hide the game UI.',

@@ -79,7 +79,7 @@ end
 -- The "Vote on features" section of the settings window.
 function V.draw(ui, settings)
   ui.wrapped('Vote on features', 0.92, 0.86, 0.72)
-  ui.wrapped('Pick what gets built next. The button opens the vote page in your browser; the plugin itself never goes online.')
+  ui.wrapped('Pick what gets built next. The button opens the vote page in your browser; the plugin itself sends nothing for the vote.')
   local n = V.unseen(settings.values)
   if n > 0 then
     ui.wrapped(V.status_text(settings.values), 0.42, 0.80, 0.62)

@@ -69,7 +69,8 @@ global POLICY_HOOK_SETTINGS_DRAW <comptime> = 4
 global POLICY_HOOK_SETTINGS_BADGE <comptime> = 5
 global POLICY_HOOK_THEME <comptime> = 6
 global POLICY_HOOK_ON_EVENT <comptime> = 7
-global POLICY_HOOK_COUNT <comptime> = 8
+global POLICY_HOOK_GALLERY <comptime> = 8
+global POLICY_HOOK_COUNT <comptime> = 9
 
 global Policy = @record{
   L: *lua_State,
@@ -541,7 +542,7 @@ end
   lua_setglobal(L, 'CONFIG')
   -- an init.lua from before a module existed (the user's copy in the config
   -- home is never replaced) gets the shipped module's defaults
-  if luaL_loadstring(L, "for _, n in ipairs({ 'themes', 'tooltips', 'assistant', 'windows', 'adopt', 'rain' }) do if CONFIG[n] == nil then local ok, m = pcall(require, n) if ok then CONFIG[n] = m end end end") == LUA_OK then
+  if luaL_loadstring(L, "for _, n in ipairs({ 'themes', 'tooltips', 'assistant', 'windows', 'adopt', 'rain', 'gallery' }) do if CONFIG[n] == nil then local ok, m = pcall(require, n) if ok then CONFIG[n] = m end end end") == LUA_OK then
     if lua_pcall(L, 0, 0, 0) ~= LUA_OK then lua_pop(L, 1) end
   else
     lua_pop(L, 1)
@@ -1426,4 +1427,75 @@ global function policy_windows_pin(id: integer, args: string): string
   end
   lua_pop(L, 3)
   return err
+end
+
+-- Screenshot gallery (lua/gallery.lua) --------------------------------------------
+
+local function push_gallery_fn(L: *lua_State, name: cstring): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'gallery')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, name)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  return true -- stack: CONFIG, gallery, fn
+end
+
+-- CONFIG.gallery.tick(now, shown): watches the screenshot folder while a
+-- terminal is (or just was) on screen; true while its prompt should be drawn.
+global function policy_gallery_tick(now: float64, shown: boolean): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_gallery_fn(L, 'tick') then return false end
+  lua_pushnumber(L, now)
+  lua_pushboolean(L, shown and 1 or 0)
+  local draw = false
+  if lua_pcall(L, 2, 1, 0) == LUA_OK then
+    draw = lua_toboolean(L, -1) ~= 0
+  else
+    log_hook_error(L, POLICY_HOOK_GALLERY, 'gallery.tick')
+  end
+  lua_pop(L, 3)
+  return draw
+end
+
+-- CONFIG.gallery.draw(): the prompt's contents (ghostty.ui), inside its window.
+global function policy_gallery_draw(): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_gallery_fn(L, 'draw') then return end
+  if lua_pcall(L, 0, 0, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_GALLERY, 'gallery.draw')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.gallery.on_upload(id, status, text): an upload the shim finished.
+global function policy_gallery_uploaded(id: integer, status: integer, text: string): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_gallery_fn(L, 'on_upload') then return end
+  lua_pushinteger(L, id)
+  lua_pushinteger(L, status)
+  lua_pushlstring(L, (@cstring)(text.data), text.size)
+  if lua_pcall(L, 3, 0, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_GALLERY, 'gallery.on_upload')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.gallery.command(args) -> the line to show for /term share; empty when
+-- the module is missing or failed (the error is logged).
+global function policy_gallery_command(args: string): string
+  local out: string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return out end
+  if not push_gallery_fn(L, 'command') then return string.copy('lua/gallery.lua is not loaded (CONFIG.gallery)') end
+  lua_pushlstring(L, (@cstring)(args.data), args.size)
+  if lua_pcall(L, 1, 1, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_GALLERY, 'gallery.command')
+  elseif lua_type(L, -1) == LUA_TSTRING then
+    out = copy_string_at(L, -1)
+  end
+  lua_pop(L, 3)
+  return out
 end

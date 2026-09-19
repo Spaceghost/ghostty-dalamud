@@ -7,6 +7,7 @@ require 'core.app.terminal'
 require 'core.chrome'
 require 'core.tooltip'
 require 'core.app.bell'
+require 'core.app.gallery'
 require 'C.stdio'
 
 local GLOW_SPREAD: float32 <comptime> = 18
@@ -52,6 +53,8 @@ global function dropdown_run(action: ChromeAction): void
     set_visible(false)
   elseif action == ChromeAction.Settings then
     host.settings_open = not host.settings_open
+  elseif action == ChromeAction.Share then
+    gallery_command('') -- the prompt for the latest screenshot (lua/gallery.lua)
   elseif s == nilptr then
     return
   elseif action == ChromeAction.Minimize then
