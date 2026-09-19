@@ -21,7 +21,8 @@
 # SKIP_SHIM=1 (no C#; refreshes only the native files and lua/ of an existing
 # build/dist/GhosttyDalamud), SKIP_UMBRA=1 (no widget), SKIP_WIN=1 (no
 # Windows core, loader or agent), SKIP_DEPS=1 (reuse the Nelua,
-# libghostty-vt and Lua builds already in build/).
+# libghostty-vt and Lua builds already in build/), MAC=1 (also cross-compile
+# ghostty-agent for macOS arm64 and x86_64; untested on a Mac).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
@@ -83,6 +84,16 @@ if [[ "${SKIP_WIN:-0}" != 1 ]]; then
   echo "== ghostty-agent.exe (windows x64)"
   ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc --cflags="-O2" \
     --cache-dir build/win/cache-agent -L . -o build/dist/ghostty-agent.exe agent/agent.nelua
+fi
+
+if [[ "${MAC:-0}" == 1 ]]; then
+  # cross-compiled only: never run on a Mac from this build (docs/REMOTE_WINDOWS.md)
+  for arch in arm64 x86_64; do
+    echo "== ghostty-agent (macos $arch)"
+    cc="$ROOT/tools/zig-cc-mac.sh"; [[ $arch == x86_64 ]] && cc="$ROOT/tools/zig-cc-mac-x64.sh"
+    ZIG="$ZIG" "$NELUA" --cc "$cc" -P nogc --cflags="-O2" \
+      --cache-dir "build/mac-cache-$arch" -L . -o "build/dist/ghostty-agent-macos-$arch" agent/agent.nelua
+  done
 fi
 
 # Game and Dalamud assemblies are referenced, never shipped: a copy beside the

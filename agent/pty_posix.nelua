@@ -12,14 +12,22 @@ require 'agent.logic'
 ## cinclude '<fcntl.h>'
 ## cinclude '<errno.h>'
 ## cinclude '<stdlib.h>'
+## if not ccinfo.is_apple then
 ## cinclude '<pty.h>'
+## end
 ## cinclude '<termios.h>'
 ## if ccinfo.is_linux and not ccinfo.is_musl then
 ## linklib 'util'
 ## end
 
 local winsize <cimport, nodecl, ctypedef> = @record{ ws_row: cushort, ws_col: cushort, ws_xpixel: cushort, ws_ypixel: cushort }
+## if ccinfo.is_apple then
+-- macOS keeps forkpty in <util.h> (libSystem, no -lutil); Zig's macOS libc
+-- headers do not ship that header, so the prototype is declared here.
+local function forkpty(amaster: *cint, name: cstring, termp: pointer, winp: pointer): cint <cimport> end
+## else
 local function forkpty(amaster: *cint, name: cstring, termp: pointer, winp: *winsize): cint <cimport, nodecl> end
+## end
 local function execvp(file: cstring, argv: *[0]cstring): cint <cimport, nodecl> end
 local function setenv(name: cstring, value: cstring, overwrite: cint): cint <cimport, nodecl> end
 local function unsetenv(name: cstring): cint <cimport, nodecl> end
