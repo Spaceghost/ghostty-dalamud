@@ -3,6 +3,7 @@
 require 'core.app.panic'
 require 'core.app.commands'
 require 'core.app.hostsurface'
+require 'core.buildinfo'
 require 'allocators.default'
 
 -- Exports -----------------------------------------------------------------------
@@ -267,7 +268,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
 end
 
 global function gu_version(): cstring <cexport, codename 'gu_version'>
-  return 'ghostty-dalamud 0.2.0'
+  return build_version_cstr()
 end
 
 -- Called from the shim's hook on the game's walk input (every game frame).
