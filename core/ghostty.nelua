@@ -133,6 +133,10 @@ global GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR: cint <cimport, nodecl, cons
 global GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_SELECTED: cint <cimport, nodecl, const>
 global GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_HAS_STYLING: cint <cimport, nodecl, const>
 global GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8: cint <cimport, nodecl, const>
+global GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW: cint <cimport, nodecl, const>
+global GhosttyCell = @uint64
+global GHOSTTY_CELL_DATA_WIDE: cint <cimport, nodecl, const>
+global GHOSTTY_CELL_WIDE_WIDE: cint <cimport, nodecl, const>
 
 global GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BAR: cint <cimport, nodecl, const>
 global GHOSTTY_RENDER_STATE_CURSOR_VISUAL_STYLE_BLOCK: cint <cimport, nodecl, const>
@@ -202,6 +206,7 @@ global function ghostty_render_state_row_cells_new(allocator: *GhosttyAllocator,
 global function ghostty_render_state_row_cells_free(cells: GhosttyRenderStateRowCells): void <cimport, nodecl> end
 global function ghostty_render_state_row_cells_next(cells: GhosttyRenderStateRowCells): boolean <cimport, nodecl> end
 global function ghostty_render_state_row_cells_get(cells: GhosttyRenderStateRowCells, data: cint, out: pointer): GhosttyResult <cimport, nodecl> end
+global function ghostty_cell_get(cell: GhosttyCell, data: cint, out: pointer): GhosttyResult <cimport, nodecl> end
 
 global function ghostty_key_encoder_new(allocator: *GhosttyAllocator, encoder: *GhosttyKeyEncoder): GhosttyResult <cimport, nodecl> end
 global function ghostty_key_encoder_free(encoder: GhosttyKeyEncoder): void <cimport, nodecl> end

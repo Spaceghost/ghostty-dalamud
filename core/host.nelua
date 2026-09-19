@@ -90,6 +90,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     agent_release_sessions()
   end
   if not ensure_imgui() then return end
+  glyphfb_frame(ui_device()) -- fallback glyphs draw on Dalamud's device (core/glyphfb.nelua)
   local now = imgui.GetTime()
   local dt = now - host.last_time
   if dt < 0 or dt > 0.5 then dt = 1.0 / 60.0 end
@@ -265,6 +266,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   for i = 0, < #host.sessions do host.sessions[i].keep_on_agent = true end
   if host.layout_restored then save_world_state() end
   for i = #host.sessions - 1, 0, -1 do session_remove(host.sessions[i]) end
+  glyphfb_shutdown() -- the fallback glyph atlas and fonts
   remotewin_shutdown() -- its panels went with their sessions (WCLOSE queued)
   window_picker_shutdown()
   chatpanel_forget_log()

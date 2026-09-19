@@ -180,6 +180,14 @@ global function wintex_upload(t: *WinTex, r: WinRect, pixels: *[0]uint8, stride:
   api_update(t.device, t.tex, r, src, (@uint32)(stride))
 end
 
+-- Upload rectangle `r` from `src`, which holds just that rectangle (its first
+-- pixel, `pitch` bytes a row): the fallback glyph atlas (core/glyphfb.nelua).
+global function wintex_upload_from(t: *WinTex, r: WinRect, src: pointer, pitch: usize): void
+  if t.tex == nilptr or r.w == 0 or r.h == 0 then return end
+  if (@uint32)(r.x) + r.w > t.w or (@uint32)(r.y) + r.h > t.h then return end
+  api_update(t.device, t.tex, r, src, (@uint32)(pitch))
+end
+
 -- Shutdown: the cached immediate context goes too (textures are released by their streams).
 global function wintex_shutdown(): void
   ## if ccinfo.is_windows then
