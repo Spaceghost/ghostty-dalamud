@@ -139,6 +139,19 @@ a running game and runs `/term selftest` there through XivMcp, from a
 self-hosted runner on the gaming PC ([docs/CI.md, "In-game
 tests"](docs/CI.md#in-game-tests); not yet run against the game).
 
+Compiling on the machine that runs the game is optional. `tools/build-remote.sh`
+syncs the current worktree — branch, local edits and all — to an Incus container
+on a build host, builds it there and copies `build/dist/` back;
+`tools/test-remote.sh` runs the host tests there. The workstation then needs only
+an `incus` client and `rsync`: no Zig, no .NET SDK, no Dalamud assemblies, no
+memory taken from the game. See
+[docs/REMOTE_BUILD.md](docs/REMOTE_BUILD.md).
+
+```sh
+tools/test-remote.sh       # host build + tests/run.sh in the container, "ALL OK"
+tools/build-remote.sh      # full build there, artifacts back in build/dist/
+```
+
 Output:
 
 | Path | What |
