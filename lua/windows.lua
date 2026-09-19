@@ -1,15 +1,16 @@
 -- Remote windows: desktop windows streamed by ghostty-agent (protocol version
 -- 3) and shown as world panels, pets and pins like terminals
 -- (docs/REMOTE_WINDOWS.md). The core reads the fields below and calls size()
--- and pin(); pull, list and close are `/term window ...` commands.
+-- and pin(); pull, run, list and close are `/window ...` commands (also
+-- `/term window ...`), and other plugins do the same over IPC (docs/IPC.md).
 --
---   /term window list             the windows the agent can capture (in the log)
---   /term window pull [match]     open one as a pet; no match: the agent's
---                                 own choice (a desktop picker where it has one)
---   /term window pull #wid        by id from the list
---   /term window pull run CMD...  have the agent start CMD and stream its window
---   /term window close            close the focused window panel
---   /term pin ...                 moves the focused window panel like a terminal
+--   /window list             the windows the agent can capture (in the log)
+--   /window pull [match]     open one as a pet; no match: the agent's
+--                            own choice (a desktop picker where it has one)
+--   /window pull #wid        by id from the list
+--   /window run CMD...       have the agent start CMD and stream its window
+--   /window close            close the focused window panel
+--   /term pin ...            moves the focused window panel like a terminal
 --
 -- Change the fields (e.g. windows.fps = 20) rather than replacing the table:
 -- the core calls its functions.

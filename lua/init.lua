@@ -93,6 +93,11 @@ local config = {
   -- What the plugin registers with Dalamud.
   host = {
     commands = { '/term', '/tomestone', '/tome' },
+    -- Commands of their own, each standing for one /term verb (the same
+    -- functions): /window pull | run CMD | list | close, /ask [question],
+    -- /agent ask [question]. Their /help lines are in lua/tooltips.lua.
+    -- A name another plugin holds is retried; {} registers none.
+    verb_commands = { ['/window'] = 'window', ['/ask'] = 'ask', ['/agent'] = 'agent' },
     help = 'Show/hide the terminal. window [n|list|pull [match]|close] | new [n] | pin [here|me|target|orbit] | unpin | ask [question] | theme [name] | config | reload',
     -- Server info bar entry. 'auto' shows it only while no Umbra toolbar
     -- widget is showing ghostty's status; 'always' | 'never'.

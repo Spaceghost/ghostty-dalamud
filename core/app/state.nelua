@@ -81,6 +81,9 @@ global GuHostApi = @record{
                              sx: float32, sy: float32, sz: float32): cint,
   bg_set_transparency: function(obj: pointer, transparency: float32): cint, -- 0 drawn .. 1 gone
   bg_destroy: function(obj: pointer): cint,
+  -- a chat command of its own (CONFIG.host.verb_commands): its handler posts
+  -- GuEventKind.Chat with `a` = tag and the arguments as text; 1 = ok
+  command_add_tagged: function(name: cstring, help: cstring, tag: cint): cint,
 }
 
 global LOG_INFO: cint <comptime> = 1

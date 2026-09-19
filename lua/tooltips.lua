@@ -37,6 +37,11 @@ M['world.sleep.on'] = 'Sleeps while nobody sees it; click to keep it running'
 M['world.sleep.off'] = 'Keeps running while unseen; click to let it sleep'
 M['world.resize'] = 'Drag to resize'
 
+-- /help lines of the commands of their own (CONFIG.host.verb_commands).
+M['command./window'] = 'Desktop windows on world panels: pull [match|#wid] | run CMD | list | close'
+M['command./ask'] = 'Ask the local AI assistant: /ask [question]'
+M['command./agent'] = 'ghostty-agent: /agent ask [question] asks the local AI assistant'
+
 -- The toolbar popup's taskbar chips.
 M['chip.min'] = 'Minimized: click to bring it back'
 M['chip.tab'] = 'A dropdown tab: click to show it'

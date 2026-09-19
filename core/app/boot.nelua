@@ -64,6 +64,9 @@ global Surface = @record{
   ipc: boolean,                  -- providers registered
   commands: vector(string),
   command_ok: vector(boolean),
+  command_tag: vector(cint),     -- 0: a /term name; k > 0: stands for verbs[k-1]
+  verbs: vector(string),         -- the /term verb of each tagged command
+  verbs_unsupported: boolean,    -- logged once: the shim cannot register them
   command_retry_ms: uint64,
   dtr_pushed: boolean,
   dtr_shown: boolean,

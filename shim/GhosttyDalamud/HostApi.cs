@@ -73,6 +73,7 @@ internal static unsafe class HostApi
         Api->BgSetTransform = &BgSetTransform;
         Api->BgSetTransparency = &BgSetTransparency;
         Api->BgDestroy      = &BgDestroy;
+        Api->CommandAddTagged = &CommandAddTagged;
     }
 
     public static void Free()
@@ -104,6 +105,16 @@ internal static unsafe class HostApi
     private static int CommandAdd(byte* name, byte* help)
     {
         try { return Plugin.Commands.AddHandler(Str(name), new CommandInfo(OnCommand) { HelpMessage = Str(help) }) ? 1 : 0; }
+        catch { return 0; }
+    }
+
+    // a command of its own (/window, /ask): the core knows it by `tag`
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int CommandAddTagged(byte* name, byte* help, int tag)
+    {
+        try {
+            return Plugin.Commands.AddHandler(Str(name), new CommandInfo((_, args) => Native.Post(GuEvent.Chat, tag, 0, 0, 0, args)) { HelpMessage = Str(help) }) ? 1 : 0;
+        }
         catch { return 0; }
     }
 

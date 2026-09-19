@@ -565,6 +565,34 @@ global function remotewin_command(args: string): cint
   return 4
 end
 
+-- `/window pull [match|#wid] | run CMD... | list | close | desktop`, with an
+-- optional trailing `@agent`: the same functions as IPC and `/term window`.
+-- 0 on success, 4 with a logged reason.
+global function window_command(args: string): cint
+  local verb: string = args
+  local rest: string
+  local sp = args:find(' ', 1, true)
+  if sp > 0 then verb, rest = args:subview(1, sp - 1), args:subview(sp + 1) end
+  if verb == 'run' then
+    local cmd, _ = split_agent(rest)
+    if #cmd == 0 then logf(LOG_WARN, 'usage: /window run CMD... [@agent]') return 4 end
+    local sb: stringbuilder
+    sb:write('run ', rest)
+    local line = sb:promote()
+    local ok, err = remotewin_pull(line)
+    line:destroy()
+    if not ok then logf(LOG_WARN, 'window run: %s', err) return 4 end
+    return 0
+  elseif verb == 'list' or verb == 'pull' or verb == 'close' then
+    return remotewin_command(args)
+  elseif verb == 'desktop' then
+    logf(LOG_WARN, 'window desktop: not available yet (reserved for a whole remote desktop on a panel)')
+    return 4
+  end
+  logf(LOG_WARN, 'usage: /window pull [match|#wid] | run CMD... | list | close   (each may end with @agent)')
+  return 4
+end
+
 -- `/term pin ...` on the focused window panel: moved, same size. False when
 -- the focused panel is not a window (the terminal pin applies).
 global function remotewin_pin(args: string): (boolean, cint)
