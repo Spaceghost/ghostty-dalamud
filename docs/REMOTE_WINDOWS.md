@@ -51,7 +51,11 @@ WOPENED answers WOPEN by its client-chosen `req`, and may come much later
 (an app being launched has not shown its window yet) and out of order. `wid 0`
 + match text means "first window whose title or app contains the text,
 case-insensitive", waiting for one to appear; on Linux `wid 0` + `run:CMD`
-starts CMD in the agent's compositor and opens its first window.
+starts CMD in the agent's compositor and opens its first window, and
+`wid 0` + `url:URL` opens URL in the compositor's browser ("Opening URLs"
+below). A WOPENED for `url:` may name a `sid` this connection already has:
+the browser's window was on a stream of it already and the link opened as a
+tab there; no second stream is made (the client focuses that panel).
 
 WFRAME carries the window's current size `w`×`h` and a list of rectangles
 that changed. Flags: bit 0 KEY (the rectangles cover the whole window; the
@@ -131,6 +135,8 @@ characters, so layouts on the two ends need not match.
 | `agent/capture.nelua` | agent | the backend interface and the `--windows` choice |
 | `agent/capture_test.nelua` | agent | synthetic windows (moving pattern) for tests; `--windows test` |
 | `agent/capture_wayland.nelua` | agent (Linux) | a headless wlroots 0.20 compositor in the agent: xdg toplevels are the windows, pixman renders them, wlr_seat takes the input; `run:` launches apps into it |
+| `agent/browser.nelua` | agent (Linux) | links: the browser's command for a URL, `--wayland-browser-profile` argv, telling a browser's windows and processes (pure) |
+| `core/links.nelua` | plugin | the URL under a Ctrl+click in a terminal row; which links go to a browser (pure) |
 | `agent/wayland_keys.nelua` | agent (Linux) | USB HID to evdev, codepoint to key in the xkb keymap (for TEXT) |
 | `agent/capture_win32.nelua` | agent (Windows) | EnumWindows, PrintWindow(PW_RENDERFULLCONTENT) with BitBlt fallbacks, window messages / SendInput; pure parts in `agent/capture_win32_logic.nelua` |
 | `agent/capture_mac.nelua` | agent (macOS) | CGWindowList for the list, ScreenCaptureKit for frames, CGEventPostToPid |
@@ -375,6 +381,25 @@ window; it needs WinRT activation and a D3D11 device, so it is not done.
   one that panel waits for). A refused window is not asked for again while
   it is listed. Windows, macOS and older agents list no launch column, so
   nothing opens by itself there.
+* Links. Ctrl+click in a terminal opens the link under the pointer: the
+  cell's OSC 8 hyperlink, else a URL in that row's text (`core/links.nelua`:
+  from `http://`, `https://` or `mailto:` to the next blank, quote or
+  bracket, without trailing `.,;:!?` or an unbalanced `)`/`]`; a URL wrapped
+  onto the next row is cut there). Only http, https and mailto open;
+  `file://` and other schemes say "link not opened" in the chat and do
+  nothing. With `CONFIG.windows.links = 'game'` (the default) and a
+  version 3 agent whose list has the launch line (its own compositor), the
+  link goes out as `window_open{ match = "url:URL" }`: a new panel where
+  `open_at` says. When WOPENED names a sid another panel shows, the new
+  panel closes and that one gets focus (the link is a tab there). A link
+  panel is not saved by its URL (a restart would open the link again) but by
+  its window key. No agent, no compositor, a failed `window_open`, or a
+  refusal (WOPENED sid 0): the desktop's browser opens it (the shim's
+  `open_url`, Dalamud's `Util.OpenLink`) and the chat says "link opened in
+  your desktop browser: WHY". `'host'`: always the desktop's browser,
+  nothing said. Lists with `raise:N` on a window (a link an app in the
+  compositor opened) open that window as a panel or focus its panel, once
+  per N; the first list after connecting is only noted.
 * `CONFIG.windows.never` (empty by default; also in the settings window,
   "Remote windows"): app ids, desktop ids or title parts, case-insensitive,
   `*` matching anything (`org.gnome.*`). Such windows are never opened by
@@ -415,7 +440,9 @@ no host compositor: the host desktop never sees these windows.
   layer rate-limits further. Direct scan-out is off: frames are always the
   composed window.
 * WLIST: the line `0 0 0 launch run:COMMAND to start an app in the game`,
-  then one line per mapped toplevel, `wid` counting up from 1.
+  then one line per mapped toplevel, `wid` counting up from 1. A window
+  that a link from outside the game asked to show carries `raise:N`
+  ("Opening URLs").
 * WOPEN `wid` → that window, live at once. `wid 0` + `run:CMD ARGS` → `sh -c
   CMD ARGS` in its own session with `WAYLAND_DISPLAY` set to ours,
   `XDG_SESSION_TYPE=wayland`, `GDK_BACKEND=wayland`, `QT_QPA_PLATFORM=wayland`,
@@ -568,6 +595,103 @@ Limits, all current:
 * Apps launched by the agent die with it (they lose their display); the agent
   does not kill them on exit itself.
 
+## Opening URLs
+
+Links open inside the game: the agent's compositor runs a browser, and its
+window is a panel like any other. Linux compositor only (`agent/browser.nelua`
+for the pure parts, `open_url` in `agent/capture_wayland.nelua`).
+
+**WOPEN `wid 0` + `url:URL`** (http, https or mailto; no blanks or control
+characters; at most 8 KiB; anything else is refused with why):
+
+1. The browser: `--wayland-browser CMD` (or `GHOSTTY_WAYLAND_BROWSER`), else
+   the host's default browser: `xdg-settings get default-web-browser` (else
+   `xdg-mime query default x-scheme-handler/https`) names a desktop entry
+   whose `Exec` is used. The first `%u %U %f %F` (or `%s`, as `$BROWSER`
+   writes it) becomes the URL in single quotes, `%i`/`%c` as for `app:`; no
+   placeholder: the URL is appended. It runs like `run:` (`sh -c`, the
+   compositor's environment).
+2. A window of that browser already in the compositor (the one the last
+   `url:` launch opened, else the newest whose app id fits the browser's
+   program or Flatpak id) gets the link: the command runs again, and the
+   browser's own single-instance handling (Firefox's remote service,
+   Chromium's singleton) opens it as a tab there. The stream is that window,
+   live at once and focused. When this connection streams that window
+   already, WOPENED answers with **that stream's sid** (and its size and
+   title) and no second stream is made; the plugin sees a sid it has and
+   focuses that panel.
+3. Otherwise the browser starts and the stream waits for its window as for
+   `run:` (30 s). Its launch id is remembered for step 2.
+4. Refused, before anything runs, when no browser window is in the
+   compositor but the browser's single instance runs on the **host
+   desktop**: a Flatpak browser listed by `flatpak ps`, or a process whose
+   `/proc/PID/comm` is the program (cut to 15 bytes, or its `-bin`, or
+   `chrome` for Google Chrome's wrappers) that is not a descendant of the
+   agent and whose `WAYLAND_DISPLAY` is not our socket. Running the browser
+   would only hand the link to that copy, so WOPENED fails with "firefox is
+   running on your desktop, so the link would open there; quit it, or give
+   the game its own browser (ghostty-agent --wayland-browser-profile NAME)"
+   and the plugin opens the link in the desktop's browser instead. A copy
+   the check misses still ends the launch with "the app exited without
+   opening a window here" (the link then opened on the desktop, and the
+   plugin's fallback opens it there a second time).
+
+**A browser of its own for the game.** `--wayland-browser-profile NAME` (or
+`GHOSTTY_WAYLAND_BROWSER_PROFILE`; letters, digits, `.`, `_`, `-`) adds a
+separate profile after the browser's program (after the app id of a
+`flatpak run`), which also keeps the game's browser apart from the desktop's
+running one (step 4 is skipped):
+
+* Firefox and its forks (LibreWolf, Waterfox, Floorp, Zen, IceCat):
+  `--profile DIR`, DIR `$XDG_DATA_HOME/ghostty-agent/firefox-NAME` (created).
+  Not `--new-instance`: that also turns off Firefox's remote service, so a
+  second link would find the profile locked instead of opening a tab. By
+  hand, `firefox --new-instance -P ffxiv` works for one window.
+* Chromium family (Chromium, Chrome, Brave, Vivaldi, Edge, Opera, Thorium):
+  `--user-data-dir=DIR`, DIR `$XDG_DATA_HOME/ghostty-agent/chromium-NAME`;
+  Chromium keeps one instance per data directory.
+* A Flatpak browser gets DIR under its own `~/.var/app/ID/ghostty-agent-NAME`,
+  a directory its sandbox can write.
+* Other browsers: refused with why; give them a profile through
+  `--wayland-browser CMD` instead.
+
+Whether a real Firefox or Chromium reuses its profile instance this way has
+not been tried here; only the argv is tested.
+
+**`ghostty-agent --open-url URL`** (optionally `--listen HOST:PORT` and
+`--token-file PATH`, else `$GHOSTTY_AGENT_LISTEN` and
+`$GHOSTTY_AGENT_TOKEN_FILE`, else the server's defaults 127.0.0.1:7777 and
+`~/.config/ghostty-agent/token`) connects to the running agent, sends HELLO
+and WOPEN `url:URL`, waits for WOPENED (up to 45 s: a browser that starts
+first takes a while) and exits: 0 when the browser has the link, else 1 and
+one line on stderr saying why (no token file, no agent, refused, no window
+in time). It never creates a token. The window stays in the compositor when
+it disconnects. Because this connection does not watch the list, the agent
+marks the window with `raise:N` (N counts up with every such link) on the
+list lines it pushes to watchers; the plugin opens a window with a new mark
+as a panel (by its wid), or focuses its panel. A watcher's own links carry no
+mark.
+
+**Apps in the compositor** are started with `BROWSER="ghostty-agent
+--open-url"` (the name when `ghostty-agent` on `PATH` is this binary, as for
+the installed `~/.local/bin/ghostty-agent`; else the binary's full path),
+`GHOSTTY_AGENT_LISTEN` / `GHOSTTY_AGENT_TOKEN_FILE` set to the agent's, and
+`PATH` beginning with `$XDG_RUNTIME_DIR/ghostty-agent-SOCKET`, which holds an
+`xdg-open` shim: http, https and mailto go to `--open-url`; anything else,
+and a link the agent refused, goes to the real `xdg-open` (the shim's
+directory taken off `PATH`). So links from `run:`/`app:` apps and from
+terminals of those apps stay in the game. Limits:
+
+* Only apps the agent starts get these; a client started by hand with
+  `WAYLAND_DISPLAY=ffxiv-0` keeps its own environment.
+* Flatpak apps ignore the host's `PATH` and `BROWSER`: their links go
+  through the OpenURI portal to the desktop's browser.
+* Apps that open links through GIO/D-Bus rather than `xdg-open` or
+  `$BROWSER` (GTK's `gtk_show_uri` without the portal, KDE's KIO) launch the
+  default browser's desktop entry directly, in the compositor's environment:
+  a browser that is not running opens here (a new window, auto-opened as a
+  panel), one running on the desktop takes the link there.
+
 ## macOS backend (agent/capture_mac.nelua)
 
 Compiles (arm64 and x86_64 Mach-O, `MAC=1 tools/build.sh`); **never run on
@@ -686,8 +810,8 @@ same and points at `/window` once per session. `/ask [question]` and
 holds the sizes asked for (`max_w`, `max_h`, default 1920×1200), `fps` (30),
 the panel's `pixels_per_yalm` (700), `width` (1600 panel pixels), `opacity`,
 `auto`: `/term window pull` arguments run once the character is loaded,
-`auto_open` (`all`), `never` (`{}`) and `reserved_chords` (`{ 'super+*' }`),
-all described above.
+`auto_open` (`all`), `links` (`game`), `never` (`{}`) and `reserved_chords`
+(`{ 'super+*' }`), all described above.
 
 Clicking a window panel focuses it; while focused the mouse and keyboard go
 to the remote window. Esc twice within half a second (or clicking outside)
@@ -711,6 +835,23 @@ Host tests only (`tests/run.sh`), nothing in game or on a real desktop:
 
 * `test_wincodec`: tile diff, QOI both ways, WFRAME packing and parsing,
   `wincodec_downscale`.
+* Links (2026-09-19): `test_agent_browser` (URL checks, the browser's
+  command line from an Exec or `--wayland-browser`, the profile argv for
+  Firefox, Chromium and Flatpak browsers, matching a browser's windows and
+  processes); `test_agent_windows` opens links through the test backend
+  (window 2 stands in for the browser: a second link names the stream that
+  shows it, a non-watching connection's link marks it `raise:N`, a
+  watcher's does not); `test_remotewin` (WOPEN `url:`, the second link
+  focusing the browser's panel, the refusal, no-agent, no-compositor and
+  `'host'` fallbacks to `open_url`, `file:` left shut, `raise:` opening and
+  focusing panels); `test_selection` (URLs in a row, a cell's OSC 8
+  hyperlink on a real libghostty terminal). By hand against a built agent
+  with a fake browser script (yad as its window): the first `--open-url`
+  started it and exited 0 once its window mapped, the second and an
+  `xdg-open` through the shim went to that window, a copy of the fake
+  browser's program running outside the compositor made `--open-url` fail
+  with the message above, `file:` was refused. No real browser, and nothing
+  in game.
 * `test_agent_windows`: the whole agent path over TCP against the synthetic
   backend (`--windows test`): WLIST, WOPEN by id and by match, WOPENED fields,
   a KEY frame and deltas rebuilt to the backend's exact pixels, a scaled

@@ -19,13 +19,14 @@ global DesktopEntry = @record{
   id: string,          -- the file name, e.g. org.mozilla.firefox.desktop
   name: string,
   exec: string,        -- a shell command: field codes gone, string escapes resolved
+  exec_raw: string,    -- Exec with its field codes, string escapes resolved (browser_expand fills in a URL)
   icon: string,        -- an icon name (or path) as the file gives it
   categories: string,  -- as given: "Network;WebBrowser;"
   terminal: boolean,   -- Terminal=true: needs a terminal to run in
 }
 
 function DesktopEntry:destroy(): void
-  self.id:destroy() self.name:destroy() self.exec:destroy() self.icon:destroy() self.categories:destroy()
+  self.id:destroy() self.name:destroy() self.exec:destroy() self.exec_raw:destroy() self.icon:destroy() self.categories:destroy()
 end
 
 local function lower_byte(c: byte): byte
@@ -131,7 +132,7 @@ global function desktop_parse(id: string, text: string): (boolean, DesktopEntry)
   e.categories = unescape(cats)
   local raw = unescape(exec)
   e.exec = desktop_exec_command(raw, e.name, e.icon)
-  raw:destroy()
+  e.exec_raw = raw
   e.terminal = terminal
   if #e.exec == 0 then e:destroy() return false, (@DesktopEntry){} end
   return true, e

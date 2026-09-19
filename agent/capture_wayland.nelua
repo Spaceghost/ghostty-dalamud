@@ -41,6 +41,7 @@ require 'math'
 require 'core.protocol'
 require 'agent.wayland_keys'
 require 'agent.desktop_entries'
+require 'agent.browser'
 
 ## cdefine 'WLR_USE_UNSTABLE'
 ## cinclude '<time.h>'
@@ -563,6 +564,10 @@ local wc: record{
   stat_render: float64,
   stat_grab: float64,
   warned_text: boolean,
+  -- links (WOPEN "url:", docs/REMOTE_WINDOWS.md "Opening URLs")
+  browser_launch: string,     -- the launch id of the browser the last url: started
+  open_url_cmd: string,       -- $BROWSER for apps in the compositor: `ghostty-agent --open-url`
+  path_env: string,           -- $PATH for them: the xdg-open shim's directory first
 }
 
 -- Options the agent may set before capture_wayland_backend (flags
@@ -571,6 +576,22 @@ local wc: record{
 local opt_socket: string
 local opt_layout: string
 local opt_render_node: string
+local opt_browser: string          -- --wayland-browser CMD (GHOSTTY_WAYLAND_BROWSER)
+local opt_browser_profile: string  -- --wayland-browser-profile NAME (GHOSTTY_WAYLAND_BROWSER_PROFILE)
+local opt_listen: string           -- the agent's --listen and token file, for `--open-url` in its apps
+local opt_token_file: string
+
+-- The browser links open in (--wayland-browser CMD, --wayland-browser-profile NAME).
+global function capture_wayland_set_browser(cmd: string, profile: string): void
+  opt_browser = cmd
+  opt_browser_profile = profile
+end
+
+-- Where apps in the compositor reach this agent (`ghostty-agent --open-url`).
+global function capture_wayland_set_agent(listen: string, token_file: string): void
+  opt_listen = listen
+  opt_token_file = token_file
+end
 
 -- --wayland-render-node PATH|auto|none (default auto; GHOSTTY_WAYLAND_RENDER_NODE).
 global function capture_wayland_set_render_node(opt: string): void
@@ -963,6 +984,11 @@ local function spawn(cmd: string): cint
   setenv('SDL_VIDEODRIVER', 'wayland', 1)
   setenv('MOZ_ENABLE_WAYLAND', '1', 1)
   setenv('ELECTRON_OZONE_PLATFORM_HINT', 'wayland', 1)
+  -- links they open come back to this agent (docs/REMOTE_WINDOWS.md "Opening URLs")
+  if #wc.open_url_cmd > 0 then setenv('BROWSER', (@cstring)(wc.open_url_cmd.data), 1) end
+  if #wc.path_env > 0 then setenv('PATH', (@cstring)(wc.path_env.data), 1) end
+  if #opt_listen > 0 then setenv('GHOSTTY_AGENT_LISTEN', (@cstring)(opt_listen.data), 1) end
+  if #opt_token_file > 0 then setenv('GHOSTTY_AGENT_TOKEN_FILE', (@cstring)(opt_token_file.data), 1) end
   execl('/bin/sh', 'sh', '-c', (@cstring)(cmd.data), (@cstring)(nilptr))
   _exit(127)
   return -1
@@ -2047,6 +2073,206 @@ local function on_path(name: string): boolean
   return found
 end
 
+--------------------------------------------------------------------------------
+-- Links (WOPEN "url:URL", docs/REMOTE_WINDOWS.md "Opening URLs")
+
+-- A command's output without the blanks around it ('' when it fails).
+local function read_cmd(cmd: string): string
+  local f = io.popen(cmd, 'r')
+  if not f:isopen() then return (@string){} end
+  local out = f:read('a')
+  f:close()
+  local i, j = 1, #out
+  while i <= j and (out:byte(i) == 32 or out:byte(i) == 9 or out:byte(i) == 10 or out:byte(i) == 13) do i = i + 1 end
+  while j >= i and (out:byte(j) == 32 or out:byte(j) == 9 or out:byte(j) == 10 or out:byte(j) == 13) do j = j - 1 end
+  local t = out:sub(i, j)
+  out:destroy()
+  return t
+end
+
+-- The browser's command line for `url`: --wayland-browser CMD (or
+-- GHOSTTY_WAYLAND_BROWSER), else the Exec of the desktop's default browser
+-- (`xdg-settings get default-web-browser`, else `xdg-mime query default
+-- x-scheme-handler/https`); with --wayland-browser-profile its own profile.
+-- Empty and why when there is none.
+local function browser_command(url: string): (string, string)
+  local tmpl = #opt_browser > 0 and string.copy(opt_browser) or os.getenv('GHOSTTY_WAYLAND_BROWSER')
+  local name: string, icon: string
+  if #tmpl == 0 then
+    local id = read_cmd('xdg-settings get default-web-browser 2>/dev/null')
+    if #id == 0 then id:destroy() id = read_cmd('xdg-mime query default x-scheme-handler/https 2>/dev/null') end
+    if #id == 0 then
+      id:destroy()
+      return (@string){}, string.copy('no default web browser (xdg-settings get default-web-browser); set --wayland-browser CMD')
+    end
+    local dirs = desktop_data_dirs()
+    local es = desktop_scan(&dirs)
+    for i = 0, < #es do
+      if es[i].id == id then
+        tmpl:destroy()
+        tmpl, name, icon = string.copy(es[i].exec_raw), string.copy(es[i].name), string.copy(es[i].icon)
+        break
+      end
+    end
+    for i = 0, < #es do es[i]:destroy() end
+    es:destroy()
+    for i = 0, < #dirs do dirs[i]:destroy() end
+    dirs:destroy()
+    if #tmpl == 0 then
+      local why = 'the default browser ' .. id .. ' is not an installed app here; set --wayland-browser CMD'
+      id:destroy()
+      return (@string){}, why
+    end
+    id:destroy()
+  end
+  local cmd = browser_expand(tmpl, url, name, icon)
+  tmpl:destroy() name:destroy() icon:destroy()
+  local profile = #opt_browser_profile > 0 and string.copy(opt_browser_profile) or os.getenv('GHOSTTY_WAYLAND_BROWSER_PROFILE')
+  if #profile == 0 then profile:destroy() return cmd, (@string){} end
+  if not browser_profile_ok(profile) then
+    profile:destroy() cmd:destroy()
+    return (@string){}, string.copy('--wayland-browser-profile: a name of letters, digits, . _ -')
+  end
+  local prog = browser_program(cmd)
+  local family = browser_family(prog)
+  local flatpak = wayland_flatpak_id(cmd)
+  local home, data_home = os.getenv('HOME'), os.getenv('XDG_DATA_HOME')
+  local dir = browser_profile_dir(family, flatpak, profile, home, data_home)
+  local ok, out = browser_with_profile(cmd, family, dir)
+  if ok then
+    local sb: stringbuilder
+    sb:write('mkdir -p ') desktop_sh_quote(&sb, dir) sb:write(' 2>/dev/null; ')
+    local mk = sb:promote()
+    os.execute(mk)
+    mk:destroy()
+  end
+  prog:destroy() flatpak:destroy() home:destroy() data_home:destroy() dir:destroy() profile:destroy() cmd:destroy()
+  if not ok then return (@string){}, out end
+  return out, (@string){}
+end
+
+-- The value of NAME in a /proc/PID/environ (NUL separated), as a view; empty when unset.
+local function environ_value(env: string, name: string): string
+  local start = 1
+  for pos = 1, #env + 1 do
+    if pos > #env or env:byte(pos) == 0 then
+      local entry = env:subview(start, pos - 1)
+      if #entry > #name and entry:byte(#name + 1) == 61 and entry:subview(1, #name) == name then return entry:subview(#name + 2) end
+      start = pos + 1
+    end
+  end
+  return (@string){}
+end
+
+-- A process of browser `prog` runs outside this compositor (on the host
+-- desktop): its /proc/PID/comm fits the program (browser_comm_matches),
+-- it is not one of ours (a descendant of the agent) and its
+-- WAYLAND_DISPLAY is not our socket. Its single instance would take the link.
+local function browser_on_desktop(prog: string): boolean
+  local me = getpid()
+  local names = desktop_list_dir('/proc')
+  local found = false
+  for i = 0, < #names do
+    local nm = names[i]
+    if found or #nm == 0 or nm:byte(1) < 48 or nm:byte(1) > 57 then continue end
+    local path = string.format('/proc/%s/comm', nm)
+    local f = io.open(path, 'r')
+    path:destroy()
+    if not f:isopen() then continue end
+    local comm = f:read('l')
+    f:close()
+    if browser_comm_matches(comm, prog) then
+      local pid = (@cint)(tointeger(nm))
+      local epath = string.format('/proc/%s/environ', nm)
+      local ef = io.open(epath, 'rb')
+      epath:destroy()
+      local env: string
+      if ef:isopen() then env = ef:read('a') ef:close() end
+      local wd = environ_value(env, 'WAYLAND_DISPLAY')
+      if wd ~= wc.socket and not descends_from(pid, me) then found = true end
+      env:destroy()
+    end
+    comm:destroy()
+  end
+  for i = 0, < #names do names[i]:destroy() end
+  names:destroy()
+  return found
+end
+
+-- The browser's window in the compositor: the one the last url: launch
+-- opened, else the newest mapped window of that browser (by app id).
+local function browser_top(prog: string, flatpak: string): *Top
+  if #wc.browser_launch > 0 then
+    for i = 0, < #wc.tops do
+      local t = wc.tops[i]
+      if t.mapped and t.launch == wc.browser_launch then return t end
+    end
+  end
+  local best: *Top = nilptr
+  for i = 0, < #wc.tops do
+    local t = wc.tops[i]
+    if t.mapped and (browser_window_matches(top_app(t), prog) or (#flatpak > 0 and browser_window_matches(top_app(t), flatpak))) then
+      if best == nilptr or t.id > best.id then best = t end
+    end
+  end
+  return best
+end
+
+-- WOPEN "url:URL": the browser opens it here. A browser window already in
+-- the compositor gets it (the browser's own "open in the running instance":
+-- the command runs again) and the stream shows that window at once;
+-- otherwise the browser starts like run: and the stream waits for its window.
+-- Refused when the browser's single instance runs on the host desktop (the
+-- link would open there), unless a separate profile is set.
+local function open_url(url: string): (pointer, string)
+  local bad = browser_url_check(url)
+  if #bad > 0 then return nilptr, string.copy(bad) end
+  local cmd, why = browser_command(url)
+  if #cmd == 0 then return nilptr, why end
+  local prog = browser_program(cmd)
+  local flatpak = wayland_flatpak_id(cmd)
+  local env_profile = os.getenv('GHOSTTY_WAYLAND_BROWSER_PROFILE')
+  local profiled = #opt_browser_profile > 0 or #env_profile > 0
+  env_profile:destroy()
+  local t = browser_top(prog, flatpak)
+  if t == nilptr and not profiled and ((#flatpak > 0 and flatpak_running(flatpak)) or (#flatpak == 0 and browser_on_desktop(prog))) then
+    local msg = string.format('%s is running on your desktop, so the link would open there; quit it, or give the game its own browser (ghostty-agent --wayland-browser-profile NAME)', #flatpak > 0 and flatpak or prog)
+    cmd:destroy() prog:destroy() flatpak:destroy()
+    return nilptr, msg
+  end
+  local pid = spawn(cmd)
+  if pid < 0 then
+    cmd:destroy() prog:destroy() flatpak:destroy()
+    return nilptr, string.copy('cannot start the browser (fork failed)')
+  end
+  wc.children:push(Child{ pid = pid })
+  local c = new(@Cap)
+  if t ~= nilptr then
+    -- the running browser takes the URL as a new tab; the stream is its window
+    log('link to the browser in window ' .. tostring(t.id) .. ' (' .. top_app(t) .. '): ' .. cmd)
+    c.top = t
+    c.state = CAPTURE_LIVE
+    wc.caps:push(c)
+    focus(t)
+  else
+    c.state = CAPTURE_PENDING
+    c.deadline = os.now() + WAYLAND_OPEN_TIMEOUT
+    c.pid = pid
+    wc.launches = wc.launches + 1
+    c.launch = string.format('%s.%d', wc.instance, wc.launches)
+    wc.browser_launch:destroy()
+    wc.browser_launch = string.copy(c.launch)
+    c.first_new = wc.next_id
+    c.name = string.copy(#flatpak > 0 and flatpak or prog)
+    c.flatpak = string.copy(flatpak)
+    log('link: started the browser "' .. cmd .. '" (pid ' .. tostring(pid) .. ') on ' .. wc.socket)
+    wc.caps:push(c)
+    settle(c, os.now())
+  end
+  cmd:destroy() prog:destroy() flatpak:destroy()
+  return c, (@string){}
+end
+
 local function wl_open(wid: uint32, match: string): (pointer, string)
   if wid ~= 0 then
     local t = find_top(wid)
@@ -2057,6 +2283,14 @@ local function wl_open(wid: uint32, match: string): (pointer, string)
     wc.caps:push(c)
     focus(t)
     return c, (@string){}
+  end
+  do
+    local is_url, url = wayland_match_form(match, 'url:')
+    if is_url then
+      local h, why = open_url(url)
+      url:destroy()
+      return h, why
+    end
   end
   local is_run, cmd = wayland_parse_run(match)
   local is_desk, spec = wayland_match_form(match, 'desktop:')
@@ -2497,6 +2731,71 @@ local function make_renderer(): *wlr_renderer
   return wlr_pixman_renderer_create()
 end
 
+-- $BROWSER and an xdg-open shim for the apps in the compositor, so links
+-- they open come back here (docs/REMOTE_WINDOWS.md "Opening URLs"). BROWSER
+-- is `ghostty-agent --open-url` when that name on PATH is this binary, else
+-- this binary's path; the shim is $XDG_RUNTIME_DIR/ghostty-agent-SOCKET/xdg-open,
+-- first on their PATH: web and mail links go to --open-url, anything else
+-- (and a refused link) to the real xdg-open.
+local function setup_link_env(): void
+  local exe: string
+  do
+    local r = realpath('/proc/self/exe', nilptr)
+    if r ~= nilptr then exe = string.copy((@string)(r)) free(r) end
+  end
+  local prog: string
+  local onpath = desktop_which('ghostty-agent')
+  if #onpath > 0 and #exe > 0 then
+    local r = realpath((@cstring)(onpath.data), nilptr)
+    if r ~= nilptr then
+      if (@string)(r) == exe then prog = string.copy('ghostty-agent') end
+      free(r)
+    end
+  end
+  onpath:destroy()
+  if #prog == 0 then
+    if #exe == 0 then return end
+    local sb: stringbuilder
+    desktop_sh_quote(&sb, exe)
+    prog = sb:promote()
+  end
+  exe:destroy()
+  wc.open_url_cmd = string.format('%s --open-url', prog)
+  local dir = string.format('%s/ghostty-agent-%s', wc.runtime_dir, wc.socket)
+  local path = string.format('%s/xdg-open', dir)
+  local sb: stringbuilder
+  sb:write('mkdir -p ') desktop_sh_quote(&sb, dir) sb:write(' 2>/dev/null')
+  local mk = sb:promote()
+  os.execute(mk)
+  mk:destroy()
+  local f = io.open(path, 'wb')
+  if f:isopen() then
+    f:write('#!/bin/sh\n# ghostty-agent (WAYLAND_DISPLAY=', wc.socket, '): web and mail links from apps in the\n',
+      '# game\'s compositor open in its browser, as a panel in the game.\n',
+      'case "$1" in\n',
+      '  [hH][tT][tT][pP]://*|[hH][tT][tT][pP][sS]://*|[mM][aA][iI][lL][tT][oO]:*)\n',
+      '    ', prog, ' --open-url "$1" && exit 0 ;;\n',
+      'esac\n',
+      '# anything else, or a link the agent refused: the real xdg-open\n',
+      'here=$(cd "$(dirname "$0")" && pwd)\n',
+      'PATH=$(printf \'%s\' "$PATH" | tr \':\' \'\\n\' | grep -vxF "$here" | paste -sd: -)\n',
+      'export PATH\n',
+      'exec xdg-open "$@"\n')
+    f:close()
+    local sb2: stringbuilder
+    sb2:write('chmod 755 ') desktop_sh_quote(&sb2, path)
+    local ch = sb2:promote()
+    os.execute(ch)
+    ch:destroy()
+    local old = os.getenv('PATH')
+    wc.path_env = string.format('%s:%s', dir, #old > 0 and old or '/usr/local/bin:/usr/bin:/bin')
+    old:destroy()
+  else
+    log('cannot write the xdg-open shim ' .. path .. ': apps get only $BROWSER')
+  end
+  prog:destroy() dir:destroy() path:destroy()
+end
+
 local function start(): (boolean, string)
   local level = WLR_ERROR
   if #os.getenv('GHOSTTY_WAYLAND_DEBUG') > 0 then level = WLR_DEBUG end
@@ -2585,6 +2884,7 @@ local function start(): (boolean, string)
   wc.instance = string.format('%x', ((@int64)(os.time()) << 20) ~ (@int64)(getpid()))
   wc.started = true
   log('compositor on WAYLAND_DISPLAY=' .. wc.socket .. ' (' .. wc.runtime_dir .. ')')
+  setup_link_env()
   proxy_install()
   start_xwayland()
   return true, ''

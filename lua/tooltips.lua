@@ -178,6 +178,7 @@ M.settings = {
   ['host.keep_visible.user_hidden'] = 'Terminals stay when you hide the game UI.',
   ['host.keep_visible.cutscene'] = 'Terminals stay during cutscenes.',
   ['host.keep_visible.gpose'] = 'Terminals stay in group pose.',
+  ['windows.links'] = 'Ctrl+click a web or mail link in a terminal. game: it opens in the browser of the agent\'s desktop (Linux), as a panel in the world, or as a new tab in that browser\'s panel; if the agent is not connected or cannot open it, your desktop\'s browser opens it and the chat says why. host: always your desktop\'s browser.',
   ['windows.auto_open'] = 'Windows that appear in the agent\'s desktop (a torn-off tab, a dialog) open as panels by themselves; related: only dialogs of windows you have out and windows of apps you have out; none: only through the Windows picker.',
   ['windows.never'] = 'These windows and apps are never shown in game: not opened, left out of the picker and the app list, and closed if one comes to match. An app id (firefox), a desktop id (org.gnome.Nautilus) or part of a title; * matches anything.',
 }
