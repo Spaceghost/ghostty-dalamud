@@ -627,6 +627,14 @@ function M.reorder(id, how)
   return nil
 end
 
+-- A shown pet's place in the order (1: first, the leftmost), else nil (IPC panel.list).
+function M.pet_rank(id)
+  for i, other in ipairs(pet_ids()) do
+    if other == id then return i end
+  end
+  return nil
+end
+
 -- Which panel is focused: the core says so to place(id, t, true) only, and
 -- may place it after the others, so this frame's answer falls back to the
 -- last frame's (one frame late at most).

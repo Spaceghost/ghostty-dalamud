@@ -21,6 +21,7 @@
 -- like procguard_lock.
 require 'os'
 require 'core.app.remotewin'
+require 'core.app.worldview'
 
 ## if ccinfo.is_windows then
 local SRWLOCK <cimport, nodecl> = @record{ Ptr: pointer }
@@ -420,6 +421,159 @@ local function l_terminal_new(L: *lua_State): cint
   return 1
 end
 
+-- Every panel (panel.*): terminals wherever they live, windows, adopted windows, chat ---------
+
+-- Where session `s` lives: 'tab' (the dropdown), 'float' (a floating
+-- window), 'min' (minimized), 'world' (a world panel) or 'none'.
+local function panel_place_of(s: *Session): cstring
+  for i = 0, < #host.world do if host.world[i] == s then return 'world' end end
+  for i = 0, < #host.dropdown_tabs do if host.dropdown_tabs[i] == s then return 'tab' end end
+  for i = 0, < #host.windows do if host.windows[i] == s then return 'float' end end
+  for i = 0, < #host.minimized do if host.minimized[i] == s then return 'min' end end
+  return 'none'
+end
+
+-- ghostty.panels() -> { {id, kind, title, place, full, focused, profile?, running?, app?}, ... }
+-- in host.sessions order (oldest first), without panels glitching out.
+-- kind: 'terminal' | 'window' | 'adopted' | 'chat'.
+local function l_panels(L: *lua_State): cint
+  lua_createtable(L, (@cint)(#host.sessions), 0)
+  local n: cint = 0
+  for i = 0, < #host.sessions do
+    local s = host.sessions[i]
+    if s.leaving then continue end
+    local place = panel_place_of(s)
+    lua_createtable(L, 0, 9)
+    lua_pushinteger(L, s.id) lua_setfield(L, -2, 'id')
+    local kind: cstring = 'terminal'
+    if s.kind == TransportKind.Window then
+      kind = 'window'
+    elseif s.kind == TransportKind.Panel then
+      local aw = adopt_of(s)
+      if aw ~= nilptr then
+        kind = 'adopted'
+        if #aw.plugin > 0 then push_str(L, aw.plugin, 'app') else push_str(L, aw.name, 'app') end
+      elseif chatpanel_of(s) ~= nilptr then
+        kind = 'chat'
+      else
+        kind = 'adopted'
+      end
+    else
+      push_str(L, s.label, 'profile')
+      lua_pushboolean(L, s.exited and 0 or 1) lua_setfield(L, -2, 'running')
+    end
+    lua_pushstring(L, kind) lua_setfield(L, -2, 'kind')
+    push_str(L, s:display_name(), 'title')
+    lua_pushstring(L, place) lua_setfield(L, -2, 'place')
+    local in_world = place == 'world'
+    lua_pushboolean(L, (in_world and host.world_full_id == s.id) and 1 or 0) lua_setfield(L, -2, 'full')
+    -- the keyboard: a world panel's focus, else the dropdown's active tab while it is out
+    local focused = host.world_focus == s.id
+    if not focused and host.world_focus == 0 and host.dropdown_open and place == 'tab' then
+      focused = host.dropdown_active >= 0 and host.dropdown_active < #host.dropdown_tabs and host.dropdown_tabs[host.dropdown_active] == s
+    end
+    lua_pushboolean(L, focused and 1 or 0) lua_setfield(L, -2, 'focused')
+    n = n + 1
+    lua_rawseti(L, -2, n)
+  end
+  return 1
+end
+
+-- The panel of argument 1 wherever it lives, or nilptr.
+local function arg_session(L: *lua_State): *Session
+  local isnum: cint = 0
+  local id = lua_tointegerx(L, 1, &isnum)
+  if isnum == 0 or id < 1 then return nilptr end
+  local s = find_session(id)
+  if s ~= nilptr and s.leaving then return nilptr end
+  return s
+end
+
+-- ghostty.panel_show(id, fly) -> true: what a click does, and hidden things
+-- come forward: a world panel gets the keyboard (with fly, the click's camera
+-- turn and walk-up, worldview's world_fly_id); a tab opens the dropdown with
+-- it active; a floating window shows with the dropdown; a minimized terminal
+-- is restored into the dropdown. (A hidden world panel: lua/ipc.lua shows it first.)
+local function l_panel_show(L: *lua_State): cint
+  local s = arg_session(L)
+  if s == nilptr then return push_fail(L, 'no such panel') end
+  local fly = lua_toboolean(L, 2) ~= 0
+  if world_panel(s.id) ~= nilptr then
+    local err = world_panel_focus(s)
+    if #err == 0 then world_fly_id = fly and s.id or 0 end
+    return push_result(L, err)
+  end
+  host.world_focus = 0
+  bring_forward(s)
+  host.dropdown_focus_next = true -- the keyboard goes to the dropdown, also when it was out already
+  lua_pushboolean(L, 1)
+  return 1
+end
+
+-- ghostty.panel_close(id) -> true: as its close button (a world panel glitches out;
+-- a window's stream closes; an adopted window goes back to its plugin)
+local function l_panel_close(L: *lua_State): cint
+  local s = arg_session(L)
+  if s == nilptr then return push_fail(L, 'no such panel') end
+  if s.kind == TransportKind.Window then
+    local ok, err = window_close(s.id)
+    if not ok then return push_fail(L, err) end
+  else
+    dismiss_terminal(s)
+  end
+  lua_pushboolean(L, 1)
+  return 1
+end
+
+-- ghostty.panel_minimize(id) -> true: a terminal into the minimized list (/term min)
+local function l_panel_minimize(L: *lua_State): cint
+  local s = arg_session(L)
+  if s == nilptr then return push_fail(L, 'no such panel') end
+  if s.kind == TransportKind.Window or s.kind == TransportKind.Panel then return push_fail(L, 'only terminals are minimized') end
+  minimize(s)
+  if #host.dropdown_tabs == 0 then set_visible(false) end
+  lua_pushboolean(L, 1)
+  return 1
+end
+
+-- ghostty.panel_place(id, pin_args) -> true: as /term pin ARGS on it. A window
+-- or adopted panel keeps its size; a terminal in the dropdown, a floating
+-- window or minimized goes into the world.
+local function l_panel_place(L: *lua_State): cint
+  local s = arg_session(L)
+  if s == nilptr then return push_fail(L, 'no such panel') end
+  local len: usize = 0
+  local p = lua_tolstring(L, 2, &len)
+  if p == nilptr then return push_fail(L, 'panel_place takes pin arguments') end
+  local args = string{data=(@*[0]byte)(p), size=len}
+  local in_world = world_panel(s.id) ~= nilptr
+  if in_world and (args == 'hide' or args == 'hide off') then return push_result(L, world_panel_hide(s, args == 'hide')) end
+  if in_world and (s.kind == TransportKind.Window or s.kind == TransportKind.Panel) then
+    return push_result(L, policy_windows_pin(s.id, args))
+  end
+  local err = policy_world_command(s.id, args)
+  if #err == 0 and not in_world then
+    take_out_of_views(s)
+    host.world:push(s)
+    set_world_visible(true)
+  end
+  return push_result(L, err)
+end
+
+-- ghostty.world_command(id, args) -> nil, or why not: CONFIG.world.command
+-- (lua/world.lua: /term pin's anchors, order, hide)
+local function l_world_command(L: *lua_State): cint
+  local isnum: cint = 0
+  local id = lua_tointegerx(L, 1, &isnum)
+  local len: usize = 0
+  local p = lua_tolstring(L, 2, &len)
+  if isnum == 0 or p == nilptr then lua_pushstring(L, 'world_command takes an id and arguments') return 1 end
+  local err = policy_world_command(id, string{data=(@*[0]byte)(p), size=len})
+  if #err == 0 then lua_pushnil(L) else lua_pushlstring(L, (@cstring)(err.data), err.size) end
+  err:destroy()
+  return 1
+end
+
 -- The agent's last WLISTR ---------------------------------------------------------------
 
 -- ghostty.agent_windows() -> { windows = {{wid, w, h, app, title, key, extra = {...}}, ...},
@@ -530,5 +684,11 @@ global function ipc_lua_register(L: *lua_State): void
   lua_pushcclosure(L, l_agent_windows, 0) lua_setfield(L, -2, 'agent_windows')
   lua_pushcclosure(L, l_agent_windows_refresh, 0) lua_setfield(L, -2, 'agent_windows_refresh')
   lua_pushcclosure(L, l_keys_reserve, 0) lua_setfield(L, -2, 'keys_reserve')
+  lua_pushcclosure(L, l_panels, 0) lua_setfield(L, -2, 'panels')
+  lua_pushcclosure(L, l_panel_show, 0) lua_setfield(L, -2, 'panel_show')
+  lua_pushcclosure(L, l_panel_close, 0) lua_setfield(L, -2, 'panel_close')
+  lua_pushcclosure(L, l_panel_minimize, 0) lua_setfield(L, -2, 'panel_minimize')
+  lua_pushcclosure(L, l_panel_place, 0) lua_setfield(L, -2, 'panel_place')
+  lua_pushcclosure(L, l_world_command, 0) lua_setfield(L, -2, 'world_command')
   lua_pop(L, 1)
 end
