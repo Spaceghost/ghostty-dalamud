@@ -434,6 +434,16 @@ Clicking a window panel focuses it; while focused the mouse and keyboard go
 to the remote window. Esc twice within half a second (or clicking outside)
 gives them back; the first Esc reaches the window.
 
+### IPC for other plugins
+
+Another plugin can do the same through `GhosttyDalamud.v1.Call`:
+`window.list`, `window.open` (`run`, `match` or `wid`, optional `pin`),
+`window.close`, `window.focus`, `window.place`, `agent.status` and `status`,
+as JSON. Reads answer from the last frame's snapshot; changes are queued and
+run by the next frame through the same `window_*` functions as the commands
+above. Methods, examples and the threading are in [IPC.md](IPC.md). Not yet
+observed in game.
+
 ## Verified
 
 Host tests only (`tests/run.sh`), nothing in game or on a real desktop:
