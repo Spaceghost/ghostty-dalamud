@@ -14,6 +14,7 @@ C.releases = {
     blurb = 'Being built right now. These land here as they are verified in game.',
     items = {
       { 'next', 'Vote on what gets built next: the About tab in Settings opens the vote page in your browser, and a small dot on the settings button shows while there are ideas you have not looked at. The plugin itself never goes online for it.' },
+      { 'next', 'Windows without Linux: ghostty-agent now also runs on Windows, and on Windows the plugin uses it for PowerShell and cmd, or opens them locally while no agent runs. Not yet tried on Windows.' },
       { 'next', 'Local terminals (conpty) on Windows start their shell with the structure size Windows expects. Not yet verified on Windows or under Wine.' },
       { 'next', 'Controller: the DualSense Create button can open the terminal while the game is in front (choose create in Settings). Not yet tried with a real controller in game.' },
       { 'next', 'Select text with the mouse — drag, double-click a word, triple-click a line — and copy it.' },
