@@ -210,6 +210,9 @@ global function run_command(cmd: string): cint
     toggle_visible()
     return 0
   elseif verb == 'pin' then
+    -- a focused window panel moves (core/app/remotewin.nelua)
+    local on_window, wrc = remotewin_pin(arg)
+    if on_window then return wrc end
     -- pin the active dropdown tab (or a new session) into the world
     local s: *Session = nilptr
     local from_tab = host.dropdown_active >= 0 and host.dropdown_active < #host.dropdown_tabs
@@ -335,6 +338,11 @@ global function run_command(cmd: string): cint
     restore(s)
     return 0
   elseif verb == 'window' then
+    -- /term window list | pull ... | close: remote desktop windows
+    local sub = arg
+    local ssp = arg:find(' ', 1, true)
+    if ssp > 0 then sub = arg:subview(1, ssp - 1) end
+    if sub == 'list' or sub == 'pull' or sub == 'close' then return remotewin_command(arg) end
     local n = policy.default_profile
     if #arg > 0 then
       local ok, id = parse_id(arg)

@@ -15,6 +15,11 @@ global AgentEvent = @record{
   len: usize,
   offset: uint64,   -- ATTACHED: the session's output bytes so far
   has_offset: boolean,
+  -- version 3 windows (docs/REMOTE_WINDOWS.md): `id` is the stream id (sid)
+  -- of WOPENED / WFRAME / WEND, except WOPENED's `req` below
+  req: uint32,      -- WOPENED: the WOPEN it answers
+  w: uint16,        -- WOPENED: the window's size
+  h: uint16,
 }
 
 global AgentEventFn = @function(ctx: pointer, ev: *AgentEvent): void
@@ -39,7 +44,11 @@ global AgentClient = @record{
   attach_fifo: vector(uint32), -- version 1: ATTACH ids waiting for OK "attached" / ERR "no such session"
   clip_fifo: vector(uint8),    -- CLIP_SET / CLIP_GET waiting for their reply
   clip_off: boolean,           -- the agent does not know clipboard frames: stop sending them
+  read_chunks: integer,        -- 16 KiB socket reads per pump; 0 = 8 (window streams ask for more)
 }
+
+-- Why window frames are not sent to an agent greeting with version 1 or 2.
+global AGENT_WINDOWS_TOO_OLD: string <comptime> = 'agent too old for windows: update ghostty-agent'
 
 function AgentClient:init(host: string, port: uint16, token: string): void
   $self = {}
@@ -202,6 +211,76 @@ function AgentClient:list(): void
   proto.write_frame(&self.outq, PROTO_LIST, nilptr, 0)
 end
 
+-- Remote windows (version 3) ---------------------------------------------------
+-- Only a version 3 agent knows these frames; an older one would answer
+-- "unknown frame" and, worse for WOPEN, never a WOPENED. Each request to one
+-- is refused here: false, plus an ERR event carrying AGENT_WINDOWS_TOO_OLD.
+
+-- Connected to an agent that streams windows.
+function AgentClient:windows_ok(): boolean
+  return self.state == AgentState.Ready and self.version >= 3
+end
+
+local function windows_refuse(self: *AgentClient): boolean
+  if self.state ~= AgentState.Ready then return false end
+  local msg: string = AGENT_WINDOWS_TOO_OLD
+  local ev: AgentEvent = { typ = PROTO_ERR, data = (@*[0]uint8)(msg.data), len = msg.size }
+  emit(self, &ev)
+  return false
+end
+
+-- Ask for the windows the agent can capture; answered by a WLISTR event.
+function AgentClient:wlist(): boolean
+  if not self:windows_ok() then return windows_refuse(self) end
+  proto.write_frame(&self.outq, PROTO_WLIST, nilptr, 0)
+  return true
+end
+
+-- Open window `wid` (0: the desktop picks, or the first matching `match`)
+-- as a stream no larger than max_w x max_h at up to `fps`. Answered, maybe
+-- much later, by a WOPENED event carrying `req`.
+function AgentClient:wopen(req: uint32, wid: uint32, max_w: uint16, max_h: uint16, fps: uint8, match: string): boolean
+  if not self:windows_ok() then return windows_refuse(self) end
+  local b: [13]uint8
+  proto.put_u32(&b, req)
+  proto.put_u32((@*[0]uint8)(&b[4]), wid)
+  proto.put_u16((@*[0]uint8)(&b[8]), max_w)
+  proto.put_u16((@*[0]uint8)(&b[10]), max_h)
+  b[12] = fps
+  local hdr: [5]uint8
+  hdr[0] = PROTO_WOPEN
+  proto.put_u32((@*[0]uint8)(&hdr[1]), (@uint32)(13 + match.size))
+  self.outq:push(&hdr, 5)
+  self.outq:push(&b, 13)
+  if match.size > 0 then self.outq:push((@*[0]uint8)(match.data), match.size) end
+  return true
+end
+
+-- The frame `seq` of stream `sid` is on screen: the agent may send more.
+function AgentClient:wack(sid: uint32, seq: uint32): void
+  if not self:windows_ok() then return end
+  local b: [4]uint8
+  proto.put_u32(&b, seq)
+  proto.write_frame_id(&self.outq, PROTO_WACK, sid, &b, 4)
+end
+
+-- Pointer or keyboard input for stream `sid`: WIN_INPUT_* `kind` and its body.
+function AgentClient:winput(sid: uint32, kind: uint8, body: *[0]uint8, len: usize): void
+  if not self:windows_ok() then return end
+  local hdr: [10]uint8
+  hdr[0] = PROTO_WINPUT
+  proto.put_u32((@*[0]uint8)(&hdr[1]), (@uint32)(5 + len))
+  proto.put_u32((@*[0]uint8)(&hdr[5]), sid)
+  hdr[9] = kind
+  self.outq:push(&hdr, 10)
+  if len > 0 then self.outq:push(body, len) end
+end
+
+function AgentClient:wclose(sid: uint32): void
+  if not self:windows_ok() then return end
+  proto.write_frame_id(&self.outq, PROTO_WCLOSE, sid, nilptr, 0)
+end
+
 -- One row of a LISTR reply: "id\tcols\trows\tattached\tcommand\n".
 global AgentListEntry = @record{ id: uint32, cols: uint16, rows: uint16, attached: integer, command: string }
 
@@ -328,6 +407,29 @@ local function dispatch(self: *AgentClient): void
       end
     elseif typ == PROTO_CLIP then
       clip_reply(self)
+    elseif typ == PROTO_WOPENED then
+      -- req, sid, w, h, title (sid 0: refused, the text says why)
+      if len >= 12 then
+        ev.req = proto.get_u32(payload)
+        ev.id = proto.get_u32((@*[0]uint8)(&payload[4]))
+        ev.w = proto.get_u16((@*[0]uint8)(&payload[8]))
+        ev.h = proto.get_u16((@*[0]uint8)(&payload[10]))
+        ev.data = (@*[0]uint8)(&payload[12])
+        ev.len = len - 12
+      else
+        deliver = false
+      end
+    elseif typ == PROTO_WFRAME then
+      -- the whole payload stays for wincodec_parse; the sid is read ahead
+      if len >= 4 then ev.id = proto.get_u32(payload) else deliver = false end
+    elseif typ == PROTO_WEND then
+      if len >= 4 then
+        ev.id = proto.get_u32(payload)
+        ev.data = (@*[0]uint8)(&payload[4])
+        ev.len = len - 4
+      else
+        deliver = false
+      end
     end
     if deliver then emit(self, &ev) end
     proto.frame_consume(&self.inq, len)
@@ -389,7 +491,8 @@ function AgentClient:pump(now: float64): void
   -- read input, a bounded amount per frame: a flood waits in the socket (and
   -- the agent stops reading the shell) instead of stalling the game
   local buf: [16384]uint8
-  for _ = 1, 8 do
+  local chunks = self.read_chunks > 0 and self.read_chunks or 8
+  for _ = 1, chunks do
     local n = net.recv(self.sock, &buf, 16384)
     if n > 0 then
       self.inq:push(&buf, (@usize)(n))

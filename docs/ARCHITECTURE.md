@@ -132,6 +132,14 @@
 9. World panels (`core/app/worldview.nelua`) are drawn in panel pixels into
    the background draw list and every vertex is mapped onto the panel through
    the game's view-projection matrix (`core/world.nelua`).
+10. Remote windows (docs/REMOTE_WINDOWS.md): WFRAMEs read in step 3 are
+   decoded into each stream's CPU copy (`core/app/remotewin.nelua`) and
+   acknowledged; `remotewin_tick` ends streams whose connection went and
+   closes ended panels; a window panel's content, where a terminal would be
+   drawn in step 9, uploads the dirty rectangles to its D3D11 texture on
+   Dalamud's device (`core/wintex.nelua`), draws it as textured quads and
+   sends the focused panel's pointer and keys back as WINPUT. Not yet
+   observed in game.
 
 ## World panels behind game geometry
 
@@ -255,6 +263,7 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_bell` | the visual bell: BEL counting, ring and glow maths, the Lua style, its triangles |
 | `test_policy` | loading `lua/init.lua`: defaults, profiles, key actions, showcase entries |
 | `test_world`, `test_worldpanel`, `test_worlddrag` | world panels: projection and hit testing, the presented pose and walk-up, drag placement and snapping, all against a fake game |
+| `test_remotewin` | remote window panels against a fake version 3 agent, a fake ImGui and a fake texture table: open, KEY and delta frames, dirty-box uploads, WACK (held while asleep), the textured quads over the letterboxed picture, pointer / button / wheel / key / text input with the chrome keeping its clicks, WEND, WCLOSE, an older shim, a version 2 agent refused |
 | `test_host` | the exported host surface without ImGui: init, status, commands, the controller toggle's source and its foreground check, shutdown |
 | `test_lights` | panel lights against fake game light callbacks |
 | `test_occluders` | panel shadow boards against fake background object callbacks: placement, lifecycle, an older `GuHostApi` |

@@ -1,0 +1,796 @@
+-- Remote windows on world panels (docs/REMOTE_WINDOWS.md): a desktop window
+-- streamed by ghostty-agent (protocol version 3) shown where a terminal would
+-- be, as a pet or a pin, with the pointer and keys of a focused panel played
+-- back into it.
+--
+-- A window panel is an ordinary Session of kind Window in host.world, so
+-- placement, pins, Alt + drag, full screen, close, the depth test and sleeping
+-- all come from the terminal code. Its terminal is a small local one that
+-- shows status text ("waiting for the window…", "window closed") and is drawn
+-- until the first frame; after that core/app/worldview.nelua hands the panel's
+-- content area to remotewin_panel, which draws the window's texture instead.
+--
+-- Per stream (RemoteWin): WOPEN goes out with a request id; WOPENED gives the
+-- stream id; each WFRAME is decoded into a CPU copy of the window
+-- (core/wincodec.nelua) and its rectangles noted as dirty; the frame's END
+-- acknowledges it (WACK), except while the panel sleeps unseen or has not been
+-- drawn for a while, so a window nobody looks at stops streaming. Once a
+-- frame the dirty rectangles go to the D3D11 texture (core/wintex.nelua) on
+-- Dalamud's device (GuSceneDepth.ui_device), created there lazily. WEND or a
+-- lost connection shows "window closed" and closes the panel 2 s later.
+--
+-- Input priority: the panel's own chrome first, exactly as for terminals.
+-- worldview decides title buttons, resize grips and Alt + drag before this
+-- file sees the frame and passes `on_content` false over them (and `click`
+-- false during a drag); the press that focuses a panel is not the window's
+-- either. What is left, over the window's picture, is mapped from panel
+-- pixels to window pixels (the letterbox removed) and sent as WINPUT.
+require 'core.app.terminal'
+require 'core.wincodec'
+require 'core.wintex'
+
+global RemoteWinState = @enum(cint){ Opening = 0, Live, Ended }
+
+-- Pixels of the title strip above the picture (the title buttons' row).
+global REMOTEWIN_TITLE: float32 <comptime> = 34
+-- Around the rest of the picture: the 16 px inset worldview hands over as content.
+global REMOTEWIN_PAD: float32 <comptime> = 16
+-- Rectangles noted before they collapse into their bounding box.
+local DIRTY_MAX <comptime> = 32
+-- The picture as a grid of textured quads, so it bends with the panel's curve
+-- (and the character cut-out has vertices to follow).
+local STRIPS <comptime> = 24
+local ROWS <comptime> = 16
+-- A panel not drawn for this long stops acknowledging frames.
+local UNDRAWN_HOLD <comptime> = 2.0
+local CLOSE_AFTER <comptime> = 2.0
+local ESC_TWICE <comptime> = 0.5
+local MAX_KEYS <comptime> = 128
+local KEY_OURS: uint8 <comptime> = 0xff -- key_mods of a held key the plugin used (a toggle, the second Esc): no KEY up
+
+global RemoteWin = @record{
+  s: *Session,              -- the panel (the stream is freed with it)
+  req: uint32,              -- WOPEN request id
+  sid: uint32,              -- stream id, 0 until WOPENED
+  state: RemoteWinState,
+  max_w: integer, max_h: integer, -- what was asked for: larger frames are refused
+  w: integer, h: integer,   -- size of the frames (0 before the first)
+  pixels: vector(uint8),    -- the window as last presented, BGRA, w * h * 4
+  dirty: vector(WinRect),   -- changed since the last upload
+  dirty_all: boolean,
+  tex: WinTex,
+  frames: integer,          -- frames complete (END seen)
+  sized: boolean,           -- the panel took the window's aspect
+  ack_pending: boolean,     -- an END not acknowledged yet (asleep or not drawn)
+  ack_seq: uint32,
+  drawn_at: float64,        -- host time the panel was last drawn
+  ended_at: float64,        -- Ended: the panel closes CLOSE_AFTER later
+  note_shim: boolean,       -- "needs a newer plugin shim" is on the panel
+  -- input
+  focused_last: boolean,    -- the panel had the keyboard last frame (a focusing click is not the window's)
+  ptr_x: integer, ptr_y: integer, -- last MOVE sent (-1: none)
+  buttons: uint8,           -- bits 0 left, 1 right: held down on the window
+  keys: [MAX_KEYS]boolean,  -- input_key(i) sent down
+  key_mods: [MAX_KEYS]uint8,
+  last_esc: float64,
+}
+
+local streams: vector(*RemoteWin)
+local next_req: uint32 = 1
+local auto_done = false
+local old_shim_logged = false
+
+-- Lookup -------------------------------------------------------------------------
+
+global function remotewin_of(s: *Session): *RemoteWin
+  for i = 0, < #streams do
+    if streams[i].s == s then return streams[i] end
+  end
+  return nilptr
+end
+
+local function find_sid(sid: uint32): *RemoteWin
+  if sid == 0 then return nilptr end
+  for i = 0, < #streams do
+    if streams[i].sid == sid and streams[i].state == RemoteWinState.Live then return streams[i] end
+  end
+  return nilptr
+end
+
+local function find_req(req: uint32): *RemoteWin
+  for i = 0, < #streams do
+    if streams[i].req == req and streams[i].state == RemoteWinState.Opening then return streams[i] end
+  end
+  return nilptr
+end
+
+-- Status text on the panel's own terminal (drawn while there is no picture).
+local function panel_text(s: *Session, a: string, b: string): void
+  local sb: stringbuilder -- no `..`: the concatenation would leak without a GC
+  sb:write('\27[2J\27[H\r\n  ', a, b, '\r\n')
+  local msg = sb:promote()
+  s:feed_text(msg)
+  msg:destroy()
+end
+
+-- The stream is over (WEND, refused, connection lost): say why, close soon.
+local function stream_end(rw: *RemoteWin, why: string, reason: string): void
+  if rw.state == RemoteWinState.Ended then return end
+  rw.state = RemoteWinState.Ended
+  rw.ended_at = host.last_time
+  rw.frames = 0 -- the text shows instead of the picture
+  panel_text(rw.s, why, reason)
+  logf(LOG_INFO, 'window %d: %s%s', rw.s.id, why, reason)
+end
+
+-- Close a window panel: world panels glitch out first (as dismiss_terminal does).
+local function close_panel(s: *Session): void
+  for i = 0, < #host.world do
+    if host.world[i] == s then
+      if host.world_visible and host.world_rez > 0.01 and s.appear > 0.01 then
+        s.leaving = true
+        if host.world_focus == s.id then host.world_focus = 0 end
+        return
+      end
+      break
+    end
+  end
+  close_terminal(s)
+end
+
+-- Session:close of a window panel: stop the stream and free it.
+local function remotewin_closed(s: *Session): void
+  for i = 0, < #streams do
+    local rw = streams[i]
+    if rw.s == s then
+      if rw.state == RemoteWinState.Live and rw.sid ~= 0 then host.agent:wclose(rw.sid) end
+      -- still Opening: its WOPENED finds no stream and is closed then
+      wintex_release(&rw.tex)
+      rw.pixels:destroy()
+      rw.dirty:destroy()
+      streams:remove(i)
+      delete(rw)
+      return
+    end
+  end
+end
+
+-- Agent events ------------------------------------------------------------------------
+
+local function note_dirty(rw: *RemoteWin, r: WinRect): void
+  if rw.dirty_all or r.w == 0 or r.h == 0 then return end
+  if #rw.dirty < DIRTY_MAX then rw.dirty:push(r) return end
+  -- too many: one bounding box (bounded memory, a few more pixels uploaded)
+  local x0, y0 = (@integer)(r.x), (@integer)(r.y)
+  local x1, y1 = x0 + (@integer)(r.w), y0 + (@integer)(r.h)
+  for i = 0, < #rw.dirty do
+    local d = rw.dirty[i]
+    x0, y0 = math.min(x0, (@integer)(d.x)), math.min(y0, (@integer)(d.y))
+    x1, y1 = math.max(x1, (@integer)(d.x) + (@integer)(d.w)), math.max(y1, (@integer)(d.y) + (@integer)(d.h))
+  end
+  rw.dirty:clear()
+  rw.dirty:push(WinRect{ x = (@uint16)(x0), y = (@uint16)(y0), w = (@uint16)(x1 - x0), h = (@uint16)(y1 - y0) })
+end
+
+-- Acknowledge the frame on screen, unless nobody sees the panel: then the
+-- agent stops sending until it is seen (and acknowledged) again.
+local function ack(rw: *RemoteWin): void
+  if not rw.ack_pending or rw.state ~= RemoteWinState.Live then return end
+  if rw.s.sleeping or host.last_time - rw.drawn_at > UNDRAWN_HOLD then return end
+  host.agent:wack(rw.sid, rw.ack_seq)
+  rw.ack_pending = false
+end
+
+local function on_frame(rw: *RemoteWin, payload: *[0]uint8, len: usize): void
+  local ok, f = wincodec_parse(payload, len)
+  if not ok or f.w == 0 or f.h == 0 then return end
+  local key = (f.flags & WINCODEC_FLAG_KEY) ~= 0
+  if (@integer)(f.w) > rw.max_w or (@integer)(f.h) > rw.max_h then return end -- never larger than asked
+  if (@integer)(f.w) ~= rw.w or (@integer)(f.h) ~= rw.h then
+    if not key then return end -- a size change always comes as a KEY frame; anything else is stale
+    rw.pixels:resize((@usize)(f.w) * (@usize)(f.h) * 4)
+    rw.w, rw.h = f.w, f.h
+  end
+  if key then
+    rw.dirty:clear()
+    rw.dirty_all = true
+  end
+  local stride = (@usize)(rw.w) * 4
+  local dst = (@*[0]uint8)(&rw.pixels[0])
+  while true do
+    local more, fr = wincodec_next_rect(&f)
+    if not more then break end
+    if not wincodec_apply_rect(&fr, dst, stride) then
+      rw.dirty_all = true -- broken data wrote part of a rectangle: upload everything
+      break
+    end
+    note_dirty(rw, fr.r)
+  end
+  if (f.flags & WINCODEC_FLAG_END) ~= 0 then
+    rw.frames = rw.frames + 1
+    rw.ack_seq, rw.ack_pending = f.seq, true
+    ack(rw)
+    if not rw.sized then
+      rw.sized = true
+      policy_windows_size(rw.s.id, rw.w, rw.h, REMOTEWIN_TITLE + REMOTEWIN_PAD)
+    end
+  end
+end
+
+-- WLISTR lines "wid\tw\th\tapp\ttitle\n", one log line each.
+local function log_list(data: *[0]uint8, len: usize): void
+  local text = string{data=(@*[0]byte)(data), size=len}
+  local n = 0
+  local start: usize = 0
+  for pos: usize = 0, < len do
+    if data[pos] == 10 then
+      local line = text:subview(start + 1, pos)
+      local sb: stringbuilder
+      sb:write('window #')
+      local field = 0
+      for k: usize = 0, < line.size do
+        local c = line.data[k]
+        if c == 9 then
+          field = field + 1
+          if field == 1 then sb:write(' ') elseif field == 2 then sb:write('x') elseif field == 3 then sb:write(' [') else sb:write('] ') end
+        else
+          sb:writebyte(c)
+        end
+      end
+      local msg = sb:promote()
+      log(LOG_INFO, msg)
+      msg:destroy()
+      n = n + 1
+      start = pos + 1
+    end
+  end
+  logf(LOG_INFO, 'window list: %d windows (pull one with /term window pull #wid)', n)
+end
+
+global function remotewin_event(ev: *AgentEvent): void
+  if ev.typ == PROTO_WLISTR then
+    log_list(ev.data, ev.len)
+  elseif ev.typ == PROTO_WOPENED then
+    local rw = find_req(ev.req)
+    if rw == nilptr then
+      -- its panel closed while the desktop was choosing: nobody wants the stream
+      if ev.id ~= 0 then host.agent:wclose(ev.id) end
+      return
+    end
+    local text = string{data=(@*[0]byte)(ev.data), size=ev.len}
+    if ev.id == 0 then
+      stream_end(rw, 'window refused: ', text)
+      return
+    end
+    rw.sid = ev.id
+    rw.state = RemoteWinState.Live
+    rw.s.title:destroy()
+    rw.s.title = text:copy()
+    panel_text(rw.s, 'waiting for the first frame of ', text)
+    logf(LOG_INFO, 'window %d: stream %d opened: %s (%dx%d)', rw.s.id, ev.id, text, ev.w, ev.h)
+  elseif ev.typ == PROTO_WFRAME then
+    local rw = find_sid(ev.id)
+    if rw ~= nilptr then on_frame(rw, ev.data, ev.len) end
+  elseif ev.typ == PROTO_WEND then
+    local rw = find_sid(ev.id)
+    if rw ~= nilptr then stream_end(rw, 'window closed: ', string{data=(@*[0]byte)(ev.data), size=ev.len}) end
+  end
+end
+
+-- Commands --------------------------------------------------------------------------
+
+-- The agent a request goes to. Only the CONFIG.agent connection streams
+-- windows so far: '' or 'default' names it.
+local function agent_for(name: string): (*AgentClient, string)
+  if #name > 0 and name ~= 'default' then
+    return nilptr, 'only the CONFIG.agent connection streams windows so far'
+  end
+  if #policy.windows.agent > 0 and policy.windows.agent ~= 'default' then
+    return nilptr, 'CONFIG.windows.agent: only the CONFIG.agent connection streams windows so far'
+  end
+  if not host.agent_enabled or not host.agent:ready() then return nilptr, 'the agent is not connected' end
+  if not host.agent:windows_ok() then return nilptr, AGENT_WINDOWS_TOO_OLD end
+  agent_window_event = remotewin_event
+  return &host.agent, ''
+end
+
+-- A trailing "@name" picks the agent; the rest is the command's own text.
+local function split_agent(args: string): (string, string)
+  local rest: string = args
+  local name: string
+  local at = 0
+  for i = 1, #args do
+    if args.data[i - 1] == '@'_b and (i == 1 or args.data[i - 2] == ' '_b) then at = i end
+  end
+  if at > 0 and args:subview(at):find(' ', 1, true) == 0 then
+    name = args:subview(at + 1)
+    rest = args:subview(1, at - 1)
+  end
+  while #rest > 0 and rest.data[#rest - 1] == ' '_b do rest = rest:subview(1, #rest - 1) end
+  return rest, name
+end
+
+-- `/term window pull [match|#wid|run CMD...] [@agent]`: a pet showing the
+-- window once the agent (or the desktop's picker) has it. False with a reason.
+global function remotewin_pull(args: string): (boolean, string)
+  local rest, name = split_agent(args)
+  local agent, err = agent_for(name)
+  if agent == nilptr then return false, err end
+  if not player_loaded() then return false, 'no player (log in first)' end
+  local wid: uint32 = 0
+  local match: string
+  local owned = false
+  if #rest > 1 and rest.data[0] == '#'_b then
+    local digits = rest:subview(2)
+    for i = 0, < #digits do
+      if digits.data[i] < '0'_b or digits.data[i] > '9'_b then return false, 'usage: /term window pull #wid (a number from /term window list)' end
+      wid = wid * 10 + (digits.data[i] - '0'_b)
+    end
+  elseif #rest > 4 and rest:subview(1, 4) == 'run ' then
+    -- the agent starts the command and streams its window (the Linux compositor backend)
+    local sb: stringbuilder
+    sb:write('run:', rest:subview(5))
+    match = sb:promote()
+    owned = true
+  else
+    match = rest
+  end
+  local s = session_new_local('window', 60, 8)
+  if s == nilptr then
+    if owned then match:destroy() end
+    return false, 'no session'
+  end
+  s.kind = TransportKind.Window
+  s.window_close = remotewin_closed
+  s.cell_w, s.cell_h = 8, 16
+  s.appear = 0
+  if not make_pet(s) then
+    if owned then match:destroy() end
+    session_remove(s)
+    return false, 'the pet could not be placed'
+  end
+  -- a window's shape until its first frame says otherwise
+  policy_windows_size(s.id, 16, 10, REMOTEWIN_TITLE + REMOTEWIN_PAD)
+  local rw = new(@RemoteWin)
+  rw.s = s
+  rw.req = next_req
+  next_req = next_req + 1
+  rw.max_w, rw.max_h = policy.windows.max_w, policy.windows.max_h
+  rw.ptr_x, rw.ptr_y = -1, -1
+  rw.drawn_at = host.last_time
+  streams:push(rw)
+  local ok = agent:wopen(rw.req, wid, (@uint16)(rw.max_w), (@uint16)(rw.max_h), (@uint8)(policy.windows.fps), match)
+  if owned then match:destroy() end
+  if not ok then
+    session_remove(s)
+    return false, 'the agent refused the request'
+  end
+  panel_text(s, 'waiting for the window', '\u{2026}')
+  return true, ''
+end
+
+-- `/term window list|pull|close ...`. 0 on success, 4 with a logged reason.
+global function remotewin_command(args: string): cint
+  local verb: string = args
+  local rest: string
+  local sp = args:find(' ', 1, true)
+  if sp > 0 then verb, rest = args:subview(1, sp - 1), args:subview(sp + 1) end
+  if verb == 'list' then
+    local _, name = split_agent(rest)
+    local agent, err = agent_for(name)
+    if agent == nilptr then logf(LOG_WARN, 'window list: %s', err) return 4 end
+    agent:wlist()
+    return 0
+  elseif verb == 'pull' then
+    local ok, err = remotewin_pull(rest)
+    if not ok then logf(LOG_WARN, 'window pull: %s', err) return 4 end
+    return 0
+  elseif verb == 'close' then
+    local s = find_session(host.world_focus)
+    if s == nilptr or s.kind ~= TransportKind.Window then
+      -- no focused window panel: the newest one
+      s = nilptr
+      if #streams > 0 then s = streams[#streams - 1].s end
+    end
+    if s == nilptr then logf(LOG_WARN, 'window close: no window panel') return 4 end
+    close_panel(s)
+    return 0
+  end
+  logf(LOG_WARN, 'usage: /term window list | pull [match|#wid|run CMD] [@agent] | close')
+  return 4
+end
+
+-- `/term pin ...` on the focused window panel: moved, same size. False when
+-- the focused panel is not a window (the terminal pin applies).
+global function remotewin_pin(args: string): (boolean, cint)
+  local s = find_session(host.world_focus)
+  if s == nilptr or s.kind ~= TransportKind.Window then return false, 0 end
+  local err = policy_windows_pin(s.id, args)
+  if #err > 0 then
+    logf(LOG_WARN, 'pin: %s', err)
+    err:destroy()
+    return true, 4
+  end
+  return true, 0
+end
+
+-- Per frame -----------------------------------------------------------------------------
+
+-- Connection loss, panels that wandered out of the world, closing ended
+-- panels, the auto pulls, and the read budget.
+global function remotewin_tick(now: float64, in_world: boolean): void
+  agent_window_event = remotewin_event
+  local ready = host.agent_enabled and host.agent:ready()
+  local live = 0
+  local i: integer = #streams - 1
+  while i >= 0 do
+    local rw = streams[i]
+    local s = rw.s
+    if rw.state ~= RemoteWinState.Ended and not ready then
+      stream_end(rw, 'window closed: ', 'agent connection lost')
+    end
+    if rw.state == RemoteWinState.Live then live = live + 1 end
+    -- a window has no tab or floating window: popped in or minimized, it goes back out
+    local in_world_list = false
+    for k = 0, < #host.world do
+      if host.world[k] == s then in_world_list = true break end
+    end
+    if not in_world_list and not s.leaving and in_world then
+      take_out_of_views(s)
+      if not make_pet(s) then
+        close_terminal(s)
+      elseif rw.sized then
+        policy_windows_size(s.id, rw.w, rw.h, REMOTEWIN_TITLE + REMOTEWIN_PAD) -- a new anchor: the window's shape again
+      end
+    elseif rw.state == RemoteWinState.Ended and now - rw.ended_at > CLOSE_AFTER and not s.leaving then
+      close_panel(s)
+    end
+    i = i - 1
+    if i >= #streams then i = #streams - 1 end
+  end
+  if host.agent_enabled then host.agent.read_chunks = live > 0 and 64 or 0 end -- up to 1 MiB a frame while streaming
+  if not auto_done and in_world and ready then
+    auto_done = true
+    if #policy.windows.autopull > 0 then
+      if not host.agent:windows_ok() then
+        logf(LOG_WARN, 'windows.auto: %s', AGENT_WINDOWS_TOO_OLD)
+      else
+        for k = 0, < #policy.windows.autopull do
+          local ok, err = remotewin_pull(policy.windows.autopull[k])
+          if not ok then logf(LOG_WARN, 'windows.auto %s: %s', policy.windows.autopull[k], err) end
+        end
+      end
+    end
+  end
+end
+
+-- Input ----------------------------------------------------------------------------------
+
+-- USB HID usages (page 7) by the keymap names of core/input.nelua.
+## local hid = {
+##   enter = 40, escape = 41, backspace = 42, tab = 43, space = 44, minus = 45, equal = 46,
+##   leftbracket = 47, rightbracket = 48, backslash = 49, semicolon = 51, apostrophe = 52, grave = 53,
+##   comma = 54, period = 55, slash = 56, insert = 73, home = 74, pageup = 75, delete = 76, ['end'] = 77,
+##   pagedown = 78, right = 79, left = 80, down = 81, up = 82, kpdivide = 84, kpmultiply = 85,
+##   kpsubtract = 86, kpadd = 87, kpenter = 88, kpdecimal = 99, kpequal = 103,
+## }
+## for i = 0, 25 do hid[string.char(97 + i)] = 4 + i end
+## for i = 1, 9 do hid[tostring(i)] = 29 + i end
+## hid['0'] = 39
+## for i = 1, 12 do hid['f' .. i] = 57 + i end
+## for i = 1, 9 do hid['kp' .. i] = 88 + i end
+## hid.kp0 = 98
+global function remotewin_hid(name: string): uint16
+  ## for k, v in pairs(hid) do
+  if name == #[k]# then return #[v]# end
+  ## end
+  return 0
+end
+
+local function send_input(rw: *RemoteWin, kind: uint8, body: *[0]uint8, len: usize): void
+  if rw.state ~= RemoteWinState.Live then return end
+  host.agent:winput(rw.sid, kind, body, len)
+end
+
+local function send_pointer(rw: *RemoteWin, kind: uint8, x: integer, y: integer, a: integer, b: integer): void
+  local p: [8]uint8
+  proto.put_u16(&p, (@uint16)((@int16)(x)))
+  proto.put_u16((@*[0]uint8)(&p[2]), (@uint16)((@int16)(y)))
+  local n: usize = 4
+  if kind == WIN_INPUT_BUTTON then
+    p[4], p[5] = (@uint8)(a), (@uint8)(b)
+    n = 6
+  elseif kind == WIN_INPUT_WHEEL then
+    proto.put_u16((@*[0]uint8)(&p[4]), (@uint16)((@int16)(a)))
+    proto.put_u16((@*[0]uint8)(&p[6]), (@uint16)((@int16)(b)))
+    n = 8
+  end
+  send_input(rw, kind, &p, n)
+end
+
+local function send_key(rw: *RemoteWin, hid: uint16, down: boolean, mods: uint8): void
+  local p: [4]uint8
+  proto.put_u16(&p, hid)
+  p[2] = down and 1 or 0
+  p[3] = mods
+  send_input(rw, WIN_INPUT_KEY, &p, 4)
+end
+
+local function mods_of(io: *ImGuiIO): uint8
+  local m: uint8 = 0
+  if io.KeyCtrl then m = m | WIN_MOD_CTRL end
+  if io.KeyShift then m = m | WIN_MOD_SHIFT end
+  if io.KeyAlt then m = m | WIN_MOD_ALT end
+  if io.KeySuper then m = m | WIN_MOD_SUPER end
+  return m
+end
+
+-- Let go of everything held on the window (focus left, panel closing).
+local function release_all(rw: *RemoteWin): void
+  local x, y = math.max(rw.ptr_x, 0), math.max(rw.ptr_y, 0)
+  if rw.buttons & 1 ~= 0 then send_pointer(rw, WIN_INPUT_BUTTON, x, y, 0, 0) end
+  if rw.buttons & 2 ~= 0 then send_pointer(rw, WIN_INPUT_BUTTON, x, y, 1, 0) end
+  rw.buttons = 0
+  for i = 0, < math.min(input_key_count(), MAX_KEYS) do
+    if rw.keys[i] then
+      rw.keys[i] = false
+      if rw.key_mods[i] ~= KEY_OURS then send_key(rw, remotewin_hid(input_key(i).name), false, rw.key_mods[i]) end
+    end
+  end
+end
+
+-- The toggle chords work from a window panel too (they never reach the window).
+local function toggle_chord(io: *ImGuiIO, name: string): boolean
+  if name ~= policy.toggle_key or io.KeySuper then return false end
+  if (policy.toggle_ctrl or policy.toggle_alt) and io.KeyCtrl == policy.toggle_ctrl
+     and io.KeyShift == policy.toggle_shift and io.KeyAlt == policy.toggle_alt then
+    toggle_visible()
+    return true
+  elseif (policy.world_toggle_ctrl or policy.world_toggle_alt) and io.KeyCtrl == policy.world_toggle_ctrl
+     and io.KeyShift == policy.world_toggle_shift and io.KeyAlt == policy.world_toggle_alt then
+    toggle_world()
+    return true
+  end
+  return false
+end
+
+-- Keys: named keys (and every key of a ctrl / alt / super chord) as KEY down
+-- and up with their HID usage; typed characters as TEXT, so the layouts at
+-- the two ends need not match. Esc twice in a row gives the keyboard back.
+local function poll_keys(rw: *RemoteWin, now: float64): void
+  local io = imgui.GetIO()
+  local mods = mods_of(io)
+  -- AltGr arrives as ctrl + alt and types characters: not a chord
+  local chord = io.KeyCtrl ~= io.KeyAlt or io.KeySuper
+  for i = 0, < math.min(input_key_count(), MAX_KEYS) do
+    local k = input_key(i)
+    local hid = remotewin_hid(k.name)
+    local down = imgui.IsKeyDown(k.imkey)
+    if hid ~= 0 and down ~= rw.keys[i] then
+      if not down then
+        rw.keys[i] = false
+        if rw.key_mods[i] ~= KEY_OURS then send_key(rw, hid, false, rw.key_mods[i]) end
+      elseif k.codepoint < 32 or chord then -- a character key without a chord comes as TEXT
+        if toggle_chord(io, k.name) then
+          rw.keys[i], rw.key_mods[i] = true, KEY_OURS -- the toggle is ours; not held on the window
+        elseif k.name == 'escape' and now - rw.last_esc < ESC_TWICE then
+          rw.keys[i], rw.key_mods[i] = true, KEY_OURS
+          rw.last_esc = 0
+          host.world_focus = 0 -- the second Esc: the keyboard goes back to the game
+        else
+          if k.name == 'escape' then rw.last_esc = now end
+          rw.keys[i], rw.key_mods[i] = true, mods
+          send_key(rw, hid, true, mods)
+        end
+      end
+    end
+  end
+  local q = &io.InputQueueCharacters
+  if q.Size > 0 then
+    local buf: [256]uint8
+    local n: usize = 0
+    for i = 0, < q.Size do
+      local c = (@uint32)(q.Data[i])
+      -- control characters come as keys; surrogate halves cannot be encoded alone
+      if c >= 32 and c ~= 127 and (c < 0xD800 or c > 0xDFFF) and not chord and n + 3 <= #buf then
+        if c < 0x80 then
+          buf[n] = (@uint8)(c) n = n + 1
+        elseif c < 0x800 then
+          buf[n], buf[n+1] = (@uint8)(0xC0 | (c >> 6)), (@uint8)(0x80 | (c & 0x3F)) n = n + 2
+        else
+          buf[n], buf[n+1], buf[n+2] = (@uint8)(0xE0 | (c >> 12)), (@uint8)(0x80 | ((c >> 6) & 0x3F)), (@uint8)(0x80 | (c & 0x3F))
+          n = n + 3
+        end
+      end
+    end
+    if n > 0 then send_input(rw, WIN_INPUT_TEXT, &buf, n) end
+    q.Size = 0 -- consumed
+  end
+end
+
+-- Panel pixel (mu, mv) -> window pixel, given the picture's rectangle in panel
+-- pixels. `inside`: the point is on the picture.
+global function remotewin_map(ix: float32, iy: float32, iw: float32, ih: float32, w: integer, h: integer,
+                              mu: float32, mv: float32): (boolean, integer, integer)
+  if iw <= 0 or ih <= 0 or w <= 0 or h <= 0 then return false, 0, 0 end
+  local fx = (mu - ix) * w / iw
+  local fy = (mv - iy) * h / ih
+  local inside = fx >= 0 and fy >= 0 and fx < w and fy < h
+  local x = math.clamp((@integer)(math.floor(fx)), 0, w - 1)
+  local y = math.clamp((@integer)(math.floor(fy)), 0, h - 1)
+  return inside, x, y
+end
+
+-- The pointer and buttons over the picture of a focused panel.
+local function poll_pointer(rw: *RemoteWin, s: *Session, on_content: boolean, click: boolean,
+                            ix: float32, iy: float32, iw: float32, ih: float32, mu: float32, mv: float32): void
+  local inside, x, y = remotewin_map(ix, iy, iw, ih, rw.w, rw.h, mu, mv)
+  inside = inside and on_content
+  local held = rw.buttons ~= 0
+  if (inside or held) and (x ~= rw.ptr_x or y ~= rw.ptr_y) then
+    rw.ptr_x, rw.ptr_y = x, y
+    send_pointer(rw, WIN_INPUT_MOVE, x, y, 0, 0)
+  end
+  -- a press on the picture of a panel that already had focus; a double click
+  -- that asked for full screen stays the panel's
+  if click and inside and rw.focused_last and host.world_full_toggle_id ~= s.id then
+    rw.buttons = rw.buttons | 1
+    send_pointer(rw, WIN_INPUT_BUTTON, x, y, 0, 1)
+    host.last_click_id = 0 -- the next click is the window's, not a double click on the panel
+  elseif rw.buttons & 1 ~= 0 and not host.lmb_down then
+    rw.buttons = rw.buttons & ~1
+    send_pointer(rw, WIN_INPUT_BUTTON, x, y, 0, 0)
+  end
+  if host.rmb_down and rw.buttons & 2 == 0 and inside and not host.lmb_down and rw.focused_last then
+    rw.buttons = rw.buttons | 2
+    send_pointer(rw, WIN_INPUT_BUTTON, x, y, 1, 1)
+  elseif rw.buttons & 2 ~= 0 and not host.rmb_down then
+    rw.buttons = rw.buttons & ~2
+    send_pointer(rw, WIN_INPUT_BUTTON, x, y, 1, 0)
+  end
+  -- the wheel reaches a hovered focused panel (it claims the mouse)
+  local io = imgui.GetIO()
+  if inside and (io.MouseWheel ~= 0 or io.MouseWheelH ~= 0) then
+    send_pointer(rw, WIN_INPUT_WHEEL, x, y, (@integer)(math.floor(io.MouseWheelH * 120 + 0.5)), (@integer)(math.floor(io.MouseWheel * 120 + 0.5)))
+  end
+  if rw.buttons ~= 0 then imgui.SetNextFrameWantCaptureMouse(true) end -- a drag on the window stays ours
+end
+
+-- Drawing ---------------------------------------------------------------------------------
+
+-- Dalamud's D3D11 device, or nilptr (an older shim: no scene depth callback).
+local function ui_device(): pointer
+  if host.api.get_scene_depth == nilptr then return nilptr end
+  local sd: GuSceneDepth
+  if host.api.get_scene_depth(&sd) == 0 then return nilptr end
+  return sd.ui_device
+end
+
+-- The picture's rectangle in panel pixels: the window's aspect, fitted below
+-- the title strip and centred (the panel background shows around it).
+global function remotewin_fit(width: float32, height: float32, w: integer, h: integer): (float32, float32, float32, float32)
+  local ax, ay = REMOTEWIN_PAD, REMOTEWIN_TITLE
+  local aw, ah = width - 2 * REMOTEWIN_PAD, height - REMOTEWIN_TITLE - REMOTEWIN_PAD
+  if aw <= 0 or ah <= 0 or w <= 0 or h <= 0 then return ax, ay, 0, 0 end
+  local scale = math.min(aw / w, ah / h)
+  local iw, ih = w * scale, h * scale
+  return ax + (aw - iw) * 0.5, ay + (ah - ih) * 0.5, iw, ih
+end
+
+-- The window's title in the title strip, left of the buttons.
+local function draw_title(s: *Session, dl: *ImDrawList, vp: ImVec2, width: float32): void
+  local title = s:display_name()
+  if #title == 0 then return end
+  if host.api.push_world_font ~= nilptr then host.api.push_world_font() end
+  local size = imgui.GetFontSize() * 0.6
+  local clip: ImVec4 = { vp.x + 10, vp.y, vp.x + width - WORLD_BUTTON_PITCH * WORLD_BUTTON_COUNT - 10, vp.y + REMOTEWIN_TITLE }
+  local z = title .. '\0' -- DrawListAddText wants the end or a NUL
+  imgui.DrawListAddText(dl, imgui.GetFont(), size, vec2(vp.x + 12, vp.y + (REMOTEWIN_TITLE - size) * 0.5),
+    im_col32(236, 228, 214, 235), (@cstring)(z.data), nilptr, 0, &clip)
+  z:destroy()
+  if host.api.pop_font ~= nilptr then host.api.pop_font() end
+end
+
+-- The content of window panel `s` (core/app/worldview.nelua, where a terminal
+-- would be drawn): the panel is `width` x `height` panel pixels at `vp`;
+-- (mu, mv) is the pointer in panel pixels, `on_content` whether it is over
+-- the panel and off its chrome, `click` this frame's left press.
+global function remotewin_panel(s: *Session, dl: *ImDrawList, vp: ImVec2, width: float32, height: float32,
+                                focused: boolean, on_content: boolean, mu: float32, mv: float32, click: boolean): void
+  local rw = remotewin_of(s)
+  local now = host.last_time
+  -- the status terminal never selects: copy-on-select would put its text on the clipboard
+  if s.sel.dragging then
+    selection_clear(&s.view, &s.sel)
+    s.sel = {}
+  end
+  local device: pointer = nilptr
+  local picture = rw ~= nilptr and rw.state == RemoteWinState.Live and rw.frames > 0 and imgui.DrawListAddImage ~= nilptr
+  if picture then
+    device = ui_device()
+    if device == nilptr then
+      picture = false
+      if not rw.note_shim then
+        rw.note_shim = true
+        panel_text(s, 'this window needs a newer plugin shim', ' (no D3D11 device from get_scene_depth)')
+        if not old_shim_logged then
+          old_shim_logged = true
+          log(LOG_WARN, 'windows: the shim reports no D3D11 device (get_scene_depth); window panels show no pixels')
+        end
+      end
+    end
+  end
+  if rw ~= nilptr then rw.drawn_at = now end
+  if picture then
+    local ok, fresh = wintex_ensure(&rw.tex, device, (@uint32)(rw.w), (@uint32)(rw.h))
+    if not ok then
+      picture = false
+      if rw.tex.hresult ~= 0 and not rw.note_shim then
+        rw.note_shim = true
+        panel_text(s, 'the window texture could not be created', '')
+        logf(LOG_WARN, 'window %d: CreateTexture2D/CreateShaderResourceView failed (0x%08x)', s.id, (@uint32)(rw.tex.hresult))
+      end
+    else
+      if fresh then rw.dirty_all = true end
+      local stride = (@usize)(rw.w) * 4
+      local px = (@*[0]uint8)(&rw.pixels[0])
+      if rw.dirty_all then
+        wintex_upload(&rw.tex, WinRect{ x = 0, y = 0, w = (@uint16)(rw.w), h = (@uint16)(rw.h) }, px, stride)
+      else
+        for i = 0, < #rw.dirty do wintex_upload(&rw.tex, rw.dirty[i], px, stride) end
+      end
+      rw.dirty_all = false
+      rw.dirty:clear()
+      ack(rw) -- an END held while the panel was asleep or undrawn
+    end
+  end
+  if not picture then
+    draw_terminal(s, dl, vec2(vp.x + 16, vp.y + REMOTEWIN_TITLE), width - 32, height - REMOTEWIN_TITLE - 16, policy.world_font_size, false, false, 0, 0)
+    if rw ~= nilptr then
+      if not focused and rw.focused_last then release_all(rw) end
+      rw.focused_last = focused
+    end
+    draw_title(s, dl, vp, width)
+    return
+  end
+  local ix, iy, iw, ih = remotewin_fit(width, height, rw.w, rw.h)
+  local col = im_col32(255, 255, 255, 255)
+  for k = 0, < STRIPS do
+    local u0, u1 = (@float32)(k) / STRIPS, (@float32)(k + 1) / STRIPS
+    for r = 0, < ROWS do
+      local v0, v1 = (@float32)(r) / ROWS, (@float32)(r + 1) / ROWS
+      imgui.DrawListAddImage(dl, rw.tex.srv, vec2(vp.x + ix + iw * u0, vp.y + iy + ih * v0),
+        vec2(vp.x + ix + iw * u1, vp.y + iy + ih * v1), vec2(u0, v0), vec2(u1, v1), col)
+    end
+  end
+  draw_title(s, dl, vp, width)
+  -- input: only a focused panel's, and only one terminal or window types per frame
+  local keyboard = terminal_claim_keyboard(focused)
+  if focused then
+    poll_pointer(rw, s, on_content, click, ix, iy, iw, ih, mu, mv)
+    if keyboard then
+      imgui.SetNextFrameWantCaptureKeyboard(true)
+      input_claim_keyboard(imgui.GetIO())
+      poll_keys(rw, now)
+    end
+  end
+  if not keyboard and rw.focused_last then release_all(rw) end
+  rw.focused_last = keyboard
+end
+
+-- Shutdown and /term reload: the panels were closed with their sessions;
+-- forget what is left of this module's state.
+global function remotewin_shutdown(): void
+  for i = 0, < #streams do
+    streams[i].s.window_close = nilptr
+    wintex_release(&streams[i].tex)
+    streams[i].pixels:destroy()
+    streams[i].dirty:destroy()
+    delete(streams[i])
+  end
+  streams:destroy()
+  wintex_shutdown()
+  auto_done = false
+  old_shim_logged = false
+  agent_window_event = nilptr
+end

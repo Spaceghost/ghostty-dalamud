@@ -44,6 +44,15 @@ global AgentCfg = @record{
   token_file: string,
 }
 
+-- Remote desktop windows (lua/windows.lua, CONFIG.windows).
+global WindowsCfg = @record{
+  agent: string,            -- '' = the CONFIG.agent connection (the only one supported so far)
+  max_w: integer,           -- largest frame the agent sends; bigger windows are scaled down there
+  max_h: integer,
+  fps: integer,
+  autopull: vector(string), -- CONFIG.windows.auto: `/term window pull` arguments to run once a character is loaded
+}
+
 -- Per-frame Lua hooks; each remembers its own last logged error.
 global POLICY_HOOK_PLACE <comptime> = 0
 global POLICY_HOOK_ON_FRAME <comptime> = 1
@@ -84,6 +93,7 @@ global Policy = @record{
   world_occlusion: uint8,   -- WORLD_OCCLUSION_* (CONFIG.world.occlusion)
   world_occlusion_tolerance: float32, -- yalms a panel may sit behind the scene before it hides (grows with distance and slope)
   world_occlusion_edge: float32,      -- pixels over which a covered edge blends
+  windows: WindowsCfg,
   last_hook_error: [POLICY_HOOK_COUNT]string,  -- per POLICY_HOOK_*: the last error logged (each distinct text logs once)
 }
 
@@ -280,6 +290,21 @@ local function read_settings(L: *lua_State, t: cint): void
   end
   lua_pop(L, 1)
 
+  lua_getfield(L, t, 'windows')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) lua_createtable(L, 0, 0) end
+  local wn: cint = lua_gettop(L)
+  policy.windows.agent:destroy()
+  policy.windows.agent = lua_field_string(L, wn, 'agent', '')
+  policy.windows.max_w = math.clamp(lua_field_integer(L, wn, 'max_w', 1920), 64, 4096)
+  policy.windows.max_h = math.clamp(lua_field_integer(L, wn, 'max_h', 1200), 64, 4096)
+  policy.windows.fps = math.clamp(lua_field_integer(L, wn, 'fps', 30), 1, 120)
+  for i = 0, < #policy.windows.autopull do policy.windows.autopull[i]:destroy() end
+  policy.windows.autopull:clear()
+  lua_getfield(L, wn, 'auto')
+  read_string_list(L, lua_gettop(L), &policy.windows.autopull)
+  lua_pop(L, 1)
+  lua_pop(L, 1)
+
   lua_getfield(L, t, 'popup')
   if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) lua_createtable(L, 0, 0) end
   local pp: cint = lua_gettop(L)
@@ -307,6 +332,9 @@ global function policy_unload(): void
   policy.agent.host:destroy()
   policy.agent.token:destroy()
   policy.agent.token_file:destroy()
+  policy.windows.agent:destroy()
+  for i = 0, < #policy.windows.autopull do policy.windows.autopull[i]:destroy() end
+  policy.windows.autopull:destroy()
   policy = {}
 end
 
@@ -962,4 +990,54 @@ global function policy_assistant_exit(status: int32, refused: boolean): string
     lua_pop(L, 3)
   end
   return string.copy('\r\n[assistant exited]\r\n')
+end
+
+-- Remote windows (lua/windows.lua) ----------------------------------------------
+
+local function push_windows_fn(L: *lua_State, name: cstring): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'windows')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, name)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  return true -- stack: CONFIG, windows, fn
+end
+
+-- CONFIG.windows.size(panel_id, window_w, window_h, chrome_px): the window's
+-- first frame arrived; its panel takes the window's aspect (`chrome_px` panel
+-- pixels above the picture for the title strip). False when it could not run.
+global function policy_windows_size(id: integer, w: integer, h: integer, chrome: float64): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_windows_fn(L, 'size') then return false end
+  lua_pushinteger(L, id)
+  lua_pushinteger(L, w)
+  lua_pushinteger(L, h)
+  lua_pushnumber(L, chrome)
+  local ok = lua_pcall(L, 4, 0, 0) == LUA_OK
+  if not ok then log_hook_error(L, POLICY_HOOK_RESIZE, 'windows.size') lua_pop(L, 1) end
+  lua_pop(L, 2)
+  return ok
+end
+
+-- CONFIG.windows.pin(panel_id, args) -> nil or an error string: `/term pin`
+-- on a window panel moves it, keeping its size.
+global function policy_windows_pin(id: integer, args: string): string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return string.copy('no config') end
+  if not push_windows_fn(L, 'pin') then return string.copy('lua/windows.lua is not loaded (CONFIG.windows)') end
+  lua_pushinteger(L, id)
+  lua_pushlstring(L, (@cstring)(args.data), args.size)
+  local err: string
+  if lua_pcall(L, 2, 1, 0) ~= LUA_OK or lua_type(L, -1) == LUA_TSTRING then
+    local len: usize = 0
+    local msg = lua_tolstring(L, -1, &len)
+    if msg ~= nilptr then
+      err = string.copy(string{data=(@*[0]byte)(msg), size=len})
+    else
+      err = string.copy('lua error')
+    end
+  end
+  lua_pop(L, 3)
+  return err
 end
