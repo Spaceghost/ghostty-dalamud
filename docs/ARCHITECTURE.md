@@ -159,6 +159,10 @@
    Dalamud's device (`core/wintex.nelua`), draws it as textured quads and
    sends the focused panel's pointer and keys back as WINPUT. Not yet
    observed in game.
+12. Jobs (docs/JOBS.md): a process the agent runs on pipes rather than a PTY,
+   for output a client parses instead of draws — a Claude Code session in
+   `stream-json` mode above all. The agent passes its bytes through
+   untouched; the events are rendered by XivDesktop, not by the plugin core.
 
 ## HUD panels
 
@@ -383,6 +387,7 @@ core/app/     the app modules; hostsurface.nelua is the plugin's side of the hos
 core/sys/     net (POSIX + Winsock), conpty (Windows), procguard, fs / fsbase, platform, wincmdline, hid and dualsense_reader (Windows HID)
 core/shaders/ HLSL sources and the committed DXBC the core embeds
 agent/        ghostty-agent PTY server (Nelua): agent.nelua, logic, pty_posix / sys_posix, pty_windows / sys_windows / winloop
+agent/        raw jobs (docs/JOBS.md): jobs.nelua, job_posix / job_windows, claude.nelua (the Claude Code command line)
 lua/          shipped policy: init.lua, keymap.lua, migrate.lua, assistant.lua (/term ask), selftest.lua (/term selftest), ...
 themes/       shipped colour themes (Ghostty theme files, read by lua/themes.lua)
 shim/         GhosttyDalamud (plugin) and Umbra.Ghostty (widget) C# projects
