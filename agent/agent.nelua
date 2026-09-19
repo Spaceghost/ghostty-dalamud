@@ -11,9 +11,12 @@
 -- (ConPTY over overlapped named pipes), agent/sys_windows.nelua (Win32
 -- clipboard, token file under %APPDATA%) and agent/winloop.nelua (one wait
 -- on socket, process and pipe events). agent/logic.nelua holds the pure parts.
+-- Remote desktop windows (protocol version 3) are agent/windows.nelua, over a
+-- capture backend from agent/capture.nelua (--windows).
 --
 -- Usage: ghostty-agent [--listen 127.0.0.1:7777] [--token-file PATH]
 --                      [--clipboard-file PATH] [--replay-bytes N] [--term xterm-256color]
+--                      [--windows auto|off|test|wayland|win32|mac]
 require 'string'
 require 'vector'
 require 'stringbuilder'
@@ -25,6 +28,7 @@ require 'memory'
 require 'core.sys.net'
 require 'core.protocol'
 require 'agent.logic'
+require 'agent.windows'
 ## if ccinfo.is_windows then
 require 'agent.pty_windows'
 require 'agent.sys_windows'
@@ -84,6 +88,7 @@ local INBUF_MAX: usize <comptime> = 8 * 1024 * 1024  -- input waiting for a PTY,
 local OUTQ_HIGH: usize <comptime> = 1024 * 1024      -- a client this far behind stops its sessions' reads
 
 local agent: Agent
+local windows: AgentWindows
 
 local function log(msg: string): void
   io.stderr:write('[ghostty-agent] ', msg, '\n')
@@ -395,6 +400,8 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     text:destroy()
   elseif typ == PROTO_HELLO then
     send_text(c, PROTO_OK, 'already authenticated')
+  elseif windows:handle(ci, &c.outq, typ, payload, len) then
+    -- a window frame (agent/windows.nelua)
   else
     send_text(c, PROTO_ERR, 'unknown frame')
   end
@@ -475,6 +482,7 @@ local function reap(): void
   local i: integer = #agent.clients - 1
   while i >= 0 do
     if not agent.clients[i].alive then
+      windows:client_gone((@usize)(i))
       for si = 0, < #agent.sessions do
         session_detach(&agent.sessions[si], (@usize)(i))
         -- shift indexes above i
@@ -532,10 +540,24 @@ local function read_token_file(path: string): string
   return tok
 end
 
+-- Where agent/windows.nelua queues frames for connection `ci`.
+local function client_queue(ci: usize): *ByteQueue
+  if ci < #agent.clients and agent.clients[ci].alive then return &agent.clients[ci].outq end
+  return nilptr
+end
+
+-- The main loop's sleep, capped by what the window streams need (ms).
+local function windows_cap(ms: integer): integer
+  local w = windows:wait_ms(os.now())
+  if w >= 0 and w < ms then return w end
+  return ms
+end
+
 local function main(): integer
   agent_sys_init()
   local listen_spec: string = '127.0.0.1:7777'
   local token_path: string = ''
+  local windows_name: string = 'auto'
   agent.replay_bytes = 256 * 1024
   agent.term = 'xterm-256color'
   agent.next_id = 1
@@ -547,8 +569,9 @@ local function main(): integer
     elseif a == '--clipboard-file' and i < #arg then agent.clip_file = arg[i+1] i = i + 1
     elseif a == '--replay-bytes' and i < #arg then agent.replay_bytes = (@usize)(tointeger(arg[i+1])) i = i + 1
     elseif a == '--term' and i < #arg then agent.term = arg[i+1] i = i + 1
+    elseif a == '--windows' and i < #arg then windows_name = arg[i+1] i = i + 1
     elseif a == '--help' or a == '-h' then
-      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME]\n')
+      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME]\n')
       return 0
     else
       io.stderr:write('unknown argument: ', a, '\n')
@@ -574,6 +597,10 @@ local function main(): integer
     local sb: stringbuilder
     sb:writef('ghostty-agent %d %d', PROTO_VERSION, nonce)
     agent.hello = sb:promote()
+  end
+  do
+    local ok, why = windows:init(windows_name, client_queue)
+    if ok then log('windows: ' .. windows.backend.name) else log('windows unavailable: ' .. why) end
   end
 
   ## if ccinfo.is_windows then
@@ -605,7 +632,7 @@ local function main(): integer
       overflow_logged = true
       log('more handles than one wait takes; polling every 50 ms while that lasts')
     end
-    winloop_wait(&handles, n, agent_wait_ms(wanted, WINLOOP_MAX_HANDLES, exiting))
+    winloop_wait(&handles, n, (@uint32)(windows_cap((@integer)(agent_wait_ms(wanted, WINLOOP_MAX_HANDLES, exiting)))))
     -- everything is pumped below: events from now on signal again
     winloop_reset(listen_ev)
     for ci = 0, < #agent.clients do winloop_reset(agent.clients[ci].ev) end
@@ -623,6 +650,8 @@ local function main(): integer
     end
     for ci = 0, < #agent.clients do pump_client(ci) end
     for si = 0, < #agent.sessions do pump_session(si) end
+    windows:pump()
+    windows:tick(os.now())
     for ci = 0, < #agent.clients do flush_client(ci) end
     reap()
   end
@@ -644,7 +673,14 @@ local function main(): integer
       if not s.exited and s.inbuf:len() > 0 then ev = ev | POLLOUT end
       if n < 512 and ev ~= 0 then fds[n] = { fd = s.pty.fd, events = ev } n = n + 1 end
     end
-    poll(&fds, n, 250)
+    do -- the capture backend's descriptors (D-Bus, PipeWire, a compositor)
+      local wfds: [16]cint
+      local wn = windows:poll_fds(&wfds, 16)
+      for k = 0, < wn do
+        if n < 512 then fds[n] = { fd = wfds[k], events = POLLIN } n = n + 1 end
+      end
+    end
+    poll(&fds, n, windows_cap(250))
 
     local c = net.accept(agent.listen_sock)
     while net.is_valid(c) do
@@ -654,6 +690,8 @@ local function main(): integer
     end
     for ci = 0, < #agent.clients do pump_client(ci) end
     for si = 0, < #agent.sessions do pump_session(si) end
+    windows:pump()
+    windows:tick(os.now())
     for ci = 0, < #agent.clients do flush_client(ci) end
     reap()
   end
