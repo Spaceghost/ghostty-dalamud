@@ -46,6 +46,8 @@ local SIGHUP: cint <cimport, nodecl, const>
 local F_GETFL: cint <cimport, nodecl, const>
 local F_SETFL: cint <cimport, nodecl, const>
 local O_NONBLOCK: cint <cimport, nodecl, const>
+local F_SETFD: cint <cimport, nodecl, const>
+local FD_CLOEXEC: cint <cimport, nodecl, const>
 local errno: cint <cimport, nodecl>
 local EAGAIN: cint <cimport, nodecl, const>
 local EINTR: cint <cimport, nodecl, const>
@@ -90,6 +92,7 @@ function AgentPty.spawn(term: string, argv: *vector(string), env: *vector(string
   end
   local flags = fcntl(master, F_GETFL, 0)
   fcntl(master, F_SETFL, flags | O_NONBLOCK)
+  fcntl(master, F_SETFD, FD_CLOEXEC) -- later children must not hold this terminal open
   return true, (@AgentPty){ pid = pid, fd = master }, (@string){}
 end
 

@@ -41,6 +41,7 @@ local BCRYPT_USE_SYSTEM_PREFERRED_RNG: uint32 <cimport, nodecl, const>
 global AGENT_CLIP_MAX: usize <comptime> = 1024 * 1024
 
 global function agent_sys_init(): void end
+global function agent_sys_reap(): void end -- POSIX only: clipboard tools left running
 
 global function agent_pid(): int64
   return GetCurrentProcessId()

@@ -92,6 +92,10 @@ global function agent_write_private(path: string, content: string): boolean
   return true
 end
 
+require 'vector'
+local function usleep(us: cuint): cint <cimport, nodecl> end
+local clip_stragglers: vector(cint)
+
 -- Each clipboard tool runs as a short child process with a pipe; the agent
 -- waits for it (a clipboard tool exits at once, wl-copy forks its own server).
 local function exec_first(argvs: *[2][4]cstring): void
@@ -120,9 +124,27 @@ global function agent_clipboard_set(data: *[0]uint8, len: usize): boolean
     off = off + (@usize)(n)
   end
   close(fds[1])
+  -- wl-copy normally forks its selection server and exits at once; one that
+  -- stays (seen on GNOME) must not stall every connection and shell: wait
+  -- up to a second, then leave it running and reap it later
   local status: cint = 0
-  waitpid(pid, &status, 0)
-  return off == len and WIFEXITED(status) and WEXITSTATUS(status) == 0
+  for _ = 1, 100 do
+    local r = waitpid(pid, &status, WNOHANG)
+    if r == pid then return off == len and WIFEXITED(status) and WEXITSTATUS(status) == 0 end
+    if r < 0 then return false end
+    usleep(10000)
+  end
+  clip_stragglers:push(pid)
+  return off == len
+end
+
+-- Clipboard tools still running after agent_clipboard_set gave up waiting.
+global function agent_sys_reap(): void
+  local i = 0
+  while i < #clip_stragglers do
+    local status: cint = 0
+    if waitpid(clip_stragglers[i], &status, WNOHANG) ~= 0 then clip_stragglers:remove(i) else i = i + 1 end
+  end
 end
 
 global function agent_clipboard_get(): (boolean, string)
