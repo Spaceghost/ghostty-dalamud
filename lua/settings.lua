@@ -116,6 +116,13 @@ S.schema = {
     { 'bell.accent.g', 'slider', 0, 1, 'Accent colour: green' },
     { 'bell.accent.b', 'slider', 0, 1, 'Accent colour: blue' },
   } },
+  { 'Assistant (/term ask)', {
+    { 'assistant.enabled', 'checkbox', '/term ask opens the assistant' },
+    { 'assistant.view', 'combo', { 'pet', 'tab', 'window' }, 'Opens as (pet needs your character; else a tab)' },
+    { 'assistant.transport', 'combo', { 'default', 'agent', 'conpty' }, 'Runs through (default: as your first profile)' },
+    { 'assistant.chat', 'argv', '/term ask runs' },
+    { 'assistant.ask', 'argv', '/term ask <question> runs, plus the question' },
+  } },
   { 'Info bar & hidden UI', {
     { 'host.dtr.mode', 'combo', DTR_MODES, 'Server info bar entry (auto: only without the Umbra widget)' },
     { 'popup.close_on_blur', 'checkbox', 'Info bar popup closes when you click elsewhere' },
@@ -279,6 +286,11 @@ function S.draw_settings(ui)
           c, v = ui.checkbox(e[3] .. '##' .. path, cur and true or false)
         elseif kind == 'combo' then
           c, v = ui.combo(e[4] .. '##' .. path, tostring(cur or ''), e[3])
+        elseif kind == 'argv' then
+          -- a command line, read-only here: edit it in the Lua module
+          local words = {}
+          for i, w in ipairs(type(cur) == 'table' and cur or {}) do words[i] = string.format('%q', w) end
+          ui.wrapped(e[3] .. ': ' .. table.concat(words, ' ') .. ' (edit in lua/)', 0.72, 0.74, 0.78)
         end
         if c then
           set(config, path, v)

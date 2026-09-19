@@ -13,6 +13,7 @@ local settings = require('settings')
 local bell = require('bell')
 local showcase = require('showcase')
 local platform = require('platform')
+local assistant = require('assistant')
 
 -- The agent connection and profiles for where the game runs (native Windows,
 -- or Wine/Proton on Linux): see lua/platform.lua.
@@ -79,7 +80,7 @@ local config = {
   -- What the plugin registers with Dalamud.
   host = {
     commands = { '/term', '/tomestone', '/tome' },
-    help = 'Show/hide the terminal. window [n] | new [n] | pin [here|me|target|orbit] | unpin | config | reload',
+    help = 'Show/hide the terminal. window [n] | new [n] | pin [here|me|target|orbit] | unpin | ask [question] | config | reload',
     -- Server info bar entry. 'auto' shows it only while no Umbra toolbar
     -- widget is showing ghostty's status; 'always' | 'never'.
     dtr = {
@@ -138,6 +139,12 @@ local config = {
   bell = bell,
   -- /term showcase: demo terminals and camera shots for screenshots (lua/showcase.lua).
   showcase = showcase,
+  -- /term ask [question]: a terminal running a local AI assistant (almanac by
+  -- default), the question as one argument, never through a shell. Command,
+  -- transport and where it opens: lua/assistant.lua. Change the fields
+  -- (e.g. assistant.view = 'tab') rather than replacing the table: the core
+  -- calls its functions.
+  assistant = assistant,
   -- The settings window (/term config) and its saved overrides (settings.lua).
   settings = settings,
   -- Pinned automatically once your character is loaded, e.g. { 'orbit 4 0.2', 'me' }.
