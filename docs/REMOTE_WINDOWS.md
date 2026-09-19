@@ -138,6 +138,75 @@ settles.
   next due frame of a stream that may send; POSIX also polls the backend's
   `poll_fds`. The Windows loop has only the timeout.
 
+## macOS backend (agent/capture_mac.nelua)
+
+Compiles (arm64 and x86_64 Mach-O, `MAC=1 tools/build.sh`); **never run on
+a Mac**. Everything below is the design as written, not observed behaviour.
+
+No SDK: the agent is cross-compiled with Zig (`tools/zig-cc-mac.sh`,
+`tools/zig-cc-mac-x64.sh`), which has macOS libc headers and libSystem
+stubs but no framework headers. Frameworks are `dlopen`ed from
+`/System/Library/Frameworks` and called through typed function pointers;
+Objective-C goes through `objc_msgSend` cast to each message's exact
+signature (no message used returns a struct, so no `_stret`). Completion
+handlers are Block literals built by hand on the stack (layout in
+`agent/capture_mac_logic.nelua`, `MacBlock`); the stream output/delegate is a
+class registered at run time (`GhosttyAgentCaptureOutput`: NSObject, a `ctx`
+ivar, `stream:didOutputSampleBuffer:ofType:`, `stream:didStopWithError:`).
+
+* **List**: `CGWindowListCopyWindowInfo(OnScreenOnly | ExcludeDesktopElements)`,
+  layer 0 windows at least 16×16 points, not the agent's own; sizes are
+  points × the backing scale of the display under the window's centre. The
+  first line is `0 0 0 launch run:APP …`; missing permissions add `note`
+  lines (wid 0).
+* **Open**: a wid (any window the server knows); `run:NAME` runs
+  `/usr/bin/open -a NAME` (posix_spawn, no shell) and stays pending until a
+  window of an app named NAME appears (30 s, then ended); any other text is
+  the first on-screen window whose title or app contains it. `wid 0` with no
+  text fails: macOS has no picker to hand to.
+* **Frames**, macOS 12.3+: ScreenCaptureKit. `SCShareableContent` finds the
+  `SCWindow` by id, `SCContentFilter initWithDesktopIndependentWindow:`
+  (other windows on top do not show; windows on other Spaces still stream),
+  `SCStreamConfiguration` at the window's pixel size, BGRA, at most 60 fps,
+  no cursor, queue depth 3, one serial dispatch queue per stream. The sample
+  callback skips buffers whose `SCStreamFrameInfoStatus` is not Complete,
+  copies the `CVPixelBuffer` rows (read-only lock) into its own buffer, swaps
+  it into the shared slot under a mutex and writes a byte to a self-pipe the
+  main loop polls; `frame()` swaps the shared slot out. No copy happens under
+  the lock and nothing is polled: frames reach the loop as they arrive.
+  Pending until the first frame (10 s, then ended). Every 0.5 s the window's
+  bounds are read again: gone ends the stream ("window closed"), a new size
+  reconfigures it (`updateConfiguration:`).
+* **Frames**, before 12.3: `CGWindowListCreateImage` (deprecated; nominal
+  1x resolution) taken when the generic layer wants a frame.
+* **Input**: window pixels map to global points through the latest frame's
+  size and the window's bounds (refreshed when older than 100 ms), so Retina
+  needs no extra factor. Mouse: `CGEventCreateMouseEvent` (moves, drags
+  while held, left/right/other down/up with a click count for double
+  clicks), wheel: `CGEventCreateScrollWheelEvent2` in lines (a partial notch
+  scrolls one), keys: USB HID → `kVK_*` with ctrl/shift/alt/super →
+  Control/Shift/Option/Command flags, text: `CGEventKeyboardSetUnicodeString`
+  in chunks of at most 20 UTF-16 units. Events go to the window's process
+  (`CGEventPostToPid`), so the user's cursor stays put; clicks also carry the
+  undocumented window-under-pointer fields (91, 92). Some apps ignore
+  pid-posted mouse events; FOCUS (`NSRunningApplication
+  activateWithOptions:`) brings the app forward and from then on posts that
+  stream's events to the HID tap (`CGEventPost`), which moves the real
+  cursor.
+* **Permissions**: Screen Recording for titles and capture
+  (`CGPreflightScreenCaptureAccess`; the system prompt is asked for once),
+  Accessibility / event posting for input (`CGPreflightPostEventAccess`, else
+  `AXIsProcessTrusted`). They belong to the agent binary, or to the terminal
+  app that started it. Without Screen Recording, WLIST says so and opens end
+  with the reason; without Accessibility, WLIST says so and input is dropped
+  (one line on stderr).
+* **Limits**: frames are the full pixel size (the generic layer scales down
+  to `max_w`×`max_h`). The pid-posted path cannot reach windows of apps that
+  only read the HID stream; FOCUS is the way out. The agent has no
+  NSApplication or run loop; ScreenCaptureKit works from dispatch queues,
+  and `CGMainDisplayID()` is called first to open the window server
+  connection.
+
 ## Using it
 
 ```
@@ -164,6 +233,14 @@ Host tests only (`tests/run.sh`), nothing in game or on a real desktop:
   coordinates, WCLOSE, WEND, open failures, another connection unable to see
   or touch a stream, a disconnect closing streams, and an agent run with
   `--windows off` refusing with the reason.
+
+* `test_capture_mac`: the macOS backend's pure parts (keycode table, flags,
+  event types, point mapping, Block layout, `run:` parsing, list lines,
+  UTF-16 chunks, CGImage layouts).
+
+The macOS agent (`ghostty-agent-macos-arm64`, `-x86_64`) cross-compiles
+with the ScreenCaptureKit backend and is a valid Mach-O; it has never been
+run on a Mac, so no part of the macOS backend is verified.
 
 The Windows agent (`ghostty-agent.exe`) cross-compiles with the window layer;
 no real backend exists yet, and the Windows loop's window path has not run.
