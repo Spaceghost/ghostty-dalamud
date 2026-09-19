@@ -393,6 +393,120 @@ assert(host.world_focus == pid, 'and back')
 host.world_focus = 0
 while #host.world > n_world do close_terminal(host.world[#host.world - 1]) end
 
+-- panel.*: every panel, wherever it lives -------------------------------------------------
+do
+  -- a dropdown tab, a minimized terminal, a pet and a pinned terminal, an adopted panel (faked)
+  local tab = session_new(policy.default_profile - 1, 80, 24)
+  host.dropdown_tabs:push(tab)
+  host.dropdown_active = 0
+  local mins = session_new(policy.default_profile - 1, 80, 24)
+  host.minimized:push(mins)
+  expect('{"method":"terminal.new"}', 'assert(r.ok)')
+  expect('{"method":"terminal.new","params":{"pin":"here"}}', 'assert(r.ok)')
+  local fake = session_new_local('adopted', 20, 4)
+  fake.kind = TransportKind.Panel
+  fake.title:destroy()
+  fake.title = string.copy('Mappy')
+  assert(make_pet(fake))
+  frame()
+  assert(host.world[#host.world - 3] == fake, 'the adopted pet first: the new terminals open at the frame')
+  local pet = host.world[#host.world - 2].id
+  local pin = host.world[#host.world - 1].id
+  local rev_p = expect('{"method":"panel.list"}', string.format([[
+    local by = {}
+    for _, p in ipairs(r.result.panels) do by[p.id] = p end
+    local function is(id, kind, view) local p = assert(by[id], 'listed: ' .. id) assert(p.kind == kind and p.view == view, RAW) return p end
+    local t = is(%d, 'terminal', 'tab')
+    assert(t.running == true and type(t.profile) == 'string' and t.focused == false, RAW)
+    is(%d, 'terminal', 'min')
+    local pt = is(%d, 'terminal', 'pet')
+    is(%d, 'terminal', 'pin')
+    local w = is(%d, 'window', 'pet')
+    assert(w.title == 'Yad Window' and w.app == 'yad', RAW)
+    local a = is(%d, 'adopted', 'pet')
+    assert(a.title == 'Mappy', RAW)
+    assert(w.order == 1 and a.order == 2 and pt.order == 3, 'the pets in their order: ' .. RAW)
+    assert(by[%d].order == nil, 'a pin has no order')
+    return r.result.rev]], tab.id, mins.id, pet, pin, pid, fake.id, pin))
+
+  -- focus a tab: the dropdown opens with it active and the keyboard
+  host.world_focus = pid
+  set_visible(false)
+  host.dropdown_tabs:push(session_new(policy.default_profile - 1, 80, 24)) -- a second tab, active
+  host.dropdown_active = 1
+  expect(string.format('{"method":"panel.focus","params":{"id":%d}}', tab.id), 'assert(r.ok)')
+  frame()
+  assert(host.dropdown_open and host.dropdown_tabs[host.dropdown_active] == tab and host.world_focus == 0, 'the tab is shown')
+  expect('{"method":"panel.list"}', string.format([[
+    for _, p in ipairs(r.result.panels) do if p.id == %d then assert(p.focused, RAW) end end
+    assert(r.result.rev ~= %d, 'rev moved')]], tab.id, rev_p))
+  -- focus a minimized terminal: restored into the dropdown
+  set_visible(false)
+  expect(string.format('{"method":"panel.focus","params":{"id":%d,"fly":false}}', mins.id), 'assert(r.ok)')
+  frame()
+  assert(#host.minimized == 0 and host.dropdown_open and host.dropdown_tabs[host.dropdown_active] == mins, 'restored')
+  -- focus a pet: the keyboard, and the click's camera turn and walk-up are asked for; fly false: not
+  expect(string.format('{"method":"panel.focus","params":{"id":%d}}', pet), 'assert(r.ok)')
+  frame()
+  assert(host.world_focus == pet and world_fly_id == pet, 'focused, flying')
+  expect(string.format('{"method":"panel.focus","params":{"id":%d,"fly":false}}', pin), 'assert(r.ok)')
+  frame()
+  assert(host.world_focus == pin and world_fly_id == 0, 'focused, no flight')
+  -- order: the adopted pet first, then the window last
+  expect(string.format('{"method":"panel.order","params":{"id":%d,"to":"first"}}', fake.id), 'assert(r.ok)')
+  expect(string.format('{"method":"panel.order","params":{"id":%d,"to":"last"}}', pid), 'assert(r.ok)')
+  expect(string.format('{"method":"panel.order","params":{"id":%d,"to":"left"}}', pin), 'assert(r.ok)')
+  frame()
+  expect('{"method":"panel.list"}', string.format([[
+    local by = {}
+    for _, p in ipairs(r.result.panels) do by[p.id] = p end
+    assert(by[%d].order == 1 and by[%d].order == 2 and by[%d].order == 3, RAW)
+]], fake.id, pet, pid))
+  expect('{"method":"window.list"}', [[
+    local q = r.result.requests[#r.result.requests]
+    assert(q.method == 'panel.order' and not q.ok and q.error:find('only pets'), RAW)]])
+  -- minimize: a terminal to the minimized list, a window hidden; focus brings both back
+  expect(string.format('{"method":"panel.minimize","params":{"id":%d}}', pet), 'assert(r.ok)')
+  expect(string.format('{"method":"panel.minimize","params":{"id":%d}}', pid), 'assert(r.ok)')
+  frame()
+  assert(#host.minimized == 1 and host.minimized[0].id == pet, 'minimized')
+  expect('{"method":"panel.list"}', string.format([[
+    for _, p in ipairs(r.result.panels) do
+      if p.id == %d then assert(p.view == 'min', RAW) end
+      if p.id == %d then assert(p.view == 'hidden', RAW) end
+    end]], pet, pid))
+  expect(string.format('{"method":"panel.focus","params":{"id":%d,"fly":false}}', pid), 'assert(r.ok)')
+  frame()
+  assert(host.world_focus == pid, 'a hidden window shown and focused')
+  expect('{"method":"panel.list"}', string.format('for _, p in ipairs(r.result.panels) do if p.id == %d then assert(p.view == "pet" and p.focused, RAW) end end', pid))
+  -- toggle_pet from the minimized list: a pet; place a tab: a HUD panel; close a tab
+  expect(string.format('{"method":"panel.toggle_pet","params":{"id":%d}}', pet), 'assert(r.ok)')
+  expect(string.format('{"method":"panel.place","params":{"id":%d,"pin":"hud 0.5 0.3"}}', tab.id), 'assert(r.ok)')
+  expect(string.format('{"method":"panel.close","params":{"id":%d}}', mins.id), 'assert(r.ok)')
+  frame()
+  expect('{"method":"panel.list"}', string.format([[
+    local by = {}
+    for _, p in ipairs(r.result.panels) do by[p.id] = p end
+    assert(by[%d].view == 'pet' and by[%d].view == 'hud' and by[%d] == nil, RAW)
+]], pet, tab.id, mins.id))
+  expect('{"method":"window.list"}', 'for i = #r.result.requests - 2, #r.result.requests do assert(r.result.requests[i].ok, RAW) end')
+  -- unknown panels
+  expect('{"method":"panel.close","params":{"id":9999}}', 'assert(r.ok)')
+  frame()
+  expect('{"method":"window.list"}', 'assert(r.result.requests[#r.result.requests].error == "no such panel", RAW)')
+  -- back to the window alone
+  host.world_focus = 0
+  world_fly_id = 0
+  local i = #host.sessions - 1
+  while i >= 0 do
+    local s = host.sessions[i]
+    if s.id ~= pid then close_terminal(s) end
+    i = i - 1
+  end
+  set_visible(false)
+  frame()
+end
+
 -- no character: open fails with the reason
 player_here = false
 expect('{"method":"window.open","params":{"match":"x"}}', 'assert(r.ok)')

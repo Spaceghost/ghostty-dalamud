@@ -171,6 +171,30 @@ do
   eq(call({ method = 'agent.apps' }).result[1].id, 'foot')
   eq(call({ method = 'focus.get' }).result, { id = 12, kind = 'window' })
   assert(#queued == 15, 'reads queue nothing')
+  -- panel.*: every panel
+  snap = json.encode({ rev = 4, panels = { { id = 3, kind = 'terminal', title = 'bash', view = 'tab', focused = false } } })
+  eq(call({ method = 'panel.list' }).result, { rev = 4, panels = { { id = 3, kind = 'terminal', title = 'bash', view = 'tab', focused = false } } })
+  call({ method = 'panel.focus', params = { id = 3 } })
+  eq(json.decode(queued[16]).params, { id = 3, fly = true })
+  call({ method = 'panel.focus', params = { id = 3, fly = false } })
+  eq(json.decode(queued[17]).params, { id = 3, fly = false })
+  call({ method = 'panel.close', params = { id = 3 } })
+  call({ method = 'panel.minimize', params = { id = 3 } })
+  call({ method = 'panel.toggle_pet', params = { id = 3 } })
+  call({ method = 'panel.place', params = { id = 3, pin = 'hud 0.5 0.2' } })
+  eq(json.decode(queued[21]).params, { id = 3, pin = 'hud 0.5 0.2' })
+  call({ method = 'panel.order', params = { id = 3, to = 'first' } })
+  call({ method = 'panel.order', params = { id = 3, to = 2 } })
+  eq(json.decode(queued[23]).params, { id = 3, to = '2' })
+  assert(#queued == 23)
+  refused({ method = 'panel.focus', params = { id = 3, fly = 'no' } }, 'fly must be')
+  refused({ method = 'panel.focus' }, 'panel.list')
+  refused({ method = 'panel.close', params = { id = 0 } }, 'id must be')
+  refused({ method = 'panel.place', params = { id = 3 } }, 'pin is required')
+  refused({ method = 'panel.order', params = { id = 3, to = 'up' } }, 'to must be')
+  refused({ method = 'panel.order', params = { id = 3, to = 0 } }, 'to must be')
+  refused({ method = 'panel.order', params = { id = 3 } }, 'to must be')
+  assert(#queued == 23, 'nothing refused was queued')
   queue_full = true
   refused({ method = 'window.focus', params = { id = 4 } }, 'too many changes waiting')
   queue_full = false
@@ -220,7 +244,7 @@ do
   eq(s1, { rev = s1.rev, windows = json.array(), requests = json.array(), status = 'ghostty',
     agent = { connected = true, version = 3, windows_ok = true, agent = '127.0.0.1:7777' },
     agent_windows = { { wid = 7, w = 800, h = 600, app = 'firefox', title = 'Mozilla Firefox', key = '', extra = json.array() } },
-    agent_apps = json.array(), focus = { id = 0 } })
+    agent_apps = json.array(), focus = { id = 0 }, panels = json.array() })
   assert(json.decode(ipc.snapshot()).rev == s1.rev, 'nothing changed: the same rev')
 
   ipc.run(queued[1]) -- window.open run yad, for XivDesktop
@@ -293,5 +317,63 @@ do
   assert(run('agent.windows.refresh', {}, 312).ok and seen.refresh)
   q = run('terminal.new', { profile = 2 }, 313)
   assert(q.ok and q.result.id == 31 and seen.new.profile == '2' and seen.new.pin == nil, 'a numeric profile goes as text')
+  -- panel.*: every panel, the view each is in, and the changes reaching ghostty.panel_*
+  panels = {}
+  world_list = {}
+  world.anchors = { [41] = { kind = 'pet' }, [42] = { kind = 'world' }, [43] = { kind = 'hud' }, [44] = { kind = 'pet', hidden = true },
+    [45] = { kind = 'pet' }, [47] = { kind = 'follow', player = true } }
+  world.pet_rank = function(id) return ({ [41] = 2, [45] = 1 })[id] end
+  local plist = {
+    { id = 40, kind = 'terminal', title = 'bash', place = 'tab', focused = true, profile = 'bash', running = true },
+    { id = 41, kind = 'terminal', title = 'htop', place = 'world', profile = 'bash', running = false },
+    { id = 42, kind = 'window', title = 'window', place = 'world' },
+    { id = 43, kind = 'adopted', title = 'Mappy', place = 'world', app = 'Mappy' },
+    { id = 44, kind = 'chat', title = 'Chat', place = 'world' },
+    { id = 45, kind = 'terminal', title = 'pwsh', place = 'world', full = true, profile = 'pwsh', running = true },
+    { id = 46, kind = 'terminal', title = 'zsh', place = 'min', profile = 'zsh', running = true },
+    { id = 47, kind = 'terminal', title = 'fish', place = 'float', profile = 'fish', running = true },
+  }
+  ghostty.panels = function() return plist end
+  panels[1] = { id = 42, sid = 5, title = 'Yad Window', app = '', w = 640, h = 400, state = 'live', view = 'world', focused = false }
+  ghostty.agent_windows = function()
+    return { windows = { { wid = 5, w = 640, h = 400, app = 'yad', title = 'Yad Window', key = '', extra = {} } },
+      apps = { { id = 'yad', name = 'Yad', icon = '/icons/yad.png', categories = '' } }, answers = 2 }
+  end
+  local p1 = json.decode(ipc.snapshot())
+  eq(p1.panels, {
+    { id = 40, kind = 'terminal', title = 'bash', view = 'tab', focused = true, profile = 'bash', running = true },
+    { id = 41, kind = 'terminal', title = 'htop', view = 'pet', focused = false, profile = 'bash', running = false, order = 2 },
+    { id = 42, kind = 'window', title = 'Yad Window', view = 'pin', focused = false, app = 'yad', icon = '/icons/yad.png' },
+    { id = 43, kind = 'adopted', title = 'Mappy', view = 'hud', focused = false, app = 'Mappy' },
+    { id = 44, kind = 'chat', title = 'Chat', view = 'hidden', focused = false },
+    { id = 45, kind = 'terminal', title = 'pwsh', view = 'full', focused = false, profile = 'pwsh', running = true },
+    { id = 46, kind = 'terminal', title = 'zsh', view = 'min', focused = false, profile = 'zsh', running = true },
+    { id = 47, kind = 'terminal', title = 'fish', view = 'dropdown', focused = false, profile = 'fish', running = true },
+  })
+  plist[7].title = 'zsh: vim'
+  assert(json.decode(ipc.snapshot()).rev ~= p1.rev, 'a panel change moves rev')
+  seen = {}
+  ghostty.panel_show = function(id, fly) seen.show = { id, fly } return true end
+  ghostty.panel_hide = function(id, hidden) seen.hide = { id, hidden } return true end
+  ghostty.panel_close = function(id) seen.close = id return true end
+  ghostty.panel_minimize = function(id) seen.min = id return true end
+  ghostty.panel_place = function(id, pin) seen.place = { id, pin } return true end
+  ghostty.panel_toggle_pet = function(id) seen.toggle = id return true end
+  ghostty.world_command = function(id, args) seen.cmd = { id, args } return nil end
+  assert(run('panel.focus', { id = 46, fly = true }, 400).ok and seen.show[1] == 46 and seen.show[2] == true and not seen.hide)
+  assert(run('panel.focus', { id = 44, fly = false }, 401).ok and seen.hide[1] == 44 and seen.hide[2] == false and seen.show[2] == false,
+    'a hidden panel is shown, then focused')
+  q = run('panel.focus', { id = 99, fly = true }, 402)
+  assert(not q.ok and q.error == 'no such panel')
+  assert(run('panel.close', { id = 43 }, 403).ok and seen.close == 43)
+  assert(run('panel.minimize', { id = 40 }, 404).ok and seen.min == 40, 'a terminal is minimized')
+  seen.hide = nil
+  assert(run('panel.minimize', { id = 42 }, 405).ok and seen.hide[1] == 42 and seen.hide[2] == true, 'a window is hidden')
+  assert(run('panel.toggle_pet', { id = 41 }, 406).ok and seen.toggle == 41, 'a world panel toggles')
+  assert(run('panel.toggle_pet', { id = 46 }, 407).ok and seen.place[1] == 46 and seen.place[2] == 'pet', 'a minimized one becomes a pet')
+  assert(run('panel.place', { id = 40, pin = 'here' }, 408).ok and seen.place[1] == 40 and seen.place[2] == 'here')
+  assert(run('panel.order', { id = 41, to = 'first' }, 409).ok and seen.cmd[1] == 41 and seen.cmd[2] == 'order first')
+  q = run('panel.order', { id = 42, to = 'last' }, 410)
+  assert(not q.ok and q.error:find('only pets'), 'a pin has no place in the order')
   print('ipc frame side OK')
 end

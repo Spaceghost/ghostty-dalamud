@@ -1,7 +1,9 @@
 # IPC for other plugins
 
 `GhosttyDalamud.v1.Call` lets another Dalamud plugin (XivDesktop, for one)
-list, open, close, focus, hide and place remote-window panels
+list, focus, close, minimize, order and place every panel (terminals in the
+dropdown, floating, minimized or in the world, remote windows, adopted plugin
+windows and the chat: `panel.*`), list, open, close, focus, hide and place remote-window panels
 ([REMOTE_WINDOWS.md](REMOTE_WINDOWS.md)), open world terminals, read the
 agent's window list and move the keyboard between world panels. It is one Dalamud call gate:
 a JSON string in, a JSON string out.
@@ -51,12 +53,14 @@ The core and its Lua state belong to ghostty's own `UiBuilder.Draw`
   that call (decode, check, encode: microseconds) and, on the frame's side,
   to swap a queue and publish a string. Calls from several threads are
   serialized; no call waits for a frame.
-* **Reads** (`window.list`, `agent.status`, `agent.windows`, `agent.apps`,
+* **Reads** (`window.list`, `panel.list`, `agent.status`, `agent.windows`, `agent.apps`,
   `focus.get`, `status`) answer at once from a snapshot the frame publishes
   at its end. They are at most one frame old.
 * **Changes** (`window.open`, `window.close`, `window.focus`,
   `window.place`, `window.hide`, `window.toggle_pet`,
-  `agent.windows.refresh`, `terminal.new`, `focus.cycle`, `keys.reserve`) are checked, given
+  `agent.windows.refresh`, `terminal.new`, `focus.cycle`, `keys.reserve`,
+  `panel.focus`, `panel.close`, `panel.minimize`, `panel.toggle_pet`,
+  `panel.place`, `panel.order`) are checked, given
   a request id and queued. The response
   says only that: `{"queued": true, "request": 1726732800001}`. At the end of
   the next frame ghostty runs them in order, in its own Lua state, through
@@ -78,6 +82,138 @@ reads return the last snapshot and changes wait. Before the first frame a
 read answers `{"ok":false,"error":"ghostty is starting; ask again after the next frame"}`.
 
 ## Methods
+
+### panel.list
+
+Every panel ghostty has, oldest first: terminals wherever they are (a
+dropdown tab, a floating window, minimized, in the world), remote windows,
+adopted plugin windows (Mappy …) and the chat. What a keyboard palette lists.
+
+```json
+{"method": "panel.list"}
+```
+```json
+{"ok": true, "result": {
+  "rev": 9,
+  "panels": [
+    {"id": 3, "kind": "terminal", "title": "bash", "profile": "bash", "running": true, "view": "tab", "focused": true},
+    {"id": 4, "kind": "terminal", "title": "htop", "profile": "bash", "running": true, "view": "pet", "focused": false, "order": 2},
+    {"id": 5, "kind": "terminal", "title": "zsh", "profile": "zsh", "running": false, "view": "min", "focused": false},
+    {"id": 12, "kind": "window", "title": "Yad Window", "app": "yad", "icon": "/home/me/.cache/ghostty-agent/icons/yad.png",
+     "view": "pet", "focused": false, "order": 1},
+    {"id": 14, "kind": "adopted", "title": "Mappy", "app": "Mappy", "view": "hud", "focused": false},
+    {"id": 15, "kind": "chat", "title": "Chat", "view": "hidden", "focused": false}
+  ]
+}}
+```
+
+* `rev`: the same counter as `window.list`'s; it changes whenever anything
+  in `panels`, `windows` or `requests` changes (a title, a view, the focus).
+* `id`: the session id every `panel.*` method takes (for a window, the same
+  id as in `window.list`).
+* `kind`: `terminal`, `window` (a remote window), `adopted` (another
+  plugin's ImGui window pulled into the world) or `chat`.
+* `title`: a terminal's title as its tab shows it (the program's, else the
+  profile's name); a window's title once open; an adopted window's label.
+* `app`: a window's program (`window.list`'s `app`, else the agent's list
+  entry with its title); an adopted window's plugin (its InternalName, else
+  the name it was adopted by). Absent when unknown and for terminals and chat.
+* `profile`, `running` (terminals only): the profile's name; false once the
+  shell has exited (the panel shows why until it closes).
+* `icon` (windows only, when known): the icon path of the agent app
+  (`agent.apps`) whose id or name is the window's `app`.
+* `view`: where it is:
+  `tab` (a dropdown tab), `dropdown` (a floating terminal window: shown and
+  hidden with the dropdown), `min` (minimized), `pet`, `pin` (fixed in the
+  world, or following `me` / `target`, or `orbit`), `hud` (docked to the
+  screen), `full` (a world panel full screen) or `hidden` (a world panel
+  hidden by `window.hide` or `panel.minimize`; also a panel with no place yet).
+* `focused`: it has the keyboard: the focused world panel, or the dropdown's
+  active tab while the dropdown is out and no world panel has it.
+* `order` (pets only): the pet's place in the lineup, from 1 (the leftmost;
+  `/term order`, the arrows on a pet's edges).
+
+### panel.focus
+
+```json
+{"method": "panel.focus", "params": {"id": 4}}
+{"method": "panel.focus", "params": {"id": 4, "fly": false}}
+```
+
+Does what a click does and brings hidden things forward:
+
+* a world panel (pet, pin, HUD) gets the keyboard as a click gives it
+  (presented, no ImGui window keeping focus beside it) and, with `fly`
+  (default `true`), the single click's camera turn toward it and the walk up
+  to it when the panel is next drawn. `fly: false`: the keyboard only, no
+  camera turn and no walk (a pet still turns your character once, as on a
+  click). A hidden panel is shown first, and the world panels are shown
+  if they were hidden (ctrl+shift+`).
+* a dropdown tab: the dropdown opens with that tab active and the keyboard.
+* a floating terminal window: the dropdown and its windows are shown.
+* a minimized terminal: restored into the dropdown as its active tab.
+
+The result in `window.list`'s `requests`: `{}`, or why not (`no such panel`,
+`the panel is closing`).
+
+### panel.close
+
+```json
+{"method": "panel.close", "params": {"id": 4}}
+```
+
+As the panel's close button: a world panel glitches out and closes; a window
+closes its stream; an adopted window goes back to its plugin (flat) and the
+chat back to the game. A terminal's shell ends with it.
+
+### panel.minimize
+
+```json
+{"method": "panel.minimize", "params": {"id": 4}}
+```
+
+A terminal goes to the minimized list (`/term min`, the toolbar widget's
+popup), wherever it was; the dropdown hides when its last tab goes. Windows,
+adopted panels and the chat have no minimized place (they go back into the
+world at once), so they are hidden instead, as `window.hide`: `view`
+`hidden`. `panel.focus` brings either back.
+
+### panel.toggle_pet
+
+```json
+{"method": "panel.toggle_pet", "params": {"id": 4}}
+```
+
+A world panel: as `window.toggle_pet` (a pet becomes a pin where it was
+shown, anything else a pet). A terminal in the dropdown, a floating window or
+minimized becomes a pet.
+
+### panel.place
+
+```json
+{"method": "panel.place", "params": {"id": 4, "pin": "hud 0.85 0.2"}}
+```
+
+`pin` as `/term pin` takes it: `here`, `me 2 1.7`, `target`, `orbit 3.5`,
+`pet`, `hud [X Y [DIST]]`, `hide`, `hide off`. A window, adopted panel or
+the chat keeps its size (as `window.place`); a terminal in the dropdown, a
+floating window or minimized moves into the world there.
+
+### panel.order
+
+```json
+{"method": "panel.order", "params": {"id": 4, "to": "left"}}
+```
+
+Moves a pet in the lineup, as `/term order` and the arrows on its edges:
+`to` is `"left"` / `"right"` (swap with that neighbour), `"first"`, `"last"`
+or a place from 1 (clamped to the pets there are). Only shown pets have a
+place (`only pets have a place in the order`).
+
+A keyboard palette on top of these: `panel.list` for the rows (`title`,
+`kind`, `view`, `order`), Enter → `panel.focus`, and keys for
+`panel.minimize`, `panel.close`, `panel.toggle_pet` and `panel.order`
+`left`/`right`; poll `panel.list` until `rev` changes to redraw.
 
 ### window.list
 
@@ -356,10 +492,12 @@ Umbra widget), without counting as the widget polling.
 | `core/loader.nelua` | forwards `gu_call` to the running core; a JSON error without one |
 | `core/host.nelua` | `gu_call` → `ipc_call`; `ipc_frame()` at the end of `gu_frame` |
 | `core/app/ipc.nelua` | the lock, the call-side Lua state, the queue, the snapshot; `ghostty.window_*` for the core's Lua state |
-| `lua/ipc.lua` | methods, parameter checks, running queued changes (`focus.cycle`'s order), the snapshot and `rev` |
+| `lua/ipc.lua` | methods, parameter checks, running queued changes (`focus.cycle`'s order, `panel.*`), the snapshot, `panel.list`'s views and `rev` |
 | `lua/json.lua` | strict JSON |
 | `core/app/remotewin.nelua` | `window_open / close / place / list`, the agent's last list (`winlist`), shared with `/window` |
 | `core/app/worldview.nelua` | `world_panel_focus / hide`, `world_toggle_pet`, `world_terminal_new`, shared with the title buttons and `/term pin` |
+| `core/app/ipc.nelua` `ghostty.panels / panel_show / panel_close / panel_minimize / panel_place` | every session and where it lives; `views.nelua`'s `bring_forward`, `minimize`, `restore`, `dismiss_terminal`; `world_fly_id` for `panel.focus`'s camera turn and walk-up (worldview) |
+| `lua/world.lua` | `pet_rank` (a pet's place, `panel.list`'s `order`), `order` (`panel.order`) |
 
 ## Verified
 
@@ -375,7 +513,13 @@ and a WLISTR with extra columns, a key and an app line through
 profile, a pin), `focus.cycle` over a window and a terminal, WCLOSE,
 malformed JSON, an unknown method, the queue limit, a response too large,
 `/term reload`, `keys.reserve`, the `never` list filtering `agent.apps` and
-`agent.windows`, and the channel gone after shutdown); `tests/test_loader.nelua`
+`agent.windows`, `panel.list` over a dropdown tab, a minimized terminal, a
+pet and a pinned terminal, a window and a faked adopted panel with the pets'
+`order`, `panel.focus` of a tab (the dropdown opens on it), of a minimized
+terminal (restored), of a pet (with and without `fly`: only that the flight
+is asked for; the camera turn and walk themselves are draw_world's, not run
+by the test) and of a hidden window, `panel.order`, `panel.minimize`,
+`panel.toggle_pet`, `panel.place` (`hud`), `panel.close`, `rev` moving, and the channel gone after shutdown); `tests/test_loader.nelua`
 (`gu_call` through the loader, with and without a core). The threading is by
 design and review: the host build's lock is a no-op, as for the event queue.
 **Not yet observed in game**, and no plugin has called it yet.

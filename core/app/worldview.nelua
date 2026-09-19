@@ -251,6 +251,23 @@ local function walk_tick(now: float64): void
   if host.walk.id == 0 then logf(LOG_INFO, 'walk: %s', WALK_ENDS[host.walk.ended]) end
 end
 
+-- A panel focused from the keyboard (IPC panel.focus) that should get the
+-- single click's camera turn and walk-up too: done when draw_world next
+-- places it, and only while it still has the keyboard. 0 = none.
+global world_fly_id: integer = 0
+
+-- The camera turn toward a panel placed at (px, pz), as a single click turns it.
+local function turn_camera_to(cam: *GuCamera, pc: *GuObject, px: float32, pz: float32): void
+  local ch: float32, cv: float32, cd: float32, cmin: float32 = 0, 0, 0, 0
+  if host.world_full_id == 0 and host.api.get_camera_state ~= nilptr and host.api.set_camera_state ~= nilptr
+     and host.api.get_camera_state(&ch, &cv, &cd, &cmin) ~= 0 then
+    host.cam_target_h = camera_heading_to(cam, ch, px - pc.x, pz - pc.z)
+    host.cam_target_v = cv
+    host.cam_target_d = cd
+    host.cam_active = true
+  end
+end
+
 -- Presenting the focused panel ----------------------------------------------------
 -- Eases toward the presented pose while the panel has focus and back after;
 -- walkable panels float toward where the character will stand, others toward
@@ -797,6 +814,13 @@ global function draw_world(now: float64): void
     if s.kind == TransportKind.Panel then ft, fw, fh, full_at, full_this = panel_flight(s.id, ft, fw, fh, full_at, full_this) end
     -- where it was placed (walk target), then the presented pose on top
     local placed_x, placed_z = pl.x, pl.z
+    if world_fly_id == s.id then
+      world_fly_id = 0
+      if ok and host.world_focus == s.id and not pl.hud then
+        turn_camera_to(&cam, &pc, placed_x, placed_z)
+        start_walk(s.id, placed_x, placed_z, &pc, now)
+      end
+    end
     if ok then
       if host.walk.id == s.id then host.walk.tx, host.walk.tz = placed_x, placed_z end
       if not carried and not pl.hud then present_panel(s, &pl, &cam, &occ, &pc, wdt, full_this) end

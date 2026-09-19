@@ -131,6 +131,44 @@ changes['window.place'] = function(p)
   return { id = id, pin = pin }
 end
 
+-- Every panel (panel.*): terminals wherever they live, windows, adopted windows, chat.
+local function panel_id_only(p)
+  local id, err = panel_id(p)
+  if not id then return false, (err:gsub('window%.list', 'panel.list')) end
+  return { id = id }
+end
+
+changes['panel.focus'] = function(p)
+  local out, err = panel_id_only(p)
+  if not out then return false, err end
+  if p.fly ~= nil and p.fly ~= json.null and type(p.fly) ~= 'boolean' then return false, 'fly must be true or false' end
+  out.fly = p.fly ~= false
+  return out
+end
+changes['panel.close'] = panel_id_only
+changes['panel.minimize'] = panel_id_only
+changes['panel.toggle_pet'] = panel_id_only
+
+changes['panel.place'] = function(p)
+  local out, err = panel_id_only(p)
+  if not out then return false, err end
+  local pin
+  pin, err = opt_string(p, 'pin', true)
+  if not pin then return false, err or 'pin is required (arguments as /term pin takes them)' end
+  out.pin = pin
+  return out
+end
+
+changes['panel.order'] = function(p)
+  local out, err = panel_id_only(p)
+  if not out then return false, err end
+  local to = p.to
+  if math.type(to) == 'integer' and to >= 1 then out.to = tostring(to)
+  elseif to == 'left' or to == 'right' or to == 'first' or to == 'last' then out.to = to
+  else return false, 'to must be "left", "right", "first", "last" or a place from 1' end
+  return out
+end
+
 -- keys.reserve {chords = {'super+*', ...}}: the caller's chords (replacing
 -- its earlier ones; [] lets them go). Checked here for shape, by the core for
 -- meaning (core/keychords.nelua).
@@ -152,6 +190,7 @@ end
 -- The part of the snapshot each read returns.
 local reads = {
   ['window.list'] = function(s) return { rev = s.rev, windows = s.windows, requests = s.requests } end,
+  ['panel.list'] = function(s) return { rev = s.rev, panels = s.panels or json.array() } end,
   ['agent.status'] = function(s) return s.agent end,
   ['agent.windows'] = function(s) return s.agent_windows end,
   ['agent.apps'] = function(s) return s.agent_apps end,
@@ -233,6 +272,50 @@ local function cycle(dir)
   return { id = id }
 end
 
+-- A panel (ghostty.panels) by id, or nil.
+local function find_panel(id)
+  for _, p in ipairs(ghostty.panels and ghostty.panels() or {}) do
+    if p.id == id then return p end
+  end
+  return nil
+end
+
+-- panel.*: every panel, wherever it lives (lua/ipc.lua's part; the core's
+-- in ghostty.panel_*, core/app/ipc.nelua).
+local function run_panel(method, p)
+  local panel = find_panel(p.id)
+  if not panel then return nil, 'no such panel' end
+  local in_world = panel.place == 'world'
+  local a = in_world and anchor(p.id) or nil
+  if method == 'panel.focus' then
+    -- hidden things are shown: a hidden world panel first comes back
+    if a and a.hidden then
+      local ok, err = ghostty.panel_hide(p.id, false)
+      if not ok then return nil, err end
+    end
+    return ghostty.panel_show(p.id, p.fly ~= false)
+  elseif method == 'panel.close' then
+    return ghostty.panel_close(p.id)
+  elseif method == 'panel.minimize' then
+    -- terminals go to the minimized list; windows and adopted panels, which
+    -- have no place there, are hidden (panel.focus shows them again)
+    if panel.kind == 'terminal' then return ghostty.panel_minimize(p.id) end
+    if not in_world then return nil, 'the panel is not in the world yet' end
+    return ghostty.panel_hide(p.id, true)
+  elseif method == 'panel.toggle_pet' then
+    if in_world then return ghostty.panel_toggle_pet(p.id) end
+    return ghostty.panel_place(p.id, 'pet')
+  elseif method == 'panel.place' then
+    return ghostty.panel_place(p.id, p.pin)
+  elseif method == 'panel.order' then
+    if not (a and a.kind == 'pet') or a.hidden then return nil, 'only pets have a place in the order' end
+    local err = ghostty.world_command(p.id, 'order ' .. p.to)
+    if err then return nil, err end
+    return true
+  end
+  return nil, 'unknown method: ' .. method
+end
+
 local function record(entry)
   local r = M.results
   r[#r + 1] = entry
@@ -270,6 +353,8 @@ function M.run(text)
     result, err = cycle(p.dir)
   elseif req.method == 'window.place' then
     result, err = ghostty.window_place(p.id, p.pin)
+  elseif req.method:sub(1, 6) == 'panel.' then
+    result, err = run_panel(req.method, p)
   elseif req.method == 'keys.reserve' then
     local n
     n, err = ghostty.keys_reserve(caller or '', p.chords)
@@ -297,9 +382,63 @@ local function kind_of(w)
   return 'pin'
 end
 
--- What the reads answer from, as JSON; `rev` moves whenever the windows or
--- the request results change.
+-- A panel's view: where it is and whether it shows.
+local function panel_view(p, a)
+  if p.place == 'tab' or p.place == 'min' then return p.place end
+  if p.place == 'float' then return 'dropdown' end -- a floating window shows and hides with the dropdown
+  if p.place ~= 'world' or (a and a.hidden) then return 'hidden' end
+  if p.full then return 'full' end
+  if a and (a.kind == 'pet' or a.kind == 'hud') then return a.kind end
+  return 'pin'
+end
+
+-- The icon of an agent app named `app` (its id, or its name in any case), or nil.
+local function app_icon(apps, app)
+  if not app or app == '' then return nil end
+  local low = app:lower()
+  for _, x in ipairs(apps) do
+    if x.icon and x.icon ~= '' and (x.id == app or (x.name or ''):lower() == low) then return x.icon end
+  end
+  return nil
+end
+
+-- panel.list: every panel, as ghostty.panels lists them (oldest first).
+local function panel_list(windows, listed)
+  local out = json.array()
+  if not ghostty.panels then return out end
+  local by_id = {}
+  for _, w in ipairs(windows) do by_id[w.id] = w end
+  local ok, world = pcall(require, 'world')
+  local rank = ok and type(world) == 'table' and world.pet_rank or nil
+  for _, p in ipairs(ghostty.panels()) do
+    local a = p.place == 'world' and anchor(p.id) or nil
+    local e = { id = p.id, kind = p.kind, title = p.title or '', view = panel_view(p, a), focused = p.focused and true or false }
+    if p.kind == 'terminal' then
+      e.profile, e.running = p.profile, p.running and true or false
+    elseif p.kind == 'window' then
+      local w = by_id[p.id]
+      local app = w and w.app or ''
+      if app == '' and w and w.title ~= '' then -- opened by id or the desktop's choice: the agent's list knows the app
+        for _, x in ipairs(listed.windows) do
+          if x.title == w.title then app = x.app break end
+        end
+      end
+      if w and w.title ~= '' then e.title = w.title end
+      if app ~= '' then e.app = app end
+      e.icon = app_icon(listed.apps, app)
+    elseif p.app and p.app ~= '' then
+      e.app = p.app
+    end
+    if e.view == 'pet' and rank then e.order = rank(p.id) end
+    out[#out + 1] = e
+  end
+  return out
+end
+
+-- What the reads answer from, as JSON; `rev` moves whenever the windows,
+-- the panels or the request results change.
 function M.snapshot()
+  local listed = ghostty.agent_windows and ghostty.agent_windows() or { windows = {}, apps = {} }
   local windows = json.array()
   for _, w in ipairs(ghostty.window_list()) do
     local a = anchor(w.id)
@@ -312,13 +451,13 @@ function M.snapshot()
   end
   local requests = json.array()
   for i, r in ipairs(M.results) do requests[i] = r end
-  local body = json.encode({ windows = windows, requests = requests })
+  local panels = panel_list(windows, listed)
+  local body = json.encode({ windows = windows, requests = requests, panels = panels })
   if body ~= last_body then
     rev = rev + 1
     last_body = body
   end
   -- the agent's last WLISTR, and the focused world panel
-  local listed = ghostty.agent_windows and ghostty.agent_windows() or { windows = {}, apps = {} }
   local wins, apps = json.array(), json.array()
   for i, e in ipairs(listed.windows) do
     local extra = json.array()
@@ -331,7 +470,7 @@ function M.snapshot()
     if p.focused then focus = { id = p.id, kind = p.window and 'window' or 'terminal' } end
   end
   return json.encode({
-    rev = rev, windows = windows, requests = requests,
+    rev = rev, windows = windows, requests = requests, panels = panels,
     agent = ghostty.agent_status(), status = ghostty.status(),
     agent_windows = wins, agent_apps = apps, focus = focus,
   })
