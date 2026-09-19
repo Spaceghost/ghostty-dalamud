@@ -3,6 +3,7 @@
 -- Chat / hotbar commands (/term ...), shared by the shim and keymap actions.
 require 'core.app.popup'
 require 'core.app.selftest'
+require 'core.app.rain'
 local strconv: type = require 'detail.strconv'
 
 -- A terminal or profile number, optionally written "#3". False for anything
@@ -358,6 +359,9 @@ global function run_command(cmd: string): cint
   elseif verb == 'bell' then
     -- /term bell [ripple|sonar|burst|aura|calm|custom|demo]
     return bell_command(arg)
+  elseif verb == 'rain' then
+    -- /term rain on|off|auto: force rain on world panels, or follow the weather
+    return rain_command(arg)
   elseif cmd == 'depth' or cmd == 'depth retry' or cmd == 'depth show' then
     -- /term depth [retry|show]: how world panels are occluded, and why (retry
     -- forgets a latched failure; show toggles colouring panels by the test)

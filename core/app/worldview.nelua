@@ -9,6 +9,7 @@ require 'core.app.remotewin'
 require 'core.app.panels'
 require 'core.app.lights'
 require 'core.app.occluders'
+require 'core.app.rain'
 require 'core.depthpass'
 require 'core.tooltip'
 
@@ -933,6 +934,7 @@ global function draw_world(now: float64): void
             imgui.DrawListAddRectFilled(dl, vec2(x0, y0), vec2(x1, y1), bg_col, 0, 0)
           end
         end
+        rain_panel_back(dl, vp, &pl, s.id, now, 1 - ft) -- the wiper at the back of the glass (core/app/rain.nelua)
         -- draw in panel pixels at the viewport origin, then bend onto the panel;
         -- font size 0 = the font's native size, the crispest after projection
         render_max_run_px = pl.width / STRIPS
@@ -1001,6 +1003,7 @@ global function draw_world(now: float64): void
           imgui.DrawListAddLine(dl, vec2(vp.x + 1.5, vp.y), vec2(vp.x + 1.5, vp.y + pl.height), col, 3.0)
           imgui.DrawListAddLine(dl, vec2(vp.x + pl.width - 1.5, vp.y), vec2(vp.x + pl.width - 1.5, vp.y + pl.height), col, 3.0)
         end
+        rain_panel_front(dl, vp, &pl, s.id) -- raindrops on the glass
         bell_panel_border(dl, vp, pl.width, pl.height, s.id)
         if carried then
           draw_drag_grip(dl, vp, pl.width, pl.height, host.drag.u, host.drag.v)

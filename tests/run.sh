@@ -33,6 +33,7 @@ run test_session
 run test_dualsense
 run test_selection
 run test_bell "$ROOT"
+run test_rain "$ROOT"
 run test_policy "$ROOT"
 run test_world "$ROOT"
 run test_worldpanel "$ROOT"

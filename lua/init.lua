@@ -11,6 +11,7 @@ local world = require('world')
 local animation = require('animation')
 local settings = require('settings')
 local bell = require('bell')
+local rain = require('rain')
 local showcase = require('showcase')
 local platform = require('platform')
 local assistant = require('assistant')
@@ -156,6 +157,8 @@ local config = {
   animation = animation,
   -- Visual bell: rings around your character and a glow on the terminal that rang (lua/bell.lua).
   bell = bell,
+  -- Rain on world panels when it rains in the world, and a wiper behind the glass (lua/rain.lua).
+  rain = rain,
   -- /term showcase: demo terminals and camera shots for screenshots (lua/showcase.lua).
   showcase = showcase,
   -- /term ask [question]: a terminal running a local AI assistant (almanac by

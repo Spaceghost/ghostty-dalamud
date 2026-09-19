@@ -241,6 +241,48 @@ are as assumed, and whether creating objects from the draw callback is safe.
 A game patch that changes `BgObject` can crash the game while the option is
 on.
 
+## Rain on world panels
+
+When it rains in the world, drops land on the world panels' glass and a wiper
+behind the glass sweeps them off. The split follows the visual bell:
+`core/rain.nelua` is the simulation (no ImGui), `core/app/rain.nelua` draws
+it, and `lua/rain.lua` decides whether it rains and holds the tunables.
+
+* **Weather.** `CONFIG.rain.frame()` runs once per frame. It maps the game's
+  weather id (`ghostty.env()`, which reads `EnvManager.ActiveWeather` and
+  `EnvState.Rain`) through `M.weather` (Rain, Showers, Thunder,
+  Thunderstorms) to an intensity from 0 to 1. The game's own rain amount is
+  used when it is higher. Weather 0 counts as no weather, meaning indoors, so
+  it is dry. `/term rain on|off|auto` forces rain on or off, or follows the
+  weather again. `CONFIG.rain.panel(id)` keeps HUD-anchored panels dry.
+* **Drops.** Each panel has a fixed `RainPanel` holding up to 120 drops and a
+  seeded xorshift generator, so the same seed and steps always give the same
+  rain. The panel's level fades toward the intensity over `fade` seconds, and
+  the drop count follows `max_drops × level`. New drops land with a splash
+  ring. Drops grow and merge with the drops they touch. Drops past the
+  trickle size run down with a wobble and a fading trail. They are drawn in
+  front of the content as triangle fans (a translucent body with a darker
+  rim, plus a specular dot toward the top left) in one reserved batch per
+  pass, from a fixed vertex buffer.
+* **Wiper.** An arm pivots from the middle of the bottom edge and rests along
+  it. While it rains, it makes one eased sweep out and back every
+  `wiper_period_light` to `wiper_period_heavy` seconds. From
+  `wiper_continuous_at`, it sweeps without resting. Drops the blade crosses
+  become short smears that fade. With `wiper_style = 'back'` (the default),
+  the arm and blade are drawn as a dark silhouette after the panel's
+  background and before the content. `'front'` draws them on the glass, and
+  `'none'` leaves the wiper out.
+* `worldview` calls `rain_panel_back` after the background grid and
+  `rain_panel_front` before `bell_panel_border`. Both run in panel pixels, so
+  `world_transform_vertices` bends the geometry and applies the panel's light
+  tint. The strips are cut into segments so they follow the curve. Only
+  visible, awake panels reach these calls. A panel unseen for 30 s loses its
+  state.
+
+Tested on the host only (tests/test_rain.nelua). None of this has been
+observed in game yet: the weather ids and the weather-0-means-indoors rule
+are assumptions, and how the drops and wiper look on a panel is unverified.
+
 ## Repository layout
 
 ```
