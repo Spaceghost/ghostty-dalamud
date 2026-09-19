@@ -40,12 +40,21 @@ NELUA="$ROOT/vendor/nelua-lang/nelua"
 export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig-global}"
 mkdir -p build/dist build/win/lib build/win/cache build/lua-win build/lua-linux build/nelua-cache
 
+# GHOSTTY_SCCACHE=1 (the Incus build container, docs/BUILDING.md) puts the
+# plain -c compiles through the shared sccache. Nelua's own steps compile and
+# link in one invocation, which sccache does not cache; those reuse the shared
+# Zig, Nelua and libghostty-vt caches instead.
+SCC=()
+if [[ "${GHOSTTY_SCCACHE:-0}" == 1 ]] && command -v sccache >/dev/null; then SCC=(sccache); fi
+
 if ! command -v "$ZIG" >/dev/null; then echo "zig $ZIG_VERSION is required (set ZIG=/path/to/zig)"; exit 127; fi
 if [[ "$("$ZIG" version)" != "$ZIG_VERSION" ]]; then echo "warning: zig $("$ZIG" version) found, toolchain.env pins $ZIG_VERSION"; fi
 
 if [[ "${SKIP_DEPS:-0}" != 1 ]]; then
   echo "== nelua"
-  [[ -x "$NELUA" ]] || make -C vendor/nelua-lang -j"$(nproc)" >/dev/null
+  # nelua is a checked-in launcher script; nelua-lua is what `make` produces,
+  # so a fresh vendor/ checkout has the first and not the second
+  [[ -x "$NELUA" && -x "$ROOT/vendor/nelua-lang/nelua-lua" ]] || make -C vendor/nelua-lang -j"$(nproc)" >/dev/null
   "$NELUA" --version | sed -n 1p
 
   echo "== libghostty-vt (host)"
@@ -60,12 +69,13 @@ if [[ "${SKIP_DEPS:-0}" != 1 ]]; then
   fi
 
   echo "== lua (host)"
-  ( cd build/lua-linux && for f in ../../vendor/lua/src/*.c; do b=$(basename "$f" .c)
-      case $b in lua|luac) continue;; esac; cc -O2 -fPIC -c "$f" -o "$b.o"; done; ar rcs liblua.a ./*.o )
+  # absolute source paths: build/lua-* may be a symlink into a shared cache
+  ( cd build/lua-linux && for f in "$ROOT"/vendor/lua/src/*.c; do b=$(basename "$f" .c)
+      case $b in lua|luac) continue;; esac; "${SCC[@]}" cc -O2 -fPIC -c "$f" -o "$b.o"; done; ar rcs liblua.a ./*.o )
   if [[ "${SKIP_WIN:-0}" != 1 ]]; then
     echo "== lua (windows x64)"
-    ( cd build/lua-win && for f in ../../vendor/lua/src/*.c; do b=$(basename "$f" .c)
-        case $b in lua|luac) continue;; esac; "$ZIG" cc -target x86_64-windows-gnu -O2 -c "$f" -o "$b.o"; done
+    ( cd build/lua-win && for f in "$ROOT"/vendor/lua/src/*.c; do b=$(basename "$f" .c)
+        case $b in lua|luac) continue;; esac; "$ROOT/tools/zig-cc-win.sh" -O2 -c "$f" -o "$b.o"; done
       "$ZIG" ar rcs liblua.a ./*.o )
   fi
 fi
