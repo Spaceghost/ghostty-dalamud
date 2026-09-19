@@ -1,5 +1,7 @@
 # Ghostty for Dalamud
 
+![Ghostty for FFXIV: a real terminal in Eorzea](images/banner.png)
+
 **Vote on what it does next: https://spacegho.st/mods/ffxiv/term/vote/**
 
 In game, Settings → About has a button that opens the vote page in your
