@@ -36,6 +36,7 @@ require 'os'
 require 'math'
 require 'core.protocol'
 require 'agent.wayland_keys'
+require 'agent.desktop_entries'
 
 ## cdefine 'WLR_USE_UNSTABLE'
 ## cinclude '<time.h>'
@@ -438,6 +439,8 @@ local wc: record{
   x_link: string,             -- $XDG_RUNTIME_DIR/<socket>-x11 -> /tmp/.X11-unix/XN
   x_started: float64,         -- os.now() when the first X11 client made Xwayland start (0: not yet)
   deco_mgr: *wlr_xdg_decoration_manager_v1,
+  icon_pids: vector(cint),    -- icon cache jobs still running (WLIST "apps")
+  icon_queued: vector(string), -- the icons they make
   xkb_ctx: *xkb_context,
   keymap: *xkb_keymap,
   socket: string,
@@ -498,6 +501,50 @@ global function wayland_parse_run(match: string): (boolean, string)
   return true, match:sub(i, j)
 end
 
+-- "PREFIX:REST" -> true and REST without surrounding blanks; false when the
+-- text does not start with the prefix or nothing follows it ("app:",
+-- "desktop:" match forms of WOPEN).
+global function wayland_match_form(match: string, prefix: string): (boolean, string)
+  if #match < #prefix or match:subview(1, #prefix) ~= prefix then return false, (@string){} end
+  local i, j = #prefix + 1, #match
+  while i <= j and (match:byte(i) == 32 or match:byte(i) == 9) do i = i + 1 end
+  while j >= i and (match:byte(j) == 32 or match:byte(j) == 9 or match:byte(j) == 10 or match:byte(j) == 13) do j = j - 1 end
+  if j < i then return false, (@string){} end
+  return true, match:sub(i, j)
+end
+
+-- Nested desktops ("desktop:NAME [ARGS]"): a whole Wayland compositor as
+-- one client of ours, its output one window. Tried in this order when no
+-- name is given; cage runs one app and needs to be told which.
+global WAYLAND_DESKTOPS: [6]string = { 'labwc', 'sway', 'wayfire', 'river', 'weston', 'Hyprland' }
+
+-- The command for "desktop:SPEC" (SPEC is NAME ARGS or empty), given which
+-- programs are installed. False and why when none fits.
+global function wayland_desktop_command(spec: string, installed: function(string): boolean): (boolean, string, string)
+  if #spec == 0 then
+    for i = 0, < #WAYLAND_DESKTOPS do
+      if installed(WAYLAND_DESKTOPS[i]) then return true, string.copy(WAYLAND_DESKTOPS[i]), (@string){} end
+    end
+    return false, (@string){}, string.copy('no nested desktop is installed (labwc, sway, wayfire, river, weston, Hyprland)')
+  end
+  local sp = spec:find(' ', 1, true)
+  local name = sp > 0 and spec:subview(1, sp - 1) or spec
+  local args = sp > 0 and spec:subview(sp + 1) or (@string){}
+  if not installed(name) then return false, (@string){}, name .. ' is not installed on the agent\'s machine' end
+  local sb: stringbuilder
+  if name == 'cage' then
+    -- cage runs exactly one app, after `--`
+    while #args > 0 and args:byte(1) == 32 do args = args:subview(2) end
+    if #args == 0 then return false, (@string){}, string.copy('cage runs one app: desktop:cage APP') end
+    sb:write('cage')
+    if #args < 2 or args:subview(1, 2) ~= '--' then sb:write(' --') end
+    sb:write(' ', args)
+  else
+    sb:write(spec)
+  end
+  return true, sb:promote(), (@string){}
+end
+
 -- The launched program's base name, lower case, for finding its window when
 -- the process hands off to another one ("gnome-disks" from
 -- "env FOO=1 /usr/bin/gnome-disks --x"). Empty when there is none.
@@ -543,7 +590,7 @@ global function wayland_list_line(sb: *stringbuilder, wid: uint32, w: integer, h
   sb:writebyte(10)
 end
 
-global WAYLAND_LAUNCH_LINE: string <comptime> = '0\t0\t0\tlaunch\trun:COMMAND to start an app in the game\n'
+global WAYLAND_LAUNCH_LINE: string <comptime> = '0\t0\t0\tlaunch\trun:COMMAND or app:NAME to start an app in the game\n'
 
 -- Case-insensitive (ASCII) "haystack contains needle"; an empty needle matches.
 global function wayland_contains(hay: string, needle_lower: string): boolean
@@ -1296,6 +1343,13 @@ local function settle(c: *Cap, now: float64): void
   end
 end
 
+local function on_path(name: string): boolean
+  local p = desktop_which(name)
+  local found = #p > 0
+  p:destroy()
+  return found
+end
+
 local function wl_open(wid: uint32, match: string): (pointer, string)
   if wid ~= 0 then
     local t = find_top(wid)
@@ -1307,10 +1361,43 @@ local function wl_open(wid: uint32, match: string): (pointer, string)
     focus(t)
     return c, (@string){}
   end
+  local is_run, cmd = wayland_parse_run(match)
+  local is_desk, spec = wayland_match_form(match, 'desktop:')
+  if not is_desk and match == 'desktop:' then is_desk = true end
+  if is_desk then
+    local ok, dcmd, why = wayland_desktop_command(spec, on_path)
+    spec:destroy()
+    if not ok then return nilptr, why end
+    -- wlroots compositors pick their Wayland backend from WAYLAND_DISPLAY;
+    -- ours offers shared memory buffers only, so they render in software
+    is_run, cmd = true, 'env WLR_RENDERER=pixman WLR_NO_HARDWARE_CURSORS=1 ' .. dcmd
+    dcmd:destroy()
+  end
+  local is_app, app = wayland_match_form(match, 'app:')
+  if is_app then
+    -- an installed app by desktop id or name: its Exec, as run: would
+    local dirs = desktop_data_dirs()
+    local es = desktop_scan(&dirs)
+    local k = desktop_find(&es, app)
+    local why: string
+    if k < 0 then
+      why = 'no installed app matches "' .. app .. '"'
+    elseif es[k].terminal then
+      why = es[k].name .. ' runs in a terminal: open "' .. es[k].exec .. '" as a terminal panel'
+    else
+      is_run, cmd = true, string.copy(es[k].exec)
+      log('app "' .. app .. '" is ' .. es[k].id .. ': ' .. cmd)
+    end
+    for i = 0, < #es do es[i]:destroy() end
+    es:destroy()
+    for i = 0, < #dirs do dirs[i]:destroy() end
+    dirs:destroy()
+    app:destroy()
+    if #why > 0 then return nilptr, why end
+  end
   local c = new(@Cap)
   c.state = CAPTURE_PENDING
   c.deadline = os.now() + WAYLAND_OPEN_TIMEOUT
-  local is_run, cmd = wayland_parse_run(match)
   if is_run then
     c.pid = spawn(cmd)
     if c.pid < 0 then
@@ -1329,6 +1416,82 @@ local function wl_open(wid: uint32, match: string): (pointer, string)
   wc.caps:push(c)
   settle(c, os.now())
   return c, (@string){}
+end
+
+-- WLIST "apps": the installed apps as `app` / `term` lines
+-- (desktop_list_line), each with a PNG icon under $HOME
+-- (~/.cache/ghostty-agent/icons) that a sandboxed game can read. Icons not
+-- cached yet are copied (PNG) or rendered (SVG, XPM: rsvg-convert, else
+-- ImageMagick) by one background job, so a path may name a file that
+-- appears a moment later; an icon that cannot be made has an empty field.
+local function wl_apps(): string
+  local dirs = desktop_data_dirs()
+  local es = desktop_scan(&dirs)
+  local idirs = desktop_icon_dirs()
+  local cache = desktop_icon_cache_dir()
+  do -- icons queued by jobs that ended are made or failed: forget them
+    local k = #wc.icon_pids - 1
+    while k >= 0 do
+      local ch = child_of(wc.icon_pids[k])
+      if ch == nilptr or ch.done then wc.icon_pids:remove((@usize)(k)) end
+      k = k - 1
+    end
+    if #wc.icon_pids == 0 then
+      for q = 0, < #wc.icon_queued do wc.icon_queued[q]:destroy() end
+      wc.icon_queued:clear()
+    end
+  end
+  local renderer = desktop_icon_renderer()
+  local jobs: stringbuilder
+  local njobs = 0
+  local sb: stringbuilder
+  for i = 0, < #es do
+    local src, size = desktop_find_icon(es[i].icon, &idirs)
+    local png: string
+    if #src > 0 then
+      png = desktop_icon_png(cache, desktop_short_id(es[i].id), size)
+      local queued = false
+      for q = 0, < #wc.icon_queued do if wc.icon_queued[q] == png then queued = true break end end
+      if not queued and access((@cstring)(png.data), 0) ~= 0 then
+        if desktop_icon_job(&jobs, src, png, renderer) then
+          njobs = njobs + 1
+          wc.icon_queued:push(string.copy(png))
+        else
+          png:destroy() png = (@string){}
+        end
+      end
+    end
+    desktop_list_line(&sb, &es[i], png)
+    png:destroy() src:destroy()
+  end
+  -- nested desktops that are installed: "desktop\tNAME\tNAME\t\t\n", opened with desktop:NAME
+  for i = 0, < #WAYLAND_DESKTOPS do
+    local p = desktop_which(WAYLAND_DESKTOPS[i])
+    if #p > 0 then sb:write('desktop\t', WAYLAND_DESKTOPS[i], '\t', WAYLAND_DESKTOPS[i], '\t\t\n') end
+    p:destroy()
+  end
+  if njobs > 0 then
+    local script: stringbuilder
+    script:write('mkdir -p ') desktop_sh_quote(&script, cache) script:write('\n')
+    local body = jobs:promote()
+    script:write(body)
+    body:destroy()
+    local cmd = script:promote()
+    local pid = spawn(cmd)
+    if pid > 0 then wc.children:push(Child{ pid = pid }) wc.icon_pids:push(pid) end
+    cmd:destroy()
+    log(string.format('apps: %d listed; caching %d icons in %s (%s)', #es, njobs, cache, #renderer > 0 and renderer or 'no SVG renderer: PNG icons only'))
+  else
+    jobs:destroy()
+  end
+  renderer:destroy() cache:destroy()
+  for i = 0, < #es do es[i]:destroy() end
+  es:destroy()
+  for i = 0, < #dirs do dirs[i]:destroy() end
+  dirs:destroy()
+  for i = 0, < #idirs do idirs[i]:destroy() end
+  idirs:destroy()
+  return sb:promote()
 end
 
 local function wl_state(h: pointer): (integer, string)
@@ -1564,6 +1727,7 @@ global function capture_wayland_backend(): (boolean, CaptureBackend, string)
     list = wl_list, open = wl_open, state = wl_state, title = wl_title,
     frame = wl_frame, input = wl_input, close = wl_close,
     pump = wl_pump, poll_fds = wl_poll_fds, wait_ms = wl_wait_ms,
+    apps = wl_apps,
   }, ''
 end
 

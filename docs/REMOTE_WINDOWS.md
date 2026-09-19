@@ -31,7 +31,7 @@ client → agent
 
 | type | name | payload |
 |---|---|---|
-| 11 | WLIST | – |
+| 11 | WLIST | – , or `apps` (installed apps instead of windows, below) |
 | 12 | WOPEN | req u32, wid u32, max_w u16, max_h u16, fps u8, then optional UTF-8 match text |
 | 13 | WACK | sid, seq u32 |
 | 14 | WINPUT | sid, kind u8, body (below) |
@@ -335,6 +335,46 @@ no host compositor: the host desktop never sees these windows.
   process, else the focused X11 window), at its root position relative to
   that window's. The pointer over no surface still goes to the X11 window,
   so a click outside ends a menu's grab.
+* Installed apps (`agent/desktop_entries.nelua`). WLIST with the payload
+  `apps` answers WLISTR with one line per app instead of the windows:
+
+  ```
+  app\tID\tNAME\tICON\tCATEGORIES\n              a graphical app
+  term\tID\tNAME\tICON\tCATEGORIES\tCOMMAND\n    Terminal=true: meant for a terminal panel
+  desktop\tNAME\tNAME\t\t\n                      an installed nested compositor (desktop:NAME)
+  ```
+
+  ID is the desktop file id without `.desktop`; NAME the unlocalized
+  `Name`; CATEGORIES as the file gives them (`Utility;TextEditor;`); unknown
+  first fields are to be skipped. Entries come from `$XDG_DATA_HOME`,
+  `$XDG_DATA_DIRS` and both Flatpak export directories (first file of an id
+  wins; `NoDisplay`/`Hidden`/non-Application entries left out), sorted by
+  name. ICON is an absolute PNG path under
+  `$XDG_CACHE_HOME/ghostty-agent/icons` (`~/.cache/...`), `<ID>-<size>.png`,
+  empty when the app has no icon: the game runs in XIVLauncher's Flatpak,
+  which sees the home directory but not `/usr/share` or `/var/lib/flatpak`,
+  so the agent copies PNG icons there and renders SVG/XPM ones at 128 px
+  with the first of `rsvg-convert`, `magick`, `convert` on `PATH`. Icon
+  names are looked up in the hicolor, Adwaita, breeze and AdwaitaLegacy
+  themes (apps context first, then categories, legacy, devices, places,
+  status, mimetypes; 128 px first), then `/usr/share/pixmaps`. Missing icons
+  are made by one background job per listing, so a path can name a file
+  that appears a moment later; the plugin should retry a missing file. An
+  agent without an app list (Windows, macOS, older) answers `apps` with an
+  empty WLISTR (older agents: the window list, whose first field is a
+  number). Remote agents on other machines would have to send icon bytes
+  over the protocol instead of paths; not designed yet.
+* WOPEN `wid 0` + `app:NAME`: NAME is a desktop id (with or without
+  `.desktop`, any case) or, fuzzily, a name (whole name, prefix, word prefix,
+  substring, letters in order; also the id's last word and the program
+  name). Its `Exec` (field codes dropped, `%i`/`%c` expanded) runs as
+  `run:` would. A Terminal=true app is refused with its command, so the
+  plugin can open it as a terminal panel instead.
+* WOPEN `wid 0` + `desktop:[NAME [ARGS]]`: a nested Wayland compositor as
+  one window (`env WLR_RENDERER=pixman WLR_NO_HARDWARE_CURSORS=1 NAME
+  ARGS`, since ours offers only shared-memory buffers to it). No NAME: the
+  first installed of labwc, sway, wayfire, river, weston, Hyprland. `cage
+  APP` runs one app (`--` added).
 * Input: the stream that gets input gets the keyboard focus (one toplevel at a
   time). Pointer events go to the surface under the point in that window's
   scene (popups included), with `BTN_LEFT/RIGHT/MIDDLE`. WHEEL `dy` is 1/120
@@ -542,6 +582,20 @@ pixman 0.46.2; agent built with zig cc), with `yad` 9.3 (GTK 3.24.52) as the cli
   300 Yad ghostty-x11-test`, a click and TEXT `typed into X11\n` changed 504
   pixels and showed the text in the saved picture, closing the stream closed
   yad. Override-redirect menus were not exercised by this test.
+* `test_desktop_entries`, 2026-09-19: parsing, Exec field codes, lookup by
+  id and fuzzy name, list lines, icon lookup in a made-up tree, and the cache
+  jobs: a PNG copied, an SVG rendered to a 128×128 PNG by rsvg-convert
+  (linuxbrew) and, with `PATH=/usr/bin:/bin`, by ImageMagick 7 `magick`.
+* `test_wayland_compositor`, 2026-09-19, apps: WLIST `apps` on this host
+  listed 89 apps; a lookup run found icons for 85 (3 entries have no `Icon`,
+  one names an icon no theme has), 76 before the non-apps contexts were
+  added. With a made-up data home, its app was listed with its icon path and
+  the icon was a PNG 0.05 s later; `app:ghostty test view` launched it by
+  fuzzy name; an unknown name was refused. `desktop:cage yad …` ran cage
+  (the only nested compositor installed here: no sway, labwc, wayfire,
+  river, weston or Hyprland, so `desktop:sway|labwc` is not run) as our
+  client: one 2560×1440 window showing yad inside cage. An unknown desktop
+  name was refused.
 * `test_e2e_wayland` (in `tests/run.sh`): the plugin's own agent client
   (`core/agent_client.nelua`, decoding as `core/app/remotewin.nelua` does)
   against a real agent run with `--windows wayland --wayland-socket …` and no

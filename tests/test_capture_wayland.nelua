@@ -90,6 +90,39 @@ do
   n = wayland_launch_name('A=1'); assert(n == '') n:destroy()
 end
 
+-- app: / desktop: match forms
+do
+  local ok, rest = wayland_match_form('app: org.gnome.Calculator \n', 'app:')
+  assert(ok and rest == 'org.gnome.Calculator') rest:destroy()
+  ok = wayland_match_form('app:', 'app:')
+  assert(not ok)
+  ok = wayland_match_form('run:app:x', 'app:')
+  assert(not ok)
+  ok, rest = wayland_match_form('desktop:sway --unsupported-gpu', 'desktop:')
+  assert(ok and rest == 'sway --unsupported-gpu') rest:destroy()
+end
+
+-- desktop: commands
+local function fake_installed(name: string): boolean
+  return name == 'sway' or name == 'cage'
+end
+do
+  local ok, cmd, why = wayland_desktop_command('', fake_installed)
+  assert(ok and cmd == 'sway') cmd:destroy()
+  ok, cmd, why = wayland_desktop_command('labwc', fake_installed)
+  assert(not ok and why == "labwc is not installed on the agent's machine") why:destroy()
+  ok, cmd = wayland_desktop_command('sway --unsupported-gpu', fake_installed)
+  assert(ok and cmd == 'sway --unsupported-gpu') cmd:destroy()
+  ok, cmd = wayland_desktop_command('cage foot', fake_installed)
+  assert(ok and cmd == 'cage -- foot') cmd:destroy()
+  ok, cmd = wayland_desktop_command('cage -- foot -e top', fake_installed)
+  assert(ok and cmd == 'cage -- foot -e top') cmd:destroy()
+  ok, cmd, why = wayland_desktop_command('cage', fake_installed)
+  assert(not ok and why:find('one app', 1, true) > 0) why:destroy()
+  ok, cmd, why = wayland_desktop_command('', function(n: string): boolean return false end)
+  assert(not ok and why:find('no nested desktop', 1, true) > 0) why:destroy()
+end
+
 -- run: parsing
 do
   local ok, cmd = wayland_parse_run('run:foot')
@@ -112,7 +145,7 @@ do
   sb:write(WAYLAND_LAUNCH_LINE)
   wayland_list_line(&sb, 7, 640, 437, 'org.gnome.TextEditor', 'notes\tand\nstuff')
   local s = sb:promote()
-  assert(s == '0\t0\t0\tlaunch\trun:COMMAND to start an app in the game\n7\t640\t437\torg.gnome.TextEditor\tnotes and stuff\n')
+  assert(s == '0\t0\t0\tlaunch\trun:COMMAND or app:NAME to start an app in the game\n7\t640\t437\torg.gnome.TextEditor\tnotes and stuff\n')
   s:destroy()
   assert(wayland_contains('Text Editor', 'text'))
   assert(wayland_contains('YAD', 'yad'))

@@ -27,6 +27,7 @@ source "$ROOT/tools/wayland-flags.sh" # the agent's Wayland compositor, when ven
 wlrun() { echo "--- $1"; "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${WAYLAND_DEFINE[@]}" --cflags="$INC $LIBS $WAYLAND_CFLAGS" --cache-dir build/nelua-cache -L . -b "tests/$1.nelua"; "build/nelua-cache/$1" "${@:2}"; }
 if [[ ${#WAYLAND_DEFINE[@]} -gt 0 ]]; then wlrun test_capture_wayland; else echo "--- test_capture_wayland skipped (no vendor/wayland-sdk or libwlroots-0.20)"; fi
 run test_capture_mac
+run test_desktop_entries "$ROOT/build/test-scratch"
 run test_render
 run test_session
 run test_dualsense

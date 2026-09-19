@@ -58,6 +58,8 @@ global CaptureBackend = @record{
   poll_fds: function(fds: *[0]cint, max: integer): integer,
   -- the longest the main loop may sleep while streams are open (ms), -1 for no limit
   wait_ms: function(): integer,
+  -- optional (nilptr: none): WLISTR text of installed apps for WLIST "apps"
+  apps: function(): string,
 }
 
 require 'agent.capture_test'

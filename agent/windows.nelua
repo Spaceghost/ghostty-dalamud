@@ -183,7 +183,15 @@ end
 function AgentWindows:handle(ci: usize, q: *ByteQueue, typ: uint8, payload: *[0]uint8, len: usize): boolean
   if typ == PROTO_WLIST then
     if not self.ok then proto.write_frame(q, PROTO_ERR, (@*[0]uint8)(self.why.data), self.why.size) return true end
-    local text = self.backend.list()
+    -- WLIST "apps": the installed apps instead of the windows (none when the
+    -- backend has no list of them)
+    local arg = string{data=(@*[0]byte)(payload), size=len}
+    local text: string
+    if arg == 'apps' then
+      if self.backend.apps ~= nilptr then text = self.backend.apps() end
+    else
+      text = self.backend.list()
+    end
     proto.write_frame(q, PROTO_WLISTR, (@*[0]uint8)(text.data), text.size)
     text:destroy()
   elseif typ == PROTO_WOPEN then
