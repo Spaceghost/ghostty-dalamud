@@ -89,7 +89,7 @@ characters, so layouts on the two ends need not match.
 | `agent/capture.nelua` | agent | the backend interface and the `--windows` choice |
 | `agent/capture_test.nelua` | agent | synthetic windows (moving pattern) for tests; `--windows test` |
 | `agent/capture_portal.nelua` | agent (Linux) | xdg-desktop-portal ScreenCast + RemoteDesktop, PipeWire; libdbus and libpipewire are dlopened |
-| `agent/capture_win32.nelua` | agent (Windows) | EnumWindows, PrintWindow(PW_RENDERFULLCONTENT), PostMessage/SendInput |
+| `agent/capture_win32.nelua` | agent (Windows) | EnumWindows, PrintWindow(PW_RENDERFULLCONTENT) with BitBlt fallbacks, window messages / SendInput; pure parts in `agent/capture_win32_logic.nelua` |
 | `agent/capture_mac.nelua` | agent (macOS) | CGWindowList for the list, ScreenCaptureKit for frames, CGEventPostToPid |
 | `core/wintex.nelua` | plugin | a BGRA D3D11 texture per stream, dirty-rect uploads, the SRV as ImTextureID |
 | `core/app/remotewin.nelua` | plugin | Session kind Window: open/close, draw on a panel, pointer and keys back, `/term window` |
@@ -138,6 +138,76 @@ settles.
   next due frame of a stream that may send; POSIX also polls the backend's
   `poll_fds`. The Windows loop has only the timeout.
 
+## Windows backend (agent/capture_win32.nelua)
+
+Plain Win32 and GDI, no WinRT or D3D. The agent makes itself per-monitor DPI
+aware (`SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`, looked up at
+run time, absent before Windows 10 1703) so sizes and coordinates are
+physical pixels.
+
+* **List**: `EnumWindows`, keeping visible top-level windows that are not
+  cloaked (`DWMWA_CLOAKED`: other virtual desktops, suspended UWP apps), have
+  no owner (dialogs, popups), are not tool windows, and have a title and a
+  non-empty client area. `app` is the exe base name
+  (`QueryFullProcessImageNameW`; empty when the process cannot be opened,
+  e.g. an elevated one), `title` is UTF-8 with tabs and newlines as spaces.
+* **Window ids** are the HWND truncated to 32 bits. Windows keeps window
+  handles 32-bit significant on 64-bit systems (32- and 64-bit processes
+  share them); the id is sign-extended back. `open` checks `IsWindow`.
+  `wid 0` + match picks the first listed window whose title or exe contains
+  the text (ASCII case-insensitive); `wid 0` without a match is refused
+  ("pick a window by id or name"): there is no system picker. Streams are
+  live at once.
+* **Frames**: on demand from `frame()`, at most one capture per 16 ms per
+  window. The client area goes into a top-down 32bpp DIB section, reused
+  until the size changes, through `PrintWindow(PW_CLIENTONLY |
+  PW_RENDERFULLCONTENT)`, which on Windows 8.1+ also gets covered windows and
+  DirectX / Chromium content. When that fails or leaves the (cleared) DIB all
+  black, `BitBlt` from the window's DC, then from the screen at the client
+  area (both only see what is visible). A copy of the last frame is kept;
+  `serial` changes only when the pixels differ (`memcmp`), so an idle window
+  costs nothing downstream. Minimised windows keep their last frame. The
+  title is reread every 500 ms. A destroyed window ends the stream
+  ("window closed").
+* **Input without FOCUS**: window messages, sent with
+  `SendMessageTimeout(SMTO_ABORTIFHUNG, 100 ms)` in order; the user's
+  foreground window is never touched. Mouse events go to the deepest visible
+  child under the point (`ChildWindowFromPointEx`, coordinates converted to
+  that child's client space) as `WM_MOUSEMOVE` / `WM_[LRM]BUTTON*` with the
+  `MK_*` state; the wheel as `WM_MOUSEWHEEL` / `WM_MOUSEHWHEEL` (screen
+  coordinates, +120 = away from the user, the WINPUT sign). KEY becomes
+  `WM_KEYDOWN`/`UP` (`WM_SYSKEY*` with alt) with a VK from the HID usage, the
+  scan code from `MapVirtualKeyW` and the repeat/extended/transition bits;
+  it goes to the window thread's focus window when that is inside the
+  window, else the child last clicked. TEXT is one `WM_CHAR` per UTF-16 unit
+  (a surrogate pair as two).
+  Messages are sent rather than posted because `TranslateMessage` queues a
+  posted key's `WM_CHAR` behind everything already posted: under Wine,
+  "enter, then TEXT" came out as the text, then the newline. Sent messages
+  are not translated, so the character a key stands for is sent too: enter,
+  tab, backspace, escape and ctrl+letter (control codes); letters and other
+  printable keys are expected as TEXT.
+  Limits: no message changes the keyboard state apps read with
+  `GetKeyState`, and sent messages skip the app's message loop, so menu
+  accelerators, dialog navigation and many ctrl shortcuts do not work this
+  way; FOCUS is the path for them.
+* **FOCUS**: restores a minimised window and brings it to the foreground
+  (`SetForegroundWindow` with the `AttachThreadInput` trick; Windows may
+  still refuse and flash the taskbar button). From then on, while the window
+  really is the foreground window, input goes through `SendInput`: absolute
+  mouse moves over the virtual desktop (`MOUSEEVENTF_ABSOLUTE |
+  MOUSEEVENTF_VIRTUALDESK` after `ClientToScreen`), buttons and wheel, keys
+  with VK and scan code (modifiers named in `mods` but not held through
+  their own KEY events are pressed around the key, so ctrl+c works), TEXT as
+  `KEYEVENTF_UNICODE`. When the user switches away, input falls back to
+  window messages; nothing is typed into whatever they switched to.
+* `pump` does nothing, `poll_fds` returns 0, `wait_ms` is 16 while streams
+  are open.
+
+Upgrade path: Windows.Graphics.Capture (Windows 10 1903+) gives GPU frames
+without a `WM_PRINT` round trip per frame and works for every kind of
+window; it needs WinRT activation and a D3D11 device, so it is not done.
+
 ## Using it
 
 ```
@@ -165,5 +235,33 @@ Host tests only (`tests/run.sh`), nothing in game or on a real desktop:
   or touch a stream, a disconnect closing streams, and an agent run with
   `--windows off` refusing with the reason.
 
-The Windows agent (`ghostty-agent.exe`) cross-compiles with the window layer;
-no real backend exists yet, and the Windows loop's window path has not run.
+* `test_capture_win32`: the Win32 backend's pure parts (HID → VK, key
+  lParams and characters, mouse words, UTF-16, list lines, matching).
+
+Under Wine only (wine-xiv-staging 10.8, throwaway prefix, notepad on an
+Xvfb display), never on real Windows:
+
+* `tests/smoke_capture_win32.nelua` (the backend alone): notepad listed with
+  its exe name and client size (942×659) and opened by match `notepad`;
+  frames at the pace asked (about 45 `frame()` a second with 16 ms sleeps),
+  7 distinct frames in 3 s of an idle window (the caret blinking), about
+  6 to 7 ms a capture at that size. Wine's `PrintWindow` returned success but drew
+  nothing for another process's window in every capture; all frames came
+  from the window-DC `BitBlt` fallback. A click, TEXT (including é and an
+  emoji as a surrogate pair), KEY enter, TEXT and KEY backspace arrived in
+  that order: the Edit control read back through `WM_GETTEXT` held
+  exactly what was typed, and the captured picture showed it. With the
+  first version, which posted messages, the newline arrived after the
+  second line of text; that is why messages are sent now.
+* `tests/smoke_windows_win32.nelua` against `ghostty-agent.exe --windows
+  win32` (the Windows loop's window path, first run): WLIST, WOPEN by match
+  (942×659, title "Untitled - Notepad"), a KEY frame and deltas rebuilt by
+  the client (7 seqs in 3 s, idle window), a click, TEXT, KEY enter and TEXT
+  that showed up in the next frames, WCLOSE.
+* Without a display (no `DISPLAY`) Wine lists and opens windows but every
+  capture path returns black.
+
+Not observed anywhere: FOCUS and the SendInput path (not run: it would have
+taken the foreground on the user's desktop), the wheel, a window closing
+while streamed, minimised windows, DPI scaling, DirectX or Chromium windows,
+real Windows.

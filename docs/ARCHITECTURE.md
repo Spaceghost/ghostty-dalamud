@@ -276,3 +276,11 @@ The last step checks that the core also compiles as a native host module.
 `ghostty-agent.exe` (on Windows, or under Wine in a throwaway prefix) that
 opens `cmd.exe`, types into it and checks replay, LIST, clipboard and exit
 status, printing PASS / FAIL per step (see the README for what it showed).
+
+Two more manual smokes cover the Win32 window capture backend (on Windows or
+under Wine; docs/REMOTE_WINDOWS.md records what they showed):
+`tests/smoke_capture_win32.nelua`, built as a Windows exe, drives the backend
+directly against a window picked by name (list, frames, a picture as PPM,
+click and typing, the Edit control read back); `tests/smoke_windows_win32.nelua`
+is a host client for `ghostty-agent.exe --windows win32` (WLIST, WOPEN by
+match, frames rebuilt into a PPM, input, WCLOSE).
