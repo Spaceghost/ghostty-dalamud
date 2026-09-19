@@ -337,9 +337,22 @@ do
     end
     local grew = collectgarbage('count') - before
     collectgarbage('restart')
-    for id = 201, 203 do w.forget(id) end
     print('placing 3 pets for 600 frames made KB', grew)
     assert(grew < 64, 'placing pets makes garbage every frame')
+    -- and with one focused: the others line up beside it
+    for f = 1, 5 do for id = 201, 203 do assert(w.place(id, 511 + f / 60, id == 202)) end end
+    collectgarbage('collect')
+    collectgarbage('stop')
+    before = collectgarbage('count')
+    for f = 1, 600 do
+      local t = 512 + f / 60
+      for id = 201, 203 do assert(w.place(id, t, id == 202)) end
+    end
+    grew = collectgarbage('count') - before
+    collectgarbage('restart')
+    for id = 201, 203 do w.forget(id) end
+    print('placing 3 lined-up pets for 600 frames made KB', grew)
+    assert(grew < 64, 'lining pets up makes garbage every frame')
   ]]
   assert(luaL_loadstring(policy.L, code) == LUA_OK, 'load')
   if lua_pcall(policy.L, 0, 0, 0) ~= LUA_OK then
@@ -525,6 +538,19 @@ local function fake_frame_count(): cint return frame_count end
 local function fake_key_down(key: cint): boolean return false end
 local function fake_key_pressed(key: cint, rep: boolean): boolean return false end
 local function fake_set_clipboard(text: cstring): void end
+-- ImGui's AddCallback: a command of its own (reusing an empty last one), then a fresh one
+local function fake_callback(l: *ImDrawList, cb: pointer, data: pointer): void
+  assert(l.CmdBuffer.Size + 2 <= MAX_CMDS)
+  local c = &cmds[l.CmdBuffer.Size - 1]
+  if c.ElemCount ~= 0 or c.UserCallback ~= nilptr then
+    cmds[l.CmdBuffer.Size] = { ClipRect = c.ClipRect }
+    l.CmdBuffer.Size = l.CmdBuffer.Size + 1
+    c = &cmds[l.CmdBuffer.Size - 1]
+  end
+  c.UserCallback, c.UserCallbackData = cb, data
+  cmds[l.CmdBuffer.Size] = { ClipRect = c.ClipRect }
+  l.CmdBuffer.Size = l.CmdBuffer.Size + 1
+end
 
 local function resolver(name: cstring): pointer
   local n: string = name
@@ -555,6 +581,7 @@ local function resolver(name: cstring): pointer
   if n == 'igIsKeyDown' then return (@pointer)(fake_key_down) end
   if n == 'igIsKeyPressed' then return (@pointer)(fake_key_pressed) end
   if n == 'igSetClipboardText' then return (@pointer)(fake_set_clipboard) end
+  if n == 'ImDrawList_AddCallback' then return (@pointer)(fake_callback) end
   return nilptr
 end
 
@@ -599,6 +626,141 @@ do
   end
   world_host.get_camera = nilptr
   print('pets clear of the camera OK')
+end
+
+-- Focusing a pet lines the others up beside it in the pet order, clear of the
+-- camera's line, smaller; they go back to their slots when focus leaves. The
+-- order is changed with `order` and kept in the saved state.
+do
+  world_host.get_camera = fake_camera
+  local code: cstring = [[
+    local w = CONFIG.world
+    local cx, _, cz = ghostty.camera()
+    local back = math.atan(-cx, -cz)
+    local ids = { 401, 402, 403, 404 }
+    for _, id in ipairs(ids) do assert(w.command(id, 'pet') == nil) end
+    local t = 900
+    local outs = {}
+    local function settle(focus_id, frames)
+      for _ = 1, frames do
+        t = t + 1 / 60
+        for _, id in ipairs(ids) do outs[id] = assert(w.place(id, t, id == focus_id)) end
+      end
+    end
+    local p = ghostty.player()
+    local function ang(id) local a = w.anchors[id] return math.atan(a.px - p.x, a.pz - p.z) end
+    local function dist(id) local a = w.anchors[id] return math.sqrt((a.px - p.x) ^ 2 + (a.pz - p.z) ^ 2) end
+    local function rel(id, to) return (ang(id) - to + math.pi) % (2 * math.pi) - math.pi end
+    settle(nil, 300)
+    local slot = {}
+    for _, id in ipairs(ids) do slot[id] = { w.anchors[id].px, w.anchors[id].pz } end
+    local base_ppy = outs[401].pixels_per_yalm
+    assert(outs[401].order_next and not outs[404].order_next and outs[404].order_prev, 'arrows where there is a neighbour')
+
+    -- a focused pet: the ones before it to its left, the ones after it to its
+    -- right, further out (or a tier up) the further away in the order; smaller,
+    -- clear of each other, the camera's line and the cone behind you
+    local function check_row(fid)
+      settle(fid, 300)
+      local af, fo = ang(fid), w.anchors[fid].order
+      for _, id in ipairs(ids) do
+        local a, o = w.anchors[id], outs[id]
+        assert(math.abs(rel(id, back)) >= w.pet.camera_clear - 1e-3, 'a pet sits between the camera and the player')
+        assert(math.abs(rel(id, math.pi)) >= w.pet.behind_clear - 1e-3, 'a pet sits behind the player')
+        if id ~= fid then
+          if a.order < fo then assert(rel(id, af) > 0.05, 'before the focused one: on its left')
+          else assert(rel(id, af) < -0.05, 'after the focused one: on its right') end
+          assert(o.pixels_per_yalm > base_ppy * 1.2, 'lined-up pets are smaller')
+          assert(math.abs(o.width - outs[fid].width) < 1e-6, 'shrinking keeps the terminal grid')
+          assert(dist(id) >= dist(fid) - 0.05, 'the row runs through the focused pet')
+          for _, jd in ipairs(ids) do
+            local b = w.anchors[jd]
+            if jd ~= fid and jd ~= id and (a.order < fo) == (b.order < fo) and math.abs(outs[jd].y - o.y) < 1e-3
+               and math.abs(b.order - fo) > math.abs(a.order - fo) then
+              assert(math.abs(rel(jd, af)) > math.abs(rel(id, af)), 'further in the order: further out')
+            end
+          end
+        end
+        for _, jd in ipairs(ids) do
+          if jd ~= id then
+            local q = outs[jd]
+            local sep = math.sqrt((o.x - q.x) ^ 2 + (o.z - q.z) ^ 2)
+            local hh = o.height / o.pixels_per_yalm / 2 + q.height / q.pixels_per_yalm / 2
+            assert(sep >= w.anchors[id].phw + w.anchors[jd].phw - 1e-3 or math.abs(o.y - q.y) >= hh - 0.03, 'lined-up pets overlap')
+          end
+        end
+      end
+      assert(math.abs(outs[fid].pixels_per_yalm - base_ppy) < 0.5, 'the focused pet keeps its size')
+    end
+    check_row(402)
+    check_row(401)
+    check_row(404)
+
+    -- focus leaves: back to the slots, full size
+    settle(nil, 400)
+    for _, id in ipairs(ids) do
+      local a = w.anchors[id]
+      assert(math.sqrt((a.px - slot[id][1]) ^ 2 + (a.pz - slot[id][2]) ^ 2) < 0.05, 'back in its slot')
+      assert(math.abs(outs[id].pixels_per_yalm - base_ppy) < 1e-3, 'back to full size')
+    end
+
+    -- the order: swap 401 right, past 402; the slots follow it
+    assert(w.command(401, 'order right') == nil)
+    assert(w.anchors[401].order > w.anchors[402].order, 'swapped with its neighbour')
+    settle(nil, 400)
+    local function near_slot(id, other)
+      local a = w.anchors[id]
+      return math.sqrt((a.px - slot[other][1]) ^ 2 + (a.pz - slot[other][2]) ^ 2) < 0.05
+    end
+    assert(near_slot(401, 402) and near_slot(402, 401), 'the swapped pets trade slots')
+    assert(w.command(404, 'order first') == nil and w.command(404, 'order left') == nil, 'first, then left of first: stays first')
+    assert(w.anchors[404].order < w.anchors[402].order, 'order first')
+    assert(w.command(404, 'order 3') == nil)
+    assert(w.command(404, 'order sideways') ~= nil, 'usage')
+    assert(w.command(999, 'order left') ~= nil, 'not a world terminal')
+    assert(w.command(405, 'here') == nil and w.command(405, 'order left') ~= nil, 'a pin has no place in the order')
+    w.forget(405)
+    -- pin <-> pet keeps its place in the order
+    local o3 = w.anchors[403].order
+    assert(w.toggle(403, 1, 2, 3, 0) == nil and w.anchors[403].kind == 'world' and w.anchors[403].order == o3)
+    assert(w.toggle(403) == nil and w.anchors[403].kind == 'pet' and w.anchors[403].order == o3, 'pin <-> pet keeps the order')
+    -- saved with the pet; the row and the scale are not
+    local list = {}
+    for i, id in ipairs(ids) do list[i] = { id = id, agent = 9400 + i, view = 'world', font_scale = 0 } end
+    settle(402, 30)
+    w.save_state(list)
+    local saved = assert(w._last_saved)
+    assert(saved:find('order = ' .. w.anchors[401].order, 1, true), 'the order is saved')
+    assert(not saved:find('lu_', 1, true) and not saved:find('ls =', 1, true) and not saved:find('phw', 1, true), 'the row is not saved')
+    os.remove((GHOSTTY_PLUGIN_DIR or '.') .. '/world-state.lua')
+    w._last_saved = nil
+    for _, id in ipairs(ids) do w.forget(id) end
+  ]]
+  assert(luaL_loadstring(policy.L, code) == LUA_OK, 'load')
+  if lua_pcall(policy.L, 0, 0, 0) ~= LUA_OK then
+    print(lua_tolstring(policy.L, -1, nilptr))
+    assert(false, 'pets line up beside a focused one')
+  end
+  world_host.get_camera = nilptr
+  print('pet lineup and order OK')
+end
+
+-- The arrows' hit areas and the draw-list reorder ------------------------------------
+do
+  assert(world_order_button(1000, 600, 10, 300, true, true) == WORLD_BUTTON_ORDER_PREV, 'left arrow')
+  assert(world_order_button(1000, 600, 990, 300, true, true) == WORLD_BUTTON_ORDER_NEXT, 'right arrow')
+  assert(world_order_button(1000, 600, 10, 300, false, true) == WORLD_BUTTON_NONE, 'no neighbour before: no arrow')
+  assert(world_order_button(1000, 600, 10, 100, true, true) == WORLD_BUTTON_NONE, 'only halfway down')
+  assert(world_order_button(1000, 600, 500, 300, true, true) == WORLD_BUTTON_NONE, 'not in the middle')
+  local c: [6]ImDrawCmd
+  for i = 0, < 6 do c[i].ElemCount = i end
+  local v: ImVector_ImDrawCmd = { Size = 6, Capacity = 6, Data = (@*[0]ImDrawCmd)(&c) }
+  world_cmds_to_front(&v, 2)
+  assert(c[0].ElemCount == 2 and c[1].ElemCount == 3 and c[3].ElemCount == 5 and c[4].ElemCount == 0 and c[5].ElemCount == 1, 'rotated, order kept')
+  world_cmds_to_front(&v, 0)
+  world_cmds_to_front(&v, 6)
+  assert(c[0].ElemCount == 2 and c[5].ElemCount == 1, 'nothing to move')
+  print('order arrows and draw-list reorder OK')
 end
 local function game_player(which: cint, id: uint64, out: *GuObject): cint
   $out = {}
@@ -774,6 +936,7 @@ do
     print('world pin <-> pet OK')
   end
 
+
   -- The log: one line while nothing changes -------------------------------------------
   for _ = 1, 10 do world_frame(false) end
   assert(diag_lines == 1 and diag_drawing == 1, 'the world summary is logged once, with the first drawn panel')
@@ -798,6 +961,90 @@ do
   world_frame(false)
   assert(host.world_tuning.walk ~= want, 'read again half a second later')
   print('world tuning OK')
+
+  local keep_lines, keep_drawing = diag_lines, diag_drawing -- the summary lines below are not the ones counted
+  -- Pet order: the arrows on a hovered pet's edges, and /term order ----------------------
+  do
+    local function order_of(id: integer): integer
+      local L = policy.L
+      lua_getglobal(L, 'require') lua_pushstring(L, 'world')
+      assert(lua_pcall(L, 1, 1, 0) == LUA_OK)
+      lua_getfield(L, -1, 'anchors') lua_rawgeti(L, -1, id)
+      lua_getfield(L, -1, 'order')
+      local o = lua_tointegerx(L, -1, nilptr)
+      lua_settop(L, 0)
+      return o
+    end
+    local pa = new_panel('pet')
+    local pb = new_panel('pet')
+    host.world_focus = 0
+    for _ = 1, 120 do world_frame(false) end
+    assert(order_of(pa.id) < order_of(pb.id), 'new pets join the order at the end')
+    local oka, pla = policy_world_place(pa.id, now, false)
+    assert(oka and pla.order_next and not pla.order_prev, 'the first pet: an arrow to the next only')
+    -- a click on its right arrow: it swaps with the next one (and takes focus, but walks nowhere)
+    now = now + 0.5
+    mouse_at = panel_screen(pa.id, pla.width - 2 - WORLD_ORDER_W * 0.5, pla.height * 0.5)
+    world_frame(false)
+    world_frame(true)
+    assert(order_of(pa.id) > order_of(pb.id) and host.world_order_id == 0, 'the right arrow moves it after its neighbour')
+    assert(host.world_focus == pa.id and host.walk.id == 0, 'an arrow focuses, walks nowhere')
+    world_frame(false)
+    mouse_at = vec2(-5000, -5000)
+    -- /term order on the focused pet
+    assert(run_command('order left') == 0 and order_of(pa.id) < order_of(pb.id), '/term order left')
+    assert(run_command('order last') == 0 and order_of(pa.id) > order_of(pb.id), '/term order last')
+    assert(run_command('order sideways') == 4, 'a bad /term order')
+    host.world_focus = s.id
+    assert(run_command('order left') == 4, 'a pin has no place in the order')
+    host.world_focus = 0
+    assert(run_command('order left') == 5, 'nothing focused')
+    close_terminal(pa)
+    close_terminal(pb)
+    print('world pet order OK')
+  end
+
+  -- Under the other plugins' overlays: what Umbra drew into the background
+  -- list before us ends up after everything of ours -------------------------------------
+  do
+    host.world_focus = s.id
+    reset_list()
+    cmds[0].ClipRect = { 1, 2, 3, 4 } -- "Umbra's toolbar"
+    quad(vec2(0, 0), vec2(2560, 40), 0xff00ff00_u32)
+    host.world_tuning.under_ui = true
+    local base = world_under_ui_begin()
+    assert(base == 1 and dl.CmdBuffer.Size == 3 and cmds[1].UserCallback == (@pointer)(IMDRAW_CALLBACK_RESET), 'a fresh command of ours')
+    now = now + 1.0 / 60
+    draw_world(now)
+    local ours: cint = 0
+    for i = 1, < dl.CmdBuffer.Size do ours = ours + cmds[i].ElemCount end
+    assert(ours > 0, 'the panel drew')
+    world_under_ui_end(base)
+    local n = dl.CmdBuffer.Size
+    assert(cmds[0].UserCallback == (@pointer)(IMDRAW_CALLBACK_RESET), 'ours first')
+    assert(cmds[n - 3].ClipRect.x == 1 and cmds[n - 3].ElemCount == 4, 'Umbra\'s command after all of ours')
+    assert(cmds[n - 2].UserCallback == (@pointer)(IMDRAW_CALLBACK_RESET) and cmds[n - 1].ElemCount == 0 and cmds[n - 1].UserCallback == nilptr,
+      'a fresh last command for whoever draws next')
+    local after: cint = 0
+    for i = 0, < n - 3 do after = after + cmds[i].ElemCount end
+    assert(after == ours, 'nothing of ours lost')
+    -- nothing drawn before us: nothing to go under
+    reset_list()
+    assert(world_under_ui_begin() == -1 and dl.CmdBuffer.Size == 1)
+    world_under_ui_end(-1)
+    -- turned off
+    quad(vec2(0, 0), vec2(10, 10), 0xff00ff00_u32)
+    host.world_tuning.under_ui = false
+    assert(world_under_ui_begin() == -1 and dl.CmdBuffer.Size == 1, 'CONFIG.world.under_ui = false')
+    assert(luaL_loadstring(policy.L, 'CONFIG.world.under_ui = false') == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+    assert(not world_read_tuning(policy.L).under_ui, 'under_ui read from lua/world.lua')
+    assert(luaL_loadstring(policy.L, 'CONFIG.world.under_ui = true') == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+    assert(world_read_tuning(policy.L).under_ui)
+    host.world_tuning.under_ui = true
+    host.world_focus = 0
+    print('world under other overlays OK')
+  end
+  diag_lines, diag_drawing = keep_lines, keep_drawing
 
   -- Level of detail: text too small to read is not drawn -----------------------------
   host.world_focus = 0

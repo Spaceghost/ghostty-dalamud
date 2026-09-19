@@ -655,6 +655,39 @@ global function world_terminal_new(profile: string, pin: string): (integer, stri
   return s.id, string{}
 end
 
+-- Other plugins' overlays stay above the world panels. Umbra draws its
+-- toolbar into the background layer, the one layer below every window, which
+-- is where the panels go too; a plugin that draws there earlier in the frame
+-- would be painted over. So everything Ghostty draws into that layer (panels,
+-- the bell) is moved in front of what was already there: the world first,
+-- the toolbars and markers of the others on top. Windows (our dropdown and
+-- popups among them) are unaffected. CONFIG.world.under_ui = false turns it
+-- off. -> the first command of ours, or -1 when there is nothing to go under.
+global function world_under_ui_begin(): integer
+  if not host.world_tuning.under_ui or imgui.DrawListAddCallback == nilptr or imgui.GetBackgroundDrawList == nilptr then return -1 end
+  local dl = imgui.GetBackgroundDrawList()
+  if dl == nilptr then return -1 end
+  local drawn = false
+  for i = 0, < dl.CmdBuffer.Size do
+    if dl.CmdBuffer.Data[i].ElemCount > 0 then drawn = true break end
+  end
+  if not drawn then return -1 end
+  -- a render-state reset is a command of its own that ImGui never merges
+  -- into, so what we draw next starts a command of its own too
+  imgui.DrawListAddCallback(dl, (@pointer)(IMDRAW_CALLBACK_RESET), nilptr)
+  return dl.CmdBuffer.Size - 2
+end
+
+global function world_under_ui_end(base: integer): void
+  if base < 0 then return end
+  local dl = imgui.GetBackgroundDrawList()
+  if dl == nilptr or base >= dl.CmdBuffer.Size then return end
+  world_cmds_to_front(&dl.CmdBuffer, base)
+  -- whoever draws next must not extend the command now last: its indices
+  -- are no longer the last ones in the buffer
+  imgui.DrawListAddCallback(dl, (@pointer)(IMDRAW_CALLBACK_RESET), nilptr)
+end
+
 global function draw_world(now: float64): void
   defer lights_sync() end -- panel lights: however this frame ends
   defer occluders_sync(&host.world_tuning) end -- and shadow boards
@@ -839,6 +872,11 @@ global function draw_world(now: float64): void
         end
         -- title buttons along the top-right edge
         local button = uok and world_title_button(pl.width, mu, mv) or WORLD_BUTTON_NONE
+        -- a pet's arrows on its edges (under the pointer only, not full screen)
+        if button == WORLD_BUTTON_NONE and uok and hovered and ft <= 0 and pl.pet then
+          button = world_order_button(pl.width, pl.height, mu, mv, pl.order_prev, pl.order_next)
+        end
+        local on_order = button == WORLD_BUTTON_ORDER_PREV or button == WORLD_BUTTON_ORDER_NEXT
         local on_close = button == WORLD_BUTTON_CLOSE
         local on_full = button == WORLD_BUTTON_FULL
         local on_popin = button == WORLD_BUTTON_POPIN
@@ -849,14 +887,16 @@ global function draw_world(now: float64): void
         -- tooltips: hovered in world space, shown at the pointer like any other
         do
           local tip_on = not over_window and prez > 0.9 and host.world_visible and (button ~= WORLD_BUTTON_NONE or grip == 3)
-          local tip_id = (@uint64)(s.id) * 8 + (@uint64)(button == WORLD_BUTTON_NONE and 7 or button) + 0x3a000000_u64
+          local tip_id = (@uint64)(s.id) * 16 + (@uint64)(button == WORLD_BUTTON_NONE and 15 or button) + 0x3a000000_u64
           if tooltip_due(tip_id, tip_on, now) then
             local key: string = 'world.resize'
             if on_close then key = 'world.close'
             elseif on_full then key = ft > 0.5 and 'world.full.off' or 'world.full'
             elseif on_popin then key = 'world.popin'
             elseif on_pet then key = pl.pet and 'world.pin' or 'world.pet'
-            elseif on_occluded then key = s.run_occluded and 'world.sleep.off' or 'world.sleep.on' end
+            elseif on_occluded then key = s.run_occluded and 'world.sleep.off' or 'world.sleep.on'
+            elseif button == WORLD_BUTTON_ORDER_PREV then key = 'world.order.prev'
+            elseif button == WORLD_BUTTON_ORDER_NEXT then key = 'world.order.next' end
             local text = policy_tooltip(key, '')
             tooltip_show(text, nilptr, 0)
             text:destroy()
@@ -892,6 +932,9 @@ global function draw_world(now: float64): void
             host.world_pet_toggle_id = s.id
           elseif click and on_occluded then
             host.world_occluded_toggle_id = s.id
+          elseif click and on_order then
+            host.world_order_id = s.id
+            host.world_order_next = button == WORLD_BUTTON_ORDER_NEXT
           end
           if click and grip ~= 0 and host.world_focus == s.id then
             host.world_drag_id = s.id
@@ -1049,6 +1092,25 @@ global function draw_world(now: float64): void
             vec2(vp.x + pl.width - 4, vp.y + pl.height - 22), vec2(vp.x + pl.width - 4, vp.y + pl.height - 4),
             chrome_col(ChromeColor.Accent, (host.world_drag_id == s.id) and 255 or 150))
         end
+        -- a pet's arrows: swap places with the neighbour on that side
+        if hovered and pl.pet and ft <= 0 and not over_window and (pl.order_prev or pl.order_next) then
+          local ink = chrome_col(ChromeColor.Ink, 255)
+          local ay0 = vp.y + (pl.height - WORLD_ORDER_H) * 0.5
+          local ay1 = ay0 + WORLD_ORDER_H
+          local aym = ay0 + WORLD_ORDER_H * 0.5
+          if pl.order_prev then
+            local ax0 = vp.x + 2
+            local hot = button == WORLD_BUTTON_ORDER_PREV
+            imgui.DrawListAddRectFilled(dl, vec2(ax0, ay0), vec2(ax0 + WORLD_ORDER_W, ay1), hot and chrome_col(ChromeColor.Popin, 235) or chrome_col(ChromeColor.PopinIdle, 180), 6, 0)
+            imgui.DrawListAddTriangleFilled(dl, vec2(ax0 + 20, aym - 11), vec2(ax0 + 20, aym + 11), vec2(ax0 + 8, aym), ink)
+          end
+          if pl.order_next then
+            local ax0 = vp.x + pl.width - 2 - WORLD_ORDER_W
+            local hot = button == WORLD_BUTTON_ORDER_NEXT
+            imgui.DrawListAddRectFilled(dl, vec2(ax0, ay0), vec2(ax0 + WORLD_ORDER_W, ay1), hot and chrome_col(ChromeColor.Popin, 235) or chrome_col(ChromeColor.PopinIdle, 180), 6, 0)
+            imgui.DrawListAddTriangleFilled(dl, vec2(ax0 + 10, aym - 11), vec2(ax0 + 22, aym), vec2(ax0 + 10, aym + 11), ink)
+          end
+        end
         if focused then
           -- drawn as short segments so it bends with the panel's curve
           local col = chrome_col(ChromeColor.Accent, 220)
@@ -1091,6 +1153,13 @@ global function draw_world(now: float64): void
       local e = policy_world_command(oid, ts.run_occluded and 'occluded off' or 'occluded on')
       e:destroy()
     end
+  end
+  if host.world_order_id ~= 0 then
+    local oid = host.world_order_id
+    host.world_order_id = 0
+    local e = policy_world_command(oid, host.world_order_next and 'order right' or 'order left')
+    if #e > 0 then sayf(LOG_WARN, 'order: %s', e) end
+    e:destroy()
   end
   if host.world_pet_toggle_id ~= 0 then
     local tid = host.world_pet_toggle_id
