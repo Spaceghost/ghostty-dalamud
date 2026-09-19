@@ -38,6 +38,7 @@ run test_world "$ROOT"
 run test_worldpanel "$ROOT"
 run test_worlddrag "$ROOT"
 run test_remotewin "$ROOT"
+run test_ipc "$ROOT"
 run test_host "$ROOT"
 
 HEAP=""; getconf GNU_LIBC_VERSION >/dev/null 2>&1 && HEAP="-P glibc_heap" # heap accounting needs glibc's mallinfo2

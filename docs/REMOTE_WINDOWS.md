@@ -543,13 +543,20 @@ ivar, `stream:didOutputSampleBuffer:ofType:`, `stream:didStopWithError:`).
 ## Using it
 
 ```
-/term window list [@agent]           windows the agent can see (in the log: wid, size, app, title)
-/term window pull [match] [@agent]   open one as a pet (no match: the agent's own choice)
-/term window pull #wid               by id from the list
-/term window pull run CMD...         the agent starts CMD and streams its window (match text "run:CMD...")
-/term window close                   the focused window panel (else the newest)
-/term pin …                          on a focused window panel: moves it, keeping its size
+/window list [@agent]           windows the agent can see (in the log: wid, size, app, title)
+/window pull [match] [@agent]   open one as a pet (no match: the agent's own choice)
+/window pull #wid               by id from the list
+/window run CMD... [@agent]     the agent starts CMD and streams its window (match text "run:CMD...")
+/window close                   the focused window panel (else the newest)
+/window desktop                 reserved (a whole remote desktop); says so for now
+/term pin …                     on a focused window panel: moves it, keeping its size
 ```
+
+`/window` is a command of its own (`CONFIG.host.verb_commands`, registered
+through the shim's `command_add_tagged`; a shim from before it logs that once
+and registers only `/term`). `/term window list | pull … | close` does the
+same and points at `/window` once per session. `/ask [question]` and
+`/agent ask [question]` are `/term ask` the same way.
 
 `@agent` may only name `default` so far. `lua/windows.lua` (`CONFIG.windows`)
 holds the sizes asked for (`max_w`, `max_h`, default 1920×1200), `fps` (30),
@@ -559,6 +566,16 @@ and `auto`: `/term window pull` arguments run once the character is loaded.
 Clicking a window panel focuses it; while focused the mouse and keyboard go
 to the remote window. Esc twice within half a second (or clicking outside)
 gives them back; the first Esc reaches the window.
+
+### IPC for other plugins
+
+Another plugin can do the same through `GhosttyDalamud.v1.Call`:
+`window.list`, `window.open` (`run`, `match` or `wid`, optional `pin`),
+`window.close`, `window.focus`, `window.place`, `agent.status` and `status`,
+as JSON. Reads answer from the last frame's snapshot; changes are queued and
+run by the next frame through the same `window_*` functions as the commands
+above. Methods, examples and the threading are in [IPC.md](IPC.md). Not yet
+observed in game.
 
 ## Verified
 
@@ -685,6 +702,9 @@ pixman 0.46.2; agent built with zig cc), with `yad` 9.3 (GTK 3.24.52) as the cli
   disconnected, a new connection's WLIST still listed the app with its
   launch id, and WOPEN `key:…` opened it again as a new stream with a
   1120×720 KEY frame; stopping the agent then ended the app.
+* `test_e2e_wayland`, 2026-09-19, GTK4 regression (outputs at 60 Hz): `run:flatpak
+  run org.gnome.TextEditor --standalone` opened a 1400×1040 window that stayed
+  mapped for 5 s (8 frames) and closed with WCLOSE.
 * `test_e2e_wayland` (in `tests/run.sh`): the plugin's own agent client
   (`core/agent_client.nelua`, decoding as `core/app/remotewin.nelua` does)
   against a real agent run with `--windows wayland --wayland-socket …` and no

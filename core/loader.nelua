@@ -57,12 +57,14 @@ local CoreFns = @record{
   shutdown: function(): void,
   version: function(): cstring,
   walk_input: function(left: *float32, forward: *float32, allowed: cint, legacy: cint): void,
+  call: function(request: cstring, out: *[0]cchar, cap: usize): usize,
 }
 ## local core_exports = {
 ##   {'init_ex', 'gu_init_ex'}, {'init', 'gu_init'}, {'event', 'gu_event'}, {'frame', 'gu_frame'},
 ##   {'popup_draw', 'gu_popup_draw'}, {'popup_reset', 'gu_popup_reset'}, {'popup_size', 'gu_popup_size'},
 ##   {'toggle', 'gu_toggle'}, {'command', 'gu_command'}, {'status', 'gu_status'},
 ##   {'shutdown', 'gu_shutdown'}, {'version', 'gu_version'}, {'walk_input', 'gu_walk_input'},
+##   {'call', 'gu_call'},
 ## }
 
 local Loader = @record{
@@ -592,6 +594,33 @@ global function gu_walk_input(left: *float32, forward: *float32, allowed: cint, 
     if loader.fns.walk_input ~= nilptr then loader.fns.walk_input(left, forward, allowed, legacy) end
     leave()
   end
+end
+
+-- GhosttyDalamud.v1.Call from any thread (docs/IPC.md); a JSON refusal while
+-- no core (or one without gu_call) is loaded.
+global function gu_call(request: cstring, out: *[0]cchar, cap: usize): usize <cexport, codename 'gu_call'>
+  local reason: cstring = 'ghostty is not running'
+  if enter() then
+    if loader.fns.call ~= nilptr then
+      local n = loader.fns.call(request, out, cap)
+      leave()
+      return n
+    end
+    leave()
+    reason = 'this ghostty core has no IPC calls'
+  end
+  if out == nilptr or cap == 0 then return 0 end
+  local sb: stringbuilder
+  sb:write('{"ok":false,"error":"', reason, '"}')
+  local text = sb:promote()
+  local n: usize = 0
+  if #text + 1 <= cap then
+    for i: usize = 0, < #text do out[i] = (@cchar)(text.data[i]) end
+    n = #text
+  end
+  out[n] = 0
+  text:destroy()
+  return n
 end
 
 -- Nelua runtime errors inside the game: built like the core (`-P

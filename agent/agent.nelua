@@ -478,6 +478,7 @@ local function pump_session(si: usize): void
 end
 
 local function reap(): void
+  agent_sys_reap()
   -- drop dead clients (from the back so indexes stay valid) and detach them
   local i: integer = #agent.clients - 1
   while i >= 0 do

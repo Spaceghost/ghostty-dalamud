@@ -51,6 +51,7 @@ local function on_event(ctx: pointer, ev: *AgentEvent): void
   elseif ev.typ == PROTO_WFRAME then
     local ok, f = wincodec_parse(ev.data, ev.len)
     assert(ok, 'a WFRAME parses')
+    if f.sid ~= st.sid then return end -- another stream (the one before, still open)
     if f.w ~= st.w or f.h ~= st.h then
       assert(f.flags & WINCODEC_FLAG_KEY ~= 0, 'a size change comes as a KEY frame')
       st.w, st.h = f.w, f.h
@@ -207,6 +208,29 @@ assert(pump_for(5, function(): boolean return st.opened or st.refused end), 'WOP
 assert(st.opened and st.sid ~= oldsid, 'the saved window opened again as a new stream')
 assert(pump_for(5, function(): boolean return st.keys >= 1 end), 'a KEY frame of the re-attached window')
 print(('e2e reattach: launch %s, %dx%d'):format(launch, st.w, st.h))
+-- GTK4 regression (outputs once advertised 0 Hz and GTK4 died with SIGFPE
+-- 1.6 s after mapping): a Flatpak GTK4 app stays mapped for 5 s. Text Editor
+-- --standalone, so a copy already open on the desktop does not take the launch.
+if os.execute('flatpak info org.gnome.TextEditor >/dev/null 2>&1') then
+  local keep_sid, keep_w, keep_h = st.sid, st.w, st.h
+  st.opened, st.refused, st.ended, st.frames, st.keys, st.w, st.h, st.sid = false, false, false, 0, 0, 0, 0, 0
+  assert(client:wopen(3, 0, 1920, 1200, 30, 'run:flatpak run org.gnome.TextEditor --standalone'))
+  assert(pump_for(30, function(): boolean return st.opened or st.refused end), 'WOPENED for the GTK4 app')
+  if st.refused then print('refused: ' .. st.why) end
+  assert(st.opened, 'the GTK4 app opened a window')
+  local gsid = st.sid
+  local ended_early = pump_for(5, function(): boolean return st.ended end)
+  assert(not ended_early, 'the GTK4 app stayed mapped for 5 s')
+  assert(st.keys >= 1, 'the GTK4 app sent frames')
+  print(('e2e GTK4: org.gnome.TextEditor %dx%d stayed mapped 5 s, %d frames'):format(st.w, st.h, st.frames))
+  client:wclose(gsid) -- the app closes with its stream
+  client:flush()
+  pump_for(1, nilptr)
+  st.sid, st.w, st.h = keep_sid, keep_w, keep_h
+else
+  print('skip: flatpak org.gnome.TextEditor is not installed (GTK4 check)')
+end
+
 -- the stream stays open: run.sh stops the agent, which must end the app
 client:flush()
 print('test_e2e_wayland OK')

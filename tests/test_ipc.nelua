@@ -1,0 +1,336 @@
+-- GhosttyDalamud.v1.Call (core/app/ipc.nelua, lua/ipc.lua, lua/json.lua).
+-- First tests/test_ipc.lua in a bare Lua state (JSON, and lua/ipc.lua against
+-- stubs), then the real thing through gu_call against a fake version 3 agent
+-- on a socketpair (as tests/test_remotewin.nelua): the calls before the core
+-- runs and before the first snapshot, every method, a mutation queued until
+-- the frame and its result in window.list, `rev`, the caller in the log, a
+-- failing change, the queue limit, a response too large, malformed JSON and an
+-- unknown method, and the channel gone after shutdown.
+--
+-- Threads (by design, not exercised here: the host build's lock is a no-op):
+-- gu_call only runs lua/ipc.lua in its own Lua state under the IPC lock and
+-- reads the snapshot string the frame swaps in under the same lock; it never
+-- touches `host`, `policy` or the core's Lua state.
+require 'core.host'
+require 'string'
+require 'vector'
+require 'arg'
+
+local root: string = arg[1]
+
+-- Part 1: tests/test_ipc.lua ------------------------------------------------------------
+do
+  local L = luaL_newstate()
+  luaL_openlibs(L)
+  local script = root .. '/tests/test_ipc.lua'
+  if luaL_loadfilex(L, (@cstring)(script.data), nilptr) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_pushlstring(L, (@cstring)(root.data), root.size)
+  if lua_pcall(L, 1, 0, 0) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_close(L)
+  script:destroy()
+end
+
+-- Part 2: through gu_call -------------------------------------------------------------------
+
+## cinclude '<sys/socket.h>'
+## cinclude '<fcntl.h>'
+## cinclude '<unistd.h>'
+local function socketpair(domain: cint, typ: cint, protocol: cint, fds: *[2]cint): cint <cimport, nodecl> end
+local function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
+local function read(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function write(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function close(fd: cint): cint <cimport, nodecl> end
+local AF_UNIX: cint <cimport, nodecl, const>
+local SOCK_STREAM: cint <cimport, nodecl, const>
+local F_GETFL: cint <cimport, nodecl, const>
+local F_SETFL: cint <cimport, nodecl, const>
+local O_NONBLOCK: cint <cimport, nodecl, const>
+
+local log_lines: vector(string)
+local function log_cb(level: cint, msg: cstring): void
+  io.write('[log ', level, '] ', msg, '\n')
+  log_lines:push(string.copy(msg))
+end
+local function logged(needle: string): integer
+  local n = 0
+  for i = 0, < #log_lines do
+    if log_lines[i]:find(needle, 1, true) > 0 then n = n + 1 end
+  end
+  return n
+end
+
+local player_here = true
+local function game_player(which: cint, id: uint64, out: *GuObject): cint
+  $out = {}
+  if which == WORLD_PLAYER and player_here then
+    $out = { x = 10, y = 0, z = 20, rotation = 0, entity_id = 7, territory = 132, found = 1, height = 1.7, hitbox_radius = 0.5 }
+  end
+  return 1
+end
+local api: GuHostApi = { size = #GuHostApi, log = log_cb, get_object = game_player }
+
+-- The fake agent
+local Frame = @record{ typ: uint8, data: string }
+local peer: cint = -1
+local peer_q: ByteQueue
+local frames: vector(Frame)
+
+local function fake_connect(greeting: string): void
+  local fds: [2]cint
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
+  fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK)
+  fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL, 0) | O_NONBLOCK)
+  net.close(host.agent.sock)
+  host.agent.sock = fds[0]
+  host.agent.inq:destroy()
+  host.agent.outq:destroy()
+  host.agent.state = AgentState.Handshake
+  peer = fds[1]
+  local q: ByteQueue
+  proto.write_frame(&q, PROTO_OK, (@*[0]uint8)(greeting.data), greeting.size)
+  assert(write(peer, q:peek(), q:len()) == (@isize)(q:len()))
+  q:destroy()
+end
+local function peer_send(q: *ByteQueue): void
+  while q:len() > 0 do
+    local n = write(peer, q:peek(), q:len())
+    assert(n > 0, 'peer write')
+    q:consume((@usize)(n))
+  end
+end
+local function peer_collect(): void
+  host.agent:flush()
+  local buf: [65536]uint8
+  while true do
+    local n = read(peer, &buf, 65536)
+    if n <= 0 then break end
+    peer_q:push(&buf, (@usize)(n))
+  end
+  while true do
+    local ok, typ, payload, len = proto.read_frame(&peer_q)
+    if not ok then break end
+    frames:push(Frame{ typ = typ, data = string.copy(string{data=(@*[0]byte)(payload), size=len}) })
+    proto.frame_consume(&peer_q, len)
+  end
+end
+local function forget(): void
+  peer_collect()
+  for i = 0, < #frames do frames[i].data:destroy() end
+  frames:clear()
+end
+local function count(typ: uint8): integer
+  peer_collect()
+  local n = 0
+  for i = 0, < #frames do if frames[i].typ == typ then n = n + 1 end end
+  return n
+end
+local function last(typ: uint8): *Frame
+  peer_collect()
+  local i = #frames - 1
+  while i >= 0 do
+    if frames[i].typ == typ then return &frames[i] end
+    i = i - 1
+  end
+  return nilptr
+end
+
+local now: float64 = 100
+-- One frame as far as windows and IPC go (gu_frame without ImGui).
+local function frame(): void
+  now = now + 1.0 / 60
+  host.last_time = now
+  agent_pump(now)
+  remotewin_tick(now, true)
+  update_status()
+  ipc_frame()
+end
+
+-- gu_call with a request; the response checked by a Lua snippet in a scratch
+-- state (json.lua decodes it into `r`).
+local J = luaL_newstate()
+luaL_openlibs(J)
+do
+  local sb: stringbuilder
+  sb:write('package.path = [==[', root, ']==] .. "/lua/?.lua;" .. package.path\njson = require("json")\n')
+  local s = sb:promote()
+  assert(luaL_loadstring(J, (@cstring)(s.data)) == LUA_OK and lua_pcall(J, 0, 0, 0) == LUA_OK)
+  s:destroy()
+end
+local buf: [65536]cchar
+local function call(request: string): string
+  local req = request .. '\0'
+  local n = gu_call((@cstring)(req.data), &buf, #buf)
+  req:destroy()
+  return string{data=(@*[0]byte)(&buf), size=n}
+end
+-- `check` sees the decoded response as `r` and may return a value (integer) for the test.
+local function expect(request: string, check: string): integer
+  local resp = call(request)
+  lua_pushlstring(J, (@cstring)(resp.data), resp.size)
+  lua_setglobal(J, 'RAW')
+  local code = 'r = assert(json.decode(RAW), "not JSON: " .. RAW)\n' .. check
+  local ok = luaL_loadstring(J, (@cstring)(code.data)) == LUA_OK and lua_pcall(J, 0, 1, 0) == LUA_OK
+  code:destroy()
+  if not ok then
+    io.stderr:write('request ', request, '\nresponse ', resp, '\nfailed: ', (@cstring)(lua_tolstring(J, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  local v = lua_tointegerx(J, -1, nilptr)
+  lua_settop(J, 0)
+  return v
+end
+
+-- before the core runs
+expect('{"method":"status"}', 'assert(r.ok == false and r.error == "ghostty is not running")')
+
+assert(gu_init(&api, (@cstring)(root.data)) == 0, 'init')
+host.agent_last_try = 1e9 -- never dial out
+assert(logged('ipc:') == 0, 'lua/ipc.lua loaded quietly')
+
+-- before the first frame: no snapshot yet
+expect('{"method":"window.list"}', 'assert(r.ok == false and r.error:find("starting"))')
+frame()
+expect('{"method":"status"}', string.format('assert(r.ok and r.result == [==[%s]==], r.result)', host.status)) -- the Status channel's text
+expect('{"method":"agent.status"}', [[
+  local a = r.result
+  assert(r.ok and a.connected == false and a.windows_ok == false and a.version == 0 and a.agent == '127.0.0.1:7777', RAW)]])
+local rev0 = expect('{"method":"window.list"}', 'assert(r.ok and #r.result.windows == 0 and #r.result.requests == 0) return r.result.rev')
+frame()
+assert(expect('{"method":"window.list"}', 'return r.result.rev') == rev0, 'nothing changed: the same rev')
+-- a change the core cannot do yet: the reason arrives in `requests`
+local req0 = expect('{"method":"window.open","params":{"match":"Firefox"}}', 'assert(r.ok and r.result.queued) return r.result.request')
+frame()
+local rev1 = expect('{"method":"window.list"}', string.format([[
+  local q = r.result.requests[1]
+  assert(q.request == %d and q.ok == false and q.error == 'the agent is not connected', RAW)
+  assert(r.result.rev ~= %d, 'a result moves rev')
+  return r.result.rev]], req0, rev0))
+assert(logged('ipc: window.open: the agent is not connected') == 1, 'a failed change is logged')
+
+fake_connect('ghostty-agent 3 42')
+frame()
+assert(host.agent:windows_ok())
+forget()
+expect('{"method":"agent.status"}', 'assert(r.result.connected and r.result.windows_ok and r.result.version == 3, RAW)')
+
+-- window.open: queued, then run by the frame
+local req1 = expect('{"method":"window.open","params":{"run":"/usr/bin/yad --title x","pin":"here"},"caller":"XivDesktop"}',
+  'assert(r.ok and r.result.queued == true) return r.result.request')
+assert(req1 > req0 and #host.world == 0 and count(PROTO_WOPEN) == 0, 'nothing happens before the frame')
+assert(expect('{"method":"window.list"}', 'return r.result.rev') == rev1, 'queued is not done')
+frame()
+local wopen = last(PROTO_WOPEN)
+assert(wopen ~= nilptr and #host.world == 1, 'WOPEN sent, a panel')
+local wreq = proto.get_u32((@*[0]uint8)(wopen.data.data))
+assert(wopen.data:subview(14) == 'run:/usr/bin/yad --title x', 'run: prefix')
+assert(logged('asked the agent for run:/usr/bin/yad --title x, pinned here (for XivDesktop)') == 1, 'the caller in the log')
+local pid = host.world[0].id
+local rev2 = expect('{"method":"window.list"}', string.format([[
+  local w = r.result.windows[1]
+  assert(#r.result.windows == 1 and w.id == %d and w.sid == 0 and w.state == 'pending' and w.kind == 'pin', RAW)
+  assert(w.app == 'yad' and w.title == '' and w.w == 0 and w.focused == false, RAW)
+  local q = r.result.requests[#r.result.requests]
+  assert(q.request == %d and q.ok and q.method == 'window.open' and q.result.id == %d, RAW)
+  assert(r.result.rev ~= %d)
+  return r.result.rev]], pid, req1, pid, rev1))
+
+-- the agent opens it: live, with its title
+do
+  local title: string = 'Yad Window'
+  local b: [64]uint8
+  proto.put_u32(&b, wreq)
+  proto.put_u32((@*[0]uint8)(&b[4]), 5)
+  proto.put_u16((@*[0]uint8)(&b[8]), 640)
+  proto.put_u16((@*[0]uint8)(&b[10]), 400)
+  for i = 0, < #title do b[12 + i] = title.data[i] end
+  local q: ByteQueue
+  proto.write_frame(&q, PROTO_WOPENED, &b, 12 + #title)
+  peer_send(&q)
+  q:destroy()
+end
+frame()
+local rev3 = expect('{"method":"window.list"}', string.format([[
+  local w = r.result.windows[1]
+  assert(w.state == 'live' and w.sid == 5 and w.title == 'Yad Window' and r.result.rev ~= %d, RAW)
+  return r.result.rev]], rev2))
+
+-- focus, place, and a place that fails
+expect(string.format('{"method":"window.focus","params":{"id":%d}}', pid), 'assert(r.ok)')
+frame()
+assert(host.world_focus == pid, 'focused')
+expect('{"method":"window.list"}', string.format('assert(r.result.windows[1].focused and r.result.rev ~= %d, RAW)', rev3))
+host.world_focus = 0
+expect(string.format('{"method":"window.place","params":{"id":%d,"pin":"pet"}}', pid), 'assert(r.ok)')
+frame()
+expect('{"method":"window.list"}', 'assert(r.result.windows[1].kind == "pet", RAW)')
+local req4 = expect(string.format('{"method":"window.place","params":{"id":%d,"pin":"nowhere"}}', pid), 'return r.result.request')
+local req5 = expect('{"method":"window.focus","params":{"id":999}}', 'return r.result.request')
+frame()
+expect('{"method":"window.list"}', string.format([[
+  local n = #r.result.requests
+  local a, b = r.result.requests[n - 1], r.result.requests[n]
+  assert(a.request == %d and a.ok == false and a.error ~= '', RAW)
+  assert(b.request == %d and b.ok == false and b.error == 'no such window panel', RAW)
+  assert(r.result.windows[1].kind == 'pet', 'unchanged')]], req4, req5))
+
+-- no character: open fails with the reason
+player_here = false
+expect('{"method":"window.open","params":{"match":"x"}}', 'assert(r.ok)')
+frame()
+expect('{"method":"window.list"}', 'assert(r.result.requests[#r.result.requests].error == "no player (log in first)", RAW)')
+player_here = true
+
+-- close: WCLOSE, the panel gone
+forget()
+expect(string.format('{"method":"window.close","params":{"id":%d}}', pid), 'assert(r.ok)')
+frame()
+assert(#host.world == 0 and find_session(pid) == nilptr, 'closed')
+assert(count(PROTO_WCLOSE) == 1, 'the stream closed')
+expect('{"method":"window.list"}', 'assert(#r.result.windows == 0 and r.result.requests[#r.result.requests].ok, RAW)')
+
+-- refusals through the channel
+expect('{"method":"window.list",', 'assert(r.ok == false and r.error:find("malformed JSON"), RAW)')
+expect('not json', 'assert(r.ok == false and r.error:find("malformed JSON"), RAW)')
+expect('{"method":"window.teleport"}', 'assert(r.ok == false and r.error == "unknown method: window.teleport", RAW)')
+expect('{"method":"window.close","params":{}}', 'assert(r.ok == false and r.error:find("id must be"), RAW)')
+do
+  local n = gu_call(nilptr, &buf, #buf)
+  assert(n > 0 and string{data=(@*[0]byte)(&buf), size=n}:find('malformed JSON', 1, true) > 0, 'no request at all')
+end
+
+-- the queue holds 64 changes until the frame
+for i = 1, 64 do expect('{"method":"window.focus","params":{"id":1}}', 'assert(r.ok)') end
+expect('{"method":"window.focus","params":{"id":1}}', 'assert(r.ok == false and r.error:find("too many"), RAW)')
+frame()
+expect('{"method":"window.focus","params":{"id":1}}', 'assert(r.ok)')
+frame()
+
+-- a response that does not fit the caller's buffer
+do
+  local small: [24]cchar
+  assert(gu_call('{"method":"window.list"}', &small, #small) == 0 and small[0] == 0, 'not even the error fits')
+  local mid: [64]cchar
+  local n = gu_call('{"method":"window.list"}', &mid, #mid)
+  assert(string{data=(@*[0]byte)(&mid), size=n} == '{"ok":false,"error":"response too large"}', 'too large')
+end
+
+-- /term reload: the channel's Lua state starts afresh, request ids do not repeat
+do
+  local before = expect('{"method":"window.focus","params":{"id":1}}', 'return r.result.request')
+  assert(load_policy(), 'reload')
+  frame()
+  local after = expect('{"method":"window.focus","params":{"id":1}}', 'return r.result.request')
+  assert(after ~= before, 'fresh ids')
+  frame()
+end
+
+gu_shutdown()
+expect('{"method":"status"}', 'assert(r.ok == false and r.error == "ghostty is not running")')
+lua_close(J)
+print('ipc OK')

@@ -337,6 +337,9 @@ local WAYLAND_HANDOFF_WAIT: float64 <comptime> = 5.0 -- s, after a launched app 
 local X11_SCREEN_W: integer <comptime> = 3840 -- the X screen Xwayland sees (see start_xwayland)
 local X11_SCREEN_H: integer <comptime> = 2160
 local POPUP_MARGIN: integer <comptime> = 600 -- logical px popups may reach beyond their window
+-- Outputs advertise 60 Hz: a refresh of 0 makes GTK4 divide by zero timing its
+-- frames (SIGFPE, seen with GNOME Calculator and Text Editor 1.6 s after mapping)
+local WAYLAND_REFRESH_MHZ: int32 <comptime> = 60000
 local BTN_LEFT: uint32 <comptime> = 0x110 -- then BTN_RIGHT 0x111, BTN_MIDDLE 0x112
 local AXIS_PER_NOTCH: float64 <comptime> = 15.0 -- wl_pointer.axis units per wheel notch (libinput's)
 
@@ -850,7 +853,7 @@ local function top_mapped(t: *Top): void
     local st: wlr_output_state
     wlr_output_state_init(&st)
     wlr_output_state_set_enabled(&st, true)
-    wlr_output_state_set_custom_mode(&st, (@int32)(w * t.scale), (@int32)(h * t.scale), 0)
+    wlr_output_state_set_custom_mode(&st, (@int32)(w * t.scale), (@int32)(h * t.scale), WAYLAND_REFRESH_MHZ)
     -- apps render at this scale: crisp text on a panel seen up close
     wlr_output_state_set_scale(&st, (@float32)(t.scale))
     wlr_output_commit_state(t.output, &st)
@@ -1280,7 +1283,7 @@ local function render(t: *Top): void
   if not resize and not moved and not wlr_scene_output_needs_frame(t.sout) then return end
   local st: wlr_output_state
   wlr_output_state_init(&st)
-  if resize then wlr_output_state_set_custom_mode(&st, (@int32)(w), (@int32)(h), 0) end
+  if resize then wlr_output_state_set_custom_mode(&st, (@int32)(w), (@int32)(h), WAYLAND_REFRESH_MHZ) end
   if wlr_scene_output_build_state(t.sout, &st, nilptr) then
     if (st.committed & WLR_OUTPUT_STATE_BUFFER) ~= 0 and st.buffer ~= nilptr then
       grab(t, st.buffer, w, h)
@@ -1798,7 +1801,7 @@ local function start_xwayland(): void
       local st: wlr_output_state
       wlr_output_state_init(&st)
       wlr_output_state_set_enabled(&st, true)
-      wlr_output_state_set_custom_mode(&st, X11_SCREEN_W, X11_SCREEN_H, 0)
+      wlr_output_state_set_custom_mode(&st, X11_SCREEN_W, X11_SCREEN_H, WAYLAND_REFRESH_MHZ)
       wlr_output_commit_state(o, &st)
       wlr_output_state_finish(&st)
       wlr_output_create_global(o, wc.display)

@@ -53,8 +53,10 @@ local function expect(want: string, why: string): void
 end
 
 local vote_logs: integer = 0 -- lua/vote.lua saying it cannot open the page
+local warned: string -- the last warning
 local function quiet(level: cint, msg: cstring): void
   if (@string)(msg):find('vote:', 1, true) > 0 then vote_logs = vote_logs + 1 end
+  if level == LOG_WARN and (@string)(msg):find('cimgui', 1, true) == 0 then warned:destroy() warned = string.copy(msg) end
 end
 local open_ok: cint = 1
 local function open_url(url: cstring): cint
@@ -360,6 +362,65 @@ do
   assert(vote_logs == 1, 'logged once, with the link')
   gu_shutdown()
   expect(UNREGISTERED, 'shutdown')
+end
+
+-- Commands of their own: /window, /ask, /agent (CONFIG.host.verb_commands) -----------------------
+-- A shim with command_add_tagged registers each with its tag; its handler
+-- posts Chat with `a` = tag. The older shim above logged them once instead.
+local tagged: [8]string
+local tag_help: [8]string
+local function command_add_tagged(name: cstring, help: cstring, tag: cint): cint
+  assert(tag >= 1 and tag <= 8)
+  tagged[tag - 1]:destroy() tagged[tag - 1] = string.copy(name)
+  tag_help[tag - 1]:destroy() tag_help[tag - 1] = string.copy(help)
+  rec('tagged', name)
+  return 1
+end
+local function tag_of(name: string): cint
+  for i = 0, < 8 do if tagged[i] == name then return i + 1 end end
+  return 0
+end
+do
+  local newer: GuHostApi = api
+  newer.command_add_tagged = command_add_tagged
+  assert(gu_init_ex(&newer, &info) == INIT_OK)
+  local got = joined()
+  ## for _, want in ipairs{'add /term', 'add /tomestone', 'add /tome', 'tagged /window', 'tagged /ask', 'tagged /agent'} do
+    assert(got:find(#[want]#, 1, true) > 0, #[want]#)
+  ## end
+  got:destroy()
+  reset_calls()
+  local w, a, g = tag_of('/window'), tag_of('/ask'), tag_of('/agent')
+  assert(w > 0 and a > 0 and g > 0 and w ~= a and a ~= g, 'distinct tags')
+  assert(tag_help[w - 1]:find('pull [match|#wid] | run CMD', 1, true) > 0, 'help from lua/tooltips.lua')
+  lua("assert(ghostty.host_info().commands['/window'] == true)")
+  gu_event(GuEventKind.Chat, w, 0, 0, 0, 'desktop')
+  gu_frame()
+  assert(warned:find('window desktop: not available yet', 1, true) > 0, warned)
+  gu_event(GuEventKind.Chat, w, 0, 0, 0, '')
+  gu_frame()
+  assert(warned:find('usage: /window pull', 1, true) == 1, warned)
+  gu_event(GuEventKind.Chat, w, 0, 0, 0, 'run')
+  gu_frame()
+  assert(warned:find('usage: /window run', 1, true) == 1, warned)
+  gu_event(GuEventKind.Chat, w, 0, 0, 0, 'pull Firefox')
+  gu_frame()
+  assert(warned:find('window pull: ', 1, true) == 1, 'the same path as /term window pull: ' .. warned)
+  gu_event(GuEventKind.Chat, g, 0, 0, 0, 'status')
+  gu_frame()
+  assert(warned == 'usage: /agent ask [question]', warned)
+  gu_event(GuEventKind.Chat, 0, 0, 0, 0, 'config')
+  host.settings_open = false
+  gu_frame()
+  assert(host.settings_open, 'tag 0 is still a /term line')
+  gu_shutdown()
+  got = joined()
+  ## for _, want in ipairs{'remove /term', 'remove /window', 'remove /ask', 'remove /agent'} do
+    assert(got:find(#[want]#, 1, true) > 0, #[want]#)
+  ## end
+  got:destroy()
+  reset_calls()
+  for i = 0, < 8 do tagged[i]:destroy() tag_help[i]:destroy() end
 end
 
 -- gu_init (tests, plain embedding) without the surface callbacks registers nothing ----------------
