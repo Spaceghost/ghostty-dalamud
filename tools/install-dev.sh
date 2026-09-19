@@ -73,14 +73,16 @@ fi
 [[ -d "$DEST/lua" ]] && mv "$DEST/lua" "$DEST/lua.old"
 mv "$DEST/lua.tmp" "$DEST/lua"
 rm -rf "$DEST/lua.old"
-# shipped themes are replaced whole; your own live in the config directory's themes/
-if [[ -d "$SRC/themes" ]]; then
-  rm -rf "$DEST/themes.tmp" "$DEST/themes.old"
-  cp -r "$SRC/themes" "$DEST/themes.tmp"
-  [[ -d "$DEST/themes" ]] && mv "$DEST/themes" "$DEST/themes.old"
-  mv "$DEST/themes.tmp" "$DEST/themes"
-  rm -rf "$DEST/themes.old"
-fi
+# shipped themes and fallback fonts are replaced whole; your own themes live
+# in the config directory's themes/ (fonts are read when the plugin loads)
+for d in themes fonts; do
+  [[ -d "$SRC/$d" ]] || continue
+  rm -rf "$DEST/$d.tmp" "$DEST/$d.old"
+  cp -r "$SRC/$d" "$DEST/$d.tmp"
+  [[ -d "$DEST/$d" ]] && mv "$DEST/$d" "$DEST/$d.old"
+  mv "$DEST/$d.tmp" "$DEST/$d"
+  rm -rf "$DEST/$d.old"
+done
 
 loader_changed=0
 put_changed "$SRC/ghostty_loader.dll" "$DEST/ghostty_loader.dll" && loader_changed=1
