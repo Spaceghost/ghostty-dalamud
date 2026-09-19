@@ -364,6 +364,55 @@ do
   expect(UNREGISTERED, 'shutdown')
 end
 
+-- The screenshot gallery: uploads go through the shim, answers come back as events -------------
+-- (lua/gallery.lua itself: tests/test_gallery.lua)
+local function http_upload(id: cint, url: cstring, path: cstring, ctype: cstring): cint
+  assert((@string)(path) == 'C:\\shots\\ffxiv_1.png' and (@string)(ctype) == 'image/png', 'path and type as given')
+  rec('http_upload', url)
+  return 1
+end
+local function game_string(name: cstring, buf: *[0]cchar, cap: usize): usize
+  if (@string)(name) ~= 'player' then return 0 end
+  local v: string = 'Wyn Ghostty@Gilgamesh'
+  for i = 0, < #v do buf[i] = (@cchar)(v.data[i]) end
+  buf[#v] = 0
+  return #v
+end
+do
+  local a: GuHostApi = api
+  a.http_upload = http_upload
+  a.game_string = game_string
+  assert(gu_init_ex(&a, &info) == INIT_OK)
+  expect(REGISTERED, 'registers the same')
+  lua([[assert(ghostty.game_string('player') == 'Wyn Ghostty@Gilgamesh' and ghostty.game_string('user_path') == nil)
+    assert(ghostty.http_upload('https://spacegho.st/mods/ffxiv/term/gallery/api/upload', 'C:\\shots\\ffxiv_1.png', 'image/png') == 1)
+    local no, why = ghostty.http_upload('http://example.org/', 'C:\\shots\\ffxiv_1.png', 'image/png')
+    assert(no == nil and why:find('https'), 'only https')
+    assert(ghostty.http_upload('https://example.org/', '', 'image/png') == nil, 'a file is needed')
+    CONFIG.gallery.on_upload = function(id, status, text) GALLERY_SEEN = id .. ' ' .. status .. ' ' .. text end]])
+  expect('http_upload https://spacegho.st/mods/ffxiv/term/gallery/api/upload', 'only the https upload reaches the shim')
+  gu_event(GuEventKind.HttpDone, 1, 201, 0, 0, '{"ok":true,"status":"pending"}')
+  gu_frame()
+  lua([[assert(GALLERY_SEEN == '1 201 {"ok":true,"status":"pending"}', tostring(GALLERY_SEEN))]])
+  gu_event(GuEventKind.HttpDone, 2, 0, 0, 0, nilptr)
+  gu_frame()
+  lua([[assert(GALLERY_SEEN == '2 0 ', 'no text: an empty string')]])
+  assert(gu_command('share off') == 0 and gu_command('share gallery') == 0, '/term share reaches lua/gallery.lua')
+  expect('open_url https://spacegho.st/mods/ffxiv/term/gallery/', 'share gallery opens the page')
+  gu_shutdown()
+  expect(UNREGISTERED, 'shutdown')
+
+  -- a shim from before the gallery: neither function is there, the page opens instead
+  local old: GuHostApi = a
+  old.size = (@usize)(&old.http_upload) - (@usize)(&old)
+  assert(gu_init_ex(&old, &info) == INIT_OK)
+  expect(REGISTERED, 'an older shim registers the same')
+  assert(host.api.http_upload == nilptr and host.api.game_string == nilptr, 'nothing copied past size')
+  lua([[assert(ghostty.http_upload == nil and ghostty.game_string == nil)]])
+  gu_shutdown()
+  expect(UNREGISTERED, 'shutdown')
+end
+
 -- Commands of their own: /window, /ask, /agent (CONFIG.host.verb_commands) -----------------------
 -- A shim with command_add_tagged registers each with its tag; its handler
 -- posts Chat with `a` = tag. The older shim above logged them once instead.

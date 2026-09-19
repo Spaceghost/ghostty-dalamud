@@ -18,6 +18,7 @@ local themes = require('themes')
 local tooltips = require('tooltips')
 local windows = require('windows')
 local adopt = require('adopt')
+local gallery = require('gallery')
 
 -- The agent connection and profiles for where the game runs (native Windows,
 -- or Wine/Proton on Linux): see lua/platform.lua.
@@ -99,7 +100,7 @@ local config = {
     -- /agent ask [question]. Their /help lines are in lua/tooltips.lua.
     -- A name another plugin holds is retried; {} registers none.
     verb_commands = { ['/window'] = 'window', ['/ask'] = 'ask', ['/agent'] = 'agent' },
-    help = 'Show/hide the terminal. window [n|list|pull [match]|close] | new [n] | pin [here|me|target|orbit] | unpin | ask [question] | theme [name] | config | reload',
+    help = 'Show/hide the terminal. window [n|list|pull [match]|close] | new [n] | pin [here|me|target|orbit] | unpin | ask [question] | theme [name] | share | config | reload',
     -- Server info bar entry. 'auto' shows it only while no Umbra toolbar
     -- widget is showing ghostty's status; 'always' | 'never'.
     dtr = {
@@ -173,6 +174,11 @@ local config = {
   -- window and click its "pull into world" grip. Names, sizes, the modifier
   -- and chat colours: lua/adopt.lua (docs/ADOPT.md).
   adopt = adopt,
+  -- Share screenshots to the gallery on spacegho.st: a prompt after a screenshot
+  -- taken with a terminal on screen, /term share for the latest one. Nothing is
+  -- uploaded until you click Share. Folders, timings: lua/gallery.lua; the
+  -- prompt and credit toggles are in Settings, Gallery.
+  gallery = gallery,
   -- The settings window (/term config) and its saved overrides (settings.lua).
   settings = settings,
   -- Pinned automatically once your character is loaded, e.g. { 'orbit 4 0.2', 'me' }.

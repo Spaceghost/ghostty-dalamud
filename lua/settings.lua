@@ -10,6 +10,7 @@ local changelog = require('changelog')
 local vote = require('vote')
 local themes = require('themes')
 local tooltips = require('tooltips')
+local gallery = require('gallery')
 
 local S = {}
 
@@ -131,6 +132,10 @@ S.schema = {
   { 'Flat windows in the world', {
     { 'adopt.auto.mappy', 'checkbox', 'Mappy\'s map is a world panel whenever it is open' },
   } },
+  { 'Gallery', {
+    { 'gallery.prompt', 'checkbox', 'Offer to share screenshots taken while a terminal is on screen' },
+    { 'gallery.credit', 'checkbox', 'Credit shared screenshots to my character' },
+  } },
   { 'Info bar & hidden UI', {
     { 'host.dtr.mode', 'combo', DTR_MODES, 'Server info bar entry (auto: only without the Umbra widget)' },
     { 'popup.close_on_blur', 'checkbox', 'Info bar popup closes when you click elsewhere' },
@@ -207,6 +212,8 @@ function S.apply(config)
   -- an init.lua copied before themes and tooltips existed still gets them
   if config.themes == nil then config.themes = themes end
   if config.tooltips == nil then config.tooltips = tooltips end
+  -- ...and the gallery prompt, whose saved choices land in its module
+  if config.gallery == nil then config.gallery = gallery end
   if type(config.theme) ~= 'string' or config.theme == '' then config.theme = themes.DEFAULT end
   capture_defaults(config)
   local chunk = loadfile(file())

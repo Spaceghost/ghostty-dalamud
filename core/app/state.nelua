@@ -92,6 +92,11 @@ global GuHostApi = @record{
   addon_show: function(name: cstring, shown: cint): cint, -- a game addon (AtkUnitBase) shown or hidden; 1 = ok
   chat_send: function(text: cstring): cint,              -- a line through the game's chat box; 1 = queued
   config_uint: function(name: cstring, out: *uint32): cint, -- a UiConfig option (log colours); 1 = found
+  -- the screenshot gallery (core/app/gallery.nelua): POST the file at `path` to
+  -- an https `url`; 1 = started, the answer comes back as GuEventKind.HttpDone
+  http_upload: function(id: cint, url: cstring, path: cstring, content_type: cstring): cint,
+  -- a game string by name (screenshot_dir, user_path, player) into buf; its length, 0 = none
+  game_string: function(name: cstring, buf: *[0]cchar, cap: usize): usize,
 }
 
 global LOG_INFO: cint <comptime> = 1

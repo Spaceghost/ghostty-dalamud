@@ -5,6 +5,7 @@ require 'core.app.hotkeys'
 require 'core.app.boot'
 require 'core.app.ipc'
 require 'core.app.winpicker'
+require 'core.app.gallery'
 
 global function update_status(): void
   local sb: stringbuilder
@@ -65,6 +66,7 @@ global function load_policy(): boolean
     return false
   end
   boot_lua_register(policy.L)
+  gallery_lua_register(policy.L) -- ghostty.http_upload / game_string for lua/gallery.lua
   ipc_lua_register(policy.L) -- ghostty.window_* for lua/ipc.lua
   ipc_load(install, host.dir) -- GhosttyDalamud.v1.Call's own Lua state (docs/IPC.md)
   settings_badge_refresh()

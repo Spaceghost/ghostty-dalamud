@@ -1,0 +1,95 @@
+-- The screenshot gallery's core side: what lua/gallery.lua decides is drawn
+-- and sent from here. ghostty.http_upload hands one file to the shim for an
+-- HTTPS POST (only https links), ghostty.game_string reads the screenshot
+-- folder and the character's name through it, and the prompt is a small
+-- window in the bottom right corner that Lua fills with ghostty.ui.
+require 'core.app.boot'
+
+local GALLERY_STRING_MAX <comptime> = 1024
+
+local gallery_next_id: cint = 0
+
+local function arg_cstring(L: *lua_State, idx: cint): (cstring, usize)
+  local len: usize = 0
+  local p = lua_tolstring(L, idx, &len)
+  return p, len
+end
+
+-- ghostty.http_upload(url, path, content_type) -> id, or nil and why. The
+-- answer arrives later in CONFIG.gallery.on_upload(id, status, text).
+local function l_http_upload(L: *lua_State): cint
+  local url, ulen = arg_cstring(L, 1)
+  local path, plen = arg_cstring(L, 2)
+  local ctype, clen = arg_cstring(L, 3)
+  if url == nilptr or not url_is_https(string{data=(@*[0]byte)(url), size=ulen}) then
+    lua_pushnil(L) lua_pushstring(L, 'only https:// links')
+    return 2
+  end
+  if path == nilptr or plen == 0 or ctype == nilptr or clen == 0 then
+    lua_pushnil(L) lua_pushstring(L, 'a file and its type are needed')
+    return 2
+  end
+  if host.api.http_upload == nilptr then
+    lua_pushnil(L) lua_pushstring(L, 'this plugin build cannot upload')
+    return 2
+  end
+  gallery_next_id = gallery_next_id + 1
+  local id = gallery_next_id
+  if host.api.http_upload(id, url, path, ctype) == 0 then
+    lua_pushnil(L) lua_pushstring(L, 'the host could not start it')
+    return 2
+  end
+  lua_pushinteger(L, id)
+  return 1
+end
+
+-- ghostty.game_string(name) -> text, or nil (screenshot_dir, user_path, player).
+local function l_game_string(L: *lua_State): cint
+  local name = lua_tolstring(L, 1, nilptr)
+  if name == nilptr or host.api.game_string == nilptr then lua_pushnil(L) return 1 end
+  local buf: [GALLERY_STRING_MAX]cchar
+  local n = host.api.game_string(name, (@*[0]cchar)(&buf), GALLERY_STRING_MAX)
+  if n == 0 or n >= GALLERY_STRING_MAX then lua_pushnil(L) return 1 end
+  lua_pushlstring(L, (@cstring)(&buf), n)
+  return 1
+end
+
+-- Adds them to `ghostty`, each only when the shim provides it (an older shim
+-- leaves them nil and lua/gallery.lua falls back to the gallery page).
+global function gallery_lua_register(L: *lua_State): void
+  lua_getglobal(L, 'ghostty')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return end
+  if host.api.http_upload ~= nilptr then lua_pushcclosure(L, l_http_upload, 0) lua_setfield(L, -2, 'http_upload') end
+  if host.api.game_string ~= nilptr then lua_pushcclosure(L, l_game_string, 0) lua_setfield(L, -2, 'game_string') end
+  lua_pop(L, 1)
+end
+
+global function gallery_uploaded(id: cint, status: cint, text: string): void
+  policy_gallery_uploaded(id, status, text)
+end
+
+-- Per frame. `shown`: a terminal is on screen (the dropdown, a window or a
+-- screen in the world). Lua watches the screenshot folder and says whether
+-- its prompt is up; `live` false (suspended) only lets it keep time.
+global function gallery_frame(now: float64, shown: boolean, live: boolean): void
+  if not policy_gallery_tick(now, shown) or not live then return end
+  local vp = imgui.GetMainViewport()
+  local margin: float32 = 24
+  imgui.SetNextWindowPos(vec2(vp.Pos.x + vp.Size.x - margin, vp.Pos.y + vp.Size.y * 0.72), ImGuiCond_Always, vec2(1, 1))
+  imgui.SetNextWindowSize(vec2(math.min(400, vp.Size.x - 2 * margin), 0), ImGuiCond_Always) -- height fits the contents
+  imgui.SetNextWindowBgAlpha(0.92)
+  local flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoSavedSettings |
+    ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoFocusOnAppearing | ImGuiWindowFlags_NoNav
+  if imgui.Begin('##ghostty_gallery_prompt', nilptr, flags) then policy_gallery_draw() end
+  imgui.End()
+end
+
+-- /term share [on|off|gallery|path]: the line goes to the chat.
+global function gallery_command(args: string): cint
+  local msg = policy_gallery_command(args)
+  if #msg == 0 then return 4 end
+  say(LOG_INFO, msg)
+  msg:destroy()
+  return 0
+end

@@ -197,10 +197,11 @@ end
 global ChromeAction = @enum{
   None = 0,
   NewTab, Profiles, Window, Pin, Pet, Minimize, Settings, Hide, -- the tab bar
+  Share,                                                        -- the tab bar: a screenshot to the gallery
   Dock, Close,                                                  -- a floating window's header
 }
 
-global ChromeIcon = @enum{ Plus = 0, Chevron, Window, Pin, Paw, Minimize, Gear, Hide, Dock, Close }
+global ChromeIcon = @enum{ Plus = 0, Chevron, Window, Pin, Paw, Minimize, Gear, Hide, Dock, Close, Camera }
 
 global ChromeButton = @record{
   id: string,
@@ -210,7 +211,7 @@ global ChromeButton = @record{
   tip: string,
 }
 
-global CHROME_TAB_BUTTONS <comptime> = 8
+global CHROME_TAB_BUTTONS <comptime> = 9
 global chrome_tab_buttons: [CHROME_TAB_BUTTONS]ChromeButton = {
   { id = 'new', action = ChromeAction.NewTab, icon = ChromeIcon.Plus, group = 0, tip = 'New tab' },
   { id = 'profiles', action = ChromeAction.Profiles, icon = ChromeIcon.Chevron, group = 0, tip = 'New tab from a profile' },
@@ -218,6 +219,7 @@ global chrome_tab_buttons: [CHROME_TAB_BUTTONS]ChromeButton = {
   { id = 'pin', action = ChromeAction.Pin, icon = ChromeIcon.Pin, group = 1, tip = 'Pin this tab into the world where you stand' },
   { id = 'pet', action = ChromeAction.Pet, icon = ChromeIcon.Paw, group = 1, tip = 'Let this tab float beside you as a pet' },
   { id = 'min', action = ChromeAction.Minimize, icon = ChromeIcon.Minimize, group = 1, tip = 'Minimize this tab to the toolbar' },
+  { id = 'share', action = ChromeAction.Share, icon = ChromeIcon.Camera, group = 2, tip = 'Share your latest screenshot to the gallery' },
   { id = 'cfg', action = ChromeAction.Settings, icon = ChromeIcon.Gear, group = 2, tip = 'Settings' },
   { id = 'hide', action = ChromeAction.Hide, icon = ChromeIcon.Hide, group = 2, tip = 'Hide the dropdown' },
 }
@@ -314,6 +316,11 @@ global function chrome_draw_icon(dl: *ImDrawList, icon: ChromeIcon, cx: float32,
     imgui.DrawListAddLine(dl, vec2(cx - r, cy - r * 0.85), vec2(cx + r, cy - r * 0.85), col, t)
     imgui.DrawListAddLine(dl, vec2(cx, cy + r), vec2(cx, cy - r * 0.1), col, t)
     imgui.DrawListAddTriangleFilled(dl, vec2(cx - r * 0.5, cy + r * 0.05), vec2(cx + r * 0.5, cy + r * 0.05), vec2(cx, cy - r * 0.5), col)
+  elseif icon == ChromeIcon.Camera then
+    -- a camera body with its lens and the shutter bump
+    imgui.DrawListAddRect(dl, vec2(cx - r, cy - r * 0.55), vec2(cx + r, cy + r * 0.8), col, r * 0.25, 0, t * 0.85)
+    imgui.DrawListAddRectFilled(dl, vec2(cx - r * 0.35, cy - r * 0.85), vec2(cx + r * 0.3, cy - r * 0.55), col, 1, 0)
+    imgui.DrawListAddCircle(dl, vec2(cx, cy + r * 0.12), r * 0.38, col, 16, t * 0.85)
   elseif icon == ChromeIcon.Close then
     imgui.DrawListAddLine(dl, vec2(cx - r * 0.7, cy - r * 0.7), vec2(cx + r * 0.7, cy + r * 0.7), col, t)
     imgui.DrawListAddLine(dl, vec2(cx + r * 0.7, cy - r * 0.7), vec2(cx - r * 0.7, cy + r * 0.7), col, t)

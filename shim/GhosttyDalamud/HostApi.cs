@@ -3,6 +3,10 @@
 using System;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Dalamud.Game.ClientState.GamePad;
@@ -82,6 +86,8 @@ internal static unsafe class HostApi
         Api->AddonShow      = &AddonShow;
         Api->ChatSend       = &ChatSend;
         Api->ConfigUInt     = &ConfigUInt;
+        Api->HttpUpload     = &HttpUpload;
+        Api->GameString     = &GameString;
     }
 
     public static void Free()
@@ -276,6 +282,41 @@ internal static unsafe class HostApi
             return 1;
         } catch { return 0; }
     }
+
+    // A game or Dalamud string the core asks for by name, as UTF-8 into buf (NUL
+    // terminated, cut to cap). Returns its length; 0 when there is none.
+    //   screenshot_dir  the game's own screenshot folder setting (empty: the default)
+    //   user_path       the game's user folder (FFXIV.cfg, and screenshots\ by default)
+    //   player          "Name@World" of the logged-in character
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static nuint GameString(byte* name, byte* buf, nuint cap)
+    {
+        if (buf == null || cap == 0) return 0;
+        try {
+            string v = Str(name) switch {
+                "screenshot_dir" => Plugin.GameConfig.System.TryGetString("ScreenShotDir", out string d) ? d : string.Empty,
+                "user_path" => FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance()->UserPathString,
+                "player" => Plugin.Objects.LocalPlayer is { } p ? p.Name.TextValue + "@" + p.HomeWorld.Value.Name.ToString() : string.Empty,
+                _ => string.Empty,
+            };
+            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(v);
+            int n = (int)Math.Min((nuint)bytes.Length, cap - 1);
+            for (int i = 0; i < n; i++) buf[i] = bytes[i];
+            buf[n] = 0;
+            return (nuint)n;
+        } catch { buf[0] = 0; return 0; }
+    }
+
+    // Uploads (the screenshot gallery, lua/gallery.lua): see GalleryUpload below.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int HttpUpload(int id, byte* url, byte* path, byte* contentType)
+    {
+        if (url == null || path == null || contentType == null) return 0;
+        try { GalleryUpload.Start(id, Str(url), Str(path), Str(contentType)); return 1; } catch { return 0; }
+    }
+
+    // Before the core goes away: no upload may call into it afterwards.
+    public static void StopHttp() => GalleryUpload.Stop();
 
     // Fonts and keys -----------------------------------------------------------------------------
 
@@ -684,5 +725,53 @@ internal static unsafe class HostApi
             *hx = hit.Point.X; *hy = hit.Point.Y; *hz = hit.Point.Z;
             return 1;
         } catch { return 0; }
+    }
+}
+
+// POST the file at `path` to `url` (the core only passes https links) as `contentType`,
+// off the game's threads. The answer comes back as GuEvent.HttpDone: a = id, b = the HTTP
+// status (0: no answer, -1: the file could not be read), text = the start of the body or
+// the error. Nothing is posted once the plugin is unloading. (Outside HostApi, which is
+// unsafe: async code cannot run in an unsafe context.)
+internal static class GalleryUpload
+{
+    private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(90) };
+    private static readonly object Gate = new();
+    private static readonly CancellationTokenSource StopSource = new();
+    private static bool _open = true;
+
+    public static void Start(int id, string url, string path, string contentType)
+    {
+        CancellationToken stop = StopSource.Token;
+        _ = Task.Run(async () => {
+            int status;
+            string text;
+            try {
+                byte[] body = await File.ReadAllBytesAsync(path, stop);
+                using var content = new ByteArrayContent(body);
+                content.Headers.ContentType = new MediaTypeHeaderValue(contentType);
+                using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+                req.Headers.TryAddWithoutValidation("X-Ghostty-Client", "GhosttyDalamud");
+                using var res = await Http.SendAsync(req, stop);
+                status = (int)res.StatusCode;
+                text = await res.Content.ReadAsStringAsync(stop);
+            } catch (OperationCanceledException) when (stop.IsCancellationRequested) {
+                return;
+            } catch (Exception e) when (e is IOException or UnauthorizedAccessException) {
+                status = -1; // the screenshot could not be read
+                text = e.Message;
+            } catch (Exception e) {
+                status = 0; // no answer: offline, DNS, TLS, timeout
+                text = e.Message;
+            }
+            if (text.Length > 240) text = text[..240];
+            lock (Gate) { if (_open) Native.Post(GuEvent.HttpDone, id, status, 0, 0, text); }
+        });
+    }
+
+    public static void Stop()
+    {
+        lock (Gate) _open = false;
+        try { StopSource.Cancel(); } catch { /* already stopped */ }
     }
 }

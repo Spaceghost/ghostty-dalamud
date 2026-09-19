@@ -27,10 +27,42 @@ only C is vendored (libghostty-vt is Zig; Lua 5.4; the cimgui header).
 
 ## Screenshots
 
-<!-- screenshots: dropdown, popup, world panels, bell (take them with /term showcase) -->
+**Gallery: https://spacegho.st/mods/ffxiv/term/gallery/**, screenshots shared by
+players.
 
-None yet. `/term showcase` sets up demo terminals and camera shots for taking
-them with your own terminals hidden.
+Sharing one takes one click. With a terminal on screen (the dropdown, a
+window or a screen in the world), take a normal screenshot with the game's
+screenshot key. The plugin sees the new file in the game's screenshot folder
+and a small prompt in the bottom right asks **Share to the Ghostty gallery?**
+Click **Share**. The image goes to the gallery, where the site owner reviews it
+before anyone else can see it. Tick **Credit it to Name@World** in the prompt to
+have your character named under it; left unticked, it is anonymous.
+
+- `/term share`, the camera button in the dropdown's tab bar, or Settings →
+  About → **Share my latest screenshot** offer your most recent screenshot at
+  any time.
+- **Don't ask again** in the prompt, `/term share off` or Settings → Gallery
+  turns the prompt off; `/term share on` turns it back on.
+- Nothing is uploaded without the click. The prompt only watches the folder
+  while a terminal is on screen, or was within the last minute, and a
+  screenshot taken while no terminal was showing is never offered.
+- The gallery takes PNG and JPEG up to 8 MB. A 4K PNG can be larger: the
+  prompt says so, and JPG (System Configuration → Other Settings →
+  Screenshots) is much smaller. The site strips the files' embedded metadata.
+- The folder is the game's own screenshot setting (`ScreenShotDir`), else
+  `screenshots` in the game's user folder; `CONFIG.gallery.folders` in
+  `lua/gallery.lua` adds more (for example a Steam or ShareX folder).
+- You can also pick a file on the gallery page itself.
+
+`/term showcase` sets up demo terminals and camera shots for taking them with
+your own terminals hidden.
+
+This is new and not yet tried in game. In particular it is not known yet
+whether the game's own screenshots include Dalamud's windows (the terminals
+are drawn by Dalamud, after the game draws its frame). If they come out
+without the terminals, point `CONFIG.gallery.folders` at the folder of a
+capture tool that grabs the whole screen (the Steam overlay's F12, the
+Windows Game Bar or ShareX).
 
 ## What you get
 
@@ -420,6 +452,7 @@ return {
 | `/term showcase`, `/term showcase off` | demo terminals and camera shots for screenshots; needs nothing on disk |
 | `/term ask [question]` | ask a local AI assistant in a terminal of its own (see [Assistant](#assistant-term-ask)) |
 | `/term theme [name]` | switch the colour theme, or list the themes (see [Themes](#themes)) |
+| `/term share [on\|off\|gallery\|path]` | offer your latest screenshot (or `path`) to the gallery; `on`/`off` the prompt after screenshots; `gallery` opens the page (see [Screenshots](#screenshots)) |
 | `/term config` | the settings window |
 | `/term reload` | reload the Lua configuration |
 | `/term selftest [list\|all\|suite...]` | deterministic checks inside the game, report in `selftest/latest.json` of the config directory (see [docs/CI.md](docs/CI.md#in-game-tests); not yet run in game) |
@@ -534,7 +567,12 @@ handles overlapped reads, not observed.
 
 Everything runs on your machines. From the code: the plugin connects only to
 the agent address you configure, sends no telemetry, and logs only to
-Dalamud's local log. The agent listens only on the address you pass (default
+Dalamud's local log. The one exception is a screenshot you choose to share:
+clicking **Share** sends that image (and, if you ticked the credit box, your
+character's name and world) over HTTPS to
+`https://spacegho.st/mods/ffxiv/term/gallery/api/upload`. It is shown
+publicly only after the site owner approves it. The plugin reads your
+character's name only to show it in the prompt. The agent listens only on the address you pass (default
 `127.0.0.1:7777`) and requires the token (on Windows kept in
 `%APPDATA%\ghostty-agent\token` with an owner-only DACL); the stream is not encrypted, so
 tunnel it for remote use. Migrated config copies are written owner-only.

@@ -83,6 +83,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         Pi.ActivePluginsChanged   -= OnPluginsChanged;
         Chat.ChatMessageUnhandled -= OnChat;
         HostApi.UnhookWalkInput(); // before the core it calls goes away
+        HostApi.StopHttp();        // a gallery upload still running never reports into an unloaded core
         Native.Shutdown();         // the core removes its commands, info bar entry and IPC first
         Native.Unload();
         HostApi.Free();
