@@ -95,6 +95,10 @@ tests/run.sh               # host-side tests (libghostty binding, renderer, Lua 
 The .NET SDK does not need root: `dotnet-install.sh --channel 10.0 --install-dir <dir>`
 (with a disk-backed `TMPDIR` if `/tmp` is small).
 
+`tools/ci/run.sh test build` does the same with pinned, checksum-verified Zig
+and Dalamud assemblies; it is what GitHub Actions and the self-hosted runners
+run (see [docs/CI.md](docs/CI.md)).
+
 Output:
 
 | Path | What |
