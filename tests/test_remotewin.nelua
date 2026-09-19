@@ -1,0 +1,737 @@
+-- Remote windows on world panels (core/app/remotewin.nelua) against a fake
+-- version 3 agent on a socketpair, a fake ImGui and a fake D3D11 texture
+-- table: opening, KEY and delta frames rebuilt in the CPU copy, texture
+-- creation and dirty-rectangle uploads, WACK after END (held while asleep),
+-- the textured strips covering the letterboxed picture, pointer / button /
+-- wheel / key / text input with the panel's chrome keeping its clicks, WEND
+-- closing the panel, a panel closed before WOPENED, an older shim, and the
+-- refusal of a version 2 agent.
+require 'core.host'
+require 'string'
+require 'vector'
+require 'arg'
+
+## cinclude '<sys/socket.h>'
+## cinclude '<fcntl.h>'
+## cinclude '<unistd.h>'
+local function socketpair(domain: cint, typ: cint, protocol: cint, fds: *[2]cint): cint <cimport, nodecl> end
+local function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
+local function read(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function write(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function close(fd: cint): cint <cimport, nodecl> end
+local AF_UNIX: cint <cimport, nodecl, const>
+local SOCK_STREAM: cint <cimport, nodecl, const>
+local F_GETFL: cint <cimport, nodecl, const>
+local F_SETFL: cint <cimport, nodecl, const>
+local O_NONBLOCK: cint <cimport, nodecl, const>
+
+local function near(a: float32, b: float32, eps: float32): boolean return math.abs(a - b) < eps end
+
+local log_lines: vector(string)
+local function log_cb(level: cint, msg: cstring): void
+  io.write('[log ', level, '] ', msg, '\n')
+  log_lines:push(string.copy(msg))
+end
+local function logged(needle: string): integer
+  local n = 0
+  for i = 0, < #log_lines do
+    if log_lines[i]:find(needle, 1, true) > 0 then n = n + 1 end
+  end
+  return n
+end
+
+-- The game: a player at (10, 0, 20) and a reversed-Z camera behind it
+-- looking along +Z (as in tests/test_worldpanel.nelua).
+local function game_player(which: cint, id: uint64, out: *GuObject): cint
+  $out = {}
+  if which == WORLD_PLAYER then
+    $out = { x = 10, y = 0, z = 20, rotation = 0, entity_id = 7, territory = 132, found = 1, height = 1.7, hitbox_radius = 0.5 }
+  end
+  return 1
+end
+local function fake_camera(c: *GuCamera): cint
+  $c = { width = 2560, height = 1440 }
+  local f = 1 / math.tan(0.78 / 2)
+  local a = f * 1440 / 2560
+  c.m[0] = -a
+  c.m[5] = f
+  c.m[11] = 1
+  c.m[12] = 10 * a
+  c.m[13] = -1.7 * f
+  c.m[15] = -15
+  c.m[14] = 0.1
+  return 1
+end
+local FAKE_DEVICE: pointer <const> = (@pointer)(0x1234)
+local function fake_scene_depth(out: *GuSceneDepth): cint
+  $out = { srv = nilptr, ui_device = FAKE_DEVICE, actual_width = 2560, actual_height = 1440, allocated_width = 2560, allocated_height = 1440 }
+  return 1
+end
+
+local api: GuHostApi = {
+  size = #GuHostApi, log = log_cb, get_object = game_player, get_camera = fake_camera, get_scene_depth = fake_scene_depth,
+}
+local dir: string = arg[1]
+
+-- Fake D3D11 ------------------------------------------------------------------------
+local creates, releases, live_textures = 0, 0, 0
+local created_w: uint32, created_h: uint32 = 0, 0
+local created_device: pointer
+local uploads: vector(WinRect)
+local upload_pitch: uint32 = 0
+local function tex_create(device: pointer, w: uint32, h: uint32, tex: *pointer, srv: *pointer): clong
+  creates = creates + 1
+  live_textures = live_textures + 1
+  created_device, created_w, created_h = device, w, h
+  $tex, $srv = (@pointer)(0x100 + creates), (@pointer)(0x200 + creates)
+  return 0
+end
+local function tex_update(device: pointer, tex: pointer, r: WinRect, src: pointer, pitch: uint32): void
+  assert(device == FAKE_DEVICE and tex ~= nilptr)
+  uploads:push(r)
+  upload_pitch = pitch
+end
+local function tex_release(tex: pointer, srv: pointer): void
+  releases = releases + 1
+  live_textures = live_textures - 1
+end
+local fake_tex: WinTexApi = { create = tex_create, update = tex_update, release = tex_release }
+wintex_fake = &fake_tex
+
+-- Fake ImGui --------------------------------------------------------------------------
+local MAX_CMDS <comptime> = 4096
+local MAX_VERTS <comptime> = 400000
+local cmds: [MAX_CMDS]ImDrawCmd
+local verts: [MAX_VERTS]ImDrawVert
+local dl: ImDrawList
+local viewport: ImGuiViewport = { Size = { 2560, 1440 } }
+local io_state: ImGuiIO
+local now: float64 = 300
+local mouse_at: ImVec2 = { -5000, -5000 }
+local frame_count = 0
+local keys_down: [1024]boolean
+local chars: [8]uint16
+
+local function reset_list(): void
+  cmds[0] = { ClipRect = { 0, 0, 2560, 1440 } }
+  dl.CmdBuffer = { Size = 1, Capacity = MAX_CMDS, Data = (@*[0]ImDrawCmd)(&cmds) }
+  dl.VtxBuffer = { Size = 0, Capacity = MAX_VERTS, Data = (@*[0]ImDrawVert)(&verts) }
+end
+local function push_vert(p: ImVec2, col: uint32): void
+  assert(dl.VtxBuffer.Size < MAX_VERTS)
+  verts[dl.VtxBuffer.Size] = { pos = p, col = col }
+  dl.VtxBuffer.Size = dl.VtxBuffer.Size + 1
+  cmds[dl.CmdBuffer.Size - 1].ElemCount = cmds[dl.CmdBuffer.Size - 1].ElemCount + 1
+end
+local function quad(a: ImVec2, b: ImVec2, col: uint32): void
+  push_vert(a, col) push_vert(vec2(b.x, a.y), col) push_vert(b, col) push_vert(vec2(a.x, b.y), col)
+end
+-- AddImage: recorded (before worldview bends the vertices onto the panel)
+local ImageCall = @record{ tex: pointer, a: ImVec2, b: ImVec2, ua: ImVec2, ub: ImVec2 }
+local images: vector(ImageCall)
+local function fake_image(l: *ImDrawList, tex: pointer, a: ImVec2, b: ImVec2, ua: ImVec2, ub: ImVec2, col: uint32): void
+  images:push(ImageCall{ tex = tex, a = a, b = b, ua = ua, ub = ub })
+  quad(a, b, col)
+end
+local texts = 0
+local function fake_rect_filled(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint): void quad(a, b, col) end
+local function fake_rect(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint, th: float32): void quad(a, b, col) end
+local function fake_line(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, th: float32): void quad(a, b, col) end
+local function fake_triangle(l: *ImDrawList, a: ImVec2, b: ImVec2, c: ImVec2, col: uint32): void
+  push_vert(a, col) push_vert(b, col) push_vert(c, col)
+end
+local function fake_text(l: *ImDrawList, font: *ImFont, size: float32, pos: ImVec2, col: uint32, tb: cstring, te: cstring, ww: float32, clip: *ImVec4): void
+  texts = texts + 1
+  quad(pos, vec2(pos.x + 8, pos.y + 16), col)
+end
+local function fake_prim_reserve(l: *ImDrawList, idx: cint, vtx: cint): void end
+local function fake_prim_vtx(l: *ImDrawList, pos: ImVec2, uv: ImVec2, col: uint32): void push_vert(pos, col) end
+local function fake_uv(out: *ImVec2): void $out = vec2(0, 0) end
+local function fake_push_clip(l: *ImDrawList, a: ImVec2, b: ImVec2, intersect: boolean): void end
+local function fake_pop_clip(l: *ImDrawList): void end
+local function fake_calc(pOut: *ImVec2, font: *ImFont, size: float32, mw: float32, ww: float32, tb: cstring, te: cstring, rem: *cstring): void
+  $pOut = vec2(8, 16)
+end
+local function fake_bg(): *ImDrawList return &dl end
+local function fake_viewport(): *ImGuiViewport return &viewport end
+local function fake_mouse(out: *ImVec2): void $out = mouse_at end
+local function fake_false_flags(flags: cint): boolean return false end
+local want_mouse = false
+local want_keyboard = false
+local function fake_want_mouse(want: boolean): void if want then want_mouse = true end end
+local function fake_want_keyboard(want: boolean): void if want then want_keyboard = true end end
+local function fake_font(): *ImFont return nilptr end
+local function fake_font_size(): float32 return 16 end
+local function fake_time(): float64 return now end
+local function fake_io(): *ImGuiIO return &io_state end
+local function fake_clicked(button: cint, rep: boolean): boolean return false end
+local function fake_focus_nil(): void end
+local function fake_frame_count(): cint return frame_count end
+local function fake_key_down(key: cint): boolean return key >= 0 and key < 1024 and keys_down[key] end
+local function fake_key_pressed(key: cint, rep: boolean): boolean return false end
+local function fake_set_clipboard(text: cstring): void end
+
+local function resolver(name: cstring): pointer
+  local n: string = name
+  if n == 'ImDrawList_AddRectFilled' then return (@pointer)(fake_rect_filled) end
+  if n == 'ImDrawList_AddRect' then return (@pointer)(fake_rect) end
+  if n == 'ImDrawList_AddLine' then return (@pointer)(fake_line) end
+  if n == 'ImDrawList_AddTriangleFilled' then return (@pointer)(fake_triangle) end
+  if n == 'ImDrawList_AddText_FontPtr' then return (@pointer)(fake_text) end
+  if n == 'ImDrawList_AddImage' then return (@pointer)(fake_image) end
+  if n == 'ImDrawList_PrimReserve' then return (@pointer)(fake_prim_reserve) end
+  if n == 'ImDrawList_PrimVtx' then return (@pointer)(fake_prim_vtx) end
+  if n == 'igGetFontTexUvWhitePixel' then return (@pointer)(fake_uv) end
+  if n == 'ImDrawList_PushClipRect' then return (@pointer)(fake_push_clip) end
+  if n == 'ImDrawList_PopClipRect' then return (@pointer)(fake_pop_clip) end
+  if n == 'ImFont_CalcTextSizeA' then return (@pointer)(fake_calc) end
+  if n == 'igGetBackgroundDrawList_Nil' then return (@pointer)(fake_bg) end
+  if n == 'igGetMainViewport' then return (@pointer)(fake_viewport) end
+  if n == 'igGetMousePos' then return (@pointer)(fake_mouse) end
+  if n == 'igIsWindowHovered' then return (@pointer)(fake_false_flags) end
+  if n == 'igSetNextFrameWantCaptureMouse' then return (@pointer)(fake_want_mouse) end
+  if n == 'igSetNextFrameWantCaptureKeyboard' then return (@pointer)(fake_want_keyboard) end
+  if n == 'igGetFont' then return (@pointer)(fake_font) end
+  if n == 'igGetFontSize' then return (@pointer)(fake_font_size) end
+  if n == 'igGetTime' then return (@pointer)(fake_time) end
+  if n == 'igGetIO' then return (@pointer)(fake_io) end
+  if n == 'igIsMouseClicked' then return (@pointer)(fake_clicked) end
+  if n == 'igSetWindowFocus_Nil' then return (@pointer)(fake_focus_nil) end
+  if n == 'igGetFrameCount' then return (@pointer)(fake_frame_count) end
+  if n == 'igIsKeyDown' then return (@pointer)(fake_key_down) end
+  if n == 'igIsKeyPressed' then return (@pointer)(fake_key_pressed) end
+  if n == 'igSetClipboardText' then return (@pointer)(fake_set_clipboard) end
+  return nilptr
+end
+
+-- A fake agent on a socketpair ----------------------------------------------------------
+local Frame = @record{ typ: uint8, data: string }
+local peer: cint = -1
+local peer_q: ByteQueue
+local frames: vector(Frame)
+
+local function fake_connect(greeting: string): void
+  local fds: [2]cint
+  assert(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
+  fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK)
+  fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL, 0) | O_NONBLOCK)
+  if peer >= 0 then close(peer) end
+  net.close(host.agent.sock)
+  host.agent.sock = fds[0]
+  host.agent.inq:destroy()
+  host.agent.outq:destroy()
+  host.agent.state = AgentState.Handshake
+  peer = fds[1]
+  peer_q:destroy()
+  local q: ByteQueue
+  proto.write_frame(&q, PROTO_OK, (@*[0]uint8)(greeting.data), greeting.size)
+  assert(write(peer, q:peek(), q:len()) == (@isize)(q:len()))
+  q:destroy()
+end
+
+local function peer_send(q: *ByteQueue): void
+  while q:len() > 0 do
+    local n = write(peer, q:peek(), q:len())
+    assert(n > 0, 'peer write')
+    q:consume((@usize)(n))
+  end
+end
+
+local function pump(): void
+  host.last_time = now
+  agent_pump(now)
+end
+
+-- Read what the client sent; each frame's payload kept.
+local function peer_collect(): void
+  host.agent:flush()
+  local buf: [65536]uint8
+  while true do
+    local n = read(peer, &buf, 65536)
+    if n <= 0 then break end
+    peer_q:push(&buf, (@usize)(n))
+  end
+  while true do
+    local ok, typ, payload, len = proto.read_frame(&peer_q)
+    if not ok then break end
+    frames:push(Frame{ typ = typ, data = string.copy(string{data=(@*[0]byte)(payload), size=len}) })
+    proto.frame_consume(&peer_q, len)
+  end
+end
+local function forget(): void
+  peer_collect()
+  for i = 0, < #frames do frames[i].data:destroy() end
+  frames:clear()
+end
+local function count(typ: uint8): integer
+  peer_collect()
+  local n = 0
+  for i = 0, < #frames do if frames[i].typ == typ then n = n + 1 end end
+  return n
+end
+-- The last frame of `typ` (its payload), or nilptr.
+local function last(typ: uint8): *[0]uint8
+  peer_collect()
+  local i = #frames - 1
+  while i >= 0 do
+    if frames[i].typ == typ then return (@*[0]uint8)(frames[i].data.data) end
+    i = i - 1
+  end
+  return nilptr
+end
+local function inputs(kind: uint8): integer
+  peer_collect()
+  local n = 0
+  for i = 0, < #frames do
+    if frames[i].typ == PROTO_WINPUT and (@*[0]uint8)(frames[i].data.data)[4] == kind then n = n + 1 end
+  end
+  return n
+end
+local function last_input(kind: uint8): *[0]uint8
+  peer_collect()
+  local i = #frames - 1
+  while i >= 0 do
+    local p = (@*[0]uint8)(frames[i].data.data)
+    if frames[i].typ == PROTO_WINPUT and p[4] == kind then return (@*[0]uint8)(&p[5]) end
+    i = i - 1
+  end
+  return nilptr
+end
+local function i16(p: *[0]uint8, at: integer): integer return (@int16)(proto.get_u16((@*[0]uint8)(&p[at]))) end
+
+-- A test window: W x H with a pattern, frame `n` differs in a small block.
+local W <comptime> = 64
+local H <comptime> = 40
+local function render(n: integer, out: *vector(uint8)): void
+  out:resize(W * H * 4)
+  for y = 0, < H do
+    for x = 0, < W do
+      local i = (y * W + x) * 4
+      out[i], out[i+1], out[i+2], out[i+3] = (@uint8)(x * 4), (@uint8)(y * 6), 90, 255
+      if x >= 8 and x < 20 and y >= 4 and y < 12 then out[i], out[i+1], out[i+2] = (@uint8)(n * 50), 200, (@uint8)(n * 30) end
+    end
+  end
+end
+local scratch: vector(uint8)
+local body: vector(uint8)
+local rects: vector(WinRect)
+local function send_frame(sid: uint32, seq: uint32, cur: *vector(uint8), prev: *vector(uint8)): void
+  local q: ByteQueue
+  local key = prev == nilptr
+  if key then
+    wincodec_diff(nilptr, 0, (@*[0]uint8)(&cur[0]), W * 4, W, H, &rects)
+  else
+    wincodec_diff((@*[0]uint8)(&prev[0]), W * 4, (@*[0]uint8)(&cur[0]), W * 4, W, H, &rects)
+  end
+  wincodec_write_frames(&q, sid, seq, (@*[0]uint8)(&cur[0]), W * 4, W, H, key, &rects, &scratch, &body)
+  peer_send(&q)
+  q:destroy()
+end
+
+-- One frame of the world, as gu_frame drives it.
+local function world_frame(press: boolean): void
+  reset_list()
+  now = now + 1.0 / 60
+  frame_count = frame_count + 1
+  host.last_time = now
+  host.lmb_pressed = press and not host.lmb_down
+  host.lmb_down = press
+  host.click_used = false
+  host.terminal_focused = host.terminal_focused_now
+  host.terminal_focused_now = false
+  want_mouse, want_keyboard = false, false
+  images:clear()
+  agent_pump(now)
+  remotewin_tick(now, true)
+  draw_world(now)
+end
+
+-- panel pixel (u, v) of panel `id` on the screen
+local function panel_screen(id: integer, u: float32, v: float32): ImVec2
+  local ok, pl = policy_world_place(id, now, host.world_focus == id)
+  assert(ok)
+  local b = world_basis(pl)
+  local x, y, z = world_point(&b, u, v)
+  local cam: GuCamera
+  fake_camera(&cam)
+  local pok, sx, sy = world_project(&cam, x, y, z)
+  assert(pok)
+  return vec2(sx, sy)
+end
+
+-- Pure parts ------------------------------------------------------------------------------
+do
+  assert(remotewin_hid('a') == 4 and remotewin_hid('z') == 29 and remotewin_hid('1') == 30 and remotewin_hid('0') == 39)
+  assert(remotewin_hid('enter') == 40 and remotewin_hid('escape') == 41 and remotewin_hid('left') == 80 and remotewin_hid('f12') == 69)
+  assert(remotewin_hid('kp0') == 98 and remotewin_hid('kpenter') == 88 and remotewin_hid('nope') == 0)
+  -- a 64x40 window on a 1000x700 panel: fitted to the width below the title strip
+  local ix, iy, iw, ih = remotewin_fit(1000, 700, 64, 40)
+  assert(near(iw, 968, 0.01) and near(ih, 605, 0.01) and near(ix, 16, 0.01), 'fitted to the width')
+  assert(near(iy, REMOTEWIN_TITLE + (700 - REMOTEWIN_TITLE - REMOTEWIN_PAD - 605) / 2, 0.01), 'centred vertically')
+  local jx, jy, jw, jh = remotewin_fit(2000, 700, 64, 40)
+  assert(near(jh, 700 - REMOTEWIN_TITLE - REMOTEWIN_PAD, 0.01) and near(jx, (2000 - jw) / 2, 0.01), 'pillarboxed')
+  local inside, x, y = remotewin_map(ix, iy, iw, ih, 64, 40, ix + iw * 0.5, iy + ih * 0.25)
+  assert(inside and x == 32 and y == 10, 'panel pixel to window pixel')
+  inside, x, y = remotewin_map(ix, iy, iw, ih, 64, 40, ix - 3, iy - 1)
+  assert(not inside and x == 0 and y == 0, 'letterbox: not the window, clamped')
+  print('remotewin pure parts OK')
+end
+
+-- Setup --------------------------------------------------------------------------------------
+assert(gu_init(&api, (@cstring)(dir.data)) == 0, 'init')
+host.agent_last_try = 1e9 -- never dial out
+assert(imgui_bind(resolver, nilptr) > 0 and imgui.DrawListAddImage ~= nilptr)
+assert(luaL_loadstring(policy.L, "CONFIG.world.occlusion = 'off'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+policy_refresh()
+assert(policy.windows.max_w == 1920 and policy.windows.max_h == 1200 and policy.windows.fps == 30, 'lua/windows.lua defaults')
+host.world_visible, host.world_rez, host.world_last_time = true, 1, now
+io_state.InputQueueCharacters = { Size = 0, Capacity = #chars, Data = (@*[0]uint16)(&chars) }
+
+-- A version 2 agent is refused ---------------------------------------------------------------
+do
+  fake_connect('ghostty-agent 2 5')
+  pump()
+  assert(host.agent:ready() and host.agent.version == 2)
+  forget()
+  assert(remotewin_command('pull Firefox') == 4, 'refused')
+  assert(logged('agent too old for windows: update ghostty-agent') >= 1, 'says why')
+  assert(#host.sessions == 0 and #host.world == 0, 'no panel')
+  assert(not host.agent:wopen(1, 0, 100, 100, 30, 'x') and not host.agent:wlist(), 'the client refuses too')
+  host.agent:flush()
+  assert(count(PROTO_WOPEN) == 0 and count(PROTO_WLIST) == 0, 'nothing sent to an old agent')
+  print('version 2 refused OK')
+end
+
+fake_connect('ghostty-agent 3 42')
+pump()
+assert(host.agent:windows_ok())
+forget()
+
+-- List -----------------------------------------------------------------------------------------
+do
+  assert(remotewin_command('list') == 0)
+  host.agent:flush()
+  assert(count(PROTO_WLIST) == 1)
+  local lines: string = '7\t800\t600\tfirefox\tMozilla Firefox\n0\t0\t0\t\tchoose on the desktop\n'
+  local q: ByteQueue
+  proto.write_frame(&q, PROTO_WLISTR, (@*[0]uint8)(lines.data), lines.size)
+  peer_send(&q)
+  q:destroy()
+  pump()
+  assert(logged('window #7 800x600 [firefox] Mozilla Firefox') == 1 and logged('window list: 2 windows') == 1, 'listed in the log')
+  print('window list OK')
+end
+
+-- Open ----------------------------------------------------------------------------------------
+local s: *Session
+local rw: *RemoteWin
+local req: uint32
+local SID: uint32 <comptime> = 9
+do
+  forget()
+  assert(remotewin_command('pull Firefox') == 0)
+  host.agent:flush()
+  local p = last(PROTO_WOPEN)
+  assert(p ~= nilptr, 'WOPEN sent')
+  req = proto.get_u32(p)
+  assert(proto.get_u32((@*[0]uint8)(&p[4])) == 0, 'wid 0: by match')
+  assert(proto.get_u16((@*[0]uint8)(&p[8])) == 1920 and proto.get_u16((@*[0]uint8)(&p[10])) == 1200 and p[12] == 30, 'max size and fps from lua/windows.lua')
+  assert(string{data=(@*[0]byte)(&p[13]), size=7} == 'Firefox', 'the match text')
+  assert(#host.world == 1 and #host.sessions == 1)
+  s = host.world[0]
+  rw = remotewin_of(s)
+  assert(s.kind == TransportKind.Window and rw ~= nilptr and rw.state == RemoteWinState.Opening, 'a pending pet')
+  s.appear = 1
+  -- `run CMD` asks the agent to start it
+  forget()
+  assert(remotewin_command('pull run foot -e htop') == 0)
+  host.agent:flush()
+  p = last(PROTO_WOPEN)
+  local frame_len = frames[#frames - 1].data.size
+  assert(string{data=(@*[0]byte)(&p[13]), size=frame_len - 13} == 'run:foot -e htop', 'run: prefix')
+  local s2 = host.world[1]
+  -- closed before the agent answered: the late WOPENED is closed at once
+  host.world_focus = s2.id
+  assert(remotewin_command('close') == 0)
+  for _ = 1, 90 do world_frame(false) end
+  assert(#host.world == 1 and find_session(s2.id) == nilptr, 'closed')
+  forget()
+  local b: [12]uint8
+  proto.put_u32(&b, proto.get_u32(p))
+  proto.put_u32((@*[0]uint8)(&b[4]), 55)
+  local q: ByteQueue
+  proto.write_frame(&q, PROTO_WOPENED, &b, 12)
+  peer_send(&q)
+  q:destroy()
+  pump()
+  host.agent:flush()
+  local c = last(PROTO_WCLOSE)
+  assert(c ~= nilptr and proto.get_u32(c) == 55, 'an unwanted stream is closed')
+  -- the one we keep: pinned in front of the player, keeping its size
+  host.world_focus = s.id
+  assert(run_command('pin here') == 0)
+  host.world_focus = 0
+  -- WOPENED (0x0 before the first frame)
+  forget()
+  local title: string = 'Mozilla Firefox'
+  local ob: [12 + 15]uint8
+  proto.put_u32(&ob, req)
+  proto.put_u32((@*[0]uint8)(&ob[4]), SID)
+  memory.copy(&ob[12], title.data, title.size)
+  local q2: ByteQueue
+  proto.write_frame(&q2, PROTO_WOPENED, &ob, #ob)
+  peer_send(&q2)
+  q2:destroy()
+  pump()
+  assert(rw.state == RemoteWinState.Live and rw.sid == SID and s.title == 'Mozilla Firefox', 'opened')
+  print('window open OK')
+end
+
+-- Frames ---------------------------------------------------------------------------------------
+local f1: vector(uint8)
+local f2: vector(uint8)
+render(1, &f1)
+render(2, &f2)
+do
+  world_frame(false) -- drawn once: the panel is seen
+  forget()
+  send_frame(SID, 1, &f1, nilptr)
+  pump()
+  assert(rw.w == W and rw.h == H and rw.frames == 1, 'KEY frame decoded')
+  assert(memory.equals(&rw.pixels[0], &f1[0], W * H * 4), 'the CPU copy matches the window')
+  host.agent:flush()
+  local a = last(PROTO_WACK)
+  assert(a ~= nilptr and proto.get_u32(a) == SID and proto.get_u32((@*[0]uint8)(&a[4])) == 1, 'WACK after END')
+  local ok, pl = policy_world_place(s.id, now, false)
+  assert(ok and near(pl.width, 1600, 0.5) and near(pl.height, 1600 * H / W + REMOTEWIN_TITLE + REMOTEWIN_PAD, 0.5), 'panel takes the window aspect')
+  assert(near(pl.ppm, 700, 0.01), 'window pixels per yalm')
+  -- drawn: texture made on Dalamud's device, the whole window uploaded
+  uploads:clear()
+  world_frame(false)
+  assert(creates == 1 and created_device == FAKE_DEVICE and created_w == W and created_h == H, 'texture created lazily')
+  assert(#uploads == 1 and uploads[0].x == 0 and uploads[0].y == 0 and uploads[0].w == W and uploads[0].h == H and upload_pitch == W * 4, 'whole window uploaded')
+  -- the picture: textured strips with the view as ImTextureID covering the letterboxed rectangle
+  assert(#images == 24 * 16, 'a grid of textured quads')
+  local ix, iy, iw, ih = remotewin_fit(pl.width, pl.height, W, H)
+  local vp = viewport.Pos
+  local minx, miny, maxx, maxy: float32 = 1e9, 1e9, -1e9, -1e9
+  local area: float32 = 0
+  for i = 0, < #images do
+    local im = images[i]
+    assert(im.tex == (@pointer)(0x201), 'the shader resource view is the texture id')
+    minx, miny = math.min(minx, im.a.x), math.min(miny, im.a.y)
+    maxx, maxy = math.max(maxx, im.b.x), math.max(maxy, im.b.y)
+    area = area + (im.b.x - im.a.x) * (im.b.y - im.a.y)
+    -- uv follows position
+    assert(near((im.a.x - vp.x - ix) / iw, im.ua.x, 1e-3) and near((im.b.y - vp.y - iy) / ih, im.ub.y, 1e-3))
+  end
+  assert(near(minx, vp.x + ix, 0.01) and near(miny, vp.y + iy, 0.01) and near(maxx, vp.x + ix + iw, 0.01) and near(maxy, vp.y + iy + ih, 0.01), 'covers the picture')
+  assert(near(area, iw * ih, iw * ih * 1e-4), 'no gaps, no overlap')
+  assert(images[0].ua.x == 0 and images[0].ua.y == 0 and images[#images - 1].ub.x == 1 and images[#images - 1].ub.y == 1, 'the whole texture')
+  -- a delta frame: only the changed rectangles are decoded and uploaded
+  forget()
+  send_frame(SID, 2, &f2, &f1)
+  pump()
+  assert(memory.equals(&rw.pixels[0], &f2[0], W * H * 4), 'delta applied')
+  host.agent:flush()
+  a = last(PROTO_WACK)
+  assert(a ~= nilptr and proto.get_u32((@*[0]uint8)(&a[4])) == 2, 'WACK for seq 2')
+  uploads:clear()
+  world_frame(false)
+  assert(creates == 1, 'same size: the texture is kept')
+  assert(#uploads == #rects and #uploads >= 1, 'one upload per changed rectangle')
+  for i = 0, < #uploads do
+    assert(uploads[i].x == rects[i].x and uploads[i].y == rects[i].y and uploads[i].w == rects[i].w and uploads[i].h == rects[i].h, 'the dirty boxes')
+  end
+  assert(uploads[0].w < W, 'not the whole window')
+  -- asleep: frames are decoded, not acknowledged, until the panel is seen again
+  s:sleep()
+  assert(s.sleeping)
+  forget()
+  send_frame(SID, 3, &f1, &f2)
+  pump()
+  assert(count(PROTO_WACK) == 0, 'asleep: no WACK')
+  world_frame(false) -- seen: wakes and acknowledges
+  host.agent:flush()
+  a = last(PROTO_WACK)
+  assert(not s.sleeping and a ~= nilptr and proto.get_u32((@*[0]uint8)(&a[4])) == 3, 'woken: the held WACK goes out')
+  print('window frames OK')
+end
+
+-- Input ----------------------------------------------------------------------------------------
+do
+  local ok, pl = policy_world_place(s.id, now, false)
+  assert(ok)
+  local ix, iy, iw, ih = remotewin_fit(pl.width, pl.height, W, H)
+  -- unfocused: nothing goes to the window, the focusing click neither
+  mouse_at = panel_screen(s.id, ix + iw * 0.5, iy + ih * 0.5)
+  for _ = 1, 40 do world_frame(false) end -- woken panels glitch back in first
+  forget()
+  world_frame(true)
+  assert(host.world_focus == s.id, 'a click focuses the panel')
+  world_frame(false)
+  assert(inputs(WIN_INPUT_BUTTON) == 0, 'the focusing click is not the window\'s')
+  -- pointer: panel pixel -> window pixel
+  forget()
+  now = now + 1 -- not a double click
+  local u, v = ix + iw * 0.25 + 1, iy + ih * 0.75 + 1
+  mouse_at = panel_screen(s.id, u, v)
+  world_frame(false)
+  local _, ex, ey = remotewin_map(ix, iy, iw, ih, W, H, u, v)
+  local m = last_input(WIN_INPUT_MOVE)
+  assert(m ~= nilptr and math.abs(i16(m, 0) - ex) <= 1 and math.abs(i16(m, 2) - ey) <= 1, 'MOVE in window pixels')
+  assert(want_keyboard, 'the focused panel claims the keyboard')
+  -- a click on the picture
+  forget()
+  world_frame(true)
+  local bdown = last_input(WIN_INPUT_BUTTON)
+  assert(bdown ~= nilptr and bdown[4] == 0 and bdown[5] == 1, 'left button down')
+  assert(want_mouse, 'held: the mouse stays ours')
+  world_frame(false)
+  local bup = last_input(WIN_INPUT_BUTTON)
+  assert(inputs(WIN_INPUT_BUTTON) == 2 and bup[5] == 0, 'and up')
+  assert(host.world_full_id == 0, 'no full screen from clicks on the window')
+  -- a second quick click is the window's (a double click), not the panel's full screen
+  forget()
+  world_frame(true)
+  world_frame(false)
+  assert(inputs(WIN_INPUT_BUTTON) == 2 and host.world_full_toggle_id == 0 and host.world_full_id == 0, 'double click goes to the window')
+  -- the resize grip over the picture keeps its click
+  forget()
+  now = now + 1
+  mouse_at = panel_screen(s.id, pl.width - 12, pl.height - 12)
+  world_frame(false)
+  world_frame(true)
+  assert(host.world_drag_id == s.id, 'the grip resizes')
+  world_frame(false)
+  assert(inputs(WIN_INPUT_BUTTON) == 0, 'no click reaches the window through the grip')
+  -- the letterbox is not the window
+  forget()
+  now = now + 1
+  mouse_at = panel_screen(s.id, 3, pl.height * 0.5)
+  world_frame(false)
+  world_frame(true)
+  world_frame(false)
+  assert(inputs(WIN_INPUT_BUTTON) == 0 and inputs(WIN_INPUT_MOVE) == 0, 'outside the picture: nothing')
+  -- wheel over the picture
+  forget()
+  now = now + 1
+  mouse_at = panel_screen(s.id, ix + iw * 0.5, iy + ih * 0.5)
+  io_state.MouseWheel = -1
+  world_frame(false)
+  io_state.MouseWheel = 0
+  local wh = last_input(WIN_INPUT_WHEEL)
+  assert(wh ~= nilptr and i16(wh, 4) == 0 and i16(wh, 6) == -120, 'WHEEL in 1/120 notches')
+  -- a named key: KEY with its HID usage, down and up
+  forget()
+  keys_down[ImGuiKey_LeftArrow] = true
+  world_frame(false)
+  local k = last_input(WIN_INPUT_KEY)
+  assert(k ~= nilptr and proto.get_u16(k) == 80 and k[2] == 1 and k[3] == 0, 'left arrow down')
+  keys_down[ImGuiKey_LeftArrow] = false
+  world_frame(false)
+  k = last_input(WIN_INPUT_KEY)
+  assert(inputs(WIN_INPUT_KEY) == 2 and k[2] == 0, 'and up')
+  -- a chord: ctrl+c as KEY with mods, not text
+  forget()
+  io_state.KeyCtrl = true
+  keys_down[ImGuiKey_C] = true
+  world_frame(false)
+  k = last_input(WIN_INPUT_KEY)
+  assert(k ~= nilptr and proto.get_u16(k) == 6 and k[2] == 1 and k[3] == WIN_MOD_CTRL, 'ctrl+c')
+  keys_down[ImGuiKey_C] = false
+  io_state.KeyCtrl = false
+  world_frame(false)
+  -- typed characters as TEXT (a plain letter key sends no KEY)
+  forget()
+  keys_down[ImGuiKey_H] = true
+  chars[0], chars[1], chars[2] = 104, 0xE9, 9 -- 'h', 'é', a tab (a key, not text)
+  io_state.InputQueueCharacters.Size = 3
+  world_frame(false)
+  keys_down[ImGuiKey_H] = false
+  local t = last_input(WIN_INPUT_TEXT)
+  local tlen = frames[#frames - 1].data.size
+  for i = 0, < #frames do if frames[i].typ == PROTO_WINPUT and (@*[0]uint8)(frames[i].data.data)[4] == WIN_INPUT_TEXT then tlen = frames[i].data.size - 5 end end
+  assert(t ~= nilptr and string{data=(@*[0]byte)(t), size=tlen} == 'h\u{e9}', 'TEXT, UTF-8')
+  assert(inputs(WIN_INPUT_KEY) == 0 and io_state.InputQueueCharacters.Size == 0, 'no KEY for a typed letter; queue consumed')
+  -- Esc twice gives the keyboard back
+  forget()
+  keys_down[ImGuiKey_Escape] = true
+  world_frame(false)
+  keys_down[ImGuiKey_Escape] = false
+  world_frame(false)
+  keys_down[ImGuiKey_Escape] = true
+  world_frame(false)
+  assert(host.world_focus == 0, 'second Esc unfocuses')
+  keys_down[ImGuiKey_Escape] = false
+  world_frame(false)
+  assert(inputs(WIN_INPUT_KEY) == 2, 'only the first Esc reached the window')
+  print('window input OK')
+end
+
+-- An older shim: no D3D11 device -------------------------------------------------------------
+do
+  host.api.get_scene_depth = nilptr
+  texts = 0
+  world_frame(false)
+  assert(#images == 0 and texts > 0, 'no picture: the panel says why')
+  assert(logged('newer plugin shim') >= 1 or logged('no D3D11 device') >= 1)
+  host.api.get_scene_depth = fake_scene_depth
+  world_frame(false)
+  assert(#images == 24 * 16, 'back with a device')
+  print('window old shim OK')
+end
+
+-- WEND closes the panel ------------------------------------------------------------------------
+do
+  forget()
+  local reason: string = 'window closed on the desktop'
+  local q: ByteQueue
+  proto.write_frame_id(&q, PROTO_WEND, SID, (@*[0]uint8)(reason.data), reason.size)
+  peer_send(&q)
+  q:destroy()
+  world_frame(false)
+  assert(rw.state == RemoteWinState.Ended and #images == 0, 'ended: text instead of the picture')
+  assert(find_session(s.id) ~= nilptr, 'still shown for a moment')
+  for _ = 1, 60 * 3 + 60 do world_frame(false) end
+  assert(#host.world == 0 and #host.sessions == 0 and remotewin_of(s) == nilptr, 'closed after 2 s')
+  assert(releases == creates and live_textures == 0, 'texture released')
+  assert(count(PROTO_WCLOSE) == 0, 'no WCLOSE for a stream the agent ended')
+  print('window end OK')
+end
+
+-- A lost connection ends a stream; a closed panel sends WCLOSE ------------------------------------
+do
+  assert(remotewin_command('pull') == 0)
+  local s3 = host.world[0]
+  local rw3 = remotewin_of(s3)
+  host.agent:flush()
+  local p = last(PROTO_WOPEN)
+  local ob: [12]uint8
+  proto.put_u32(&ob, proto.get_u32(p))
+  proto.put_u32((@*[0]uint8)(&ob[4]), 21)
+  local q: ByteQueue
+  proto.write_frame(&q, PROTO_WOPENED, &ob, 12)
+  peer_send(&q)
+  q:destroy()
+  pump()
+  assert(rw3.state == RemoteWinState.Live)
+  forget()
+  close_terminal(s3)
+  host.agent:flush()
+  local c = last(PROTO_WCLOSE)
+  assert(c ~= nilptr and proto.get_u32(c) == 21 and #host.sessions == 0, 'closing the panel closes the stream')
+  assert(remotewin_command('pull') == 0)
+  local s4 = host.world[0]
+  host.agent:disconnect()
+  host.agent.state = AgentState.Failed
+  remotewin_tick(now, true)
+  assert(remotewin_of(s4).state == RemoteWinState.Ended, 'connection lost: ended')
+  close_terminal(s4)
+  print('window lifetime OK')
+end
+
+gu_shutdown()
+wintex_fake = nilptr
+f1:destroy() f2:destroy() scratch:destroy() body:destroy() rects:destroy() uploads:destroy() images:destroy()
+print('remotewin OK')
