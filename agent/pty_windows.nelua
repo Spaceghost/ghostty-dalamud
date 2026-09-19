@@ -1,0 +1,437 @@
+-- ghostty-agent's PTYs on Windows: a pseudo console (ConPTY) per session,
+-- fed through two named pipes whose agent ends are overlapped, so the event
+-- loop waits on their events instead of polling (anonymous pipes cannot do
+-- overlapped I/O). Same API as agent/pty_posix.nelua.
+--
+-- Everything overlapped I/O points at (OVERLAPPED records, buffers) lives in
+-- a heap block that never moves: sessions sit in a vector that does.
+require 'string'
+require 'vector'
+require 'stringbuilder'
+require 'memory'
+require 'agent.logic'
+require 'core.sys.wincmdline'
+
+## cinclude '<windows.h>'
+
+local COORD <cimport, nodecl> = @record{ X: int16, Y: int16 }
+local STARTUPINFOW <cimport, nodecl> = @record{ cb: uint32 }
+local STARTUPINFOEXW <cimport, nodecl> = @record{ StartupInfo: STARTUPINFOW, lpAttributeList: pointer }
+-- declared with only the fields used: the C compiler knows the real size
+local SIZEOF_STARTUPINFOEXW: uint32 <cimport 'sizeof(STARTUPINFOEXW)', nodecl, const>
+local PROCESS_INFORMATION <cimport, nodecl> = @record{ hProcess: pointer, hThread: pointer, dwProcessId: uint32, dwThreadId: uint32 }
+local OVERLAPPED <cimport, nodecl> = @record{ Internal: usize, InternalHigh: usize, Offset: uint32, OffsetHigh: uint32, hEvent: pointer }
+
+local function CloseHandle(h: pointer): cint <cimport, nodecl> end
+local function GetLastError(): uint32 <cimport, nodecl> end
+local function ReadFile(h: pointer, buf: pointer, n: uint32, read: *uint32, ov: *OVERLAPPED): cint <cimport, nodecl> end
+local function WriteFile(h: pointer, buf: pointer, n: uint32, written: *uint32, ov: *OVERLAPPED): cint <cimport, nodecl> end
+local function GetOverlappedResult(h: pointer, ov: *OVERLAPPED, n: *uint32, wait: cint): cint <cimport, nodecl> end
+local function CancelIoEx(h: pointer, ov: *OVERLAPPED): cint <cimport, nodecl> end
+local function CreateEventA(sa: pointer, manual: cint, initial: cint, name: cstring): pointer <cimport, nodecl> end
+local function CreateNamedPipeA(name: cstring, open_mode: uint32, pipe_mode: uint32, instances: uint32, out_size: uint32, in_size: uint32, timeout: uint32, sa: pointer): pointer <cimport, nodecl> end
+local function ConnectNamedPipe(h: pointer, ov: *OVERLAPPED): cint <cimport, nodecl> end
+local function CreateFileA(name: cstring, access: uint32, share: uint32, sa: pointer, disposition: uint32, flags: uint32, template: pointer): pointer <cimport, nodecl> end
+local function InitializeProcThreadAttributeList(list: pointer, count: uint32, flags: uint32, size: *usize): cint <cimport, nodecl> end
+local function UpdateProcThreadAttribute(list: pointer, flags: uint32, attr: usize, value: pointer, size: usize, prev: pointer, ret: pointer): cint <cimport, nodecl> end
+local function DeleteProcThreadAttributeList(list: pointer): void <cimport, nodecl> end
+local function CreateProcessW(app: pointer, cmd: pointer, pa: pointer, ta: pointer, inherit: cint, flags: uint32, env: pointer, cwd: pointer, si: pointer, pi: *PROCESS_INFORMATION): cint <cimport, nodecl> end
+local function WaitForSingleObject(h: pointer, ms: uint32): uint32 <cimport, nodecl> end
+local function GetExitCodeProcess(h: pointer, code: *uint32): cint <cimport, nodecl> end
+local function TerminateProcess(h: pointer, code: uint32): cint <cimport, nodecl> end
+local function GetTickCount64(): uint64 <cimport, nodecl> end
+local function GetCurrentProcessId(): uint32 <cimport, nodecl> end
+local function MultiByteToWideChar(cp: uint32, flags: uint32, src: cstring, srclen: cint, dst: *[0]uint16, dstlen: cint): cint <cimport, nodecl> end
+local function GetEnvironmentVariableW(name: *[0]uint16, buf: *[0]uint16, size: uint32): uint32 <cimport, nodecl> end
+local function SetEnvironmentVariableW(name: *[0]uint16, value: *[0]uint16): cint <cimport, nodecl> end
+local function GetModuleHandleA(name: cstring): pointer <cimport, nodecl> end
+local function GetProcAddress(mod: pointer, name: cstring): pointer <cimport, nodecl> end
+local EXTENDED_STARTUPINFO_PRESENT: uint32 <cimport, nodecl, const>
+local CREATE_UNICODE_ENVIRONMENT: uint32 <cimport, nodecl, const>
+local PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize <cimport, nodecl, const>
+local WAIT_OBJECT_0: uint32 <cimport, nodecl, const>
+local CP_UTF8: uint32 <cimport, nodecl, const>
+local INVALID_HANDLE_VALUE: pointer <cimport, nodecl, const>
+local PIPE_ACCESS_INBOUND: uint32 <cimport, nodecl, const>
+local PIPE_ACCESS_OUTBOUND: uint32 <cimport, nodecl, const>
+local FILE_FLAG_OVERLAPPED: uint32 <cimport, nodecl, const>
+local FILE_FLAG_FIRST_PIPE_INSTANCE: uint32 <cimport, nodecl, const>
+local PIPE_TYPE_BYTE: uint32 <cimport, nodecl, const>
+local PIPE_READMODE_BYTE: uint32 <cimport, nodecl, const>
+local PIPE_WAIT: uint32 <cimport, nodecl, const>
+local PIPE_REJECT_REMOTE_CLIENTS: uint32 <cimport, nodecl, const>
+local GENERIC_READ: uint32 <cimport, nodecl, const>
+local GENERIC_WRITE: uint32 <cimport, nodecl, const>
+local OPEN_EXISTING: uint32 <cimport, nodecl, const>
+local ERROR_IO_PENDING: uint32 <cimport, nodecl, const>
+local ERROR_IO_INCOMPLETE: uint32 <cimport, nodecl, const>
+local ERROR_PIPE_CONNECTED: uint32 <cimport, nodecl, const>
+local ERROR_ENVVAR_NOT_FOUND: uint32 <cimport, nodecl, const>
+
+local CreatePseudoConsoleFn = @function(size: COORD, hInput: pointer, hOutput: pointer, flags: uint32, out: *pointer): int32
+local ResizePseudoConsoleFn = @function(hpc: pointer, size: COORD): int32
+local ClosePseudoConsoleFn = @function(hpc: pointer): void
+local create_pc: CreatePseudoConsoleFn = nilptr
+local resize_pc: ResizePseudoConsoleFn = nilptr
+local close_pc: ClosePseudoConsoleFn = nilptr
+
+-- ConPTY arrived in Windows 10 1809; resolved at run time so an older
+-- Windows gets a message instead of a loader error.
+local function conpty_resolve(): boolean
+  if create_pc == nilptr then
+    local k32 = GetModuleHandleA('kernel32.dll')
+    if k32 ~= nilptr then
+      create_pc = (@CreatePseudoConsoleFn)(GetProcAddress(k32, 'CreatePseudoConsole'))
+      resize_pc = (@ResizePseudoConsoleFn)(GetProcAddress(k32, 'ResizePseudoConsole'))
+      close_pc = (@ClosePseudoConsoleFn)(GetProcAddress(k32, 'ClosePseudoConsole'))
+    end
+  end
+  return create_pc ~= nilptr and resize_pc ~= nilptr and close_pc ~= nilptr
+end
+
+local READ_SIZE: uint32 <comptime> = 32768
+local WRITE_SIZE: uint32 <comptime> = 65536
+-- After the shell exits, the console may still hand over output it already
+-- took: keep reading this long (ms) before the session reports its exit.
+local EXIT_GRACE_MS: uint64 <comptime> = 150
+
+local WinPty = @record{
+  hpc: pointer,
+  process: pointer,
+  out_h: pointer,        -- agent end of the console's output (overlapped reads)
+  in_h: pointer,         -- agent end of the console's input (overlapped writes)
+  attr_list: pointer,
+  rov: OVERLAPPED,
+  rpending: boolean,
+  rready: usize,         -- bytes a finished read left in rbuf
+  rofs: usize,
+  reof: boolean,
+  wov: OVERLAPPED,
+  wpending: boolean,
+  wbroken: boolean,
+  exited: boolean,       -- the process ended (the session may still be in its grace)
+  exit_code: uint32,
+  exit_at: uint64,
+  rbuf: [READ_SIZE]uint8,
+  wbuf: [WRITE_SIZE]uint8,
+}
+
+global AgentPty = @record{ w: *WinPty }
+
+local function to_wide(s: string): *[0]uint16
+  local n = MultiByteToWideChar(CP_UTF8, 0, (@cstring)(s.data), (@cint)(s.size), nilptr, 0)
+  local w = (@*[0]uint16)(default_allocator:alloc((@usize)(n + 1) * 2))
+  if w == nilptr then return nilptr end
+  if n > 0 then MultiByteToWideChar(CP_UTF8, 0, (@cstring)(s.data), (@cint)(s.size), w, n) end
+  w[n] = 0
+  return w
+end
+
+local function free_wide(w: *[0]uint16): void
+  if w ~= nilptr then default_allocator:dealloc(w) end
+end
+
+local pipe_serial: uint32 = 0
+
+-- A named pipe pair: the agent's end overlapped, the console's end not.
+-- `inbound`: the agent reads (console output); otherwise it writes.
+local function make_pipe(inbound: boolean, agent_end: *pointer, console_end: *pointer): boolean
+  pipe_serial = pipe_serial + 1
+  local sb: stringbuilder
+  sb:writef('\\\\.\\pipe\\ghostty-agent-%d-%d-%s\0', GetCurrentProcessId(), pipe_serial, inbound and 'out' or 'in')
+  local name = sb:promote()
+  local mode = (inbound and PIPE_ACCESS_INBOUND or PIPE_ACCESS_OUTBOUND) | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE
+  local srv = CreateNamedPipeA((@cstring)(name.data), mode, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+    1, WRITE_SIZE, WRITE_SIZE, 0, nilptr)
+  if srv == INVALID_HANDLE_VALUE then name:destroy() return false end
+  local cli = CreateFileA((@cstring)(name.data), inbound and GENERIC_WRITE or GENERIC_READ, 0, nilptr, OPEN_EXISTING, 0, nilptr)
+  name:destroy()
+  if cli == INVALID_HANDLE_VALUE then CloseHandle(srv) return false end
+  -- the console end is already connected; ConnectNamedPipe just confirms it
+  local ov: OVERLAPPED
+  ov.hEvent = CreateEventA(nilptr, 1, 0, nilptr)
+  local ok = ConnectNamedPipe(srv, &ov) ~= 0
+  if not ok then
+    local err = GetLastError()
+    ok = err == ERROR_PIPE_CONNECTED
+    if err == ERROR_IO_PENDING then
+      local n: uint32 = 0
+      ok = GetOverlappedResult(srv, &ov, &n, 1) ~= 0
+    end
+  end
+  CloseHandle(ov.hEvent)
+  if not ok then CloseHandle(srv) CloseHandle(cli) return false end
+  $agent_end = srv
+  $console_end = cli
+  return true
+end
+
+-- Per-session environment for CreateProcessW: set in the agent (which runs
+-- one thing at a time) around the call, then put back.
+local EnvSave = @record{ name: *[0]uint16, old: *[0]uint16, had: boolean }
+
+local function env_set(saves: *vector(EnvSave), k: string, v: string): void
+  local wk = to_wide(k)
+  local wv = to_wide(v)
+  if wk == nilptr or wv == nilptr then free_wide(wk) free_wide(wv) return end
+  local save: EnvSave = { name = wk }
+  local need = GetEnvironmentVariableW(wk, nilptr, 0)
+  if need > 0 then
+    save.old = (@*[0]uint16)(default_allocator:alloc((@usize)(need) * 2))
+    if save.old ~= nilptr and GetEnvironmentVariableW(wk, save.old, need) < need then save.had = true end
+  end
+  saves:push(save)
+  SetEnvironmentVariableW(wk, wv)
+  free_wide(wv)
+end
+
+local function env_restore(saves: *vector(EnvSave)): void
+  local i: isize = #saves - 1
+  while i >= 0 do
+    local s = saves[i]
+    SetEnvironmentVariableW(s.name, s.had and s.old or nilptr)
+    free_wide(s.name)
+    free_wide(s.old)
+    i = i - 1
+  end
+  saves:destroy()
+end
+
+local function free_winpty(w: *WinPty): void
+  if w.rov.hEvent ~= nilptr then CloseHandle(w.rov.hEvent) end
+  if w.wov.hEvent ~= nilptr then CloseHandle(w.wov.hEvent) end
+  if w.hpc ~= nilptr then close_pc(w.hpc) end
+  if w.attr_list ~= nilptr then
+    DeleteProcThreadAttributeList(w.attr_list)
+    default_allocator:dealloc(w.attr_list)
+  end
+  if w.process ~= nilptr then CloseHandle(w.process) end
+  delete(w)
+end
+
+function AgentPty.spawn(term: string, argv: *vector(string), env: *vector(string), cols: uint16, rows: uint16): (boolean, AgentPty, string)
+  local none: AgentPty = { w = nilptr }
+  if not conpty_resolve() then return false, none, 'ConPTY unavailable (needs Windows 10 1809 or later)' end
+  local w = new(@WinPty)
+  w.rov.hEvent = CreateEventA(nilptr, 1, 0, nilptr)
+  w.wov.hEvent = CreateEventA(nilptr, 1, 0, nilptr)
+  local con_in: pointer = nilptr
+  local con_out: pointer = nilptr
+  if w.rov.hEvent == nilptr or w.wov.hEvent == nilptr
+     or not make_pipe(true, &w.out_h, &con_out) then
+    free_winpty(w)
+    return false, none, 'pipe creation failed'
+  end
+  if not make_pipe(false, &w.in_h, &con_in) then
+    CloseHandle(w.out_h) CloseHandle(con_out)
+    free_winpty(w)
+    return false, none, 'pipe creation failed'
+  end
+  local size: COORD = { X = (@int16)(cols), Y = (@int16)(rows) }
+  local hr = create_pc(size, con_in, con_out, 0, &w.hpc)
+  CloseHandle(con_in) -- the console keeps its own handles
+  CloseHandle(con_out)
+  if hr ~= 0 then
+    w.hpc = nilptr
+    CloseHandle(w.out_h) CloseHandle(w.in_h)
+    free_winpty(w)
+    return false, none, 'CreatePseudoConsole failed'
+  end
+
+  local attr_size: usize = 0
+  InitializeProcThreadAttributeList(nilptr, 1, 0, &attr_size)
+  w.attr_list = default_allocator:alloc(attr_size)
+  local fail: string = ''
+  if w.attr_list == nilptr or InitializeProcThreadAttributeList(w.attr_list, 1, 0, &attr_size) == 0 then
+    if w.attr_list ~= nilptr then default_allocator:dealloc(w.attr_list) end
+    w.attr_list = nilptr
+    fail = 'attribute list failed'
+  elseif UpdateProcThreadAttribute(w.attr_list, 0, PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE, w.hpc, #pointer, nilptr, nilptr) == 0 then
+    fail = 'attribute list failed'
+  end
+
+  if #fail == 0 then
+    local saves: vector(EnvSave)
+    local cwd: string = ''
+    env_set(&saves, 'TERM', term)
+    env_set(&saves, 'COLORTERM', 'truecolor')
+    env_set(&saves, 'TERM_PROGRAM', 'ghostty-umbra')
+    for i = 0, < #env do
+      local ok, k, v = agent_env_split(env[i])
+      if ok then
+        if k == 'PWD' or k == 'CWD' then
+          cwd:destroy()
+          cwd = v
+          v = (@string){}
+        else
+          env_set(&saves, k, v)
+        end
+        k:destroy()
+        v:destroy()
+      end
+    end
+    local si: STARTUPINFOEXW
+    si.StartupInfo.cb = SIZEOF_STARTUPINFOEXW
+    si.lpAttributeList = w.attr_list
+    local pi: PROCESS_INFORMATION
+    local cmdline = win_cmdline(argv)
+    local wcmd = to_wide(cmdline)
+    cmdline:destroy()
+    local wcwd: *[0]uint16 = nilptr
+    if #cwd > 0 then wcwd = to_wide(cwd) end
+    cwd:destroy()
+    -- no handles inherited: the child talks only to its pseudo console
+    local ok = wcmd ~= nilptr and CreateProcessW(nilptr, wcmd, nilptr, nilptr, 0,
+      EXTENDED_STARTUPINFO_PRESENT | CREATE_UNICODE_ENVIRONMENT, nilptr, wcwd, &si, &pi) ~= 0
+    free_wide(wcmd)
+    free_wide(wcwd)
+    env_restore(&saves)
+    if ok then
+      CloseHandle(pi.hThread)
+      w.process = pi.hProcess
+      return true, (@AgentPty){ w = w }, (@string){}
+    end
+    fail = 'CreateProcess failed (is the command on PATH?)'
+  end
+  CloseHandle(w.out_h) CloseHandle(w.in_h)
+  free_winpty(w)
+  return false, none, fail
+end
+
+-- Output: bytes read (> 0), 0 when none is ready (a read is then pending and
+-- its event wakes the loop), -1 when the console closed its output.
+function AgentPty:read(buf: *[0]uint8, cap: usize): isize
+  local w = self.w
+  if w.rpending then
+    local got: uint32 = 0
+    if GetOverlappedResult(w.out_h, &w.rov, &got, 0) == 0 then
+      if GetLastError() == ERROR_IO_INCOMPLETE then return 0 end
+      w.rpending = false
+      w.reof = true
+      return -1
+    end
+    w.rpending = false
+    w.rready = got
+    w.rofs = 0
+  end
+  if w.rready == 0 then
+    if w.reof then return -1 end
+    if ReadFile(w.out_h, &w.rbuf, READ_SIZE, nilptr, &w.rov) == 0 then
+      if GetLastError() == ERROR_IO_PENDING then w.rpending = true return 0 end
+      w.reof = true
+      return -1
+    end
+    -- finished at once: the count comes from the overlapped record
+    local got: uint32 = 0
+    GetOverlappedResult(w.out_h, &w.rov, &got, 0)
+    w.rready = got
+    w.rofs = 0
+    if got == 0 then return 0 end
+  end
+  local n = w.rready
+  if n > cap then n = cap end
+  memory.copy(buf, &w.rbuf[w.rofs], n)
+  w.rofs = w.rofs + n
+  w.rready = w.rready - n
+  return (@isize)(n)
+end
+
+-- Input: bytes taken (>= 0; 0 while the previous write is still in flight),
+-- -1 when the console is gone. Taken bytes are copied: the caller's buffer
+-- may change while the write is pending.
+function AgentPty:write(p: *[0]uint8, n: usize): isize
+  local w = self.w
+  if w.wbroken then return -1 end
+  if w.wpending then
+    local done: uint32 = 0
+    if GetOverlappedResult(w.in_h, &w.wov, &done, 0) == 0 then
+      if GetLastError() == ERROR_IO_INCOMPLETE then return 0 end
+      w.wpending = false
+      w.wbroken = true
+      return -1
+    end
+    w.wpending = false
+  end
+  if n == 0 then return 0 end
+  local take = n
+  if take > WRITE_SIZE then take = WRITE_SIZE end
+  memory.copy(&w.wbuf, p, take)
+  if WriteFile(w.in_h, &w.wbuf, (@uint32)(take), nilptr, &w.wov) == 0 then
+    if GetLastError() ~= ERROR_IO_PENDING then w.wbroken = true return -1 end
+    w.wpending = true
+  end
+  return (@isize)(take)
+end
+
+function AgentPty:resize(cols: uint16, rows: uint16): void
+  local size: COORD = { X = (@int16)(cols), Y = (@int16)(rows) }
+  resize_pc(self.w.hpc, size)
+end
+
+-- CLOSE: end the shell. Programs it started that still hold the console end
+-- with it when the pseudo console closes.
+function AgentPty:hangup(): void
+  if not self.w.exited then TerminateProcess(self.w.process, 1) end
+end
+
+-- True once the process ended and the grace for its last output is over.
+function AgentPty:poll_exit(): (boolean, int32)
+  local w = self.w
+  if not w.exited then
+    if WaitForSingleObject(w.process, 0) ~= WAIT_OBJECT_0 then return false, 0 end
+    local code: uint32 = 0
+    GetExitCodeProcess(w.process, &code)
+    w.exit_code = code
+    w.exited = true
+    w.exit_at = GetTickCount64()
+  end
+  if not w.reof and GetTickCount64() - w.exit_at < EXIT_GRACE_MS then return false, 0 end
+  return true, (@int32)(w.exit_code)
+end
+
+-- In the exit grace: the loop should wake soon to finish it.
+function AgentPty:exiting(): boolean
+  return self.w ~= nilptr and self.w.exited
+end
+
+-- The handles the event loop waits on: the process until it exits, the
+-- pending read (only when the session wants output) and the pending write.
+function AgentPty:wait_handles(out: *[0]pointer, n: *usize, max: usize, want_read: boolean): usize
+  local w = self.w
+  local wanted: usize = 0
+  if not w.exited then
+    wanted = wanted + 1
+    if $n < max then out[$n] = w.process $n = $n + 1 end
+  end
+  if want_read and w.rpending then
+    wanted = wanted + 1
+    if $n < max then out[$n] = w.rov.hEvent $n = $n + 1 end
+  end
+  if w.wpending then
+    wanted = wanted + 1
+    if $n < max then out[$n] = w.wov.hEvent $n = $n + 1 end
+  end
+  return wanted
+end
+
+-- After the exit: cancel what is in flight, wait for the cancellations (the
+-- kernel writes into the block until then), close our pipe ends before the
+-- pseudo console (so closing it never waits on unread output), free it all.
+function AgentPty:close(): void
+  local w = self.w
+  if w == nilptr then return end
+  local n: uint32 = 0
+  if w.rpending then
+    CancelIoEx(w.out_h, &w.rov)
+    GetOverlappedResult(w.out_h, &w.rov, &n, 1)
+  end
+  if w.wpending then
+    CancelIoEx(w.in_h, &w.wov)
+    GetOverlappedResult(w.in_h, &w.wov, &n, 1)
+  end
+  CloseHandle(w.out_h)
+  CloseHandle(w.in_h)
+  if not w.exited then TerminateProcess(w.process, 1) end
+  free_winpty(w)
+  self.w = nilptr
+end

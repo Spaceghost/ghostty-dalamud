@@ -1,0 +1,138 @@
+-- ghostty-agent's host facilities on Windows: the Win32 clipboard, random
+-- bytes (BCryptGenRandom), the process id, the token file's home under
+-- %APPDATA% with an owner-only DACL. Same API as agent/sys_posix.nelua.
+require 'string'
+require 'stringbuilder'
+require 'io'
+require 'os'
+require 'agent.logic'
+require 'core.sys.fsbase'
+
+## cinclude '<windows.h>'
+## linklib 'user32'
+## linklib 'bcrypt'
+
+local function GetCurrentProcessId(): uint32 <cimport, nodecl> end
+local function BCryptGenRandom(alg: pointer, buf: pointer, n: uint32, flags: uint32): int32 <cimport, nodecl> end
+local function OpenClipboard(owner: pointer): cint <cimport, nodecl> end
+local function CloseClipboard(): cint <cimport, nodecl> end
+local function EmptyClipboard(): cint <cimport, nodecl> end
+local function SetClipboardData(format: uint32, h: pointer): pointer <cimport, nodecl> end
+local function GetClipboardData(format: uint32): pointer <cimport, nodecl> end
+local function GlobalAlloc(flags: uint32, n: usize): pointer <cimport, nodecl> end
+local function GlobalFree(h: pointer): pointer <cimport, nodecl> end
+local function GlobalLock(h: pointer): pointer <cimport, nodecl> end
+local function GlobalUnlock(h: pointer): cint <cimport, nodecl> end
+local function GlobalSize(h: pointer): usize <cimport, nodecl> end
+local function Sleep(ms: uint32): void <cimport, nodecl> end
+local function MultiByteToWideChar(cp: uint32, flags: uint32, src: cstring, srclen: cint, dst: *[0]uint16, dstlen: cint): cint <cimport, nodecl> end
+local function WideCharToMultiByte(cp: uint32, flags: uint32, src: *[0]uint16, srclen: cint, dst: *[0]cchar, dstlen: cint, def: cstring, used: pointer): cint <cimport, nodecl> end
+local CF_UNICODETEXT: uint32 <cimport, nodecl, const>
+local GMEM_MOVEABLE: uint32 <cimport, nodecl, const>
+local CP_UTF8: uint32 <cimport, nodecl, const>
+local BCRYPT_USE_SYSTEM_PREFERRED_RNG: uint32 <cimport, nodecl, const>
+
+global AGENT_CLIP_MAX: usize <comptime> = 1024 * 1024
+
+global function agent_sys_init(): void end
+
+global function agent_pid(): int64
+  return GetCurrentProcessId()
+end
+
+global function agent_random(n: usize): string
+  local sb: stringbuilder
+  local buf: [64]uint8
+  if n > 64 then n = 64 end
+  if BCryptGenRandom(nilptr, &buf, (@uint32)(n), BCRYPT_USE_SYSTEM_PREFERRED_RNG) ~= 0 then return (@string){} end
+  for i = 0, < n do sb:writebyte(buf[i]) end
+  return sb:promote()
+end
+
+-- %APPDATA%\ghostty-agent\token, its directory made on the way.
+global function agent_default_token_path(): string
+  local base = os.getenv('APPDATA')
+  if #base == 0 then base:destroy() base = os.getenv('USERPROFILE') end
+  local dir = base .. '\\ghostty-agent'
+  base:destroy()
+  local dirz = dir .. '\0'
+  fs_mkdir((@cstring)(dirz.data))
+  dirz:destroy()
+  local path = dir .. '\\token'
+  dir:destroy()
+  return path
+end
+
+-- Create the file empty, give it a DACL naming only the current user (what
+-- the core does for migrated config), then write the token into it.
+global function agent_write_private(path: string, content: string): boolean
+  local f = io.open(path, 'wb')
+  if not f:isopen() then return false end
+  f:close()
+  local pz = path .. '\0'
+  local private = fs_make_private((@cstring)(pz.data))
+  pz:destroy()
+  if not private then
+    io.stderr:write('[ghostty-agent] WARNING: could not restrict ', path, ' to the current user\n')
+  end
+  f = io.open(path, 'wb')
+  if not f:isopen() then return false end
+  f:write(content)
+  f:close()
+  return true
+end
+
+-- Another program may hold the clipboard for a moment: try for about 100 ms.
+local function open_clipboard(): boolean
+  for _ = 1, 10 do
+    if OpenClipboard(nilptr) ~= 0 then return true end
+    Sleep(10)
+  end
+  return false
+end
+
+global function agent_clipboard_set(data: *[0]uint8, len: usize): boolean
+  local text = agent_crlf(string{data=(@*[0]byte)(data), size=len})
+  local n = MultiByteToWideChar(CP_UTF8, 0, (@cstring)(text.data), (@cint)(text.size), nilptr, 0)
+  if n < 0 or (n == 0 and text.size > 0) then text:destroy() return false end
+  local h = GlobalAlloc(GMEM_MOVEABLE, (@usize)(n + 1) * 2)
+  if h == nilptr then text:destroy() return false end
+  local w = (@*[0]uint16)(GlobalLock(h))
+  if w == nilptr then GlobalFree(h) text:destroy() return false end
+  if n > 0 then MultiByteToWideChar(CP_UTF8, 0, (@cstring)(text.data), (@cint)(text.size), w, n) end
+  w[n] = 0
+  GlobalUnlock(h)
+  text:destroy()
+  if not open_clipboard() then GlobalFree(h) return false end
+  EmptyClipboard()
+  local ok = SetClipboardData(CF_UNICODETEXT, h) ~= nilptr
+  if not ok then GlobalFree(h) end -- on success the clipboard owns it
+  CloseClipboard()
+  return ok
+end
+
+-- The clipboard's text as UTF-8; empty when it holds no text.
+global function agent_clipboard_get(): (boolean, string)
+  if not open_clipboard() then return false, (@string){} end
+  local h = GetClipboardData(CF_UNICODETEXT)
+  if h == nilptr then CloseClipboard() return true, (@string){} end
+  local w = (@*[0]uint16)(GlobalLock(h))
+  if w == nilptr then CloseClipboard() return true, (@string){} end
+  local cap = GlobalSize(h) // 2
+  local wlen: usize = 0
+  while wlen < cap and w[wlen] ~= 0 do wlen = wlen + 1 end
+  local out: string
+  if wlen > 0 then
+    local n = WideCharToMultiByte(CP_UTF8, 0, w, (@cint)(wlen), nilptr, 0, nilptr, nilptr)
+    if n > 0 and (@usize)(n) <= AGENT_CLIP_MAX then
+      local sb: stringbuilder
+      local span = sb:prepare((@usize)(n))
+      WideCharToMultiByte(CP_UTF8, 0, w, (@cint)(wlen), (@*[0]cchar)(span.data), n, nilptr, nilptr)
+      sb:commit((@usize)(n))
+      out = sb:promote()
+    end
+  end
+  GlobalUnlock(h)
+  CloseClipboard()
+  return true, out
+end

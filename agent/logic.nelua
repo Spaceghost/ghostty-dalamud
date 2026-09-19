@@ -1,0 +1,126 @@
+-- The pure parts of ghostty-agent: no sockets, no processes, no platform
+-- calls. Both builds (POSIX and Windows) use them, and
+-- tests/test_agent_logic.nelua checks them on the host.
+require 'string'
+require 'vector'
+require 'stringbuilder'
+
+-- OPEN's payload after cols/rows: argv entries, an empty entry, env entries,
+-- all NUL separated. The strings are copies the caller frees.
+global function agent_split_nul(p: *[0]uint8, len: usize): (vector(string), vector(string))
+  local argv: vector(string)
+  local env: vector(string)
+  local i: usize = 0
+  local start: usize = 0
+  local in_env = false
+  while i < len do
+    if p[i] == 0 then
+      if i == start then
+        -- empty entry marks the argv/env boundary
+        in_env = true
+      else
+        local s = string{data=(@*[0]byte)(&p[start]), size=i-start}:copy()
+        if in_env then env:push(s) else argv:push(s) end
+      end
+      start = i + 1
+    end
+    i = i + 1
+  end
+  if start < len then
+    local s = string{data=(@*[0]byte)(&p[start]), size=len-start}:copy()
+    if in_env then env:push(s) else argv:push(s) end
+  end
+  return argv, env
+end
+
+-- "host:port" or "host" (port 7777). The host is a copy.
+global function agent_parse_hostport(s: string): (string, uint16)
+  local colon = s:find(':', 1, true)
+  if colon == 0 then return s:copy(), 7777 end
+  return s:sub(1, colon - 1), (@uint16)(tointeger(s:sub(colon + 1)))
+end
+
+-- A copy of `s` without trailing newlines and spaces (a token file's contents).
+global function agent_trim(s: string): string
+  local e = #s
+  while e > 0 and (s:byte(e) == 10 or s:byte(e) == 13 or s:byte(e) == 32) do e = e - 1 end
+  return s:sub(1, e)
+end
+
+-- Lowercase hex of `raw` (a new token from random bytes).
+global function agent_hex(raw: string): string
+  local sb: stringbuilder
+  local hex: string = '0123456789abcdef'
+  for i = 1, #raw do
+    local b = raw:byte(i)
+    sb:writebyte(hex:byte((b >> 4) + 1))
+    sb:writebyte(hex:byte((b & 15) + 1))
+  end
+  return sb:promote()
+end
+
+-- Text for the Windows clipboard: every bare LF becomes CRLF; CRLF stays.
+global function agent_crlf(text: string): string
+  local sb: stringbuilder
+  for i = 1, #text do
+    local c = text:byte(i)
+    if c == 10 and (i == 1 or text:byte(i - 1) ~= 13) then sb:writebyte(13) end
+    sb:writebyte(c)
+  end
+  return sb:promote()
+end
+
+-- "KEY=value" from OPEN's env: false for entries without a key (no '=', or
+-- one at the start, like Windows' "=C:=C:\" drive entries). Copies.
+global function agent_env_split(kv: string): (boolean, string, string)
+  local eq = kv:find('=', 1, true)
+  if eq <= 1 then return false, (@string){}, (@string){} end
+  return true, kv:sub(1, eq - 1), kv:sub(eq + 1)
+end
+
+-- The shell an OPEN without argv gets: a login /bin/sh, or on Windows
+-- %COMSPEC% (cmd.exe when it is unset).
+global function agent_default_argv(windows: boolean, comspec: string): vector(string)
+  local argv: vector(string)
+  if windows then
+    argv:push(#comspec > 0 and comspec:copy() or string.copy('cmd.exe'))
+  else
+    argv:push(string.copy('/bin/sh'))
+    argv:push(string.copy('-l'))
+  end
+  return argv
+end
+
+-- What ATTACH replays. The ring holds the last `size` of `total` output
+-- bytes. A client that says how much it already has (`fed`) gets only the
+-- rest, onto the screen it kept. Otherwise, or when the ring no longer holds
+-- the rest, its terminal is reset and gets everything the ring holds.
+-- `start` counts from the oldest byte in the ring.
+global AgentReplayPlan = @record{ reset: boolean, start: usize, count: usize }
+
+global function agent_replay_plan(size: uint64, total: uint64, has_fed: boolean, fed: uint64): AgentReplayPlan
+  if has_fed and fed <= total and total - fed <= size then
+    local missed = total - fed
+    return { reset = false, start = (@usize)(size - missed), count = (@usize)(missed) }
+  end
+  if size == 0 then return { reset = false, start = 0, count = 0 } end
+  return { reset = true, start = 0, count = (@usize)(size) }
+end
+
+-- Index in the ring of the byte `start` bytes after the oldest one. Until the
+-- ring is full (size < cap) the oldest byte is at index 0; after that it is
+-- at `head`, where the next byte will be written.
+global function agent_ring_index(size: usize, cap: usize, head: usize, start: usize): usize
+  if size == 0 then return 0 end
+  if size >= cap then return (head + start) % size end
+  return start
+end
+
+-- How long the Windows event loop sleeps: it wakes on its handles, so the
+-- timeout is only a safety net, except while a shell's console output may
+-- still arrive after the shell exited, or when more handles are wanted than
+-- one wait takes (MAXIMUM_WAIT_OBJECTS); those fall back to a short poll.
+global function agent_wait_ms(wanted: usize, max: usize, exiting: boolean): uint32
+  if exiting or wanted > max then return 50 end
+  return 1000
+end
