@@ -267,11 +267,12 @@ end
 
 local rev, last_body = 0, nil
 
--- A window panel's kind: full, tab, or its world anchor's (pet or pin).
+-- A window panel's kind: full, tab, or its world anchor's (pet, hud or pin).
 local function kind_of(w)
   if w.view ~= 'world' then return w.view end
   local a = anchor(w.id)
-  return (a and a.kind == 'pet') and 'pet' or 'pin'
+  if a and (a.kind == 'pet' or a.kind == 'hud') then return a.kind end
+  return 'pin'
 end
 
 -- What the reads answer from, as JSON; `rev` moves whenever the windows or

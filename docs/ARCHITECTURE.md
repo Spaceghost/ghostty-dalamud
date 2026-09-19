@@ -160,6 +160,27 @@
    sends the focused panel's pointer and keys back as WINPUT. Not yet
    observed in game.
 
+## HUD panels
+
+A world panel whose anchor is `hud` (lua/world.lua; `/term pin hud [X Y]
+[DIST]`, or let a panel carried with Alt go within `CONFIG.world.hud.edge`
+pixels of a side of the screen, or with Ctrl) is docked to a spot on the
+screen but drawn as any other panel, in 3D, `M.hud.distance` yalms in front
+of the camera and parallel to the screen. Its pixel density follows the
+camera's field of view and the distance, so it keeps the screen size it was
+docked at (`scale`, screen pixels per panel pixel); the anchor stores the spot
+in screen fractions, so a new resolution keeps it. Each frame Lua reads the
+camera frame (`ghostty.view`, from `world_view` in `core/world.nelua`) and
+its turn rate since the last frame; springs (`M.hud`: stiffness, damping,
+tilt, roll, drag, bob, max_tilt, max_drag) slide the panel back against the
+turn, keep it facing where the camera looked and bank it (`roll`, a new
+placement field the panel basis honours), then settle it on its spot. Every
+spring value is clamped, so a fast spin cannot fling it; the camera moving
+along its view (zoom) does not move it. HUD placements carry `hud = true`:
+no depth test or character cut-out (always in front), no present, no camera
+turn on a click, no shadow board, and no world tint or cast light. Not yet
+observed in game.
+
 ## World panels behind game geometry
 
 ImGui draws after the game, so a world panel would cover everything. With
@@ -289,6 +310,7 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_bell` | the visual bell: BEL counting, ring and glow maths, the Lua style, its triangles |
 | `test_policy` | loading `lua/init.lua`: defaults, profiles, key actions, showcase entries |
 | `test_world`, `test_worldpanel`, `test_worlddrag` | world panels: projection and hit testing, the presented pose and walk-up, drag placement and snapping, all against a fake game |
+| `test_worldhud` | HUD panels: roll in the panel basis, the camera frame, the docked spot and size at rest (within a pixel), the lag and settling on a synthetic camera turn, clamps under a wild spin, zoom, the bob, docking maths, the dock hook and persistence in screen fractions |
 | `test_remotewin` | remote window panels against a fake version 3 agent, a fake ImGui and a fake texture table: open, KEY and delta frames, dirty-box uploads, WACK (held while asleep), the textured quads over the letterboxed picture, pointer / button / wheel / key / text input with the chrome keeping its clicks, WEND, WCLOSE, an older shim, a version 2 agent refused |
 | `test_adopt` (`.nelua` + `.lua`) | flat windows in the world, pure parts ([ADOPT.md](ADOPT.md)): window ↔ panel mapping, CPU clipping and strips, the draw-list copy through a fake ImGui, snapshots, the pointer remap and mouse event rewrite, keeping a window on screen, flags, the adopt/lose/give-up state machine, the pull grip, window names, the chat ring, wrapping, the input line and colours; lua/adopt.lua's names, sizes, saved list and colours |
 | `test_adopt_app` | the same in an embedded core against fake ImGui internals and a fake shim: hooks on and off, RenderPre snapshots emptying the window, click-through, moved on screen and back, the pet drawing it, the pointer remapped (queued events rewritten, the core still sees the real pointer), lost and regained, reload and restore, release, the chat pet (lines, addons hidden and shown, typing sent), the pull grip, Mappy adopted automatically (closed, reopened, given back, the settings switch) |
