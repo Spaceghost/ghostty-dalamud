@@ -267,6 +267,8 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_agent_logic` | the agent's pure parts: OPEN parsing, replay plans, ring indexes, CRLF for the Windows clipboard, env entries, default shells, the Windows wait timeout, command line quoting |
 | `test_capture_win32` | the Win32 window capture backend's pure parts: USB HID → virtual key, key message lParams, the characters keys stand for, mouse and wheel words, SendInput absolute coordinates, blank (all-black) captures, UTF-8 → UTF-16 for WM_CHAR, WLISTR lines, window matching |
 | `test_agent` | `ghostty-agent` end to end over TCP |
+| `test_wincodec` | remote window frames: changed tiles, QOI both ways, banding, WFRAME write/parse/apply, malformed input, downscaling |
+| `test_agent_windows` | remote windows end to end over TCP against `--windows test`: list, open by id and match, KEY and delta frames rebuilt, scaling, flow control, every input kind, close, WEND, failures, streams per connection, `--windows off` |
 
 The last step checks that the core also compiles as a native host module.
 

@@ -99,14 +99,44 @@ characters, so layouts on the two ends need not match.
 
 A `CaptureBackend` record of function pointers (see the file for the exact
 signatures): `list`, `open`, `state`, `title`, `frame`, `input`, `close`,
-`pump`, `poll_fds`, `wait_ms`. `--windows NAME` picks one (`auto` by default:
-the platform's own, `off` for none).
+`pump`, `poll_fds`, `wait_ms`. `--windows NAME` picks one: `auto` (the
+default) means the platform's own, `wayland` on Linux, `win32` on Windows,
+`mac` on macOS; `off` means none; `test` is the synthetic backend. A platform
+backend joins the build by flipping its entry in `CAPTURE_BUILT` at the end of
+`agent/capture.nelua` to true, which requires its file and calls its
+`capture_<name>_backend(): (boolean, CaptureBackend, string)`; until then
+`capture_select` answers "<name> backend not built". An agent without a
+backend keeps serving terminals, answers WLIST with ERR and WOPEN with a
+failed WOPENED, both carrying the reason.
 
 Frames are BGRA top-down (alpha ignored), at the window's own size; the
 generic layer scales frames larger than `max_w`×`max_h` down
 (`wincodec_downscale`), rate-limits to `fps`, diffs and encodes. An open may
 stay pending (the portal's picker is up); the WOPENED goes out when it
 settles.
+
+## The generic layer (agent/windows.nelua)
+
+* A stream belongs to the connection that sent its WOPEN. WACK, WINPUT and
+  WCLOSE naming another connection's `sid` are ignored, and a connection's
+  streams are closed when it goes. Windows do not outlive their client.
+* WOPENED goes out once `state` leaves PENDING. Live: `sid`, the size of the
+  first frame as sent (after scaling; 0×0 when the backend has no frame yet)
+  and the backend's title, followed by the KEY frame. Ended first, or an
+  immediate `open` failure: `sid` 0 and the reason.
+* `fps` 0 means 30; it is clamped to 1..60. A frame goes out only when its
+  time is due, fewer than 2 `seq` are unacknowledged, the client's output
+  queue is under 4 MiB, the backend's `serial` changed and some visible pixel
+  changed. The agent keeps a copy of what the client shows and diffs against
+  it; the first frame and every size change are KEY frames.
+* Scaling is by the smallest integer factor that fits (box filter). WINPUT
+  coordinates are pixels of the frames as sent; the agent maps them back
+  (`x * factor + factor / 2`) and clamps them to the window.
+* WCLOSE has no answer. A live stream whose `state` becomes ENDED gets WEND
+  with the backend's reason and is forgotten.
+* The main loop sleeps no longer than `wait_ms` of the backend and of the
+  next due frame of a stream that may send; POSIX also polls the backend's
+  `poll_fds`. The Windows loop has only the timeout.
 
 ## Using it
 
@@ -122,4 +152,18 @@ to the remote window. Esc twice (or clicking outside) gives them back.
 
 ## Verified
 
-Nothing yet.
+Host tests only (`tests/run.sh`), nothing in game or on a real desktop:
+
+* `test_wincodec`: tile diff, QOI both ways, WFRAME packing and parsing,
+  `wincodec_downscale`.
+* `test_agent_windows`: the whole agent path over TCP against the synthetic
+  backend (`--windows test`): WLIST, WOPEN by id and by match, WOPENED fields,
+  a KEY frame and deltas rebuilt to the backend's exact pixels, a scaled
+  stream, flow control (no third `seq` without WACK), an unchanged window
+  sending nothing more, every WINPUT kind with scaled and clamped
+  coordinates, WCLOSE, WEND, open failures, another connection unable to see
+  or touch a stream, a disconnect closing streams, and an agent run with
+  `--windows off` refusing with the reason.
+
+The Windows agent (`ghostty-agent.exe`) cross-compiles with the window layer;
+no real backend exists yet, and the Windows loop's window path has not run.
