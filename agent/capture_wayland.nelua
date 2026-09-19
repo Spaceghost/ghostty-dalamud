@@ -55,6 +55,8 @@ require 'agent.desktop_entries'
 ## cinclude '<wlr/backend/headless.h>'
 ## cinclude '<wlr/render/allocator.h>'
 ## cinclude '<wlr/render/pixman.h>'
+## cinclude '<wlr/render/wlr_texture.h>'
+## cinclude '<stdlib.h>'
 ## cinclude '<wlr/render/wlr_renderer.h>'
 ## cinclude '<wlr/interfaces/wlr_keyboard.h>'
 ## cinclude '<wlr/types/wlr_buffer.h>'
@@ -228,6 +230,17 @@ local function wlr_headless_add_output(b: *wlr_backend, w: cuint, h: cuint): *wl
 local function wlr_backend_start(b: *wlr_backend): boolean <cimport, nodecl> end
 local function wlr_backend_destroy(b: *wlr_backend): void <cimport, nodecl> end
 local function wlr_pixman_renderer_create(): *wlr_renderer <cimport, nodecl> end
+-- declared here: <wlr/render/gles2.h> needs the GLES headers, which the SDK does not pin
+local function wlr_gles2_renderer_create_with_drm_fd(fd: cint): *wlr_renderer <cimport> end
+local wlr_texture <cimport, nodecl, ctypedef> = @record{}
+local wlr_texture_read_pixels_options <cimport, nodecl, ctypedef> = @record{
+  data: pointer, format: uint32, stride: uint32, dst_x: uint32, dst_y: uint32,
+}
+local function wlr_texture_from_buffer(r: *wlr_renderer, b: *wlr_buffer): *wlr_texture <cimport, nodecl> end
+local function wlr_texture_read_pixels(t: *wlr_texture, o: *wlr_texture_read_pixels_options): boolean <cimport, nodecl> end
+local function wlr_texture_destroy(t: *wlr_texture): void <cimport, nodecl> end
+local function realpath(path: cstring, resolved: pointer): cstring <cimport, nodecl> end
+local function free(p: pointer): void <cimport, nodecl> end
 local function wlr_renderer_init_wl_display(r: *wlr_renderer, d: *wl_display): boolean <cimport, nodecl> end
 local function wlr_renderer_destroy(r: *wlr_renderer): void <cimport, nodecl> end
 local function wlr_allocator_autocreate(b: *wlr_backend, r: *wlr_renderer): *wlr_allocator <cimport, nodecl> end
@@ -541,6 +554,11 @@ local wc: record{
   tis: vector(*TI),          -- text inputs (text-input-v3) of the clients
   kb_surface: *wlr_surface,   -- the surface with the keyboard focus
   warned_format: boolean,
+  gpu: string,                -- the render node rendering, empty for pixman
+  drm_fd: cint,
+  stat_frames: integer,       -- frames rendered, and the time it took (s): compose, read back
+  stat_render: float64,
+  stat_grab: float64,
   warned_text: boolean,
 }
 
@@ -549,6 +567,19 @@ local wc: record{
 -- GHOSTTY_WAYLAND_SOCKET and GHOSTTY_XKB_LAYOUT are the fallback.
 local opt_socket: string
 local opt_layout: string
+local opt_render_node: string
+
+-- --wayland-render-node PATH|auto|none (default auto; GHOSTTY_WAYLAND_RENDER_NODE).
+global function capture_wayland_set_render_node(opt: string): void
+  opt_render_node = opt
+end
+
+-- Frames rendered so far, the average milliseconds a frame spent composing
+-- and reading back, and the render node (empty: pixman).
+global function capture_wayland_stats(): (integer, float64, float64, string)
+  if wc.stat_frames == 0 then return 0, 0, 0, wc.gpu end
+  return wc.stat_frames, wc.stat_render * 1000.0 / wc.stat_frames, wc.stat_grab * 1000.0 / wc.stat_frames, wc.gpu
+end
 
 global function capture_wayland_configure(socket: string, layout: string): void
   opt_socket = socket
@@ -597,6 +628,94 @@ global function wayland_match_form(match: string, prefix: string): (boolean, str
   while j >= i and (match:byte(j) == 32 or match:byte(j) == 9 or match:byte(j) == 10 or match:byte(j) == 13) do j = j - 1 end
   if j < i then return false, (@string){} end
   return true, match:sub(i, j)
+end
+
+-- The renderer (--wayland-render-node / GHOSTTY_WAYLAND_RENDER_NODE).
+-- A DRM render node, the GPU behind it and what is known about it.
+global RenderNode = @record{
+  path: string,        -- /dev/dri/renderD128
+  pci: string,         -- 0000:03:00.0
+  driver: string,      -- nvidia, amdgpu, i915, ...
+  display: boolean,    -- one of its card's connectors is connected
+  free_mb: integer,    -- free VRAM in MiB, -1 unknown
+  total_mb: integer,
+}
+
+-- Auto takes a GPU only with this much VRAM free (MiB): the renderer's
+-- buffers are small, but a GPU that is nearly full (a local LLM) must not
+-- be pushed over.
+global WAYLAND_GPU_MIN_FREE_MB: integer <comptime> = 1024
+
+-- The render node for option `opt` ('' for the software pixman renderer) and
+-- why, in a few words for the log:
+--   'none', 'pixman', 'off'  software rendering
+--   '/dev/dri/...'           that node, as given
+--   'auto' (or '')           the GPU with the most free VRAM among those
+--                            driving no display and with at least
+--                            WAYLAND_GPU_MIN_FREE_MB free; pixman when there
+--                            is none, or when VRAM cannot be read
+global function wayland_pick_render_node(opt: string, nodes: *vector(RenderNode)): (string, string)
+  if opt == 'none' or opt == 'pixman' or opt == 'off' then return (@string){}, string.copy('software rendering asked for') end
+  if #opt > 0 and opt:byte(1) == 47 then return string.copy(opt), string.copy('as configured') end
+  if #opt > 0 and opt ~= 'auto' then return (@string){}, string.format('unknown render node "%s": software rendering', opt) end
+  local best = -1
+  local why: stringbuilder
+  for i = 0, < #nodes do
+    local n = &nodes[i]
+    if n.display then
+      why:writef('%s (%s) drives a display; ', n.pci, n.driver)
+    elseif n.free_mb < 0 then
+      why:writef('%s (%s): free VRAM unknown; ', n.pci, n.driver)
+    elseif n.free_mb < WAYLAND_GPU_MIN_FREE_MB then
+      why:writef('%s (%s) has %d MiB free (needs %d); ', n.pci, n.driver, n.free_mb, WAYLAND_GPU_MIN_FREE_MB)
+    elseif best < 0 or n.free_mb > nodes[best].free_mb then
+      best = i
+    end
+  end
+  if best >= 0 then
+    why:destroy()
+    local n = &nodes[best]
+    return string.copy(n.path), string.format('%s (%s), no display, %d of %d MiB free', n.pci, n.driver, n.free_mb, n.total_mb)
+  end
+  if #nodes == 0 then why:write('no render node; ') end
+  why:write('software rendering')
+  return (@string){}, why:promote()
+end
+
+-- The number in `s`, blanks around it ignored; -1 for none.
+local function digits_of(s: string): integer
+  local v, any = 0, false
+  for i = 1, #s do
+    local c = s:byte(i)
+    if c >= 48 and c <= 57 then v = v * 10 + (c - 48) any = true
+    elseif any then break end
+  end
+  return any and v or -1
+end
+
+-- nvidia-smi's "00000000:03:00.0, 953, 8188" lines -> free and total MiB
+-- for sysfs address `pci` ("0000:03:00.0"), -1 when not there.
+global function wayland_nvidia_vram(csv: string, pci: string): (integer, integer)
+  local want = pci:lower()
+  local pos = 1
+  while pos <= #csv do
+    local nl = csv:find('\n', pos, true)
+    local stop = nl > 0 and nl - 1 or #csv
+    local line = csv:subview(pos, stop)
+    pos = stop + 2
+    local c1 = line:find(',', 1, true)
+    if c1 > 0 then
+      local bus = line:subview(1, c1 - 1):lower() -- 8 hex digits of domain
+      local short = #bus > 4 and bus:subview(5) or bus
+      if short == want or bus == want then
+        local c2 = line:find(',', c1 + 1, true)
+        if c2 > 0 then
+          return digits_of(line:subview(c1 + 1, c2 - 1)), digits_of(line:subview(c2 + 1))
+        end
+      end
+    end
+  end
+  return -1, -1
 end
 
 -- Nested desktops ("desktop:NAME [ARGS]"): a whole Wayland compositor as
@@ -1508,7 +1627,41 @@ end
 -- Rendering: each mapped window's output, when its scene has damage
 
 -- The rendered buffer, into t.pixels as BGRA top-down.
+-- With a GPU renderer the buffer lives in video memory: read it back through
+-- a texture (BGRA; RGBA swapped when the driver offers only that).
+local function grab_gpu(t: *Top, buf: *wlr_buffer, w: integer, h: integer): void
+  local tex = wlr_texture_from_buffer(wc.renderer, buf)
+  if tex == nilptr then
+    if not wc.warned_format then wc.warned_format = true log('cannot read a GPU frame back (no texture)') end
+    return
+  end
+  local row = (@usize)(w) * 4
+  t.pixels:resize(row * (@usize)(h))
+  local o: wlr_texture_read_pixels_options = { data = &t.pixels[0], format = DRM_FORMAT_ARGB8888, stride = (@uint32)(row) }
+  local ok = wlr_texture_read_pixels(tex, &o)
+  local swap = false
+  if not ok then
+    o.format = DRM_FORMAT_ABGR8888
+    ok = wlr_texture_read_pixels(tex, &o)
+    swap = ok
+  end
+  wlr_texture_destroy(tex)
+  if not ok then
+    if not wc.warned_format then wc.warned_format = true log('cannot read a GPU frame back (read_pixels failed)') end
+    return
+  end
+  if swap then
+    for i = 0, < w * h do
+      local k = (@usize)(i) * 4
+      t.pixels[k], t.pixels[k + 2] = t.pixels[k + 2], t.pixels[k]
+    end
+  end
+  t.w, t.h = w, h
+  t.serial = t.serial + 1
+end
+
 local function grab(t: *Top, buf: *wlr_buffer, w: integer, h: integer): void
+  if #wc.gpu > 0 then grab_gpu(t, buf, w, h) return end
   local data: pointer
   local fmt: uint32 = 0
   local stride: usize = 0
@@ -1588,9 +1741,14 @@ local function render(t: *Top): void
   local st: wlr_output_state
   wlr_output_state_init(&st)
   if resize then wlr_output_state_set_custom_mode(&st, (@int32)(w), (@int32)(h), WAYLAND_REFRESH_MHZ) end
+  local t0 = os.now()
   if wlr_scene_output_build_state(t.sout, &st, nilptr) then
     if (st.committed & WLR_OUTPUT_STATE_BUFFER) ~= 0 and st.buffer ~= nilptr then
+      local t1 = os.now()
       grab(t, st.buffer, w, h)
+      wc.stat_frames = wc.stat_frames + 1
+      wc.stat_render = wc.stat_render + (t1 - t0)
+      wc.stat_grab = wc.stat_grab + (os.now() - t1)
       t.boxes:clear()
       for i = 0, < #t.lay do
         local b = t.lay[i]
@@ -2151,6 +2309,126 @@ local function start_xwayland(): void
   target:destroy() disp:destroy()
 end
 
+-- The machine's DRM render nodes, with their GPU's PCI address, driver,
+-- whether it drives a display and its free VRAM (amdgpu: sysfs; nvidia:
+-- one nvidia-smi query; others unknown).
+local function sys_real(path: string): string
+  local r = realpath((@cstring)(path.data), nilptr)
+  if r == nilptr then return (@string){} end
+  local out = string.copy((@string)(r))
+  free(r)
+  return out
+end
+
+local function sys_base(path: string): string
+  local r = sys_real(path)
+  local slash = 0
+  for i = 1, #r do if r:byte(i) == 47 then slash = i end end
+  local b = r:sub(slash + 1)
+  r:destroy()
+  return b
+end
+
+local function sys_read(path: string): string
+  local f = io.open(path, 'r')
+  if not f:isopen() then return (@string){} end
+  local t = f:read('a')
+  f:close()
+  return t
+end
+
+local function render_nodes(): vector(RenderNode)
+  local out: vector(RenderNode)
+  local drm = desktop_list_dir('/sys/class/drm')
+  local nvidia_csv: string
+  local asked_nvidia = false
+  for i = 0, < #drm do
+    local nm = drm[i]
+    if #nm > 7 and nm:subview(1, 7) == 'renderD' then
+      local n: RenderNode
+      n.path = '/dev/dri/' .. nm
+      local dev = '/sys/class/drm/' .. nm .. '/device'
+      n.pci = sys_base(dev)
+      local drv = dev .. '/driver'
+      n.driver = sys_base(drv)
+      drv:destroy()
+      local devreal = sys_real(dev)
+      -- a connected connector ("cardN-HDMI-A-1") of a card on the same device
+      for k = 0, < #drm do
+        local c = drm[k]
+        local dash = c:find('-', 1, true)
+        if #c > 4 and c:subview(1, 4) == 'card' and dash > 0 then
+          local st = sys_read('/sys/class/drm/' .. c .. '/status')
+          if #st >= 9 and st:subview(1, 9) == 'connected' then
+            local cr = sys_real('/sys/class/drm/' .. c:subview(1, dash - 1) .. '/device')
+            if cr == devreal then n.display = true end
+            cr:destroy()
+          end
+          st:destroy()
+        end
+      end
+      n.free_mb, n.total_mb = -1, -1
+      if n.driver == 'amdgpu' then
+        local tot = sys_read(dev .. '/mem_info_vram_total')
+        local used = sys_read(dev .. '/mem_info_vram_used')
+        if #tot > 0 and #used > 0 then
+          local tb, ub = digits_of(tot), digits_of(used)
+          if tb > 0 and ub >= 0 then n.total_mb, n.free_mb = tb // 1048576, (tb - ub) // 1048576 end
+        end
+        tot:destroy() used:destroy()
+      elseif n.driver == 'nvidia' then
+        if not asked_nvidia then
+          asked_nvidia = true
+          local f = io.popen('timeout 5 nvidia-smi --query-gpu=pci.bus_id,memory.free,memory.total --format=csv,noheader,nounits 2>/dev/null', 'r')
+          if f:isopen() then nvidia_csv = f:read('a') f:close() end
+        end
+        n.free_mb, n.total_mb = wayland_nvidia_vram(nvidia_csv, n.pci)
+      end
+      devreal:destroy() dev:destroy()
+      out:push(n)
+    end
+  end
+  nvidia_csv:destroy()
+  for i = 0, < #drm do drm[i]:destroy() end
+  drm:destroy()
+  return out
+end
+
+-- The renderer: a GPU's (GLES2 on its render node) when the option picks
+-- one and it starts, else pixman. Logs which and why.
+local function make_renderer(): *wlr_renderer
+  local opt = #opt_render_node > 0 and string.copy(opt_render_node) or os.getenv('GHOSTTY_WAYLAND_RENDER_NODE')
+  local path, why: string, string
+  if opt == 'none' or opt == 'pixman' or opt == 'off' or (#opt > 0 and opt:byte(1) == 47) then
+    path, why = wayland_pick_render_node(opt, nilptr)
+  else
+    local nodes = render_nodes()
+    path, why = wayland_pick_render_node(opt, &nodes)
+    for i = 0, < #nodes do nodes[i].path:destroy() nodes[i].pci:destroy() nodes[i].driver:destroy() end
+    nodes:destroy()
+  end
+  opt:destroy()
+  if #path > 0 then
+    local fd = open((@cstring)(path.data), O_RDWR | O_CLOEXEC)
+    if fd >= 0 then
+      local r = wlr_gles2_renderer_create_with_drm_fd(fd)
+      if r ~= nilptr then
+        wc.gpu, wc.drm_fd = path, fd
+        log('renderer: GPU ' .. path .. ': ' .. why)
+        why:destroy()
+        return r
+      end
+      close(fd)
+    end
+    log('renderer: cannot render on ' .. path .. ' (' .. why .. '): software rendering')
+    path:destroy() why:destroy()
+    return wlr_pixman_renderer_create()
+  end
+  log('renderer: pixman: ' .. why)
+  why:destroy()
+  return wlr_pixman_renderer_create()
+end
+
 local function start(): (boolean, string)
   local level = WLR_ERROR
   if #os.getenv('GHOSTTY_WAYLAND_DEBUG') > 0 then level = WLR_DEBUG end
@@ -2162,11 +2440,24 @@ local function start(): (boolean, string)
   wc.loop = wl_display_get_event_loop(wc.display)
   wc.backend = wlr_headless_backend_create(wc.loop)
   if wc.backend == nilptr then return false, 'cannot create the headless backend' end
-  wc.renderer = wlr_pixman_renderer_create()
+  wc.drm_fd = -1
+  wc.renderer = make_renderer()
   if wc.renderer == nilptr then return false, 'cannot create the pixman renderer' end
-  wlr_renderer_init_wl_display(wc.renderer, wc.display) -- wl_shm and friends
   wc.allocator = wlr_allocator_autocreate(wc.backend, wc.renderer)
+  if wc.allocator == nilptr and #wc.gpu > 0 then
+    log('renderer: no buffer allocator for ' .. wc.gpu .. ': software rendering')
+    wlr_renderer_destroy(wc.renderer)
+    close(wc.drm_fd)
+    wc.drm_fd = -1
+    wc.gpu:destroy()
+    wc.gpu = (@string){}
+    wc.renderer = wlr_pixman_renderer_create()
+    wc.allocator = wlr_allocator_autocreate(wc.backend, wc.renderer)
+  end
   if wc.allocator == nilptr then return false, 'cannot create a buffer allocator' end
+  -- wl_shm and friends; with a GPU also linux-dmabuf, so GL/Vulkan clients
+  -- hand over GPU buffers
+  wlr_renderer_init_wl_display(wc.renderer, wc.display)
   wc.compositor = wlr_compositor_create(wc.display, 6, wc.renderer)
   wlr_subcompositor_create(wc.display)
   wlr_data_device_manager_create(wc.display)
@@ -2281,8 +2572,14 @@ global function capture_wayland_shutdown(): void
   unhook(&wc.on_req_sel) unhook(&wc.on_req_psel) unhook(&wc.on_set_sel) unhook(&wc.on_new_ti)
   wlr_keyboard_finish(&keyboard)
   wlr_backend_destroy(wc.backend)
+  if wc.stat_frames > 0 then
+    log(string.format('rendered %d frames: %.2f ms composing, %.2f ms reading back a frame on average (%s)', wc.stat_frames,
+      wc.stat_render * 1000.0 / wc.stat_frames, wc.stat_grab * 1000.0 / wc.stat_frames, #wc.gpu > 0 and wc.gpu or 'pixman'))
+  end
   wlr_allocator_destroy(wc.allocator)
   wlr_renderer_destroy(wc.renderer)
+  if wc.drm_fd >= 0 then close(wc.drm_fd) wc.drm_fd = -1 end
+  wc.gpu:destroy()
   wl_display_destroy(wc.display)
   xkb_keymap_unref(wc.keymap)
   xkb_context_unref(wc.xkb_ctx)

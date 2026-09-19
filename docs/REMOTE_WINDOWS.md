@@ -469,6 +469,19 @@ no host compositor: the host desktop never sees these windows.
   clipboard and also make the agent's source the selection again; the
   game's pastes (CLIP_GET) read the host clipboard, so text copied in an
   app pastes in the game. Non-text selections stay among the apps.
+* Renderer: `--wayland-render-node PATH|auto|none` (or
+  GHOSTTY_WAYLAND_RENDER_NODE), default `auto`. `none` is pixman (software);
+  a path renders with GLES2 on that DRM render node; `auto` lists
+  `/sys/class/drm/renderD*`, finds each GPU's PCI address and driver,
+  whether one of its card's connectors is connected (it drives a display),
+  and its free VRAM (amdgpu: sysfs `mem_info_vram_*`; nvidia: one
+  `nvidia-smi --query-gpu` call; others: unknown), and takes the GPU with
+  the most free VRAM among those driving no display with at least 1024 MiB
+  free; otherwise pixman, and the log line says why for each GPU. With a
+  GPU, wlroots offers linux-dmabuf to clients, output buffers come from GBM
+  and each frame is read back with `wlr_texture_read_pixels` (ARGB8888,
+  else ABGR8888 swapped). If the GPU renderer or its allocator does not
+  start, pixman takes over. Nested desktops still get `WLR_RENDERER=pixman`.
 * Input: the stream that gets input gets the keyboard focus (one toplevel at a
   time). Pointer events go to the surface under the point in that window's
   scene (popups included), with `BTN_LEFT/RIGHT/MIDDLE`. WHEEL `dy` is 1/120
@@ -489,8 +502,10 @@ Limits, all current:
   accented letters, emoji) are dropped with one log line.
 * The primary selection (middle-click paste) works between apps but is not
   bridged to the host.
-* Software rendering (pixman) only; GL clients render through their own
-  software fallback.
+* pixman scales slowly: a client that ignores the output scale (video, many
+  games: waylandsink measured below) is upscaled 2× in software at a cost
+  that caps it near 6 fps at 1280×720. GHOSTTY_WAYLAND_SCALE=1 or a GPU
+  renderer avoids it.
 * Single-instance apps (GApplication/D-Bus activation) that are already
   running on the host desktop hand the request to that instance, and the
   window opens there instead; the launch then ends "without opening a window
@@ -763,6 +778,27 @@ pixman 0.46.2; agent built with zig cc), with `yad` 9.3 (GTK 3.24.52) as the cli
   CLIP_SET `from the game ✓` from the plugin's client, then ctrl+a ctrl+v
   ctrl+a ctrl+c in yad, left exactly that text in the file. The host
   desktop's own clipboard (wl-copy/wl-paste) was not exercised.
+* Renderer, 2026-09-19. `test_capture_wayland` checks the auto choice
+  (display GPUs, low or unknown VRAM, an explicit path, none). On this PC
+  auto logged "pixman: 0000:03:00.0 (nvidia) has 953 MiB free (needs 1024);
+  0000:02:00.0 (nvidia) drives a display" (the RTX 4060 runs a local LLM,
+  the RTX 3070 drives the display). `tests/bench_wayland_render.nelua`
+  (manual, not in run.sh) with `gst-launch-1.0 videotestsrc pattern=snow
+  ! 1280x720 ! waylandsink` (full damage every frame, not scale aware), 8 s
+  each, NVIDIA open driver, GLES2 forced on the 3070 (`/dev/dri/renderD129`):
+
+  | renderer | output | fps | compose ms | read back ms |
+  |---|---|---|---|---|
+  | pixman, scale 2 | 2560×1440 | 6.4 | 135.4 | 5.2 |
+  | GLES2 3070, scale 2 | 2560×1440 | 32.0 | 5.6 | 9.6 |
+  | pixman, scale 1 | 1280×720 | 34.2 | 12.0 | 1.2 |
+  | GLES2 3070, scale 1 | 1280×720 | 47.0 | 1.9 | 3.4 |
+
+  `vkcube --wsi wayland` ran under both (GLES2: 52 fps, 0.5 + 2.6 ms;
+  pixman: 54 fps, 1.5 + 1.0 ms). The GPU path was stable in these runs, so
+  it stays available and auto stays the default; on this PC auto still
+  means pixman. Not run: the GPU path on AMD or Intel, on the 4060, with
+  the game running, for longer than a few seconds.
 * `test_e2e_wayland` (in `tests/run.sh`): the plugin's own agent client
   (`core/agent_client.nelua`, decoding as `core/app/remotewin.nelua` does)
   against a real agent run with `--windows wayland --wayland-socket …` and no
