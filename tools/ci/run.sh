@@ -2,7 +2,7 @@
 # The one CI entry point: GitHub Actions, self-hosted runners and a local shell
 # all run this.
 #
-#   tools/ci/run.sh <stage>...      stages: deps test build package all
+#   tools/ci/run.sh <stage>...      stages: deps test build package all ingame
 #
 #   deps     pinned Zig, pinned Dalamud reference assemblies, tools/fetch-vendor.sh
 #   test     host parts of tools/build.sh (Nelua, libghostty-vt, Lua), then tests/run.sh
@@ -10,6 +10,10 @@
 #   package  tools/package.sh when the checkout has one; its .zip and
 #            pluginmaster .json files are collected into build/release/
 #   all      deps test build package
+#   ingame   tools/ci/ingame.sh: the built core into the running game through the
+#            loader's hot swap, `/term selftest all` through XivMcp, the report
+#            in build/ingame/ (exit 3: skipped, game not available). Only on the
+#            gaming PC's runner; never part of `all`
 #
 # Configured only by the environment (see docs/CI.md):
 #   ZIG, DOTNET              binaries; unset = PATH, else fetched (Zig) or ~/.dotnet (dotnet)
@@ -20,7 +24,7 @@
 #   CI_CACHE_DIR             download cache, default ${XDG_CACHE_HOME:-~/.cache}/ghostty-dalamud-ci
 #
 # Every download is pinned in toolchain.env and checked against its sha256.
-# Nothing here needs a secret.
+# Only the ingame stage needs a secret (XIVMCP_CI_TOKEN, docs/CI.md).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck disable=SC1091
@@ -35,7 +39,7 @@ log() { printf '== ci: %s\n' "$*"; }
 die() { printf 'ci: error: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null || die "$1 is required"; }
 
-usage() { sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,27p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 # fetch URL to FILE and check its sha256; the file only appears when it matches
 fetch_checked() { # url sha256 file
@@ -161,6 +165,11 @@ stage_build() {
   "$ROOT/tools/build.sh"
 }
 
+stage_ingame() {
+  log "tools/ci/ingame.sh"
+  "$ROOT/tools/ci/ingame.sh"
+}
+
 stage_package() {
   local out="$ROOT/build/release"
   if [[ ! -x "$ROOT/tools/package.sh" ]]; then
@@ -186,7 +195,7 @@ stage_package() {
 [[ $# -gt 0 ]] || { usage; exit 2; }
 for s in "$@"; do
   case "$s" in
-    deps | test | build | package | all) ;;
+    deps | test | build | package | all | ingame) ;;
     -h | --help) usage; exit 0 ;;
     *) usage >&2; die "unknown stage: $s" ;;
   esac
@@ -197,6 +206,7 @@ for s in "$@"; do
     test) stage_test ;;
     build) stage_build ;;
     package) stage_package ;;
+    ingame) stage_ingame ;;
     all) stage_test; stage_build; stage_package ;;
   esac
 done
