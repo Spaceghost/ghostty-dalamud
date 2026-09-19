@@ -235,6 +235,8 @@ local function status_line(c: *Conn): string
   local at = text:find('4\t16\t16\ttest\t', 1, true)
   assert(at > 0, 'status window listed')
   local e = text:find('\n', at, true)
+  local tab = text:find('\t', at + 13, true) -- a sid: column when this connection streams it
+  if tab > 0 and tab < e then e = tab end
   local s = text:sub(at + 13, e - 1)
   text:destroy()
   return s
@@ -320,7 +322,11 @@ end
 -- every WINPUT kind reaches the backend
 local function expect_input(c: *Conn, want: string): void
   local text = wlist(c)
-  if text:find(want, 1, true) == 0 then
+  -- the title ends the line, or a column follows it (sid: of our stream)
+  local bare = want:subview(1, #want - 1)
+  local at = text:find(bare, 1, true)
+  local next_b = at > 0 and text:byte(at + #bare) or 0
+  if at == 0 or (next_b ~= 10 and next_b ~= 9) then
     print('WLISTR:', text)
     error('input not seen: ' .. want)
   end
@@ -457,6 +463,54 @@ do
 end
 
 conn_close(&c1)
+
+-- links (WOPEN "url:", the test backend's "browser" is window 2): a second
+-- link to a window the connection streams names that stream instead of a
+-- new one; links from a connection that does not watch the list (like
+-- `ghostty-agent --open-url`) put "raise:N" on the window's line for the
+-- watchers, a watcher's own links do not
+local function last_list(c: *Conn, secs: number): string
+  settle(c, secs)
+  local text: string
+  local i: integer = #c.msgs - 1
+  while i >= 0 do
+    if c.msgs[i].typ == PROTO_WLISTR then text = msg_text(&c.msgs[i], 0):copy() break end
+    i = i - 1
+  end
+  return text
+end
+do
+  local w = conn_open()
+  send(&w, PROTO_WLIST, (@*[0]uint8)(('watch').data), 5)
+  local okw, mw = take(&w, PROTO_WLISTR, 0, 3)
+  assert(okw, 'the watch list')
+  mw.data:destroy()
+  local c = conn_open()
+  local _, sa, _, _, ta = wopen(&c, 0, 0, 0, 0, 'url:https://example.org/a')
+  print('link WOPENED', sa, ta)
+  assert(sa ~= 0 and ta:find('pattern two', 1, true) == 1, 'a link opens the browser window')
+  local _, sb2, _, _, tb = wopen(&c, 0, 0, 0, 0, 'url:https://example.org/b')
+  assert(sb2 == sa, 'a second link names the stream that shows the browser already')
+  settle(&c, 0.2)
+  local text = last_list(&w, 0.3)
+  print('watcher list:', (text:gsub('\t', ' '):gsub('\n', ' | ')))
+  local line2 = text:find('2\t64\t48\ttest\tpattern two', 1, true)
+  assert(line2 > 0 and text:find('\traise:2\n', line2, true) > 0 and text:find('\traise:2\n', line2, true) < text:find('\n', line2, true) + 1,
+    'watchers see the window raised, once per link')
+  text:destroy()
+  local okl = wlist(&c)
+  assert(okl:find('\tsid:', okl:find('2\t64\t48\ttest\tpattern two', 1, true), true) > 0 and okl:find('\tsid:', okl:find('\tsid:', 1, true) + 1, true) == 0,
+    'one stream of the link window for that connection')
+  okl:destroy()
+  local _, sw = wopen(&w, 0, 0, 0, 0, 'url:https://example.org/c')
+  assert(sw ~= 0 and sw ~= sa, 'a link of another connection is its own stream')
+  local text2 = last_list(&w, 0.3)
+  assert(text2:find('raise:3', 1, true) == 0 and text2:find('raise:2', 1, true) > 0, 'a watcher\'s own link raises nothing')
+  text2:destroy()
+  ta:destroy() tb:destroy()
+  conn_close(&c)
+  conn_close(&w)
+end
 
 -- without a backend: WLIST gets ERR and WOPEN a failed WOPENED, both saying why
 do

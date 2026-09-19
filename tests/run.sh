@@ -28,6 +28,7 @@ wlrun() { echo "--- $1"; "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${WAYLAN
 if [[ ${#WAYLAND_DEFINE[@]} -gt 0 ]]; then wlrun test_capture_wayland; else echo "--- test_capture_wayland skipped (no vendor/wayland-sdk or libwlroots-0.20)"; fi
 run test_capture_mac
 run test_desktop_entries "$ROOT/build/test-scratch"
+run test_agent_browser
 run test_render
 run test_session
 run test_dualsense

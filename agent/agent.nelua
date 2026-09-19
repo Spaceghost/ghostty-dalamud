@@ -18,6 +18,8 @@
 --                      [--clipboard-file PATH] [--replay-bytes N] [--term xterm-256color]
 --                      [--windows auto|off|test|wayland|win32|mac]
 --                      [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|none]
+--                      [--wayland-browser CMD] [--wayland-browser-profile NAME]
+--        ghostty-agent [--listen HOST:PORT] [--token-file PATH] --open-url URL
 require 'string'
 require 'vector'
 require 'stringbuilder'
@@ -558,6 +560,108 @@ local function windows_cap(ms: integer): integer
   return ms
 end
 
+
+-- `ghostty-agent --open-url URL`: ask the running agent (--listen, else
+-- $GHOSTTY_AGENT_LISTEN, else 127.0.0.1:7777; its token file likewise with
+-- $GHOSTTY_AGENT_TOKEN_FILE) to open URL in its compositor's browser
+-- (WOPEN "url:URL"), and wait for the answer. 0 when the browser has it, else
+-- 1 and one line on stderr saying why. $BROWSER of the compositor's apps
+-- (docs/REMOTE_WINDOWS.md "Opening URLs").
+local function open_url_fail(why: string): integer
+  io.stderr:write('ghostty-agent --open-url: ', why, '\n')
+  return 1
+end
+
+local function open_url_client(listen_spec: string, token_path: string, url: string): integer
+  ## if ccinfo.is_windows then
+  return open_url_fail('links open in the Linux compositor only')
+  ## else
+  if #listen_spec == 0 then listen_spec = os.getenv('GHOSTTY_AGENT_LISTEN') end
+  if #listen_spec == 0 then listen_spec = '127.0.0.1:7777' end
+  if #token_path == 0 then token_path = os.getenv('GHOSTTY_AGENT_TOKEN_FILE') end
+  if #token_path == 0 then token_path = agent_default_token_path() end
+  local token: string
+  do
+    local f = io.open(token_path, 'rb')
+    if not f:isopen() then return open_url_fail('no token file ' .. token_path .. ' (is the agent running?)') end
+    token = agent_trim(f:read('a'))
+    f:close()
+  end
+  local host, port = agent_parse_hostport(listen_spec)
+  local conn = net.connect(host, port)
+  if not net.is_valid(conn.sock) then return open_url_fail('cannot connect to ' .. listen_spec) end
+  local fds: [1]pollfd
+  local deadline = os.now() + 5.0
+  while true do
+    local st = net.connect_poll(&conn)
+    if st == 1 then break end
+    if st < 0 or os.now() > deadline then net.close(conn.sock) return open_url_fail('no agent at ' .. listen_spec) end
+    fds[0] = { fd = net.socket_fd(conn.sock), events = POLLOUT }
+    poll(&fds, 1, 100)
+  end
+  local outq: ByteQueue
+  local inq: ByteQueue
+  proto.write_frame(&outq, PROTO_HELLO, (@*[0]uint8)(token.data), token.size)
+  local req: uint32 = 1
+  do
+    local match = 'url:' .. url
+    local body: vector(uint8)
+    body:resize(13 + match.size)
+    local b = (@*[0]uint8)(&body[0])
+    proto.put_u32(b, req)
+    proto.put_u32((@*[0]uint8)(&b[4]), 0)
+    proto.put_u16((@*[0]uint8)(&b[8]), 64) -- a small picture: nobody looks at it
+    proto.put_u16((@*[0]uint8)(&b[10]), 64)
+    body[12] = 1
+    for i = 0, < match.size do body[13 + i] = (@uint8)(match.data[i]) end
+    proto.write_frame(&outq, PROTO_WOPEN, b, #body)
+    body:destroy()
+    match:destroy()
+  end
+  -- a browser that has to start first may take a while to show its window
+  deadline = os.now() + 45.0
+  local buf: [16384]uint8
+  local result: integer = -1
+  while result < 0 do
+    while outq:len() > 0 do
+      local n = net.send(conn.sock, outq:peek(), outq:len())
+      if n < 0 then net.close(conn.sock) return open_url_fail('the agent closed the connection') end
+      if n == 0 then break end
+      outq:consume((@usize)(n))
+    end
+    local n = net.recv(conn.sock, &buf, 16384)
+    if n < 0 then net.close(conn.sock) return open_url_fail('the agent closed the connection') end
+    if n > 0 then inq:push(&buf, (@usize)(n)) end
+    while result < 0 do
+      local ok, typ, payload, len = proto.read_frame(&inq)
+      if not ok then break end
+      if typ == PROTO_ERR then
+        local view = string{data=(@*[0]byte)(payload), size=len}
+        net.close(conn.sock)
+        return open_url_fail(view)
+      elseif typ == PROTO_WOPENED and len >= 12 and proto.get_u32(payload) == req then
+        local sid = proto.get_u32((@*[0]uint8)(&payload[4]))
+        if sid == 0 then
+          local view = string{data=(@*[0]byte)(&payload[12]), size=len - 12}
+          net.close(conn.sock)
+          return open_url_fail(view)
+        end
+        result = 0
+      end
+      proto.frame_consume(&inq, len)
+    end
+    if result >= 0 then break end
+    if os.now() > deadline then net.close(conn.sock) return open_url_fail('the browser showed no window in time') end
+    local ev: cshort = POLLIN
+    if outq:len() > 0 then ev = ev | POLLOUT end
+    fds[0] = { fd = net.socket_fd(conn.sock), events = ev }
+    poll(&fds, 1, 200)
+  end
+  net.close(conn.sock) -- the window stays in the compositor; the game shows it (raise:)
+  return 0
+  ## end
+end
+
 local function main(): integer
   agent_sys_init()
   local listen_spec: string = '127.0.0.1:7777'
@@ -566,13 +670,21 @@ local function main(): integer
   local wayland_socket: string = '' -- empty: GHOSTTY_WAYLAND_SOCKET, else ffxiv-0, ffxiv-1, ...
   local xkb_layout: string = ''     -- empty: GHOSTTY_XKB_LAYOUT, else us
   local render_node: string = ''    -- empty: GHOSTTY_WAYLAND_RENDER_NODE, else auto
+  local browser: string = ''        -- empty: GHOSTTY_WAYLAND_BROWSER, else the desktop's default browser
+  local browser_profile: string = '' -- empty: GHOSTTY_WAYLAND_BROWSER_PROFILE, else the browser's own profile
+  local open_url: string = ''       -- --open-url: a client of the running agent, not an agent
+  local has_open_url = false
+  local listen_given = false
   agent.replay_bytes = 256 * 1024
   agent.term = 'xterm-256color'
   agent.next_id = 1
   local i = 1
   while i <= #arg do
     local a = arg[i]
-    if a == '--listen' and i < #arg then listen_spec = arg[i+1] i = i + 1
+    if a == '--listen' and i < #arg then listen_spec = arg[i+1] listen_given = true i = i + 1
+    elseif a == '--open-url' and i < #arg then open_url = arg[i+1] has_open_url = true i = i + 1
+    elseif a == '--wayland-browser' and i < #arg then browser = arg[i+1] i = i + 1
+    elseif a == '--wayland-browser-profile' and i < #arg then browser_profile = arg[i+1] i = i + 1
     elseif a == '--token-file' and i < #arg then token_path = arg[i+1] i = i + 1
     elseif a == '--clipboard-file' and i < #arg then agent.clip_file = arg[i+1] i = i + 1
     elseif a == '--replay-bytes' and i < #arg then agent.replay_bytes = (@usize)(tointeger(arg[i+1])) i = i + 1
@@ -582,7 +694,8 @@ local function main(): integer
     elseif a == '--xkb-layout' and i < #arg then xkb_layout = arg[i+1] i = i + 1
     elseif a == '--wayland-render-node' and i < #arg then render_node = arg[i+1] i = i + 1 -- PATH, auto or none
     elseif a == '--help' or a == '-h' then
-      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME] [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|none]\n')
+      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME] [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|none] [--wayland-browser CMD] [--wayland-browser-profile NAME]\n',
+               '       ghostty-agent [--listen HOST:PORT] [--token-file PATH] --open-url URL\n')
       return 0
     else
       io.stderr:write('unknown argument: ', a, '\n')
@@ -590,6 +703,7 @@ local function main(): integer
     end
     i = i + 1
   end
+  if has_open_url then return open_url_client(listen_given and listen_spec or '', token_path, open_url) end
   if #token_path == 0 then token_path = agent_default_token_path() end
   agent.token = read_token_file(token_path)
   local host, port = agent_parse_hostport(listen_spec)
@@ -612,6 +726,8 @@ local function main(): integer
   ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
   capture_wayland_configure(wayland_socket, xkb_layout)
   capture_wayland_set_render_node(render_node)
+  capture_wayland_set_browser(browser, browser_profile)
+  capture_wayland_set_agent(listen_spec, token_path)
   capture_wayland_set_clipboard(clipboard_get, clipboard_set) -- the compositor's apps share the host clipboard
   ## end
   do

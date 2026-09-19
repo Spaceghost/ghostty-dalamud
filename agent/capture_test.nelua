@@ -14,6 +14,8 @@
 -- capture_test_render. Input is not played anywhere: each window remembers
 -- the last event it got and shows it in its WLIST title
 -- ("pattern one: key 40 down mods 1"), which is how tests observe WINPUT.
+-- WOPEN "url:..." opens window 2, the stand-in for a browser that already
+-- has a window (the generic layer's link handling: one stream, raise:N).
 --
 -- Loaded by agent/capture.nelua after the backend types it uses.
 require 'string'
@@ -92,6 +94,7 @@ end
 
 local function test_open(wid: uint32, match: string): (pointer, string)
   local found = -1
+  if wid == 0 and #match > 4 and match:subview(1, 4) == 'url:' then wid = 2 end -- the "browser"
   for i = 0, < #test_windows do
     local win = &test_windows[i]
     if (wid ~= 0 and win.wid == wid) or (wid == 0 and (#match == 0 or contains_nocase(win.title, match) or contains_nocase('test', match))) then
@@ -154,6 +157,11 @@ local function test_close(h: pointer): void
   test_open_count = test_open_count - 1
 end
 
+local function test_wid_of(h: pointer): uint32
+  return test_windows[(@*TestCapture)(h).win].wid
+end
+local function test_list_serial(): uint64 return 1 end -- pushes to watchers only when a stream changes (relist)
+
 local function test_pump(): void end
 local function test_poll_fds(fds: *[0]cint, max: integer): integer return 0 end
 -- frames are drawn on demand; the generic layer's own schedule wakes the loop
@@ -164,6 +172,6 @@ global function capture_test_backend(): (boolean, CaptureBackend, string)
   return true, CaptureBackend{
     name = 'test', list = test_list, open = test_open, state = test_state, title = test_title,
     frame = test_frame, input = test_input, close = test_close, pump = test_pump,
-    poll_fds = test_poll_fds, wait_ms = test_wait_ms,
+    poll_fds = test_poll_fds, wait_ms = test_wait_ms, wid_of = test_wid_of, list_serial = test_list_serial,
   }, ''
 end
