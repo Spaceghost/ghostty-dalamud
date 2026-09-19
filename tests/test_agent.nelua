@@ -70,7 +70,7 @@ for _ = 1, 200 do pump1(&c) if c:ready() then break end end
 assert(c:ready(), 'agent handshake: ' .. c.last_error)
 print('handshake ok:', first_ok, 'version', c.version, 'nonce', c.nonce)
 assert(first_ok:find('ghostty-agent 3 ', 1, true) == 1, 'the greeting carries protocol version 3 and a nonce')
-assert(c.version == 2 and c.nonce ~= 0)
+assert(c.version == 3 and c.nonce ~= 0)
 
 local argv: vector(string)
 argv:push('/bin/sh')
