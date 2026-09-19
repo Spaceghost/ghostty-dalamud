@@ -75,6 +75,7 @@ internal static unsafe class HostApi
         Api->BgDestroy      = &BgDestroy;
         Api->CommandAddTagged = &CommandAddTagged;
         Api->ChatPrint      = &ChatPrint;
+        Api->TextureFile    = &TextureFile;
     }
 
     public static void Free()
@@ -186,6 +187,21 @@ internal static unsafe class HostApi
     {
         if (text == null) return 0;
         try { Plugin.Chat.Print(Str(text)); return 1; } catch { return 0; }
+    }
+
+    // an image file (the Windows picker's app icons) as an ImTextureID, 0 until
+    // Dalamud has loaded it; asked again every frame it is drawn (a shared
+    // texture Dalamud keeps while it is used). Which file, and when, is the core's.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static nint TextureFile(byte* path, uint* w, uint* h)
+    {
+        if (path == null) return 0;
+        try {
+            if (!Plugin.Textures.GetFromFile(Str(path)).TryGetWrap(out var wrap, out _) || wrap == null) return 0;
+            if (w != null) *w = (uint)wrap.Width;
+            if (h != null) *h = (uint)wrap.Height;
+            return (nint)wrap.Handle.Handle;
+        } catch { return 0; }
     }
 
     // the core only passes https links; opening one is Dalamud's job

@@ -1217,6 +1217,34 @@ do
   print('window never OK')
 end
 
+-- App icons that appear late: looked for again every few seconds -------------------------------
+local tex_asked: string
+local function fake_texture_file(path: cstring, w: *uint32, h: *uint32): pointer
+  tex_asked:destroy()
+  tex_asked = string.copy(path)
+  $w, $h = 128, 128
+  return (@pointer)(0x777)
+end
+do
+  local path = dir .. '/build/late-icon-test.png'
+  os.remove(path)
+  local t0 = now
+  assert(winpicker_icon(path, t0) == nilptr, 'not there yet')
+  host.api.texture_file = fake_texture_file
+  local f = io.open(path, 'wb')
+  f:write('png')
+  f:close()
+  f:destroy()
+  assert(winpicker_icon(path, t0 + 1) == nilptr, 'not looked for again at once')
+  assert(winpicker_icon(path, t0 + 3.5) == (@pointer)(0x777) and tex_asked == path, 'found a few seconds later: the texture')
+  host.api.texture_file = nilptr
+  assert(winpicker_icon(path, t0 + 4) == nilptr, 'an older shim: the letter')
+  os.remove(path)
+  path:destroy()
+  tex_asked:destroy()
+  print('window picker icons OK')
+end
+
 gu_shutdown()
 do -- the next test's core must not restore these windows
   local ws = dir .. '/window-state.lua'

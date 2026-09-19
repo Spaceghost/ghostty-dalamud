@@ -87,6 +87,10 @@ global GuHostApi = @record{
   -- a line in the game's chat for the person (short results: a window refused,
   -- a command that failed); nilptr in older shims: the log only
   chat_print: function(text: cstring): cint,
+  -- an image file as an ImTextureID (Dalamud's ITextureProvider.GetFromFile),
+  -- nilptr until it has loaded; asked again each frame it is drawn. nilptr in
+  -- older shims: the Windows picker shows letters instead of app icons
+  texture_file: function(path: cstring, w: *uint32, h: *uint32): pointer,
 }
 
 global LOG_INFO: cint <comptime> = 1

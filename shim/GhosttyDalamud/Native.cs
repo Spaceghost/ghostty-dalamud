@@ -51,6 +51,7 @@ internal unsafe struct GuHostApi
     public delegate* unmanaged[Cdecl]<nint, int> BgDestroy;
     public delegate* unmanaged[Cdecl]<byte*, byte*, int, int> CommandAddTagged;
     public delegate* unmanaged[Cdecl]<byte*, int> ChatPrint;
+    public delegate* unmanaged[Cdecl]<byte*, uint*, uint*, nint> TextureFile;
 }
 
 // Mirrors GuInitInfo in core/app/boot.nelua.
