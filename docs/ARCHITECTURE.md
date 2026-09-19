@@ -28,7 +28,7 @@
   calls `gu_init_ex` with the install and config directories, forwards
   `UiBuilder.Draw` to `gu_frame` and the /xlplugins buttons, chat commands and
   info bar clicks to `gu_event`, and fills `GuHostApi` with callbacks (log,
-  fonts, key state, camera, objects, animation, lights, shadow boards,
+  fonts, key state, camera, objects, animation, lights, shadow boards, desk props,
   commands, info bar, UI-hide flags, IPC, opening a link in the browser, a line in the chat). The core
   decides what to register, when, and under which names (`core/app/hostsurface.nelua`,
   `CONFIG.host` in lua/init.lua).
@@ -282,6 +282,63 @@ it, and `lua/rain.lua` decides whether it rains and holds the tunables.
 Tested on the host only (tests/test_rain.nelua). None of this has been
 observed in game yet: the weather ids and the weather-0-means-indoors rule
 are assumptions, and how the drops and wiper look on a panel is unverified.
+## Desk scene
+
+Opt-in (`CONFIG.animation.style = 'desk'`, "Style" in Settings → Character
+animation; the phone stays the default). Opening a terminal, the same trigger
+as the phone pose, puts a desk and a chair where the character stands and
+sits it down to work. `lua/desk.lua` decides what and where;
+`core/app/deskprops.nelua` makes the furniture, using the same client-side
+`BgObject` callbacks and rules as the panel shadows above.
+
+* Lua asks with `ghostty.desk_props({...})` (model, position, yaw, uniform
+  scale per prop; `core/desk.nelua`) and `ghostty.desk_props(nil)` to let go.
+  The chair goes at the character's feet facing its way, the desk in front
+  turned toward it. Models are the Origenics Monitor Desk and Origenics Chair
+  (HousingFurniture model keys 1419 and 1420, both paths checked against the
+  game's sqpack index), swappable in `CONFIG.animation.desk.models`.
+* Scale: `desk.scale = 'normal'` is the furniture's own size (made for an
+  average adult Midlander), so a smaller character looks like a child at a
+  grown-up desk; `'fit'` scales by the character's model height over
+  `reference_height`; a number is a factor. The chair defaults to `'fit'`,
+  so the seated pose meets its seat.
+* Props are created lazily, polled until loaded, transformed once (again
+  only when Lua moves them), and freed when the terminal closes, when the
+  character walks off, and whenever `desk_block` is set: a cutscene, group
+  pose, a loading screen or an event (a new `scene_flags` callback appended
+  to `GuHostApi`; an older shim reports none of these), combat, a mount, a
+  zone change or no character. They are also freed on the no-world path of
+  the frame loop and in `teardown_effects`. A blocked scene does not come
+  back by itself; the next terminal toggle starts a new one.
+* The pose is the local character's base override, as with the phone
+  (`AnimSet` with the mode untouched, `AnimPlay`): nothing goes to the
+  server. It holds a seated `event_base_chair_*` loop and changes mood every
+  8–25 s by a weighted, seedable draw (`desk.moods`: working 9287, writing
+  4203, reading 5593, thinking 9001/5511, stretching 5752, yawning
+  1068/9040, frustrated 9042 with additive 664, sipping 9033/9190). A
+  character that is already seated, mounted or in combat gets the phone.
+
+Not yet observed in game: the furniture's origin, facing and depth, whether
+the seated loops' seat height meets a fitted chair, what
+`GameObject.Height` holds for `'fit'`, and whether creating objects from the
+draw callback is safe (the shadow boards carry the same risk).
+
+## Character reactions
+
+`CONFIG.animation.reactions` (on by default). `core/app/reactions.nelua`
+compares each terminal's counters once a frame and calls
+`CONFIG.animation.on_event(kind, time, a, b)` while the pose is out:
+`bell`, `done` (exit status, seconds since the command started) and
+`output` (bytes). Exit statuses come from OSC 133;D, which libghostty-vt does
+not surface, so `core/cmdwatch.nelua` scans the output for 133;C and 133;D
+itself (a byte-at-a-time state machine, nothing buffered, replayed output
+skipped); a shell without integration reports only its own non-zero exit.
+`lua/animation.lua` turns events into short additive or facial timelines
+(`reaction_table`: weights, cooldowns, durations) that play over the hold,
+standing, seated or at the desk, and replays the hold when one ends: a bell
+looks up, a failed command shakes the head or curses, a success after
+10 s nods, output after a quiet spell while you are not typing earns a
+glance, and 30–90 s without typing a fidget. Not yet observed in game.
 
 ## Repository layout
 

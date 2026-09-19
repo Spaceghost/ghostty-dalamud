@@ -83,6 +83,7 @@ internal static unsafe class HostApi
         Api->ChatSend       = &ChatSend;
         Api->ConfigUInt     = &ConfigUInt;
         Api->TextureFile    = &TextureFile;
+        Api->SceneFlags     = &SceneFlags;
     }
 
     public static void Free()
@@ -541,6 +542,27 @@ internal static unsafe class HostApi
             if (c == null) return 0;
             c->Timeline.TimelineSequencer.SetSlotSpeed(slot, speed);
             return 1;
+        } catch { return 0; }
+    }
+
+    // What the game is busy with, for props that must not stay in a scene they
+    // do not belong to (the desk scene): 1 cutscene, 2 group pose, 4 between
+    // areas, 8 bound by an event (talking to an NPC, a quest event).
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int SceneFlags()
+    {
+        try {
+            var c = Plugin.Condition;
+            int f = 0;
+            if (c[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedInCutSceneEvent]
+                || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.WatchingCutscene]
+                || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.WatchingCutscene78]) f |= 1;
+            if (Plugin.Client.IsGPosing) f |= 2;
+            if (c[Dalamud.Game.ClientState.Conditions.ConditionFlag.BetweenAreas]
+                || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.BetweenAreas51]) f |= 4;
+            if (c[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedInEvent]
+                || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedInQuestEvent]) f |= 8;
+            return f;
         } catch { return 0; }
     }
 

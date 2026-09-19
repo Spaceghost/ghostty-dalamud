@@ -9,6 +9,7 @@ require 'core.protocol'
 require 'core.agent_client'
 require 'core.sys.conpty'
 require 'core.policy'
+require 'core.cmdwatch'
 
 -- Window: a desktop window streamed by the agent (core/app/remotewin.nelua).
 -- Its terminal is a small local one that only shows status text; nothing
@@ -53,6 +54,7 @@ global Session = @record{
   pending_out: ByteQueue,   -- bytes typed before the agent acknowledged OPEN
   unread: boolean,          -- output arrived while the tab was not visible
   bells: integer,           -- BEL characters received; the host turns new ones into the visual bell
+  cmd: CmdWatch,            -- OSC 133 command marks and output volume, for the character's reactions
   cols: uint16,
   rows: uint16,
   replaying: boolean,       -- the agent is replaying old output: libghostty's answers to it are dropped
@@ -73,6 +75,7 @@ local FED_UNKNOWN: uint64 <comptime> = 0xffffffffffffffff_u64
 
 function Session:feed(data: *[0]uint8, len: usize): void
   self.view:feed(data, len)
+  if self.replaying then self.cmd:reset_scan() else self.cmd:scan(data, len) end
   if self.fed ~= FED_UNKNOWN then self.fed = self.fed + len end
   self.unread = true
 end

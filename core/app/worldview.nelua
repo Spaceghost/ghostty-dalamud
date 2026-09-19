@@ -10,6 +10,8 @@ require 'core.app.panels'
 require 'core.app.lights'
 require 'core.app.occluders'
 require 'core.app.rain'
+require 'core.app.deskprops'
+require 'core.app.reactions'
 require 'core.depthpass'
 require 'core.tooltip'
 
@@ -296,7 +298,7 @@ global function release_look_at(): void
 end
 
 -- Let go of what the core makes the game show or do: panel lights, shadow
--- boards, the character animation, the walk and the head aim. gu_shutdown,
+-- boards, the desk scene's furniture, the character animation, the walk and the head aim. gu_shutdown,
 -- /term reload and the kill switch all do this.
 global function teardown_effects(): void
   lights_destroy_all()
@@ -304,6 +306,8 @@ global function teardown_effects(): void
   local anim_err = policy_anim_toggle(false)
   anim_err:destroy()
   host.anim_out = false
+  desk_props_teardown() -- after the toggle: Lua has let the desk scene go
+  reactions_reset()
   release_walk() -- stop steering before the hook can call a core that is gone
   release_look_at()
 end

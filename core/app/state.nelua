@@ -96,6 +96,9 @@ global GuHostApi = @record{
   -- nilptr until it has loaded; asked again each frame it is drawn. nilptr in
   -- older shims: the Windows picker shows letters instead of app icons
   texture_file: function(path: cstring, w: *uint32, h: *uint32): pointer,
+  -- what the game is busy with (SCENE_* bits: cutscene, group pose, between
+  -- areas, an event); nilptr in older shims: never busy (core/app/deskprops.nelua)
+  scene_flags: function(): cint,
 }
 
 global LOG_INFO: cint <comptime> = 1

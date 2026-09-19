@@ -1216,7 +1216,7 @@ end
 
 -- Lua bindings ------------------------------------------------------------------
 -- ghostty.player() / ghostty.target() / ghostty.object(entity_id) return
--- { x, y, z, rotation, entity_id, territory, in_combat } or nil; ghostty.zone()
+-- { x, y, z, rotation, entity_id, territory, in_combat, height, mounted } or nil; ghostty.zone()
 -- returns the current territory id or nil. ghostty.player(t) and
 -- ghostty.target(t) fill and return the table `t` instead of a new one, so a
 -- per-frame caller makes no garbage.
@@ -1238,6 +1238,8 @@ local function push_object(L: *lua_State, which: cint, id: uint64, reuse: cint):
   lua_pushinteger(L, (@lua_Integer)(o.entity_id)) lua_setfield(L, -2, 'entity_id')
   lua_pushinteger(L, o.territory) lua_setfield(L, -2, 'territory')
   lua_pushboolean(L, o.in_combat) lua_setfield(L, -2, 'in_combat')
+  lua_pushnumber(L, o.height) lua_setfield(L, -2, 'height') -- model height in yalms (the desk scene's 'fit')
+  lua_pushboolean(L, o.mounted) lua_setfield(L, -2, 'mounted')
   return 1
 end
 
