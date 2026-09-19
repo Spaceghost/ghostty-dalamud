@@ -468,6 +468,38 @@ local function l_agent_windows_refresh(L: *lua_State): cint
   return 1
 end
 
+-- ghostty.keys_reserve(caller, {chord, ...}) -> how many chords the caller
+-- now holds: they replace its earlier ones (core/keychords.nelua)
+local function l_keys_reserve(L: *lua_State): cint
+  local len: usize = 0
+  local c = lua_tolstring(L, 1, &len)
+  if c == nilptr then return push_fail(L, 'keys_reserve takes the caller') end
+  if lua_type(L, 2) ~= LUA_TTABLE then return push_fail(L, 'keys_reserve takes a list of chords') end
+  local caller = string.copy(string{data=(@*[0]byte)(c), size=len})
+  local chords: vector(string)
+  local n = (@integer)(lua_rawlen(L, 2))
+  for i = 1, n do
+    lua_rawgeti(L, 2, i)
+    local l: usize = 0
+    local p = lua_tolstring(L, -1, &l)
+    if p ~= nilptr then chords:push(string.copy(string{data=(@*[0]byte)(p), size=l})) end
+    lua_pop(L, 1)
+  end
+  local err = keychords_reserve(caller, &chords)
+  for i = 0, < #chords do chords[i]:destroy() end
+  chords:destroy()
+  local rc: cint
+  if #err > 0 then
+    rc = push_fail(L, err)
+  else
+    lua_pushinteger(L, keychords_count(caller, false))
+    rc = 1
+  end
+  err:destroy()
+  caller:destroy()
+  return rc
+end
+
 -- ghostty.status() -> the info bar / Umbra widget label (GhosttyDalamud.v1.Status)
 local function l_status(L: *lua_State): cint
   lua_pushlstring(L, (@cstring)(host.status.data), host.status.size)
@@ -491,5 +523,6 @@ global function ipc_lua_register(L: *lua_State): void
   lua_pushcclosure(L, l_terminal_new, 0) lua_setfield(L, -2, 'terminal_new')
   lua_pushcclosure(L, l_agent_windows, 0) lua_setfield(L, -2, 'agent_windows')
   lua_pushcclosure(L, l_agent_windows_refresh, 0) lua_setfield(L, -2, 'agent_windows_refresh')
+  lua_pushcclosure(L, l_keys_reserve, 0) lua_setfield(L, -2, 'keys_reserve')
   lua_pop(L, 1)
 end

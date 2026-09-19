@@ -11,5 +11,6 @@ obj/
 
 # state the Lua modules write to the working directory when GHOSTTY_PLUGIN_DIR is unset (tests/run.sh removes them)
 /world-state.lua
+/window-state.lua
 /animation-reset-done
 /settings.lua

@@ -3,6 +3,7 @@
 -- One terminal on screen: key/text input into its session, plugin actions
 -- (copy, paste, tabs, zoom, toggles) and drawing the grid.
 require 'core.app.views'
+require 'core.keychords'
 local strconv: type = require 'detail.strconv'
 
 local ImGuiHoveredFlags_AllowWhenBlockedByActiveItem: cint <cimport, nodecl, const>
@@ -131,6 +132,8 @@ global function key_action(ctx: pointer, name: string, key: *KeyInfo): boolean
       return do_action(ctx, 'toggle_world', key)
     end
   end
+  -- a chord another plugin owns (CONFIG.windows.reserved_chords, IPC keys.reserve): not typed
+  if keychord_reserved(keychord_mods(io), name) then return true end
   local buf: [64]cchar
   local n = policy_key_action(name, io.KeyCtrl, io.KeyShift, io.KeyAlt, io.KeySuper, &buf, 64)
   if n == 0 then return false end

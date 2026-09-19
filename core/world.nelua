@@ -278,14 +278,20 @@ end
 -- split into a grid of small flat cells, the cell under `p` is found and
 -- inverted exactly. `out_hit` is false when `p` is not on the panel;
 -- u/v are still extrapolated from the nearest edge cell for grips.
-global function world_hit(cam: *GuCamera, b: *WorldBasis, p: ImVec2): (boolean, boolean, float32, float32)
+--
+-- world_hit_area does the same for any rectangle of panel pixels, also beyond
+-- the panel's edges (the surface extended: a remote window's menus hang off
+-- its panel); `out_hit` then says whether `p` is on that rectangle.
+global function world_hit_area(cam: *GuCamera, b: *WorldBasis, p: ImVec2, u0: float32, v0: float32,
+                               u1: float32, v1: float32): (boolean, boolean, float32, float32)
   local COLS <comptime> = 12
   local ROWS <comptime> = 4
-  local w, h = b.hw * 2, b.hh * 2
+  local w, h = u1 - u0, v1 - v0
+  if w <= 0 or h <= 0 then return false, false, 0, 0 end
   local grid: [(COLS + 1) * (ROWS + 1)]ImVec2
   for r = 0, ROWS do
     for c = 0, COLS do
-      local x, y, z = world_point(b, w * c / COLS, h * r / ROWS)
+      local x, y, z = world_point(b, u0 + w * c / COLS, v0 + h * r / ROWS)
       local ok, sx, sy = world_project(cam, x, y, z)
       if not ok then return false, false, 0, 0 end
       grid[r * (COLS + 1) + c] = vec2(sx, sy)
@@ -303,7 +309,7 @@ global function world_hit(cam: *GuCamera, b: *WorldBasis, p: ImVec2): (boolean, 
       local cw, ch = w / COLS, h / ROWS
       local uok, lu, lv = world_unproject(&q, cw, ch, p)
       if uok then
-        local u, v = lu + cw * c, lv + ch * r
+        local u, v = u0 + lu + cw * c, v0 + lv + ch * r
         if world_point_in_quad(&q, p) then
           return true, true, u, v
         end
@@ -316,6 +322,10 @@ global function world_hit(cam: *GuCamera, b: *WorldBasis, p: ImVec2): (boolean, 
     end
   end
   return found, false, bu, bv
+end
+
+global function world_hit(cam: *GuCamera, b: *WorldBasis, p: ImVec2): (boolean, boolean, float32, float32)
+  return world_hit_area(cam, b, p, 0, 0, b.hw * 2, b.hh * 2)
 end
 
 -- A panel drawn this frame, as something light behind it hides: its surface

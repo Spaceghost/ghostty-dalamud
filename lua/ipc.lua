@@ -131,6 +131,24 @@ changes['window.place'] = function(p)
   return { id = id, pin = pin }
 end
 
+-- keys.reserve {chords = {'super+*', ...}}: the caller's chords (replacing
+-- its earlier ones; [] lets them go). Checked here for shape, by the core for
+-- meaning (core/keychords.nelua).
+M.max_chords = 64
+changes['keys.reserve'] = function(p)
+  local c = p.chords
+  if type(c) ~= 'table' or getmetatable(c) ~= json.array_mt then return false, 'chords must be an array of strings' end
+  if #c > M.max_chords then return false, 'at most ' .. M.max_chords .. ' chords' end
+  local out = json.array()
+  for i, v in ipairs(c) do
+    if type(v) ~= 'string' or v == '' or #v > 64 or v:find('[%z\1-\31\127 ]') then
+      return false, 'chords must be strings like "super+*" or "alt+shift+q"'
+    end
+    out[i] = v
+  end
+  return { chords = out }
+end
+
 -- The part of the snapshot each read returns.
 local reads = {
   ['window.list'] = function(s) return { rev = s.rev, windows = s.windows, requests = s.requests } end,
@@ -252,6 +270,10 @@ function M.run(text)
     result, err = cycle(p.dir)
   elseif req.method == 'window.place' then
     result, err = ghostty.window_place(p.id, p.pin)
+  elseif req.method == 'keys.reserve' then
+    local n
+    n, err = ghostty.keys_reserve(caller or '', p.chords)
+    if n then result = { chords = n } end
   else
     err = 'unknown method: ' .. tostring(req.method)
   end

@@ -54,6 +54,7 @@ global WindowsCfg = @record{
   fps: integer,
   open_at: string,          -- where a new window panel goes, as /term pin takes it ('here': in front of you)
   autopull: vector(string), -- CONFIG.windows.auto: `/term window pull` arguments to run once a character is loaded
+  reserved_chords: vector(string), -- CONFIG.windows.reserved_chords: keys never sent to a window or typed into a terminal (core/keychords.nelua)
 }
 
 -- Per-frame Lua hooks; each remembers its own last logged error.
@@ -408,6 +409,15 @@ local function read_settings(L: *lua_State, t: cint): void
   lua_getfield(L, wn, 'auto')
   read_string_list(L, lua_gettop(L), &policy.windows.autopull)
   lua_pop(L, 1)
+  for i = 0, < #policy.windows.reserved_chords do policy.windows.reserved_chords[i]:destroy() end
+  policy.windows.reserved_chords:clear()
+  lua_getfield(L, wn, 'reserved_chords')
+  if lua_type(L, -1) == LUA_TNIL then
+    policy.windows.reserved_chords:push(string.copy('super+*')) -- XivDesktop's default chords
+  else
+    read_string_list(L, lua_gettop(L), &policy.windows.reserved_chords) -- {} reserves nothing
+  end
+  lua_pop(L, 1)
   lua_pop(L, 1)
 
   lua_getfield(L, t, 'popup')
@@ -441,6 +451,8 @@ global function policy_unload(): void
   policy.windows.agent:destroy()
   for i = 0, < #policy.windows.autopull do policy.windows.autopull[i]:destroy() end
   policy.windows.autopull:destroy()
+  for i = 0, < #policy.windows.reserved_chords do policy.windows.reserved_chords[i]:destroy() end
+  policy.windows.reserved_chords:destroy()
   policy = {}
 end
 
@@ -1244,6 +1256,76 @@ global function policy_windows_size(id: integer, w: integer, h: integer, chrome:
   local ok = lua_pcall(L, 4, 0, 0) == LUA_OK
   if not ok then log_hook_error(L, POLICY_HOOK_RESIZE, 'windows.size') lua_pop(L, 1) end
   lua_pop(L, 2)
+  return ok
+end
+
+-- Window panels saved with the layout (lua/windows.lua's window-state.lua).
+-- `key`, `match`, `title` are borrowed when saving, owned when read back.
+global WindowSaveEntry = @record{ id: integer, key: string, match: string, title: string }
+
+local function push_lstr(L: *lua_State, v: string, k: cstring): void
+  lua_pushlstring(L, (@cstring)(v.data), v.size)
+  lua_setfield(L, -2, k)
+end
+
+-- CONFIG.windows.save_state({ {id=, key=, match=, title=}, ... }): the anchors
+-- come from lua/world.lua by panel id.
+global function policy_windows_save(entries: *vector(WindowSaveEntry)): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_windows_fn(L, 'save_state') then return end
+  lua_createtable(L, (@cint)(#entries), 0)
+  for i = 0, < #entries do
+    local e = entries[i]
+    lua_createtable(L, 0, 4)
+    lua_pushinteger(L, e.id) lua_setfield(L, -2, 'id')
+    push_lstr(L, e.key, 'key')
+    push_lstr(L, e.match, 'match')
+    push_lstr(L, e.title, 'title')
+    lua_rawseti(L, -2, i + 1)
+  end
+  if lua_pcall(L, 1, 0, 0) ~= LUA_OK then log_hook_error(L, POLICY_HOOK_RESIZE, 'windows.save_state') lua_pop(L, 1) end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.windows.saved() -> { {key=, match=, title=}, ... } into `out` (owned strings).
+global function policy_windows_saved(out: *vector(WindowSaveEntry)): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_windows_fn(L, 'saved') then return end
+  if lua_pcall(L, 0, 1, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_RESIZE, 'windows.saved')
+    lua_pop(L, 3)
+    return
+  end
+  local t = lua_gettop(L)
+  if lua_type(L, t) == LUA_TTABLE then
+    local n = (@integer)(lua_rawlen(L, t))
+    for i = 1, n do
+      lua_rawgeti(L, t, i)
+      if lua_type(L, -1) == LUA_TTABLE then
+        local e = lua_gettop(L)
+        out:push(WindowSaveEntry{ key = lua_field_string(L, e, 'key', ''), match = lua_field_string(L, e, 'match', ''),
+          title = lua_field_string(L, e, 'title', '') })
+      end
+      lua_pop(L, 1)
+    end
+  end
+  lua_pop(L, 3)
+end
+
+-- CONFIG.windows.restore(panel_id, n): panel `panel_id` takes saved entry n's
+-- anchor (from 1). True when there was one.
+global function policy_windows_restore(id: integer, n: integer): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_windows_fn(L, 'restore') then return false end
+  lua_pushinteger(L, id)
+  lua_pushinteger(L, n)
+  local ok = false
+  if lua_pcall(L, 2, 1, 0) == LUA_OK then
+    ok = lua_toboolean(L, -1) ~= 0
+  else
+    log_hook_error(L, POLICY_HOOK_RESIZE, 'windows.restore')
+  end
+  lua_pop(L, 3)
   return ok
 end
 

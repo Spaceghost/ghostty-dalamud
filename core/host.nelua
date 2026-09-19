@@ -253,8 +253,9 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   for i = 0, < #host.sessions do host.sessions[i].keep_on_agent = true end
   if host.layout_restored then save_world_state() end
   for i = #host.sessions - 1, 0, -1 do session_remove(host.sessions[i]) end
-  remotewin_shutdown() -- its panels went with their sessions (WCLOSE queued)
+  remotewin_shutdown() -- its panels went with their sessions (no WCLOSE: the agent keeps their windows)
   window_picker_shutdown()
+  keychords_shutdown() -- run-time reserved chords (IPC keys.reserve) go with this core
   ipc_shutdown() -- the channel was unregistered with the other surfaces
   agent_final_flush() -- the queued DETACH/CLOSE frames, before the socket goes away
   host.sessions:destroy()

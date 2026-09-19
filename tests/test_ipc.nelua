@@ -399,6 +399,27 @@ assert(#host.world == 0 and find_session(pid) == nilptr, 'closed')
 assert(count(PROTO_WCLOSE) == 1, 'the stream closed')
 expect('{"method":"window.list"}', 'assert(#r.result.windows == 0 and r.result.requests[#r.result.requests].ok, RAW)')
 
+-- keys.reserve: a plugin's chords are neither sent to windows nor typed into terminals
+do
+  expect('{"method":"keys.reserve","params":{"chords":["alt+shift+q","ctrl+alt+*"]},"caller":"XivDesktop"}', 'assert(r.ok and r.result.queued, RAW)')
+  frame()
+  expect('{"method":"window.list"}', 'local q = r.result.requests[#r.result.requests]; assert(q.method == "keys.reserve" and q.ok and q.result.chords == 2, RAW)')
+  assert(keychord_reserved(KEYCHORD_ALT | KEYCHORD_SHIFT, 'q') and not keychord_reserved(KEYCHORD_ALT | KEYCHORD_SHIFT, 'w'), 'a named chord')
+  assert(keychord_reserved(KEYCHORD_CTRL | KEYCHORD_ALT, 'f5') and keychord_reserves_all(KEYCHORD_CTRL | KEYCHORD_ALT), 'a wildcard chord')
+  assert(keychord_reserved(KEYCHORD_SUPER, 'a') and not keychord_reserved(KEYCHORD_CTRL, 'a'), 'CONFIG.windows.reserved_chords: super+* by default')
+  -- a bad chord changes nothing
+  expect('{"method":"keys.reserve","params":{"chords":["hyper+x"]},"caller":"XivDesktop"}', 'assert(r.ok, RAW)')
+  frame()
+  expect('{"method":"window.list"}', 'local q = r.result.requests[#r.result.requests]; assert(not q.ok and q.error:find("hyper"), RAW)')
+  assert(keychord_reserved(KEYCHORD_ALT | KEYCHORD_SHIFT, 'q'), 'kept')
+  expect('{"method":"keys.reserve","params":{"chords":"super+*"}}', 'assert(not r.ok and r.error:find("array"), RAW)')
+  expect('{"method":"keys.reserve","params":{"chords":["super +x"]}}', 'assert(not r.ok, RAW)')
+  -- [] lets them go
+  expect('{"method":"keys.reserve","params":{"chords":[]},"caller":"XivDesktop"}', 'assert(r.ok, RAW)')
+  frame()
+  assert(not keychord_reserved(KEYCHORD_ALT | KEYCHORD_SHIFT, 'q') and keychords_count('', true) == 0, 'released')
+end
+
 -- refusals through the channel
 expect('{"method":"window.list",', 'assert(r.ok == false and r.error:find("malformed JSON"), RAW)')
 expect('not json', 'assert(r.ok == false and r.error:find("malformed JSON"), RAW)')
