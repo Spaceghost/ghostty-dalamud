@@ -1,0 +1,98 @@
+-- Keys for the agent's Wayland compositor (agent/capture_wayland.nelua):
+-- WINPUT KEY carries USB HID usages and TEXT carries UTF-8, while a Wayland
+-- seat speaks evdev keycodes interpreted through an xkb keymap. This file
+-- holds the HID -> evdev table and the reverse lookup from a codepoint to the
+-- key (and shift level) that types it in a keymap. Needs only libxkbcommon,
+-- so tests/test_capture_wayland.nelua checks it against a real keymap.
+require 'string'
+
+## cinclude '<xkbcommon/xkbcommon.h>'
+## linklib 'xkbcommon'
+
+global xkb_context <cimport, nodecl, forwarddecl, ctypedef> = @record{}
+global xkb_keymap <cimport, nodecl, forwarddecl, ctypedef> = @record{}
+global xkb_state <cimport, nodecl, forwarddecl, ctypedef> = @record{}
+global xkb_rule_names <cimport, nodecl, ctypedef> = @record{
+  rules: cstring, model: cstring, layout: cstring, variant: cstring, options: cstring,
+}
+global function xkb_context_new(flags: cint): *xkb_context <cimport, nodecl> end
+global function xkb_context_unref(ctx: *xkb_context): void <cimport, nodecl> end
+global function xkb_keymap_new_from_names(ctx: *xkb_context, names: *xkb_rule_names, flags: cint): *xkb_keymap <cimport, nodecl> end
+global function xkb_keymap_unref(km: *xkb_keymap): void <cimport, nodecl> end
+local function xkb_keymap_min_keycode(km: *xkb_keymap): uint32 <cimport, nodecl> end
+local function xkb_keymap_max_keycode(km: *xkb_keymap): uint32 <cimport, nodecl> end
+local function xkb_keymap_num_levels_for_key(km: *xkb_keymap, key: uint32, layout: uint32): uint32 <cimport, nodecl> end
+local function xkb_keymap_key_get_syms_by_level(km: *xkb_keymap, key: uint32, layout: uint32, level: uint32, syms: **[0]uint32): cint <cimport, nodecl> end
+local function xkb_utf32_to_keysym(ucs: uint32): uint32 <cimport, nodecl> end
+
+-- evdev keycodes (linux/input-event-codes.h) the compositor presses itself
+global WL_KEY_ESC: uint32 <comptime> = 1
+global WL_KEY_BACKSPACE: uint32 <comptime> = 14
+global WL_KEY_TAB: uint32 <comptime> = 15
+global WL_KEY_ENTER: uint32 <comptime> = 28
+global WL_KEY_LEFTCTRL: uint32 <comptime> = 29
+global WL_KEY_LEFTSHIFT: uint32 <comptime> = 42
+global WL_KEY_LEFTALT: uint32 <comptime> = 56
+global WL_KEY_LEFTMETA: uint32 <comptime> = 125
+
+-- USB HID usage (keyboard page 7) -> evdev keycode, 0 where there is none.
+-- Usages 0x00-0x73 in order, the same mapping as Linux's hid-input.c:
+-- letters, digits, Enter/Esc/Backspace/Tab/Space, punctuation, F1-F12,
+-- PrintScreen/ScrollLock/Pause, Insert/Home/PgUp/Delete/End/PgDn, arrows,
+-- the keypad, Compose, Power, KP=, F13-F24.
+local hid_table: [116]uint8 = {
+    0,   0,   0,   0,  30,  48,  46,  32,  18,  33,  34,  35,  23,  36,  37,  38,
+   50,  49,  24,  25,  16,  19,  31,  20,  22,  47,  17,  45,  21,  44,   2,   3,
+    4,   5,   6,   7,   8,   9,  10,  11,  28,   1,  14,  15,  57,  12,  13,  26,
+   27,  43,  43,  39,  40,  41,  51,  52,  53,  58,  59,  60,  61,  62,  63,  64,
+   65,  66,  67,  68,  87,  88,  99,  70, 119, 110, 102, 104, 111, 107, 109, 106,
+  105, 108, 103,  69,  98,  55,  74,  78,  96,  79,  80,  81,  75,  76,  77,  71,
+   72,  73,  82,  83,  86, 127, 116, 117, 183, 184, 185, 186, 187, 188, 189, 190,
+  191, 192, 193, 194,
+}
+-- 0xE0-0xE7: LCtrl LShift LAlt LMeta RCtrl RShift RAlt RMeta
+local hid_mods: [8]uint8 = { 29, 42, 56, 125, 97, 54, 100, 126 }
+
+global function wayland_hid_to_evdev(hid: uint16): uint32
+  if hid < #hid_table then return hid_table[hid] end
+  if hid >= 0xE0 and hid <= 0xE7 then return hid_mods[hid - 0xE0] end
+  return 0
+end
+
+-- The key typing codepoint `cp` in `km` (layout 0): evdev keycode and whether
+-- it needs Shift (level 2). False when no key makes it at level 1 or 2 (AltGr
+-- levels and dead-key sequences are not searched). Level 1 wins over level 2
+-- on any key, so '1' is the digit key, not a shifted one. Newline and tab
+-- have no keysym of their own and map to Enter and Tab.
+global function wayland_key_for_codepoint(km: *xkb_keymap, cp: uint32): (boolean, uint32, boolean)
+  if cp == 10 or cp == 13 then return true, WL_KEY_ENTER, false end
+  if cp == 9 then return true, WL_KEY_TAB, false end
+  if cp == 8 then return true, WL_KEY_BACKSPACE, false end
+  if cp == 27 then return true, WL_KEY_ESC, false end
+  local want = xkb_utf32_to_keysym(cp)
+  if want == 0 then return false, 0, false end
+  local lo, hi = xkb_keymap_min_keycode(km), xkb_keymap_max_keycode(km)
+  for level: uint32 = 0, 1 do
+    for kc = lo, hi do
+      if level < xkb_keymap_num_levels_for_key(km, kc, 0) then
+        local syms: *[0]uint32
+        local n = xkb_keymap_key_get_syms_by_level(km, kc, 0, level, &syms)
+        -- xkb keycodes are evdev + 8; keys below 8 do not exist on evdev
+        if n == 1 and syms[0] == want and kc >= 8 then return true, kc - 8, level == 1 end
+      end
+    end
+  end
+  return false, 0, false
+end
+
+-- A keymap from the default rules with `layout` ("us" when empty); nilptr and
+-- the context stays nilptr when xkb data is missing.
+global function wayland_keymap(layout: string): (*xkb_context, *xkb_keymap)
+  local ctx = xkb_context_new(0)
+  if ctx == nilptr then return nilptr, nilptr end
+  local names: xkb_rule_names = { layout = 'us' }
+  if #layout > 0 then names.layout = (@cstring)(layout.data) end
+  local km = xkb_keymap_new_from_names(ctx, &names, 0)
+  if km == nilptr then xkb_context_unref(ctx) return nilptr, nilptr end
+  return ctx, km
+end
