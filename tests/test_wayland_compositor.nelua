@@ -304,7 +304,36 @@ check(changed > 50, 'typing changed the pixels')
 save_png(fr, 'typed.png')
 popup_check(h, w0, h0, 'xdg')
 
--- close: the launched app is asked to close; its exit is reaped
+-- the client goes away (release): the window and yad stay, listed with a
+-- launch id; "key:" finds the window again, and a key for a window that is
+-- not there ends after a short wait
+be.release(h)
+run_for(0.5)
+do
+  local l = be.list()
+  local at = l:find('ghostty-wayland-test\t', 1, true)
+  check(at > 0, 'the window stays after release: ' .. l)
+  local nl = l:find('\n', at, true)
+  local launch = l:sub(at + #'ghostty-wayland-test\t', nl - 1)
+  check(#launch > 0, 'a launch id in the list')
+  print('launch id ' .. launch)
+  local hk, errk = be.open(0, 'key:' .. launch .. '\tyad\tghostty-wayland-test')
+  check(hk ~= nilptr, 'key open: ' .. errk)
+  local sk = be.state(hk)
+  check(sk == CAPTURE_LIVE and be.title(hk) == 'ghostty-wayland-test', 'key: re-attached at once')
+  h = hk
+  local hm = be.open(0, 'key:\tno-such-app\tnothing')
+  local t2 = os.now()
+  local sm, wm = be.state(hm)
+  while sm == CAPTURE_PENDING and os.now() - t2 < 8 do turn(50) sm, wm = be.state(hm) end
+  check(sm == CAPTURE_ENDED, 'a missing key ends: ' .. wm)
+  print(string.format('missing key ended after %.1f s: %s', os.now() - t2, wm))
+  be.close(hm)
+  l:destroy() launch:destroy()
+end
+
+-- close: the launched app is asked to close (also when re-attached by its
+-- key); its exit is reaped
 be.close(h)
 run_for(1.0)
 do

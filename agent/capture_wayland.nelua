@@ -92,6 +92,7 @@ local function unsetenv(name: cstring): cint <cimport, nodecl> end
 local function waitpid(pid: cint, status: *cint, options: cint): cint <cimport, nodecl> end
 local function kill(pid: cint, sig: cint): cint <cimport, nodecl> end
 local function usleep(us: cuint): cint <cimport, nodecl> end
+local function getpid(): cint <cimport, nodecl> end
 local function symlink(target: cstring, path: cstring): cint <cimport, nodecl> end
 local function unlink(path: cstring): cint <cimport, nodecl> end
 local function access(path: cstring, mode: cint): cint <cimport, nodecl> end
@@ -391,6 +392,7 @@ Top = @record{
   w: integer, h: integer,
   serial: uint64,
   popups: vector(*Popup),
+  launch: string,            -- the launch id when a launch of ours opened it
   ox: integer, oy: integer,  -- the picture's corner relative to the window's (logical; <= 0)
   lay: vector(CaptureBox),   -- the window and its shown popups, logical, window-relative
   boxes: vector(CaptureBox), -- the same in the latest picture's pixels (CaptureFrame.boxes)
@@ -427,6 +429,8 @@ local Cap = @record{
   first_new: uint32,       -- run: windows with this id or later appeared after the launch
   name: string,            -- owned, lower case: the launched program's base name
   handed_off: boolean,     -- the launched process exited 0 without a window of its own
+  launch: string,          -- owned: the launch id of the app started for this open
+  key: string,             -- owned: "key:..." match text, re-attaching a saved window
 }
 
 local Child = @record{ pid: cint, done: boolean, status: cint }
@@ -451,6 +455,8 @@ local wc: record{
   x_link: string,             -- $XDG_RUNTIME_DIR/<socket>-x11 -> /tmp/.X11-unix/XN
   x_started: float64,         -- os.now() when the first X11 client made Xwayland start (0: not yet)
   deco_mgr: *wlr_xdg_decoration_manager_v1,
+  instance: string,           -- this agent run, in launch ids (hex of start time and pid)
+  launches: integer,          -- launches so far
   icon_pids: vector(cint),    -- icon cache jobs still running (WLIST "apps")
   icon_queued: vector(string), -- the icons they make
   xkb_ctx: *xkb_context,
@@ -593,13 +599,59 @@ local function write_field(sb: *stringbuilder, s: string): void
   end
 end
 
--- One WLISTR line: "wid\tw\th\tapp\ttitle\n".
-global function wayland_list_line(sb: *stringbuilder, wid: uint32, w: integer, h: integer, app: string, title: string): void
+-- One WLISTR line: "wid\tw\th\tapp\ttitle\tlaunch\n"; `launch` is the
+-- window's launch id (empty when the agent did not start it).
+global function wayland_list_line(sb: *stringbuilder, wid: uint32, w: integer, h: integer, app: string, title: string, launch: string): void
   sb:writef('%d\t%d\t%d\t', wid, w, h)
   write_field(sb, app)
   sb:writebyte(9)
   write_field(sb, title)
+  sb:writebyte(9)
+  write_field(sb, launch)
   sb:writebyte(10)
+end
+
+-- A window's key, as a plugin saves it with its panel: the launch id (empty
+-- when unknown), the app and the title. WOPEN "key:LAUNCH\tAPP\tTITLE".
+global WindowKey = @record{ launch: string, app: string, title: string }
+
+-- "key:LAUNCH\tAPP\tTITLE" -> true and the key (views into `match`).
+global function wayland_parse_key(match: string): (boolean, WindowKey)
+  local k: WindowKey
+  if #match < 4 or match:subview(1, 4) ~= 'key:' then return false, k end
+  local rest = match:subview(5)
+  local t1 = rest:find('\t', 1, true)
+  if t1 == 0 then return false, k end
+  local t2 = rest:find('\t', t1 + 1, true)
+  if t2 == 0 then return false, k end
+  k.launch = rest:subview(1, t1 - 1)
+  k.app = rest:subview(t1 + 1, t2 - 1)
+  k.title = rest:subview(t2 + 1)
+  while #k.title > 0 and (k.title:byte(#k.title) == 10 or k.title:byte(#k.title) == 13) do k.title = k.title:subview(1, #k.title - 1) end
+  return true, k
+end
+
+-- How well window `c` fits saved key `k`, 0 for not at all. A window already
+-- streamed never fits (two panels would fight over it). The same launch id
+-- fits whatever the title became; otherwise the app must be equal when the
+-- key has one (a key without one needs the title), and the same title
+-- weighs more than one that contains the other.
+global function wayland_key_score(k: WindowKey, c: WindowKey, streamed: boolean): integer
+  if streamed then return 0 end
+  if #k.launch > 0 and c.launch == k.launch then return 100 end
+  local title_eq = #k.title > 0 and c.title == k.title
+  local title_near = #k.title > 0 and #c.title > 0 and (c.title:find(k.title, 1, true) > 0 or k.title:find(c.title, 1, true) > 0)
+  local score = 0
+  if #k.app > 0 then
+    if c.app ~= k.app then return 0 end
+    score = 10
+  elseif title_eq or title_near then
+    score = 5
+  else
+    return 0
+  end
+  if title_eq then score = score + 20 elseif title_near then score = score + 5 end
+  return score
 end
 
 global WAYLAND_LAUNCH_LINE: string <comptime> = '0\t0\t0\tlaunch\trun:COMMAND or app:NAME to start an app in the game\n'
@@ -828,7 +880,7 @@ local function top_free(t: *Top): void
     if pp.p ~= nilptr then pp.p.base.data = nilptr end
   end
   t.popups:destroy()
-  t.lay:destroy() t.boxes:destroy()
+  t.lay:destroy() t.boxes:destroy() t.launch:destroy()
   if t.deco ~= nilptr then (@*Deco)(t.deco).top = nilptr end
   if t.output ~= nilptr then wlr_output_destroy(t.output) end -- takes the scene output along
   wlr_scene_node_destroy(&t.scene.tree.node)
@@ -1329,7 +1381,7 @@ local function wl_list(): string
     local t = wc.tops[i]
     if t.mapped then
       local w, h = top_size(t)
-      wayland_list_line(&sb, t.id, w, h, top_app(t), top_title(t))
+      wayland_list_line(&sb, t.id, w, h, top_app(t), top_title(t), t.launch)
     end
   end
   return sb:promote()
@@ -1357,6 +1409,27 @@ end
 -- app id or title contains the program's name. Without run:, the first
 -- window whose title or app id contains the match.
 local function settle(c: *Cap, now: float64): void
+  if #c.key > 0 then
+    -- a saved window: the best fit nobody streams, waiting briefly for it
+    local _, k = wayland_parse_key(c.key)
+    local best: *Top, best_score = nilptr, 0
+    for i = 0, < #wc.tops do
+      local t = wc.tops[i]
+      if t.mapped then
+        local cand: WindowKey = { launch = t.launch, app = top_app(t), title = top_title(t) }
+        local sc = wayland_key_score(k, cand, owned(t))
+        if sc > best_score then best, best_score = t, sc end
+      end
+    end
+    if best ~= nilptr then
+      c.top = best
+      set_why(c, CAPTURE_LIVE, '')
+      focus(best)
+    elseif now >= c.deadline then
+      set_why(c, CAPTURE_ENDED, 'no such window (the app is not running: launch it again)')
+    end
+    return
+  end
   for pass = 1, 3 do
     for i = 0, < #wc.tops do
       local t = wc.tops[i]
@@ -1374,6 +1447,7 @@ local function settle(c: *Cap, now: float64): void
         if hit then
           c.top = t
           set_why(c, CAPTURE_LIVE, '')
+          if #c.launch > 0 and #t.launch == 0 then t.launch = string.copy(c.launch) end
           focus(t)
           return
         end
@@ -1471,10 +1545,17 @@ local function wl_open(wid: uint32, match: string): (pointer, string)
       return nilptr, string.copy('cannot start the app (fork failed)')
     end
     wc.children:push(Child{ pid = c.pid })
+    wc.launches = wc.launches + 1
+    c.launch = string.format('%s.%d', wc.instance, wc.launches)
     c.first_new = wc.next_id
     c.name = wayland_launch_name(cmd)
     log('started "' .. cmd .. '" (pid ' .. tostring(c.pid) .. ') on ' .. wc.socket)
     cmd:destroy()
+  elseif #match >= 4 and match:subview(1, 4) == 'key:' then
+    local ok = wayland_parse_key(match)
+    if not ok then delete(c) return nilptr, string.copy('bad key: key:LAUNCH<tab>APP<tab>TITLE') end
+    c.key = string.copy(match)
+    c.deadline = os.now() + WAYLAND_HANDOFF_WAIT
   else
     c.match = match:lower()
   end
@@ -1623,15 +1704,26 @@ local function wl_input(h: pointer, ev: *CaptureInput): void
   wl_display_flush_clients(wc.display)
 end
 
-local function wl_close(h: pointer): void
-  local c = (@*Cap)(h)
-  -- an app launched for this stream is asked to close with it
-  if c.pid ~= 0 and c.top ~= nilptr then top_close(c.top) end
+local function forget_cap(c: *Cap): void
   for i = 0, < #wc.caps do
     if wc.caps[i] == c then wc.caps:remove(i) break end
   end
-  c.why:destroy() c.title:destroy() c.match:destroy() c.name:destroy()
+  c.why:destroy() c.title:destroy() c.match:destroy() c.name:destroy() c.launch:destroy() c.key:destroy()
   delete(c)
+end
+
+local function wl_close(h: pointer): void
+  local c = (@*Cap)(h)
+  -- an app launched for this stream (or re-attached by its key) is asked
+  -- to close with it
+  if c.top ~= nilptr and (c.pid ~= 0 or (#c.key > 0 and #c.top.launch > 0)) then top_close(c.top) end
+  forget_cap(c)
+end
+
+-- The client went away (a plugin reload, the game quitting): the stream
+-- goes, the window and the app launched for it stay, to be opened again.
+local function wl_release(h: pointer): void
+  forget_cap((@*Cap)(h))
 end
 
 local function wl_pump(): void
@@ -1791,6 +1883,7 @@ local function start(): (boolean, string)
   end
   if not wlr_backend_start(wc.backend) then return false, 'cannot start the headless backend' end
   wc.next_id = 1
+  wc.instance = string.format('%x', ((@int64)(os.time()) << 20) ~ (@int64)(getpid()))
   wc.started = true
   log('compositor on WAYLAND_DISPLAY=' .. wc.socket .. ' (' .. wc.runtime_dir .. ')')
   start_xwayland()
@@ -1809,7 +1902,7 @@ global function capture_wayland_backend(): (boolean, CaptureBackend, string)
     list = wl_list, open = wl_open, state = wl_state, title = wl_title,
     frame = wl_frame, input = wl_input, close = wl_close,
     pump = wl_pump, poll_fds = wl_poll_fds, wait_ms = wl_wait_ms,
-    apps = wl_apps,
+    apps = wl_apps, release = wl_release,
   }, ''
 end
 

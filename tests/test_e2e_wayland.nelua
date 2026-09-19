@@ -36,6 +36,7 @@ local State = @record{
   gn: integer,         -- boxes in the latest
   gwin: [4]integer,    -- its first box (the window)
   gpop: [4]integer,    -- its second (a popup), if any
+  list: string,        -- the latest WLISTR
 }
 local st: State
 
@@ -75,6 +76,9 @@ local function on_event(ctx: pointer, ev: *AgentEvent): void
       st.gwin[k] = proto.get_u16((@*[0]uint8)(&ev.data[10 + k * 2]))
       st.gpop[k] = n > 1 and (@integer)(proto.get_u16((@*[0]uint8)(&ev.data[18 + k * 2]))) or 0
     end
+  elseif ev.typ == PROTO_WLISTR then
+    st.list:destroy()
+    st.list = string{data=(@*[0]byte)(ev.data), size=ev.len}:copy()
   elseif ev.typ == PROTO_WEND then
     st.ended = true
   end
@@ -178,6 +182,31 @@ esc[2] = 0
 client:winput(st.sid, WIN_INPUT_KEY, &esc, 4)
 assert(pump_for(5, function(): boolean return st.gn == 1 and st.w == ww end), 'the menu closed: the window alone again')
 print(('e2e: %dx%d, %d frames (%d key, %d delta), %d pixels changed by typing'):format(st.w, st.h, st.frames, st.keys, st.deltas, changed))
+-- persistence: the connection goes (a plugin reload); the app stays. A new
+-- connection lists the window with its launch id and opens it again by key.
+client:flush()
+client:disconnect()
+usleep(300000)
+local oldsid = st.sid
+st.opened, st.frames, st.keys, st.w, st.h = false, 0, 0, 0, 0
+local client2: AgentClient
+client2:init('127.0.0.1', port, token)
+client2.on_event = on_event
+client = client2
+client:connect(os.now())
+assert(pump_for(5, function(): boolean return client:ready() end), 'reconnected')
+client:wlist()
+assert(pump_for(5, function(): boolean return #st.list > 0 end), 'WLISTR after reconnect')
+local at = st.list:find(title .. '\t', 1, true)
+assert(at > 0, 'the app outlived its connection: ' .. st.list)
+local nl = st.list:find('\n', at, true)
+local launch = st.list:sub(at + #title + 1, nl - 1)
+assert(#launch > 0, 'the window has a launch id')
+assert(client:wopen(2, 0, 1920, 1200, 30, 'key:' .. launch .. '\tyad\t' .. title))
+assert(pump_for(5, function(): boolean return st.opened or st.refused end), 'WOPENED for the key')
+assert(st.opened and st.sid ~= oldsid, 'the saved window opened again as a new stream')
+assert(pump_for(5, function(): boolean return st.keys >= 1 end), 'a KEY frame of the re-attached window')
+print(('e2e reattach: launch %s, %dx%d'):format(launch, st.w, st.h))
 -- the stream stays open: run.sh stops the agent, which must end the app
 client:flush()
 print('test_e2e_wayland OK')

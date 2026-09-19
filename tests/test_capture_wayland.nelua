@@ -123,6 +123,26 @@ do
   assert(not ok and why:find('no nested desktop', 1, true) > 0) why:destroy()
 end
 
+-- window keys
+do
+  local ok, k = wayland_parse_key('key:5f3a.2\torg.gnome.TextEditor\tnotes.txt\n')
+  assert(ok and k.launch == '5f3a.2' and k.app == 'org.gnome.TextEditor' and k.title == 'notes.txt')
+  assert(not wayland_parse_key('key:no tabs'))
+  assert(not wayland_parse_key('run:x'))
+  local c: WindowKey = { launch = '5f3a.2', app = 'org.gnome.TextEditor', title = 'other.txt' }
+  assert(wayland_key_score(k, c, false) == 100) -- the same launch, whatever the title became
+  assert(wayland_key_score(k, c, true) == 0)    -- streamed already
+  c.launch = ''
+  assert(wayland_key_score(k, c, false) == 10)  -- same app, another title
+  c.title = 'notes.txt'
+  assert(wayland_key_score(k, c, false) == 30)
+  c.app = 'yad'
+  assert(wayland_key_score(k, c, false) == 0)   -- another app never fits
+  local _, k2 = wayland_parse_key('key:\t\tSome Title')
+  local c2: WindowKey = { title = 'Some Title - edited' }
+  assert(wayland_key_score(k2, c2, false) == 10) -- no app: the title near
+end
+
 -- run: parsing
 do
   local ok, cmd = wayland_parse_run('run:foot')
@@ -143,9 +163,10 @@ end
 do
   local sb: stringbuilder
   sb:write(WAYLAND_LAUNCH_LINE)
-  wayland_list_line(&sb, 7, 640, 437, 'org.gnome.TextEditor', 'notes\tand\nstuff')
+  wayland_list_line(&sb, 7, 640, 437, 'org.gnome.TextEditor', 'notes\tand\nstuff', '')
+  wayland_list_line(&sb, 8, 500, 300, 'yad', 'x', '5f3a.2')
   local s = sb:promote()
-  assert(s == '0\t0\t0\tlaunch\trun:COMMAND or app:NAME to start an app in the game\n7\t640\t437\torg.gnome.TextEditor\tnotes and stuff\n')
+  assert(s == '0\t0\t0\tlaunch\trun:COMMAND or app:NAME to start an app in the game\n7\t640\t437\torg.gnome.TextEditor\tnotes and stuff\t\n8\t500\t300\tyad\tx\t5f3a.2\n')
   s:destroy()
   assert(wayland_contains('Text Editor', 'text'))
   assert(wayland_contains('YAD', 'yad'))

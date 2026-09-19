@@ -9,8 +9,10 @@
 -- queue is already over WINDOWS_OUTQ_MAX).
 --
 -- A stream belongs to the connection that opened it: other connections cannot
--- see or touch it, and it closes when that connection goes. Nothing about
--- windows outlives a client (unlike PTY sessions).
+-- see or touch it, and it closes when that connection goes. The window
+-- itself may stay (a backend's `release`): the Linux compositor keeps it
+-- and its app for the next connection to open again (WOPEN "key:").
+
 require 'vector'
 require 'memory'
 require 'math'
@@ -87,10 +89,11 @@ local function send_opened(q: *ByteQueue, req: uint32, sid: uint32, w: integer, 
   q:push((@*[0]uint8)(text.data), text.size)
 end
 
--- Close the backend's handle and forget stream `i`.
-local function drop(self: *AgentWindows, i: usize): void
+-- Close the backend's handle and forget stream `i`. `gone`: its client went
+-- away (not WCLOSE), so a backend that can keeps the window and its app.
+local function drop(self: *AgentWindows, i: usize, gone: boolean): void
   local s = &self.streams[i]
-  self.backend.close(s.h)
+  if gone and self.backend.release ~= nilptr then self.backend.release(s.h) else self.backend.close(s.h) end
   s.prev:destroy()
   s.scaled:destroy()
   s.rects:destroy()
@@ -271,7 +274,7 @@ function AgentWindows:handle(ci: usize, q: *ByteQueue, typ: uint8, payload: *[0]
     if len < 4 then return true end
     local sid = proto.get_u32(payload)
     for i = 0, < #self.streams do
-      if self.streams[i].sid == sid and self.streams[i].client == ci then drop(self, i) break end
+      if self.streams[i].sid == sid and self.streams[i].client == ci then drop(self, i, false) break end
     end
   else
     return false
@@ -294,7 +297,7 @@ function AgentWindows:tick(now: float64): void
       if st == CAPTURE_PENDING then i = i + 1 continue end
       if st == CAPTURE_ENDED then
         send_opened(q, s.req, 0, 0, 0, #why > 0 and why or 'capture ended')
-        drop(self, i)
+        drop(self, i, false)
         continue
       end
       -- live: announce with the first frame when there is one, else without a size
@@ -310,7 +313,7 @@ function AgentWindows:tick(now: float64): void
     if st == CAPTURE_ENDED then
       local reason = #why > 0 and why or 'capture ended'
       proto.write_frame_id(q, PROTO_WEND, s.sid, (@*[0]uint8)(reason.data), reason.size)
-      drop(self, i)
+      drop(self, i, false)
       continue
     end
     if st == CAPTURE_LIVE and s.seq - s.acked < WINDOWS_UNACKED_MAX and now >= s.due
@@ -354,7 +357,7 @@ end
 function AgentWindows:client_gone(ci: usize): void
   local i: integer = #self.streams - 1
   while i >= 0 do
-    if self.streams[i].client == ci then drop(self, (@usize)(i))
+    if self.streams[i].client == ci then drop(self, (@usize)(i), true)
     elseif self.streams[i].client > ci then self.streams[i].client = self.streams[i].client - 1 end
     i = i - 1
   end

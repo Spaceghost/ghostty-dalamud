@@ -41,7 +41,7 @@ agent → client
 
 | type | name | payload |
 |---|---|---|
-| 24 | WLISTR | lines `wid\tw\th\tapp\ttitle\n`; a wid 0 line describes what WOPEN with wid 0 does |
+| 24 | WLISTR | lines `wid\tw\th\tapp\ttitle\n` (Linux adds `\tlaunch`, below); a wid 0 line describes what WOPEN with wid 0 does |
 | 25 | WOPENED | req u32, sid, w u16, h u16, title UTF-8 (sid 0: failed, the text says why) |
 | 26 | WFRAME | sid, seq u32, w u16, h u16, flags u8, nrect u16, rects… |
 | 27 | WEND | sid, reason UTF-8 (window closed, capture refused, …) |
@@ -154,7 +154,9 @@ goes out when it settles.
 
 * A stream belongs to the connection that sent its WOPEN. WACK, WINPUT and
   WCLOSE naming another connection's `sid` are ignored, and a connection's
-  streams are closed when it goes. Windows do not outlive their client.
+  streams are closed when it goes. A backend with `release` (the Linux
+  compositor) then keeps the window and its app for a later WOPEN; the
+  others close the stream as for WCLOSE.
 * WOPENED goes out once `state` leaves PENDING. Live: `sid`, the size of the
   first frame as sent (after scaling; 0×0 when the backend has no frame yet)
   and the backend's title, followed by the KEY frame. Ended first, or an
@@ -301,7 +303,22 @@ window; it needs WinRT activation and a D3D11 device, so it is not done.
   its late WOPENED answered with WCLOSE. Closing a live panel sends WCLOSE.
 * Window panels are not saved with the layout and do not survive
   `/term reload` (their streams belong to the connection, which a reload
-  replaces). Popped into a tab or minimized, a window panel goes back into
+  replaces). The Linux agent now keeps the windows (see "Window keys");
+  what the plugin has to do to use that:
+  1. On WOPENED for a panel, send WLIST and remember from its line for
+     that window (matched by title/app, or by wid when opened by wid) the
+     key: launch id, app, title. Refresh the title from later WLISTs or
+     WOPENED titles as it changes, keeping the launch id.
+  2. Save window panels in the world layout like terminal panels (place,
+     size, pet/pin), plus the key and the match text they were first
+     opened with (`run:…`, `app:…`, `desktop:…`, a name).
+  3. On start and after `/term reload`, for each saved window panel send
+     WOPEN `key:LAUNCH\tAPP\tTITLE`; on a refusal ("no such window") send
+     the saved match text instead (launching the app again, if it was a
+     launch) and save the new key.
+  4. Closing a panel with its × sends WCLOSE (the app closes); a reload or
+     quit just drops the connection (the app stays). Do not send WCLOSE on
+     shutdown. Popped into a tab or minimized, a window panel goes back into
   the world as a pet.
 
 ## Linux: the agent is the compositor
@@ -345,9 +362,22 @@ no host compositor: the host desktop never sees these windows.
   here" when it exits first, and with "the app opened no window" after 30 s.
   `wid 0` + other text → the first window whose title or app id contains it,
   waiting up to 30 s. An unmapped or destroyed window ends its streams with
-  "window closed". Closing a stream asks an app launched for it to close
-  (`xdg_toplevel.close`); other windows stay. Launched processes are reaped
-  by pid only, never the agent's shells.
+  "window closed". WCLOSE asks an app launched for the stream (or
+  re-attached by its key, below) to close (`xdg_toplevel.close`, X11
+  `WM_DELETE_WINDOW`); other windows stay. A connection that goes away
+  (plugin reload, game restart, network) closes its streams but not their
+  windows or apps. Launched processes are reaped by pid only, never the
+  agent's shells.
+* Window keys, for re-attaching. WLISTR window lines have a sixth field,
+  the launch id: `<agent run>.<n>` (hex of the agent's start time and pid,
+  then a counter) for the window a `run:`/`app:`/`desktop:` launch opened,
+  empty for others. WOPEN `wid 0` + `key:LAUNCH\tAPP\tTITLE` opens the
+  window that fits best among those nobody streams: the same launch id
+  fits whatever the title became; else APP must equal the window's app
+  (when given) and an equal title beats one that contains the other.
+  Nothing fitting within 5 s ends the stream with "no such window (the app
+  is not running: launch it again)". A launch id of an earlier agent run
+  never matches (its apps died with it).
 * X11 apps: wlroots' Xwayland, lazily. The agent listens on the next free X
   display at start (logged: `X11 apps: DISPLAY=:N or
   DISPLAY=$XDG_RUNTIME_DIR/ffxiv-0-x11`); the Xwayland server starts when
@@ -646,6 +676,15 @@ pixman 0.46.2; agent built with zig cc), with `yad` 9.3 (GTK 3.24.52) as the cli
   alone came with the first frame; after a right click near the edge a
   WGEOM with window 0,0 1120×720 and a menu at 1102,362 352×544, and a
   1454×906 picture; after Escape the window alone again.
+* `test_wayland_compositor`, 2026-09-19, keys: after `release` the yad
+  window stayed and was listed with launch id `6aaeb5983ff6c.1`; WOPEN
+  `key:6aaeb5983ff6c.1\tyad\tghostty-wayland-test` was live at once; a key
+  for a missing app ended after 5.0 s; WCLOSE on the re-attached stream
+  closed yad. Pure checks of key parsing and scoring in `test_capture_wayland`.
+* `test_e2e_wayland`, 2026-09-19, persistence over TCP: the client
+  disconnected, a new connection's WLIST still listed the app with its
+  launch id, and WOPEN `key:…` opened it again as a new stream with a
+  1120×720 KEY frame; stopping the agent then ended the app.
 * `test_e2e_wayland` (in `tests/run.sh`): the plugin's own agent client
   (`core/agent_client.nelua`, decoding as `core/app/remotewin.nelua` does)
   against a real agent run with `--windows wayland --wayland-socket …` and no
