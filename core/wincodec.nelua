@@ -86,6 +86,43 @@ global function wincodec_diff(prev: *[0]uint8, prev_stride: usize, cur: *[0]uint
   end
 end
 
+-- Scaling --------------------------------------------------------------------
+
+-- Shrink a w x h frame by the smallest integer factor that fits max_w x max_h
+-- (0: no limit that way), each output pixel the average of its factor x
+-- factor box (fewer at the right and bottom edges, so nothing is cut off).
+-- Returns (factor, out_w, out_h). Factor 1: nothing is written, use `src` as
+-- it is; otherwise `out` holds out_w x out_h pixels, stride out_w * 4, alpha 255.
+global function wincodec_downscale(src: *[0]uint8, stride: usize, w: integer, h: integer,
+                                   max_w: integer, max_h: integer, out: *vector(uint8)): (integer, integer, integer)
+  local f = 1
+  if max_w > 0 and w > max_w then f = math.max(f, (w + max_w - 1) // max_w) end
+  if max_h > 0 and h > max_h then f = math.max(f, (h + max_h - 1) // max_h) end
+  if f == 1 or w <= 0 or h <= 0 then return 1, w, h end
+  local ow, oh = (w + f - 1) // f, (h + f - 1) // f
+  out:resize((@usize)(ow * oh * 4))
+  local o = (@*[0]uint8)(&out[0])
+  for oy = 0, < oh do
+    local y0 = oy * f
+    local y1 = math.min(y0 + f, h)
+    for ox = 0, < ow do
+      local x0 = ox * f
+      local x1 = math.min(x0 + f, w)
+      local sb: uinteger, sg: uinteger, sr: uinteger = 0, 0, 0
+      for y = y0, < y1 do
+        local p = (@*[0]uint8)(&src[(@usize)(y) * stride])
+        for x = x0, < x1 do
+          sb = sb + p[x*4] sg = sg + p[x*4+1] sr = sr + p[x*4+2]
+        end
+      end
+      local n = (@uinteger)((y1 - y0) * (x1 - x0))
+      local i = (oy * ow + ox) * 4
+      o[i], o[i+1], o[i+2], o[i+3] = (@uint8)((sb + n // 2) // n), (@uint8)((sg + n // 2) // n), (@uint8)((sr + n // 2) // n), 255
+    end
+  end
+  return f, ow, oh
+end
+
 -- QOI ------------------------------------------------------------------------
 -- The chunk format of https://qoiformat.org without header or end marker.
 -- Alpha is always 255, so QOI_OP_RGBA never appears.

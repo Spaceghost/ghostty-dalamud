@@ -101,6 +101,36 @@ do
   assert(#rects == 1 and rects[0].w == w and rects[0].h == h)
 end
 
+-- downscaling: the smallest integer factor that fits, box averages, ragged edges
+do
+  local w, h = 10, 5
+  local src: vector(uint8)
+  src:resize((@usize)(w * h * 4))
+  for y = 0, < h do
+    for x = 0, < w do
+      local i = (y * w + x) * 4
+      src[i], src[i+1], src[i+2], src[i+3] = (@uint8)(x * 10), (@uint8)(y * 20), 200, 7
+    end
+  end
+  local out: vector(uint8)
+  local f, ow, oh = wincodec_downscale((@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, 0, 0, &out)
+  assert(f == 1 and ow == w and oh == h and #out == 0, 'no limit: untouched')
+  f, ow, oh = wincodec_downscale((@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, 10, 5, &out)
+  assert(f == 1 and #out == 0, 'fits already')
+  f, ow, oh = wincodec_downscale((@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, 4, 0, &out)
+  -- 10 / 4 needs factor 3: 4 x 2 pixels, the last column and row from partial boxes
+  assert(f == 3 and ow == 4 and oh == 2 and #out == 4 * 2 * 4)
+  assert(out[0] == 10 and out[1] == 20 and out[2] == 200 and out[3] == 255, 'box average of x 0..2, y 0..2')
+  assert(out[3*4] == 90 and out[3*4+1] == 20, 'right edge: column 9 alone')
+  local b = (1 * 4 + 1) * 4
+  assert(out[b] == 40 and out[b+1] == 70, 'bottom edge: x 3..5, y 3..4')
+  f, ow, oh = wincodec_downscale((@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, 100, 2, &out)
+  assert(f == 3 and ow == 4 and oh == 2, 'the height limit decides')
+  f, ow, oh = wincodec_downscale((@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, 5, 5, &out)
+  assert(f == 2 and ow == 5 and oh == 3)
+  assert(out[0] == 5 and out[1] == 10, 'factor 2 averages four pixels (rounded)')
+end
+
 -- banding keeps every rectangle's raw size under the limit
 do
   local rects: vector(WinRect)

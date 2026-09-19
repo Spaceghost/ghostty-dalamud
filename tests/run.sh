@@ -53,6 +53,7 @@ echo "--- test_reinit"
 GLIBC_TUNABLES=$HEAP_ENV build/nelua-cache/test_reinit "$ROOT"
 
 run test_agent_logic
+run test_wincodec
 
 echo "--- test_agent"
 "$NELUA" --cc gcc -P nogc --cache-dir build/nelua-cache -L . -o build/ghostty-agent -b agent/agent.nelua
