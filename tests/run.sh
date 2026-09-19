@@ -21,6 +21,10 @@ unset UMBRA_GHOSTTY_HOME GHOSTTY_HOME # the migration and config home read these
 rm -rf build/test-scratch && mkdir -p build/test-scratch/surface/config
 run test_ghostty
 run test_wincodec
+# shellcheck source=tools/wayland-flags.sh
+source "$ROOT/tools/wayland-flags.sh" # the agent's Wayland compositor, when vendor/wayland-sdk is there
+wlrun() { echo "--- $1"; "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${WAYLAND_DEFINE[@]}" --cflags="$INC $LIBS $WAYLAND_CFLAGS" --cache-dir build/nelua-cache -L . -b "tests/$1.nelua"; "build/nelua-cache/$1" "${@:2}"; }
+if [[ ${#WAYLAND_DEFINE[@]} -gt 0 ]]; then wlrun test_capture_wayland; else echo "--- test_capture_wayland skipped (no vendor/wayland-sdk or libwlroots-0.20)"; fi
 run test_render
 run test_session
 run test_dualsense
@@ -57,7 +61,7 @@ GLIBC_TUNABLES=$HEAP_ENV build/nelua-cache/test_reinit "$ROOT"
 run test_agent_logic
 
 echo "--- test_agent"
-"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -o build/ghostty-agent -b agent/agent.nelua
+"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${WAYLAND_NELUA[@]}" --cache-dir build/nelua-cache -L . -o build/ghostty-agent -b agent/agent.nelua
 "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -b tests/test_agent.nelua
 echo "testtoken123" > build/agent-token
 # a port per run, so test runs at the same time never share an agent
@@ -79,6 +83,14 @@ sleep 0.5
 kill -0 "$WAGENT" || { cat build/agent-windows.log; exit 1; }
 # the first agent runs --windows off: window requests are refused with the reason
 build/nelua-cache/test_agent_windows "$WPORT" testtoken123 "$PORT"
+
+if [[ ${#WAYLAND_DEFINE[@]} -gt 0 ]]; then
+  # a real Wayland client (yad, GTK3) in the agent's compositor; frames land in build/test-scratch/wayland
+  mkdir -p build/test-scratch/wayland
+  wlrun test_wayland_compositor "$ROOT/build/test-scratch/wayland"
+else
+  echo "--- test_wayland_compositor skipped (no vendor/wayland-sdk or libwlroots-0.20)"
+fi
 
 echo "--- host module compiles natively"
 "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc -P noentrypoint --cflags="$INC $LIBS" --cache-dir build/nelua-cache -L . -H -o build/libghostty_umbra_host.so core/host.nelua
