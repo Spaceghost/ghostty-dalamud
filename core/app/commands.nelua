@@ -2,6 +2,7 @@
 
 -- Chat / hotbar commands (/term ...), shared by the shim and keymap actions.
 require 'core.app.popup'
+require 'core.app.selftest'
 local strconv: type = require 'detail.strconv'
 
 -- A terminal or profile number, optionally written "#3". False for anything
@@ -306,6 +307,9 @@ global function run_command(cmd: string): cint
   elseif verb == 'ask' then
     -- /term ask [question]: the rest of the line, untouched, is the question
     return assistant_command(arg)
+  elseif verb == 'selftest' then
+    -- /term selftest [list | all | suite...]: checks inside the live game (core/app/selftest.nelua)
+    return selftest_command(arg)
   elseif verb == 'bell' then
     -- /term bell [ripple|sonar|burst|aura|calm|custom|demo]
     return bell_command(arg)

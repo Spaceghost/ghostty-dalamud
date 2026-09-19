@@ -166,6 +166,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     occluders_destroy_all() -- no character (loading screen, logout): boards go before the scene they sit in
   end
   bell_demo_tick(now)
+  if live then selftest_tick(in_world) end -- /term selftest: one step per frame
   -- a click on the game world (not an ImGui window, not a panel) unfocuses
   -- every terminal so the keyboard goes back to the game
   if live and (host.drop_focus or world_click_off(now)) then
@@ -232,6 +233,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   defer surface_reset() end -- whatever state we were in, forget the shim's callbacks
   if not host.initialized then return end
   surface_shutdown() -- commands, info bar entry and IPC go first
+  selftest_shutdown() -- a run not handing over to the next core reports itself interrupted
   showcase_stop() -- demo terminals never outlive the session; yours come back
   teardown_effects()
   depthpass_shutdown()
