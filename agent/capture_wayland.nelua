@@ -61,6 +61,8 @@ require 'agent.wayland_keys'
 ## cinclude '<wlr/types/wlr_keyboard.h>'
 ## cinclude '<wlr/types/wlr_xdg_shell.h>'
 ## cinclude '<wlr/types/wlr_xdg_decoration_v1.h>'
+## cinclude '<wlr/types/wlr_server_decoration.h>'
+## cinclude '<wlr/util/edges.h>'
 ## linklib 'wlroots-0.20'
 ## linklib 'wayland-server'
 ## linklib 'pixman-1'
@@ -217,6 +219,16 @@ local function wlr_xdg_decoration_manager_v1_create(d: *wl_display): *wlr_xdg_de
 local function wlr_xdg_toplevel_decoration_v1_set_mode(d: *wlr_xdg_toplevel_decoration_v1, mode: cint): uint32 <cimport, nodecl> end
 local function wlr_xdg_toplevel_set_size(t: *wlr_xdg_toplevel, w: int32, h: int32): uint32 <cimport, nodecl> end
 local function wlr_xdg_toplevel_set_activated(t: *wlr_xdg_toplevel, on: boolean): uint32 <cimport, nodecl> end
+local function wlr_xdg_toplevel_set_tiled(t: *wlr_xdg_toplevel, edges: uint32): uint32 <cimport, nodecl> end
+local function wlr_output_state_set_scale(s: *wlr_output_state, scale: float32): void <cimport, nodecl> end
+local wlr_server_decoration_manager <cimport, nodecl, ctypedef, forwarddecl> = @record{}
+local function wlr_server_decoration_manager_create(d: *wl_display): *wlr_server_decoration_manager <cimport, nodecl> end
+local function wlr_server_decoration_manager_set_default_mode(m: *wlr_server_decoration_manager, mode: uint32): void <cimport, nodecl> end
+local WLR_SERVER_DECORATION_MANAGER_MODE_SERVER: uint32 <cimport, nodecl, const>
+local WLR_EDGE_TOP: uint32 <cimport, nodecl, const>
+local WLR_EDGE_BOTTOM: uint32 <cimport, nodecl, const>
+local WLR_EDGE_LEFT: uint32 <cimport, nodecl, const>
+local WLR_EDGE_RIGHT: uint32 <cimport, nodecl, const>
 local function wlr_xdg_toplevel_set_wm_capabilities(t: *wlr_xdg_toplevel, caps: uint32): uint32 <cimport, nodecl> end
 local function wlr_xdg_toplevel_send_close(t: *wlr_xdg_toplevel): void <cimport, nodecl> end
 local function wlr_xdg_surface_schedule_configure(s: *wlr_xdg_surface): uint32 <cimport, nodecl> end
@@ -357,6 +369,7 @@ local wc: record{
   focused: *Top,             -- keyboard focus
   held_mods: uint8,          -- WIN_MOD_* pressed by us
   next_id: uint32,
+  scale: integer,          -- output scale apps render at (GHOSTTY_WAYLAND_SCALE, default 2)
   on_new_toplevel: Hook, on_new_popup: Hook, on_new_deco: Hook,
   warned_format: boolean,
   warned_text: boolean,
@@ -586,6 +599,9 @@ local function on_commit(l: *wl_listener, data: pointer): void
     -- buttons (the game's panel has the chrome), always shown as active
     wlr_xdg_toplevel_set_size(t.xdg, 0, 0)
     wlr_xdg_toplevel_set_activated(t.xdg, true)
+    -- tiled on every edge: GTK and Qt then draw no shadow and no rounded
+    -- corners, so the picture is the window and nothing around it
+    wlr_xdg_toplevel_set_tiled(t.xdg, WLR_EDGE_TOP | WLR_EDGE_BOTTOM | WLR_EDGE_LEFT | WLR_EDGE_RIGHT)
     wlr_xdg_toplevel_set_wm_capabilities(t.xdg, 0)
     if t.deco ~= nilptr then
       wlr_xdg_toplevel_decoration_v1_set_mode((@*Deco)(t.deco).d, WLR_XDG_TOPLEVEL_DECORATION_V1_MODE_SERVER_SIDE)
@@ -606,13 +622,15 @@ local function on_map(l: *wl_listener, data: pointer): void
     w, h = WAYLAND_DEFAULT_W, WAYLAND_DEFAULT_H
   end
   if t.output == nilptr then
-    t.output = wlr_headless_add_output(wc.backend, (@cuint)(w), (@cuint)(h))
+    t.output = wlr_headless_add_output(wc.backend, (@cuint)(w * wc.scale), (@cuint)(h * wc.scale))
     if t.output == nilptr then log('cannot add an output for window ' .. tostring(t.id)) return end
     wlr_output_init_render(t.output, wc.allocator, wc.renderer)
     local st: wlr_output_state
     wlr_output_state_init(&st)
     wlr_output_state_set_enabled(&st, true)
-    wlr_output_state_set_custom_mode(&st, (@int32)(w), (@int32)(h), 0)
+    wlr_output_state_set_custom_mode(&st, (@int32)(w * wc.scale), (@int32)(h * wc.scale), 0)
+    -- apps render at this scale: crisp text on a panel seen up close
+    wlr_output_state_set_scale(&st, (@float32)(wc.scale))
     wlr_output_commit_state(t.output, &st)
     wlr_output_state_finish(&st)
     wlr_output_create_global(t.output, wc.display)
@@ -790,7 +808,8 @@ end
 
 local function render(t: *Top): void
   if not t.mapped or t.sout == nilptr or t.output.frame_pending then return end
-  local w, h = top_size(t)
+  local lw, lh = top_size(t)
+  local w, h = lw * wc.scale, lh * wc.scale -- output pixels
   local resize = w ~= t.output.width or h ~= t.output.height
   if not resize and not wlr_scene_output_needs_frame(t.sout) then return end
   local st: wlr_output_state
@@ -832,7 +851,9 @@ end
 -- Pointer onto window pixel (x, y): whatever surface is there gets it.
 local function pointer_to(t: *Top, x: integer, y: integer, time: uint32): void
   local sx: float64, sy: float64 = 0, 0
-  local node = wlr_scene_node_at(&t.scene.tree.node, x, y, &sx, &sy)
+  -- frames are output pixels; the scene is in logical coordinates
+  local lx, ly = (x + 0.5) / wc.scale, (y + 0.5) / wc.scale
+  local node = wlr_scene_node_at(&t.scene.tree.node, lx, ly, &sx, &sy)
   local surf: *wlr_surface = nilptr
   if node ~= nilptr and node.type == WLR_SCENE_NODE_BUFFER then
     local ss = wlr_scene_surface_try_from_buffer(wlr_scene_buffer_from_node(node))
@@ -1141,6 +1162,15 @@ local function start(): (boolean, string)
   hook(&wc.on_new_popup, &wc.xdg_shell.events.new_popup, on_new_popup, nilptr)
   wc.deco_mgr = wlr_xdg_decoration_manager_v1_create(wc.display)
   hook(&wc.on_new_deco, &wc.deco_mgr.events.new_toplevel_decoration, on_new_deco, nilptr)
+  -- GTK3 ignores xdg-decoration but honours KDE's older protocol: server
+  -- side there too, so it draws no title bar of its own (the panel is the frame)
+  local kde_deco = wlr_server_decoration_manager_create(wc.display)
+  if kde_deco ~= nilptr then wlr_server_decoration_manager_set_default_mode(kde_deco, WLR_SERVER_DECORATION_MANAGER_MODE_SERVER) end
+  do
+    local e = os.getenv('GHOSTTY_WAYLAND_SCALE') -- one digit, 1 to 4
+    wc.scale = (#e == 1 and e:byte(1) >= 0x31 and e:byte(1) <= 0x34) and (e:byte(1) - 0x30) or 2
+    e:destroy()
+  end
 
   local layout = #opt_layout > 0 and opt_layout or os.getenv('GHOSTTY_XKB_LAYOUT')
   wc.xkb_ctx, wc.keymap = wayland_keymap(layout)

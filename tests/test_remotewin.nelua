@@ -364,12 +364,14 @@ do
   assert(remotewin_hid('a') == 4 and remotewin_hid('z') == 29 and remotewin_hid('1') == 30 and remotewin_hid('0') == 39)
   assert(remotewin_hid('enter') == 40 and remotewin_hid('escape') == 41 and remotewin_hid('left') == 80 and remotewin_hid('f12') == 69)
   assert(remotewin_hid('kp0') == 98 and remotewin_hid('kpenter') == 88 and remotewin_hid('nope') == 0)
-  -- a 64x40 window on a 1000x700 panel: fitted to the width below the title strip
+  -- a 64x40 window on a 1000x700 panel: fitted to the whole panel's width, centred
   local ix, iy, iw, ih = remotewin_fit(1000, 700, 64, 40)
-  assert(near(iw, 968, 0.01) and near(ih, 605, 0.01) and near(ix, 16, 0.01), 'fitted to the width')
-  assert(near(iy, REMOTEWIN_TITLE + (700 - REMOTEWIN_TITLE - REMOTEWIN_PAD - 605) / 2, 0.01), 'centred vertically')
+  assert(near(iw, 1000, 0.01) and near(ih, 625, 0.01) and near(ix, 0, 0.01), 'fitted to the width')
+  assert(near(iy, (700 - 625) / 2, 0.01), 'centred vertically')
+  local ex, ey, ew, eh = remotewin_fit(1600, 1000, 64, 40)
+  assert(near(ex, 0, 0.01) and near(ey, 0, 0.01) and near(ew, 1600, 0.01) and near(eh, 1000, 0.01), 'the window shape fills the panel edge to edge')
   local jx, jy, jw, jh = remotewin_fit(2000, 700, 64, 40)
-  assert(near(jh, 700 - REMOTEWIN_TITLE - REMOTEWIN_PAD, 0.01) and near(jx, (2000 - jw) / 2, 0.01), 'pillarboxed')
+  assert(near(jh, 700, 0.01) and near(jx, (2000 - jw) / 2, 0.01), 'pillarboxed')
   local inside, x, y = remotewin_map(ix, iy, iw, ih, 64, 40, ix + iw * 0.5, iy + ih * 0.25)
   assert(inside and x == 32 and y == 10, 'panel pixel to window pixel')
   inside, x, y = remotewin_map(ix, iy, iw, ih, 64, 40, ix - 3, iy - 1)
@@ -503,7 +505,7 @@ do
   local a = last(PROTO_WACK)
   assert(a ~= nilptr and proto.get_u32(a) == SID and proto.get_u32((@*[0]uint8)(&a[4])) == 1, 'WACK after END')
   local ok, pl = policy_world_place(s.id, now, false)
-  assert(ok and near(pl.width, 1600, 0.5) and near(pl.height, 1600 * H / W + REMOTEWIN_TITLE + REMOTEWIN_PAD, 0.5), 'panel takes the window aspect')
+  assert(ok and near(pl.width, 1600, 0.5) and near(pl.height, 1600 * H / W, 0.5), 'panel takes the window aspect exactly')
   assert(near(pl.ppm, 700, 0.01), 'window pixels per yalm')
   -- drawn: texture made on Dalamud's device, the whole window uploaded
   uploads:clear()

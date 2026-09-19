@@ -212,7 +212,7 @@ local function on_frame(rw: *RemoteWin, payload: *[0]uint8, len: usize): void
     ack(rw)
     if not rw.sized then
       rw.sized = true
-      policy_windows_size(rw.s.id, rw.w, rw.h, REMOTEWIN_TITLE + REMOTEWIN_PAD)
+      policy_windows_size(rw.s.id, rw.w, rw.h, 0) -- the panel is the picture, edge to edge
     end
   end
 end
@@ -440,7 +440,7 @@ global function remotewin_tick(now: float64, in_world: boolean): void
       if not make_pet(s) then
         close_terminal(s)
       elseif rw.sized then
-        policy_windows_size(s.id, rw.w, rw.h, REMOTEWIN_TITLE + REMOTEWIN_PAD) -- a new anchor: the window's shape again
+        policy_windows_size(s.id, rw.w, rw.h, 0) -- a new anchor: the window's shape again
       end
     elseif rw.state == RemoteWinState.Ended and now - rw.ended_at > CLOSE_AFTER and not s.leaving then
       close_panel(s)
@@ -666,15 +666,24 @@ local function ui_device(): pointer
   return sd.ui_device
 end
 
--- The picture's rectangle in panel pixels: the window's aspect, fitted below
--- the title strip and centred (the panel background shows around it).
+-- The picture's rectangle in panel pixels: the window's aspect fitted into
+-- the whole panel and centred. The panel takes the window's shape, so this
+-- is normally edge to edge; after a resize the other axis is letterboxed.
 global function remotewin_fit(width: float32, height: float32, w: integer, h: integer): (float32, float32, float32, float32)
-  local ax, ay = REMOTEWIN_PAD, REMOTEWIN_TITLE
-  local aw, ah = width - 2 * REMOTEWIN_PAD, height - REMOTEWIN_TITLE - REMOTEWIN_PAD
+  local ax, ay: float32 = 0, 0
+  local aw, ah = width, height
   if aw <= 0 or ah <= 0 or w <= 0 or h <= 0 then return ax, ay, 0, 0 end
   local scale = math.min(aw / w, ah / h)
   local iw, ih = w * scale, h * scale
   return ax + (aw - iw) * 0.5, ay + (ah - ih) * 0.5, iw, ih
+end
+
+-- Window panel `s` shows its picture: worldview then draws no slab behind it
+-- and its chrome only under the pointer.
+global function remotewin_bare(s: *Session): boolean
+  local rw = remotewin_of(s)
+  return rw ~= nilptr and rw.state == RemoteWinState.Live and rw.frames > 0 and imgui.DrawListAddImage ~= nilptr
+    and rw.tex.srv ~= nilptr
 end
 
 -- The window's title in the title strip, left of the buttons.
