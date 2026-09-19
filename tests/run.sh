@@ -62,12 +62,23 @@ echo "--- test_agent"
 echo "testtoken123" > build/agent-token
 # a port per run, so test runs at the same time never share an agent
 PORT="${GHOSTTY_TEST_PORT:-$((20000 + $$ % 20000))}"
-build/ghostty-agent --listen "127.0.0.1:$PORT" --token-file build/agent-token --clipboard-file build/agent-clipboard >build/agent.log 2>&1 &
+build/ghostty-agent --listen "127.0.0.1:$PORT" --token-file build/agent-token --clipboard-file build/agent-clipboard --windows off >build/agent.log 2>&1 &
 AGENT=$!
 trap 'kill $AGENT 2>/dev/null || true' EXIT
 sleep 0.5
 kill -0 "$AGENT" || { cat build/agent.log; exit 1; }
 build/nelua-cache/test_agent "$PORT" testtoken123 "$AGENT"
+
+echo "--- test_agent_windows"
+"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -b tests/test_agent_windows.nelua
+WPORT=$((PORT + 1))
+build/ghostty-agent --listen "127.0.0.1:$WPORT" --token-file build/agent-token --windows test >build/agent-windows.log 2>&1 &
+WAGENT=$!
+trap 'kill $AGENT $WAGENT 2>/dev/null || true' EXIT
+sleep 0.5
+kill -0 "$WAGENT" || { cat build/agent-windows.log; exit 1; }
+# the first agent runs --windows off: window requests are refused with the reason
+build/nelua-cache/test_agent_windows "$WPORT" testtoken123 "$PORT"
 
 echo "--- host module compiles natively"
 "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc -P noentrypoint --cflags="$INC $LIBS" --cache-dir build/nelua-cache -L . -H -o build/libghostty_umbra_host.so core/host.nelua
