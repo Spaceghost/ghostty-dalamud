@@ -71,6 +71,11 @@ global CaptureBackend = @record{
   -- optional (nilptr: `close`): the stream's client went away; forget the
   -- handle but leave the window and its app alone, to be opened again
   release: function(h: pointer): void,
+  -- optional (nilptr: none): changes whenever the window list does (a window
+  -- mapped, unmapped or retitled), so WLIST "watch" clients get it pushed
+  list_serial: function(): uint64,
+  -- optional (nilptr: none): the window a stream shows, as its WLISTR wid
+  wid_of: function(h: pointer): uint32,
 }
 
 require 'agent.capture_test'

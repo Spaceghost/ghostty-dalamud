@@ -14,6 +14,7 @@
 -- and its app for the next connection to open again (WOPEN "key:").
 
 require 'vector'
+require 'stringbuilder'
 require 'memory'
 require 'math'
 require 'string'
@@ -56,6 +57,9 @@ global AgentWindows = @record{
   next_sid: uint32,
   -- the output queue of a connection, nilptr when it is gone
   queue_of: function(ci: usize): *ByteQueue,
+  watchers: vector(usize), -- connections that sent WLIST "watch": the list is pushed to them on change
+  list_seen: uint64,       -- the backend's list_serial when the list last went out to them
+  relist: boolean,         -- a stream opened or closed: push the list (its sid columns) again
 }
 
 -- Pick the backend (`--windows NAME`). False and why when there is none; the
@@ -65,6 +69,42 @@ function AgentWindows:init(name: string, queue_of: function(ci: usize): *ByteQue
   self.next_sid = 1
   self.ok, self.backend, self.why = capture_select(name)
   return self.ok, self.why
+end
+
+-- The window list for connection `ci`: each window line that one of its
+-- streams shows gets a "sid:N" column, so a client can tell the windows it
+-- has from new ones (a torn-off tab, a dialog) it may want to open.
+local function list_for(self: *AgentWindows, ci: usize, text: string): string
+  if self.backend.wid_of == nilptr then return text:copy() end
+  local sb: stringbuilder
+  local start: usize = 0
+  for pos: usize = 0, < text.size do
+    if text.data[pos] == 10 then
+      local line = string{data=(@*[0]byte)(&text.data[start]), size=pos-start}
+      sb:write(line)
+      local wid: uint64 = 0
+      local k: usize = 0
+      while k < line.size and line.data[k] >= '0'_b and line.data[k] <= '9'_b do wid = wid * 10 + (line.data[k] - '0'_b) k = k + 1 end
+      if k > 0 and k < line.size and line.data[k] == 9 and wid ~= 0 then
+        for i = 0, < #self.streams do
+          local st = &self.streams[i]
+          if st.client == ci and st.announced and self.backend.wid_of(st.h) == wid then sb:writef('\tsid:%d', st.sid) end
+        end
+      end
+      sb:writebyte(10)
+      start = pos + 1
+    end
+  end
+  if start < text.size then sb:write(string{data=(@*[0]byte)(&text.data[start]), size=text.size-start}) end
+  return sb:promote()
+end
+
+local function send_list(self: *AgentWindows, ci: usize, q: *ByteQueue): void
+  local text = self.backend.list()
+  local mine = list_for(self, ci, text)
+  proto.write_frame(q, PROTO_WLISTR, (@*[0]uint8)(mine.data), mine.size)
+  mine:destroy()
+  text:destroy()
 end
 
 local function find_stream(self: *AgentWindows, ci: usize, sid: uint32): *WinStream
@@ -93,6 +133,7 @@ end
 -- away (not WCLOSE), so a backend that can keeps the window and its app.
 local function drop(self: *AgentWindows, i: usize, gone: boolean): void
   local s = &self.streams[i]
+  self.relist = true -- the window lost its sid column
   if gone and self.backend.release ~= nilptr then self.backend.release(s.h) else self.backend.close(s.h) end
   s.prev:destroy()
   s.scaled:destroy()
@@ -144,6 +185,7 @@ local function stream_send(self: *AgentWindows, s: *WinStream, q: *ByteQueue, fr
   if not s.announced then
     send_opened(q, s.req, s.sid, w, h, self.backend.title(s.h))
     s.announced = true
+    self.relist = true -- watchers learn the window is streamed (its sid column)
   end
   local key = w ~= s.pw or h ~= s.ph -- the first frame, or a new size
   if key then
@@ -220,15 +262,21 @@ function AgentWindows:handle(ci: usize, q: *ByteQueue, typ: uint8, payload: *[0]
     if not self.ok then proto.write_frame(q, PROTO_ERR, (@*[0]uint8)(self.why.data), self.why.size) return true end
     -- WLIST "apps": the installed apps instead of the windows (none when the
     -- backend has no list of them)
+    -- WLIST "watch": the window list now and again whenever it changes
     local arg = string{data=(@*[0]byte)(payload), size=len}
-    local text: string
     if arg == 'apps' then
+      local text: string
       if self.backend.apps ~= nilptr then text = self.backend.apps() end
+      proto.write_frame(q, PROTO_WLISTR, (@*[0]uint8)(text.data), text.size)
+      text:destroy()
     else
-      text = self.backend.list()
+      if arg == 'watch' then
+        local known = false
+        for i = 0, < #self.watchers do if self.watchers[i] == ci then known = true end end
+        if not known then self.watchers:push(ci) end
+      end
+      send_list(self, ci, q)
     end
-    proto.write_frame(q, PROTO_WLISTR, (@*[0]uint8)(text.data), text.size)
-    text:destroy()
   elseif typ == PROTO_WOPEN then
     if len < WINDOWS_WOPEN_HEAD then
       local why: string = 'bad wopen'
@@ -286,6 +334,17 @@ end
 -- end streams whose window went, and send the frames that are due.
 function AgentWindows:tick(now: float64): void
   if not self.ok then return end
+  if #self.watchers > 0 and self.backend.list_serial ~= nilptr then
+    local serial = self.backend.list_serial()
+    if serial ~= self.list_seen or self.relist then
+      self.list_seen = serial
+      self.relist = false
+      for w = 0, < #self.watchers do
+        local wq = self.queue_of(self.watchers[w])
+        if wq ~= nilptr then send_list(self, self.watchers[w], wq) end
+      end
+    end
+  end
   local i: usize = 0
   while i < #self.streams do
     local s = &self.streams[i]
@@ -306,6 +365,7 @@ function AgentWindows:tick(now: float64): void
       else
         send_opened(q, s.req, s.sid, 0, 0, self.backend.title(s.h))
         s.announced = true
+        self.relist = true
       end
       i = i + 1
       continue
@@ -355,6 +415,12 @@ end
 -- Connection `ci` is going away: close its streams, and renumber the streams
 -- of the connections after it (the agent's client vector closes the gap).
 function AgentWindows:client_gone(ci: usize): void
+  local w: integer = #self.watchers - 1
+  while w >= 0 do
+    if self.watchers[w] == ci then self.watchers:remove(w)
+    elseif self.watchers[w] > ci then self.watchers[w] = self.watchers[w] - 1 end
+    w = w - 1
+  end
   local i: integer = #self.streams - 1
   while i >= 0 do
     if self.streams[i].client == ci then drop(self, (@usize)(i), true)

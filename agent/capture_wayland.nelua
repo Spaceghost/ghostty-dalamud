@@ -182,6 +182,7 @@ local wlr_xdg_surface <cimport, nodecl, ctypedef> = @record{
 wlr_xdg_toplevel = @record{
   resource: *wl_resource,
   base: *wlr_xdg_surface,
+  parent: *wlr_xdg_toplevel, -- a dialog's window (set_parent), else nilptr
   title: cstring,
   app_id: cstring,
   events: record{ destroy: wl_signal, request_maximize: wl_signal, request_fullscreen: wl_signal },
@@ -547,6 +548,7 @@ local wc: record{
   focused: *Top,             -- keyboard focus
   held_mods: uint8,          -- WIN_MOD_* pressed by us
   next_id: uint32,
+  list_serial: uint64,     -- moves when a window maps or unmaps (WLIST "watch")
   scale: integer,          -- output scale apps render at (GHOSTTY_WAYLAND_SCALE, default 2)
   on_new_toplevel: Hook, on_new_popup: Hook, on_new_deco: Hook,
   on_x_surface: Hook, on_x_ready: Hook, on_x_start: Hook,
@@ -1262,6 +1264,7 @@ end
 -- The window shows: its output, sized to it, on the first map.
 local function top_mapped(t: *Top): void
   t.mapped = true
+  wc.list_serial = wc.list_serial + 1
   local w, h = top_size(t)
   if t.xdg ~= nilptr and (w <= 1 or h <= 1) and not t.sized then
     -- a client that commits no size of its own gets the default
@@ -1290,6 +1293,7 @@ end
 
 local function top_unmapped(t: *Top): void
   t.mapped = false
+  wc.list_serial = wc.list_serial + 1
   end_caps_of(t, 'window closed')
   if wc.focused == t then wc.focused = nilptr end
 end
@@ -1873,9 +1877,26 @@ local function wl_list(): string
     if t.mapped then
       local w, h = top_size(t)
       wayland_list_line(&sb, t.id, w, h, top_app(t), top_title(t), t.launch)
+      -- a dialog names its window, so the game can put it beside that one
+      if t.xdg ~= nilptr and t.xdg.parent ~= nilptr then
+        for k = 0, < #wc.tops do
+          if wc.tops[k].xdg == t.xdg.parent and wc.tops[k].mapped then
+            sb.size = sb.size - 1 -- before the line's newline
+            sb:writef('\tparent:%d\n', wc.tops[k].id)
+            break
+          end
+        end
+      end
     end
   end
   return sb:promote()
+end
+
+local function wl_list_serial(): uint64 return wc.list_serial end
+
+local function wl_wid_of(h: pointer): uint32
+  local c = (@*Cap)(h)
+  return c.top ~= nilptr and c.top.id or 0
 end
 
 local function find_top(id: uint32): *Top
@@ -2534,7 +2555,7 @@ global function capture_wayland_backend(): (boolean, CaptureBackend, string)
     list = wl_list, open = wl_open, state = wl_state, title = wl_title,
     frame = wl_frame, input = wl_input, close = wl_close,
     pump = wl_pump, poll_fds = wl_poll_fds, wait_ms = wl_wait_ms,
-    apps = wl_apps, release = wl_release,
+    apps = wl_apps, release = wl_release, list_serial = wl_list_serial, wid_of = wl_wid_of,
   }, ''
 end
 
