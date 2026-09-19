@@ -1,0 +1,89 @@
+-- Tooltips in the theme's colours, after the pointer rests on something for
+-- a moment. ImGui tooltips take no input, so they never steal focus or the
+-- mouse from the game. The texts come from lua/tooltips.lua (policy_tooltip);
+-- this only decides when to show one and draws it.
+require 'string'
+require 'math'
+require 'memory'
+require 'core.imgui'
+require 'core.theme'
+
+-- Seconds before a tooltip shows (CONFIG.tooltips.delay).
+global tooltip_delay: float64 = 0.45
+
+local hover_key: uint64 = 0
+local hover_since: float64 = 0
+local hover_frame: cint = -10
+
+-- A key for tooltip_due from any string (FNV-1a).
+global function tooltip_key(s: string): uint64
+  local h: uint64 = 14695981039346656037_u64
+  for i = 0, < #s do
+    h = (h ~ (@uint64)(s.data[i])) * 1099511628211_u64
+  end
+  return h
+end
+
+-- Call every frame for whatever may show a tooltip: true once `key` has been
+-- hot for tooltip_delay seconds without a break. `now` is in seconds.
+global function tooltip_due(key: uint64, hot: boolean, now: float64): boolean
+  if not hot then return false end
+  local frame: cint = 0
+  if imgui.GetFrameCount ~= nilptr then frame = imgui.GetFrameCount() end
+  if key ~= hover_key or frame > hover_frame + 1 then
+    hover_key = key
+    hover_since = now
+  end
+  hover_frame = frame
+  return now - hover_since >= tooltip_delay
+end
+
+-- The tooltip box, with a row of colour squares (0xRRGGBB) under the text
+-- when `n` > 0 (the Theme combo's swatch).
+-- What was shown last (the host tests look at it): how many so far, and the text.
+global tooltip_shown: integer = 0
+global tooltip_last: [160]byte
+global tooltip_last_len: integer = 0
+
+global function tooltip_show(text: string, swatch: *[0]uint32, n: integer): void
+  if #text == 0 and n <= 0 then return end
+  tooltip_shown = tooltip_shown + 1
+  tooltip_last_len = math.min(#text, 160)
+  if tooltip_last_len > 0 then memory.copy(&tooltip_last, text.data, tooltip_last_len) end
+  if imgui.BeginTooltip == nilptr or imgui.PushStyleVarVec2 == nilptr or imgui.PushStyleColorU32 == nilptr
+     or imgui.TextUnformatted == nilptr or imgui.PushTextWrapPos == nilptr then return end -- a partial ImGui (tests)
+  imgui.PushStyleVarVec2(ImGuiStyleVar_WindowPadding, vec2(9, 5))
+  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowRounding, 6)
+  imgui.PushStyleVarFloat(ImGuiStyleVar_PopupBorderSize, 1)
+  imgui.PushStyleColorU32(ImGuiCol_PopupBg, chrome_col(ChromeColor.Tooltip, 242))
+  imgui.PushStyleColorU32(ImGuiCol_Border, chrome_col(ChromeColor.Accent, 102))
+  imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.Ink, 255))
+  imgui.BeginTooltip()
+  if #text > 0 then
+    imgui.PushTextWrapPos(imgui.GetFontSize() * 26)
+    imgui.TextUnformatted((@cstring)(text.data), (@cstring)(&text.data[text.size]))
+    imgui.PopTextWrapPos()
+  end
+  if n > 0 and swatch ~= nilptr and imgui.GetWindowDrawList ~= nilptr and imgui.Dummy ~= nilptr then
+    local dl = imgui.GetWindowDrawList()
+    local p: ImVec2
+    imgui.GetCursorScreenPos(&p)
+    local s: float32 = math.max(imgui.GetFontSize(), 10)
+    for i = 0, < n do
+      local c = swatch[i]
+      local col = ((c >> 16) & 0xFF) | (((c >> 8) & 0xFF) << 8) | ((c & 0xFF) << 16) | 0xFF000000
+      local x = p.x + i * (s + 3)
+      imgui.DrawListAddRectFilled(dl, vec2(x, p.y), vec2(x + s, p.y + s), col, 3, 0)
+      imgui.DrawListAddRect(dl, vec2(x, p.y), vec2(x + s, p.y + s), chrome_col(ChromeColor.InkFaint, 160), 3, 0, 1)
+    end
+    imgui.Dummy(vec2(n * (s + 3), s))
+  end
+  imgui.EndTooltip()
+  imgui.PopStyleColor(3)
+  imgui.PopStyleVar(3)
+end
+
+-- tooltip_due and tooltip_show in one, for plain text.
+global function tooltip_hover(key: uint64, hot: boolean, now: float64, text: string): void
+  if tooltip_due(key, hot, now) then tooltip_show(text, nilptr, 0) end
+end

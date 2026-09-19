@@ -108,7 +108,7 @@ Output:
 
 | Path | What |
 |---|---|
-| `build/dist/GhosttyDalamud/` | the loadable plugin folder: `GhosttyDalamud.dll`, `GhosttyDalamud.json`, `ghostty_loader.dll`, `ghostty_core.dll`, `lua/` |
+| `build/dist/GhosttyDalamud/` | the loadable plugin folder: `GhosttyDalamud.dll`, `GhosttyDalamud.json`, `ghostty_loader.dll`, `ghostty_core.dll`, `lua/`, `themes/` |
 | `build/dist/Umbra.Ghostty.dll` | the optional Umbra widget |
 | `build/dist/ghostty-agent` | the PTY server for the build host |
 | `build/dist/ghostty-agent.exe` | the PTY server for Windows |
@@ -314,6 +314,91 @@ calls a game function found by signature, so a game patch can crash the game
 while it is on; seen from behind, the board probably hides the screen
 with the depth test on.
 
+## Themes
+
+**New and untested in game**: only the host tests (`tests/test_themes.*`)
+have run it.
+
+<!-- screenshots TODO: the dropdown and a world screen in spaceghost, gruvbox-dark, catppuccin and catppuccin-latte -->
+
+A theme colours the terminals (palette, background, foreground, cursor,
+selection) and the glass around them: the dropdown, windows, world screens,
+the toolbar popup's taskbar, tooltips and the settings window's accents.
+
+| Theme | |
+|---|---|
+| `spaceghost` | the default: the look the plugin has always had |
+| `gruvbox-dark` | [gruvbox](https://github.com/morhetz/gruvbox) |
+| `catppuccin` | [Catppuccin](https://catppuccin.com) Mocha |
+| `catppuccin-macchiato`, `catppuccin-frappe`, `catppuccin-latte` | the other Catppuccin flavours (Latte is light) |
+
+Pick one in Settings → Theme (hovering a name shows its colours; choosing
+applies it at once), with `/term theme <name>` (`/term theme` lists them),
+or with `theme = '<name>'` in your `lua/init.lua` copy. The choice is saved
+in `settings.lua`.
+
+### Adding a theme
+
+Themes are Ghostty theme files, so any of the hundreds made for Ghostty
+(or converted from iTerm2, e.g. [iTerm2-Color-Schemes](https://github.com/mbadolato/iTerm2-Color-Schemes/tree/master/ghostty))
+work as they are. Put the file in `themes/` inside the config directory
+(`pluginConfigs/GhosttyDalamud/themes/`, create it); a theme there replaces a
+shipped one with the same name. The name is the file name without `.theme`
+or `.lua`; Ghostty's own files have no extension and names with spaces are
+fine (`/term theme Gruvbox Light`). `/term theme` reads the folder again.
+
+The keys the plugin reads (every other Ghostty key is ignored, and a line it
+cannot read is skipped with a warning in the log):
+
+```
+# comments start with #
+palette = 0=#1d1f21          # palette = N=COLOUR, N from 0 to 255
+background = #000000         # colours are #rrggbb, rrggbb, #rgb or rgb
+foreground = ffffff
+cursor-color = #ffffff       # unset: the cursor takes the foreground
+cursor-text = #000000        # the glyph under a block cursor
+selection-background = #444444   # unset: a selection inverts its cells
+selection-foreground = #ffffff
+```
+
+Palette entries a theme leaves out keep libghostty-vt's defaults (the
+standard 256-colour cube and grey ramp above 15).
+
+**The Ghostty-FFXIV extension** colours the glass UI. It lives in comments,
+so the file still loads in Ghostty:
+
+```
+# ffxiv: accent = #c8a05a
+```
+
+| Key | Used for | Left out |
+|---|---|---|
+| `accent` | the active tab's underline, unread dots, focused borders, tooltip borders, the settings badge | palette 3 |
+| `accent-2` | the grip on a world screen being moved | palette 6 |
+| `ok` | where a stretched screen will land | palette 2 |
+| `ink`, `ink-dim`, `ink-faint` | chrome text and icons: hovered or active, normal, exited | foreground, and it faded into the background |
+| `glass-top`, `glass-bottom` | the glass body's gradient | background lifted, and darkened |
+| `glass-flat` | the body with glass off | background |
+| `glow` | the glow around the dropdown and world screens | palette 4 |
+| `panel` | world screen backgrounds | background |
+| `tooltip` | tooltip backgrounds | background |
+| `tab` | active and hovered tab fills (drawn faint) | foreground |
+| `close`, `full`, `popin`, `sleep` | a world screen's title buttons, hovered | palette 1, 4, 3, 5 |
+| `close-idle`, `full-idle`, `popin-idle`, `sleep-idle` | the same, at rest | the hovered colour sunk into the background |
+| `chip`, `chip-hot`, `chip-ink` | the toolbar popup's taskbar chips | background lifted, accent, foreground |
+| `label`, `label-ink` | captions on screen (`/term bell demo`, `/term theme`) | background, foreground |
+| `bell` | the bell's custom accent colour (`bell.preset = 'custom'`) while it is not set in Settings | the bell's own default |
+
+A theme can also be a `.lua` file returning the same keys:
+
+```lua
+return {
+  background = '#282828', foreground = '#ebdbb2',
+  palette = { [0] = '#282828', [1] = '#cc241d' },
+  ffxiv = { accent = '#fabd2f', glow = '#fe8019' },
+}
+```
+
 ## Commands and keys
 
 `/term` (also `/tomestone` and `/tome`, see `host.commands`):
@@ -331,6 +416,7 @@ with the depth test on.
 | `/term bell [ripple\|sonar\|burst\|aura\|calm\|custom\|demo]` | preview the visual bell |
 | `/term showcase`, `/term showcase off` | demo terminals and camera shots for screenshots; needs nothing on disk |
 | `/term ask [question]` | ask a local AI assistant in a terminal of its own (see [Assistant](#assistant-term-ask)) |
+| `/term theme [name]` | switch the colour theme, or list the themes (see [Themes](#themes)) |
 | `/term config` | the settings window |
 | `/term reload` | reload the Lua configuration |
 
@@ -341,6 +427,10 @@ the world. Inside a terminal: <kbd>ctrl</kbd>+<kbd>shift</kbd>+<kbd>c</kbd> /
 `copy_on_select`), <kbd>ctrl</kbd>+<kbd>shift</kbd>+<kbd>t</kbd> /
 <kbd>w</kbd> open and close tabs, <kbd>ctrl</kbd>+<kbd>tab</kbd> switches tabs,
 <kbd>ctrl</kbd>+<kbd>=</kbd> / <kbd>-</kbd> / <kbd>0</kbd> zoom.
+
+Every icon button, taskbar chip and setting explains itself in a tooltip
+after the pointer rests on it for a moment (world screens included). The
+texts are in `lua/tooltips.lua`, ready to be translated; untested in game.
 
 Info bar entry (`host.dtr.on_click`): click toggles the drop-down,
 right-click opens the popup, shift+click opens a window, ctrl+click shows the
@@ -456,7 +546,7 @@ Tested on the host (`tests/run.sh`): the libghostty-vt binding, cell renderer,
 key encoding, DualSense report parsing, Lua policy, agent protocol and server,
 the plugin's activation state machine, its command / info bar / IPC registration and the config
 migration (`tests/test_hostsurface.nelua`, `tests/test_migrate.*`), the
-per-platform defaults and local fallbacks (`tests/test_platform.*`), `/term ask` (`tests/test_assistant.*`; untested in game) and the
+per-platform defaults and local fallbacks (`tests/test_platform.*`), `/term ask` (`tests/test_assistant.*`; untested in game), themes and tooltips (`tests/test_themes.*`; untested in game) and the
 agent's shared pure logic (`tests/test_agent_logic.nelua`). Both C#
 projects, the Windows DLLs and `ghostty-agent.exe` compile.
 

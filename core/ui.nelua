@@ -3,6 +3,7 @@
 require 'string'
 require 'core.lua'
 require 'core.imgui'
+require 'core.tooltip'
 
 local function arg_string(L: *lua_State, idx: cint): cstring
   local s: cstring = lua_tolstring(L, idx, nilptr)
@@ -58,11 +59,14 @@ local function l_checkbox(L: *lua_State): cint
   return 2
 end
 
--- ui.combo(label, current, { options }) -> changed, value
+-- ui.combo(label, current, { options }) -> changed, value, hovered
+-- `hovered` is the index of the option under the pointer while the list is
+-- open (nil otherwise), so a caller can preview it.
 local function l_combo(L: *lua_State): cint
   local current = arg_string(L, 2)
   local changed = false
   local chosen_idx: lua_Integer = 0
+  local hovered_idx: lua_Integer = 0
   if imgui.BeginCombo(arg_string(L, 1), current, 0) then
     if lua_type(L, 3) == LUA_TTABLE then
       local n = (@lua_Integer)(lua_rawlen(L, 3))
@@ -73,6 +77,7 @@ local function l_combo(L: *lua_State): cint
           changed = true
           chosen_idx = i
         end
+        if imgui.IsItemHovered(0) then hovered_idx = i end
         lua_pop(L, 1)
       end
     end
@@ -80,7 +85,39 @@ local function l_combo(L: *lua_State): cint
   end
   lua_pushboolean(L, changed and 1 or 0)
   if changed then lua_rawgeti(L, 3, chosen_idx) else lua_pushvalue(L, 2) end
-  return 2
+  if hovered_idx > 0 then lua_pushinteger(L, hovered_idx) else lua_pushnil(L) end
+  return 3
+end
+
+-- ui.tip(text[, swatch[, now]]): the tooltip of the item just drawn, once the
+-- pointer has rested on it; `swatch` adds a row of 0xRRGGBB squares; `now`
+-- true shows it at once without asking ImGui (an option inside an open combo).
+local function l_tip(L: *lua_State): cint
+  if lua_type(L, 1) ~= LUA_TSTRING then return 0 end
+  local len: usize = 0
+  local p = lua_tolstring(L, 1, &len)
+  local text = string{data = (@*[0]byte)(p), size = len}
+  local immediate = lua_toboolean(L, 3) ~= 0
+  if not immediate then
+    local t: float64 = 0
+    if imgui.GetTime ~= nilptr then t = imgui.GetTime() end
+    if not tooltip_due(tooltip_key(text), imgui.IsItemHovered(0), t) then return 0 end
+  end
+  local sw: [16]uint32
+  local n: integer = 0
+  if lua_type(L, 2) == LUA_TTABLE then
+    local count = math.min((@integer)(lua_rawlen(L, 2)), 16)
+    for i = 1, count do
+      lua_rawgeti(L, 2, i)
+      if lua_type(L, -1) == LUA_TNUMBER then
+        sw[n] = (@uint32)(lua_tointegerx(L, -1, nilptr) & 0xFFFFFF)
+        n = n + 1
+      end
+      lua_pop(L, 1)
+    end
+  end
+  tooltip_show(text, (@*[0]uint32)(&sw), n)
+  return 0
 end
 
 local function l_text(L: *lua_State): cint
@@ -138,7 +175,7 @@ local function l_spacing(L: *lua_State): cint imgui.Spacing() return 0 end
 
 -- Adds `ui` to the table on top of the stack.
 global function ui_lua_register(L: *lua_State): void
-  lua_createtable(L, 0, 15)
+  lua_createtable(L, 0, 16)
   lua_pushcclosure(L, l_tabs, 0) lua_setfield(L, -2, 'tabs')
   lua_pushcclosure(L, l_tab, 0) lua_setfield(L, -2, 'tab')
   lua_pushcclosure(L, l_end_tab, 0) lua_setfield(L, -2, 'end_tab')
@@ -154,5 +191,6 @@ global function ui_lua_register(L: *lua_State): void
   lua_pushcclosure(L, l_separator, 0) lua_setfield(L, -2, 'separator')
   lua_pushcclosure(L, l_button, 0) lua_setfield(L, -2, 'button')
   lua_pushcclosure(L, l_same_line, 0) lua_setfield(L, -2, 'same_line')
+  lua_pushcclosure(L, l_tip, 0) lua_setfield(L, -2, 'tip')
   lua_setfield(L, -2, 'ui')
 end

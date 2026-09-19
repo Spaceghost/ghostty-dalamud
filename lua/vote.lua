@@ -86,7 +86,12 @@ function V.draw(ui, settings)
   else
     ui.wrapped(V.status_text(settings.values), 0.72, 0.74, 0.78)
   end
-  if ui.button('Open the vote page##vote') then V.open(settings) end
+  local pressed = ui.button('Open the vote page##vote')
+  if ui.tip then
+    local tips = (settings.config and settings.config.tooltips) or package.loaded.tooltips
+    ui.tip(tips and tips.vote)
+  end
+  if pressed then V.open(settings) end
   ui.wrapped(V.url, 0.55, 0.70, 0.98)
 end
 

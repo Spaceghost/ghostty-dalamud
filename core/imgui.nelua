@@ -81,6 +81,7 @@ global ImGuiIO <cimport, nodecl> = @record{
 ##  'ImDrawFlags_RoundCornersTop','ImGuiButtonFlags_MouseButtonLeft','ImGuiButtonFlags_MouseButtonMiddle',
 ##  'ImGuiCol_PopupBg','ImGuiCol_Border','ImGuiCol_ResizeGrip','ImGuiCol_ResizeGripHovered','ImGuiCol_ResizeGripActive',
 ##  'ImGuiStyleVar_PopupRounding','ImGuiStyleVar_PopupBorderSize','ImGuiSliderFlags_AlwaysClamp',
+##  'ImGuiCol_CheckMark','ImGuiCol_SliderGrab','ImGuiCol_SliderGrabActive',
 ## }
 ## for _, c in ipairs(consts) do
   global #|c|#: cint <cimport, nodecl, const>

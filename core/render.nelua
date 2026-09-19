@@ -2,6 +2,7 @@
 require 'core.ghostty'
 require 'core.imgui'
 require 'core.termview'
+require 'core.theme'
 require 'memory'
 
 global RenderMetrics = @record{
@@ -58,6 +59,13 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
   local iter = v.iter
   if ghostty_render_state_get(v.state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &iter) ~= GHOSTTY_SUCCESS then return end
 
+  -- the cursor's cell, so a theme's cursor-text can redraw its glyph on the block
+  local cur: GhosttyRenderStateCursor = { size = #GhosttyRenderStateCursor }
+  local has_cur = ghostty_render_state_get(v.state, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cur) == GHOSTTY_SUCCESS and cur.visible and cur.viewport_has_value
+  local want_cur_glyph = has_cur and theme_term.has_cursor_text
+  local cur_glyph: [64]uint8
+  local cur_glyph_len: usize = 0
+
   local text: [64]uint8
   local y: float32 = origin.y
   -- Same-colour ASCII glyphs in adjacent cells go out as one AddText. ImGui
@@ -105,9 +113,16 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
         end
         local selected: boolean = has_sel and col >= sel.start_x and col <= sel.end_x
         if selected then
-          local t = fg
-          fg = bg
-          bg = t
+          -- the theme's selection colours, else the cell inverted (as Ghostty)
+          if theme_term.has_sel_bg then
+            bg = theme_term.sel_bg
+            if theme_term.has_sel_fg then fg = theme_term.sel_fg end
+          else
+            local t = fg
+            fg = bg
+            bg = t
+            if theme_term.has_sel_fg then fg = theme_term.sel_fg end
+          end
           has_bg = true
         end
 
@@ -133,6 +148,10 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
         if glen > 0 and not (styled and style.invisible) then
           local buf: GhosttyBuffer = { ptr = &text, cap = 63, len = 0 }
           if ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &buf) == GHOSTTY_SUCCESS and buf.len > 0 then
+            if want_cur_glyph and row_index == cur.viewport_y and col == cur.viewport_x then
+              memory.copy(&cur_glyph, &text, buf.len)
+              cur_glyph_len = buf.len
+            end
             local underline = styled and style.underline ~= GHOSTTY_SGR_UNDERLINE_NONE
             local strike = styled and style.strikethrough
             local bold = styled and style.bold
@@ -192,8 +211,7 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
   end
 
   -- Cursor.
-  local cur: GhosttyRenderStateCursor = { size = #GhosttyRenderStateCursor }
-  if ghostty_render_state_get(v.state, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cur) == GHOSTTY_SUCCESS and cur.visible and cur.viewport_has_value then
+  if has_cur then
     if not cur.blinking or blink_on or not focused then
       local cx = origin.x + m.cell_w * cur.viewport_x
       local cy = origin.y + m.cell_h * cur.viewport_y
@@ -209,9 +227,12 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
         imgui.DrawListAddRect(dl, vec2(cx, cy), vec2(cx + m.cell_w, cy + m.cell_h), ccol, 0.0, 0, 1.0)
       else
         imgui.DrawListAddRectFilled(dl, vec2(cx, cy), vec2(cx + m.cell_w, cy + m.cell_h), ccol, 0.0, 0)
-        -- Re-draw the glyph under a block cursor in the background color so it stays readable.
-        -- (Cheap approach: the terminal foreground/background swap is handled by the next frame's
-        -- selection logic; here we only paint the block.)
+        -- a theme with cursor-text redraws the glyph under the block in that colour
+        if cur_glyph_len > 0 then
+          local b = (@cstring)(&cur_glyph[0])
+          local e = (@cstring)(&cur_glyph[cur_glyph_len])
+          imgui.DrawListAddText(dl, m.font, m.font_size, vec2(cx, cy), rgb(theme_term.cursor_text, 255), b, e, 0.0, nilptr)
+        end
       end
     end
   end

@@ -94,6 +94,14 @@
 * **Lua decides, Nelua executes.** `policy.nelua` embeds Lua 5.4, loads
   `lua/init.lua`, and exposes typed config records; `keymap.lua`'s `on_key`
   is consulted for every named key press before the terminal sees it.
+* **Themes are data.** `lua/themes.lua` reads Ghostty theme files from the
+  shipped and the user's `themes/` and resolves `CONFIG.theme` into colour
+  numbers; `core/theme.nelua` holds the result (spaceghost's values until
+  one is read). Each terminal applies it to libghostty-vt's default colours
+  and palette when its generation changes (`TermView:sync_theme`); the
+  renderer takes selection and cursor-text colours from it; the chrome draws
+  through `chrome_col`. Tooltips (`core/tooltip.nelua`) wait for a hover
+  delay, draw in the theme and take their texts from `lua/tooltips.lua`.
 * **No GC.** The core is compiled with `-P nogc` because it runs inside a
   foreign process on the render thread; allocations are explicit and short
   lived (`stringbuilder`/`vector` with `destroy`).
@@ -223,6 +231,7 @@ core/sys/     net (POSIX + Winsock), conpty (Windows), procguard, fs / fsbase, p
 core/shaders/ HLSL sources and the committed DXBC the core embeds
 agent/        ghostty-agent PTY server (Nelua): agent.nelua, logic, pty_posix / sys_posix, pty_windows / sys_windows / winloop
 lua/          shipped policy: init.lua, keymap.lua, migrate.lua, assistant.lua (/term ask), ...
+themes/       shipped colour themes (Ghostty theme files, read by lua/themes.lua)
 shim/         GhosttyDalamud (plugin) and Umbra.Ghostty (widget) C# projects
 tests/        host tests + run.sh
 tools/        fetch-vendor.sh, build.sh, package.sh, install-dev.sh, zig-cc-win.sh, build-shaders.lua, crash-restart.{nelua,sh} (Linux/Wine only)
@@ -259,6 +268,7 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_lights` | panel lights against fake game light callbacks |
 | `test_occluders` | panel shadow boards against fake background object callbacks: placement, lifecycle, an older `GuHostApi` |
 | `test_chrome` | the glass chrome of the drop-down and windows: colour, tint, glow, tab strip, buttons, the settings button's badge |
+| `test_themes` (`.nelua` + `.lua`) | themes: Ghostty theme files and the extension, user themes over shipped ones, spaceghost against the built-in colours, the shipped themes against upstream, switching at runtime (terminals, selection, cursor-text, chrome), the Theme combo, a tooltip for every setting |
 | `test_migrate` (`.nelua` + `.lua`) | the one-time migration from the Umbra-hosted home |
 | `test_hostsurface` | the plugin side against a recording fake host: activation and refusals, registration and shutdown order, suspension, events, info bar, `ghostty.open_url` (https only) and an older shim's smaller `GuHostApi` |
 | `test_vote` (`.nelua` + `.lua`) | the feature vote link: the shipped catalogue, new-idea count, the settings window's section and badge, the seen marker through `settings.lua` |

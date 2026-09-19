@@ -5,6 +5,7 @@
 -- adjusted after drawing, never positions, so terminal text stays crisp.
 require 'core.app.terminal'
 require 'core.chrome'
+require 'core.tooltip'
 require 'core.app.bell'
 require 'C.stdio'
 
@@ -19,9 +20,7 @@ local TAB_MAX: float32 <comptime> = 240
 local TAB_SQUEEZED: float32 <comptime> = 64
 local BUTTON_GAP: float32 <comptime> = 2
 local GROUP_GAP: float32 <comptime> = 13
-local TIP_DELAY <comptime> = 0.45
 local UNDERLINE_EASE: float32 <comptime> = 0.22
-local CLOSE_HOT: uint32 <comptime> = 0xDC323CBE   -- im_col32(190, 60, 50, 220), the panels' close red
 
 -- Actions ------------------------------------------------------------------------------
 -- Everything the chrome's buttons do, free of ImGui so tests can drive it.
@@ -203,30 +202,17 @@ local function claim_click(): void
   if host.lmb_pressed and imgui.IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows) then host.click_used = true end
 end
 
--- The tooltip of button `key` once the pointer has rested on it.
-local function chrome_tooltip(key: integer, hot: boolean, tip: string, now: float64): void
-  if not hot then return end
-  if host.chrome_tip_key ~= key or host.chrome_tip_frame + 1 < host.frame then
-    host.chrome_tip_key = key
-    host.chrome_tip_since = now
-  end
-  host.chrome_tip_frame = host.frame
-  if now - host.chrome_tip_since < TIP_DELAY then return end
-  imgui.PushStyleVarVec2(ImGuiStyleVar_WindowPadding, vec2(9, 5))
-  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowRounding, 6)
-  imgui.PushStyleVarFloat(ImGuiStyleVar_PopupBorderSize, 1)
-  imgui.PushStyleColorU32(ImGuiCol_PopupBg, im_col32(16, 18, 24, 242))
-  imgui.PushStyleColorU32(ImGuiCol_Border, chrome_fade_alpha(CHROME_GOLD, 0.4))
-  imgui.PushStyleColorU32(ImGuiCol_Text, CHROME_INK)
-  imgui.BeginTooltip()
-  imgui.TextUnformatted((@cstring)(tip.data), (@cstring)(&tip.data[tip.size]))
-  imgui.EndTooltip()
-  imgui.PopStyleColor(3)
-  imgui.PopStyleVar(3)
+-- The tooltip of chrome button `key` once the pointer has rested on it; its
+-- text is lua/tooltips.lua's `tip_key`, else the built-in `fallback`.
+local function chrome_tooltip(key: integer, hot: boolean, tip_key: string, fallback: string, now: float64): void
+  if not tooltip_due((@uint64)(key) ~ 0x9e3779b97f4a7c15_u64, hot, now) then return end
+  local text = policy_tooltip(tip_key, fallback)
+  tooltip_show(text, nilptr, 0)
+  text:destroy()
 end
 
 -- One square icon button; true when clicked. `on` marks a toggle that is on.
-local function icon_button(dl: *ImDrawList, b: *ChromeButton, key: integer, x: float32, y: float32, size: float32, on: boolean, pal: ChromePalette, now: float64): boolean
+local function icon_button(dl: *ImDrawList, b: *ChromeButton, key: integer, x: float32, y: float32, size: float32, on: boolean, pal: ChromePalette, now: float64, where: string): boolean
   imgui.SetCursorScreenPos(vec2(x, y))
   imgui.PushIDInt((@cint)(key))
   local pressed = imgui.InvisibleButton('##chrome_button', vec2(size, size), 0)
@@ -234,19 +220,25 @@ local function icon_button(dl: *ImDrawList, b: *ChromeButton, key: integer, x: f
   local held = imgui.IsItemActive()
   imgui.PopID()
   local fill: uint32 = 0
-  if held then fill = chrome_fade_alpha(CHROME_GOLD, 0.35)
-  elseif hot and b.action == ChromeAction.Close then fill = CLOSE_HOT
+  if held then fill = chrome_fade_alpha(chrome_col(ChromeColor.Accent, 255), 0.35)
+  elseif hot and b.action == ChromeAction.Close then fill = chrome_col(ChromeColor.Close, 220)
   elseif on then fill = pal.pill
   elseif hot then fill = pal.pill_hover end
   if fill ~= 0 then imgui.DrawListAddRectFilled(dl, vec2(x, y), vec2(x + size, y + size), fill, size * 0.3, 0) end
-  local ink = CHROME_INK_DIM
-  if on then ink = CHROME_GOLD elseif hot or held then ink = CHROME_INK end
+  local ink = chrome_col(ChromeColor.InkDim, 255)
+  if on then ink = chrome_col(ChromeColor.Accent, 255) elseif hot or held then ink = chrome_col(ChromeColor.Ink, 255) end
   chrome_draw_icon(dl, b.icon, x + size * 0.5, y + size * 0.5, size, ink, pal.body_top | 0xFF000000)
   if b.action == ChromeAction.Settings and host.settings_badge then
     chrome_draw_badge(dl, x, y, size, pal.body_top | 0xFF000000)
-    chrome_tooltip(key, hot, CHROME_BADGE_TIP, now)
-  else
-    chrome_tooltip(key, hot, b.tip, now)
+    if hot then
+      local k = where .. b.id .. '.badge'
+      chrome_tooltip(key, hot, k, CHROME_BADGE_TIP, now)
+      k:destroy()
+    end
+  elseif hot then
+    local k = where .. b.id
+    chrome_tooltip(key, hot, k, b.tip, now)
+    k:destroy()
   end
   return pressed
 end
@@ -287,7 +279,7 @@ local function draw_tab_bar(dl: *ImDrawList, x0: float32, y0: float32, x1: float
       imgui.DrawListAddLine(dl, vec2(sx, by + bsize * 0.25), vec2(sx, by + bsize * 0.75), pal.edge_top, 1)
     end
     local on = (b.action == ChromeAction.Profiles and host.show_profiles) or (b.action == ChromeAction.Settings and host.settings_open)
-    if icon_button(dl, b, (@integer)(b.action), bx, by, bsize, on, pal, now) then bar.action = b.action end
+    if icon_button(dl, b, (@integer)(b.action), bx, by, bsize, on, pal, now, 'tab.') then bar.action = b.action end
     if b.action == ChromeAction.Profiles then
       bar.menu_x0, bar.menu_x1, bar.menu_y0, bar.menu_y1 = bx, bx + bsize, by, by + bsize
     end
@@ -388,13 +380,13 @@ local function draw_tab_bar(dl: *ImDrawList, x0: float32, y0: float32, x1: float
         imgui.DrawListAddRectFilled(dl, vec2(tx0, ty0), vec2(tx1, ty1), pal.pill_hover, th * 0.5, 0)
       end
       if s.unread and not active then
-        imgui.DrawListAddCircleFilled(dl, vec2(tx0 + TAB_PAD + 3, cy), 3, CHROME_GOLD, 12)
+        imgui.DrawListAddCircleFilled(dl, vec2(tx0 + TAB_PAD + 3, cy), 3, chrome_col(ChromeColor.Accent, 255), 12)
       end
       local tx = tx0 + TAB_PAD + TAB_DOT
       local text_x1 = tx1 - TAB_PAD
       if show_close then text_x1 = ccx - TAB_CLOSE_R - 3 end
-      local ink = CHROME_INK_DIM
-      if s.exited then ink = CHROME_INK_FAINT elseif active or over then ink = CHROME_INK end
+      local ink = chrome_col(ChromeColor.InkDim, 255)
+      if s.exited then ink = chrome_col(ChromeColor.InkFaint, 255) elseif active or over then ink = chrome_col(ChromeColor.Ink, 255) end
       imgui.DrawListPushClipRect(dl, vec2(tx, ty0), vec2(math.max(math.min(text_x1, vx1), tx), ty1), true)
       local text_first = dl.VtxBuffer.Size
       add_text(dl, font, fs, tx, cy - fs * 0.5, ink, labels[i])
@@ -405,8 +397,9 @@ local function draw_tab_bar(dl: *ImDrawList, x0: float32, y0: float32, x1: float
         ul_x, ul_w = tx, math.max(math.min(text_ws[i], text_x1 - tx), 8)
       end
       if show_close then
-        if close_hot then imgui.DrawListAddCircleFilled(dl, vec2(ccx, cy), TAB_CLOSE_R, CLOSE_HOT, 16) end
-        chrome_draw_icon(dl, ChromeIcon.Close, ccx, cy, TAB_CLOSE_R * 2.2, close_hot and CHROME_INK or CHROME_INK_DIM, 0)
+        if close_hot then imgui.DrawListAddCircleFilled(dl, vec2(ccx, cy), TAB_CLOSE_R, chrome_col(ChromeColor.Close, 220), 16) end
+        chrome_draw_icon(dl, ChromeIcon.Close, ccx, cy, TAB_CLOSE_R * 2.2, close_hot and chrome_col(ChromeColor.Ink, 255) or chrome_col(ChromeColor.InkDim, 255), 0)
+        if close_hot then chrome_tooltip(-1000 - s.id, true, 'tab.close', 'Close this tab', now) end
       end
     end
   end
@@ -419,8 +412,8 @@ local function draw_tab_bar(dl: *ImDrawList, x0: float32, y0: float32, x1: float
       host.dropdown_ul_w, host.dropdown_ul_vw = world_ease(host.dropdown_ul_w, host.dropdown_ul_vw, ul_w, (@float32)(dt), UNDERLINE_EASE)
     end
     local ux, uw, uy = host.dropdown_ul_x, host.dropdown_ul_w, ty1 - 4
-    imgui.DrawListAddRectFilled(dl, vec2(ux - 3, uy - 2), vec2(ux + uw + 3, uy + 4), chrome_fade_alpha(CHROME_GOLD, 0.16), 3, 0)
-    imgui.DrawListAddRectFilled(dl, vec2(ux, uy), vec2(ux + uw, uy + 2), CHROME_GOLD, 1, 0)
+    imgui.DrawListAddRectFilled(dl, vec2(ux - 3, uy - 2), vec2(ux + uw + 3, uy + 4), chrome_fade_alpha(chrome_col(ChromeColor.Accent, 255), 0.16), 3, 0)
+    imgui.DrawListAddRectFilled(dl, vec2(ux, uy), vec2(ux + uw, uy + 2), chrome_col(ChromeColor.Accent, 255), 1, 0)
   else
     host.dropdown_ul_w = 0
   end
@@ -489,11 +482,11 @@ local function draw_profiles_menu(bar: TabBar, pal: ChromePalette, light: Chrome
       if hot then imgui.DrawListAddRectFilled(dl, vec2(rx0, ry + 1), vec2(rx1, ry + row_h - 1), pal.pill, (row_h - 2) * 0.5, 0) end
       -- the gold dot marks the profile + opens
       if pi == policy.default_profile - 1 then
-        imgui.DrawListAddCircleFilled(dl, vec2(rx0 + 10, ry + row_h * 0.5), 3, CHROME_GOLD, 12)
+        imgui.DrawListAddCircleFilled(dl, vec2(rx0 + 10, ry + row_h * 0.5), 3, chrome_col(ChromeColor.Accent, 255), 12)
       end
       local ty = ry + (row_h - fs) * 0.5
-      add_text(dl, font, fs, rx0 + 22, ty, hot and CHROME_INK or CHROME_INK_DIM, p.name)
-      add_text(dl, font, fs, rx1 - 10 - text_width(font, fs, p.transport), ty, CHROME_INK_FAINT, p.transport)
+      add_text(dl, font, fs, rx0 + 22, ty, hot and chrome_col(ChromeColor.Ink, 255) or chrome_col(ChromeColor.InkDim, 255), p.name)
+      add_text(dl, font, fs, rx1 - 10 - text_width(font, fs, p.transport), ty, chrome_col(ChromeColor.InkFaint, 255), p.transport)
       if picked then
         dropdown_new_tab(pi)
         host.show_profiles = false
@@ -654,22 +647,22 @@ global function draw_windows(): void
       imgui.DrawListPushClipRect(dl, vec2(tx, y0), vec2(math.max(title_x1, tx), y0 + header), true)
       local text_first = dl.VtxBuffer.Size
       local name_w = text_width(font, fs, name)
-      add_text(dl, font, fs, tx, ty, focused and CHROME_INK or CHROME_INK_DIM, name)
-      if s.exited then add_text(dl, font, fs, tx + name_w + 8, ty, CHROME_INK_FAINT, 'exited') end
+      add_text(dl, font, fs, tx, ty, focused and chrome_col(ChromeColor.Ink, 255) or chrome_col(ChromeColor.InkDim, 255), name)
+      if s.exited then add_text(dl, font, fs, tx + name_w + 8, ty, chrome_col(ChromeColor.InkFaint, 255), 'exited') end
       if tx + name_w > title_x1 then chrome_fade_tail(dl, text_first, title_x1 - 18, title_x1) end
       imgui.DrawListPopClipRect(dl)
       if focused then
-        imgui.DrawListAddLine(dl, vec2(x0 + rounding, y0 + header - 0.5), vec2(x1 - rounding, y0 + header - 0.5), chrome_fade_alpha(CHROME_GOLD, 0.55), 1)
+        imgui.DrawListAddLine(dl, vec2(x0 + rounding, y0 + header - 0.5), vec2(x1 - rounding, y0 + header - 0.5), chrome_fade_alpha(chrome_col(ChromeColor.Accent, 255), 0.55), 1)
       end
       for k = 0, < CHROME_WINDOW_BUTTONS do
         local b = &chrome_window_buttons[k]
         local bx = math.floor(chrome_button_x(buttons, CHROME_WINDOW_BUTTONS, k, right, bsize, BUTTON_GAP, GROUP_GAP))
-        if icon_button(dl, b, 1000 * s.id + (@integer)(b.action), bx, y0 + 4, bsize, false, pal, now) then acted = b.action end
+        if icon_button(dl, b, 1000 * s.id + (@integer)(b.action), bx, y0 + 4, bsize, false, pal, now, 'window.') then acted = b.action end
       end
       -- resize corner hint
       local inset = 4 + rounding * 0.3
       imgui.DrawListAddTriangleFilled(dl, vec2(x1 - inset - 10, y1 - inset), vec2(x1 - inset, y1 - inset - 10), vec2(x1 - inset, y1 - inset),
-        chrome_fade_alpha(CHROME_GOLD, 0.35))
+        chrome_fade_alpha(chrome_col(ChromeColor.Accent, 255), 0.35))
 
       local origin = vec2(x0 + pad, y0 + header)
       local tw, th = wsz.x - 2 * pad, wsz.y - header - pad

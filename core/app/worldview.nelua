@@ -8,6 +8,7 @@ require 'core.app.dropdown'
 require 'core.app.lights'
 require 'core.app.occluders'
 require 'core.depthpass'
+require 'core.tooltip'
 
 -- World panels ------------------------------------------------------------------
 -- The camera DirH that looks along (dx, dz): DirH is calibrated against the
@@ -345,7 +346,7 @@ end
 -- The grip on a panel under Alt (or being carried), in panel pixels: an outline
 -- in short segments so it bends with a curved panel, and a crosshair where it is held.
 local function draw_drag_grip(dl: *ImDrawList, o: ImVec2, w: float32, h: float32, u: float32, v: float32): void
-  local col, shade = im_col32(120, 220, 255, 240), im_col32(0, 20, 30, 160)
+  local col, shade = chrome_col(ChromeColor.Accent2, 240), im_col32(0, 20, 30, 160)
   local SEG <comptime> = 24
   for pass = 0, 1 do
     local c, t = pass == 0 and shade or col, (@float32)(pass == 0 and 12 or 6)
@@ -366,8 +367,8 @@ local function draw_drop_ghost(dl: *ImDrawList, cam: *GuCamera, vp: ImVec2, pl: 
   local b = world_basis(pl)
   local q: [4]ImVec2
   if not world_corners(cam, &b, &q) then return end
-  local col = fitted and im_col32(140, 240, 150, 240) or im_col32(120, 220, 255, 240)
-  local fill = fitted and im_col32(140, 240, 150, 40) or im_col32(120, 220, 255, 32)
+  local col = fitted and chrome_col(ChromeColor.Ok, 240) or chrome_col(ChromeColor.Accent2, 240)
+  local fill = fitted and chrome_col(ChromeColor.Ok, 40) or chrome_col(ChromeColor.Accent2, 32)
   for i = 0, < 4 do q[i] = vec2(q[i].x + vp.x, q[i].y + vp.y) end
   imgui.DrawListAddTriangleFilled(dl, q[0], q[1], q[2], fill)
   imgui.DrawListAddTriangleFilled(dl, q[0], q[2], q[3], fill)
@@ -653,6 +654,21 @@ global function draw_world(now: float64): void
         local on_occluded = button == WORLD_BUTTON_OCCLUDED
         if button ~= WORLD_BUTTON_NONE then grip = 0 end
         if ft > 0 then grip = 0 end -- no resizing while full screen
+        -- tooltips: hovered in world space, shown at the pointer like any other
+        do
+          local tip_on = not over_window and prez > 0.9 and host.world_visible and (button ~= WORLD_BUTTON_NONE or grip == 3)
+          local tip_id = (@uint64)(s.id) * 8 + (@uint64)(button == WORLD_BUTTON_NONE and 7 or button) + 0x3a000000_u64
+          if tooltip_due(tip_id, tip_on, now) then
+            local key: string = 'world.resize'
+            if on_close then key = 'world.close'
+            elseif on_full then key = ft > 0.5 and 'world.full.off' or 'world.full'
+            elseif on_popin then key = 'world.popin'
+            elseif on_occluded then key = s.run_occluded and 'world.sleep.off' or 'world.sleep.on' end
+            local text = policy_tooltip(key, '')
+            tooltip_show(text, nilptr, 0)
+            text:destroy()
+          end
+        end
         -- text selection on the grid (drawn 16 px in); grips and buttons win
         local tx, ty = mu - 16, mv - 16
         local on_grid = hovered and grip == 0 and button == WORLD_BUTTON_NONE and not over_window
@@ -756,13 +772,17 @@ global function draw_world(now: float64): void
             local pad = (@float32)(gi * 10)
             local ga = (@uint8)(math.clamp(pl.backlight * 34 / gi, 0, 255))
             imgui.DrawListAddRectFilled(dl, vec2(vp.x - pad, vp.y - pad), vec2(vp.x + pl.width + pad, vp.y + pl.height + pad),
-              im_col32(90, 150, 220, ga), pad + 8, 0)
+              chrome_col(ChromeColor.Glow, ga), pad + 8, 0)
           end
         end
         -- background as a grid: follows the curve, and gives the character
         -- cut-out enough vertices to follow its silhouette; backlight lifts it
-        local bgl = (@uint8)(10 + 26 * math.clamp(pl.backlight, 0, 1))
-        local bg_col = im_col32(bgl, (@uint8)(bgl + 3), (@uint8)(bgl + 8), (@uint8)(math.clamp(pl.opacity, 0, 1) * 255))
+        -- (the lift is taken as spaceghost's 10 + 26 * backlight always was, so it stays pixel for pixel)
+        local lift = (@integer)((@uint8)(10 + 26 * math.clamp(pl.backlight, 0, 1))) - 10
+        local panel = chrome_colors[(@integer)(ChromeColor.Panel)]
+        local bg_col = im_col32((@uint8)(math.min(((panel >> 16) & 0xFF) + lift, 255)),
+          (@uint8)(math.min(((panel >> 8) & 0xFF) + lift, 255)),
+          (@uint8)(math.min((panel & 0xFF) + lift, 255)), (@uint8)(math.clamp(pl.opacity, 0, 1) * 255))
         local STRIPS <comptime> = 24
         local ROWS <comptime> = 32
         for k = 0, < STRIPS do
@@ -794,35 +814,35 @@ global function draw_world(now: float64): void
         render_max_run_px = 0
         render_world = false
         do -- title buttons: sleep unseen, pop-in, full screen, close (brighter when hovered)
-          local ink = im_col32(240, 230, 220, 255)
+          local ink = chrome_col(ChromeColor.Ink, 255)
           local cy0 = vp.y + 4
           -- close ×
           local cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_CLOSE)
-          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_close and not over_window) and im_col32(190, 60, 50, 235) or im_col32(90, 40, 36, 180), 5, 0)
+          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_close and not over_window) and chrome_col(ChromeColor.Close, 235) or chrome_col(ChromeColor.CloseIdle, 180), 5, 0)
           imgui.DrawListAddLine(dl, vec2(cx0 + 7, cy0 + 7), vec2(cx0 + 19, cy0 + 19), ink, 2.5)
           imgui.DrawListAddLine(dl, vec2(cx0 + 19, cy0 + 7), vec2(cx0 + 7, cy0 + 19), ink, 2.5)
           -- full screen: a frame (filled corners when already full screen)
           cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_FULL)
-          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_full and not over_window) and im_col32(70, 110, 160, 235) or im_col32(40, 50, 70, 180), 5, 0)
+          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_full and not over_window) and chrome_col(ChromeColor.Full, 235) or chrome_col(ChromeColor.FullIdle, 180), 5, 0)
           imgui.DrawListAddRect(dl, vec2(cx0 + 6, cy0 + 7), vec2(cx0 + 20, cy0 + 19), ink, 2, 0, 2.0)
           if ft > 0.5 then imgui.DrawListAddRectFilled(dl, vec2(cx0 + 10, cy0 + 11), vec2(cx0 + 16, cy0 + 15), ink, 0, 0) end
           -- pop-in: arrow into a tab
           cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_POPIN)
-          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_popin and not over_window) and im_col32(120, 100, 60, 235) or im_col32(60, 52, 40, 180), 5, 0)
+          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_popin and not over_window) and chrome_col(ChromeColor.Popin, 235) or chrome_col(ChromeColor.PopinIdle, 180), 5, 0)
           imgui.DrawListAddLine(dl, vec2(cx0 + 6, cy0 + 8), vec2(cx0 + 20, cy0 + 8), ink, 2.0)
           imgui.DrawListAddLine(dl, vec2(cx0 + 13, cy0 + 12), vec2(cx0 + 13, cy0 + 21), ink, 2.0)
           imgui.DrawListAddTriangleFilled(dl, vec2(cx0 + 8, cy0 + 12), vec2(cx0 + 18, cy0 + 12), vec2(cx0 + 13, cy0 + 7), ink)
           -- keep running when unseen: moon (sleeps) or play (keeps running)
           cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_OCCLUDED)
-          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_occluded and not over_window) and im_col32(80, 90, 130, 235) or im_col32(44, 46, 66, 180), 5, 0)
+          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_occluded and not over_window) and chrome_col(ChromeColor.Sleep, 235) or chrome_col(ChromeColor.SleepIdle, 180), 5, 0)
           draw_occluded_icon(dl, cx0, cy0, s.run_occluded, ink)
         end
         imgui.DrawListAddTriangleFilled(dl, vec2(vp.x + pl.width - 22, vp.y + pl.height - 4),
           vec2(vp.x + pl.width - 4, vp.y + pl.height - 22), vec2(vp.x + pl.width - 4, vp.y + pl.height - 4),
-          im_col32(200, 160, 90, (host.world_drag_id == s.id) and 255 or 150))
+          chrome_col(ChromeColor.Accent, (host.world_drag_id == s.id) and 255 or 150))
         if focused then
           -- drawn as short segments so it bends with the panel's curve
-          local col = im_col32(200, 160, 90, 220)
+          local col = chrome_col(ChromeColor.Accent, 220)
           local SEG <comptime> = 32
           for k = 0, < SEG do
             local xa = vp.x + pl.width * k / SEG

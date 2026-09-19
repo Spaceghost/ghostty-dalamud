@@ -27,6 +27,7 @@ global function lua_pcallk(L: *lua_State, nargs: cint, nresults: cint, errfunc: 
 global function lua_gettop(L: *lua_State): cint <cimport, nodecl> end
 global function lua_settop(L: *lua_State, idx: cint): void <cimport, nodecl> end
 global function lua_type(L: *lua_State, idx: cint): cint <cimport, nodecl> end
+global function lua_gettable(L: *lua_State, idx: cint): cint <cimport, nodecl> end
 global function lua_getfield(L: *lua_State, idx: cint, k: cstring): cint <cimport, nodecl> end
 global function lua_setfield(L: *lua_State, idx: cint, k: cstring): void <cimport, nodecl> end
 global function lua_getglobal(L: *lua_State, name: cstring): cint <cimport, nodecl> end

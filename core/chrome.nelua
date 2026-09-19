@@ -6,10 +6,12 @@ require 'math'
 require 'string'
 require 'core.imgui'
 require 'core.world'
+require 'core.theme'
 
 -- Colours ------------------------------------------------------------------------
 
--- The panels' gold accent and ink (core/app/worldview.nelua).
+-- spaceghost's gold accent and ink, as ImGui colours. What is drawn follows
+-- the theme: chrome_col(ChromeColor.Accent, a) and friends (core/theme.nelua).
 global CHROME_GOLD: uint32 <comptime> = 0xFF5AA0C8   -- im_col32(200, 160, 90, 255)
 global CHROME_INK: uint32 <comptime> = 0xFFDCE6F0    -- im_col32(240, 230, 220, 255)
 global CHROME_INK_DIM: uint32 <comptime> = 0xFFA0A5AA -- im_col32(170, 165, 160, 255)
@@ -67,14 +69,15 @@ global function chrome_palette(opacity: float32, glass: boolean, light: ChromeLi
   local bl = light.backlight
   local lr, lg, lb = 16 * bl, 18 * bl, 24 * bl
   local p: ChromePalette
+  local C = ChromeColor
   if glass then
-    p.body_top = chrome_rgba(34 + lr, 39 + lg, 50 + lb, a * 0.88)
-    p.body_bottom = chrome_rgba(10 + lr, 12 + lg, 17 + lb, a)
+    p.body_top = chrome_rgba(chrome_channel(C.GlassTop, 0) + lr, chrome_channel(C.GlassTop, 1) + lg, chrome_channel(C.GlassTop, 2) + lb, a * 0.88)
+    p.body_bottom = chrome_rgba(chrome_channel(C.GlassBottom, 0) + lr, chrome_channel(C.GlassBottom, 1) + lg, chrome_channel(C.GlassBottom, 2) + lb, a)
     p.edge_top = chrome_rgba(255, 255, 255, 64)
     p.edge_bottom = chrome_rgba(255, 255, 255, 8)
     p.sheen = chrome_rgba(255, 255, 255, 16)
   else
-    p.body_top = chrome_rgba(16 + lr, 18 + lg, 24 + lb, a)
+    p.body_top = chrome_rgba(chrome_channel(C.GlassFlat, 0) + lr, chrome_channel(C.GlassFlat, 1) + lg, chrome_channel(C.GlassFlat, 2) + lb, a)
     p.body_bottom = p.body_top
     p.edge_top = chrome_rgba(255, 255, 255, 14)
     p.edge_bottom = p.edge_top
@@ -86,9 +89,9 @@ global function chrome_palette(opacity: float32, glass: boolean, light: ChromeLi
   p.edge_bottom = chrome_tint(p.edge_bottom, light.r, light.g, light.b)
   p.sheen = chrome_tint(p.sheen, light.r, light.g, light.b)
   p.rim = chrome_rgba(0, 0, 0, a * 0.45)
-  p.glow = chrome_rgba(90, 150, 220, 255) -- the panels' backlight blue
-  p.pill = chrome_tint(chrome_rgba(255, 255, 255, 26), light.r, light.g, light.b)
-  p.pill_hover = chrome_tint(chrome_rgba(255, 255, 255, 14), light.r, light.g, light.b)
+  p.glow = chrome_col(C.Glow, 255) -- the panels' backlight
+  p.pill = chrome_tint(chrome_col(C.Tab, 26), light.r, light.g, light.b)
+  p.pill_hover = chrome_tint(chrome_col(C.Tab, 14), light.r, light.g, light.b)
   return p
 end
 
@@ -266,7 +269,7 @@ global function chrome_draw_badge(dl: *ImDrawList, x: float32, y: float32, size:
   local r: float32 = 3
   local cx, cy = x + size - r - 2, y + r + 2
   imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r + 1.5, ring, 12)
-  imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r, CHROME_GOLD, 12)
+  imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r, chrome_col(ChromeColor.Accent, 255), 12)
 end
 
 -- Icons ---------------------------------------------------------------------------

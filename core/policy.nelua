@@ -6,6 +6,8 @@ require 'stringbuilder'
 require 'core.lua'
 require 'core.world'
 require 'core.sys.fs'
+require 'core.theme'
+require 'core.tooltip'
 require 'io'
 
 global Profile = @record{
@@ -51,7 +53,8 @@ global POLICY_HOOK_ON_KEY <comptime> = 2
 global POLICY_HOOK_RESIZE <comptime> = 3
 global POLICY_HOOK_SETTINGS_DRAW <comptime> = 4
 global POLICY_HOOK_SETTINGS_BADGE <comptime> = 5
-global POLICY_HOOK_COUNT <comptime> = 6
+global POLICY_HOOK_THEME <comptime> = 6
+global POLICY_HOOK_COUNT <comptime> = 7
 
 global Policy = @record{
   L: *lua_State,
@@ -201,6 +204,97 @@ global function policy_gamepad_hid(name: string): boolean
   return name == 'create'
 end
 
+-- Themes (core/theme.nelua) ----------------------------------------------------------
+
+-- The integer colour in field `k` of the table at `idx`; false when absent.
+local function field_color(L: *lua_State, idx: cint, k: cstring): (boolean, integer)
+  lua_getfield(L, idx, k)
+  local ok = lua_type(L, -1) == LUA_TNUMBER
+  local v: integer = 0
+  if ok then v = (@integer)(lua_tointegerx(L, -1, nilptr)) end
+  lua_pop(L, 1)
+  if v < 0 or v > 0xFFFFFF then return false, 0 end
+  return ok, v
+end
+
+-- Read a table from lua/themes.lua's resolve() at stack index `idx`:
+-- { terminal = { background, ..., palette = { [i] } }, chrome = { [key] } }.
+-- Returns true when the colours changed.
+global function policy_theme_read(L: *lua_State, idx: cint): boolean
+  local t: TermTheme
+  memory.zero(&t, #TermTheme)
+  local chrome: [CHROME_COLOR_COUNT]uint32 = CHROME_SPACEGHOST
+  if lua_type(L, idx) ~= LUA_TTABLE then return theme_install(&t, &chrome) end
+  lua_getfield(L, idx, 'terminal')
+  local term = lua_gettop(L)
+  if lua_type(L, term) == LUA_TTABLE then
+    local ok, v = field_color(L, term, 'background')
+    if ok then t.has_background, t.background = true, theme_rgb(v) end
+    ok, v = field_color(L, term, 'foreground')
+    if ok then t.has_foreground, t.foreground = true, theme_rgb(v) end
+    ok, v = field_color(L, term, 'cursor')
+    if ok then t.has_cursor, t.cursor = true, theme_rgb(v) end
+    ok, v = field_color(L, term, 'cursor_text')
+    if ok then t.has_cursor_text, t.cursor_text = true, theme_rgb(v) end
+    ok, v = field_color(L, term, 'selection_background')
+    if ok then t.has_sel_bg, t.sel_bg = true, theme_rgb(v) end
+    ok, v = field_color(L, term, 'selection_foreground')
+    if ok then t.has_sel_fg, t.sel_fg = true, theme_rgb(v) end
+    lua_getfield(L, term, 'palette')
+    local pal = lua_gettop(L)
+    if lua_type(L, pal) == LUA_TTABLE then
+      for i = 0, 255 do
+        lua_rawgeti(L, pal, i)
+        if lua_type(L, -1) == LUA_TNUMBER then
+          local c = (@integer)(lua_tointegerx(L, -1, nilptr))
+          if c >= 0 and c <= 0xFFFFFF then
+            t.palette_set[i] = true
+            t.palette[i] = theme_rgb(c)
+          end
+        end
+        lua_pop(L, 1)
+      end
+    end
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 1)
+  lua_getfield(L, idx, 'chrome')
+  local ct = lua_gettop(L)
+  if lua_type(L, ct) == LUA_TTABLE then
+    for i = 0, < CHROME_COLOR_COUNT do
+      local ok, v = field_color(L, ct, (@cstring)(CHROME_COLOR_KEYS[i].data))
+      if ok then chrome[i] = (@uint32)(v) end
+    end
+  end
+  lua_pop(L, 1)
+  return theme_install(&t, &chrome)
+end
+
+-- The theme named by CONFIG.theme, as CONFIG.themes.resolve (lua/themes.lua)
+-- gives it, into theme_term and chrome_colors. Without the module (an
+-- init.lua that bypasses settings.apply) or when it fails, the built-in look.
+local function read_theme(L: *lua_State, t: cint): void
+  lua_getfield(L, t, 'themes')
+  if lua_type(L, -1) == LUA_TTABLE then
+    lua_getfield(L, -1, 'resolve')
+    if lua_type(L, -1) == LUA_TFUNCTION then
+      lua_getfield(L, t, 'theme')
+      if lua_pcall(L, 1, 1, 0) == LUA_OK then
+        policy_theme_read(L, lua_gettop(L))
+      else
+        log_hook_error(L, POLICY_HOOK_THEME, 'themes.resolve')
+        theme_reset()
+      end
+    else
+      theme_reset()
+    end
+    lua_pop(L, 2)
+  else
+    theme_reset()
+    lua_pop(L, 1)
+  end
+end
+
 -- Scalar settings from the CONFIG table at stack index t (used at load and
 -- when the settings window applies changes, without touching sessions).
 local function read_settings(L: *lua_State, t: cint): void
@@ -277,6 +371,14 @@ local function read_settings(L: *lua_State, t: cint): void
   else
     policy.world_occlusion = WORLD_OCCLUSION_DEPTH
     policy.world_occlusion_tolerance, policy.world_occlusion_edge = 0.01, 1
+  end
+  lua_pop(L, 1)
+
+  read_theme(L, t)
+
+  lua_getfield(L, t, 'tooltips')
+  if lua_type(L, -1) == LUA_TTABLE then
+    tooltip_delay = math.clamp(lua_field_number(L, lua_gettop(L), 'delay', 0.45), 0, 5)
   end
   lua_pop(L, 1)
 
@@ -752,6 +854,87 @@ global function policy_settings_badge(): boolean
   end
   lua_pop(L, 3)
   return on
+end
+
+-- Tooltips and themes -----------------------------------------------------------------
+
+-- CONFIG.tooltips[key] (lua/tooltips.lua), or a copy of `fallback`. Asked
+-- only while a tooltip shows. The caller destroys the result.
+global function policy_tooltip(key: string, fallback: string): string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return fallback:copy() end
+  lua_getglobal(L, 'CONFIG')
+  local out: string
+  if lua_type(L, -1) == LUA_TTABLE then
+    lua_getfield(L, -1, 'tooltips')
+    if lua_type(L, -1) == LUA_TTABLE then
+      lua_pushlstring(L, (@cstring)(key.data), key.size)
+      lua_gettable(L, -2)
+      if lua_type(L, -1) == LUA_TSTRING then
+        local len: usize = 0
+        local p = lua_tolstring(L, -1, &len)
+        out = string.copy(string{data=(@*[0]byte)(p), size=len})
+      end
+      lua_pop(L, 1)
+    end
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 1)
+  if #out == 0 then return fallback:copy() end
+  return out
+end
+
+local function copy_string_at(L: *lua_State, idx: cint): string
+  local len: usize = 0
+  local p = lua_tolstring(L, idx, &len)
+  if p == nilptr then return (@string){} end
+  return string.copy(string{data=(@*[0]byte)(p), size=len})
+end
+
+-- /term theme [name]: CONFIG.themes.command lists the themes or names the
+-- one to switch to, which CONFIG.settings.set_theme applies and saves.
+-- Returns the message to show; the caller re-reads the settings.
+global function policy_theme_command(args: string): string
+  local L = policy.L
+  local msg: string
+  if L == nilptr or not policy.loaded then return msg end
+  lua_getglobal(L, 'CONFIG')
+  local c = lua_gettop(L)
+  if lua_type(L, c) ~= LUA_TTABLE then lua_pop(L, 1) return string.copy('themes: no configuration loaded') end
+  lua_getfield(L, c, 'themes')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return string.copy('themes: lua/themes.lua is missing') end
+  lua_getfield(L, -1, 'command')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return string.copy('themes: lua/themes.lua is missing') end
+  lua_pushlstring(L, (@cstring)(args.data), args.size)
+  lua_getfield(L, c, 'theme')
+  if lua_pcall(L, 2, 2, 0) ~= LUA_OK then
+    msg = copy_string_at(L, -1)
+    lua_pop(L, 3)
+    return msg
+  end
+  msg = copy_string_at(L, -2)
+  if lua_type(L, -1) == LUA_TSTRING then
+    local name = lua_gettop(L)
+    lua_getfield(L, c, 'settings')
+    local set_ok = false
+    if lua_type(L, -1) == LUA_TTABLE then
+      lua_getfield(L, -1, 'set_theme')
+      if lua_type(L, -1) == LUA_TFUNCTION then
+        lua_pushvalue(L, name)
+        set_ok = lua_pcall(L, 1, 0, 0) == LUA_OK
+        if not set_ok then lua_pop(L, 1) end
+      else
+        lua_pop(L, 1)
+      end
+    end
+    lua_pop(L, 1)
+    if not set_ok then -- no settings module: switch without saving
+      lua_pushvalue(L, name)
+      lua_setfield(L, c, 'theme')
+    end
+  end
+  lua_pop(L, 4) -- message, name, themes, CONFIG
+  return msg
 end
 
 -- Visual bell ---------------------------------------------------------------------
