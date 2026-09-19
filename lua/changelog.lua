@@ -5,6 +5,7 @@
 -- ('next'), so the tab never claims more than has been seen working.
 
 local vote = require('vote')
+local gallery = require('gallery')
 
 local C = {}
 
@@ -13,6 +14,7 @@ C.releases = {
     version = 'next', title = 'In the workshop',
     blurb = 'Being built right now. These land here as they are verified in game.',
     items = {
+      { 'next', 'Share your screenshots: take one with the game\'s screenshot key while a terminal is on screen and a small prompt offers to share it to the gallery on spacegho.st. One click uploads it; the site owner reviews every shot before it is shown. /term share, the camera button in the dropdown and the About tab offer your latest one; "Don\'t ask again" or Settings, Gallery turns the prompt off. Not yet tried in game.' },
       { 'next', 'Themes: spaceghost (the look you know), gruvbox-dark and four Catppuccin flavours colour the terminals and the glass around them. Pick one in Settings (hover to preview) or with /term theme; drop any Ghostty theme file into themes/ in the config folder. Not yet tried in game.' },
       { 'next', 'Tooltips everywhere: every button, taskbar chip and setting explains itself when you rest the pointer on it, world screens included. Not yet tried in game.' },
       { 'next', 'A self-test you can run in the game: /term selftest checks the terminal, drawing, the camera maths, settings and the agent without moving your character, and writes a report. Not yet run in game.' },
@@ -114,6 +116,10 @@ function C.draw_about(ui, settings)
     ui.spacing()
     ui.separator()
     ui.spacing()
+    gallery.draw_about(ui)
+    ui.spacing()
+    ui.separator()
+    ui.spacing()
   end
   ui.wrapped('Ghostty for FFXIV', 0.92, 0.86, 0.72)
   ui.wrapped('A real terminal emulator living in Eorzea: libghostty-vt for the terminal, a Nelua core for everything on screen, Lua for every decision you can change, and tiny C# shims that only forward calls to the game.')
@@ -128,6 +134,7 @@ function C.draw_about(ui, settings)
   ui.spacing()
   ui.wrapped('Your data', 0.92, 0.86, 0.72)
   ui.wrapped('Shells run on your own machine through ghostty-agent (loopback, token protected). Poses, lights and screens are client-side: other players never see your terminal.')
+  ui.wrapped('The plugin goes online only when you click Share on a screenshot: it sends that one image (and your character\'s name and world, if you ticked the credit box) to the gallery on spacegho.st.')
 end
 
 return C

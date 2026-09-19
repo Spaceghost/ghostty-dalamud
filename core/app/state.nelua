@@ -99,6 +99,11 @@ global GuHostApi = @record{
   -- what the game is busy with (SCENE_* bits: cutscene, group pose, between
   -- areas, an event); nilptr in older shims: never busy (core/app/deskprops.nelua)
   scene_flags: function(): cint,
+  -- the screenshot gallery (core/app/gallery.nelua): POST the file at `path` to
+  -- an https `url`; 1 = started, the answer comes back as GuEventKind.HttpDone
+  http_upload: function(id: cint, url: cstring, path: cstring, content_type: cstring): cint,
+  -- a game string by name (screenshot_dir, user_path, player) into buf; its length, 0 = none
+  game_string: function(name: cstring, buf: *[0]cchar, cap: usize): usize,
 }
 
 global LOG_INFO: cint <comptime> = 1

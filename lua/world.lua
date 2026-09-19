@@ -11,6 +11,11 @@
 --   ghostty.target([t])      -> same shape, your current target
 --   ghostty.object(entity_id)-> same shape, any loaded object
 --   ghostty.zone()           -> territory id
+--   ghostty.view([t])        -> { x, y, z, fx, fy, fz, rx, ry, rz, ux, uy, uz,
+--                                 tan_x, tan_y, width, height, yaw, pitch }:
+--                               the camera's position, forward, screen-right and
+--                               screen-up, tangents of half its field of view,
+--                               the view in pixels
 -- Coordinates are yalms with +Y up; rotation is radians and a character faces
 -- (sin r, 0, cos r). A panel's yaw is the direction its readable side faces.
 
@@ -90,7 +95,9 @@ M.walk = {
 -- camera (walking or zooming carries it too, the wheel pushes it out or pulls
 -- it in); letting go pins it there in the world, whatever it was before. Hold
 -- Shift to land it flush on the wall, floor or table under the cursor, and
--- Ctrl as well to stretch it over that surface. The right button puts it back.
+-- Ctrl as well to stretch it over that surface. Let it go at a side or corner
+-- of the screen, or with Ctrl alone, and it docks to the screen instead (see
+-- M.hud). The right button puts it back.
 M.drag = {
   enabled = true,
   wheel_step = 0.35,     -- yalms per wheel notch (negative flips the direction)
@@ -104,6 +111,34 @@ M.drag = {
   fit_margin = 0.05,     -- kept clear of the surface's edges (yalms)
   fit_min = 0.4,         -- smaller than this either way: keep the panel's own size
   fit_tolerance = 0.05,  -- bumps lower than this still count as flat (yalms)
+}
+
+-- HUD panels (`/term pin hud`, or let a carried panel go at a side of the
+-- screen): docked to a spot on the screen, but living in 3D just in front of
+-- the camera, like Lakitu's cloud. When the camera turns the panel lags on a
+-- spring, sliding back and twisting a little with the turn, then settles
+-- where it was docked. It keeps a gentle bob. Always drawn in front of the
+-- world, without the world's light.
+M.hud = {
+  distance = 1.6,     -- yalms in front of the camera (the panel keeps its screen size at any distance)
+  stiffness = 14,     -- spring stiffness: higher follows the camera more tightly
+  damping = 0.75,     -- 1 = settles with no overshoot; lower wobbles a little first
+  tilt = 0.10,        -- radians the panel lags in facing per rad/s the camera turns
+  roll = 0.06,        -- radians it banks per rad/s the camera turns sideways
+  drag = 0.025,       -- screen fractions it slides back per rad/s the camera turns
+  bob = 0.003,        -- idle bob, screen fractions
+  bob_speed = 1.3,    -- radians per second
+  max_tilt = 0.30,    -- radians, facing and bank alike: however fast the camera spins
+  max_drag = 0.05,    -- screen fractions
+  max_turn = 6,       -- camera turn rates above this (rad/s) count as this
+  min_scale = 0.25,   -- screen pixels per panel pixel a docked panel keeps
+  max_scale = 1.5,
+  fill = 0.45,        -- a panel docked without a size to keep fills at most this much of the screen
+  -- docking by dragging (Alt + drag): let go within `edge` pixels of a side or
+  -- corner of the screen, or with Ctrl held, and it docks there
+  dock = true,
+  edge = 40,
+  margin = 16,        -- pixels a docked panel keeps from the side it is docked to
 }
 
 M.defaults = {
@@ -250,7 +285,8 @@ local function placement(a, x, y, z, yaw, pitch, width, height, ppy, opacity, cu
   out.run_occluded = a.run_occluded or false
   out.pet = a.kind == 'pet'
   out.order_prev, out.order_next = false, false
-  out.x, out.y, out.z, out.yaw, out.pitch = x, y, z, yaw, pitch
+  out.hud = false
+  out.x, out.y, out.z, out.yaw, out.pitch, out.roll = x, y, z, yaw, pitch, 0
   out.width, out.height, out.pixels_per_yalm, out.opacity, out.curve = width, height, ppy, opacity, curve
   return lit(out, now)
 end
@@ -267,6 +303,12 @@ end
 --   target [up]     follows your target, floating above it, facing you
 --   orbit [r] [spd] circles you (radius yalms, radians per second)
 --   pet             floats behind you facing the camera and trails after you
+--   hud [X Y] [DIST] [SCALE]
+--                   docked to the screen: its centre at X, Y (fractions of
+--                   the screen, 0..1 from the top left; default where it
+--                   shows now), DIST yalms in front of the camera (default
+--                   M.hud.distance), SCALE screen pixels per panel pixel
+--                   (default the size it shows at now)
 --   toggle [x y z yaw [pitch]]
 --                   a pet becomes a pin where it is (the pose the core drew it
 --                   at, else where it was last placed, else as `here`); any
@@ -293,6 +335,11 @@ function M.command(id, args)
     return nil
   end
   if how == 'toggle' then return M.toggle(id, tonumber(a[2]), tonumber(a[3]), tonumber(a[4]), tonumber(a[5]), tonumber(a[6])) end
+  if how == 'hud' then
+    local x, y = tonumber(a[2]), tonumber(a[3])
+    if (a[2] and not x) or (x and not y) then return 'usage: /term pin hud [X Y] [DIST] [SCALE]' end
+    return M.dock(id, x, y, tonumber(a[5]), tonumber(a[4]), true)
+  end
   local p = ghostty.player()
   if not p then return 'no player (log in first)' end
   if how == 'here' then
@@ -319,7 +366,7 @@ function M.command(id, args)
   elseif how == 'orbit' then
     M.anchors[id] = { kind = 'orbit', radius = tonumber(a[2]) or 3.5, speed = tonumber(a[3]) or 0.25, up = 1.8, phase = p.rotation }
   else
-    return 'usage: /term pin [here|me|target|orbit] ...'
+    return 'usage: /term pin [here|me|target|orbit|pet|hud] ...'
   end
   return nil
 end
@@ -352,6 +399,58 @@ function M.toggle(id, x, y, z, yaw, pitch)
   else
     a = { kind = 'pet', phase = math.random() * 2 * pi }
   end
+  for _, k in ipairs(KEEP) do a[k] = old[k] end
+  M.anchors[id] = a
+  M._pet_ids = nil
+  return nil
+end
+
+-- HUD docking --------------------------------------------------------------------
+
+local function clamp(x, lo, hi) return x < lo and lo or (x > hi and hi or x) end
+
+-- Where a panel centred at (x, y, z), `ppy` pixels per yalm, shows in camera
+-- view `v`: screen fractions and screen pixels per panel pixel (as
+-- world_hud_spot in core/world.nelua); nil behind the camera.
+local function hud_spot(v, x, y, z, ppy)
+  local dx, dy, dz = x - v.x, y - v.y, z - v.z
+  local depth = dx * v.fx + dy * v.fy + dz * v.fz
+  if depth < 0.05 or not ppy or ppy <= 0 then return nil end
+  local nx = (dx * v.rx + dy * v.ry + dz * v.rz) / (depth * v.tan_x)
+  local ny = (dx * v.ux + dy * v.uy + dz * v.uz) / (depth * v.tan_y)
+  return (nx + 1) / 2, (1 - ny) / 2, v.height / (2 * depth * v.tan_y * ppy)
+end
+
+-- Dock panel `id` to the screen as a HUD panel: centre at (x, y) in screen
+-- fractions, `scale` screen pixels per panel pixel, `dist` yalms out. What is
+-- not given comes from where and how big the panel shows now (else the
+-- middle of the screen, at a size that fits). Also the core's drag-to-dock.
+-- `new`: a terminal not in the world yet may be docked too (/term pin hud).
+function M.dock(id, x, y, scale, dist, new)
+  local old = M.anchors[id]
+  if not old and not new then return 'not a world terminal' end
+  old = old or {}
+  local cfg = M.hud
+  local v = ghostty.view and ghostty.view() or nil
+  if (not x or not scale) and v and old._out and not old.hidden then
+    local o = old._out
+    local fx, fy, sc = hud_spot(v, o.x, o.y, o.z, o.pixels_per_yalm)
+    if fx and (x or (fx > -0.05 and fx < 1.05 and fy > -0.05 and fy < 1.05)) then
+      if not x then x, y = fx, fy end
+      scale = scale or sc
+    end
+  end
+  if not scale then
+    local w, h = old.width or M.defaults.width, old.height or M.defaults.height
+    scale = 1
+    if v then scale = math.min(1, cfg.fill * v.width / w, cfg.fill * v.height / h) end
+  end
+  local a = {
+    kind = 'hud', sx = clamp(x or 0.5, 0, 1), sy = clamp(y or 0.5, 0, 1),
+    scale = clamp(scale, cfg.min_scale, cfg.max_scale),
+    dist = dist and clamp(dist, 0.3, 20) or nil,
+    phase = math.random() * 2 * pi,
+  }
   for _, k in ipairs(KEEP) do a[k] = old[k] end
   M.anchors[id] = a
   M._pet_ids = nil
@@ -587,6 +686,17 @@ local function clear_of(x, z, p, back, half_angle)
     return p.x + sin(edge) * rr, p.z + cos(edge) * rr
   end
   return x, z
+end
+
+-- A spring whose value never leaves [-lim, lim]: at the limit it stops there
+-- (no bounce off it), so a wild spin never flings the panel.
+local function hud_spring(h, key, target, lim, dt, k, zeta)
+  local x = spring(h, key, clamp(target, -lim, lim), dt, k, zeta)
+  if x > lim or x < -lim then
+    x = clamp(x, -lim, lim)
+    h[key], h[key .. '_v'] = x, 0
+  end
+  return x
 end
 
 local function pet_ppy(a)
@@ -842,6 +952,74 @@ function M.place_pet(id, a, p, t, focused)
   return out
 end
 
+-- The camera once per frame time, and how fast it turns (rad/s toward its
+-- right and its up, from the last frame; 0 after a hitch or a gap).
+local view_prev = { t = nil }
+local function view_at(t)
+  if M._vt == t then return M._v end
+  M._vt = t
+  M._vbuf = M._vbuf or {}
+  local v = ghostty.view and ghostty.view(M._vbuf) or nil
+  local p = view_prev
+  M._turn_r, M._turn_u = 0, 0
+  if v then
+    local dt = p.t and t - p.t or 0
+    if dt > 1e-4 and dt < 0.25 then
+      local lim = M.hud.max_turn
+      local ar = math.asin(clamp(v.fx * p.rx + v.fy * p.ry + v.fz * p.rz, -1, 1))
+      local au = math.asin(clamp(v.fx * p.ux + v.fy * p.uy + v.fz * p.uz, -1, 1))
+      -- more than a big turn in one frame is a cut (a cutscene, a teleport): no sway
+      if math.abs(ar) + math.abs(au) < 0.5 then
+        M._turn_r = clamp(ar / dt, -lim, lim)
+        M._turn_u = clamp(au / dt, -lim, lim)
+      end
+    end
+    p.t, p.rx, p.ry, p.rz, p.ux, p.uy, p.uz = t, v.rx, v.ry, v.rz, v.ux, v.uy, v.uz
+  else
+    p.t = nil
+  end
+  M._v = v
+  return v
+end
+
+function M.place_hud(id, a, t)
+  local cfg = M.hud
+  local v = view_at(t)
+  if not v then return nil end
+  local h = a._hud
+  if not h then h = { lx = 0, ly = 0, tr = 0, tu = 0, rl = 0 } a._hud = h end -- starts at rest
+  local dt = h.t and clamp(t - h.t, 0, 0.1) or 0
+  h.t = t
+  local wr, wu = M._turn_r, M._turn_u
+  local k, z, mt, md = cfg.stiffness, cfg.damping, cfg.max_tilt, cfg.max_drag
+  -- lagging behind the turn: slid back on screen, still facing where the camera looked
+  local lx = hud_spring(h, 'lx', -cfg.drag * wr, md, dt, k, z)
+  local ly = hud_spring(h, 'ly', cfg.drag * wu, md, dt, k, z)
+  local tr = hud_spring(h, 'tr', cfg.tilt * wr, mt, dt, k, z)
+  local tu = hud_spring(h, 'tu', cfg.tilt * wu, mt, dt, k, z)
+  local rl = hud_spring(h, 'rl', -cfg.roll * wr, mt, dt, k, z)
+  local sx = a.sx + lx
+  local sy = a.sy + ly + sin(t * cfg.bob_speed + (a.phase or 0)) * cfg.bob
+  local d = a.dist or cfg.distance
+  local nx, ny = (2 * sx - 1) * v.tan_x * d, (1 - 2 * sy) * v.tan_y * d
+  local x = v.x + v.fx * d + v.rx * nx + v.ux * ny
+  local y = v.y + v.fy * d + v.ry * nx + v.uy * ny
+  local zz = v.z + v.fz * d + v.rz * nx + v.uz * ny
+  -- face back along the camera's (lagged) view: parallel to the screen at rest
+  local fx, fy, fz = v.fx - tr * v.rx - tu * v.ux, v.fy - tr * v.ry - tu * v.uy, v.fz - tr * v.rz - tu * v.uz
+  local fl = math.sqrt(fx * fx + fy * fy + fz * fz)
+  local yaw, pitch = atan(-fx, -fz), math.asin(clamp(-fy / fl, -1, 1))
+  -- keeps its screen size whatever the distance or field of view
+  local ppy = v.height / (2 * d * v.tan_y * (a.scale or 1))
+  local out = placement(a, x, y, zz, yaw, pitch, a.width or M.defaults.width, a.height or M.defaults.height,
+    ppy, a.opacity or M.defaults.opacity, 0, t)
+  out.roll, out.hud = rl, true
+  -- UI, not part of the world: none of its light, none cast
+  out.tint_r, out.tint_g, out.tint_b, out.backlight = 1, 1, 1, 0
+  out.light_intensity = 0
+  return out
+end
+
 -- Walking up makes sense for panels that stay put when you move: pins in the
 -- world and panels over other characters. Pets, `me` and orbits move with you.
 function M.walkable(id)
@@ -859,6 +1037,8 @@ function M.place(id, t, focused)
     if a.zone and a.zone ~= ghostty.zone() then return nil end
     return result(a, a.x, a.y, a.z, a.yaw, t)
   end
+
+  if a.kind == 'hud' then return M.place_hud(id, a, t) end
 
   -- the player once per frame time, into the same table every time
   if M._pt ~= t then

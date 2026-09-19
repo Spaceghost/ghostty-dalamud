@@ -401,6 +401,40 @@ local function draw_drop_ghost(dl: *ImDrawList, cam: *GuCamera, vp: ImVec2, pl: 
   if ok then draw_crosshair(dl, sx + vp.x, sy + vp.y, 12, col, 2) end
 end
 
+-- Docking a carried panel to the screen (lua/world.lua `hud`): where it would
+-- dock if let go now, and the screen pixels per panel pixel it keeps.
+local function hud_dock_at(cam: *GuCamera, pose: WorldPlacement, ctrl: boolean): (WorldDock, float32)
+  local tn = &host.world_tuning
+  local none: WorldDock
+  if not tn.hud_dock then return none, 1 end
+  local vok, v = world_view(cam)
+  if not vok then return none, 1 end
+  local ok, fx, fy, scale = world_hud_spot(&v, pose.x, pose.y, pose.z, pose.ppm)
+  if not ok then return none, 1 end
+  local vp = imgui.GetMainViewport().Pos
+  local mouse: ImVec2
+  imgui.GetMousePos(&mouse)
+  local px, py = mouse.x - vp.x, mouse.y - vp.y
+  return world_hud_dock(cam.width, cam.height, px, py, px - fx * cam.width, py - fy * cam.height,
+    pose.width * scale * 0.5, pose.height * scale * 0.5, tn.hud_edge, tn.hud_margin, ctrl), scale
+end
+
+-- The dock preview: a soft glow along the sides it docks to, and its outline there.
+local function draw_dock_preview(dl: *ImDrawList, cam: *GuCamera, vp: ImVec2, dock: *WorldDock, hw: float32, hh: float32): void
+  local col = chrome_col(ChromeColor.Accent2, 200)
+  for gi = 0, < 4 do
+    local g = (@float32)(6 + gi * 7)
+    local glow = chrome_col(ChromeColor.Accent2, (@uint8)(46 - gi * 10))
+    if dock.left then imgui.DrawListAddRectFilled(dl, vp, vec2(vp.x + g, vp.y + cam.height), glow, 0, 0) end
+    if dock.right then imgui.DrawListAddRectFilled(dl, vec2(vp.x + cam.width - g, vp.y), vec2(vp.x + cam.width, vp.y + cam.height), glow, 0, 0) end
+    if dock.top then imgui.DrawListAddRectFilled(dl, vp, vec2(vp.x + cam.width, vp.y + g), glow, 0, 0) end
+    if dock.bottom then imgui.DrawListAddRectFilled(dl, vec2(vp.x, vp.y + cam.height - g), vec2(vp.x + cam.width, vp.y + cam.height), glow, 0, 0) end
+  end
+  local cx, cy = vp.x + dock.x * cam.width, vp.y + dock.y * cam.height
+  imgui.DrawListAddRectFilled(dl, vec2(cx - hw, cy - hh), vec2(cx + hw, cy + hh), chrome_col(ChromeColor.Accent2, 24), 6, 0)
+  imgui.DrawListAddRect(dl, vec2(cx - hw, cy - hh), vec2(cx + hw, cy + hh), col, 6, 0, 2.0)
+end
+
 -- After the panels: advance the gesture, show where a snap lands, pin on release.
 local function drag_tick(dl: *ImDrawList, cam: *GuCamera, vp: ImVec2, inp: WorldDragInput, carried: WorldPlacement,
                          ray_ok: boolean, ox: float32, oy: float32, oz: float32, dx: float32, dy: float32, dz: float32, now: float64): void
@@ -416,6 +450,24 @@ local function drag_tick(dl: *ImDrawList, cam: *GuCamera, vp: ImVec2, inp: World
   if not st.dragging and not st.dropped then return end
   local pose = carried
   local fit_w: float32, fit_h: float32 = 0, 0
+  -- at a side of the screen (or with Ctrl, no Shift): docks to the screen instead
+  if not st.snap then
+    local dock, scale = hud_dock_at(cam, carried, inp.ctrl)
+    if dock.ok and st.dragging then
+      draw_dock_preview(dl, cam, vp, &dock, math.min(carried.width * scale * 0.5, cam.width * 0.5 - tn.hud_margin),
+        math.min(carried.height * scale * 0.5, cam.height * 0.5 - tn.hud_margin))
+    elseif dock.ok then
+      local err = policy_world_dock(st.id, dock.x, dock.y, scale)
+      if #err > 0 then
+        logf(LOG_WARN, 'session %d: dock failed: %s', st.id, err)
+      else
+        logf(LOG_INFO, 'session %d: docked to the screen at (%.3f, %.3f), %.2f px per px', st.id, dock.x, dock.y, scale)
+        save_world_state()
+      end
+      err:destroy()
+      return
+    end
+  end
   if st.snap and ray_ok and host.api.raycast ~= nilptr then
     local snap = world_snap(host.api.raycast, ox, oy, oz, dx, dy, dz, tn.drag_reach, tn.drag_probe)
     if snap.ok then
@@ -747,14 +799,14 @@ global function draw_world(now: float64): void
     local placed_x, placed_z = pl.x, pl.z
     if ok then
       if host.walk.id == s.id then host.walk.tx, host.walk.tz = placed_x, placed_z end
-      if not carried then present_panel(s, &pl, &cam, &occ, &pc, wdt, full_this) end
+      if not carried and not pl.hud then present_panel(s, &pl, &cam, &occ, &pc, wdt, full_this) end
     end
     -- the pose it is shown at: pin <-> pet turns it into a pin right there
     s.posed = ok and not carried
     if s.posed then s.pose_x, s.pose_y, s.pose_z, s.pose_yaw, s.pose_pitch = pl.x, pl.y, pl.z, pl.yaw, pl.pitch end
     -- the shadow board follows the pose the panel is drawn at (carried or
     -- presented); full screen leaves the world, so the board goes
-    occluder_panel(s.id, ok and not s.sleeping and prez * (1 - ft) > 0, &pl, &host.world_tuning)
+    occluder_panel(s.id, ok and not pl.hud and not s.sleeping and prez * (1 - ft) > 0, &pl, &host.world_tuning)
     -- mid-flight the terminal keeps the grid of its world size, so the shell is
     -- resized once when the flight ends instead of on every frame of it
     local grid_w, grid_h = pl.width, pl.height
@@ -904,7 +956,7 @@ global function draw_world(now: float64): void
                 end_walk(WORLD_WALK_CANCELLED)
                 host.world_full_toggle_id = s.id
                 local ch: float32, cv: float32, cd: float32, cmin: float32 = 0, 0, 0, 0
-                if host.api.get_camera_state ~= nilptr and host.api.set_camera_state ~= nilptr and host.world_full_id ~= s.id
+                if not pl.hud and host.api.get_camera_state ~= nilptr and host.api.set_camera_state ~= nilptr and host.world_full_id ~= s.id
                    and host.api.get_camera_state(&ch, &cv, &cd, &cmin) ~= 0 then
                   host.cam_target_h = camera_heading_to(&cam, ch, pl.x - pc.x, pl.z - pc.z)
                   host.cam_target_v = 0
@@ -918,7 +970,7 @@ global function draw_world(now: float64): void
                 host.last_click_id = s.id
                 host.last_click_time = now
                 local ch: float32, cv: float32, cd: float32, cmin: float32 = 0, 0, 0, 0
-                if host.world_full_id == 0 and host.api.get_camera_state ~= nilptr and host.api.set_camera_state ~= nilptr
+                if host.world_full_id == 0 and not pl.hud and host.api.get_camera_state ~= nilptr and host.api.set_camera_state ~= nilptr
                    and host.api.get_camera_state(&ch, &cv, &cd, &cmin) ~= 0 then
                   host.cam_target_h = camera_heading_to(&cam, ch, pl.x - pc.x, pl.z - pc.z)
                   host.cam_target_v = cv
@@ -946,9 +998,10 @@ global function draw_world(now: float64): void
         -- the depth test goes in before the panel's first draw command (the glow
         -- included); off once the full-screen flight starts moving the vertices
         -- away from the surface the shader intersects
-        local depth_on = occlusion == WORLD_OCCLUSION_DEPTH and depthpass_panel_begin(dl, &b, ft > 0 and 0 or 1)
+        -- a HUD panel is always in front
+        local depth_on = not pl.hud and occlusion == WORLD_OCCLUSION_DEPTH and depthpass_panel_begin(dl, &b, ft > 0 and 0 or 1)
         local panel_occ: *WorldOccluder = nilptr
-        if occlusion ~= WORLD_OCCLUSION_OFF and not depth_on then panel_occ = &occ end
+        if occlusion ~= WORLD_OCCLUSION_OFF and not depth_on and not pl.hud then panel_occ = &occ end
         local first = dl.VtxBuffer.Size
         local first_cmd = dl.CmdBuffer.Size
         bell_panel_glow(dl, vp, &pl, s.id) -- the visual bell lifts the backlight below

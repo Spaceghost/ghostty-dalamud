@@ -57,6 +57,8 @@ internal unsafe struct GuHostApi
     public delegate* unmanaged[Cdecl]<byte*, uint*, int> ConfigUInt;
     public delegate* unmanaged[Cdecl]<byte*, uint*, uint*, nint> TextureFile;
     public delegate* unmanaged[Cdecl]<int> SceneFlags;
+    public delegate* unmanaged[Cdecl]<int, byte*, byte*, byte*, int> HttpUpload;
+    public delegate* unmanaged[Cdecl]<byte*, byte*, nuint, nuint> GameString;
 }
 
 // Mirrors GuInitInfo in core/app/boot.nelua.
@@ -110,6 +112,7 @@ internal enum GuEvent
     OpenConfig = 3,
     DtrClick = 4,
     PluginsChanged = 5,
+    HttpDone = 6,
 }
 
 internal static unsafe class Native

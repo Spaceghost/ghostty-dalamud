@@ -69,7 +69,8 @@ global POLICY_HOOK_SETTINGS_DRAW <comptime> = 4
 global POLICY_HOOK_SETTINGS_BADGE <comptime> = 5
 global POLICY_HOOK_THEME <comptime> = 6
 global POLICY_HOOK_ON_EVENT <comptime> = 7
-global POLICY_HOOK_COUNT <comptime> = 8
+global POLICY_HOOK_GALLERY <comptime> = 8
+global POLICY_HOOK_COUNT <comptime> = 9
 
 global Policy = @record{
   L: *lua_State,
@@ -541,7 +542,7 @@ end
   lua_setglobal(L, 'CONFIG')
   -- an init.lua from before a module existed (the user's copy in the config
   -- home is never replaced) gets the shipped module's defaults
-  if luaL_loadstring(L, "for _, n in ipairs({ 'themes', 'tooltips', 'assistant', 'windows', 'adopt', 'rain' }) do if CONFIG[n] == nil then local ok, m = pcall(require, n) if ok then CONFIG[n] = m end end end") == LUA_OK then
+  if luaL_loadstring(L, "for _, n in ipairs({ 'themes', 'tooltips', 'assistant', 'windows', 'adopt', 'rain', 'gallery' }) do if CONFIG[n] == nil then local ok, m = pcall(require, n) if ok then CONFIG[n] = m end end end") == LUA_OK then
     if lua_pcall(L, 0, 0, 0) ~= LUA_OK then lua_pop(L, 1) end
   else
     lua_pop(L, 1)
@@ -694,6 +695,7 @@ global function policy_world_place(id: integer, t: float64, focused: boolean): (
     pl.z = (@float32)(lua_field_number(L, r, 'z', 0))
     pl.yaw = (@float32)(lua_field_number(L, r, 'yaw', 0))
     pl.pitch = (@float32)(lua_field_number(L, r, 'pitch', 0))
+    pl.roll = (@float32)(lua_field_number(L, r, 'roll', 0))
     pl.width = (@float32)(lua_field_number(L, r, 'width', 900))
     pl.height = (@float32)(lua_field_number(L, r, 'height', 520))
     pl.ppm = (@float32)(lua_field_number(L, r, 'pixels_per_yalm', 300))
@@ -713,6 +715,7 @@ global function policy_world_place(id: integer, t: float64, focused: boolean): (
     pl.pet = lua_field_boolean(L, r, 'pet', false)
     pl.order_prev = lua_field_boolean(L, r, 'order_prev', false)
     pl.order_next = lua_field_boolean(L, r, 'order_next', false)
+    pl.hud = lua_field_boolean(L, r, 'hud', false)
     ok = true
   end
   lua_pop(L, 3)
@@ -809,6 +812,32 @@ global function policy_world_resize(id: integer, w: float64, h: float64): void
   lua_pushnumber(L, h)
   if lua_pcall(L, 3, 0, 0) ~= LUA_OK then log_hook_error(L, POLICY_HOOK_RESIZE, 'world.resize') lua_pop(L, 1) end
   lua_pop(L, 2)
+end
+
+-- CONFIG.world.dock(terminal_id, x, y, scale) -> nil or an error string: a
+-- carried panel let go at a side of the view (or with Ctrl) docks there as a
+-- HUD panel, its centre at (x, y) in fractions of the view, `scale` screen
+-- pixels per panel pixel.
+global function policy_world_dock(id: integer, x: float32, y: float32, scale: float32): string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return string.copy('no config') end
+  if not push_world_fn(L, 'dock') then return string.copy('lua/world.lua has no dock') end
+  lua_pushinteger(L, id)
+  lua_pushnumber(L, x)
+  lua_pushnumber(L, y)
+  lua_pushnumber(L, scale)
+  local err: string
+  if lua_pcall(L, 4, 1, 0) ~= LUA_OK or lua_type(L, -1) == LUA_TSTRING then
+    local len: usize = 0
+    local msg = lua_tolstring(L, -1, &len)
+    if msg ~= nilptr then
+      err = string.copy(string{data=(@*[0]byte)(msg), size=len})
+    else
+      err = string.copy('lua error')
+    end
+  end
+  lua_pop(L, 3)
+  return err
 end
 
 -- CONFIG.world.drop(terminal_id, pose) -> nil or an error string: a panel
@@ -1400,4 +1429,75 @@ global function policy_windows_pin(id: integer, args: string): string
   end
   lua_pop(L, 3)
   return err
+end
+
+-- Screenshot gallery (lua/gallery.lua) --------------------------------------------
+
+local function push_gallery_fn(L: *lua_State, name: cstring): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'gallery')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, name)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  return true -- stack: CONFIG, gallery, fn
+end
+
+-- CONFIG.gallery.tick(now, shown): watches the screenshot folder while a
+-- terminal is (or just was) on screen; true while its prompt should be drawn.
+global function policy_gallery_tick(now: float64, shown: boolean): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_gallery_fn(L, 'tick') then return false end
+  lua_pushnumber(L, now)
+  lua_pushboolean(L, shown and 1 or 0)
+  local draw = false
+  if lua_pcall(L, 2, 1, 0) == LUA_OK then
+    draw = lua_toboolean(L, -1) ~= 0
+  else
+    log_hook_error(L, POLICY_HOOK_GALLERY, 'gallery.tick')
+  end
+  lua_pop(L, 3)
+  return draw
+end
+
+-- CONFIG.gallery.draw(): the prompt's contents (ghostty.ui), inside its window.
+global function policy_gallery_draw(): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_gallery_fn(L, 'draw') then return end
+  if lua_pcall(L, 0, 0, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_GALLERY, 'gallery.draw')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.gallery.on_upload(id, status, text): an upload the shim finished.
+global function policy_gallery_uploaded(id: integer, status: integer, text: string): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_gallery_fn(L, 'on_upload') then return end
+  lua_pushinteger(L, id)
+  lua_pushinteger(L, status)
+  lua_pushlstring(L, (@cstring)(text.data), text.size)
+  if lua_pcall(L, 3, 0, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_GALLERY, 'gallery.on_upload')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.gallery.command(args) -> the line to show for /term share; empty when
+-- the module is missing or failed (the error is logged).
+global function policy_gallery_command(args: string): string
+  local out: string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return out end
+  if not push_gallery_fn(L, 'command') then return string.copy('lua/gallery.lua is not loaded (CONFIG.gallery)') end
+  lua_pushlstring(L, (@cstring)(args.data), args.size)
+  if lua_pcall(L, 1, 1, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_GALLERY, 'gallery.command')
+  elseif lua_type(L, -1) == LUA_TSTRING then
+    out = copy_string_at(L, -1)
+  end
+  lua_pop(L, 3)
+  return out
 end
