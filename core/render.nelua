@@ -1,6 +1,7 @@
 -- Draw a TermView into an ImGui draw list.
 require 'core.ghostty'
 require 'core.imgui'
+require 'core.boxdraw'
 require 'core.termview'
 require 'core.theme'
 require 'memory'
@@ -161,8 +162,12 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
               -- a written space draws nothing
             else
               local mergeable = merge_text and plain and buf.len == 1 and text[0] > 32 and text[0] < 127
+              local cp = boxdraw_codepoint(&text, buf.len)
+              if not boxdraw_handles(cp) then cp = 0 end
               local n = #v.glyphs
-              if mergeable and text_next_col == col and n > 0 and v.glyphs[n - 1].col == fgcol and v.glyphs[n - 1].bold == bold then
+              if cp ~= 0 then
+                v.glyphs:push(GlyphDraw{ x = x, col = fgcol, off = #v.glyph_bytes, len = 0, underline = underline, strike = strike, cp = cp })
+              elseif mergeable and text_next_col == col and n > 0 and v.glyphs[n - 1].col == fgcol and v.glyphs[n - 1].bold == bold then
                 -- the run's bytes are the last ones queued
                 v.glyph_bytes:push(text[0])
                 v.glyphs[n - 1].len = v.glyphs[n - 1].len + 1
@@ -189,8 +194,12 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
           local g = v.glyphs[gi]
           local b = (@cstring)(&bytes[g.off])
           local e = (@cstring)(&bytes[g.off + g.len])
-          imgui.DrawListAddText(dl, m.font, m.font_size, vec2(g.x, y), g.col, b, e, 0.0, nilptr)
-          if g.bold then
+          if g.cp ~= 0 then
+            boxdraw_draw(dl, g.cp, g.x, y, m.cell_w, m.cell_h, g.col, not render_world)
+          else
+            imgui.DrawListAddText(dl, m.font, m.font_size, vec2(g.x, y), g.col, b, e, 0.0, nilptr)
+          end
+          if g.bold and g.cp == 0 then
             imgui.DrawListAddText(dl, m.font, m.font_size, vec2(g.x + 0.7, y), g.col, b, e, 0.0, nilptr)
           end
           if g.underline then
@@ -228,7 +237,10 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
       else
         imgui.DrawListAddRectFilled(dl, vec2(cx, cy), vec2(cx + m.cell_w, cy + m.cell_h), ccol, 0.0, 0)
         -- a theme with cursor-text redraws the glyph under the block in that colour
-        if cur_glyph_len > 0 then
+        local ccp = cur_glyph_len > 0 and boxdraw_codepoint(&cur_glyph, cur_glyph_len) or 0
+        if boxdraw_handles(ccp) then
+          boxdraw_draw(dl, ccp, cx, cy, m.cell_w, m.cell_h, rgb(theme_term.cursor_text, 255), not render_world)
+        elseif cur_glyph_len > 0 then
           local b = (@cstring)(&cur_glyph[0])
           local e = (@cstring)(&cur_glyph[cur_glyph_len])
           imgui.DrawListAddText(dl, m.font, m.font_size, vec2(cx, cy), rgb(theme_term.cursor_text, 255), b, e, 0.0, nilptr)

@@ -148,13 +148,14 @@ if [[ "${SKIP_SHIM:-0}" != 1 ]]; then
   if [[ -f build/dist/ghostty_core.dll && -f build/dist/ghostty_loader.dll ]]; then
     echo "== build/dist/GhosttyDalamud (plugin folder)"
     P=build/dist/GhosttyDalamud
-    rm -rf "$P.tmp" && mkdir -p "$P.tmp/lua" "$P.tmp/themes"
+    rm -rf "$P.tmp" && mkdir -p "$P.tmp/lua" "$P.tmp/themes" "$P.tmp/fonts"
     cp build/plugin/GhosttyDalamud/GhosttyDalamud.dll build/plugin/GhosttyDalamud/GhosttyDalamud.json "$P.tmp/"
     [[ -f build/plugin/GhosttyDalamud/GhosttyDalamud.pdb ]] && cp build/plugin/GhosttyDalamud/GhosttyDalamud.pdb "$P.tmp/" || true
     cp build/dist/ghostty_core.dll build/dist/ghostty_loader.dll "$P.tmp/"
     cp lua/*.lua "$P.tmp/lua/"
     cp themes/*.theme "$P.tmp/themes/"
-    for f in GhosttyDalamud.dll GhosttyDalamud.json ghostty_core.dll ghostty_loader.dll lua/init.lua lua/migrate.lua themes/spaceghost.theme; do
+    cp fonts/*.ttf fonts/LICENSE-* "$P.tmp/fonts/"
+    for f in GhosttyDalamud.dll GhosttyDalamud.json ghostty_core.dll ghostty_loader.dll lua/init.lua lua/migrate.lua themes/spaceghost.theme fonts/SymbolsNerdFontMono-Regular.ttf; do
       [[ -f "$P.tmp/$f" ]] || { echo "error: $f missing from the plugin folder"; exit 1; }
     done
     forbid_host_assemblies "$P.tmp"

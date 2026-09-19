@@ -566,7 +566,7 @@ global SELFTEST_RENDER_INPUT: string <comptime> = #[
   '\27[38;2;255;128;0mtrue\27[48;2;0;64;128mcolour\27[0m\r\n' ..
   '\xe6\x97\xa5\xe6\x9c\xac wide \xe2\x94\x80\xe2\x94\x80 box\r\n' ..
   '\27[42m          \27[0m end']#
-global SELFTEST_RENDER_HASH: string <comptime> = '1eda1cc81deb88a4'
+global SELFTEST_RENDER_HASH: string <comptime> = '7cd4943e6e6e1e25'
 
 global function selftest_render_ops(): (boolean, uint64, integer, string)
   local v: TermView

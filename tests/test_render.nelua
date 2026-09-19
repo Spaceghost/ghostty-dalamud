@@ -135,6 +135,31 @@ do
   print('text runs OK')
 end
 
+-- Box drawing, blocks and braille are drawn as rectangles that fill the cell
+-- exactly, not through the font (which may lack them or leave gaps).
+do
+  local tv: TermView
+  assert(tv:init(4, 3))
+  local rows: string = "\xE2\x94\x8C\xE2\x94\x80\xE2\x94\x90\r\n\xE2\x96\x88\xE2\x96\x80\xE2\xA3\xBF\r\n\xE2\x95\x94\xE2\x95\x90\xE2\x95\x9D"
+  tv:feed((@*[0]uint8)(rows.data), rows.size)
+  assert(tv:update())
+  local mb = render_measure(nilptr, 16.0)
+  text_count = 0
+  rect_count = 0
+  render_termview(nilptr, &tv, vec2(0.0, 0.0), mb, false, true, 255, 0.0)
+  local b = log:promote()
+  assert(text_count == 0, 'no font glyphs for box drawing')
+  assert(b:find('rect 4,8-8,9 ', 1, true) > 0 and b:find('rect 4,8-5,16 ', 1, true) > 0, 'a light corner: two arms meeting in the cell centre')
+  assert(b:find('rect 8,8-12,9 ', 1, true) > 0 and b:find('rect 12,8-16,9 ', 1, true) > 0, 'a horizontal line spans the cell')
+  assert(b:find('rect 0,16-8,32 ', 1, true) > 0, 'full block fills the cell')
+  assert(b:find('rect 8,16-16,24 ', 1, true) > 0, 'upper half block')
+  assert(b:find('rect 3,39-8,40 ', 1, true) > 0 and b:find('rect 5,41-8,42 ', 1, true) > 0 and
+    b:find('rect 3,39-4,48 ', 1, true) > 0 and b:find('rect 5,41-6,48 ', 1, true) > 0, 'a double corner: outer and inner lines')
+  b:destroy()
+  tv:destroy()
+  print('box drawing OK')
+end
+
 -- Regression: a focused terminal must set WantTextInput, or Dalamud passes the
 -- keystrokes to the game (in-game: typing opened the chat box).
 local io: ImGuiIO
