@@ -1,0 +1,504 @@
+-- The desk scene and the character's reactions against a fake game: where
+-- the furniture goes and how big, the mood scheduler (weights, durations,
+-- the same day for the same seed), the props' lifecycle (lazy creation,
+-- load polling, freed on walking off, combat, group pose, a zone change,
+-- closing the terminal, teardown and shutdown, never twice), the phone as
+-- the default and when the desk cannot be had, the OSC 133 scanner, and
+-- events turning into reactions that return to the hold.
+require 'core.host'
+require 'string'
+require 'stringbuilder'
+require 'arg'
+require 'math'
+
+local function near(a: float64, b: float64, eps: float64): boolean return math.abs(a - b) < eps end
+
+-- OSC 133 scanner --------------------------------------------------------------------
+do
+  local w: CmdWatch
+  local function feed(w: *CmdWatch, s: string): void w:scan((@*[0]uint8)(s.data), (@usize)(#s)) end
+  feed(&w, 'hello \27]133;A\7$ ls\r\n\27]133;C\7out\r\n\27]133;D;0\7')
+  assert(w.starts == 1 and w.dones == 1 and w.last_exit == 0 and w.seen, 'C then D;0 (BEL)')
+  feed(&w, '\27]133;C\27\\x\27]133;D;127;aid=5\27\\')
+  assert(w.starts == 2 and w.dones == 2 and w.last_exit == 127, 'ST terminators, extra parameters')
+  -- a mark split across reads, byte by byte
+  local s = '\27]133;D;2\7'
+  for i = 1, #s do feed(&w, s:sub(i, i)) end
+  assert(w.dones == 3 and w.last_exit == 2, 'split across reads')
+  feed(&w, '\27]133;D\7')
+  assert(w.dones == 4 and w.last_exit == 0, 'D without a status counts as 0')
+  feed(&w, '\27]0;title 133;D;1\7\27]1330;D;1\7\27[133;D;1m')
+  assert(w.dones == 4, 'other OSCs, a longer number and CSI are not marks')
+  feed(&w, '\27\27]133;D;-1\7')
+  assert(w.dones == 5 and w.last_exit == -1, 'ESC ESC ] still starts a mark; negative status')
+  assert(w.bytes > 0)
+  print('cmdwatch OK')
+end
+
+-- Fake shim -------------------------------------------------------------------------
+local MAX <comptime> = 64
+local objs: [MAX]boolean
+local loaded: [MAX]boolean
+local paths: [MAX]string
+local creates, destroys, transforms, live = 0, 0, 0, 0
+local load_all = false
+local poses: [MAX][7]float32   -- x y z qy qw scale set
+local scene: cint = 0
+local pc: GuObject = { x = 10, y = 2, z = 20, rotation = 0, entity_id = 7, territory = 132, found = 1, height = 1.75 }
+local mode: uint8, param: uint8, base: uint16 = 1, 0, 0
+local alog: stringbuilder
+
+local function index(obj: pointer): integer
+  local i = (@integer)((@usize)(obj) // 16)
+  assert(i >= 1 and i < MAX and (@usize)(obj) % 16 == 0, 'a pointer the fake made')
+  return i
+end
+local function fake_create(path: cstring): pointer
+  creates = creates + 1
+  assert(creates < MAX)
+  paths[creates] = string.copy(path)
+  objs[creates], loaded[creates] = true, load_all
+  live = live + 1
+  return (@pointer)((@usize)(creates * 16))
+end
+local function fake_ready(obj: pointer): cint
+  local i = index(obj)
+  assert(objs[i], 'ready asked of a live object')
+  return loaded[i] and 1 or 0
+end
+local function fake_transform(obj: pointer, x: float32, y: float32, z: float32, qx: float32, qy: float32, qz: float32, qw: float32,
+                              sx: float32, sy: float32, sz: float32): cint
+  local i = index(obj)
+  assert(objs[i] and loaded[i], 'placed only once loaded')
+  assert(qx == 0 and qz == 0 and sx == sy and sy == sz, 'turned about +Y only, scaled evenly')
+  transforms = transforms + 1
+  poses[i] = { x, y, z, qy, qw, sx, 1 }
+  return 1
+end
+local function fake_destroy(obj: pointer): cint
+  local i = index(obj)
+  assert(objs[i], 'never destroyed twice')
+  objs[i] = false
+  destroys = destroys + 1
+  live = live - 1
+  return 1
+end
+local function fake_object(which: cint, id: uint64, out: *GuObject): cint
+  $out = pc
+  return 1
+end
+local function fake_flags(): cint return scene end
+local function fake_anim_get(m: *uint8, p: *uint8, b: *uint16, current: *uint16): cint
+  $m, $p, $b, $current = mode, param, base, base
+  return 1
+end
+local function fake_anim_set(m: uint8, p: uint8, b: uint16, use_set_mode: cint): cint
+  if m ~= 255 then mode, param = m, p end
+  base = b
+  alog:writef('set %d %d %d %d;', m, p, b, use_set_mode)
+  return 1
+end
+local function fake_anim_play(id: uint16): cint
+  alog:writef('play %d;', id)
+  return 1
+end
+local function fake_anim_speed(slot: uint32, speed: float32): cint return 1 end
+local function quiet(level: cint, msg: cstring): void end
+
+local api: GuHostApi = {
+  size = #GuHostApi, log = quiet, get_object = fake_object,
+  anim_get = fake_anim_get, anim_set = fake_anim_set, anim_play = fake_anim_play, anim_speed = fake_anim_speed,
+  bg_create = fake_create, bg_ready = fake_ready, bg_set_transform = fake_transform, bg_destroy = fake_destroy,
+  scene_flags = fake_flags,
+}
+local dir: string = arg[1]
+assert(gu_init(&api, (@cstring)(dir.data)) == 0)
+
+local function lua(code: cstring): void
+  if luaL_loadstring(policy.L, code) ~= LUA_OK or lua_pcall(policy.L, 0, 0, 0) ~= LUA_OK then
+    local len: usize = 0
+    local msg = lua_tolstring(policy.L, -1, &len)
+    print(msg)
+    assert(false, code)
+  end
+end
+local function take(): string
+  local s = alog:promote()
+  alog = {}
+  return s
+end
+local function has(log: string, what: string): boolean return log:find(what, 1, true) > 0 end
+
+local t = 100.0
+local function frame(): void
+  policy_anim_frame(t)
+  desk_props_sync()
+  t = t + 1 / 60
+end
+local function toggle(v: boolean): void
+  local e = policy_anim_toggle(v)
+  assert(#e == 0, e)
+  host.anim_out = v
+end
+
+-- Defaults, scale and placement (lua/desk.lua) ---------------------------------------
+lua([[
+local A = CONFIG.animation
+assert(A.style == 'phone', 'the phone is the default')
+assert(A.reactions == true, 'reactions on by default')
+local D = A.desk
+assert(D.scale == 'normal' and D.chair_scale == 'fit')
+assert(D.scale_factor('normal', 0.9) == 1, 'normal: native size whatever the character')
+assert(math.abs(D.scale_factor('fit', D.reference_height / 2) - 0.5) < 1e-9, 'fit: by height')
+assert(D.scale_factor(1.5, 1) == 1.5 and D.scale_factor('2', 1) == 2, 'a factor, also as text')
+assert(D.scale_factor(100, 1) == D.max_scale and D.scale_factor('fit', 0.01) == D.min_scale, 'clamped')
+assert(D.scale_factor('fit', nil) == 1, 'fit without a height: normal')
+for _, m in pairs(D.models) do assert(m.path:match('^bgcommon/hou/indoor/general/%d+/bgparts/fun_b0_m%d+%.mdl$'), m.path) end
+
+-- a small character (half the reference height) facing +X
+local p = { x = 10, y = 2, z = 20, rotation = math.pi / 2, height = D.reference_height / 2 }
+local list, ds, cs = D.layout(p)
+assert(#list == 2 and ds == 1 and math.abs(cs - 0.5) < 1e-9, 'desk normal, chair fitted')
+local chair, desk = list[1], list[2]
+assert(chair.model == D.models.chair.path and desk.model == D.models.desk.path)
+assert(chair.x == 10 and chair.y == 2 and chair.z == 20 and chair.yaw == p.rotation, 'chair where the character stands, facing its way')
+local ahead = D.knee_room * cs + D.models.desk.depth / 2 * ds
+assert(math.abs(desk.x - (10 + ahead)) < 1e-9 and math.abs(desk.z - 20) < 1e-9 and desk.y == 2, 'desk in front, on the ground')
+assert(math.abs(desk.yaw - (p.rotation + math.pi)) < 1e-9, 'desk turned toward the chair')
+D.scale = 'fit'
+list, ds = D.layout(p)
+assert(math.abs(ds - 0.5) < 1e-9 and list[2].scale == ds, 'fit desk')
+assert(math.abs(list[2].x - (10 + D.knee_room * 0.5 + D.models.desk.depth / 2 * 0.5)) < 1e-9, 'a smaller desk sits closer')
+D.scale = 'normal'
+]])
+print('layout OK')
+
+-- Mood scheduler -------------------------------------------------------------------
+lua([[
+local D = CONFIG.animation.desk
+local a, b = D.rng(42), D.rng(42)
+for _ = 1, 100 do local x = a() assert(x == b() and x >= 0 and x < 1, 'same seed, same draws') end
+assert(D.rng(1)() ~= D.rng(2)(), 'another seed, another day')
+-- weights: a 3:1 list over many draws
+local r, n = D.rng(7), { 0, 0 }
+for _ = 1, 20000 do local i = D.pick({ { weight = 3 }, { weight = 1 } }, r()) n[i] = n[i] + 1 end
+assert(math.abs(n[1] / 20000 - 0.75) < 0.02, 'weights: ' .. n[1])
+assert(D.pick({ { weight = 0 }, { weight = 2 } }, 0) == 2, 'weight 0 is never drawn')
+-- after anything but work, back to work
+local work
+for i, m in ipairs(D.moods) do if m.name == 'working' then work = i end end
+for i = 1, #D.moods do if i ~= work then assert(D.next_mood(i, 0.5) == work) end end
+for _, m in ipairs(D.moods) do
+  assert(m.min > 0 and m.max >= m.min and #m.timelines > 0 and m.weight >= 0, m.name)
+  for _, id in ipairs(m.timelines) do assert(D.owns(id)) end
+end
+for _, name in ipairs({ 'working', 'stretching', 'yawning', 'thinking', 'frustrated', 'sip' }) do
+  local found = false
+  for _, m in ipairs(D.moods) do if m.name == name then found = true end end
+  assert(found, 'mood ' .. name)
+end
+]])
+print('scheduler OK')
+
+-- The desk scene against the fake game ------------------------------------------------
+lua("CONFIG.animation.enabled = true CONFIG.animation.style = 'desk' CONFIG.animation.desk.seed = 5 CONFIG.animation.reseed(3)")
+for _ = 1, 3 do frame() end
+toggle(true)
+local l = take()
+assert(has(l, 'set 255 0 9287 0;play 9287;'), 'sits down to work: '..l)
+assert(desk_want.count == 2, 'asked for a chair and a desk')
+for _ = 1, 5 do frame() end
+assert(creates == 2 and live == 2 and transforms == 0, 'made lazily, not placed while loading')
+assert(paths[1] == 'bgcommon/hou/indoor/general/1420/bgparts/fun_b0_m1420.mdl', 'chair model')
+assert(paths[2] == 'bgcommon/hou/indoor/general/1419/bgparts/fun_b0_m1419.mdl', 'desk model')
+loaded[1], loaded[2] = true, true
+frame()
+assert(transforms == 2, 'placed once loaded')
+assert(near(poses[1][0], 10, 1e-5) and near(poses[1][1], 2, 1e-5) and near(poses[1][2], 20, 1e-5), 'chair at the feet')
+assert(near(poses[1][3], 0, 1e-6) and near(poses[1][4], 1, 1e-6) and near(poses[1][5], 1, 1e-5), 'chair facing +Z (rotation 0), fitted to a Midlander: 1')
+assert(near(poses[2][0], 10, 1e-5) and poses[2][2] > 20.3 and near(poses[2][3], 1, 1e-6) and near(poses[2][4], 0, 1e-5), 'desk ahead, half a turn')
+for _ = 1, 30 do frame() end
+assert(transforms == 2 and creates == 2, 'a still scene is not touched again')
+
+-- moods come and go within their durations, all of them our own seated timelines
+do
+  local changes = 0
+  for _ = 1, 60 * 120 do
+    frame()
+    local s = take()
+    if #s > 0 then changes = changes + 1 end
+  end
+  assert(changes >= 5 and changes <= 60, 'a mood every 8-25 s over two minutes')
+  lua("assert(CONFIG.animation.desk.active() and CONFIG.animation.desk.owns(CONFIG.animation.desk.hold()))")
+  assert(live == 2 and creates == 2, 'moods do not touch the furniture')
+end
+
+-- the game swaps the base pose: the mood comes back
+base = 3
+for _ = 1, 300 do
+  frame()
+  if base ~= 3 then break end
+end
+l = take()
+assert(base ~= 3 and has(l, 'set 255 0 '), 'guard puts the mood back')
+
+-- walking off ends the scene cleanly and frees the furniture
+pc.x = 11
+frame()
+l = take()
+assert(has(l, 'set 255 0 0 0;play 3;'), 'stands up: '..l)
+assert(live == 0 and desk_want.count == 0, 'furniture freed')
+for _ = 1, 10 do frame() end
+assert(live == 0 and creates == 2, 'not back until the terminal opens again')
+toggle(false)
+assert(live == 0)
+pc.x = 10
+
+-- closing the terminal
+load_all = true
+toggle(true)
+frame()
+assert(live == 2)
+toggle(false)
+l = take()
+assert(has(l, 'set 255 0 0 0;play 3;'), 'closing: stands up')
+frame()
+assert(live == 0, 'closing: freed')
+
+-- group pose (the shim's scene flags): freed at once and the scene ends
+toggle(true)
+frame()
+assert(live == 2)
+scene = 2
+frame()
+assert(live == 0 and desk_block == DESK_BLOCK_GPOSE, 'group pose frees the props')
+frame()
+lua("assert(not CONFIG.animation.desk.active(), 'the scene ended')")
+toggle(false)
+scene = 1 -- a cutscene: the scene does not start
+toggle(true)
+frame()
+assert(live == 0, 'no desk in a cutscene')
+lua("assert(not CONFIG.animation.desk.active())")
+toggle(false)
+scene = 0
+frame()
+
+-- combat and a zone change
+toggle(true)
+frame()
+assert(live == 2)
+pc.in_combat = 1
+frame()
+assert(live == 0, 'combat frees the props')
+frame()
+lua("assert(not CONFIG.animation.desk.active())")
+toggle(false)
+pc.in_combat = 0
+frame()
+toggle(true)
+frame()
+assert(live == 2)
+pc.territory = 133
+frame()
+assert(live == 0 and desk_block & DESK_BLOCK_ZONE ~= 0, 'zone change frees the props')
+frame()
+lua("assert(not CONFIG.animation.desk.active())")
+toggle(false)
+frame()
+assert(desk_block == 0, 'a new zone is not blocked')
+
+-- seated already: the desk steps aside and the phone comes out, seated
+mode, param = 11, 2
+take()
+toggle(true)
+frame()
+l = take()
+assert(live == 0 and has(l, 'play 6303;'), 'seated: the seated device, no furniture')
+toggle(false)
+mode, param = 1, 0
+take()
+
+-- no character: freed (the frame loop's no-world path)
+toggle(true)
+frame()
+assert(live == 2)
+desk_props_destroy_all()
+assert(live == 0)
+toggle(false)
+frame()
+
+-- teardown frees them, once
+toggle(true)
+frame()
+assert(live == 2)
+teardown_effects()
+assert(live == 0 and desk_want.count == 0, 'teardown frees the props')
+local d0 = destroys
+teardown_effects()
+desk_props_destroy_all()
+assert(destroys == d0, 'no double destroy')
+print('desk lifecycle OK')
+
+-- Reactions ------------------------------------------------------------------------
+-- fidgets wait until their own test
+lua("CONFIG.animation.style = 'phone' CONFIG.animation.reseed(11) CONFIG.animation.reaction_table.fidget.after_min = 1e6 CONFIG.animation.reaction_table.fidget.after_max = 1e6")
+host.anim_out = false
+toggle(true)
+frame()
+l = take()
+assert(has(l, 'set 255 0 6302 0;play 6302;'), 'the phone: '..l)
+-- a bell: one of the bell reactions, then straight back to the device
+policy_anim_event('bell', t, 1, 0)
+l = take()
+assert(has(l, 'play 665;') or has(l, 'play 618;'), 'bell reaction: '..l)
+lua("assert(CONFIG.animation.reacting())")
+policy_anim_event('bell', t, 1, 0)
+assert(#take() == 0, 'one reaction at a time')
+for _ = 1, 150 do frame() end
+l = take()
+assert(has(l, 'play 6302;'), 'back to the hold: '..l)
+lua("assert(not CONFIG.animation.reacting())")
+policy_anim_event('bell', t, 1, 0)
+assert(#take() == 0, 'bell cooldown')
+-- a failed command (after the gap between reactions)
+t = t + 2
+frame() take()
+policy_anim_event('done', t, 1, 3)
+l = take()
+assert(has(l, 'play 666;') or has(l, 'play 670;') or has(l, 'play 668;') or has(l, 'play 664;'), 'failed: '..l)
+for _ = 1, 200 do frame() end
+assert(has(take(), 'play 6302;'))
+-- success: only after a long run
+t = t + 10
+frame()
+take()
+policy_anim_event('done', t, 0, 3)
+assert(#take() == 0, 'a quick success is no news')
+policy_anim_event('done', t, 0, 12)
+l = take()
+assert(has(l, 'play 671;') or has(l, 'play 6216;'), 'long success: '..l)
+for _ = 1, 200 do frame() end
+take()
+-- output: a glance only after a quiet spell and when not typing
+t = t + 30
+frame() take()
+policy_anim_event('output', t, 500, 0)
+l = take()
+assert(has(l, 'play 665;') or has(l, 'play 669;'), 'glance after quiet: '..l)
+for _ = 1, 150 do frame() end
+take()
+policy_anim_event('output', t, 500, 0)
+assert(#take() == 0, 'steady output: no glance')
+t = t + 30
+policy_anim_key(t)
+policy_anim_event('output', t + 0.5, 500, 0)
+assert(#take() == 0, 'typing: no glance')
+-- a fidget between 30 and 90 s without typing
+lua("CONFIG.animation.reaction_table.fidget.after_min = 30 CONFIG.animation.reaction_table.fidget.after_max = 90")
+t = t + 60
+frame() take()
+policy_anim_key(t)
+do
+  local t0 = t
+  local fid = 0.0
+  for _ = 1, 60 * 100 do
+    frame()
+    local s = take()
+    if fid == 0 and (has(s, 'play 669;') or has(s, 'play 625;') or has(s, 'play 667;')) then fid = t end
+  end
+  assert(fid - t0 >= 29 and fid - t0 <= 91, 'fidget after 30-90 s idle')
+end
+-- switched off: nothing
+lua('CONFIG.animation.reactions = false')
+t = t + 60
+frame() take()
+policy_anim_event('bell', t, 1, 0)
+policy_anim_event('done', t, 1, 0)
+assert(#take() == 0, 'reactions off')
+lua('CONFIG.animation.reactions = true')
+-- the same seed, the same reactions
+lua([[
+local A = CONFIG.animation
+A.reaction_table.fidget.after_min, A.reaction_table.fidget.after_max = 1e6, 1e6
+local function run()
+  A.reseed(99)
+  local out = {}
+  for i = 1, 20 do
+    out[i] = A.react('failed', 1000 + i * 10) or 0
+    A.on_frame(1000 + i * 10 + 5) -- the reaction ends, back to the hold
+  end
+  return table.concat(out, ',')
+end
+local a = run()
+assert(a == run(), 'deterministic with a seed')
+local distinct = {}
+for id in a:gmatch('%d+') do assert(id ~= '0', 'every draw played: ' .. a) distinct[id] = true end
+local n = 0 for _ in pairs(distinct) do n = n + 1 end
+assert(n >= 2, 'weighted draws vary: ' .. a)
+A.reseed(11)
+]])
+-- seated: the hold is the seated device
+toggle(false)
+frame()
+mode, param = 11, 1
+toggle(true)
+frame() take()
+t = t + 60
+frame() take()
+policy_anim_event('bell', t, 1, 0)
+for _ = 1, 150 do frame() end
+l = take()
+assert(has(l, 'play 6303;'), 'seated: back to the seated device: '..l)
+toggle(false)
+mode, param = 1, 0
+print('reactions OK')
+
+-- Terminal events (core/app/reactions.nelua) ------------------------------------------
+do
+  lua("EV = {} CONFIG.animation._on_event = CONFIG.animation.on_event CONFIG.animation.on_event = function(k, t, a, b) EV[#EV + 1] = k .. ':' .. math.floor(a) .. ':' .. math.floor(b) end")
+  local s: Session = { id = 501 }
+  s.bells = 2
+  s.cmd.dones = 4
+  host.sessions:push(&s)
+  host.anim_out = true
+  reactions_tick(1.0)
+  lua("assert(#EV == 0, 'a terminal met for the first time is not news')")
+  s.bells = 3
+  reactions_tick(2.0)
+  s.cmd.starts = 1
+  reactions_tick(3.0)
+  s.cmd.dones, s.cmd.last_exit = 5, 0
+  reactions_tick(15.0)
+  s.cmd.dones, s.cmd.last_exit = 6, 2
+  reactions_tick(16.0)
+  s.cmd.bytes = 300
+  reactions_tick(17.0)
+  lua("assert(table.concat(EV, ' ') == 'bell:1:0 done:0:12 done:2:-1 output:300:0', table.concat(EV, ' '))")
+  host.anim_out = false
+  s.bells = 9
+  reactions_tick(18.0)
+  lua("assert(#EV == 4, 'nothing while the animation is not out')")
+  -- a shell without integration exiting non-zero
+  local s2: Session = { id = 502 }
+  host.sessions:push(&s2)
+  host.anim_out = true
+  reactions_tick(19.0)
+  s2.exited, s2.process_exited, s2.exit_status = true, true, 1
+  reactions_tick(20.0)
+  lua("assert(EV[#EV] == 'done:1:-1', EV[#EV])")
+  host.sessions:clear()
+  reactions_tick(21.0)
+  lua("CONFIG.animation.on_event = CONFIG.animation._on_event")
+  print('events OK')
+end
+
+-- Shutdown frees what is left
+lua("CONFIG.animation.style = 'desk'")
+toggle(true)
+frame()
+assert(live == 2)
+gu_shutdown()
+assert(live == 0, 'shutdown frees the props')
+for i = 1, creates do paths[i]:destroy() end
+print('desk OK')

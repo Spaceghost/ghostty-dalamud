@@ -102,6 +102,10 @@ S.schema = {
   } },
   { 'Character animation', {
     { 'animation.enabled', 'checkbox', 'Hold a pose while a terminal is out or focused' },
+    { 'animation.style', 'combo', { 'phone', 'desk' }, 'Style (phone in hand, or working at a desk)' },
+    { 'animation.desk.scale', 'combo', { 'normal', 'fit', '0.75', '1.25', '1.5', '2' }, 'Desk size (normal = sized for a Midlander)' },
+    { 'animation.desk.chair_scale', 'combo', { 'fit', 'normal', '0.75', '1.25', '1.5', '2' }, 'Chair size' },
+    { 'animation.reactions', 'checkbox', 'React to bells, failed and long commands, output and idling' },
     { 'animation.preset', 'combo', { 'device', 'book', 'pen', 'photograph', 'think', 'lookout' }, 'Pose' },
     { 'animation.custom_timeline', 'slider_int', 0, 40000, 'Custom ActionTimeline id (0 = use the pose)' },
     { 'animation.typing_speed', 'slider', 1, 4, 'Pose animation speed while typing' },

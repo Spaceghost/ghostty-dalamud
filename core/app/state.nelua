@@ -92,6 +92,9 @@ global GuHostApi = @record{
   addon_show: function(name: cstring, shown: cint): cint, -- a game addon (AtkUnitBase) shown or hidden; 1 = ok
   chat_send: function(text: cstring): cint,              -- a line through the game's chat box; 1 = queued
   config_uint: function(name: cstring, out: *uint32): cint, -- a UiConfig option (log colours); 1 = found
+  -- what the game is busy with (SCENE_* bits: cutscene, group pose, between
+  -- areas, an event); nilptr in older shims: never busy (core/app/deskprops.nelua)
+  scene_flags: function(): cint,
 }
 
 global LOG_INFO: cint <comptime> = 1

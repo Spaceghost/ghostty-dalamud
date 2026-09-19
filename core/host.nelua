@@ -162,13 +162,16 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
   end
   if live and in_world then
     sync_animation()
+    reactions_tick(now) -- bells, finished commands, output: the character's reactions
     policy_anim_frame(now)
+    desk_props_sync() -- the desk scene's furniture, as lua/desk.lua asked for it
     apply_world_pins(now)
     draw_world(now)
     panels_after_world(now) -- the "pull into world" grip over flat windows
     draw_bell(now) -- after the world screens: light behind one is cut out, not painted over it
   else
     occluders_destroy_all() -- no character (loading screen, logout): boards go before the scene they sit in
+    desk_props_destroy_all() -- and the desk scene's furniture
   end
   bell_demo_tick(now)
   if live then selftest_tick(in_world) end -- /term selftest: one step per frame
