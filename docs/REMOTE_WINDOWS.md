@@ -41,7 +41,7 @@ agent → client
 
 | type | name | payload |
 |---|---|---|
-| 24 | WLISTR | lines `wid\tw\th\tapp\ttitle\n`; a wid 0 line describes what WOPEN with wid 0 does |
+| 24 | WLISTR | lines `wid\tw\th\tapp\ttitle\n`; a wid 0 line describes what WOPEN with wid 0 does. Readers keep further columns after the title (a newer agent's; `key:K` marks a stable window key) and lines `app\tid\tname\ticon\tcategories` (apps the agent can start) |
 | 25 | WOPENED | req u32, sid, w u16, h u16, title UTF-8 (sid 0: failed, the text says why) |
 | 26 | WFRAME | sid, seq u32, w u16, h u16, flags u8, nrect u16, rects… |
 | 27 | WEND | sid, reason UTF-8 (window closed, capture refused, …) |
@@ -268,6 +268,16 @@ window; it needs WinRT activation and a D3D11 device, so it is not done.
 * WEND, a refused WOPENED or a lost connection: the panel shows why and
   closes 2 s later. A panel closed while the desktop is still choosing gets
   its late WOPENED answered with WCLOSE. Closing a live panel sends WCLOSE.
+* The last WLISTR is kept (`winlist`): the Windows picker and IPC's
+  `agent.windows` / `agent.apps` read it, and `/window list` logs it, one
+  line a window with its source agent and key (`window #7 800x600 [firefox]
+  Mozilla Firefox  @default key K`). A panel's key is that of the window id it
+  asked for, else of the one listed window with its title (a panel opened by
+  `run` or `match` never learns its window id); `''` when there is none.
+* Short results also go to the game chat, not only the log (/xllog): a
+  window opened, refused or closed, and a `/window` command that failed
+  (`say` in `core/app/state.nelua`, through the shim's `chat_print`; an older
+  shim without it: the log only).
 * Window panels are not saved with the layout and do not survive
   `/term reload` (their streams belong to the connection, which a reload
   replaces). Popped into a tab or minimized, a window panel goes back into
@@ -417,14 +427,32 @@ ivar, `stream:didOutputSampleBuffer:ofType:`, `stream:didStopWithError:`).
 ## Using it
 
 ```
-/window list [@agent]           windows the agent can see (in the log: wid, size, app, title)
-/window pull [match] [@agent]   open one as a pet (no match: the agent's own choice)
+/window                         the Windows picker (again: closes it)
+/window list [@agent]           the picker too, with a fresh list (also logged: wid, size, app, title, agent, key)
+/window pull                    the picker too
+/window pull match [@agent]     open one as a pet
 /window pull #wid               by id from the list
 /window run CMD... [@agent]     the agent starts CMD and streams its window (match text "run:CMD...")
 /window close                   the focused window panel (else the newest)
 /window desktop                 reserved (a whole remote desktop); says so for now
 /term pin …                     on a focused window panel: moves it, keeping its size
+/term pin toggle                on a focused world panel: pin <-> pet where it is
 ```
+
+The **Windows picker** (`core/app/winpicker.nelua`) is a small ImGui window
+in the dropdown's glass. It asks the agent for a fresh list when it opens
+(Refresh asks again) and shows the last one: each open window, pulled onto a
+pet with a click; a **Run:** box whose Enter (or Run) does `/window run TEXT`;
+the apps a newer agent lists (`app` lines), started by sending WOPEN with the
+match text `app:ID` (an assumption until the agent side defines it); and
+**Let the desktop choose** (WOPEN with nothing: the agent's own picker, which
+is what `/window pull` without arguments used to do). A pick that works
+closes the picker; one that fails says why at its bottom and in the chat.
+
+Every world panel, terminal or window, has a pin <-> pet title button next to
+pop-in: a paw on pins (it becomes a pet), a push pin on pets (it is pinned in
+the world right where it is shown, facing the same way). Its own size stays
+where it had one set (window panels always do).
 
 `/window` is a command of its own (`CONFIG.host.verb_commands`, registered
 through the shim's `command_add_tagged`; a shim from before it logs that once
@@ -445,7 +473,9 @@ gives them back; the first Esc reaches the window.
 
 Another plugin can do the same through `GhosttyDalamud.v1.Call`:
 `window.list`, `window.open` (`run`, `match` or `wid`, optional `pin`),
-`window.close`, `window.focus`, `window.place`, `agent.status` and `status`,
+`window.close`, `window.focus`, `window.place`, `window.hide`,
+`window.toggle_pet`, `agent.windows` (+ `.refresh`), `agent.apps`,
+`terminal.new`, `focus.get`, `focus.cycle`, `agent.status` and `status`,
 as JSON. Reads answer from the last frame's snapshot; changes are queued and
 run by the next frame through the same `window_*` functions as the commands
 above. Methods, examples and the threading are in [IPC.md](IPC.md). Not yet

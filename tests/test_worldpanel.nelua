@@ -3,6 +3,7 @@
 require 'core.world'
 require 'core.policy'
 require 'core.app.worldview'
+require 'core.app.commands' -- /term pin
 require 'string'
 require 'math'
 require 'arg'
@@ -132,8 +133,9 @@ do
   assert(world_title_button(w, 1790, 10) == WORLD_BUTTON_CLOSE)
   assert(world_title_button(w, 1750, 10) == WORLD_BUTTON_FULL)
   assert(world_title_button(w, 1720, 10) == WORLD_BUTTON_POPIN)
-  assert(world_title_button(w, 1680, 10) == WORLD_BUTTON_OCCLUDED, 'fourth button left of pop-in')
-  assert(world_title_button(w, 1650, 10) == WORLD_BUTTON_NONE, 'nothing left of the buttons')
+  assert(world_title_button(w, 1680, 10) == WORLD_BUTTON_PET, 'pin <-> pet next to pop-in')
+  assert(world_title_button(w, 1650, 10) == WORLD_BUTTON_OCCLUDED, 'keep running left of it')
+  assert(world_title_button(w, 1610, 10) == WORLD_BUTTON_NONE, 'nothing left of the buttons')
   assert(world_title_button(w, 1790, 40) == WORLD_BUTTON_NONE, 'below the title row')
   assert(world_title_button(w, 1790, -1) == WORLD_BUTTON_NONE, 'above the panel')
   assert(world_title_button(w, 1801, 10) == WORLD_BUTTON_NONE, 'right of the panel')
@@ -144,6 +146,7 @@ do
     assert(world_title_button(w, x + 13, 13) == b, 'square centre hits its own button')
   end
   assert(world_title_button_x(w, WORLD_BUTTON_CLOSE) == w - 30 and world_title_button_x(w, WORLD_BUTTON_POPIN) == w - 98, 'existing buttons keep their places')
+  assert(world_title_button_x(w, WORLD_BUTTON_PET) == w - 132 and WORLD_BUTTON_COUNT == 5)
   print('title buttons OK')
 end
 
@@ -693,6 +696,56 @@ do
   mouse_at = vec2(-5000, -5000)
   print('world clicks OK')
 
+  -- Pin <-> pet: the title button next to pop-in ------------------------------------------
+  do
+    local function anchor_kind(id: integer): string
+      local L = policy.L
+      lua_getglobal(L, 'require') lua_pushstring(L, 'world')
+      assert(lua_pcall(L, 1, 1, 0) == LUA_OK)
+      lua_getfield(L, -1, 'anchors') lua_rawgeti(L, -1, id)
+      local kind: string = 'none'
+      if lua_type(L, -1) == LUA_TTABLE then
+        lua_getfield(L, -1, 'kind')
+        kind = string.copy(lua_tolstring(L, -1, nilptr))
+      end
+      lua_settop(L, 0)
+      return kind
+    end
+    host.world_focus = s.id
+    world_frame(false)
+    local ok0, pl0 = policy_world_place(s.id, now, true)
+    assert(ok0 and not pl0.pet and anchor_kind(s.id) == 'world')
+    -- a click on it: the pin becomes a pet (the paw)
+    now = now + 0.5
+    mouse_at = panel_screen(s.id, world_title_button_x(pl0.width, WORLD_BUTTON_PET) + 13, 13)
+    world_frame(true)
+    world_frame(false)
+    assert(anchor_kind(s.id) == 'pet' and host.world_pet_toggle_id == 0, 'the paw makes it a pet')
+    assert(host.walk.id == 0, 'a title button walks nowhere')
+    for _ = 1, 30 do world_frame(false) end -- the pet floats to its place beside you
+    local ok1, pl1 = policy_world_place(s.id, now, true)
+    assert(ok1 and pl1.pet and s.posed, 'a pet, shown')
+    local px, py, pz, pyaw = s.pose_x, s.pose_y, s.pose_z, s.pose_yaw
+    -- and again: the pet is pinned right where it is shown, facing the same way (the pin)
+    now = now + 0.5
+    mouse_at = panel_screen(s.id, world_title_button_x(pl1.width, WORLD_BUTTON_PET) + 13, 13)
+    px, py, pz, pyaw = s.pose_x, s.pose_y, s.pose_z, s.pose_yaw
+    world_frame(true)
+    assert(anchor_kind(s.id) == 'world', 'the pin pins it')
+    local ok2, pl2 = policy_world_place(s.id, now, true)
+    assert(ok2 and not pl2.pet and near(pl2.x, px, 0.05) and near(pl2.y, py, 0.05) and near(pl2.z, pz, 0.05) and near(pl2.yaw, pyaw, 0.01),
+      'pinned at the pose it was shown at')
+    world_frame(false)
+    -- /term pin toggle does the same for the focused panel
+    host.world_focus = s.id
+    assert(run_command('pin toggle') == 0 and anchor_kind(s.id) == 'pet', '/term pin toggle')
+    assert(run_command('pin here') == 0 and anchor_kind(s.id) == 'world', '/term pin here on a focused world terminal')
+    host.world_focus = 0
+    assert(run_command('pin toggle') == 4, 'nothing focused: nothing to toggle')
+    mouse_at = vec2(-5000, -5000)
+    print('world pin <-> pet OK')
+  end
+
   -- The log: one line while nothing changes -------------------------------------------
   for _ = 1, 10 do world_frame(false) end
   assert(diag_lines == 1 and diag_drawing == 1, 'the world summary is logged once, with the first drawn panel')
@@ -799,6 +852,7 @@ do
     assert(hover(t.id, pl.width - 30 + 13, 17, 20) == 0, 'not before the delay')
     assert(hover(t.id, pl.width - 30 + 13, 17, 20) > 0 and tip_text() == 'Close this screen', 'close: ' .. tip_text())
     assert(hover(t.id, world_title_button_x(pl.width, WORLD_BUTTON_OCCLUDED) + 13, 17, 40) > 0 and tip_text():find('Sleeps while nobody sees it', 1, true) == 1, tip_text())
+    assert(hover(t.id, world_title_button_x(pl.width, WORLD_BUTTON_PET) + 13, 17, 40) > 0 and tip_text() == 'Let it float beside you as a pet', 'pin: ' .. tip_text())
     assert(hover(t.id, 400, 300, 40) == 0, 'the terminal itself shows none')
     close_terminal(t)
     print('world tooltips OK')

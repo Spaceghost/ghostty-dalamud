@@ -42,6 +42,8 @@ global Session = @record{
   woke_at: float64,         -- host time it last woke (content fades in); 0 = never slept
   present_t: float32,       -- world panel: 0 placed .. 1 presented (floated toward you)
   present_v: float32,       -- its ease velocity
+  posed: boolean,           -- world panel: placed last frame at pose_* (where it was drawn, presented)
+  pose_x: float32, pose_y: float32, pose_z: float32, pose_yaw: float32, pose_pitch: float32,
   cell_w_px: uint32,
   cell_h_px: uint32,
   cell_w: float32,          -- cell size as last drawn, for mouse hit testing

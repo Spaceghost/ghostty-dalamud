@@ -1,8 +1,9 @@
 # IPC for other plugins
 
 `GhosttyDalamud.v1.Call` lets another Dalamud plugin (XivDesktop, for one)
-list, open, close, focus and place remote-window panels
-([REMOTE_WINDOWS.md](REMOTE_WINDOWS.md)). It is one Dalamud call gate:
+list, open, close, focus, hide and place remote-window panels
+([REMOTE_WINDOWS.md](REMOTE_WINDOWS.md)), open world terminals, read the
+agent's window list and move the keyboard between world panels. It is one Dalamud call gate:
 a JSON string in, a JSON string out.
 
 **Status: host tests only. Not yet observed in game.**
@@ -50,14 +51,19 @@ The core and its Lua state belong to ghostty's own `UiBuilder.Draw`
   that call (decode, check, encode: microseconds) and, on the frame's side,
   to swap a queue and publish a string. Calls from several threads are
   serialized; no call waits for a frame.
-* **Reads** (`window.list`, `agent.status`, `status`) answer at once from a
-  snapshot the frame publishes at its end. They are at most one frame old.
+* **Reads** (`window.list`, `agent.status`, `agent.windows`, `agent.apps`,
+  `focus.get`, `status`) answer at once from a snapshot the frame publishes
+  at its end. They are at most one frame old.
 * **Changes** (`window.open`, `window.close`, `window.focus`,
-  `window.place`) are checked, given a request id and queued. The response
+  `window.place`, `window.hide`, `window.toggle_pet`,
+  `agent.windows.refresh`, `terminal.new`, `focus.cycle`) are checked, given
+  a request id and queued. The response
   says only that: `{"queued": true, "request": 1726732800001}`. At the end of
   the next frame ghostty runs them in order, in its own Lua state, through
-  the same functions as `/window` (`core/app/remotewin.nelua`: `window_open`,
-  `window_close`, `window_focus`, `window_place`). The outcome shows in
+  the same functions as `/window` and the title buttons
+  (`core/app/remotewin.nelua`: `window_open`, `window_close`,
+  `window_place`; `core/app/worldview.nelua`: `world_panel_focus`,
+  `world_panel_hide`, `world_toggle_pet`, `world_terminal_new`). The outcome shows in
   `window.list`: `requests` holds the last 16 results, and `rev` changes.
   At most 64 changes wait; the 65th before a frame is refused ("too many
   changes waiting").
@@ -85,7 +91,8 @@ The window panels, oldest first, and the results of recent changes.
   "rev": 7,
   "windows": [
     {"id": 12, "sid": 5, "title": "Yad Window", "app": "yad", "w": 640, "h": 400,
-     "state": "live", "kind": "pet", "focused": false}
+     "state": "live", "kind": "pet", "anchor": "pet", "hidden": false, "focused": false,
+     "agent": "default", "key": "yad-1"}
   ],
   "requests": [
     {"request": 1726732800001, "method": "window.open", "ok": true, "result": {"id": 12}},
@@ -109,7 +116,15 @@ The window panels, oldest first, and the results of recent changes.
 * `kind`: `pet` (floats beside the character), `pin` (placed in the world:
   here, me, target, orbit …), `full` (full screen), `tab` (popped into the
   dropdown for a moment; window panels go back out).
+* `anchor`: the world anchor as it is, also while `full` or `tab`: `pet`,
+  `pin` (fixed in the world), `me` or `target` (following a character),
+  `orbit`, or `none`.
+* `hidden`: hidden by `window.hide` (not drawn, not streamed).
 * `focused`: the panel has the keyboard.
+* `agent`: the agent streaming it (`default`, the only one so far).
+  `key`: the window's stable key from the agent's last list (`agent.windows`)
+  where the agent sends one: the entry of the window id it asked for, else the
+  one entry with its title; `""` when none.
 * `requests[]`: `{request, method, ok, result | error}`; `window.open`'s
   result is `{"id": panel}`, the others' `{}`.
 
@@ -154,8 +169,39 @@ Closes the panel (it glitches out) and its stream.
 {"method": "window.focus", "params": {"id": 12}}
 ```
 
-Gives the panel the keyboard and shows the world panels, as a click would.
-Esc twice (or a click on the world) gives it back to the game.
+Gives the panel the keyboard exactly as a click on it would: it becomes the
+focused world panel, no ImGui window keeps focus beside it, and it claims the
+keyboard from its next frame; the world panels are shown. Unlike a click it
+does not walk your character up to it or turn the camera (a pet still turns
+your character to face it once, as on a click). Any world panel: a window
+or a terminal (`terminal.new`, `focus.get`). A hidden panel is refused ("the
+panel is hidden …"). Esc twice (or a click on the world) gives the keyboard
+back to the game.
+
+### window.hide
+
+```json
+{"method": "window.hide", "params": {"id": 12, "hidden": true}}
+```
+
+`hidden` (required, true or false). A hidden panel is neither drawn nor
+streamed: it loses the keyboard and full screen and sleeps at once, as an
+unseen panel does after 30 s (a window stops acknowledging frames, so the
+agent stops sending; a terminal detaches, unless a full-screen program runs
+in it). `hidden: false` shows it again where its anchor puts it; it wakes and
+glitches in when next drawn. Any world panel. It is lua/world.lua's `hidden`
+flag (as `/term pin hide`), so pets close ranks while one is hidden.
+
+### window.toggle_pet
+
+```json
+{"method": "window.toggle_pet", "params": {"id": 12}}
+```
+
+The title button next to pop-in: a pet becomes a pin right where it was last
+shown (position and facing), anything else (a pin, `me`, `target`, `orbit`)
+a pet. A size set on the panel stays. Any world panel. `/term pin toggle`
+does it for the focused panel.
 
 ### window.place
 
@@ -166,17 +212,98 @@ Esc twice (or a click on the world) gives it back to the game.
 Moves the panel as `/term pin ARGS` does on a focused window panel, keeping
 its size. `"pet"` makes it a pet again.
 
+### terminal.new
+
+```json
+{"method": "terminal.new", "params": {"profile": "pwsh", "pin": "here"}, "caller": "XivDesktop"}
+```
+
+Opens a world terminal, as `/term pet` does. Optional: `profile`, a name from
+`CONFIG.profiles` or its place there counting from 1 (default: the default
+profile); `pin`, as `window.open` takes it (default: a pet). The result in
+`requests`: `{"id": panel}`, or why not: `no player (log in first)`, `no such
+profile: …`, `pin: …`.
+
+### focus.get
+
+```json
+{"method": "focus.get"}
+```
+```json
+{"ok": true, "result": {"id": 12, "kind": "window"}}
+```
+
+The world panel with the keyboard: `kind` is `window` or `terminal`;
+`{"id": 0}` when none has it.
+
+### focus.cycle
+
+```json
+{"method": "focus.cycle", "params": {"dir": "next"}}
+```
+
+Gives the keyboard to the next (`"next"` or `1`, the default) or previous
+(`"prev"` or `-1`) shown world panel after the focused one, in the order
+they were opened, wrapping; hidden panels are skipped. With none focused,
+`next` takes the first and `prev` the last. As `window.focus`: no walk-up, no
+camera turn. The result in `requests`: `{"id": panel}`, or `no world panel
+shown`.
+
+### agent.windows
+
+```json
+{"method": "agent.windows"}
+```
+```json
+{"ok": true, "result": [
+  {"wid": 7, "w": 800, "h": 600, "app": "firefox", "title": "Mozilla Firefox", "key": "", "extra": []},
+  {"wid": 5, "w": 640, "h": 400, "app": "yad", "title": "Yad Window", "key": "yad-1", "extra": ["key:yad-1"]},
+  {"wid": 0, "w": 0, "h": 0, "app": "", "title": "choose on the desktop", "key": "", "extra": []}
+]}
+```
+
+The windows of the agent's last list (WLISTR), as it sent them: `wid` for
+`window.open`, the size, `app`, `title`. Columns a newer agent adds after the
+title are passed through in `extra`; `key` is the one written `key:K` (or
+`key=K`), else a plain first extra column, else `""`. A `wid` 0 entry says
+what `window.open` without `run`, `match` or `wid` does. Empty until the
+first list arrived.
+
+### agent.windows.refresh
+
+```json
+{"method": "agent.windows.refresh"}
+```
+
+Asks the agent for its list again (WLIST). The answer arrives a moment later:
+`agent.status`'s `window_lists` counts the lists received, so poll that (or
+`agent.windows`) after the request's result shows in `window.list`.
+`agent` may only be `"default"`. The Windows picker (`/window`) asks too.
+
+### agent.apps
+
+```json
+{"method": "agent.apps"}
+```
+```json
+{"ok": true, "result": [{"id": "foot", "name": "Foot", "icon": "foot", "categories": "System;TerminalEmulator;"}]}
+```
+
+The apps the agent can start, from `app` lines in its list, where a newer
+agent sends them; `[]` otherwise.
+
 ### agent.status
 
 ```json
 {"method": "agent.status"}
 ```
 ```json
-{"ok": true, "result": {"connected": true, "version": 3, "windows_ok": true, "agent": "127.0.0.1:7777"}}
+{"ok": true, "result": {"connected": true, "version": 3, "windows_ok": true, "agent": "127.0.0.1:7777", "window_lists": 2}}
 ```
 
 `windows_ok`: connected to an agent that streams windows (protocol version 3).
-`agent` is `""` when no agent is configured.
+`agent` is `""` when no agent is configured. `window_lists`: how many window
+lists (WLISTR) have arrived.
 
 ### status
 
@@ -198,9 +325,10 @@ Umbra widget), without counting as the widget polling.
 | `core/loader.nelua` | forwards `gu_call` to the running core; a JSON error without one |
 | `core/host.nelua` | `gu_call` → `ipc_call`; `ipc_frame()` at the end of `gu_frame` |
 | `core/app/ipc.nelua` | the lock, the call-side Lua state, the queue, the snapshot; `ghostty.window_*` for the core's Lua state |
-| `lua/ipc.lua` | methods, parameter checks, running queued changes, the snapshot and `rev` |
+| `lua/ipc.lua` | methods, parameter checks, running queued changes (`focus.cycle`'s order), the snapshot and `rev` |
 | `lua/json.lua` | strict JSON |
-| `core/app/remotewin.nelua` | `window_open / close / focus / place / list`, shared with `/window` |
+| `core/app/remotewin.nelua` | `window_open / close / place / list`, the agent's last list (`winlist`), shared with `/window` |
+| `core/app/worldview.nelua` | `world_panel_focus / hide`, `world_toggle_pet`, `world_terminal_new`, shared with the title buttons and `/term pin` |
 
 ## Verified
 
@@ -208,9 +336,14 @@ Host tests only (`tests/run.sh`): `tests/test_ipc.lua` (the JSON round trip
 and its refusals; every method's checks against stubs; queued results and
 `rev`) and `tests/test_ipc.nelua` (every method through `gu_call` against a
 fake version 3 agent: WOPEN with `run:`, the caller in the log, WOPENED
-turning a panel live, focus, place, failures in `requests`, WCLOSE, malformed
-JSON, an unknown method, the queue limit, a response too large, `/term
-reload`, and the channel gone after shutdown); `tests/test_loader.nelua`
+turning a panel live, focus, place, failures in `requests`, focus without a
+walk or camera turn and `focus.get`, hide (asleep, unplaced, refused focus)
+and unhide, toggle_pet pinning at the pose it was shown at and back, WLIST
+and a WLISTR with extra columns, a key and an app line through
+`agent.windows`, `agent.apps` and `window.list`, `terminal.new` (a pet, a bad
+profile, a pin), `focus.cycle` over a window and a terminal, WCLOSE,
+malformed JSON, an unknown method, the queue limit, a response too large,
+`/term reload`, and the channel gone after shutdown); `tests/test_loader.nelua`
 (`gu_call` through the loader, with and without a core). The threading is by
 design and review: the host build's lock is a no-op, as for the event queue.
 **Not yet observed in game**, and no plugin has called it yet.

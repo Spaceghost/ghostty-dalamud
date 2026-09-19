@@ -29,7 +29,7 @@
   `UiBuilder.Draw` to `gu_frame` and the /xlplugins buttons, chat commands and
   info bar clicks to `gu_event`, and fills `GuHostApi` with callbacks (log,
   fonts, key state, camera, objects, animation, lights, shadow boards,
-  commands, info bar, UI-hide flags, IPC, opening a link in the browser). The core
+  commands, info bar, UI-hide flags, IPC, opening a link in the browser, a line in the chat). The core
   decides what to register, when, and under which names (`core/app/hostsurface.nelua`,
   `CONFIG.host` in lua/init.lua).
 * **Umbra is optional.** `Umbra.Ghostty.dll` keeps its file, assembly name and
