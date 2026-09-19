@@ -28,7 +28,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/toolchain.env"
 cd "$ROOT"
 
-ZIG="${ZIG:-zig}"
+export ZIG="${ZIG:-zig}"
 DOTNET="${DOTNET:-dotnet}"
 NELUA="$ROOT/vendor/nelua-lang/nelua"
 export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig-global}"
@@ -67,7 +67,7 @@ fi
 INC="-I$ROOT/vendor/ghostty/include -I$ROOT/vendor/gc-cimgui -I$ROOT/vendor/lua/src"
 
 echo "== ghostty-agent (host)"
-"$NELUA" --cc gcc -P nogc --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
+"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
 mkdir -p build/dist/lua && cp lua/*.lua build/dist/lua/
 
 if [[ "${SKIP_WIN:-0}" != 1 ]]; then
