@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 # Host-side tests: libghostty binding, renderer (fake ImGui), selection, Lua policy,
-# and the agent end to end. Needs tools/build.sh (or at least its host parts).
+# platform defaults, and the agent end to end. Needs tools/build.sh (or at
+# least its host parts: SKIP_WIN=1 SKIP_SHIM=1). Non-interactive; exits
+# non-zero on the first failure and prints ALL OK at the end.
+#
+# Environment: GHOSTTY_TEST_PORT (loopback port for the agent test; default
+# derived from the PID). Reads only this checkout (vendor/, build/).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
@@ -37,6 +42,7 @@ run test_occluders "$ROOT"
 run test_chrome "$ROOT"
 run test_migrate "$ROOT" "$ROOT/build/test-scratch"
 run test_vote "$ROOT" "$ROOT/build/test-scratch"
+run test_platform "$ROOT" "$ROOT/build/test-scratch"
 run test_hostsurface "$ROOT" "$ROOT/build/test-scratch/surface"
 run test_depthpass "$ROOT"
 
@@ -44,6 +50,8 @@ echo "--- test_reinit"
 # shellcheck disable=SC2086
 "$NELUA" --cc gcc -P nogc $HEAP --cflags="$INC $LIBS" --cache-dir build/nelua-cache -L . -b tests/test_reinit.nelua
 GLIBC_TUNABLES=$HEAP_ENV build/nelua-cache/test_reinit "$ROOT"
+
+run test_agent_logic
 
 echo "--- test_agent"
 "$NELUA" --cc gcc -P nogc --cache-dir build/nelua-cache -L . -o build/ghostty-agent -b agent/agent.nelua

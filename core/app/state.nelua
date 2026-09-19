@@ -103,6 +103,7 @@ global Host = @record{
   agent_seen: boolean,              -- some connection reached Ready: agent_nonce says which agent that was
   agent_nonce: uint64,              -- the agent process last seen Ready (0 unknown: a version 1 agent)
   agent_error_shown: string,        -- connection error already shown in the waiting terminals
+  agent_down: boolean,              -- the last connection attempt failed (profiles with a fallback use it)
   sessions: vector(*Session),
   pending_open: vector(*Session),   -- FIFO awaiting agent OPENED; nilptr = closed while waiting
   next_session_id: integer,

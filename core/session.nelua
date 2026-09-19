@@ -54,6 +54,7 @@ global Session = @record{
   fed: uint64,              -- agent output bytes fed to the terminal (ATTACH asks only for the rest); FED_UNKNOWN after a lost replay
   open_argv: vector(string), -- what OPEN asks for, kept until the agent answers (a reconnect asks again)
   open_env: vector(string),
+  fallback: string,         -- the profile to switch to if the agent turns out to be down (Profile.fallback)
 }
 
 
@@ -180,21 +181,28 @@ function Session:init_local(id: integer, label: string, cols: uint16, rows: uint
   return true
 end
 
-function Session:init(id: integer, profile: *Profile, cols: uint16, rows: uint16, agent: *AgentClient): boolean
-  if not session_setup(self, id, cols, rows) then return false end
-  self.label = profile.name:copy()
-
+-- Start the transport of a profile that does not need the agent.
+local function open_local_transport(self: *Session, profile: *Profile): void
   if profile.transport == 'conpty' then
     self.kind = TransportKind.ConPty
-    if not self.conpty:open(&profile.argv, profile.cwd, cols, rows) then
+    if not self.conpty:open(&profile.argv, profile.cwd, self.cols, self.rows) then
       self:feed_text('\r\n[ghostty] ConPTY is unavailable on this host (needs Windows 10 1809+ or a recent Wine).\r\n')
       self.exited = true
     end
-  elseif profile.transport == 'superlogical' then
+  else
     self.kind = TransportKind.Superlogical
     self:feed_text('\r\n[ghostty] Superlogical support is waiting on its public client protocol.\r\n')
     self:feed_text('[ghostty] Until then use the "agent" transport, which streams raw PTY bytes the same way.\r\n')
     self.exited = true
+  end
+end
+
+function Session:init(id: integer, profile: *Profile, cols: uint16, rows: uint16, agent: *AgentClient): boolean
+  if not session_setup(self, id, cols, rows) then return false end
+  self.label = profile.name:copy()
+
+  if profile.transport == 'conpty' or profile.transport == 'superlogical' then
+    open_local_transport(self, profile)
   else
     self.kind = TransportKind.Agent
     self.agent = agent
@@ -203,6 +211,7 @@ function Session:init(id: integer, profile: *Profile, cols: uint16, rows: uint16
       self.exited = true
     else
       self.awaiting_open = true
+      self.fallback = profile.fallback:copy()
       -- copies: a reload replaces the profiles while this may still wait
       for i = 0, < #profile.argv do self.open_argv:push(profile.argv[i]:copy()) end
       for i = 0, < #profile.env do self.open_env:push(profile.env[i]:copy()) end
@@ -247,6 +256,23 @@ local function free_open_request(self: *Session): void
   for i = 0, < #self.open_env do self.open_env[i]:destroy() end
   self.open_argv:destroy()
   self.open_env:destroy()
+end
+
+-- An agent terminal still waiting for its shell when the agent turned out to
+-- be down: open its fallback profile here instead. Typed input goes along.
+function Session:use_fallback(profile: *Profile): void
+  if self.kind ~= TransportKind.Agent or not self.awaiting_open or self.exited then return end
+  free_open_request(self)
+  self.awaiting_open = false
+  self.agent = nilptr
+  self.label:destroy()
+  self.label = profile.name:copy()
+  self:feed_text('[ghostty] no agent answered; opening the local fallback\r\n')
+  open_local_transport(self, profile)
+  if self.kind == TransportKind.ConPty and not self.exited and self.pending_out:len() > 0 then
+    self.conpty:write(self.pending_out:peek(), self.pending_out:len())
+  end
+  self.pending_out:consume(self.pending_out:len())
 end
 
 -- Called by the host when the agent acknowledges OPEN.
@@ -341,6 +367,7 @@ function Session:destroy(): void
   self.label:destroy()
   self.pending_out:destroy()
   free_open_request(self)
+  self.fallback:destroy()
   $self = {}
 end
 
