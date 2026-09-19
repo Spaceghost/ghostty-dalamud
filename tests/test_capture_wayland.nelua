@@ -147,6 +147,32 @@ do
   assert(wayland_key_score(k2, c2, false) == 10) -- no app: the title near
 end
 
+-- render node choice
+do
+  local csv = '00000000:02:00.0, 3454, 8192\n00000000:03:00.0, 953, 8188\n'
+  local f, t = wayland_nvidia_vram(csv, '0000:03:00.0')
+  assert(f == 953 and t == 8188)
+  f, t = wayland_nvidia_vram(csv, '0000:09:00.0')
+  assert(f == -1 and t == -1)
+  -- this PC: the 3070 drives the display, the 4060 runs an LLM (953 MiB free)
+  local nodes: vector(RenderNode)
+  nodes:push({ path = '/dev/dri/renderD128', pci = '0000:03:00.0', driver = 'nvidia', display = false, free_mb = 953, total_mb = 8188 })
+  nodes:push({ path = '/dev/dri/renderD129', pci = '0000:02:00.0', driver = 'nvidia', display = true, free_mb = 3454, total_mb = 8192 })
+  local p, why = wayland_pick_render_node('auto', &nodes)
+  assert(#p == 0 and why:find('953 MiB free', 1, true) > 0 and why:find('drives a display', 1, true) > 0)
+  nodes[0].free_mb = 4000
+  p, why = wayland_pick_render_node('', &nodes)
+  assert(p == '/dev/dri/renderD128')
+  nodes[0].free_mb = -1
+  p, why = wayland_pick_render_node('auto', &nodes)
+  assert(#p == 0 and why:find('unknown', 1, true) > 0)
+  p = wayland_pick_render_node('none', &nodes) assert(#p == 0)
+  p = wayland_pick_render_node('/dev/dri/renderD129', &nodes) assert(p == '/dev/dri/renderD129')
+  p, why = wayland_pick_render_node('bogus', &nodes) assert(#p == 0 and why:find('unknown render node', 1, true) > 0)
+  local empty: vector(RenderNode)
+  p, why = wayland_pick_render_node('auto', &empty) assert(#p == 0 and why:find('no render node', 1, true) > 0)
+end
+
 -- run: parsing
 do
   local ok, cmd = wayland_parse_run('run:foot')

@@ -1,0 +1,73 @@
+-- Manual measurement (not in tests/run.sh): the compositor's cost a frame
+-- with a busy client, pixman against a GPU renderer.
+--
+-- Usage: bench_wayland_render RENDER_NODE SECONDS 'run:COMMAND' [OUT.png]
+--   RENDER_NODE: none, auto or /dev/dri/renderDN (--wayland-render-node)
+-- Launches COMMAND into a private compositor, pumps it as the agent's loop
+-- does for SECONDS, reads every frame (as a stream would), and prints the
+-- frames rendered and the average milliseconds composing and reading back.
+require 'core.protocol'
+require 'agent.capture'
+require 'string'
+require 'stringbuilder'
+require 'io'
+require 'os'
+require 'arg'
+
+## cinclude '<poll.h>'
+## cinclude '<unistd.h>'
+local pollfd <cimport, nodecl, ctypedef> = @record{ fd: cint, events: cshort, revents: cshort }
+local function poll(fds: *[0]pollfd, n: culong, timeout: cint): cint <cimport, nodecl> end
+local function getpid(): cint <cimport, nodecl> end
+local POLLIN: cshort <cimport, nodecl, const>
+
+local node: string = arg[1]
+local secs = tonumber(arg[2])
+local cmd: string = arg[3]
+do
+  local sb: stringbuilder
+  sb:writef('ghostty-bench-%d', getpid())
+  capture_wayland_configure(sb:promote(), 'us')
+end
+capture_wayland_set_render_node(node)
+local ok, be, why = capture_select('wayland')
+assert(ok, why)
+local function turn(ms: integer): void
+  local fds: [4]cint
+  local n = be.poll_fds(&fds, 4)
+  local pf: [4]pollfd
+  for i = 0, < n do pf[i] = { fd = fds[i], events = POLLIN } end
+  local w = be.wait_ms()
+  if w < 0 or w > ms then w = ms end
+  poll(&pf, (@culong)(n), (@cint)(w))
+  be.pump()
+end
+local h, err = be.open(0, cmd)
+assert(h ~= nilptr, err)
+local t0 = os.now()
+local st, sw = be.state(h)
+while st == CAPTURE_PENDING and os.now() - t0 < 30 do turn(50) st, sw = be.state(h) end
+assert(st == CAPTURE_LIVE, sw)
+local f0 = capture_wayland_stats()
+local t1 = os.now()
+local seen, last = 0, 0_u64
+local fr: CaptureFrame
+local lit = 0
+while os.now() - t1 < secs do
+  turn(5)
+  if be.frame(h, &fr) and fr.serial ~= last then
+    seen, last = seen + 1, fr.serial
+    lit = 0
+    for i = 0, < fr.w * fr.h, 97 do
+      local o = (@usize)(i) * 4
+      if fr.pixels[o] ~= 0 or fr.pixels[o + 1] ~= 0 or fr.pixels[o + 2] ~= 0 then lit = lit + 1 end
+    end
+  end
+end
+local n, ms_r, ms_g, gpu = capture_wayland_stats()
+print(string.format('renderer %s: %dx%d, %d frames in %.1f s (%.1f fps), %.2f ms composing + %.2f ms reading back a frame, last frame %d of %d samples lit',
+  #gpu > 0 and gpu or 'pixman', fr.w, fr.h, n - f0, secs, (n - f0) / secs, ms_r, ms_g, lit, fr.w * fr.h // 97 + 1))
+be.close(h)
+local t2 = os.now()
+while os.now() - t2 < 1 do turn(20) end
+capture_wayland_shutdown()
