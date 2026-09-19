@@ -1,0 +1,72 @@
+# Test and build on every push and pull request; see docs/CI.md.
+# The runner comes from the repository variable CI_RUNS_ON (a JSON string or
+# label array), default GitHub's ubuntu-latest.
+name: CI
+
+on:
+  push:
+    branches: ['**']
+    paths-ignore: ['**.md', 'docs/**']
+  pull_request:
+    paths-ignore: ['**.md', 'docs/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-build:
+    # a branch in this repository is already built by its push; only pull
+    # requests from forks need their own run
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name != github.repository
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '"ubuntu-latest"') }}
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Probe for the .NET SDK
+        id: dotnet
+        run: |
+          if command -v dotnet >/dev/null && dotnet --list-sdks | grep -q '^10\.'; then
+            echo "have=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "have=false" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Install the .NET SDK
+        if: steps.dotnet.outputs.have != 'true'
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Cache toolchains and vendor checkouts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/ghostty-dalamud-ci
+            vendor
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+      - name: Cache Zig build caches
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/zig-global
+            build/zig-cache-linux
+            build/zig-cache-win
+          key: zig-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+
+      - name: Test and build
+        run: tools/ci/run.sh test build
+
+      - name: Upload build/dist
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ghostty-dalamud-${{ github.sha }}
+          path: build/dist
+          if-no-files-found: error
+          retention-days: 14

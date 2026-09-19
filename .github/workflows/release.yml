@@ -1,0 +1,92 @@
+# On a v* tag: test, build and package, then attach the plugin zip and the
+# pluginmaster JSON to a GitHub Release for the tag; see docs/CI.md.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '"ubuntu-latest"') }}
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Probe for the .NET SDK
+        id: dotnet
+        run: |
+          if command -v dotnet >/dev/null && dotnet --list-sdks | grep -q '^10\.'; then
+            echo "have=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "have=false" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Install the .NET SDK
+        if: steps.dotnet.outputs.have != 'true'
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      # restore only: release runs never write caches
+      - name: Restore toolchains and vendor checkouts
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/ghostty-dalamud-ci
+            vendor
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+      - name: Restore Zig build caches
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/zig-global
+            build/zig-cache-linux
+            build/zig-cache-win
+          key: zig-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+
+      - name: Test, build and package
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: tools/ci/run.sh all
+
+      - name: Check the release files
+        run: |
+          if ! compgen -G 'build/release/*.zip' >/dev/null; then
+            echo "::error::no build/release/*.zip: this checkout has no tools/package.sh, or it wrote no zip"
+            exit 1
+          fi
+          compgen -G 'build/release/*.json' >/dev/null ||
+            echo "::warning::no pluginmaster JSON in build/release"
+          ls -la build/release
+
+      - name: Publish the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          pre=()
+          [[ "$TAG" == *-* ]] && pre=(--prerelease)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" build/release/* --clobber
+          else
+            gh release create "$TAG" build/release/* --verify-tag --title "$TAG" --generate-notes "${pre[@]}"
+          fi
+
+      - name: Upload build/release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ghostty-dalamud-${{ github.ref_name }}
+          path: build/release
+          if-no-files-found: error
+          retention-days: 30
