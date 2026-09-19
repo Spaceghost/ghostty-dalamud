@@ -269,6 +269,61 @@ do
   check(l == WAYLAND_LAUNCH_LINE, 'window gone from the list after close: ' .. l)
   l:destroy()
 end
+-- An X11 client through Xwayland: the same yad forced onto X11. Xwayland
+-- starts with it (lazily); its toplevel is a window like the xdg one.
+local function wait_live(hx: pointer, secs: float64): (integer, string)
+  local t1 = os.now()
+  local s1, w1 = be.state(hx)
+  while s1 == CAPTURE_PENDING and os.now() - t1 < secs do turn(50) s1, w1 = be.state(hx) end
+  return s1, w1
+end
+do
+  local tx = os.now()
+  local hx, errx = be.open(0, 'run:env GDK_BACKEND=x11 yad --text-info --editable --width=500 --height=300 --title=ghostty-x11-test')
+  check(hx ~= nilptr, 'x11 open: ' .. errx)
+  local sx, wx = wait_live(hx, 30)
+  check(sx == CAPTURE_LIVE, 'x11 live: ' .. wx)
+  print(string.format('X11 window mapped after %.2f s (Xwayland start included), title "%s"', os.now() - tx, be.title(hx)))
+  local fx: CaptureFrame
+  tx = os.now()
+  while not be.frame(hx, &fx) and os.now() - tx < 10 do turn(20) end
+  run_for(1.0)
+  fx = frame_of(hx)
+  print(string.format('X11 first frame %dx%d', fx.w, fx.h))
+  check(fx.w >= 200 and fx.h >= 150 and fx.w <= 2048 and fx.h <= 2048, 'x11 sane size')
+  save_png(fx, 'x11-first.png')
+  local l = be.list()
+  check(l:find('ghostty-x11-test', 1, true) > 0, 'x11 listed: ' .. l)
+  io.write(l)
+  l:destroy()
+  local bx: vector(uint8)
+  bx:resize((@usize)(fx.w * fx.h * 4))
+  for y = 0, < fx.h do memory.copy(&bx[(@usize)(y * fx.w * 4)], &fx.pixels[(@usize)(y) * fx.stride], (@usize)(fx.w * 4)) end
+  local xw, xh = fx.w, fx.h
+  ev = { kind = WIN_INPUT_MOVE, x = xw // 2, y = xh // 3 }
+  be.input(hx, &ev)
+  ev = { kind = WIN_INPUT_BUTTON, x = xw // 2, y = xh // 3, button = 0, down = true }
+  be.input(hx, &ev)
+  ev.down = false
+  be.input(hx, &ev)
+  run_for(0.3)
+  ev = { kind = WIN_INPUT_TEXT, text = 'typed into X11\n' }
+  be.input(hx, &ev)
+  run_for(1.0)
+  fx = frame_of(hx)
+  check(fx.w == xw and fx.h == xh, 'x11 same size after typing')
+  local cx = differing(&bx[0], fx.pixels, (@usize)(fx.w * fx.h * 4))
+  print('X11 pixels changed by typing: ' .. tostring(cx))
+  check(cx > 50, 'typing reached the X11 app')
+  save_png(fx, 'x11-typed.png')
+  bx:destroy()
+  be.close(hx) -- WM_DELETE_WINDOW: yad exits
+  run_for(1.0)
+  l = be.list()
+  check(l == WAYLAND_LAUNCH_LINE, 'x11 window gone after close: ' .. l)
+  l:destroy()
+end
+
 -- an open by match that never shows up times out as pending; not waited
 -- for here (30 s) - check it is pending and close it
 local h2 = be.open(0, 'no-such-window-anywhere')

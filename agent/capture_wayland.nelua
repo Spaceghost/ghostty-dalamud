@@ -17,10 +17,13 @@
 -- geometry; rendering that output yields the window's pixels. Popups render
 -- into their toplevel's scene, constrained to the window and clipped to it.
 --
--- Limits (docs/REMOTE_WINDOWS.md): Wayland clients only (no Xwayland yet;
--- DISPLAY is unset for launched apps), popups clipped to the window, TEXT
--- typed through keymap lookup (levels 1 and 2 of the layout; other characters
--- are dropped), software rendering only.
+-- X11 apps come in through wlroots' Xwayland (started with the first X11
+-- client): their toplevels are windows like xdg ones, their override-redirect
+-- windows (menus, tooltips) are drawn into the window they belong to.
+--
+-- Limits (docs/REMOTE_WINDOWS.md): popups clipped to the window, TEXT typed
+-- through keymap lookup (levels 1 and 2 of the layout; other characters are
+-- dropped), software rendering only.
 --
 -- Loaded by agent/capture.nelua when the agent was built with -D WAYLAND
 -- (tools/wayland-flags.sh: vendor/wayland-sdk headers, host libwlroots-0.20).
@@ -63,6 +66,7 @@ require 'agent.wayland_keys'
 ## cinclude '<wlr/types/wlr_xdg_decoration_v1.h>'
 ## cinclude '<wlr/types/wlr_server_decoration.h>'
 ## cinclude '<wlr/util/edges.h>'
+## cinclude '<wlr/xwayland.h>'
 ## linklib 'wlroots-0.20'
 ## linklib 'wayland-server'
 ## linklib 'pixman-1'
@@ -83,6 +87,9 @@ local function unsetenv(name: cstring): cint <cimport, nodecl> end
 local function waitpid(pid: cint, status: *cint, options: cint): cint <cimport, nodecl> end
 local function kill(pid: cint, sig: cint): cint <cimport, nodecl> end
 local function usleep(us: cuint): cint <cimport, nodecl> end
+local function symlink(target: cstring, path: cstring): cint <cimport, nodecl> end
+local function unlink(path: cstring): cint <cimport, nodecl> end
+local function access(path: cstring, mode: cint): cint <cimport, nodecl> end
 local O_RDWR: cint <cimport, nodecl, const>
 local WNOHANG: cint <cimport, nodecl, const>
 local SIGTERM: cint <cimport, nodecl, const>
@@ -132,6 +139,7 @@ local wlr_allocator <cimport, nodecl, ctypedef> = @record{}
 local wlr_buffer <cimport, nodecl, ctypedef> = @record{}
 local wlr_surface <cimport, nodecl, ctypedef> = @record{
   resource: *wl_resource,
+  mapped: boolean,
   events: record{ commit: wl_signal, map: wl_signal, unmap: wl_signal, destroy: wl_signal },
 }
 local wlr_output <cimport, nodecl, ctypedef> = @record{ width: int32, height: int32, frame_pending: boolean }
@@ -142,6 +150,7 @@ local wlr_scene <cimport, nodecl, ctypedef> = @record{ tree: wlr_scene_tree }
 local wlr_scene_output <cimport, nodecl, ctypedef> = @record{}
 local wlr_scene_buffer <cimport, nodecl, ctypedef> = @record{}
 local wlr_scene_surface <cimport, nodecl, ctypedef> = @record{ surface: *wlr_surface }
+local wlr_compositor <cimport, nodecl, ctypedef> = @record{}
 local wlr_xdg_shell <cimport, nodecl, ctypedef> = @record{
   events: record{ new_surface: wl_signal, new_toplevel: wl_signal, new_popup: wl_signal },
 }
@@ -209,7 +218,7 @@ local function wlr_renderer_init_wl_display(r: *wlr_renderer, d: *wl_display): b
 local function wlr_renderer_destroy(r: *wlr_renderer): void <cimport, nodecl> end
 local function wlr_allocator_autocreate(b: *wlr_backend, r: *wlr_renderer): *wlr_allocator <cimport, nodecl> end
 local function wlr_allocator_destroy(a: *wlr_allocator): void <cimport, nodecl> end
-local function wlr_compositor_create(d: *wl_display, version: uint32, r: *wlr_renderer): pointer <cimport, nodecl> end
+local function wlr_compositor_create(d: *wl_display, version: uint32, r: *wlr_renderer): *wlr_compositor <cimport, nodecl> end
 local function wlr_subcompositor_create(d: *wl_display): pointer <cimport, nodecl> end
 local function wlr_data_device_manager_create(d: *wl_display): pointer <cimport, nodecl> end
 local function wlr_primary_selection_v1_device_manager_create(d: *wl_display): pointer <cimport, nodecl> end
@@ -270,6 +279,48 @@ local function wlr_keyboard_init(kb: *wlr_keyboard, impl: *wlr_keyboard_impl, na
 local function wlr_keyboard_set_keymap(kb: *wlr_keyboard, km: *xkb_keymap): boolean <cimport, nodecl> end
 local function wlr_keyboard_finish(kb: *wlr_keyboard): void <cimport, nodecl> end
 local function wlr_keyboard_notify_key(kb: *wlr_keyboard, ev: *wlr_keyboard_key_event): void <cimport, nodecl> end
+local function wlr_scene_subsurface_tree_create(parent: *wlr_scene_tree, s: *wlr_surface): *wlr_scene_tree <cimport, nodecl> end
+local function wlr_scene_node_set_position(n: *wlr_scene_node, x: cint, y: cint): void <cimport, nodecl> end
+
+-- Xwayland (wlroots' XWM): X11 windows are wlr_xwayland_surfaces whose
+-- wl_surface Xwayland commits like any client's.
+local wlr_xwayland_server <cimport, nodecl, ctypedef> = @record{
+  pid: cint,
+  events: record{ start: wl_signal, ready: wl_signal, destroy: wl_signal },
+}
+local wlr_xwayland <cimport, nodecl, ctypedef> = @record{
+  server: *wlr_xwayland_server,
+  display_name: cstring,
+  events: record{ destroy: wl_signal, ready: wl_signal, new_surface: wl_signal },
+}
+local wlr_xwayland_surface <cimport, nodecl, forwarddecl, ctypedef> = @record{}
+wlr_xwayland_surface = @record{
+  window_id: uint32,
+  surface: *wlr_surface,
+  x: int16, y: int16, width: uint16, height: uint16,
+  override_redirect: boolean,
+  title: cstring,
+  class: cstring,
+  instance: cstring,
+  pid: cint,
+  parent: *wlr_xwayland_surface,
+  events: record{
+    destroy: wl_signal, request_configure: wl_signal, request_activate: wl_signal,
+    associate: wl_signal, dissociate: wl_signal,
+  },
+  data: pointer,
+}
+local wlr_xwayland_surface_configure_event <cimport, nodecl, ctypedef> = @record{
+  surface: *wlr_xwayland_surface, x: int16, y: int16, width: uint16, height: uint16, mask: uint16,
+}
+local function wlr_xwayland_create(d: *wl_display, c: *wlr_compositor, lazy: boolean): *wlr_xwayland <cimport, nodecl> end
+local function wlr_xwayland_destroy(x: *wlr_xwayland): void <cimport, nodecl> end
+local function wlr_xwayland_set_seat(x: *wlr_xwayland, s: *wlr_seat): void <cimport, nodecl> end
+local function wlr_xwayland_surface_configure(s: *wlr_xwayland_surface, x: int16, y: int16, w: uint16, h: uint16): void <cimport, nodecl> end
+local function wlr_xwayland_surface_activate(s: *wlr_xwayland_surface, on: boolean): void <cimport, nodecl> end
+local function wlr_xwayland_surface_close(s: *wlr_xwayland_surface): void <cimport, nodecl> end
+local function wlr_xwayland_surface_restack(s: *wlr_xwayland_surface, sibling: *wlr_xwayland_surface, mode: cint): void <cimport, nodecl> end
+local XCB_STACK_MODE_ABOVE: cint <comptime> = 0
 
 global WAYLAND_DEFAULT_W: integer <comptime> = 1280
 global WAYLAND_DEFAULT_H: integer <comptime> = 800
@@ -299,11 +350,27 @@ local function owner_of(l: *wl_listener): pointer
   return (@*Hook)(l).owner
 end
 
--- One xdg_toplevel: its scene, its output, its latest pixels.
-local Top = @record{
+local Top <forwarddecl> = @record{}
+local XSurf <forwarddecl> = @record{}
+
+-- Something drawn into a window's output beside the window itself: an
+-- xdg_popup (menus, tooltips, combo lists) or an X11 override-redirect window.
+local Popup = @record{
+  p: *wlr_xdg_popup,         -- an xdg popup, or
+  x: *XSurf,                 -- an X11 override-redirect window
+  top: *Top,                 -- the window it shows in (nilptr: none)
+  tree: *wlr_scene_tree,     -- its node in that window's scene
+  on_commit: Hook, on_destroy: Hook,
+}
+
+-- One window: an xdg_toplevel, or an X11 toplevel through Xwayland (`x11`).
+-- Its scene, its output, its latest pixels.
+Top = @record{
   id: uint32,
-  xdg: *wlr_xdg_toplevel,
-  pid: cint,                 -- the client process
+  xdg: *wlr_xdg_toplevel,    -- xdg windows (nilptr for X11)
+  x11: *XSurf,               -- X11 windows (nilptr for xdg)
+  pid: cint,                 -- the client process (X11: _NET_WM_PID)
+  scale: integer,            -- the output scale the window renders at
   scene: *wlr_scene,
   output: *wlr_output,       -- made on the first map, sized to the window
   sout: *wlr_scene_output,
@@ -313,19 +380,26 @@ local Top = @record{
   pixels: vector(uint8),     -- BGRA top-down, w*4 a row
   w: integer, h: integer,
   serial: uint64,
+  popups: vector(*Popup),
   on_commit: Hook, on_map: Hook, on_unmap: Hook, on_destroy: Hook,
   on_maximize: Hook, on_fullscreen: Hook,
+}
+
+-- One Xwayland surface, from creation to destruction. While its wl_surface
+-- is mapped it is a window (`top`) or, override-redirect, a popup (`pop`).
+XSurf = @record{
+  xs: *wlr_xwayland_surface,
+  top: *Top,
+  pop: *Popup,
+  on_destroy: Hook, on_associate: Hook, on_dissociate: Hook,
+  on_configure: Hook, on_activate: Hook,
+  on_map: Hook, on_unmap: Hook,
 }
 
 local Deco = @record{
   d: *wlr_xdg_toplevel_decoration_v1,
   top: *Top,
   on_destroy: Hook, on_mode: Hook,
-}
-
-local Popup = @record{
-  p: *wlr_xdg_popup,
-  on_commit: Hook, on_destroy: Hook,
 }
 
 -- A capture handle: one WOPEN.
@@ -357,7 +431,12 @@ local wc: record{
   renderer: *wlr_renderer,
   allocator: *wlr_allocator,
   seat: *wlr_seat,
+  compositor: *wlr_compositor,
   xdg_shell: *wlr_xdg_shell,
+  xwayland: *wlr_xwayland,    -- nilptr: no X11 apps (no Xwayland binary, or GHOSTTY_XWAYLAND=off)
+  x_display: string,          -- ":N" once Xwayland listens
+  x_link: string,             -- $XDG_RUNTIME_DIR/<socket>-x11 -> /tmp/.X11-unix/XN
+  x_started: float64,         -- os.now() when the first X11 client made Xwayland start (0: not yet)
   deco_mgr: *wlr_xdg_decoration_manager_v1,
   xkb_ctx: *xkb_context,
   keymap: *xkb_keymap,
@@ -371,6 +450,7 @@ local wc: record{
   next_id: uint32,
   scale: integer,          -- output scale apps render at (GHOSTTY_WAYLAND_SCALE, default 2)
   on_new_toplevel: Hook, on_new_popup: Hook, on_new_deco: Hook,
+  on_x_surface: Hook, on_x_ready: Hook, on_x_start: Hook,
   warned_format: boolean,
   warned_text: boolean,
 }
@@ -519,8 +599,9 @@ local function spawn(cmd: string): cint
   local null = open('/dev/null', O_RDWR)
   if null >= 0 then dup2(null, 0) end
   for fd = 3, 1023 do close(fd) end
-  unsetenv('DISPLAY')
   unsetenv('WAYLAND_SOCKET')
+  -- X11 apps reach our Xwayland; nothing reaches the host's X server
+  if #wc.x_display > 0 then setenv('DISPLAY', (@cstring)(wc.x_display.data), 1) else unsetenv('DISPLAY') end
   setenv('WAYLAND_DISPLAY', (@cstring)(wc.socket.data), 1)
   if #wc.runtime_dir > 0 then setenv('XDG_RUNTIME_DIR', (@cstring)(wc.runtime_dir.data), 1) end
   setenv('XDG_SESSION_TYPE', 'wayland', 1)
@@ -556,27 +637,59 @@ local function child_of(pid: cint): *Child
 end
 
 --------------------------------------------------------------------------------
--- Toplevels
+-- Toplevels (xdg and X11)
 
 local function top_title(t: *Top): string
-  if t.xdg.title ~= nilptr then return (@string)(t.xdg.title) end
+  local s: cstring = nilptr
+  if t.x11 ~= nilptr then s = t.x11.xs.title else s = t.xdg.title end
+  if s ~= nilptr then return (@string)(s) end
   return ''
 end
 
+-- The app: the xdg app id, or the X11 WM_CLASS class (else its instance).
 local function top_app(t: *Top): string
-  if t.xdg.app_id ~= nilptr then return (@string)(t.xdg.app_id) end
+  local s: cstring = nilptr
+  if t.x11 ~= nilptr then
+    s = t.x11.xs.class
+    if s == nilptr then s = t.x11.xs.instance end
+  else
+    s = t.xdg.app_id
+  end
+  if s ~= nilptr then return (@string)(s) end
   return ''
 end
 
--- Give `t` the keyboard (and xdg "activated"). One toplevel has it at a time.
+local function top_surface(t: *Top): *wlr_surface
+  if t.x11 ~= nilptr then return t.x11.xs.surface end
+  return t.xdg.base.surface
+end
+
+-- Ask the app to close the window (xdg close, X11 WM_DELETE_WINDOW).
+local function top_close(t: *Top): void
+  if t.x11 ~= nilptr then wlr_xwayland_surface_close(t.x11.xs)
+  else wlr_xdg_toplevel_send_close(t.xdg) end
+end
+
+-- Give `t` the keyboard (and xdg "activated", X11 focus and top of the
+-- stack). One toplevel has it at a time.
 local function focus(t: *Top): void
   if wc.focused == t or not t.mapped then return end
+  local prev = wc.focused
+  if prev ~= nilptr and prev.x11 ~= nilptr then wlr_xwayland_surface_activate(prev.x11.xs, false) end
   wc.focused = t
-  wlr_seat_keyboard_notify_enter(wc.seat, t.xdg.base.surface, (@*[0]uint32)(&keyboard.keycodes), keyboard.num_keycodes, &keyboard.modifiers)
+  if t.x11 ~= nilptr then
+    wlr_xwayland_surface_activate(t.x11.xs, true)
+    wlr_xwayland_surface_restack(t.x11.xs, nilptr, XCB_STACK_MODE_ABOVE)
+  end
+  wlr_seat_keyboard_notify_enter(wc.seat, top_surface(t), (@*[0]uint32)(&keyboard.keycodes), keyboard.num_keycodes, &keyboard.modifiers)
 end
 
--- The window's size: its xdg geometry (the surface's extent when unset).
+-- The window's size: its xdg geometry (the surface's extent when unset), or
+-- the X11 window's size.
 local function top_size(t: *Top): (integer, integer)
+  if t.x11 ~= nilptr then
+    return math.max(1, (@integer)(t.x11.xs.width)), math.max(1, (@integer)(t.x11.xs.height))
+  end
   local g = t.xdg.base.geometry
   return math.max(1, (@integer)(g.width)), math.max(1, (@integer)(g.height))
 end
@@ -589,6 +702,81 @@ local function end_caps_of(t: *Top, why: string): void
       set_why(c, CAPTURE_ENDED, why)
     end
   end
+end
+
+-- A new window, not mapped yet, with its own scene.
+local function top_new(pid: cint): *Top
+  local t = new(@Top)
+  t.id = wc.next_id
+  wc.next_id = wc.next_id + 1
+  t.pid = pid
+  t.scale = wc.scale
+  -- No direct scan-out: with one surface covering the output, the scene would
+  -- hand the client's own buffer (shadows and all) to the output instead of
+  -- rendering, and that is not the window's pixels. wlroots reads this
+  -- variable when the scene is created.
+  setenv('WLR_SCENE_DISABLE_DIRECT_SCANOUT', '1', 1)
+  t.scene = wlr_scene_create()
+  unsetenv('WLR_SCENE_DISABLE_DIRECT_SCANOUT')
+  wc.tops:push(t)
+  return t
+end
+
+-- The window shows: its output, sized to it, on the first map.
+local function top_mapped(t: *Top): void
+  t.mapped = true
+  local w, h = top_size(t)
+  if t.xdg ~= nilptr and (w <= 1 or h <= 1) and not t.sized then
+    -- a client that commits no size of its own gets the default
+    t.sized = true
+    wlr_xdg_toplevel_set_size(t.xdg, WAYLAND_DEFAULT_W, WAYLAND_DEFAULT_H)
+    w, h = WAYLAND_DEFAULT_W, WAYLAND_DEFAULT_H
+  end
+  if t.output == nilptr then
+    t.output = wlr_headless_add_output(wc.backend, (@cuint)(w * t.scale), (@cuint)(h * t.scale))
+    if t.output == nilptr then log('cannot add an output for window ' .. tostring(t.id)) return end
+    wlr_output_init_render(t.output, wc.allocator, wc.renderer)
+    local st: wlr_output_state
+    wlr_output_state_init(&st)
+    wlr_output_state_set_enabled(&st, true)
+    wlr_output_state_set_custom_mode(&st, (@int32)(w * t.scale), (@int32)(h * t.scale), 0)
+    -- apps render at this scale: crisp text on a panel seen up close
+    wlr_output_state_set_scale(&st, (@float32)(t.scale))
+    wlr_output_commit_state(t.output, &st)
+    wlr_output_state_finish(&st)
+    wlr_output_create_global(t.output, wc.display)
+    t.sout = wlr_scene_output_create(t.scene, t.output)
+  end
+  if wc.focused == nilptr then focus(t) end
+  log('window ' .. tostring(t.id) .. (t.x11 ~= nilptr and ' (X11)' or '') .. ' mapped: ' .. top_app(t) .. ' "' .. top_title(t) .. '"')
+end
+
+local function top_unmapped(t: *Top): void
+  t.mapped = false
+  end_caps_of(t, 'window closed')
+  if wc.focused == t then wc.focused = nilptr end
+end
+
+-- Forget `t`: its streams end, its output and scene go. Popups still shown
+-- in it lose their place and show nowhere.
+local function top_free(t: *Top): void
+  end_caps_of(t, 'window closed')
+  if wc.focused == t then wc.focused = nilptr end
+  for i = 0, < #t.popups do
+    local pp = t.popups[i]
+    pp.top = nilptr
+    pp.tree = nilptr -- goes with the scene below
+    if pp.p ~= nilptr then pp.p.base.data = nilptr end
+  end
+  t.popups:destroy()
+  if t.deco ~= nilptr then (@*Deco)(t.deco).top = nilptr end
+  if t.output ~= nilptr then wlr_output_destroy(t.output) end -- takes the scene output along
+  wlr_scene_node_destroy(&t.scene.tree.node)
+  for i = 0, < #wc.tops do
+    if wc.tops[i] == t then wc.tops:remove(i) break end
+  end
+  t.pixels:destroy()
+  delete(t)
 end
 
 local function on_commit(l: *wl_listener, data: pointer): void
@@ -612,39 +800,11 @@ local function on_commit(l: *wl_listener, data: pointer): void
 end
 
 local function on_map(l: *wl_listener, data: pointer): void
-  local t = (@*Top)(owner_of(l))
-  t.mapped = true
-  local w, h = top_size(t)
-  if (w <= 1 or h <= 1) and not t.sized then
-    -- a client that commits no size of its own gets the default
-    t.sized = true
-    wlr_xdg_toplevel_set_size(t.xdg, WAYLAND_DEFAULT_W, WAYLAND_DEFAULT_H)
-    w, h = WAYLAND_DEFAULT_W, WAYLAND_DEFAULT_H
-  end
-  if t.output == nilptr then
-    t.output = wlr_headless_add_output(wc.backend, (@cuint)(w * wc.scale), (@cuint)(h * wc.scale))
-    if t.output == nilptr then log('cannot add an output for window ' .. tostring(t.id)) return end
-    wlr_output_init_render(t.output, wc.allocator, wc.renderer)
-    local st: wlr_output_state
-    wlr_output_state_init(&st)
-    wlr_output_state_set_enabled(&st, true)
-    wlr_output_state_set_custom_mode(&st, (@int32)(w * wc.scale), (@int32)(h * wc.scale), 0)
-    -- apps render at this scale: crisp text on a panel seen up close
-    wlr_output_state_set_scale(&st, (@float32)(wc.scale))
-    wlr_output_commit_state(t.output, &st)
-    wlr_output_state_finish(&st)
-    wlr_output_create_global(t.output, wc.display)
-    t.sout = wlr_scene_output_create(t.scene, t.output)
-  end
-  if wc.focused == nilptr then focus(t) end
-  log('window ' .. tostring(t.id) .. ' mapped: ' .. top_app(t) .. ' "' .. top_title(t) .. '"')
+  top_mapped((@*Top)(owner_of(l)))
 end
 
 local function on_unmap(l: *wl_listener, data: pointer): void
-  local t = (@*Top)(owner_of(l))
-  t.mapped = false
-  end_caps_of(t, 'window closed')
-  if wc.focused == t then wc.focused = nilptr end
+  top_unmapped((@*Top)(owner_of(l)))
 end
 
 -- A state request must be answered with a configure, even when nothing changes.
@@ -657,34 +817,17 @@ local function on_top_destroy(l: *wl_listener, data: pointer): void
   local t = (@*Top)(owner_of(l))
   unhook(&t.on_commit) unhook(&t.on_map) unhook(&t.on_unmap) unhook(&t.on_destroy)
   unhook(&t.on_maximize) unhook(&t.on_fullscreen)
-  end_caps_of(t, 'window closed')
-  if wc.focused == t then wc.focused = nilptr end
-  if t.deco ~= nilptr then (@*Deco)(t.deco).top = nilptr end
-  if t.output ~= nilptr then wlr_output_destroy(t.output) end -- takes the scene output along
-  wlr_scene_node_destroy(&t.scene.tree.node)
   t.xdg.base.data = nilptr
-  for i = 0, < #wc.tops do
-    if wc.tops[i] == t then wc.tops:remove(i) break end
-  end
-  t.pixels:destroy()
-  delete(t)
+  top_free(t)
 end
 
 local function on_new_toplevel(l: *wl_listener, data: pointer): void
   local xdg = (@*wlr_xdg_toplevel)(data)
-  local t = new(@Top)
-  t.id = wc.next_id
-  wc.next_id = wc.next_id + 1
-  t.xdg = xdg
+  local pid: cint = 0
   local uid: cuint, gid: cuint = 0, 0
-  wl_client_get_credentials(wl_resource_get_client(xdg.resource), &t.pid, &uid, &gid)
-  -- No direct scan-out: with one surface covering the output, the scene would
-  -- hand the client's own buffer (shadows and all) to the output instead of
-  -- rendering, and that is not the window's pixels. wlroots reads this
-  -- variable when the scene is created.
-  setenv('WLR_SCENE_DISABLE_DIRECT_SCANOUT', '1', 1)
-  t.scene = wlr_scene_create()
-  unsetenv('WLR_SCENE_DISABLE_DIRECT_SCANOUT')
+  wl_client_get_credentials(wl_resource_get_client(xdg.resource), &pid, &uid, &gid)
+  local t = top_new(pid)
+  t.xdg = xdg
   -- popups find their parent's tree through wlr_xdg_surface.data
   xdg.base.data = wlr_scene_xdg_surface_create(&t.scene.tree, xdg.base)
   hook(&t.on_commit, &xdg.base.surface.events.commit, on_commit, t)
@@ -693,11 +836,10 @@ local function on_new_toplevel(l: *wl_listener, data: pointer): void
   hook(&t.on_destroy, &xdg.events.destroy, on_top_destroy, t)
   hook(&t.on_maximize, &xdg.events.request_maximize, on_state_request, t)
   hook(&t.on_fullscreen, &xdg.events.request_fullscreen, on_state_request, t)
-  wc.tops:push(t)
 end
 
 --------------------------------------------------------------------------------
--- Popups: into the parent's scene tree, kept inside the toplevel's window
+-- Popups: into their window's scene
 
 -- The toplevel a popup chain hangs off, or nilptr.
 local function popup_root(p: *wlr_xdg_popup): *wlr_xdg_toplevel
@@ -711,6 +853,22 @@ local function popup_root(p: *wlr_xdg_popup): *wlr_xdg_toplevel
     parent = xs.popup.parent
   end
   return nilptr
+end
+
+local function top_of_xdg(x: *wlr_xdg_toplevel): *Top
+  if x == nilptr then return nilptr end
+  for i = 0, < #wc.tops do
+    if wc.tops[i].xdg == x then return wc.tops[i] end
+  end
+  return nilptr
+end
+
+local function popup_detach(pp: *Popup): void
+  if pp.top == nilptr then return end
+  for i = 0, < #pp.top.popups do
+    if pp.top.popups[i] == pp then pp.top.popups:remove(i) break end
+  end
+  pp.top = nilptr
 end
 
 local function on_popup_commit(l: *wl_listener, data: pointer): void
@@ -727,6 +885,7 @@ end
 local function on_popup_destroy(l: *wl_listener, data: pointer): void
   local pp = (@*Popup)(owner_of(l))
   unhook(&pp.on_commit) unhook(&pp.on_destroy)
+  popup_detach(pp)
   delete(pp)
 end
 
@@ -737,8 +896,159 @@ local function on_new_popup(l: *wl_listener, data: pointer): void
   p.base.data = wlr_scene_xdg_surface_create((@*wlr_scene_tree)(parent.data), p.base)
   local pp = new(@Popup)
   pp.p = p
+  pp.tree = (@*wlr_scene_tree)(p.base.data)
+  pp.top = top_of_xdg(popup_root(p))
+  if pp.top ~= nilptr then pp.top.popups:push(pp) end
   hook(&pp.on_commit, &p.base.surface.events.commit, on_popup_commit, pp)
   hook(&pp.on_destroy, &p.events.destroy, on_popup_destroy, pp)
+end
+
+--------------------------------------------------------------------------------
+-- X11 windows through Xwayland: a mapped X11 toplevel is a window like an
+-- xdg one (its own scene and output, at scale 1: X11 apps draw at 1x); an
+-- override-redirect one (menu, tooltip, drag icon) is drawn into the window
+-- it belongs to, at its root position relative to that window's.
+
+-- The window an override-redirect X11 window belongs to: its X11 parent's
+-- (transient-for), else the X11 window of its process it lies over, else
+-- one of its process, else the focused X11 window.
+local function x11_owner(xs: *wlr_xwayland_surface): *Top
+  local p = xs.parent
+  for _ = 1, 16 do
+    if p == nilptr then break end
+    local xp = (@*XSurf)(p.data)
+    if xp ~= nilptr then
+      if xp.top ~= nilptr then return xp.top end
+      if xp.pop ~= nilptr and xp.pop.top ~= nilptr then return xp.pop.top end
+    end
+    p = p.parent
+  end
+  local px, py = (@integer)(xs.x), (@integer)(xs.y)
+  local same_pid: *Top = nilptr
+  for i = 0, < #wc.tops do
+    local t = wc.tops[i]
+    if t.x11 ~= nilptr and t.mapped then
+      local o = t.x11.xs
+      local ox, oy = (@integer)(o.x), (@integer)(o.y)
+      local inside = px >= ox and py >= oy and px < ox + (@integer)(o.width) and py < oy + (@integer)(o.height)
+      local mine = xs.pid ~= 0 and xs.pid == o.pid
+      if inside and (mine or xs.pid == 0) then return t end
+      if mine and same_pid == nilptr then same_pid = t end
+    end
+  end
+  if same_pid ~= nilptr then return same_pid end
+  if wc.focused ~= nilptr and wc.focused.x11 ~= nilptr then return wc.focused end
+  return nilptr
+end
+
+-- An X11 popup's node follows its root position (X11 coordinates are the
+-- root window's, one space for all windows).
+local function x11_place(pp: *Popup): void
+  if pp.x == nilptr or pp.top == nilptr or pp.tree == nilptr or pp.top.x11 == nilptr then return end
+  local o = pp.top.x11.xs
+  local xs = pp.x.xs
+  wlr_scene_node_set_position(&pp.tree.node, (@cint)(xs.x) - (@cint)(o.x), (@cint)(xs.y) - (@cint)(o.y))
+end
+
+local function x_unmapped(x: *XSurf): void
+  if x.pop ~= nilptr then
+    local pp = x.pop
+    if pp.tree ~= nilptr then wlr_scene_node_destroy(&pp.tree.node) end
+    popup_detach(pp)
+    delete(pp)
+    x.pop = nilptr
+  end
+  if x.top ~= nilptr then
+    top_free(x.top)
+    x.top = nilptr
+  end
+end
+
+local function on_x_map(l: *wl_listener, data: pointer): void
+  local x = (@*XSurf)(owner_of(l))
+  local xs = x.xs
+  if x.top ~= nilptr or x.pop ~= nilptr then return end
+  if xs.override_redirect then
+    local t = x11_owner(xs)
+    if t == nilptr then return end -- no window to show it in
+    local pp = new(@Popup)
+    pp.x = x
+    pp.top = t
+    pp.tree = wlr_scene_subsurface_tree_create(&t.scene.tree, xs.surface)
+    t.popups:push(pp)
+    x.pop = pp
+    x11_place(pp)
+    return
+  end
+  local t = top_new(xs.pid)
+  t.x11 = x
+  t.scale = 1 -- X11 apps draw at 1x; an output scale would only stretch them
+  wlr_scene_subsurface_tree_create(&t.scene.tree, xs.surface)
+  x.top = t
+  top_mapped(t)
+end
+
+local function on_x_unmap(l: *wl_listener, data: pointer): void
+  x_unmapped((@*XSurf)(owner_of(l)))
+end
+
+local function on_x_associate(l: *wl_listener, data: pointer): void
+  local x = (@*XSurf)(owner_of(l))
+  hook(&x.on_map, &x.xs.surface.events.map, on_x_map, x)
+  hook(&x.on_unmap, &x.xs.surface.events.unmap, on_x_unmap, x)
+end
+
+local function on_x_dissociate(l: *wl_listener, data: pointer): void
+  local x = (@*XSurf)(owner_of(l))
+  x_unmapped(x)
+  unhook(&x.on_map) unhook(&x.on_unmap)
+end
+
+-- X11 windows place and size themselves: granted as asked.
+local function on_x_configure(l: *wl_listener, data: pointer): void
+  local ev = (@*wlr_xwayland_surface_configure_event)(data)
+  wlr_xwayland_surface_configure(ev.surface, ev.x, ev.y, ev.width, ev.height)
+end
+
+local function on_x_activate(l: *wl_listener, data: pointer): void
+  local x = (@*XSurf)(owner_of(l))
+  if x.top ~= nilptr then focus(x.top) end
+end
+
+local function on_x_destroy(l: *wl_listener, data: pointer): void
+  local x = (@*XSurf)(owner_of(l))
+  x_unmapped(x)
+  unhook(&x.on_map) unhook(&x.on_unmap)
+  unhook(&x.on_destroy) unhook(&x.on_associate) unhook(&x.on_dissociate)
+  unhook(&x.on_configure) unhook(&x.on_activate)
+  x.xs.data = nilptr
+  delete(x)
+end
+
+local function on_x_surface(l: *wl_listener, data: pointer): void
+  local xs = (@*wlr_xwayland_surface)(data)
+  local x = new(@XSurf)
+  x.xs = xs
+  xs.data = x
+  hook(&x.on_destroy, &xs.events.destroy, on_x_destroy, x)
+  hook(&x.on_associate, &xs.events.associate, on_x_associate, x)
+  hook(&x.on_dissociate, &xs.events.dissociate, on_x_dissociate, x)
+  hook(&x.on_configure, &xs.events.request_configure, on_x_configure, x)
+  hook(&x.on_activate, &xs.events.request_activate, on_x_activate, x)
+end
+
+-- Xwayland runs from the first X11 client on (lazy) and stops 10 s after the
+-- last one leaves; each start is logged with how long it took.
+local function on_x_start(l: *wl_listener, data: pointer): void
+  wc.x_started = os.now()
+end
+
+local function on_x_ready(l: *wl_listener, data: pointer): void
+  if wc.x_started > 0 then
+    log(string.format('Xwayland ready on DISPLAY=%s after %.0f ms', wc.x_display, (os.now() - wc.x_started) * 1000.0))
+  else
+    log('Xwayland ready on DISPLAY=' .. wc.x_display)
+  end
 end
 
 --------------------------------------------------------------------------------
@@ -809,7 +1119,7 @@ end
 local function render(t: *Top): void
   if not t.mapped or t.sout == nilptr or t.output.frame_pending then return end
   local lw, lh = top_size(t)
-  local w, h = lw * wc.scale, lh * wc.scale -- output pixels
+  local w, h = lw * t.scale, lh * t.scale -- output pixels
   local resize = w ~= t.output.width or h ~= t.output.height
   if not resize and not wlr_scene_output_needs_frame(t.sout) then return end
   local st: wlr_output_state
@@ -852,12 +1162,16 @@ end
 local function pointer_to(t: *Top, x: integer, y: integer, time: uint32): void
   local sx: float64, sy: float64 = 0, 0
   -- frames are output pixels; the scene is in logical coordinates
-  local lx, ly = (x + 0.5) / wc.scale, (y + 0.5) / wc.scale
+  local lx, ly = (x + 0.5) / t.scale, (y + 0.5) / t.scale
   local node = wlr_scene_node_at(&t.scene.tree.node, lx, ly, &sx, &sy)
   local surf: *wlr_surface = nilptr
   if node ~= nilptr and node.type == WLR_SCENE_NODE_BUFFER then
     local ss = wlr_scene_surface_try_from_buffer(wlr_scene_buffer_from_node(node))
     if ss ~= nilptr then surf = ss.surface end
+  end
+  if surf == nilptr and t.x11 ~= nilptr then
+    -- over nothing: X11 still wants it (a click outside ends a menu's grab)
+    surf, sx, sy = top_surface(t), lx, ly
   end
   if surf == nilptr then wlr_seat_pointer_notify_clear_focus(wc.seat) return end
   wlr_seat_pointer_notify_enter(wc.seat, surf, sx, sy)
@@ -1083,7 +1397,7 @@ end
 local function wl_close(h: pointer): void
   local c = (@*Cap)(h)
   -- an app launched for this stream is asked to close with it
-  if c.pid ~= 0 and c.top ~= nilptr then wlr_xdg_toplevel_send_close(c.top.xdg) end
+  if c.pid ~= 0 and c.top ~= nilptr then top_close(c.top) end
   for i = 0, < #wc.caps do
     if wc.caps[i] == c then wc.caps:remove(i) break end
   end
@@ -1136,6 +1450,37 @@ global function capture_wayland_socket(): string
   return wc.socket
 end
 
+-- Xwayland, lazily: wlroots listens on the next free X display now and
+-- starts the server when the first X11 client connects. GHOSTTY_XWAYLAND=off
+-- leaves it out; without the Xwayland binary there is none either. A link
+-- $XDG_RUNTIME_DIR/<socket>-x11 to the display's socket gives a name that
+-- stays the same when the number does not: DISPLAY=$XDG_RUNTIME_DIR/ffxiv-0-x11
+-- (libxcb takes a socket path).
+local function start_xwayland(): void
+  local mode = os.getenv('GHOSTTY_XWAYLAND')
+  if mode == 'off' or mode == '0' then log('Xwayland off (GHOSTTY_XWAYLAND)') return end
+  if access('/usr/bin/Xwayland', 1) ~= 0 and access('/usr/local/bin/Xwayland', 1) ~= 0 then
+    log('no Xwayland binary: X11-only apps will not show')
+    return
+  end
+  local t0 = os.now()
+  wc.xwayland = wlr_xwayland_create(wc.display, wc.compositor, mode ~= 'eager')
+  if wc.xwayland == nilptr then log('cannot start Xwayland: X11-only apps will not show') return end
+  wlr_xwayland_set_seat(wc.xwayland, wc.seat)
+  hook(&wc.on_x_surface, &wc.xwayland.events.new_surface, on_x_surface, nilptr)
+  hook(&wc.on_x_ready, &wc.xwayland.events.ready, on_x_ready, nilptr)
+  if wc.xwayland.server ~= nilptr then hook(&wc.on_x_start, &wc.xwayland.server.events.start, on_x_start, nilptr) end
+  if mode == 'eager' then wc.x_started = t0 end
+  wc.x_display = string.copy((@string)(wc.xwayland.display_name))
+  local disp = wc.x_display:sub(2)
+  local target = '/tmp/.X11-unix/X' .. disp
+  wc.x_link = wc.runtime_dir .. '/' .. wc.socket .. '-x11'
+  unlink((@cstring)(wc.x_link.data))
+  if symlink((@cstring)(target.data), (@cstring)(wc.x_link.data)) ~= 0 then wc.x_link:destroy() wc.x_link = (@string){} end
+  log('X11 apps: DISPLAY=' .. wc.x_display .. (#wc.x_link > 0 and (' or DISPLAY=' .. wc.x_link) or '') .. (mode == 'eager' and '' or ' (Xwayland starts with the first X11 client)'))
+  target:destroy() disp:destroy()
+end
+
 local function start(): (boolean, string)
   local level = WLR_ERROR
   if #os.getenv('GHOSTTY_WAYLAND_DEBUG') > 0 then level = WLR_DEBUG end
@@ -1152,7 +1497,7 @@ local function start(): (boolean, string)
   wlr_renderer_init_wl_display(wc.renderer, wc.display) -- wl_shm and friends
   wc.allocator = wlr_allocator_autocreate(wc.backend, wc.renderer)
   if wc.allocator == nilptr then return false, 'cannot create a buffer allocator' end
-  wlr_compositor_create(wc.display, 6, wc.renderer)
+  wc.compositor = wlr_compositor_create(wc.display, 6, wc.renderer)
   wlr_subcompositor_create(wc.display)
   wlr_data_device_manager_create(wc.display)
   wlr_primary_selection_v1_device_manager_create(wc.display)
@@ -1203,6 +1548,7 @@ local function start(): (boolean, string)
   wc.next_id = 1
   wc.started = true
   log('compositor on WAYLAND_DISPLAY=' .. wc.socket .. ' (' .. wc.runtime_dir .. ')')
+  start_xwayland()
   return true, ''
 end
 
@@ -1242,6 +1588,13 @@ global function capture_wayland_shutdown(): void
       waitpid(wc.children[i].pid, &st, 0)
       wc.children[i].done = true
     end
+  end
+  if wc.xwayland ~= nilptr then
+    unhook(&wc.on_x_surface) unhook(&wc.on_x_ready) unhook(&wc.on_x_start)
+    wlr_xwayland_destroy(wc.xwayland) -- its surfaces go, and their hooks with them
+    wc.xwayland = nilptr
+    if #wc.x_link > 0 then unlink((@cstring)(wc.x_link.data)) end
+    wc.x_display:destroy() wc.x_link:destroy()
   end
   wl_display_destroy_clients(wc.display) -- toplevels go, and their hooks with them
   unhook(&wc.on_new_toplevel) unhook(&wc.on_new_popup) unhook(&wc.on_new_deco)

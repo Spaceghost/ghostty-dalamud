@@ -307,7 +307,8 @@ no host compositor: the host desktop never sees these windows.
   CMD ARGS` in its own session with `WAYLAND_DISPLAY` set to ours,
   `XDG_SESSION_TYPE=wayland`, `GDK_BACKEND=wayland`, `QT_QPA_PLATFORM=wayland`,
   `SDL_VIDEODRIVER=wayland`, `MOZ_ENABLE_WAYLAND=1`,
-  `ELECTRON_OZONE_PLATFORM_HINT=wayland`, and `DISPLAY` unset; the stream is
+  `ELECTRON_OZONE_PLATFORM_HINT=wayland`, and `DISPLAY` set to the agent's
+  own Xwayland (below; unset when there is none); the stream is
   pending until a window of that process (or of a descendant, found through
   `/proc`) maps, ends with "the app exited (status N) without opening a window
   here" when it exits first, and with "the app opened no window" after 30 s.
@@ -316,6 +317,24 @@ no host compositor: the host desktop never sees these windows.
   "window closed". Closing a stream asks an app launched for it to close
   (`xdg_toplevel.close`); other windows stay. Launched processes are reaped
   by pid only, never the agent's shells.
+* X11 apps: wlroots' Xwayland, lazily. The agent listens on the next free X
+  display at start (logged: `X11 apps: DISPLAY=:N or
+  DISPLAY=$XDG_RUNTIME_DIR/ffxiv-0-x11`); the Xwayland server starts when
+  the first X11 client connects (logged with how long it took) and stops 10 s
+  after the last one leaves. `$XDG_RUNTIME_DIR/<socket>-x11` is a symlink to
+  the display's socket, a name that does not change with the number (libxcb
+  accepts a socket path as `DISPLAY`). `GHOSTTY_XWAYLAND=off` leaves Xwayland
+  out, `=eager` starts it with the agent; no `Xwayland` binary means no X11.
+  A mapped X11 toplevel is a window like an xdg one (WLIST with its WM_CLASS
+  class as app, streams, input, close as `WM_DELETE_WINDOW`), rendered at
+  scale 1 (X11 apps draw at 1x; scaling their buffers would only blur them).
+  The client pid for `run:` matching is `_NET_WM_PID`. Position and size
+  requests are granted as asked. An override-redirect window (menu, tooltip)
+  is drawn into the output of the window it belongs to (its transient-for
+  parent's, else the X11 window of its process it lies over, else one of its
+  process, else the focused X11 window), at its root position relative to
+  that window's. The pointer over no surface still goes to the X11 window,
+  so a click outside ends a menu's grab.
 * Input: the stream that gets input gets the keyboard focus (one toplevel at a
   time). Pointer events go to the surface under the point in that window's
   scene (popups included), with `BTN_LEFT/RIGHT/MIDDLE`. WHEEL `dy` is 1/120
@@ -331,7 +350,6 @@ no host compositor: the host desktop never sees these windows.
 
 Limits, all current:
 
-* No Xwayland yet: X11-only apps do not show up (DISPLAY is unset for them).
 * Popups are constrained to the window and clipped to it.
 * TEXT reaches only characters the layout types at level 1 or 2; others (for
   "us": accented letters, emoji) are dropped with one log line. text-input-v3
@@ -516,6 +534,14 @@ pixman 0.46.2; agent built with zig cc), with `yad` 9.3 (GTK 3.24.52) as the cli
   WOPEN `run:yad …` answered WOPENED sid 1, a 500×337 KEY frame followed,
   a click and TEXT produced 4 delta frames, WCLOSE closed the app.
 
+* `test_wayland_compositor`, 2026-09-19, X11: `run:env GDK_BACKEND=x11 yad
+  --text-info --editable --width=500 --height=300` started Xwayland lazily
+  (Xwayland 24.1 on this host; "ready after" 67 and 124 ms in two runs, glamor
+  unavailable so software) and mapped 0.19 to 0.40 s after WOPEN, Xwayland
+  start included; the first frame was 500×300 (scale 1), WLIST listed `2 500
+  300 Yad ghostty-x11-test`, a click and TEXT `typed into X11\n` changed 504
+  pixels and showed the text in the saved picture, closing the stream closed
+  yad. Override-redirect menus were not exercised by this test.
 * `test_e2e_wayland` (in `tests/run.sh`): the plugin's own agent client
   (`core/agent_client.nelua`, decoding as `core/app/remotewin.nelua` does)
   against a real agent run with `--windows wayland --wayland-socket …` and no
