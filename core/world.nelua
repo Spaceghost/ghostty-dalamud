@@ -80,6 +80,8 @@ global WorldPlacement = @record{
   light_r: float32, light_g: float32, light_b: float32,
   light_shadows: boolean,   -- the light casts shadows (expensive)
   pet: boolean,             -- its anchor is a pet (the title button offers a pin), else a pin of some kind
+  order_prev: boolean,      -- a pet with a neighbour before it in the pet order (the left edge's arrow)
+  order_next: boolean,      -- and after it (the right edge's arrow)
 }
 
 global WorldBasis = @record{
@@ -546,6 +548,40 @@ end
 -- Left edge of a button's 26 px square.
 global function world_title_button_x(width: float32, button: integer): float32
   return width - 30 - WORLD_BUTTON_PITCH * (button - 1)
+end
+
+-- A pet's arrows, halfway down its left and right edges: swap places with its
+-- neighbour in the pet order. Not title buttons, but hit tested and hinted
+-- like them.
+global WORLD_BUTTON_ORDER_PREV: integer <comptime> = 6
+global WORLD_BUTTON_ORDER_NEXT: integer <comptime> = 7
+global WORLD_ORDER_W: float32 <comptime> = 30
+global WORLD_ORDER_H: float32 <comptime> = 64
+
+-- Which arrow (if any) panel pixel (u, v) is on; only arrows that are shown.
+global function world_order_button(width: float32, height: float32, u: float32, v: float32, prev: boolean, next: boolean): integer
+  if v < (height - WORLD_ORDER_H) * 0.5 or v >= (height + WORLD_ORDER_H) * 0.5 then return WORLD_BUTTON_NONE end
+  if prev and u >= 2 and u < 2 + WORLD_ORDER_W then return WORLD_BUTTON_ORDER_PREV end
+  if next and u > width - 2 - WORLD_ORDER_W and u <= width - 2 then return WORLD_BUTTON_ORDER_NEXT end
+  return WORLD_BUTTON_NONE
+end
+
+-- Draw-list surgery for "under the other plugins' overlays": the commands
+-- from `base` on move before the commands [0, base), order kept on both sides
+-- (three reversals, in place). Every command keeps its own IdxOffset and
+-- VtxOffset, which is all the renderer reads.
+local function reverse_cmds(c: *[0]ImDrawCmd, i: integer, j: integer): void
+  while i < j do
+    c[i], c[j] = c[j], c[i]
+    i, j = i + 1, j - 1
+  end
+end
+global function world_cmds_to_front(v: *ImVector_ImDrawCmd, base: integer): void
+  local n: integer = v.Size
+  if base <= 0 or base >= n then return end
+  reverse_cmds(v.Data, 0, base - 1)
+  reverse_cmds(v.Data, base, n - 1)
+  reverse_cmds(v.Data, 0, n - 1)
 end
 
 -- Camera position from the view-projection matrix: the one point whose clip
@@ -1379,6 +1415,9 @@ global WorldTuning = @record{
   shadows_offset: float32,       -- yalms behind the panel
   shadows_depth: float32,        -- Z scale
   shadows_transparency: float32, -- 0 drawn .. 1 gone
+  -- CONFIG.world.under_ui: world panels draw beneath what other plugins drew
+  -- into the background layer earlier in the frame (Umbra's toolbar)
+  under_ui: boolean,
 }
 
 global WORLD_SHADOW_MODEL: string <comptime> = 'bgcommon/hou/indoor/general/0766/bgparts/fun_b0_m0766.mdl'
@@ -1409,10 +1448,12 @@ global function world_read_tuning(L: *lua_State): WorldTuning
     drag_fit_min = 0.4, drag_fit_tolerance = 0.05,
     shadows = false, shadows_model_width = 4, shadows_model_height = 3, shadows_model_origin = 0,
     shadows_offset = 0.05, shadows_depth = 0.1, shadows_transparency = 0,
+    under_ui = true,
   }
   copy_path(&t.shadows_model, WORLD_SHADOW_MODEL)
   if L == nilptr or not push_config_world(L) then return t end
   local w = lua_gettop(L)
+  t.under_ui = lua_field_boolean(L, w, 'under_ui', t.under_ui)
   lua_getfield(L, w, 'present')
   if lua_type(L, -1) == LUA_TTABLE then
     local p = lua_gettop(L)

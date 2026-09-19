@@ -165,6 +165,8 @@ global Host = @record{
   cam_restore: boolean,
   world_occluded_toggle_id: integer, -- title button: keep running when unseen
   world_pet_toggle_id: integer,      -- title button: pin <-> pet where the panel is
+  world_order_id: integer,           -- a pet's edge arrow: moves it in the pet order
+  world_order_next: boolean,         -- which way: after its neighbour (else before)
   window_picker_open: boolean,       -- the Windows picker (/window, core/app/winpicker.nelua)
   world_tuning: WorldTuning,        -- CONFIG.world.present / walk, read each frame
   walk: WorldWalk,                  -- walking up to the clicked panel

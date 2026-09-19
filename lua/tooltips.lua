@@ -38,6 +38,8 @@ M['world.pin'] = 'Pin it in the world, right where it floats'
 M['world.sleep.on'] = 'Sleeps while nobody sees it; click to keep it running'
 M['world.sleep.off'] = 'Keeps running while unseen; click to let it sleep'
 M['world.resize'] = 'Drag to resize'
+M['world.order.prev'] = 'Swap places with the pet before it (to its left in the row); /term order left'
+M['world.order.next'] = 'Swap places with the pet after it (to its right in the row); /term order right'
 
 -- /help lines of the commands of their own (CONFIG.host.verb_commands).
 M['command./window'] = 'Desktop windows on world panels: the picker, or pull [match|#wid] | run CMD | list | close'

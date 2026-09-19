@@ -39,6 +39,19 @@ M.pet = {
   curve = 9.0,           -- curve radius in yalms (concave toward the character); larger = flatter, 0 = flat
   gap = 0.3,             -- minimum yalms between neighbouring pets
   turn_speed = 5.0,      -- radians per second the character turns to face a newly selected pet
+  around_step = 1.0,     -- radians: a pet with further to go round you goes the long way, a step at a time
+  -- While a panel is focused the other pets line up in a row beside it, at its
+  -- distance from you: earlier in the order to its left, later to its right,
+  -- smaller, and in tiers above it where a side would reach into a no-go cone
+  -- (behind you, between the camera and you). Back to their slots when focus leaves.
+  -- The order is yours: the arrows on a pet's edges or `/term order`.
+  lineup = {
+    enabled = true,
+    scale = 0.7,         -- size of the lined-up pets (1 = their own size)
+    gap = 0.2,           -- yalms between neighbours in the row
+    reach = 4.5,         -- yalms the row reaches out each side before a tier above begins
+    margin = 0.15,       -- yalms kept from the no-go cones
+  },
 }
 
 -- Clicking a panel presents it: it floats part of the way toward you and turns
@@ -110,6 +123,11 @@ M.occlusion = 'depth'
 M.occlusion_tolerance = 0.01  -- yalms a panel may sit behind a surface and still show (no flicker where they touch);
                               -- the depth test adds more with distance and at grazing angles
 M.occlusion_edge = 1          -- pixels over which a covered edge blends (0 = hard, up to 3)
+
+-- Panels draw beneath what other plugins put in the background layer
+-- earlier in the frame, such as Umbra's toolbar at the screen edge. false:
+-- panels paint over them as before.
+M.under_ui = true
 
 -- id -> anchor table
 M.anchors = {}
@@ -231,6 +249,7 @@ local function placement(a, x, y, z, yaw, pitch, width, height, ppy, opacity, cu
   if not out then out = {} a._out = out end
   out.run_occluded = a.run_occluded or false
   out.pet = a.kind == 'pet'
+  out.order_prev, out.order_next = false, false
   out.x, out.y, out.z, out.yaw, out.pitch = x, y, z, yaw, pitch
   out.width, out.height, out.pixels_per_yalm, out.opacity, out.curve = width, height, ppy, opacity, curve
   return lit(out, now)
@@ -259,6 +278,7 @@ function M.command(id, args)
   local a = words(args)
   local how = a[1] or 'here'
   if how == 'forget' then M.forget(id) return nil end
+  if how == 'order' then return M.reorder(id, a[2] or '') end
   if how == 'hide' then
     -- kept but not drawn (and out of the pet slots), e.g. during /term showcase
     local anchor = M.anchors[id]
@@ -307,7 +327,7 @@ end
 -- Fields a panel keeps when it turns from pin to pet and back: only those set
 -- on it (a terminal takes the new kind's default size; a window panel keeps
 -- the size lua/windows.lua gave it).
-local KEEP = { 'width', 'height', 'pixels_per_yalm', 'opacity', 'run_occluded', 'hidden' }
+local KEEP = { 'width', 'height', 'pixels_per_yalm', 'opacity', 'run_occluded', 'hidden', 'order' }
 
 -- Pin <-> pet at the panel's current pose (see `toggle` above).
 function M.toggle(id, x, y, z, yaw, pitch)
@@ -362,7 +382,7 @@ function M.drop(id, p)
     kind = 'world', zone = zone,
     x = p.x, y = p.y, z = p.z, yaw = p.yaw, pitch = p.pitch or 0,
     width = p.width, height = p.height, pixels_per_yalm = p.pixels_per_yalm,
-    opacity = old.opacity, run_occluded = old.run_occluded,
+    opacity = old.opacity, run_occluded = old.run_occluded, order = old.order,
   }
   if p.fit_width and p.fit_height and p.fit_width > 0 and p.fit_height > 0 then
     local lo = math.max(MIN_W / p.fit_width, MIN_H / p.fit_height)
@@ -381,7 +401,8 @@ end
 -- Anchors of live world terminals are saved keyed by agent session id, so a
 -- reload (or game restart) reattaches them into the world, not the dropdown.
 
-local TRANSIENT = { t = true, placed_at = true, px = true, pz = true }
+local TRANSIENT = { t = true, placed_at = true, px = true, pz = true, phw = true, ls = true,
+  lu_t = true, lu_ang = true, lu_dist = true, lu_y = true, lu_scale = true }
 
 local function state_path()
   return (GHOSTTY_PLUGIN_DIR or '.') .. '/world-state.lua'
@@ -449,18 +470,71 @@ function M.forget(id)
   M._pet_ids = nil
 end
 
--- Shown pets in id order, kept until an anchor comes, goes, hides or changes
--- kind (M.command, M.drop, M.restore, M.forget reset it).
+-- The pet order: each pet anchor keeps `order` (saved with it), smaller first.
+local function by_order(x, y)
+  local ox, oy = M.anchors[x].order, M.anchors[y].order
+  if ox ~= oy then return ox < oy end
+  return x < y
+end
+
+-- Shown pets in their order, kept until an anchor comes, goes, hides, changes
+-- kind or is reordered (M.command, M.drop, M.restore, M.forget reset it). A
+-- pet without a place in the order takes the next one after the rest.
 local function pet_ids()
   local ids = M._pet_ids
   if ids then return ids end
   ids = {}
+  local top = 0
   for id, a in pairs(M.anchors) do
     if a.kind == 'pet' and not a.hidden then ids[#ids + 1] = id end
+    if type(a.order) == 'number' and a.order > top then top = a.order end
   end
   table.sort(ids)
+  for _, id in ipairs(ids) do
+    local a = M.anchors[id]
+    if type(a.order) ~= 'number' then top = top + 1 a.order = top end
+  end
+  table.sort(ids, by_order)
   M._pet_ids = ids
   return ids
+end
+
+-- /term order left|right|first|last|N: moves pet `id` in the order (left and
+-- right swap it with its neighbour), which is both its slot beside you and its
+-- place in the row while a panel is focused.
+function M.reorder(id, how)
+  local a = M.anchors[id]
+  if not a then return 'not a world terminal' end
+  if a.kind ~= 'pet' or a.hidden then return 'only pets have a place in the order' end
+  M._pet_ids = nil
+  local ids = pet_ids()
+  local k = 1
+  for i, other in ipairs(ids) do if other == id then k = i end end
+  local to
+  if how == 'left' or how == 'prev' then to = k - 1
+  elseif how == 'right' or how == 'next' then to = k + 1
+  elseif how == 'first' then to = 1
+  elseif how == 'last' then to = #ids
+  elseif tonumber(how) then to = math.floor(tonumber(how))
+  else return 'usage: /term order left|right|first|last|N' end
+  to = math.max(1, math.min(#ids, to))
+  if to == k then return nil end
+  local list = {}
+  for i, other in ipairs(ids) do list[i] = other end
+  table.remove(list, k)
+  table.insert(list, to, id)
+  for i, other in ipairs(list) do M.anchors[other].order = i end
+  M._pet_ids = nil
+  return nil
+end
+
+-- Which panel is focused: the core says so to place(id, t, true) only, and
+-- may place it after the others, so this frame's answer falls back to the
+-- last frame's (one frame late at most).
+local focus = { t = nil, cur = nil, prev = nil }
+local function note_focus(id, t, focused)
+  if focus.t ~= t then focus.prev, focus.cur, focus.t = focus.cur, nil, t end
+  if focused then focus.cur = id end
 end
 
 -- Shared per-frame character state: smoothed heading and whether it is moving.
@@ -515,30 +589,22 @@ local function clear_of(x, z, p, back, half_angle)
   return x, z
 end
 
-function M.place_pet(id, a, p, t, focused)
-  local cfg = M.pet
-  update_body(p, t)
-  local dt = a.t and math.max(0, math.min(t - a.t, 0.1)) or 0
-  a.t = t
-
-  local width = a.width or cfg.width
-  local height = a.height or cfg.height
+local function pet_ppy(a)
   -- an anchor's own density wins (window panels, lua/windows.lua); a settings slider at 0 must not make NaN pets
-  local ppy = math.max(a.pixels_per_yalm or cfg.pixels_per_yalm or 0, 50)
-  local half_w = width / ppy / 2
-  local half_h = height / ppy / 2
+  return math.max(a.pixels_per_yalm or M.pet.pixels_per_yalm or 0, 50)
+end
+local function pet_half_w(a) return (a.width or M.pet.width) / pet_ppy(a) / 2 end
 
-  -- slots beside the character, alternating right / left and stepping back:
-  -- the usual camera sits behind the character, so the sides stay visible
-  -- without ever coming between the camera and the character
-  local ids = pet_ids()
-  local k = 1
-  for i, other in ipairs(ids) do if other == id then k = i end end
+-- Slot k beside the character, alternating right / left and stepping back:
+-- the usual camera sits behind the character, so the sides stay visible
+-- without ever coming between the camera and the character. Running swings
+-- the slots a little further back; never into the cone straight behind you
+-- (between you and the usual camera): pairs that no longer fit beside you
+-- stack further out instead. -> angle from the pets' heading, distance
+local function slot(k, half_w)
+  local cfg = M.pet
   local side_sign = (k % 2 == 1) and 1 or -1
   local level = (k - 1) // 2
-  -- running swings the slots a little further back; never into the cone
-  -- straight behind you (between you and the usual camera): pairs that no
-  -- longer fit beside you stack further out instead
   local run = math.max(0, math.min(1, (body.speed - cfg.walk_speed) / math.max(cfg.run_speed - cfg.walk_speed, 0.1)))
   local max_side = pi - cfg.behind_clear
   local want = cfg.side + level * cfg.step + run * cfg.run_back
@@ -547,44 +613,12 @@ function M.place_pet(id, a, p, t, focused)
     extra = math.ceil((want - max_side) / math.max(cfg.step, 0.1)) * cfg.stack_out
     want = max_side
   end
-  local slot = side_sign * want
-  local ang = body.heading + slot + sin(t * 0.11 + a.phase) * cfg.drift
   -- stay clear of the character: never closer than the panel's half width plus a margin
-  local dist = math.max(cfg.distance, half_w + 0.9) + extra
-  local tx = p.x + sin(ang) * dist
-  local tz = p.z + cos(ang) * dist
-  local ty = p.y + math.max(cfg.height_above, half_h + 0.2) + sin(t * 0.9 + a.phase) * cfg.bob
+  return side_sign * want, math.max(cfg.distance, half_w + 0.9) + extra
+end
 
-  local x = spring(a, 'x', tx, dt, cfg.stiffness, cfg.damping)
-  local y = spring(a, 'y', ty, dt, cfg.stiffness, cfg.damping)
-  local z = spring(a, 'z', tz, dt, cfg.stiffness, cfg.damping)
-
-  -- hard guarantees on top of the springs: outside the character's personal
-  -- space, and not overlapping pets already placed this frame
-  local dx, dz = x - p.x, z - p.z
-  local r = math.sqrt(dx * dx + dz * dz)
-  local min_r = half_w + 0.6
-  if r < min_r then
-    if r < 1e-3 then dx, dz, r = sin(ang), cos(ang), 1 end
-    x, z = p.x + dx / r * min_r, p.z + dz / r * min_r
-  end
-  for i = 1, k - 1 do
-    local o = M.anchors[ids[i]]
-    if o and o.placed_at == t and o.px then
-      local ox, oz = x - o.px, z - o.pz
-      local d = math.sqrt(ox * ox + oz * oz)
-      local need = half_w + (o.width or cfg.width) / ppy / 2 + cfg.gap
-      if d < need then
-        if d < 1e-3 then ox, oz, d = cos(ang), -sin(ang), 1 end
-        x, z = o.px + ox / d * need, o.pz + oz / d * need
-      end
-    end
-  end
-  -- the springs lag while you run or turn: keep the pet out of the cone behind
-  -- you (your facing while moving; the pets' frame while standing still)
-  -- and never between the camera and you, wherever the camera turns (focusing
-  -- a pet turns it; the other pets step aside rather than fill the view)
-  x, z = clear_of(x, z, p, (body.speed > cfg.walk_speed and p.rotation or body.heading) + pi, cfg.behind_clear)
+-- Direction from the character toward the camera, once per frame (nil unknown).
+local function camera_back(t)
   if M._ct ~= t then
     local fx, fz
     if ghostty.camera then
@@ -593,8 +627,189 @@ function M.place_pet(id, a, p, t, focused)
     end
     M._ct, M._cam_back = t, (fx and (fx * fx + fz * fz) > 1e-4) and atan(-fx, -fz) or nil
   end
-  if M._cam_back then x, z = clear_of(x, z, p, M._cam_back, cfg.camera_clear) end
-  a.placed_at, a.px, a.pz = t, x, z
+  return M._cam_back
+end
+
+-- Direction straight behind the character, the centre of the cone no pet enters.
+local function behind(p)
+  return (body.speed > M.pet.walk_speed and p.rotation or body.heading) + pi
+end
+
+-- Radians from direction `from`, turning `dir` (+1 or -1), before the cone of
+-- half_angle about `centre` begins (0 when `from` is inside it).
+local function room_before(from, dir, centre, half)
+  local d = (dir * (centre - from)) % (2 * pi)
+  if d > 2 * pi - half + 1e-3 then return 0 end
+  return math.max(0, d - half)
+end
+
+-- The way around the character from direction `cur` to `target`: -> dir
+-- (+1 or -1), radians. The way that enters neither no-go cone, else the
+-- shorter one.
+local function around(cur, target, p, t)
+  local cfg = M.pet
+  local back, cb = behind(p), camera_back(t)
+  local best_dir, best_arc, best_clear = 1, nil, false
+  for dir = -1, 1, 2 do
+    local arc = (dir * (target - cur)) % (2 * pi)
+    local clear = arc <= room_before(cur, dir, back, cfg.behind_clear) + 1e-3
+      and (not cb or arc <= room_before(cur, dir, cb, cfg.camera_clear) + 1e-3)
+    if best_arc == nil or (clear and not best_clear) or (clear == best_clear and arc < best_arc) then
+      best_dir, best_arc, best_clear = dir, arc, clear
+    end
+  end
+  return best_dir, best_arc
+end
+
+-- The row beside the focused pet, once per frame: each other pet gets lu_t,
+-- lu_ang (absolute), lu_dist, lu_y (centre above the feet) and lu_scale.
+-- The row runs straight through the focused pet, square to your line of
+-- sight to it, so each pet is turned a little more toward you the further out
+-- it sits. Earlier in the order goes to its left (a larger angle, seen from
+-- you looking at it), later to its right. A side that would reach into a
+-- no-go cone (behind you, between the camera and you) or past `reach` goes on
+-- in a tier above the focused pet instead.
+local function lineup(t, p)
+  if M._lu_t == t then return M._lu_on end
+  M._lu_t, M._lu_on = t, false
+  local cfg = M.pet
+  local lu = cfg.lineup
+  local fid = focus.cur or focus.prev
+  if not fid or type(lu) ~= 'table' or not lu.enabled then return false end
+  local ids = pet_ids()
+  if #ids < 2 then return false end
+  local fk
+  for i, id in ipairs(ids) do if id == fid then fk = i end end
+  if not fk then return false end
+  local fa = M.anchors[fid]
+  local fhw = pet_half_w(fa)
+  local fhh = (fa.height or cfg.height) / pet_ppy(fa) / 2
+  local frel, d = slot(fk, fhw)
+  local af = body.heading + frel
+  local fy = math.max(cfg.height_above, fhh + 0.2)
+  local back, cb = behind(p), camera_back(t)
+  local scale, gap, margin = lu.scale or 0.7, lu.gap or 0.2, lu.margin or 0.15
+  for dir = -1, 1, 2 do
+    local first, last, step = fk + 1, #ids, 1 -- later: to the right
+    if dir == 1 then first, last, step = fk - 1, 1, -1 end
+    if first >= 1 and first <= #ids then
+      -- how far out this side may reach (yalms along the row)
+      local room = math.min(pi / 2 - 0.05, room_before(af, dir, back, cfg.behind_clear))
+      if cb then room = math.min(room, room_before(af, dir, cb, cfg.camera_clear)) end
+      local reach = math.min(lu.reach or 4.5, math.max(0, d * math.tan(math.max(room, 0)) - margin))
+      local hh_max = 0
+      for j = first, last, step do
+        local o = M.anchors[ids[j]]
+        hh_max = math.max(hh_max, (o.height or cfg.height) / pet_ppy(o) / 2 * scale)
+      end
+      local tier, off, count = 0, fhw, 0
+      for j = first, last, step do
+        local o = M.anchors[ids[j]]
+        local h = pet_half_w(o) * scale
+        local c = off + gap + h
+        if c + h > reach and (count > 0 or tier == 0) then
+          -- the next tier up starts at the focused pet's middle: each side
+          -- keeps its own half above it
+          tier, off, count = tier + 1, -gap / 2, 0
+          c = off + gap + h
+        end
+        local y
+        if tier == 0 then
+          y = math.max(cfg.height_above, (o.height or cfg.height) / pet_ppy(o) / 2 * scale + 0.2)
+        else
+          y = fy + fhh + gap + hh_max + (tier - 1) * (2 * hh_max + gap)
+        end
+        o.lu_t, o.lu_ang, o.lu_dist, o.lu_y, o.lu_scale = t, af + dir * atan(c, d), math.sqrt(d * d + c * c), y, scale
+        off, count = c + h, count + 1
+      end
+    end
+  end
+  M._lu_on = true
+  return true
+end
+
+function M.place_pet(id, a, p, t, focused)
+  local cfg = M.pet
+  update_body(p, t)
+  local dt = a.t and math.max(0, math.min(t - a.t, 0.1)) or 0
+  a.t = t
+
+  local ids = pet_ids()
+  local k = 1
+  for i, other in ipairs(ids) do if other == id then k = i end end
+  local lined_up = lineup(t, p)
+  local in_row = lined_up and a.lu_t == t
+
+  -- lined up beside the focused pet, the pet shrinks by showing its pixels
+  -- denser (its terminal keeps its grid)
+  local s = spring(a, 'ls', in_row and a.lu_scale or 1, dt, cfg.stiffness, 1)
+  s = math.max(s, 0.05)
+  local width = a.width or cfg.width
+  local height = a.height or cfg.height
+  local ppy = pet_ppy(a) / s
+  local half_w = width / ppy / 2
+  local half_h = height / ppy / 2
+
+  local ang, dist
+  if in_row then
+    ang, dist = a.lu_ang, a.lu_dist
+  else
+    local rel
+    rel, dist = slot(k, pet_half_w(a))
+    ang = body.heading + rel + sin(t * 0.11 + a.phase) * cfg.drift
+  end
+  local tx = p.x + sin(ang) * dist
+  local tz = p.z + cos(ang) * dist
+  -- the springs pull in a straight line: a slot across the character (a pet
+  -- changing sides, lining up or going back) is reached around it instead,
+  -- the way that passes neither no-go cone, a step at a time
+  if a.x and a.z then
+    local cur = atan(a.x - p.x, a.z - p.z)
+    local dir, arc = around(cur, ang, p, t)
+    local step = cfg.around_step or 1.0
+    if arc > step then
+      local wa = cur + dir * step
+      tx, tz = p.x + sin(wa) * dist, p.z + cos(wa) * dist
+    end
+  end
+  local ty = p.y + (in_row and a.lu_y or math.max(cfg.height_above, half_h + 0.2)) + sin(t * 0.9 + a.phase) * cfg.bob
+
+  local x = spring(a, 'x', tx, dt, cfg.stiffness, cfg.damping)
+  local y = spring(a, 'y', ty, dt, cfg.stiffness, cfg.damping)
+  local z = spring(a, 'z', tz, dt, cfg.stiffness, cfg.damping)
+
+  -- hard guarantees on top of the springs: outside the character's personal
+  -- space, and (in the slots; the row is spaced already) not overlapping pets
+  -- already placed this frame
+  local dx, dz = x - p.x, z - p.z
+  local r = math.sqrt(dx * dx + dz * dz)
+  local min_r = half_w + 0.6
+  if r < min_r then
+    if r < 1e-3 then dx, dz, r = sin(ang), cos(ang), 1 end
+    x, z = p.x + dx / r * min_r, p.z + dz / r * min_r
+  end
+  if not lined_up then
+    for i = 1, k - 1 do
+      local o = M.anchors[ids[i]]
+      if o and o.placed_at == t and o.px then
+        local ox, oz = x - o.px, z - o.pz
+        local d = math.sqrt(ox * ox + oz * oz)
+        local need = half_w + (o.phw or pet_half_w(o)) + cfg.gap
+        if d < need then
+          if d < 1e-3 then ox, oz, d = cos(ang), -sin(ang), 1 end
+          x, z = o.px + ox / d * need, o.pz + oz / d * need
+        end
+      end
+    end
+  end
+  -- the springs lag while you run or turn: keep the pet out of the cone behind
+  -- you (your facing while moving; the pets' frame while standing still)
+  -- and never between the camera and you, wherever the camera turns (focusing
+  -- a pet turns it; the other pets step aside rather than fill the view)
+  x, z = clear_of(x, z, p, behind(p), cfg.behind_clear)
+  local cb = camera_back(t)
+  if cb then x, z = clear_of(x, z, p, cb, cfg.camera_clear) end
+  a.placed_at, a.px, a.pz, a.phw = t, x, z, half_w
   a.x, a.z = x, z -- keep the spring from fighting the constraint
 
   -- face the character (the concave side looks at it)
@@ -620,8 +835,11 @@ function M.place_pet(id, a, p, t, focused)
     a.faced = false
   end
 
-  return placement(a, x, y, z, yaw, 0, width, height, ppy, a.opacity or M.defaults.opacity,
+  local out = placement(a, x, y, z, yaw, 0, width, height, ppy, a.opacity or M.defaults.opacity,
     cfg.curve > 0 and math.max(cfg.curve, half_w * 2.5) or 0, t)
+  -- the arrows on its edges: a neighbour to swap places with in the order
+  out.order_prev, out.order_next = k > 1, k < #ids
+  return out
 end
 
 -- Walking up makes sense for panels that stay put when you move: pins in the
@@ -633,6 +851,7 @@ function M.walkable(id)
 end
 
 function M.place(id, t, focused)
+  note_focus(id, t, focused)
   local a = M.anchors[id]
   if not a or a.hidden then return nil end
 

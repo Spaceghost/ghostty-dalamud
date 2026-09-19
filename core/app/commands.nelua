@@ -340,6 +340,15 @@ global function run_command(cmd: string): cint
     if s == nilptr then return 5 end
     bring_forward(s)
     return 0
+  elseif verb == 'order' then
+    -- /term order left|right|first|last|N: the focused pet's place in the pet order
+    local s = find_session(host.world_focus)
+    if s == nilptr then sayf(LOG_WARN, 'order: no focused world panel') return 5 end
+    local e = policy_world_command(s.id, cmd)
+    local rc: cint = 0
+    if #e > 0 then sayf(LOG_WARN, 'order: %s', e) rc = 4 end
+    e:destroy()
+    return rc
   elseif verb == 'occluded' then
     -- /term occluded on|off: whether the focused world screen keeps running unseen
     local s = find_session(host.world_focus)
