@@ -413,6 +413,7 @@ return {
 | `/term pin [here\|me\|target\|orbit]` | pin the active tab (or a new terminal) into the world |
 | `/term unpin` | the focused world terminal goes back to the drop-down |
 | `/term pet` | a terminal that floats beside your character |
+| `/term pin hud [X Y] [DIST]` | dock the focused world panel (or the active tab) to the screen at X, Y (fractions 0..1; default where it shows); it floats just in front of the camera and sways a little as the camera turns (not yet observed in game) |
 | `/term occluded on\|off` | whether the focused world screen keeps running while unseen |
 | `/term min [id]`, `/term restore [id]`, `/term focus id` | minimise, restore or raise a terminal |
 | `/term send [#id] text`, `/term type [#id] text` | type into a terminal, with or without Enter |

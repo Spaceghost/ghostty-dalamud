@@ -65,6 +65,7 @@ global WorldPlacement = @record{
   x: float32, y: float32, z: float32,
   yaw: float32,           -- direction the readable side faces
   pitch: float32,         -- tilt back, radians
+  roll: float32,          -- turn about the front normal, radians (counterclockwise as seen from the front)
   width: float32,         -- panel size in terminal pixels
   height: float32,
   ppm: float32,           -- terminal pixels per world unit (yalm)
@@ -80,11 +81,12 @@ global WorldPlacement = @record{
   light_r: float32, light_g: float32, light_b: float32,
   light_shadows: boolean,   -- the light casts shadows (expensive)
   pet: boolean,             -- its anchor is a pet (the title button offers a pin), else a pin of some kind
+  hud: boolean,             -- docked to the screen: always in front (no occlusion), no present, no shadow board
 }
 
 global WorldBasis = @record{
   cx: float32, cy: float32, cz: float32,
-  rx: float32, rz: float32,              -- unit right (horizontal)
+  rx: float32, ry: float32, rz: float32, -- unit right (horizontal unless rolled)
   fx: float32, fz: float32,              -- unit front normal (toward the viewer)
   ux: float32, uy: float32, uz: float32, -- up, world units per pixel
   ypp: float32,                          -- yalms per pixel
@@ -97,15 +99,18 @@ global WorldBasis = @record{
 global function world_basis(p: WorldPlacement): WorldBasis
   local sy, cy = math.sin(p.yaw), math.cos(p.yaw)
   local sp, cp = math.sin(p.pitch), math.cos(p.pitch)
+  local sr, cr = math.sin(p.roll), math.cos(p.roll)
   local inv = 1.0 / (p.ppm > 0 and p.ppm or 300.0)
   -- front normal f = (sy, 0, cy); a viewer in front looks along -f and sees
-  -- right = up x f = (cy, 0, -sy)
+  -- right = up x f = (cy, 0, -sy); tilt: up leans back away from the viewer,
+  -- (-sy sp, cp, -cy sp); roll turns both about the panel's normal
+  local r0x, r0z = cy, -sy
+  local u0x, u0y, u0z = -sy * sp, cp, -cy * sp
   local b: WorldBasis = {
     cx = p.x, cy = p.y, cz = p.z,
-    rx = (@float32)(cy), rz = (@float32)(-sy),
+    rx = (@float32)(cr * r0x + sr * u0x), ry = (@float32)(sr * u0y), rz = (@float32)(cr * r0z + sr * u0z),
     fx = (@float32)(sy), fz = (@float32)(cy),
-    -- tilt: up leans back away from the viewer
-    ux = (@float32)(-sy * sp * inv), uy = (@float32)(cp * inv), uz = (@float32)(-cy * sp * inv),
+    ux = (@float32)((cr * u0x - sr * r0x) * inv), uy = (@float32)(cr * u0y * inv), uz = (@float32)((cr * u0z - sr * r0z) * inv),
     ypp = (@float32)(inv),
     curve = p.curve,
     hw = p.width * 0.5, hh = p.height * 0.5,
@@ -128,7 +133,7 @@ global function world_point(b: *WorldBasis, u: float32, v: float32): (float32, f
     forward = b.curve * (1.0 - math.cos(ang))
   end
   return b.cx + b.rx * lateral + b.fx * forward + b.ux * dv,
-         b.cy + b.uy * dv,
+         b.cy + b.ry * lateral + b.uy * dv,
          b.cz + b.rz * lateral + b.fz * forward + b.uz * dv
 end
 
@@ -398,7 +403,9 @@ global function world_panel_projection(cam: *GuCamera, b: *WorldBasis): WorldPan
   pre.base_w = (@float32)(cx * m[3] + cy * m[7] + cz * m[11] + m[15])
   -- lat(-s) = -lat(s) and fwd(-s) = fwd(s): mirroring flips the right axis only
   local sign: float32 = b.mirror and -1 or 1
-  pre.r_x, pre.r_y, pre.r_w = sign * (b.rx * m[0] + b.rz * m[8]), sign * (b.rx * m[1] + b.rz * m[9]), sign * (b.rx * m[3] + b.rz * m[11])
+  pre.r_x = sign * (b.rx * m[0] + b.ry * m[4] + b.rz * m[8])
+  pre.r_y = sign * (b.rx * m[1] + b.ry * m[5] + b.rz * m[9])
+  pre.r_w = sign * (b.rx * m[3] + b.ry * m[7] + b.rz * m[11])
   pre.f_x, pre.f_y, pre.f_w = b.fx * m[0] + b.fz * m[8], b.fx * m[1] + b.fz * m[9], b.fx * m[3] + b.fz * m[11]
   pre.u_x = b.ux * m[0] + b.uy * m[4] + b.uz * m[8]
   pre.u_y = b.ux * m[1] + b.uy * m[5] + b.uz * m[9]
@@ -564,6 +571,93 @@ global function world_camera_position(cam: *GuCamera): (boolean, float32, float3
   return true, (@float32)(x), (@float32)(y), (@float32)(z)
 end
 
+-- The camera as a frame: position, unit forward, screen-right and screen-up
+-- in the world, and the tangents of the half field of view, all from the
+-- view-projection matrix (the game's projection is symmetric). A point at
+-- depth d along forward, a * d * tan_x to the right and b * d * tan_y up
+-- lands at NDC (a, b).
+global WorldView = @record{
+  x: float32, y: float32, z: float32,
+  fx: float32, fy: float32, fz: float32,
+  rx: float32, ry: float32, rz: float32,
+  ux: float32, uy: float32, uz: float32,
+  tan_x: float32, tan_y: float32,
+  width: float32, height: float32, -- the game view in pixels
+}
+
+global function world_view(cam: *GuCamera): (boolean, WorldView)
+  local v: WorldView
+  local ok, px, py, pz = world_camera_position(cam)
+  if not ok or cam.width < 1 or cam.height < 1 then return false, v end
+  local m = &cam.m
+  local wx: float64, wy: float64, wz: float64 = m[3], m[7], m[11]
+  local wl = math.sqrt(wx * wx + wy * wy + wz * wz)
+  if wl < 1e-9 then return false, v end
+  local fx, fy, fz = wx / wl, wy / wl, wz / wl
+  -- clip x and y rows with any forward part (an off-centre projection) taken out
+  local ax: float64, ay: float64, az: float64 = m[0], m[4], m[8]
+  local d = ax * fx + ay * fy + az * fz
+  ax, ay, az = ax - d * fx, ay - d * fy, az - d * fz
+  local bx: float64, by: float64, bz: float64 = m[1], m[5], m[9]
+  d = bx * fx + by * fy + bz * fz
+  bx, by, bz = bx - d * fx, by - d * fy, bz - d * fz
+  local al, bl = math.sqrt(ax * ax + ay * ay + az * az), math.sqrt(bx * bx + by * by + bz * bz)
+  if al < 1e-9 or bl < 1e-9 then return false, v end
+  v = {
+    x = px, y = py, z = pz,
+    fx = (@float32)(fx), fy = (@float32)(fy), fz = (@float32)(fz),
+    rx = (@float32)(ax / al), ry = (@float32)(ay / al), rz = (@float32)(az / al),
+    ux = (@float32)(bx / bl), uy = (@float32)(by / bl), uz = (@float32)(bz / bl),
+    tan_x = (@float32)(wl / al), tan_y = (@float32)(wl / bl),
+    width = cam.width, height = cam.height,
+  }
+  return true, v
+end
+
+-- A HUD panel (lua/world.lua `hud`) is docked at a screen spot in fractions
+-- of the view (0..1, y down) and drawn `scale` screen pixels per panel pixel.
+-- Where a panel centred at world (x, y, z) with `ppm` panel pixels per yalm
+-- shows now: its screen fractions and that scale; false behind the camera.
+global function world_hud_spot(v: *WorldView, x: float32, y: float32, z: float32, ppm: float32): (boolean, float32, float32, float32)
+  local dx, dy, dz = x - v.x, y - v.y, z - v.z
+  local depth = dx * v.fx + dy * v.fy + dz * v.fz
+  if depth < 0.05 or ppm <= 0 then return false, 0.5, 0.5, 1 end
+  local nx = (dx * v.rx + dy * v.ry + dz * v.rz) / (depth * v.tan_x)
+  local ny = (dx * v.ux + dy * v.uy + dz * v.uz) / (depth * v.tan_y)
+  return true, (nx + 1) * 0.5, (1 - ny) * 0.5, v.height / (2 * depth * v.tan_y * ppm)
+end
+
+-- Docking by dragging: letting a carried panel go with the pointer within
+-- `edge` pixels of a side or corner of the view (or with `force`, Ctrl) docks
+-- it there as a HUD panel. Its centre is where the carry had it (the pointer
+-- less `grab`, the held point's offset from the centre in screen pixels),
+-- pushed in so the panel (half size hw x hh on screen) sits `margin` pixels
+-- inside every side it was dropped at, and kept on screen.
+global WorldDock = @record{
+  ok: boolean,
+  x: float32, y: float32,           -- centre, fractions of the view
+  left: boolean, right: boolean, top: boolean, bottom: boolean, -- the sides it snapped to
+}
+
+global function world_hud_dock(w: float32, h: float32, px: float32, py: float32, gx: float32, gy: float32,
+                               hw: float32, hh: float32, edge: float32, margin: float32, force: boolean): WorldDock
+  local out: WorldDock
+  if w < 1 or h < 1 then return out end
+  out.left, out.right = px <= edge, px >= w - edge
+  out.top, out.bottom = py <= edge, py >= h - edge
+  out.ok = force or out.left or out.right or out.top or out.bottom
+  if not out.ok then return out end
+  -- a panel bigger than the view centres on that axis
+  hw, hh = math.min(hw, w * 0.5 - margin), math.min(hh, h * 0.5 - margin)
+  local cx, cy = px - gx, py - gy
+  if out.left then cx = margin + hw elseif out.right then cx = w - margin - hw end
+  if out.top then cy = margin + hh elseif out.bottom then cy = h - margin - hh end
+  if hw > 0 then cx = math.clamp(cx, margin + hw, w - margin - hw) else cx = w * 0.5 end
+  if hh > 0 then cy = math.clamp(cy, margin + hh, h - margin - hh) else cy = h * 0.5 end
+  out.x, out.y = cx / w, cy / h
+  return out
+end
+
 -- Panel depth against the game's depth buffer ----------------------------------
 -- What hides panel pixels behind the scene (CONFIG.world.occlusion): nothing,
 -- the character capsule above, or a per-pixel test against the game's depth
@@ -671,7 +765,7 @@ end
 -- inverse([R F U]) with R, F, U as columns. U tilts with pitch, so this is
 -- not a transpose.
 global function world_basis_inverse(b: *WorldBasis): (boolean, [9]float64)
-  local a: [9]float64 = { b.rx, b.fx, b.ux, 0, 0, b.uy, b.rz, b.fz, b.uz }
+  local a: [9]float64 = { b.rx, b.fx, b.ux, b.ry, 0, b.uy, b.rz, b.fz, b.uz }
   return mat3_inverse(a)
 end
 
@@ -959,7 +1053,8 @@ global function world_drag_pose(pl: WorldPlacement, ox: float32, oy: float32, oz
   local a = world_axes(out.yaw, 0)
   local du, dv = (u - pl.width * 0.5) * ypp, (pl.height * 0.5 - v) * ypp
   out.x, out.y, out.z = gx - a.rx * du, gy - dv, gz - a.rz * du
-  out.pitch, out.curve = 0, 0
+  out.pitch, out.roll, out.curve = 0, 0, 0
+  out.hud = false
   return out
 end
 
@@ -1299,6 +1394,39 @@ local function l_camera(L: *lua_State): cint
   return 3
 end
 
+-- ghostty.view([t]) -> { x, y, z, fx, fy, fz, rx, ry, rz, ux, uy, uz, tan_x,
+-- tan_y, width, height, yaw, pitch }: the camera's position, its forward,
+-- screen-right and screen-up unit vectors, the tangents of half its field of
+-- view, the view size in pixels, and its heading and pitch (radians; forward
+-- is (sin yaw cos pitch, sin pitch, cos yaw cos pitch)). nil if unknown.
+-- Fills and returns table t when given one.
+local function l_view(L: *lua_State): cint
+  local cam: GuCamera
+  if world_host.get_camera == nilptr or world_host.get_camera(&cam) == 0 then lua_pushnil(L) return 1 end
+  local ok, v = world_view(&cam)
+  if not ok then lua_pushnil(L) return 1 end
+  if lua_type(L, 1) == LUA_TTABLE then lua_pushvalue(L, 1) else lua_createtable(L, 0, 18) end
+  lua_pushnumber(L, v.x) lua_setfield(L, -2, 'x')
+  lua_pushnumber(L, v.y) lua_setfield(L, -2, 'y')
+  lua_pushnumber(L, v.z) lua_setfield(L, -2, 'z')
+  lua_pushnumber(L, v.fx) lua_setfield(L, -2, 'fx')
+  lua_pushnumber(L, v.fy) lua_setfield(L, -2, 'fy')
+  lua_pushnumber(L, v.fz) lua_setfield(L, -2, 'fz')
+  lua_pushnumber(L, v.rx) lua_setfield(L, -2, 'rx')
+  lua_pushnumber(L, v.ry) lua_setfield(L, -2, 'ry')
+  lua_pushnumber(L, v.rz) lua_setfield(L, -2, 'rz')
+  lua_pushnumber(L, v.ux) lua_setfield(L, -2, 'ux')
+  lua_pushnumber(L, v.uy) lua_setfield(L, -2, 'uy')
+  lua_pushnumber(L, v.uz) lua_setfield(L, -2, 'uz')
+  lua_pushnumber(L, v.tan_x) lua_setfield(L, -2, 'tan_x')
+  lua_pushnumber(L, v.tan_y) lua_setfield(L, -2, 'tan_y')
+  lua_pushnumber(L, v.width) lua_setfield(L, -2, 'width')
+  lua_pushnumber(L, v.height) lua_setfield(L, -2, 'height')
+  lua_pushnumber(L, math.atan(v.fx, v.fz)) lua_setfield(L, -2, 'yaw')
+  lua_pushnumber(L, math.asin(math.clamp(v.fy, -1, 1))) lua_setfield(L, -2, 'pitch')
+  return 1
+end
+
 -- ghostty.log(msg): write a [Ghostty] line to the Dalamud log
 local function l_log(L: *lua_State): cint
   local msg = lua_tolstring(L, 1, nilptr)
@@ -1322,13 +1450,14 @@ local function l_env(L: *lua_State): cint
 end
 
 global function world_lua_register(L: *lua_State): void
-  lua_createtable(L, 0, 11)
+  lua_createtable(L, 0, 12)
   lua_pushcclosure(L, l_env, 0) lua_setfield(L, -2, 'env')
   ui_lua_register(L)
   lua_pushcclosure(L, l_set_rotation, 0) lua_setfield(L, -2, 'set_rotation')
   lua_pushcclosure(L, l_anim_speed, 0) lua_setfield(L, -2, 'anim_speed')
   lua_pushcclosure(L, l_log, 0) lua_setfield(L, -2, 'log')
   lua_pushcclosure(L, l_camera, 0) lua_setfield(L, -2, 'camera')
+  lua_pushcclosure(L, l_view, 0) lua_setfield(L, -2, 'view')
   lua_pushcclosure(L, l_anim_state, 0) lua_setfield(L, -2, 'anim_state')
   lua_pushcclosure(L, l_anim_set, 0) lua_setfield(L, -2, 'anim_set')
   lua_pushcclosure(L, l_anim_play, 0) lua_setfield(L, -2, 'anim_play')
@@ -1370,6 +1499,10 @@ global WorldTuning = @record{
   drag_fit_margin: float32,
   drag_fit_min: float32,
   drag_fit_tolerance: float32,
+  -- CONFIG.world.hud: docking a carried panel to the screen
+  hud_dock: boolean,
+  hud_edge: float32,             -- pixels from a side of the view that dock
+  hud_margin: float32,           -- pixels a docked panel keeps from that side
   -- CONFIG.world.shadows: a board behind each panel that casts its shadow (experimental)
   shadows: boolean,
   shadows_model: [256]cchar,     -- game path of the flat model, NUL-terminated ('' = none)
@@ -1407,6 +1540,7 @@ global function world_read_tuning(L: *lua_State): WorldTuning
     drag = true, drag_wheel_step = 0.35, drag_min_distance = 0.8, drag_max_distance = 40, drag_reach = 80,
     drag_offset = 0.02, drag_probe = 0.15, drag_fit_max = 3, drag_fit_step = 0.1, drag_fit_margin = 0.05,
     drag_fit_min = 0.4, drag_fit_tolerance = 0.05,
+    hud_dock = true, hud_edge = 40, hud_margin = 16,
     shadows = false, shadows_model_width = 4, shadows_model_height = 3, shadows_model_origin = 0,
     shadows_offset = 0.05, shadows_depth = 0.1, shadows_transparency = 0,
   }
@@ -1453,6 +1587,14 @@ global function world_read_tuning(L: *lua_State): WorldTuning
     t.drag_fit_margin = (@float32)(lua_field_number(L, k, 'fit_margin', t.drag_fit_margin))
     t.drag_fit_min = (@float32)(lua_field_number(L, k, 'fit_min', t.drag_fit_min))
     t.drag_fit_tolerance = (@float32)(lua_field_number(L, k, 'fit_tolerance', t.drag_fit_tolerance))
+  end
+  lua_pop(L, 1)
+  lua_getfield(L, w, 'hud')
+  if lua_type(L, -1) == LUA_TTABLE then
+    local k = lua_gettop(L)
+    t.hud_dock = lua_field_boolean(L, k, 'dock', t.hud_dock)
+    t.hud_edge = (@float32)(math.clamp(lua_field_number(L, k, 'edge', t.hud_edge), 0, 400))
+    t.hud_margin = (@float32)(math.clamp(lua_field_number(L, k, 'margin', t.hud_margin), 0, 400))
   end
   lua_pop(L, 1)
   lua_getfield(L, w, 'shadows')

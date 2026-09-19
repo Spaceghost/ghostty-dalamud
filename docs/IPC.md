@@ -113,12 +113,12 @@ The window panels, oldest first, and the results of recent changes.
 * `state`: `pending` (asked, not opened yet), `live`, `ended` (the window
   closed or the connection went; the panel closes 2 s later; also while a
   closed panel glitches out).
-* `kind`: `pet` (floats beside the character), `pin` (placed in the world:
+* `kind`: `pet` (floats beside the character), `hud` (docked to the screen), `pin` (placed in the world:
   here, me, target, orbit …), `full` (full screen), `tab` (popped into the
   dropdown for a moment; window panels go back out).
 * `anchor`: the world anchor as it is, also while `full` or `tab`: `pet`,
   `pin` (fixed in the world), `me` or `target` (following a character),
-  `orbit`, or `none`.
+  `orbit`, `hud` (docked to the screen), or `none`.
 * `hidden`: hidden by `window.hide` (not drawn, not streamed).
 * `focused`: the panel has the keyboard.
 * `agent`: the agent streaming it (`default`, the only one so far).
@@ -210,7 +210,13 @@ does it for the focused panel.
 ```
 
 Moves the panel as `/term pin ARGS` does on a focused window panel, keeping
-its size. `"pet"` makes it a pet again.
+its size. `"pet"` makes it a pet again. `"hud X Y"` (optionally `"hud X Y
+DIST"`) docks it to the screen: its centre at X, Y in fractions of the game
+view (0..1 from the top left), DIST yalms in front of the camera, at the size
+it shows now; `"hud"` alone docks it where it shows. A HUD panel floats in 3D
+just in front of the camera, lags and twists a little when the camera turns,
+and is always drawn in front of the world. `window.toggle_pet` turns a HUD
+panel into a pet. Not yet observed in game.
 
 ### terminal.new
 

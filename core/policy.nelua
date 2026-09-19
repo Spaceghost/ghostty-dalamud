@@ -694,6 +694,7 @@ global function policy_world_place(id: integer, t: float64, focused: boolean): (
     pl.z = (@float32)(lua_field_number(L, r, 'z', 0))
     pl.yaw = (@float32)(lua_field_number(L, r, 'yaw', 0))
     pl.pitch = (@float32)(lua_field_number(L, r, 'pitch', 0))
+    pl.roll = (@float32)(lua_field_number(L, r, 'roll', 0))
     pl.width = (@float32)(lua_field_number(L, r, 'width', 900))
     pl.height = (@float32)(lua_field_number(L, r, 'height', 520))
     pl.ppm = (@float32)(lua_field_number(L, r, 'pixels_per_yalm', 300))
@@ -711,6 +712,7 @@ global function policy_world_place(id: integer, t: float64, focused: boolean): (
     pl.light_b = (@float32)(lua_field_number(L, r, 'light_b', 1))
     pl.light_shadows = lua_field_boolean(L, r, 'light_shadows', false)
     pl.pet = lua_field_boolean(L, r, 'pet', false)
+    pl.hud = lua_field_boolean(L, r, 'hud', false)
     ok = true
   end
   lua_pop(L, 3)
@@ -807,6 +809,32 @@ global function policy_world_resize(id: integer, w: float64, h: float64): void
   lua_pushnumber(L, h)
   if lua_pcall(L, 3, 0, 0) ~= LUA_OK then log_hook_error(L, POLICY_HOOK_RESIZE, 'world.resize') lua_pop(L, 1) end
   lua_pop(L, 2)
+end
+
+-- CONFIG.world.dock(terminal_id, x, y, scale) -> nil or an error string: a
+-- carried panel let go at a side of the view (or with Ctrl) docks there as a
+-- HUD panel, its centre at (x, y) in fractions of the view, `scale` screen
+-- pixels per panel pixel.
+global function policy_world_dock(id: integer, x: float32, y: float32, scale: float32): string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return string.copy('no config') end
+  if not push_world_fn(L, 'dock') then return string.copy('lua/world.lua has no dock') end
+  lua_pushinteger(L, id)
+  lua_pushnumber(L, x)
+  lua_pushnumber(L, y)
+  lua_pushnumber(L, scale)
+  local err: string
+  if lua_pcall(L, 4, 1, 0) ~= LUA_OK or lua_type(L, -1) == LUA_TSTRING then
+    local len: usize = 0
+    local msg = lua_tolstring(L, -1, &len)
+    if msg ~= nilptr then
+      err = string.copy(string{data=(@*[0]byte)(msg), size=len})
+    else
+      err = string.copy('lua error')
+    end
+  end
+  lua_pop(L, 3)
+  return err
 end
 
 -- CONFIG.world.drop(terminal_id, pose) -> nil or an error string: a panel
