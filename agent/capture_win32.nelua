@@ -1,0 +1,720 @@
+-- The Win32 window capture backend of ghostty-agent.exe (docs/REMOTE_WINDOWS.md,
+-- "Windows"). Implements the CaptureBackend of agent/capture.nelua with plain
+-- GDI and window messages, no WinRT or D3D:
+--
+--   list   EnumWindows: visible, not cloaked, unowned, not tool windows, with
+--          a title and a non-empty client area
+--   frame  PrintWindow(PW_CLIENTONLY | PW_RENDERFULLCONTENT) into a reused
+--          top-down 32bpp DIB section (occluded, DirectX and Chromium windows
+--          on Windows 8.1+), BitBlt from the window DC when that fails
+--   input  window messages to the window (or its deepest child under the
+--          point), which leave the user's foreground alone; after a FOCUS,
+--          while the window is in the foreground, SendInput, which makes
+--          shortcuts work
+--
+-- Window ids: the HWND truncated to 32 bits. Windows keeps window handles
+-- 32-bit significant on 64-bit systems (so 32- and 64-bit processes can share
+-- them); the id is sign-extended back into a handle.
+--
+-- Windows.Graphics.Capture would be faster (GPU frames, no WM_PRINT round
+-- trip) and is the upgrade path, but needs WinRT and D3D11; not done here.
+-- The pure parts live in agent/capture_win32_logic.nelua (host-tested).
+require 'string'
+require 'vector'
+require 'stringbuilder'
+require 'memory'
+require 'core.protocol'
+require 'agent.capture'
+require 'agent.capture_win32_logic'
+
+## cinclude '<windows.h>'
+## cinclude '<dwmapi.h>'
+## linklib 'user32'
+## linklib 'gdi32'
+## linklib 'dwmapi'
+
+local RECT <cimport, nodecl> = @record{ left: int32, top: int32, right: int32, bottom: int32 }
+local POINT <cimport, nodecl> = @record{ x: int32, y: int32 }
+-- declared with only the fields used: the C compiler knows the real layouts
+local BITMAPINFOHEADER <cimport, nodecl> = @record{
+  biSize: uint32, biWidth: int32, biHeight: int32, biPlanes: uint16, biBitCount: uint16, biCompression: uint32,
+}
+local BITMAPINFO <cimport, nodecl> = @record{ bmiHeader: BITMAPINFOHEADER }
+local SIZEOF_BITMAPINFOHEADER: uint32 <cimport 'sizeof(BITMAPINFOHEADER)', nodecl, const>
+local GUITHREADINFO <cimport, nodecl> = @record{ cbSize: uint32, hwndFocus: pointer }
+local SIZEOF_GUITHREADINFO: uint32 <cimport 'sizeof(GUITHREADINFO)', nodecl, const>
+-- INPUT spelled out in full (its union is anonymous in C, so it cannot be
+-- borrowed with nodecl); cw32_backend checks the size against the C one.
+local MOUSEINPUT = @record{ dx: int32, dy: int32, mouseData: uint32, dwFlags: uint32, time: uint32, extra: usize }
+local KEYBDINPUT = @record{ wVk: uint16, wScan: uint16, dwFlags: uint32, time: uint32, extra: usize }
+local INPUT = @record{ type: uint32, u: union{ mi: MOUSEINPUT, ki: KEYBDINPUT } }
+local SIZEOF_INPUT: cint <cimport 'sizeof(INPUT)', nodecl, const>
+
+local function EnumWindows(cb: function(pointer, isize): cint, lp: isize): cint <cimport, nodecl> end
+local function IsWindow(hwnd: pointer): cint <cimport, nodecl> end
+local function IsWindowVisible(hwnd: pointer): cint <cimport, nodecl> end
+local function IsIconic(hwnd: pointer): cint <cimport, nodecl> end
+local function IsChild(parent: pointer, hwnd: pointer): cint <cimport, nodecl> end
+local function GetWindow(hwnd: pointer, cmd: uint32): pointer <cimport, nodecl> end
+local function GetWindowLongW(hwnd: pointer, index: cint): clong <cimport, nodecl> end
+local function GetWindowTextLengthW(hwnd: pointer): cint <cimport, nodecl> end
+local function GetWindowTextW(hwnd: pointer, buf: *[0]uint16, n: cint): cint <cimport, nodecl> end
+local function GetClientRect(hwnd: pointer, r: *RECT): cint <cimport, nodecl> end
+local function ClientToScreen(hwnd: pointer, p: *POINT): cint <cimport, nodecl> end
+local function MapWindowPoints(from: pointer, to: pointer, p: *POINT, n: uint32): cint <cimport, nodecl> end
+local function ChildWindowFromPointEx(hwnd: pointer, p: POINT, flags: uint32): pointer <cimport, nodecl> end
+local function GetWindowThreadProcessId(hwnd: pointer, pid: *uint32): uint32 <cimport, nodecl> end
+local function GetGUIThreadInfo(tid: uint32, info: *GUITHREADINFO): cint <cimport, nodecl> end
+local function OpenProcess(access: uint32, inherit: cint, pid: uint32): pointer <cimport, nodecl> end
+local function QueryFullProcessImageNameW(h: pointer, flags: uint32, buf: *[0]uint16, n: *uint32): cint <cimport, nodecl> end
+local function CloseHandle(h: pointer): cint <cimport, nodecl> end
+local function DwmGetWindowAttribute(hwnd: pointer, attr: uint32, out: pointer, n: uint32): clong <cimport, nodecl> end
+local function WideCharToMultiByte(cp: uint32, flags: uint32, src: *[0]uint16, srclen: cint, dst: *[0]cchar, dstlen: cint, def: cstring, used: pointer): cint <cimport, nodecl> end
+local function GetTickCount64(): uint64 <cimport, nodecl> end
+local function GetModuleHandleA(name: cstring): pointer <cimport, nodecl> end
+local function LoadLibraryA(name: cstring): pointer <cimport, nodecl> end
+local function GetProcAddress(mod: pointer, name: cstring): pointer <cimport, nodecl> end
+local function GetCurrentThreadId(): uint32 <cimport, nodecl> end
+-- GDI
+local function GetDC(hwnd: pointer): pointer <cimport, nodecl> end
+local function ReleaseDC(hwnd: pointer, dc: pointer): cint <cimport, nodecl> end
+local function CreateCompatibleDC(dc: pointer): pointer <cimport, nodecl> end
+local function DeleteDC(dc: pointer): cint <cimport, nodecl> end
+local function CreateDIBSection(dc: pointer, bmi: *BITMAPINFO, usage: uint32, bits: *pointer, section: pointer, offset: uint32): pointer <cimport, nodecl> end
+local function SelectObject(dc: pointer, obj: pointer): pointer <cimport, nodecl> end
+local function DeleteObject(obj: pointer): cint <cimport, nodecl> end
+local function BitBlt(dst: pointer, x: cint, y: cint, w: cint, h: cint, src: pointer, sx: cint, sy: cint, rop: uint32): cint <cimport, nodecl> end
+local function PrintWindow(hwnd: pointer, dc: pointer, flags: uint32): cint <cimport, nodecl> end
+local function GdiFlush(): cint <cimport, nodecl> end
+-- input
+local function SendMessageTimeoutW(hwnd: pointer, msg: uint32, wp: usize, lp: isize, flags: uint32, ms: uint32, result: pointer): isize <cimport, nodecl> end
+local function MapVirtualKeyW(code: uint32, kind: uint32): uint32 <cimport, nodecl> end
+local function SendInput(n: uint32, inputs: pointer, size: cint): uint32 <cimport, nodecl> end
+local function GetSystemMetrics(index: cint): cint <cimport, nodecl> end
+local function GetForegroundWindow(): pointer <cimport, nodecl> end
+local function SetForegroundWindow(hwnd: pointer): cint <cimport, nodecl> end
+local function BringWindowToTop(hwnd: pointer): cint <cimport, nodecl> end
+local function ShowWindow(hwnd: pointer, cmd: cint): cint <cimport, nodecl> end
+local function AttachThreadInput(from: uint32, to: uint32, attach: cint): cint <cimport, nodecl> end
+
+local GW_OWNER: uint32 <cimport, nodecl, const>
+local GWL_EXSTYLE: cint <cimport, nodecl, const>
+local WS_EX_TOOLWINDOW: clong <cimport, nodecl, const>
+local DWMWA_CLOAKED: uint32 <cimport, nodecl, const>
+local PROCESS_QUERY_LIMITED_INFORMATION: uint32 <cimport, nodecl, const>
+local CP_UTF8: uint32 <cimport, nodecl, const>
+local BI_RGB: uint32 <cimport, nodecl, const>
+local DIB_RGB_COLORS: uint32 <cimport, nodecl, const>
+local SRCCOPY: uint32 <cimport, nodecl, const>
+local PW_CLIENTONLY: uint32 <cimport, nodecl, const>
+local PW_RENDERFULLCONTENT: uint32 <comptime> = 2 -- not in every SDK's headers
+local CWP_SKIPINVISIBLE: uint32 <cimport, nodecl, const>
+local CWP_SKIPTRANSPARENT: uint32 <cimport, nodecl, const>
+local MAPVK_VK_TO_VSC: uint32 <cimport, nodecl, const>
+local INPUT_MOUSE: uint32 <cimport, nodecl, const>
+local INPUT_KEYBOARD: uint32 <cimport, nodecl, const>
+local MOUSEEVENTF_MOVE: uint32 <cimport, nodecl, const>
+local MOUSEEVENTF_ABSOLUTE: uint32 <cimport, nodecl, const>
+local MOUSEEVENTF_VIRTUALDESK: uint32 <cimport, nodecl, const>
+local MOUSEEVENTF_LEFTDOWN: uint32 <cimport, nodecl, const>
+local MOUSEEVENTF_LEFTUP: uint32 <cimport, nodecl, const>
+local MOUSEEVENTF_RIGHTDOWN: uint32 <cimport, nodecl, const>
+local MOUSEEVENTF_RIGHTUP: uint32 <cimport, nodecl, const>
+local MOUSEEVENTF_MIDDLEDOWN: uint32 <cimport, nodecl, const>
+local MOUSEEVENTF_MIDDLEUP: uint32 <cimport, nodecl, const>
+local MOUSEEVENTF_WHEEL: uint32 <cimport, nodecl, const>
+local MOUSEEVENTF_HWHEEL: uint32 <cimport, nodecl, const>
+local KEYEVENTF_KEYUP: uint32 <cimport, nodecl, const>
+local KEYEVENTF_EXTENDEDKEY: uint32 <cimport, nodecl, const>
+local KEYEVENTF_UNICODE: uint32 <cimport, nodecl, const>
+local SM_XVIRTUALSCREEN: cint <cimport, nodecl, const>
+local SM_YVIRTUALSCREEN: cint <cimport, nodecl, const>
+local SM_CXVIRTUALSCREEN: cint <cimport, nodecl, const>
+local SM_CYVIRTUALSCREEN: cint <cimport, nodecl, const>
+local SW_RESTORE: cint <cimport, nodecl, const>
+local SMTO_ABORTIFHUNG: uint32 <cimport, nodecl, const>
+
+local CAPTURE_MIN_MS: uint64 <comptime> = 16   -- at most one PrintWindow per 16 ms per window
+local TITLE_EVERY_MS: uint64 <comptime> = 500  -- how often frame() rereads the title
+
+local CW32Win = @record{
+  hwnd: pointer,
+  state: integer,
+  why: string,         -- a literal, never freed
+  title: string,       -- owned
+  title_ms: uint64,
+  -- capture target, reused until the client size changes
+  memdc: pointer,
+  dib: pointer,
+  old_bmp: pointer,
+  bits: *[0]uint8,
+  dib_w: integer, dib_h: integer,
+  -- the last frame handed out (a copy, so a later capture can be compared)
+  last: vector(uint8),
+  last_w: integer, last_h: integer,
+  serial: uint64,
+  capture_ms: uint64,
+  -- input
+  focus: boolean,      -- FOCUS asked for: SendInput while we are in the foreground
+  buttons: uint32,     -- MK_* of the buttons held, for WM_MOUSEMOVE
+  last_target: pointer, -- the child the last click went to
+  held_mods: uint8,    -- WIN_MOD_* held through KEY events (SendInput path)
+}
+
+local open_count = 0
+
+-- which capture path produced the frames (for smoke tests and diagnosis)
+global cw32_stats: record{ captures: integer, printed: integer, window_blits: integer, screen_blits: integer }
+
+local function hwnd_of(wid: uint32): pointer
+  return (@pointer)((@isize)((@int32)(wid)))
+end
+
+local function wid_of(hwnd: pointer): uint32
+  return (@uint32)((@usize)(hwnd) & 0xFFFFFFFF)
+end
+
+-- UTF-16 (n units) → a UTF-8 copy the caller frees
+local function utf8_of(w: *[0]uint16, n: cint): string
+  if n <= 0 then return (@string){} end
+  local len = WideCharToMultiByte(CP_UTF8, 0, w, n, nilptr, 0, nilptr, nilptr)
+  if len <= 0 then return (@string){} end
+  local s = string.create((@usize)(len))
+  WideCharToMultiByte(CP_UTF8, 0, w, n, (@*[0]cchar)(s.data), len, nilptr, nilptr)
+  return s
+end
+
+local function window_title(hwnd: pointer): string
+  local n = GetWindowTextLengthW(hwnd)
+  if n <= 0 then return (@string){} end
+  local buf: vector(uint16)
+  buf:resize((@usize)(n + 1))
+  local got = GetWindowTextW(hwnd, (@*[0]uint16)(buf.data.data), n + 1)
+  local s = utf8_of((@*[0]uint16)(buf.data.data), got)
+  buf:destroy()
+  return s
+end
+
+-- the exe base name of the process owning the window ('' when it cannot be
+-- opened, e.g. an elevated process and a non-elevated agent)
+local function window_app(hwnd: pointer): string
+  local pid: uint32 = 0
+  GetWindowThreadProcessId(hwnd, &pid)
+  local ph = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+  if ph == nilptr then return (@string){} end
+  local buf: [1024]uint16
+  local n: uint32 = #buf
+  local app: string
+  if QueryFullProcessImageNameW(ph, 0, &buf, &n) ~= 0 then
+    local full = utf8_of(&buf, (@cint)(n))
+    app = cw32_basename(full)
+    full:destroy()
+  end
+  CloseHandle(ph)
+  return app
+end
+
+local function client_size(hwnd: pointer): (integer, integer)
+  local r: RECT
+  if GetClientRect(hwnd, &r) == 0 then return 0, 0 end
+  return r.right - r.left, r.bottom - r.top
+end
+
+-- EnumWindows' callback fills this; the filtering happens afterwards
+local enum_found: vector(pointer)
+local function enum_cb(hwnd: pointer, lp: isize): cint
+  enum_found:push(hwnd)
+  return 1
+end
+
+-- Top-level windows worth listing: visible, not cloaked (other virtual
+-- desktops, suspended UWP apps), unowned (not dialogs or popups), not tool
+-- windows, with a title and a non-empty client area.
+local function listable(hwnd: pointer): boolean
+  if IsWindowVisible(hwnd) == 0 then return false end
+  if GetWindow(hwnd, GW_OWNER) ~= nilptr then return false end
+  if GetWindowLongW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW ~= 0 then return false end
+  local cloaked: uint32 = 0
+  if DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, &cloaked, #uint32) == 0 and cloaked ~= 0 then return false end
+  if GetWindowTextLengthW(hwnd) <= 0 then return false end
+  local w, h = client_size(hwnd)
+  return w > 0 and h > 0
+end
+
+local function listable_windows(): vector(pointer)
+  enum_found:clear()
+  EnumWindows(enum_cb, 0)
+  local out: vector(pointer)
+  for i = 0, < #enum_found do
+    if listable(enum_found[i]) then out:push(enum_found[i]) end
+  end
+  return out
+end
+
+local function cw32_list(): string
+  local wins = listable_windows()
+  local sb: stringbuilder
+  for i = 0, < #wins do
+    local hwnd = wins[i]
+    local w, h = client_size(hwnd)
+    local title = window_title(hwnd)
+    local app = window_app(hwnd)
+    cw32_list_line(&sb, wid_of(hwnd), w, h, app, title)
+    title:destroy()
+    app:destroy()
+  end
+  wins:destroy()
+  return sb:promote()
+end
+
+local function cw32_open(wid: uint32, match: string): (pointer, string)
+  local hwnd: pointer = nilptr
+  if wid ~= 0 then
+    hwnd = hwnd_of(wid)
+    if IsWindow(hwnd) == 0 then return nilptr, 'no such window' end
+  else
+    if #match == 0 then return nilptr, 'pick a window by id or name (/term window list)' end
+    local wins = listable_windows()
+    for i = 0, < #wins do
+      local title = window_title(wins[i])
+      local app = window_app(wins[i])
+      local hit = cw32_window_matches(title, app, match)
+      title:destroy()
+      app:destroy()
+      if hit then hwnd = wins[i] break end
+    end
+    wins:destroy()
+    if hwnd == nilptr then return nilptr, 'no window matches' end
+  end
+  local win = new(@CW32Win)
+  win.hwnd = hwnd
+  win.state = CAPTURE_LIVE
+  win.title = window_title(hwnd)
+  win.title_ms = GetTickCount64()
+  open_count = open_count + 1
+  return win, (@string){}
+end
+
+local function cw32_state(h: pointer): (integer, string)
+  local win = (@*CW32Win)(h)
+  return win.state, win.why
+end
+
+local function cw32_title(h: pointer): string
+  return (@*CW32Win)(h).title
+end
+
+local function free_dib(win: *CW32Win): void
+  if win.memdc ~= nilptr then
+    SelectObject(win.memdc, win.old_bmp)
+    DeleteObject(win.dib)
+    DeleteDC(win.memdc)
+  end
+  win.memdc, win.dib, win.old_bmp, win.bits = nilptr, nilptr, nilptr, nilptr
+  win.dib_w, win.dib_h = 0, 0
+end
+
+-- a w×h top-down 32bpp DIB section selected into a memory DC
+local function ensure_dib(win: *CW32Win, w: integer, h: integer): boolean
+  if win.memdc ~= nilptr and win.dib_w == w and win.dib_h == h then return true end
+  free_dib(win)
+  local memdc = CreateCompatibleDC(nilptr)
+  if memdc == nilptr then return false end
+  local bmi: BITMAPINFO
+  bmi.bmiHeader.biSize = SIZEOF_BITMAPINFOHEADER
+  bmi.bmiHeader.biWidth = (@int32)(w)
+  bmi.bmiHeader.biHeight = -(@int32)(h) -- negative: rows top to bottom
+  bmi.bmiHeader.biPlanes = 1
+  bmi.bmiHeader.biBitCount = 32
+  bmi.bmiHeader.biCompression = BI_RGB
+  local bits: pointer = nilptr
+  local dib = CreateDIBSection(memdc, &bmi, DIB_RGB_COLORS, &bits, nilptr, 0)
+  if dib == nilptr or bits == nilptr then
+    DeleteDC(memdc)
+    return false
+  end
+  win.memdc, win.dib, win.bits = memdc, dib, (@*[0]uint8)(bits)
+  win.old_bmp = SelectObject(memdc, dib)
+  win.dib_w, win.dib_h = w, h
+  return true
+end
+
+local function fill_out(win: *CW32Win, out: *CaptureFrame): boolean
+  if win.serial == 0 then return false end
+  out.pixels = (@*[0]uint8)(win.last.data.data)
+  out.w, out.h = win.last_w, win.last_h
+  out.stride = (@usize)(win.last_w * 4)
+  out.serial = win.serial
+  return true
+end
+
+-- BitBlt w×h from (x, y) of `hwnd`'s DC (nilptr: the screen) into the DIB
+local function blit_from(win: *CW32Win, hwnd: pointer, x: integer, y: integer, w: integer, h: integer): boolean
+  local dc = GetDC(hwnd)
+  if dc == nilptr then return false end
+  local ok = BitBlt(win.memdc, 0, 0, w, h, dc, x, y, SRCCOPY) ~= 0
+  ReleaseDC(hwnd, dc)
+  GdiFlush()
+  return ok
+end
+
+-- Grab the client area now. PrintWindow asks the window to paint itself into
+-- our DC (works while covered); PW_RENDERFULLCONTENT makes DWM hand over
+-- DirectX / Chromium content as well. BitBlt from the window's DC, then from
+-- the screen, are the fallbacks: they only see what is visible.
+local function capture(win: *CW32Win, w: integer, h: integer): boolean
+  if not ensure_dib(win, w, h) then return false end
+  local n = (@usize)(w * h * 4)
+  -- cleared first, so a PrintWindow that draws nothing shows up as black
+  memory.zero(win.bits, n)
+  local printed = PrintWindow(win.hwnd, win.memdc, PW_CLIENTONLY | PW_RENDERFULLCONTENT) ~= 0
+  GdiFlush() -- the DIB's memory is up to date only after GDI's batch ran
+  -- Failed, or succeeded without drawing anything: Wine returns success but
+  -- cannot paint another process's window into our DC (WM_PRINT carries
+  -- the DC handle across processes). A window that really is black costs
+  -- one extra BitBlt a capture and still comes out black.
+  cw32_stats.captures = cw32_stats.captures + 1
+  if printed and not cw32_all_black(win.bits, w * h) then
+    cw32_stats.printed = cw32_stats.printed + 1
+  else
+    local ok = blit_from(win, win.hwnd, 0, 0, w, h)
+    if ok and not cw32_all_black(win.bits, w * h) then
+      cw32_stats.window_blits = cw32_stats.window_blits + 1
+    else
+      -- still nothing: the screen itself at the client area (right only
+      -- while the window is uncovered)
+      local o: POINT
+      ClientToScreen(win.hwnd, &o)
+      if blit_from(win, nilptr, o.x, o.y, w, h) then
+        ok = true
+        cw32_stats.screen_blits = cw32_stats.screen_blits + 1
+      end
+    end
+    if not ok and not printed then return false end
+  end
+  if w ~= win.last_w or h ~= win.last_h or #win.last ~= n then
+    win.last:resize(n)
+    win.last_w, win.last_h = w, h
+  elseif win.serial ~= 0 and memory.equals(win.last.data.data, win.bits, n) then
+    return true -- unchanged: same serial, nothing to send
+  end
+  memory.copy(win.last.data.data, win.bits, n)
+  win.serial = win.serial + 1
+  return true
+end
+
+local function cw32_frame(h: pointer, out: *CaptureFrame): boolean
+  local win = (@*CW32Win)(h)
+  if win.state ~= CAPTURE_LIVE then return false end
+  if IsWindow(win.hwnd) == 0 then
+    win.state, win.why = CAPTURE_ENDED, 'window closed'
+    free_dib(win)
+    return false
+  end
+  local now = GetTickCount64()
+  if now - win.title_ms >= TITLE_EVERY_MS then
+    local t = window_title(win.hwnd)
+    if t ~= win.title then win.title:destroy() win.title = t else t:destroy() end
+    win.title_ms = now
+  end
+  -- minimised windows paint nothing useful: keep showing the last frame
+  if win.serial ~= 0 and (now - win.capture_ms < CAPTURE_MIN_MS or IsIconic(win.hwnd) ~= 0) then
+    return fill_out(win, out)
+  end
+  local cw, ch = client_size(win.hwnd)
+  if cw > 0 and ch > 0 and IsIconic(win.hwnd) == 0 then
+    win.capture_ms = now
+    capture(win, cw, ch)
+  end
+  return fill_out(win, out)
+end
+
+-- Input --------------------------------------------------------------------
+
+-- The deepest visible child under client point (x, y), and the point in its
+-- client coordinates. Controls (an edit box, a browser's render widget) take
+-- their mouse messages themselves; the top-level window would not forward them.
+local function child_at(hwnd: pointer, x: integer, y: integer): (pointer, POINT)
+  local cur = hwnd
+  local p: POINT = {x=(@int32)(x), y=(@int32)(y)}
+  for _ = 1, 32 do
+    local child = ChildWindowFromPointEx(cur, p, CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT)
+    if child == nilptr or child == cur then break end
+    MapWindowPoints(cur, child, &p, 1)
+    cur = child
+  end
+  return cur, p
+end
+
+-- Where key messages go: the window's thread's focus window if it is inside
+-- this window, else the child last clicked, else the window itself.
+local function key_target(win: *CW32Win): pointer
+  local info: GUITHREADINFO
+  info.cbSize = SIZEOF_GUITHREADINFO
+  local tid = GetWindowThreadProcessId(win.hwnd, nilptr)
+  if GetGUIThreadInfo(tid, &info) ~= 0 and info.hwndFocus ~= nilptr and
+     (info.hwndFocus == win.hwnd or IsChild(win.hwnd, info.hwndFocus) ~= 0) then
+    return info.hwndFocus
+  end
+  if win.last_target ~= nilptr and IsWindow(win.last_target) ~= 0 then return win.last_target end
+  return win.hwnd
+end
+
+local function mods_mk(mods: uint8): uint32
+  local mk: uint32 = 0
+  if mods & WIN_MOD_SHIFT ~= 0 then mk = mk | CW32_MK_SHIFT end
+  if mods & WIN_MOD_CTRL ~= 0 then mk = mk | CW32_MK_CONTROL end
+  return mk
+end
+
+-- Window messages are sent (SendMessageTimeout), not posted, and in order.
+-- Posting looks closer to real input, but TranslateMessage appends a posted
+-- WM_KEYDOWN's WM_CHAR behind everything already queued, so "enter, then a
+-- line of TEXT" came out as the line, then the newline (seen under Wine), and
+-- it would type a plain "c" for a KEY c with ctrl. Sent messages skip the
+-- target's message loop: no translation, no accelerators, no dialog
+-- navigation; the characters a key stands for are sent as WM_CHAR here
+-- (cw32_key_char). A hung window answers at once (SMTO_ABORTIFHUNG), a busy
+-- one costs at most SEND_TIMEOUT_MS a message. Neither way changes the
+-- foreground window or the keyboard state apps read with GetKeyState, so
+-- shortcuts that check modifiers that way (menu accelerators, ctrl+c in many
+-- apps) need FOCUS, which switches to SendInput.
+local SEND_TIMEOUT_MS: uint32 <comptime> = 100
+
+local function deliver(target: pointer, msg: uint32, wp: usize, lp: isize): void
+  SendMessageTimeoutW(target, msg, wp, lp, SMTO_ABORTIFHUNG, SEND_TIMEOUT_MS, nilptr)
+end
+
+local function msg_mouse(win: *CW32Win, ev: *CaptureInput): void
+  local target, p = child_at(win.hwnd, ev.x, ev.y)
+  if ev.kind == WIN_INPUT_MOVE then
+    deliver(target, CW32_WM_MOUSEMOVE, win.buttons | mods_mk(ev.mods), (@isize)(cw32_makelparam(p.x, p.y)))
+  elseif ev.kind == WIN_INPUT_BUTTON then
+    local msg = cw32_button_msg(ev.button, ev.down)
+    if msg == 0 then return end
+    if ev.down then win.buttons = win.buttons | cw32_button_mk(ev.button) win.last_target = target
+    else win.buttons = win.buttons & ~cw32_button_mk(ev.button) end
+    local lp = (@isize)(cw32_makelparam(p.x, p.y))
+    -- a move first, so hover-driven controls know where the click is
+    deliver(target, CW32_WM_MOUSEMOVE, win.buttons | mods_mk(ev.mods), lp)
+    deliver(target, msg, win.buttons | mods_mk(ev.mods), lp)
+  elseif ev.kind == WIN_INPUT_WHEEL then
+    -- wheel messages carry screen coordinates
+    local sp: POINT = {x=(@int32)(ev.x), y=(@int32)(ev.y)}
+    ClientToScreen(win.hwnd, &sp)
+    local lp = (@isize)(cw32_makelparam(sp.x, sp.y))
+    local mk = win.buttons | mods_mk(ev.mods)
+    if ev.dy ~= 0 then deliver(target, CW32_WM_MOUSEWHEEL, cw32_wheel_wparam(ev.dy, mk), lp) end
+    if ev.dx ~= 0 then deliver(target, CW32_WM_MOUSEHWHEEL, cw32_wheel_wparam(ev.dx, mk), lp) end
+  end
+end
+
+local function msg_key(win: *CW32Win, ev: *CaptureInput): void
+  local vk, ext = cw32_hid_key(ev.hid)
+  if vk == 0 then return end
+  local gvk = cw32_generic_vk(vk)
+  local scan = MapVirtualKeyW(vk, MAPVK_VK_TO_VSC)
+  local alt = ev.mods & WIN_MOD_ALT ~= 0
+  local lp = cw32_key_lparam(scan, ev.down, ext, alt)
+  local target = key_target(win)
+  deliver(target, cw32_key_msg(gvk, ev.down, alt), gvk, (@isize)(lp))
+  if ev.down then
+    local ch = cw32_key_char(vk, ev.mods)
+    if ch ~= 0 then deliver(target, CW32_WM_CHAR, ch, (@isize)(lp)) end
+  end
+end
+
+local function msg_text(win: *CW32Win, text: string): void
+  local units = cw32_utf16_units(text)
+  local target = key_target(win)
+  for i = 0, < #units do deliver(target, CW32_WM_CHAR, units[i], 1) end
+  units:destroy()
+end
+
+-- SendInput path (FOCUS, window in the foreground) -------------------------
+
+local function send_mouse(win: *CW32Win, ev: *CaptureInput): void
+  local sp: POINT = {x=(@int32)(ev.x), y=(@int32)(ev.y)}
+  ClientToScreen(win.hwnd, &sp)
+  local vx, vy = GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN)
+  local vw, vh = GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN)
+  local inputs: [3]INPUT
+  local n: uint32 = 0
+  inputs[0].type = INPUT_MOUSE
+  inputs[0].u.mi.dx = (@int32)(cw32_abs_coord(sp.x, vx, vw))
+  inputs[0].u.mi.dy = (@int32)(cw32_abs_coord(sp.y, vy, vh))
+  inputs[0].u.mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK
+  n = 1
+  if ev.kind == WIN_INPUT_BUTTON then
+    local f: uint32 = 0
+    if ev.button == 0 then f = ev.down and MOUSEEVENTF_LEFTDOWN or MOUSEEVENTF_LEFTUP
+    elseif ev.button == 1 then f = ev.down and MOUSEEVENTF_RIGHTDOWN or MOUSEEVENTF_RIGHTUP
+    elseif ev.button == 2 then f = ev.down and MOUSEEVENTF_MIDDLEDOWN or MOUSEEVENTF_MIDDLEUP end
+    if f ~= 0 then
+      inputs[n].type = INPUT_MOUSE
+      inputs[n].u.mi.dwFlags = f
+      n = n + 1
+    end
+  elseif ev.kind == WIN_INPUT_WHEEL then
+    if ev.dy ~= 0 then
+      inputs[n].type = INPUT_MOUSE
+      inputs[n].u.mi.dwFlags = MOUSEEVENTF_WHEEL
+      inputs[n].u.mi.mouseData = (@uint32)(ev.dy) -- two's complement, as the API wants
+      n = n + 1
+    end
+    if ev.dx ~= 0 then
+      inputs[n].type = INPUT_MOUSE
+      inputs[n].u.mi.dwFlags = MOUSEEVENTF_HWHEEL
+      inputs[n].u.mi.mouseData = (@uint32)(ev.dx)
+      n = n + 1
+    end
+  end
+  SendInput(n, &inputs, SIZEOF_INPUT)
+end
+
+local function key_input(inp: *INPUT, vk: uint8, ext: boolean, down: boolean): void
+  inp.type = INPUT_KEYBOARD
+  inp.u.ki.wVk = vk
+  inp.u.ki.wScan = (@uint16)(MapVirtualKeyW(vk, MAPVK_VK_TO_VSC))
+  inp.u.ki.dwFlags = (ext and KEYEVENTF_EXTENDEDKEY or 0) | (down and 0 or KEYEVENTF_KEYUP)
+end
+
+-- the modifier bit a sided modifier VK stands for (0 for other keys)
+local function mod_bit(vk: uint8): uint8
+  local g = cw32_generic_vk(vk)
+  if g == CW32_VK_CONTROL then return WIN_MOD_CTRL end
+  if g == CW32_VK_SHIFT then return WIN_MOD_SHIFT end
+  if g == CW32_VK_MENU then return WIN_MOD_ALT end
+  if vk == CW32_VK_LWIN or vk == 0x5C then return WIN_MOD_SUPER end
+  return 0
+end
+
+-- A key with its modifiers: modifiers named in `mods` that were not pressed
+-- through their own KEY events are pressed around the key down, so a client
+-- that only sends "c with ctrl" still produces ctrl+c.
+local function send_key(win: *CW32Win, ev: *CaptureInput): void
+  local vk, ext = cw32_hid_key(ev.hid)
+  if vk == 0 then return end
+  local bit = mod_bit(vk)
+  if bit ~= 0 then
+    if ev.down then win.held_mods = win.held_mods | bit else win.held_mods = win.held_mods & ~bit end
+    local one: [1]INPUT
+    key_input(&one[0], vk, ext, ev.down)
+    SendInput(1, &one, SIZEOF_INPUT)
+    return
+  end
+  local extra = ev.down and (ev.mods & ~win.held_mods) or 0
+  local mvk: [4]uint8 = {CW32_VK_LCONTROL, CW32_VK_LSHIFT, CW32_VK_LMENU, CW32_VK_LWIN}
+  local mbit: [4]uint8 = {WIN_MOD_CTRL, WIN_MOD_SHIFT, WIN_MOD_ALT, WIN_MOD_SUPER}
+  local inputs: [9]INPUT
+  local n = 0
+  for i = 0, < 4 do
+    if extra & mbit[i] ~= 0 then key_input(&inputs[n], mvk[i], mvk[i] == CW32_VK_LWIN, true) n = n + 1 end
+  end
+  key_input(&inputs[n], vk, ext, ev.down)
+  n = n + 1
+  for i = 3, 0, -1 do
+    if extra & mbit[i] ~= 0 then key_input(&inputs[n], mvk[i], mvk[i] == CW32_VK_LWIN, false) n = n + 1 end
+  end
+  SendInput((@uint32)(n), &inputs, SIZEOF_INPUT)
+end
+
+local function send_text(text: string): void
+  local units = cw32_utf16_units(text)
+  for i = 0, < #units do
+    local pair: [2]INPUT
+    for k = 0, < 2 do
+      pair[k].type = INPUT_KEYBOARD
+      pair[k].u.ki.wScan = units[i]
+      pair[k].u.ki.dwFlags = KEYEVENTF_UNICODE | (k == 1 and KEYEVENTF_KEYUP or 0)
+    end
+    SendInput(2, &pair, SIZEOF_INPUT)
+  end
+  units:destroy()
+end
+
+-- Bring the window to the foreground. Windows only lets the foreground
+-- process do that; attaching our input queue to the current foreground
+-- thread's for the call is the usual way around it (it can still refuse,
+-- e.g. while the user is typing elsewhere; the taskbar button flashes then).
+local function focus_window(win: *CW32Win): void
+  if IsIconic(win.hwnd) ~= 0 then ShowWindow(win.hwnd, SW_RESTORE) end
+  local fg = GetForegroundWindow()
+  local me = GetCurrentThreadId()
+  local them: uint32 = fg ~= nilptr and GetWindowThreadProcessId(fg, nilptr) or 0
+  local attached = them ~= 0 and them ~= me and AttachThreadInput(me, them, 1) ~= 0
+  SetForegroundWindow(win.hwnd)
+  BringWindowToTop(win.hwnd)
+  if attached then AttachThreadInput(me, them, 0) end
+end
+
+local function cw32_input(h: pointer, ev: *CaptureInput): void
+  local win = (@*CW32Win)(h)
+  if win.state ~= CAPTURE_LIVE or IsWindow(win.hwnd) == 0 then return end
+  if ev.kind == WIN_INPUT_FOCUS then
+    win.focus = true
+    focus_window(win)
+    return
+  end
+  -- SendInput only while the window really is in front: input sent to the
+  -- screen would otherwise land in whatever the user has there
+  local direct = win.focus and GetForegroundWindow() == win.hwnd
+  if ev.kind == WIN_INPUT_MOVE or ev.kind == WIN_INPUT_BUTTON or ev.kind == WIN_INPUT_WHEEL then
+    if direct then send_mouse(win, ev) else msg_mouse(win, ev) end
+  elseif ev.kind == WIN_INPUT_KEY then
+    if direct then send_key(win, ev) else msg_key(win, ev) end
+  elseif ev.kind == WIN_INPUT_TEXT then
+    if direct then send_text(ev.text) else msg_text(win, ev.text) end
+  end
+end
+
+local function cw32_close(h: pointer): void
+  local win = (@*CW32Win)(h)
+  free_dib(win)
+  win.last:destroy()
+  win.title:destroy()
+  delete(win)
+  open_count = open_count - 1
+end
+
+local function cw32_pump(): void end -- captures happen in frame(), on demand
+
+local function cw32_poll_fds(fds: *[0]cint, max: integer): integer return 0 end
+
+local function cw32_wait_ms(): integer
+  if open_count > 0 then return 16 end
+  return -1
+end
+
+-- Sizes and coordinates in physical pixels: without this a scaled monitor
+-- gives a DPI-unaware agent virtualised (smaller, blurred) windows. The
+-- function is Windows 10 1703+; older systems keep their default.
+local dpi_done = false
+local function set_dpi_awareness(): void
+  if dpi_done then return end
+  dpi_done = true
+  local user32 = GetModuleHandleA('user32.dll')
+  if user32 == nilptr then user32 = LoadLibraryA('user32.dll') end
+  if user32 == nilptr then return end
+  local SetCtxFn = @function(ctx: pointer): cint
+  local fn = (@SetCtxFn)(GetProcAddress(user32, 'SetProcessDpiAwarenessContext'))
+  if fn ~= nilptr then fn((@pointer)((@isize)(-4))) end -- DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+end
+
+global function capture_win32_backend(): (boolean, CaptureBackend, string)
+  if #INPUT ~= SIZEOF_INPUT then return false, (@CaptureBackend){}, 'INPUT layout mismatch' end
+  set_dpi_awareness()
+  return true, (@CaptureBackend){
+    name = 'win32',
+    list = cw32_list,
+    open = cw32_open,
+    state = cw32_state,
+    title = cw32_title,
+    frame = cw32_frame,
+    input = cw32_input,
+    close = cw32_close,
+    pump = cw32_pump,
+    poll_fds = cw32_poll_fds,
+    wait_ms = cw32_wait_ms,
+  }, (@string){}
+end

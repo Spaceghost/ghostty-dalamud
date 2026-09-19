@@ -1,5 +1,5 @@
 -- The Win32 capture backend's pure parts (agent/capture_win32_logic.nelua):
--- HID → VK, key lParams, mouse words, UTF-16 for WM_CHAR, WLISTR lines and
+-- HID → VK, key lParams, key characters, mouse words, blank captures, UTF-16 for WM_CHAR, WLISTR lines and
 -- window matching. The Win32 half is exercised by tests/smoke_capture_win32.
 require 'agent.capture_win32_logic'
 require 'string'
@@ -48,6 +48,17 @@ do
   assert(cw32_key_msg(CW32_VK_LMENU, false, false) == CW32_WM_SYSKEYUP)
 end
 
+-- the WM_CHAR a key stands for
+do
+  assert(cw32_key_char(0x0D, 0) == 0x0D and cw32_key_char(0x09, 0) == 0x09)
+  assert(cw32_key_char(0x08, 2) == 0x08 and cw32_key_char(0x1B, 0) == 0x1B)
+  assert(cw32_key_char(0x0D, 1) == 0x0A and cw32_key_char(0x09, 1) == 0)
+  assert(cw32_key_char(0x43, 1) == 3 and cw32_key_char(0x5A, 3) == 26)  -- ctrl+c, ctrl+shift+z
+  assert(cw32_key_char(0x43, 0) == 0 and cw32_key_char(0x43, 2) == 0)   -- letters come as TEXT
+  assert(cw32_key_char(0x43, 5) == 0 and cw32_key_char(0x0D, 4) == 0)   -- alt: none
+  assert(cw32_key_char(0x27, 0) == 0 and cw32_key_char(0x70, 1) == 0)   -- arrows, F-keys
+end
+
 -- mouse words
 do
   assert(cw32_makelparam(10, 20) == 0x0014000A)
@@ -63,6 +74,17 @@ do
   assert(cw32_abs_coord(-1920, -1920, 3840) == 0 and cw32_abs_coord(1919, -1920, 3840) == 65535)
   assert(cw32_abs_coord(960, 0, 1921) == 32768)
   assert(cw32_abs_coord(5000, 0, 1920) == 65535 and cw32_abs_coord(-5, 0, 1920) == 0)
+end
+
+-- blank capture detection
+do
+  local px: [4 * 3]uint8
+  assert(cw32_all_black(&px, 3))
+  px[11] = 255 -- alpha only
+  assert(cw32_all_black(&px, 3))
+  px[9] = 1
+  assert(not cw32_all_black(&px, 3))
+  assert(cw32_all_black(&px, 2) and cw32_all_black(&px, 0))
 end
 
 -- UTF-8 → UTF-16 units

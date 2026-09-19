@@ -1,7 +1,7 @@
 -- The pure parts of the Win32 capture backend (agent/capture_win32.nelua):
 -- no Win32 calls, so tests/test_capture_win32.nelua checks them on the host.
 -- USB HID usage → virtual key, key message lParams, mouse message words,
--- UTF-8 → UTF-16 for WM_CHAR, WLISTR line building and window matching.
+-- blank captures, UTF-8 → UTF-16 for WM_CHAR, WLISTR line building and window matching.
 -- Message and VK numbers are spelled out (they are fixed by the Win32 ABI)
 -- because <windows.h> is not available to host builds.
 require 'string'
@@ -133,6 +133,20 @@ global function cw32_key_msg(vk: uint8, down: boolean, alt: boolean): uint32
   return down and CW32_WM_KEYDOWN or CW32_WM_KEYUP
 end
 
+-- The WM_CHAR a key stands for when keys go as window messages (nothing
+-- translates them there): enter, tab, backspace and escape give their
+-- control characters, ctrl+letter its control code (ctrl+c = 3), like
+-- TranslateMessage would. Other keys give 0: typed characters come as TEXT.
+global function cw32_key_char(vk: uint8, mods: uint8): uint16
+  if mods & 4 ~= 0 then return 0 end -- WIN_MOD_ALT: menu mnemonics, not characters
+  if vk == 0x0D or vk == 0x09 or vk == 0x08 or vk == 0x1B then
+    if mods & 1 ~= 0 then return vk == 0x0D and 0x0A or 0 end -- ctrl+enter is LF
+    return vk
+  end
+  if mods & 1 ~= 0 and vk >= 0x41 and vk <= 0x5A then return vk - 0x40 end -- WIN_MOD_CTRL
+  return 0
+end
+
 -- MAKELPARAM(x, y): two 16-bit halves, negative coordinates kept as their
 -- two's complement (GET_X_LPARAM sign-extends them back).
 global function cw32_makelparam(x: integer, y: integer): uint32
@@ -170,6 +184,16 @@ global function cw32_abs_coord(p: integer, origin: integer, size: integer): inte
   local v = ((p - origin) * 65535 + (size - 1) // 2) // (size - 1)
   if v < 0 then v = 0 elseif v > 65535 then v = 65535 end
   return v
+end
+
+-- Every pixel of a BGRA buffer black (alpha ignored): PrintWindow drew
+-- nothing into the cleared DIB. Stops at the first coloured pixel.
+global function cw32_all_black(p: *[0]uint8, npixels: integer): boolean
+  for i = 0, < npixels do
+    local o = i * 4
+    if p[o] ~= 0 or p[o+1] ~= 0 or p[o+2] ~= 0 then return false end
+  end
+  return true
 end
 
 -- UTF-8 → UTF-16 code units (what WM_CHAR and KEYEVENTF_UNICODE carry, one
