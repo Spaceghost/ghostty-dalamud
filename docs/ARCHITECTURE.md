@@ -265,6 +265,7 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_platform` (`.nelua` + `.lua`) | `ghostty.platform()` on the host, `lua/platform.lua` per platform, the shipped `init.lua` as Windows and as Wine, the fallback choice and an agent terminal switching to its fallback |
 | `test_assistant` (`.nelua` + `.lua`) | `/term ask`: the argv a question becomes (one element: quotes, `;`, unicode, empty), chat without one, pet / tab / window, the off switch, the terminal kept open with `[assistant exited]` and the not-found hint (127 and an agent refusal), the local ConPTY fallback |
 | `test_agent_logic` | the agent's pure parts: OPEN parsing, replay plans, ring indexes, CRLF for the Windows clipboard, env entries, default shells, the Windows wait timeout, command line quoting |
+| `test_capture_win32` | the Win32 window capture backend's pure parts: USB HID → virtual key, key message lParams, mouse and wheel words, SendInput absolute coordinates, UTF-8 → UTF-16 for WM_CHAR, WLISTR lines, window matching |
 | `test_agent` | `ghostty-agent` end to end over TCP |
 
 The last step checks that the core also compiles as a native host module.
