@@ -114,7 +114,7 @@ global function reap_exited(now: float64): void
   local i: integer = #host.sessions - 1
   while i >= 0 do
     local s = host.sessions[i]
-    if s.process_exited then
+    if s.process_exited and not s.assistant then -- /term ask keeps its answer on screen
       if s.exited_at == 0 then
         s.exited_at = now
       elseif now - s.exited_at > 0.4 and s ~= host.popup_session and not s.leaving then

@@ -222,7 +222,7 @@ core/app/     the app modules; hostsurface.nelua is the plugin's side of the hos
 core/sys/     net (POSIX + Winsock), conpty (Windows), procguard, fs / fsbase, platform, wincmdline, hid and dualsense_reader (Windows HID)
 core/shaders/ HLSL sources and the committed DXBC the core embeds
 agent/        ghostty-agent PTY server (Nelua): agent.nelua, logic, pty_posix / sys_posix, pty_windows / sys_windows / winloop
-lua/          shipped policy: init.lua, keymap.lua, migrate.lua, ...
+lua/          shipped policy: init.lua, keymap.lua, migrate.lua, assistant.lua (/term ask), ...
 shim/         GhosttyDalamud (plugin) and Umbra.Ghostty (widget) C# projects
 tests/        host tests + run.sh
 tools/        fetch-vendor.sh, build.sh, package.sh, install-dev.sh, zig-cc-win.sh, build-shaders.lua, crash-restart.{nelua,sh} (Linux/Wine only)
@@ -263,6 +263,7 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_hostsurface` | the plugin side against a recording fake host: activation and refusals, registration and shutdown order, suspension, events, info bar, `ghostty.open_url` (https only) and an older shim's smaller `GuHostApi` |
 | `test_vote` (`.nelua` + `.lua`) | the feature vote link: the shipped catalogue, new-idea count, the settings window's section and badge, the seen marker through `settings.lua` |
 | `test_platform` (`.nelua` + `.lua`) | `ghostty.platform()` on the host, `lua/platform.lua` per platform, the shipped `init.lua` as Windows and as Wine, the fallback choice and an agent terminal switching to its fallback |
+| `test_assistant` (`.nelua` + `.lua`) | `/term ask`: the argv a question becomes (one element: quotes, `;`, unicode, empty), chat without one, pet / tab / window, the off switch, the terminal kept open with `[assistant exited]` and the not-found hint (127 and an agent refusal), the local ConPTY fallback |
 | `test_agent_logic` | the agent's pure parts: OPEN parsing, replay plans, ring indexes, CRLF for the Windows clipboard, env entries, default shells, the Windows wait timeout, command line quoting |
 | `test_agent` | `ghostty-agent` end to end over TCP |
 

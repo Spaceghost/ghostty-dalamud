@@ -55,6 +55,8 @@ global Session = @record{
   open_argv: vector(string), -- what OPEN asks for, kept until the agent answers (a reconnect asks again)
   open_env: vector(string),
   fallback: string,         -- the profile to switch to if the agent turns out to be down (Profile.fallback)
+  assistant: boolean,       -- /term ask: stays open after its process exits, which it announces itself
+  local_fallback: boolean,  -- agent down: run open_argv over ConPTY (an assistant on native Windows)
 }
 
 
@@ -307,6 +309,13 @@ function Session:mark_exited(status: int32): void
   self.exited = true
   self.exit_status = status
   self.process_exited = true
+  if self.assistant then
+    -- lua/assistant.lua words it: a hint for a missing command (127), then "[assistant exited]"
+    local note = policy_assistant_exit(status, false)
+    self:feed_text(note)
+    note:destroy()
+    return
+  end
   local sb: stringbuilder
   sb:writef('\r\n\27[90m[process exited with status %d]\27[0m\r\n', status)
   local msg = sb:promote()

@@ -328,6 +328,7 @@ with the depth test on.
 | `/term send [#id] text`, `/term type [#id] text` | type into a terminal, with or without Enter |
 | `/term bell [ripple\|sonar\|burst\|aura\|calm\|custom\|demo]` | preview the visual bell |
 | `/term showcase`, `/term showcase off` | demo terminals and camera shots for screenshots; needs nothing on disk |
+| `/term ask [question]` | ask a local AI assistant in a terminal of its own (see [Assistant](#assistant-term-ask)) |
 | `/term config` | the settings window |
 | `/term reload` | reload the Lua configuration |
 
@@ -343,6 +344,40 @@ Info bar entry (`host.dtr.on_click`): click toggles the drop-down,
 right-click opens the popup, shift+click opens a window, ctrl+click shows the
 world screens. The popup closes when it loses focus; <kbd>Esc</kbd> goes to
 the terminal.
+
+## Assistant (`/term ask`)
+
+**New and untested in game**: only the host tests (`tests/test_assistant.*`)
+have run it.
+
+`/term ask <question>` opens a terminal that runs a local AI assistant with
+your question; `/term ask` alone opens its interactive session. The default
+assistant is almanac, a separate project: `almanac ask -- "<question>"`
+and `almanac chat`. It must be installed where the terminal's command runs
+(the agent's machine, or the game's machine for a local ConPTY terminal).
+Works from macros and hotbars:
+
+```
+/term ask what's my next MSQ step?
+```
+
+* The question is the rest of the line, passed as **one argument** and never
+  through a shell: quotes, `;`, `$(...)` and the like reach the assistant as
+  plain text. The chat line reaches the plugin cut at about 250 bytes; a
+  character cut in half at the end is dropped.
+* The terminal stays open after the assistant exits (whatever
+  `close_on_exit` says) and ends with `[assistant exited]`; close it like any
+  terminal. If the command was not found (exit status 127, or an agent that
+  refused to start it) it also prints a short hint.
+* Settings → Assistant (/term ask): on or off, where it opens (`pet`, the
+  default, beside your character, or a tab while no character is loaded;
+  `tab`; `window`) and the transport (`default`: as your first profile, the
+  agent, with a local ConPTY fallback on native Windows; or `agent` /
+  `conpty`).
+* The commands themselves are argv lists in `lua/assistant.lua`
+  (`CONFIG.assistant.chat`, `CONFIG.assistant.ask`, question appended), shown
+  read-only in the settings window. Copy the file into the config
+  directory's `lua/` to point it at another program.
 
 ## Controller
 
@@ -419,7 +454,7 @@ Tested on the host (`tests/run.sh`): the libghostty-vt binding, cell renderer,
 key encoding, DualSense report parsing, Lua policy, agent protocol and server,
 the plugin's activation state machine, its command / info bar / IPC registration and the config
 migration (`tests/test_hostsurface.nelua`, `tests/test_migrate.*`), the
-per-platform defaults and local fallbacks (`tests/test_platform.*`) and the
+per-platform defaults and local fallbacks (`tests/test_platform.*`), `/term ask` (`tests/test_assistant.*`; untested in game) and the
 agent's shared pure logic (`tests/test_agent_logic.nelua`). Both C#
 projects, the Windows DLLs and `ghostty-agent.exe` compile.
 

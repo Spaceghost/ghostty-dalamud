@@ -134,6 +134,37 @@ local function showcase_start(): cint
   return 0
 end
 
+-- /term ask [question]: a terminal running the assistant (lua/assistant.lua),
+-- the question as one argv element. Opens as a pet (a tab while no character
+-- is loaded), a tab or a window, as CONFIG.assistant.view says.
+global function assistant_command(question: string): cint
+  local ok, spec, err = policy_assistant_open(question)
+  if not ok then
+    logf(LOG_WARN, 'ask: %s', err)
+    spec:destroy()
+    err:destroy()
+    return 4
+  end
+  err:destroy()
+  local s = session_new_assistant(&spec, 80, 24)
+  if s == nilptr then spec:destroy() return 2 end
+  local placed = false
+  if spec.view == 'pet' and player_loaded() then placed = make_pet(s) end
+  if not placed and spec.view == 'window' then
+    host.windows:push(s)
+    set_visible(true)
+    placed = true
+  end
+  if not placed then
+    host.dropdown_tabs:push(s)
+    host.dropdown_active = #host.dropdown_tabs - 1
+    set_visible(true)
+    host.dropdown_focus_next = true
+  end
+  spec:destroy()
+  return 0
+end
+
 global function run_command(cmd: string): cint
   -- "verb arg...": verbs match whole words ("minimize" is not "min")
   local verb: string = cmd
@@ -272,6 +303,9 @@ global function run_command(cmd: string): cint
     local e = policy_world_command(s.id, cmd)
     e:destroy()
     return 0
+  elseif verb == 'ask' then
+    -- /term ask [question]: the rest of the line, untouched, is the question
+    return assistant_command(arg)
   elseif verb == 'bell' then
     -- /term bell [ripple|sonar|burst|aura|calm|custom|demo]
     return bell_command(arg)

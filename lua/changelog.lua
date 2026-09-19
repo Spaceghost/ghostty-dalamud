@@ -13,6 +13,7 @@ C.releases = {
     version = 'next', title = 'In the workshop',
     blurb = 'Being built right now. These land here as they are verified in game.',
     items = {
+      { 'next', 'Ask a local AI assistant from chat or a macro: /term ask <question> opens a terminal with the answer (as a pet by default), /term ask alone a conversation. Uses almanac, a separate program you install yourself; see Settings, Assistant. Not yet tried in game.' },
       { 'next', 'Vote on what gets built next: the About tab in Settings opens the vote page in your browser, and a small dot on the settings button shows while there are ideas you have not looked at. The plugin itself never goes online for it.' },
       { 'next', 'Windows without Linux: ghostty-agent now also runs on Windows, and on Windows the plugin uses it for PowerShell and cmd, or opens them locally while no agent runs. Not yet tried on Windows.' },
       { 'next', 'Local terminals (conpty) on Windows start their shell with the structure size Windows expects. Not yet verified on Windows or under Wine.' },
