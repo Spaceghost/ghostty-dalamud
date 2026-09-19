@@ -65,6 +65,7 @@ skip() {
 
 command -v curl >/dev/null || setup "curl is required"
 command -v jq >/dev/null || setup "jq is required"
+[[ "$SUITES" =~ ^[a-z][a-z\ ,]{0,120}$ ]] || setup "INGAME_SUITES must be suite names (see /term selftest list), got: $SUITES"
 [[ -n "${XIVMCP_CI_TOKEN:-}" ]] || setup "XIVMCP_CI_TOKEN is not set (the ghostty-ci client's token, from the environment only)"
 [[ -n "$PLUGIN_DIR" ]] || setup "GHOSTTY_DEV_PLUGIN_DIR is not set (the dev plugin folder the game loads)"
 [[ -f "$PLUGIN_DIR/GhosttyDalamud.dll" && -f "$PLUGIN_DIR/ghostty_loader.dll" ]] ||
