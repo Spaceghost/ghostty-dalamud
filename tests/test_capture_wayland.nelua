@@ -127,7 +127,11 @@ end
 do
   local ok, k = wayland_parse_key('key:5f3a.2\torg.gnome.TextEditor\tnotes.txt\n')
   assert(ok and k.launch == '5f3a.2' and k.app == 'org.gnome.TextEditor' and k.title == 'notes.txt')
-  assert(not wayland_parse_key('key:no tabs'))
+  local okl, kl = wayland_parse_key('key:5f3a.2\n')
+  assert(okl and kl.launch == '5f3a.2' and #kl.app == 0 and #kl.title == 0) -- the WLISTR column as is
+  assert(wayland_key_score(kl, (@WindowKey){ launch = '5f3a.2', app = 'x', title = 'y' }, false) == 100)
+  assert(wayland_key_score(kl, (@WindowKey){ launch = '5f3a.3', app = 'x', title = 'y' }, false) == 0)
+  assert(not wayland_parse_key('key:'))
   assert(not wayland_parse_key('run:x'))
   local c: WindowKey = { launch = '5f3a.2', app = 'org.gnome.TextEditor', title = 'other.txt' }
   assert(wayland_key_score(k, c, false) == 100) -- the same launch, whatever the title became

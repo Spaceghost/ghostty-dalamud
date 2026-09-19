@@ -371,8 +371,9 @@ no host compositor: the host desktop never sees these windows.
 * Window keys, for re-attaching. WLISTR window lines have a sixth field,
   the launch id: `<agent run>.<n>` (hex of the agent's start time and pid,
   then a counter) for the window a `run:`/`app:`/`desktop:` launch opened,
-  empty for others. WOPEN `wid 0` + `key:LAUNCH\tAPP\tTITLE` opens the
-  window that fits best among those nobody streams: the same launch id
+  empty for others. WOPEN `wid 0` + `key:LAUNCH\tAPP\tTITLE` (or
+  `key:LAUNCH`, the column as is, for a launched window) opens the window
+  that fits best among those nobody streams: the same launch id
   fits whatever the title became; else APP must equal the window's app
   (when given) and an equal title beats one that contains the other.
   Nothing fitting within 5 s ends the stream with "no such window (the app
@@ -444,6 +445,20 @@ no host compositor: the host desktop never sees these windows.
   popups (clamped to the same margin) and placed at their top-left corner;
   WFRAME pictures are that rectangle and WGEOM says where the window and
   each popup are in it. WINPUT coordinates are pixels of that picture.
+* Text input: the compositor offers text-input-v3. When the focused
+  surface's client has enabled one, TEXT is sent as `commit_string` (then
+  `done`), any Unicode, with newline and tab as the Enter and Tab keys;
+  otherwise TEXT goes through the keymap as below.
+* Clipboard: apps' copy requests are granted (`wl_data_device`, and X11
+  through Xwayland's bridge; the primary selection too). When no app owns
+  the selection, it is the agent's own source, which reads the host
+  clipboard (the agent's `wl-paste`, or `--clipboard-file`) when an app
+  pastes. When an app copies text, the agent reads it, puts it on the host
+  clipboard (`wl-copy` / the file) and takes the selection back with its
+  own source. The game's copies (CLIP_SET) already land on the host
+  clipboard and also make the agent's source the selection again; the
+  game's pastes (CLIP_GET) read the host clipboard, so text copied in an
+  app pastes in the game. Non-text selections stay among the apps.
 * Input: the stream that gets input gets the keyboard focus (one toplevel at a
   time). Pointer events go to the surface under the point in that window's
   scene (popups included), with `BTN_LEFT/RIGHT/MIDDLE`. WHEEL `dy` is 1/120
@@ -459,9 +474,11 @@ no host compositor: the host desktop never sees these windows.
 
 Limits, all current:
 
-* TEXT reaches only characters the layout types at level 1 or 2; others (for
-  "us": accented letters, emoji) are dropped with one log line. text-input-v3
-  is the way to more.
+* TEXT to a client without text-input-v3 (X11 apps, some toolkits) reaches
+  only characters the layout types at level 1 or 2; others (for "us":
+  accented letters, emoji) are dropped with one log line.
+* The primary selection (middle-click paste) works between apps but is not
+  bridged to the host.
 * Software rendering (pixman) only; GL clients render through their own
   software fallback.
 * Single-instance apps (GApplication/D-Bus activation) that are already
@@ -705,6 +722,17 @@ pixman 0.46.2; agent built with zig cc), with `yad` 9.3 (GTK 3.24.52) as the cli
 * `test_e2e_wayland`, 2026-09-19, GTK4 regression (outputs at 60 Hz): `run:flatpak
   run org.gnome.TextEditor --standalone` opened a 1400×1040 window that stayed
   mapped for 5 s (8 frames) and closed with WCLOSE.
+* `test_wayland_compositor`, 2026-09-19, text input and clipboard, read
+  back from `yad --entry` (GTK3, which enables text-input-v3): TEXT
+  `héllo ✓ 日本 Ω\n` came out exactly; ctrl+v pasted the host clipboard's
+  text (a test function standing in for the agent's); text typed, selected
+  (ctrl+a) and copied (ctrl+c) in the app reached the host clipboard,
+  "copied in the app ✓".
+* `test_e2e_wayland`, 2026-09-19, clipboard through the agent
+  (`--clipboard-file`): ctrl+a ctrl+c in yad put its text in the file;
+  CLIP_SET `from the game ✓` from the plugin's client, then ctrl+a ctrl+v
+  ctrl+a ctrl+c in yad, left exactly that text in the file. The host
+  desktop's own clipboard (wl-copy/wl-paste) was not exercised.
 * `test_e2e_wayland` (in `tests/run.sh`): the plugin's own agent client
   (`core/agent_client.nelua`, decoding as `core/app/remotewin.nelua` does)
   against a real agent run with `--windows wayland --wayland-socket …` and no

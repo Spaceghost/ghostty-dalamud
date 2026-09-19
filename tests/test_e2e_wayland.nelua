@@ -22,6 +22,7 @@ local port: uint16 = (@uint16)(tointeger(arg[1]))
 local token: string = arg[2]
 local outdir: string = arg[3]
 local title: string = arg[4]
+local clipfile: string = #arg >= 5 and arg[5] or ''
 
 local State = @record{
   opened: boolean, refused: boolean, ended: boolean,
@@ -183,6 +184,35 @@ esc[2] = 0
 client:winput(st.sid, WIN_INPUT_KEY, &esc, 4)
 assert(pump_for(5, function(): boolean return st.gn == 1 and st.w == ww end), 'the menu closed: the window alone again')
 print(('e2e: %dx%d, %d frames (%d key, %d delta), %d pixels changed by typing'):format(st.w, st.h, st.frames, st.keys, st.deltas, changed))
+-- the clipboard (the agent runs with --clipboard-file): a copy in the app
+-- reaches the host clipboard; the game's CLIP_SET is what the app pastes
+local function chord(hid: uint16): void
+  local kb: [4]uint8
+  proto.put_u16(&kb, hid)
+  kb[2], kb[3] = 1, WIN_MOD_CTRL
+  client:winput(st.sid, WIN_INPUT_KEY, &kb, 4)
+  kb[2] = 0
+  client:winput(st.sid, WIN_INPUT_KEY, &kb, 4)
+end
+local function clip_now(): string
+  local f = io.open(clipfile, 'rb')
+  if not f:isopen() then return (@string){} end
+  local t = f:read('a')
+  f:close()
+  return t
+end
+if #clipfile > 0 then
+  chord(0x04) chord(0x06) -- ctrl+a, ctrl+c
+  assert(pump_for(5, function(): boolean local t = clip_now() return t:find('typed from FFXIV', 1, true) > 0 end), 'the app\'s copy reached the host clipboard')
+  client:clip_set('from the game ✓')
+  pump_for(0.5, nilptr)
+  chord(0x04) chord(0x19) -- ctrl+a, ctrl+v: the game's text replaces it
+  pump_for(0.5, nilptr)
+  chord(0x04) chord(0x06) -- and copied back out
+  assert(pump_for(5, function(): boolean return clip_now() == 'from the game ✓' end), 'the app pasted the game\'s copy: ' .. clip_now())
+  print('e2e clipboard: app -> host and game -> app OK')
+end
+
 -- persistence: the connection goes (a plugin reload); the app stays. A new
 -- connection lists the window with its launch id and opens it again by key.
 client:flush()

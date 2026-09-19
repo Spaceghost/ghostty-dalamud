@@ -52,6 +52,17 @@ do
   sb:writef('ghostty-test-%d', getpid())
   capture_wayland_configure(sb:promote(), 'us')
 end
+-- the host clipboard, as the agent would hand it in (tests: a string)
+local host_clip: string = 'from the host clipboard'
+local host_sets = 0
+local sets0 = 0
+local function test_clip_get(): (boolean, string) return true, string.copy(host_clip) end
+local function test_clip_set(p: *[0]uint8, n: usize): boolean
+  host_clip = string{data=(@*[0]byte)(p), size=n}:copy()
+  host_sets = host_sets + 1
+  return true
+end
+capture_wayland_set_clipboard(test_clip_get, test_clip_set)
 local ok, be, why = capture_select('wayland')
 check(ok, 'backend: ' .. why)
 print('socket ' .. capture_wayland_socket())
@@ -317,7 +328,7 @@ do
   local launch = l:sub(at + #'ghostty-wayland-test\t', nl - 1)
   check(#launch > 0, 'a launch id in the list')
   print('launch id ' .. launch)
-  local hk, errk = be.open(0, 'key:' .. launch .. '\tyad\tghostty-wayland-test')
+  local hk, errk = be.open(0, 'key:' .. launch) -- the launch id alone, as the plugin sends it
   check(hk ~= nilptr, 'key open: ' .. errk)
   local sk = be.state(hk)
   check(sk == CAPTURE_LIVE and be.title(hk) == 'ghostty-wayland-test', 'key: re-attached at once')
@@ -472,6 +483,72 @@ else
 end
 local hn, errn = be.open(0, 'desktop:no-such-compositor-qq')
 check(hn == nilptr and errn:find('not installed', 1, true) > 0, 'unknown desktop refused: ' .. errn)
+
+-- text-input-v3 and the clipboard, read back through yad --entry, which
+-- prints its text when Enter closes it
+local function entry_run(title: string, input: function(h: pointer): void): string
+  local out = outdir .. '/' .. title .. '.txt'
+  os.execute("rm -f '" .. out .. "'")
+  local he, erre = be.open(0, "run:yad --entry --width=400 --title=" .. title .. " > '" .. out .. "'")
+  check(he ~= nilptr, 'entry open: ' .. erre)
+  local se, we = wait_live(he, 30)
+  check(se == CAPTURE_LIVE, 'entry live: ' .. we)
+  run_for(0.8) -- mapped, focused, the text input enabled
+  input(he)
+  local t1 = os.now()
+  local text: string
+  while os.now() - t1 < 5 do
+    turn(50)
+    local f = io.open(out, 'rb')
+    if f:isopen() then
+      text = f:read('a')
+      f:close()
+      if #text > 0 then break end
+    end
+  end
+  be.close(he)
+  run_for(0.3)
+  return text
+end
+do
+  local typed = entry_run('ghostty-ti-test', function(h: pointer): void
+    local e: CaptureInput = { kind = WIN_INPUT_TEXT, text = 'héllo ✓ 日本 Ω\n' }
+    be.input(h, &e)
+  end)
+  print('text-input read back: ' .. typed)
+  check(typed == 'héllo ✓ 日本 Ω\n', 'TEXT with characters no us key types arrived whole')
+  -- paste: the host clipboard's text lands in the entry (ctrl+v)
+  local pasted = entry_run('ghostty-paste-test', function(h: pointer): void
+    local e: CaptureInput = { kind = WIN_INPUT_KEY, hid = 0x19, down = true, mods = WIN_MOD_CTRL } -- ctrl+v
+    be.input(h, &e)
+    e.down = false
+    be.input(h, &e)
+    run_for(0.5)
+    e = { kind = WIN_INPUT_TEXT, text = '\n' }
+    be.input(h, &e)
+  end)
+  print('pasted: ' .. pasted)
+  check(pasted == 'from the host clipboard\n', 'an app pasted the host clipboard')
+  -- copy: text selected and copied in an app reaches the host clipboard
+  sets0 = host_sets
+  entry_run('ghostty-copy-test', function(h: pointer): void
+    local e: CaptureInput = { kind = WIN_INPUT_TEXT, text = 'copied in the app ✓' }
+    be.input(h, &e)
+    local keys: [2]uint16 = { 0x04, 0x06 } -- ctrl+a, ctrl+c
+    for k = 0, < 2 do
+      e = { kind = WIN_INPUT_KEY, hid = keys[k], down = true, mods = WIN_MOD_CTRL }
+      be.input(h, &e)
+      e.down = false
+      be.input(h, &e)
+    end
+    local t2 = os.now()
+    while host_sets == sets0 and os.now() - t2 < 3 do turn(20) end
+    e = { kind = WIN_INPUT_TEXT, text = '\n' }
+    be.input(h, &e)
+  end)
+  print('host clipboard after the copy: ' .. host_clip)
+  check(host_clip == 'copied in the app ✓', 'the app\'s copy reached the host clipboard')
+end
 
 -- an open by match that never shows up times out as pending; not waited
 -- for here (30 s) - check it is pending and close it

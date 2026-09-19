@@ -72,6 +72,10 @@ require 'agent.desktop_entries'
 ## cinclude '<wlr/types/wlr_server_decoration.h>'
 ## cinclude '<wlr/util/edges.h>'
 ## cinclude '<wlr/xwayland.h>'
+## cinclude '<wlr/types/wlr_text_input_v3.h>'
+## cinclude '<wlr/types/wlr_primary_selection.h>'
+## cinclude '<string.h>'
+## cinclude '<errno.h>'
 ## linklib 'wlroots-0.20'
 ## linklib 'wayland-server'
 ## linklib 'pixman-1'
@@ -192,7 +196,11 @@ local wlr_xdg_toplevel_decoration_v1 <cimport, nodecl, ctypedef> = @record{
   toplevel: *wlr_xdg_toplevel,
   events: record{ destroy: wl_signal, request_mode: wl_signal },
 }
-local wlr_seat <cimport, nodecl, ctypedef> = @record{}
+local wlr_data_source <cimport, nodecl, forwarddecl, ctypedef> = @record{}
+local wlr_seat <cimport, nodecl, ctypedef> = @record{
+  selection_source: *wlr_data_source,
+  events: record{ request_set_selection: wl_signal, set_selection: wl_signal, request_set_primary_selection: wl_signal },
+}
 local wlr_keyboard_modifiers <cimport, nodecl, ctypedef> = @record{ depressed: uint32, latched: uint32, locked: uint32, group: uint32 }
 local wlr_keyboard <cimport, nodecl, ctypedef> = @record{
   keycodes: [32]uint32,
@@ -285,6 +293,54 @@ local function wlr_keyboard_init(kb: *wlr_keyboard, impl: *wlr_keyboard_impl, na
 local function wlr_keyboard_set_keymap(kb: *wlr_keyboard, km: *xkb_keymap): boolean <cimport, nodecl> end
 local function wlr_keyboard_finish(kb: *wlr_keyboard): void <cimport, nodecl> end
 local function wlr_keyboard_notify_key(kb: *wlr_keyboard, ev: *wlr_keyboard_key_event): void <cimport, nodecl> end
+-- selections (clipboard) and text-input-v3
+local wl_array <cimport, nodecl, ctypedef> = @record{ size: usize, alloc: usize, data: pointer }
+local wlr_data_source_impl <cimport, nodecl, ctypedef> = @record{
+  send: function(*wlr_data_source, cstring, int32): void,
+  destroy: function(*wlr_data_source): void,
+}
+wlr_data_source = @record{ impl: *wlr_data_source_impl, mime_types: wl_array }
+local wlr_seat_request_set_selection_event <cimport, nodecl, ctypedef> = @record{ source: *wlr_data_source, serial: uint32 }
+local wlr_seat_request_set_primary_selection_event <cimport, nodecl, ctypedef> = @record{ source: pointer, serial: uint32 }
+local wl_event_source <cimport, nodecl, ctypedef> = @record{}
+local function wl_array_add(a: *wl_array, size: usize): pointer <cimport, nodecl> end
+local function wl_display_next_serial(d: *wl_display): uint32 <cimport, nodecl> end
+local function wl_event_loop_add_fd(l: *wl_event_loop, fd: cint, mask: uint32, cb: function(cint, uint32, pointer): cint, data: pointer): *wl_event_source <cimport, nodecl> end
+local function wl_event_source_remove(s: *wl_event_source): cint <cimport, nodecl> end
+local WL_EVENT_READABLE: uint32 <cimport, nodecl, const>
+local WL_EVENT_WRITABLE: uint32 <cimport, nodecl, const>
+local WL_EVENT_HANGUP: uint32 <cimport, nodecl, const>
+local WL_EVENT_ERROR: uint32 <cimport, nodecl, const>
+local function wlr_data_source_init(s: *wlr_data_source, impl: *wlr_data_source_impl): void <cimport, nodecl> end
+local function wlr_data_source_send(s: *wlr_data_source, mime: cstring, fd: int32): void <cimport, nodecl> end
+local function wlr_seat_set_selection(s: *wlr_seat, src: *wlr_data_source, serial: uint32): void <cimport, nodecl> end
+local function wlr_seat_set_primary_selection(s: *wlr_seat, src: pointer, serial: uint32): void <cimport, nodecl> end
+local function strdup(s: cstring): cstring <cimport, nodecl> end
+local function pipe2(fds: *[2]cint, flags: cint): cint <cimport, nodecl> end
+local function read(fd: cint, buf: pointer, n: usize): isize <cimport, nodecl> end
+local function write(fd: cint, buf: pointer, n: usize): isize <cimport, nodecl> end
+local function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
+local O_CLOEXEC: cint <cimport, nodecl, const>
+local O_NONBLOCK: cint <cimport, nodecl, const>
+local F_SETFL: cint <cimport, nodecl, const>
+local errno: cint <cimport, nodecl>
+local EAGAIN: cint <cimport, nodecl, const>
+local EINTR: cint <cimport, nodecl, const>
+local wlr_text_input_v3 <cimport, nodecl, ctypedef> = @record{
+  resource: *wl_resource,
+  focused_surface: *wlr_surface,
+  current_enabled: boolean,
+  events: record{ enable: wl_signal, commit: wl_signal, disable: wl_signal, destroy: wl_signal },
+}
+local wlr_text_input_manager_v3 <cimport, nodecl, ctypedef> = @record{
+  events: record{ new_text_input: wl_signal },
+}
+local function wlr_text_input_manager_v3_create(d: *wl_display): *wlr_text_input_manager_v3 <cimport, nodecl> end
+local function wlr_text_input_v3_send_enter(ti: *wlr_text_input_v3, s: *wlr_surface): void <cimport, nodecl> end
+local function wlr_text_input_v3_send_leave(ti: *wlr_text_input_v3): void <cimport, nodecl> end
+local function wlr_text_input_v3_send_commit_string(ti: *wlr_text_input_v3, text: cstring): void <cimport, nodecl> end
+local function wlr_text_input_v3_send_done(ti: *wlr_text_input_v3): void <cimport, nodecl> end
+
 local function wlr_scene_subsurface_tree_create(parent: *wlr_scene_tree, s: *wlr_surface): *wlr_scene_tree <cimport, nodecl> end
 local function wlr_scene_node_set_position(n: *wlr_scene_node, x: cint, y: cint): void <cimport, nodecl> end
 local function wlr_scene_node_coords(n: *wlr_scene_node, x: *cint, y: *cint): boolean <cimport, nodecl> end
@@ -414,6 +470,12 @@ XSurf = @record{
   on_map: Hook, on_unmap: Hook,
 }
 
+-- A client's text input (text-input-v3).
+local TI = @record{
+  ti: *wlr_text_input_v3,
+  on_destroy: Hook,
+}
+
 local Deco = @record{
   d: *wlr_xdg_toplevel_decoration_v1,
   top: *Top,
@@ -475,6 +537,9 @@ local wc: record{
   scale: integer,          -- output scale apps render at (GHOSTTY_WAYLAND_SCALE, default 2)
   on_new_toplevel: Hook, on_new_popup: Hook, on_new_deco: Hook,
   on_x_surface: Hook, on_x_ready: Hook, on_x_start: Hook,
+  on_new_ti: Hook, on_req_sel: Hook, on_req_psel: Hook, on_set_sel: Hook,
+  tis: vector(*TI),          -- text inputs (text-input-v3) of the clients
+  kb_surface: *wlr_surface,   -- the surface with the keyboard focus
   warned_format: boolean,
   warned_text: boolean,
 }
@@ -619,15 +684,24 @@ end
 global WindowKey = @record{ launch: string, app: string, title: string }
 
 -- "key:LAUNCH\tAPP\tTITLE" -> true and the key (views into `match`).
+-- "key:LAUNCH" alone (the WLISTR column as is) is a key of the launch id
+-- only; "key:LAUNCH\tAPP" has no title. An empty key is not one.
 global function wayland_parse_key(match: string): (boolean, WindowKey)
   local k: WindowKey
   if #match < 4 or match:subview(1, 4) ~= 'key:' then return false, k end
   local rest = match:subview(5)
+  while #rest > 0 and (rest:byte(#rest) == 10 or rest:byte(#rest) == 13 or rest:byte(#rest) == 32) do rest = rest:subview(1, #rest - 1) end
   local t1 = rest:find('\t', 1, true)
-  if t1 == 0 then return false, k end
+  if t1 == 0 then
+    k.launch = rest
+    return #rest > 0, k
+  end
   local t2 = rest:find('\t', t1 + 1, true)
-  if t2 == 0 then return false, k end
   k.launch = rest:subview(1, t1 - 1)
+  if t2 == 0 then
+    k.app = rest:subview(t1 + 1)
+    return true, k
+  end
   k.app = rest:subview(t1 + 1, t2 - 1)
   k.title = rest:subview(t2 + 1)
   while #k.title > 0 and (k.title:byte(#k.title) == 10 or k.title:byte(#k.title) == 13) do k.title = k.title:subview(1, #k.title - 1) end
@@ -751,6 +825,234 @@ local function child_of(pid: cint): *Child
 end
 
 --------------------------------------------------------------------------------
+-- Text input (text-input-v3): TEXT as committed strings to a client that
+-- takes them, so any character arrives, not only what the keymap can type
+
+local function same_client(a: *wl_resource, b: *wl_resource): boolean
+  return a ~= nilptr and b ~= nilptr and wl_resource_get_client(a) == wl_resource_get_client(b)
+end
+
+-- Keyboard focus moved to `surf` (nilptr: nowhere): text inputs follow it,
+-- entering the surface for its own client's and leaving the others'.
+local function ti_focus(surf: *wlr_surface): void
+  for i = 0, < #wc.tis do
+    local ti = wc.tis[i].ti
+    if ti.focused_surface ~= surf then
+      if ti.focused_surface ~= nilptr then wlr_text_input_v3_send_leave(ti) end
+      if surf ~= nilptr and same_client(ti.resource, surf.resource) then wlr_text_input_v3_send_enter(ti, surf) end
+    end
+  end
+end
+
+-- The enabled text input on the focused surface, or nilptr.
+local function ti_active(surf: *wlr_surface): *wlr_text_input_v3
+  if surf == nilptr then return nilptr end
+  for i = 0, < #wc.tis do
+    local ti = wc.tis[i].ti
+    if ti.focused_surface == surf and ti.current_enabled then return ti end
+  end
+  return nilptr
+end
+
+local function on_ti_destroy(l: *wl_listener, data: pointer): void
+  local x = (@*TI)(owner_of(l))
+  unhook(&x.on_destroy)
+  for i = 0, < #wc.tis do
+    if wc.tis[i] == x then wc.tis:remove(i) break end
+  end
+  delete(x)
+end
+
+local function on_new_ti(l: *wl_listener, data: pointer): void
+  local x = new(@TI)
+  x.ti = (@*wlr_text_input_v3)(data)
+  hook(&x.on_destroy, &x.ti.events.destroy, on_ti_destroy, x)
+  wc.tis:push(x)
+  local surf = wc.kb_surface
+  if surf ~= nilptr and same_client(x.ti.resource, surf.resource) then wlr_text_input_v3_send_enter(x.ti, surf) end
+end
+
+--------------------------------------------------------------------------------
+-- Clipboard. Apps set and read the seat's selection as on any desktop
+-- (request_set_selection granted). Bridged to the host clipboard (which the
+-- game's copies and pastes already go through, CLIP_SET/CLIP_GET) with
+-- functions the agent hands in (capture_wayland_set_clipboard):
+--   * When nothing else owns it, the selection is our "host" source, which
+--     reads the host clipboard when an app pastes: pastes get whatever was
+--     copied last in the game, on the desktop or in another app.
+--   * When an app copies text, it is read from the app, put on the host
+--     clipboard, and our host source takes the selection back (it serves
+--     the same text from then on).
+-- X11 apps take part through Xwayland's selection bridge. The primary
+-- selection (middle click) works between apps but is not bridged.
+
+local ClipGet = @function(): (boolean, string)
+local ClipSet = @function(*[0]uint8, usize): boolean
+local clip_get_fn: ClipGet
+local clip_set_fn: ClipSet
+
+local CLIP_MIMES: [5]string = { 'text/plain;charset=utf-8', 'text/plain', 'UTF8_STRING', 'TEXT', 'STRING' }
+local CLIP_READ_MAX: usize <comptime> = 1024 * 1024
+
+-- One transfer between a pipe and a buffer: writing our text to an app that
+-- pastes, or reading an app's copied text.
+local Xfer = @record{
+  fd: cint,
+  src: *wl_event_source,
+  buf: vector(uint8),
+  off: usize,
+}
+
+local proxy_src: wlr_data_source
+local proxy_impl: wlr_data_source_impl
+local proxy_live = false
+
+local function xfer_end(x: *Xfer): void
+  if x.src ~= nilptr then wl_event_source_remove(x.src) end
+  close(x.fd)
+  x.buf:destroy()
+  delete(x)
+end
+
+local function on_xfer_write(fd: cint, mask: uint32, data: pointer): cint
+  local x = (@*Xfer)(data)
+  while x.off < #x.buf do
+    local n = write(fd, &x.buf[x.off], #x.buf - x.off)
+    if n < 0 then
+      if errno == EAGAIN then return 0 end
+      if errno ~= EINTR then break end
+    else
+      x.off = x.off + (@usize)(n)
+    end
+  end
+  xfer_end(x)
+  return 0
+end
+
+-- An app pastes from our host source: the host clipboard, now.
+local function proxy_send(src: *wlr_data_source, mime: cstring, fd: int32): void
+  local ok, text: string = false, (@string){}
+  if clip_get_fn ~= nilptr then ok, text = clip_get_fn() end
+  local x = new(@Xfer)
+  x.fd = fd
+  if ok and #text > 0 then
+    x.buf:resize((@usize)(#text))
+    memory.copy(&x.buf[0], text.data, (@usize)(#text))
+  end
+  text:destroy()
+  fcntl(fd, F_SETFL, O_NONBLOCK)
+  x.src = wl_event_loop_add_fd(wc.loop, fd, WL_EVENT_WRITABLE, on_xfer_write, x)
+  if x.src == nilptr then xfer_end(x) end
+end
+
+local function proxy_destroy(src: *wlr_data_source): void
+  proxy_live = false -- replaced; wlroots freed its mime types, the struct is ours
+end
+
+-- Our host source takes the selection (nothing else owns it, or an app's
+-- text has gone to the host).
+local function proxy_install(): void
+  if proxy_live or clip_get_fn == nilptr then return end
+  proxy_impl.send = proxy_send
+  proxy_impl.destroy = proxy_destroy
+  wlr_data_source_init(&proxy_src, &proxy_impl)
+  for i = 0, < #CLIP_MIMES do
+    local slot = (@*cstring)(wl_array_add(&proxy_src.mime_types, #@cstring))
+    if slot ~= nilptr then $slot = strdup((@cstring)(CLIP_MIMES[i].data)) end
+  end
+  proxy_live = true
+  wlr_seat_set_selection(wc.seat, &proxy_src, wl_display_next_serial(wc.display))
+end
+
+-- The agent's host clipboard (agent.nelua: wl-copy/wl-paste, or the
+-- --clipboard-file). Without it the selection stays among the apps.
+global function capture_wayland_set_clipboard(get: ClipGet, set: ClipSet): void
+  clip_get_fn, clip_set_fn = get, set
+  if wc.started and wc.seat.selection_source == nilptr then proxy_install() end
+end
+
+local function on_xfer_read(fd: cint, mask: uint32, data: pointer): cint
+  local x = (@*Xfer)(data)
+  local done = false
+  local chunk: [16384]uint8
+  while true do
+    local n = read(fd, &chunk, 16384)
+    if n > 0 then
+      if #x.buf + (@usize)(n) <= CLIP_READ_MAX then
+        local at = #x.buf
+        x.buf:resize(at + (@usize)(n))
+        memory.copy(&x.buf[at], &chunk, (@usize)(n))
+      else
+        x.off = 1 -- too big to bridge
+      end
+    elseif n == 0 then
+      done = true
+      break
+    elseif errno ~= EINTR then
+      if errno ~= EAGAIN then done = true end
+      break
+    end
+  end
+  if done then
+    if x.off == 0 and #x.buf > 0 and clip_set_fn ~= nilptr then
+      clip_set_fn(&x.buf[0], #x.buf)
+      log('clipboard: ' .. tostring(#x.buf) .. ' bytes copied in an app went to the host clipboard')
+    end
+    xfer_end(x)
+    proxy_install()
+  end
+  return 0
+end
+
+-- An app set the selection: read its text (the best text type it offers).
+-- Not text (an image, files): it stays the app's, among the apps.
+local function clip_read_app(src: *wlr_data_source): void
+  local mime: cstring = nilptr
+  local n = src.mime_types.size // #@cstring
+  local arr = (@*[0]cstring)(src.mime_types.data)
+  for k = 0, < #CLIP_MIMES do
+    for i = 0, < (@integer)(n) do
+      if (@string)(arr[i]) == CLIP_MIMES[k] then mime = arr[i] break end
+    end
+    if mime ~= nilptr then break end
+  end
+  if mime == nilptr then return end
+  local fds: [2]cint
+  if pipe2(&fds, O_CLOEXEC | O_NONBLOCK) ~= 0 then return end
+  wlr_data_source_send(src, mime, fds[1]) -- the source owns (and closes) the write end
+  local x = new(@Xfer)
+  x.fd = fds[0]
+  x.src = wl_event_loop_add_fd(wc.loop, fds[0], WL_EVENT_READABLE, on_xfer_read, x)
+  if x.src == nilptr then xfer_end(x) end
+  wl_display_flush_clients(wc.display)
+end
+
+local function on_set_selection(l: *wl_listener, data: pointer): void
+  if clip_get_fn == nilptr then return end
+  local src = wc.seat.selection_source
+  if src == &proxy_src then return end
+  if src == nilptr then proxy_install() return end -- its app went: back to the host's
+  clip_read_app(src)
+end
+
+-- Apps copy as on any desktop: granted.
+local function on_request_selection(l: *wl_listener, data: pointer): void
+  local ev = (@*wlr_seat_request_set_selection_event)(data)
+  wlr_seat_set_selection(wc.seat, ev.source, ev.serial)
+end
+
+local function on_request_primary(l: *wl_listener, data: pointer): void
+  local ev = (@*wlr_seat_request_set_primary_selection_event)(data)
+  wlr_seat_set_primary_selection(wc.seat, ev.source, ev.serial)
+end
+
+-- The game copied (CLIP_SET, already on the host clipboard): an app's own
+-- selection gives way to our host source, so pastes here get the new text.
+global function capture_wayland_clipboard_changed(): void
+  if wc.started and wc.seat.selection_source ~= &proxy_src then proxy_install() end
+end
+
+--------------------------------------------------------------------------------
 -- Toplevels (xdg and X11)
 
 local function top_title(t: *Top): string
@@ -796,6 +1098,8 @@ local function focus(t: *Top): void
     wlr_xwayland_surface_restack(t.x11.xs, nilptr, XCB_STACK_MODE_ABOVE)
   end
   wlr_seat_keyboard_notify_enter(wc.seat, top_surface(t), (@*[0]uint32)(&keyboard.keycodes), keyboard.num_keycodes, &keyboard.modifiers)
+  wc.kb_surface = top_surface(t)
+  ti_focus(wc.kb_surface)
 end
 
 -- The window's size: its xdg geometry (the surface's extent when unset), or
@@ -1347,7 +1651,7 @@ end
 
 -- UTF-8 -> keys through the keymap; characters the layout cannot type at
 -- level 1 or 2 are dropped (logged once).
-local function type_text(text: string): void
+local function type_keys(text: string): void
   sync_mods(0)
   local i = 1
   while i <= #text do
@@ -1370,6 +1674,32 @@ local function type_text(text: string): void
     elseif not wc.warned_text then
       wc.warned_text = true
       log('the keymap cannot type U+' .. tostring(cp) .. ' (and maybe more); dropped')
+    end
+  end
+end
+
+-- TEXT: committed as strings through the focused client's enabled text
+-- input (any character), newlines and tabs as the Enter and Tab keys; a
+-- client without one gets keys through the keymap.
+local function type_text(text: string): void
+  local ti = ti_active(wc.kb_surface)
+  if ti == nilptr then type_keys(text) return end
+  local start = 1
+  for i = 1, #text + 1 do
+    local b: uint8 = i <= #text and text:byte(i) or 0
+    if i > #text or b == 10 or b == 13 or b == 9 then
+      if i > start then
+        local run = text:sub(start, i - 1)
+        wlr_text_input_v3_send_commit_string(ti, (@cstring)(run.data))
+        wlr_text_input_v3_send_done(ti)
+        run:destroy()
+      end
+      if i <= #text then
+        sync_mods(0)
+        local code = b == 9 and WL_KEY_TAB or WL_KEY_ENTER
+        key(code, true) key(code, false)
+      end
+      start = i + 1
     end
   end
 end
@@ -1556,7 +1886,7 @@ local function wl_open(wid: uint32, match: string): (pointer, string)
     cmd:destroy()
   elseif #match >= 4 and match:subview(1, 4) == 'key:' then
     local ok = wayland_parse_key(match)
-    if not ok then delete(c) return nilptr, string.copy('bad key: key:LAUNCH<tab>APP<tab>TITLE') end
+    if not ok then delete(c) return nilptr, string.copy('bad key: key:LAUNCH or key:LAUNCH<tab>APP<tab>TITLE') end
     c.key = string.copy(match)
     c.deadline = os.now() + WAYLAND_HANDOFF_WAIT
   else
@@ -1866,6 +2196,13 @@ local function start(): (boolean, string)
   wc.seat = wlr_seat_create(wc.display, 'seat0')
   wlr_seat_set_capabilities(wc.seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD)
   wlr_seat_set_keyboard(wc.seat, &keyboard)
+  hook(&wc.on_req_sel, &wc.seat.events.request_set_selection, on_request_selection, nilptr)
+  hook(&wc.on_req_psel, &wc.seat.events.request_set_primary_selection, on_request_primary, nilptr)
+  hook(&wc.on_set_sel, &wc.seat.events.set_selection, on_set_selection, nilptr)
+  do
+    local tim = wlr_text_input_manager_v3_create(wc.display)
+    if tim ~= nilptr then hook(&wc.on_new_ti, &tim.events.new_text_input, on_new_ti, nilptr) end
+  end
 
   -- a fixed name first, so apps and scripts can find it; the next free one after
   local want = #opt_socket > 0 and opt_socket or os.getenv('GHOSTTY_WAYLAND_SOCKET')
@@ -1889,6 +2226,7 @@ local function start(): (boolean, string)
   wc.instance = string.format('%x', ((@int64)(os.time()) << 20) ~ (@int64)(getpid()))
   wc.started = true
   log('compositor on WAYLAND_DISPLAY=' .. wc.socket .. ' (' .. wc.runtime_dir .. ')')
+  proxy_install()
   start_xwayland()
   return true, ''
 end
@@ -1940,6 +2278,7 @@ global function capture_wayland_shutdown(): void
   end
   wl_display_destroy_clients(wc.display) -- toplevels go, and their hooks with them
   unhook(&wc.on_new_toplevel) unhook(&wc.on_new_popup) unhook(&wc.on_new_deco)
+  unhook(&wc.on_req_sel) unhook(&wc.on_req_psel) unhook(&wc.on_set_sel) unhook(&wc.on_new_ti)
   wlr_keyboard_finish(&keyboard)
   wlr_backend_destroy(wc.backend)
   wlr_allocator_destroy(wc.allocator)
