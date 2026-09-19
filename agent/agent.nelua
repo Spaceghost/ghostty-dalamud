@@ -558,7 +558,7 @@ local function main(): integer
   local listen_spec: string = '127.0.0.1:7777'
   local token_path: string = ''
   local windows_name: string = 'auto'
-  local wayland_socket: string = '' -- empty: GHOSTTY_WAYLAND_SOCKET, else ghostty-0, ghostty-1, ...
+  local wayland_socket: string = '' -- empty: GHOSTTY_WAYLAND_SOCKET, else ffxiv-0, ffxiv-1, ...
   local xkb_layout: string = ''     -- empty: GHOSTTY_XKB_LAYOUT, else us
   agent.replay_bytes = 256 * 1024
   agent.term = 'xterm-256color'

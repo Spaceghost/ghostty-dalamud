@@ -288,11 +288,11 @@ no host compositor: the host desktop never sees these windows.
   which always answers server side (that is: no decorations; the game panel
   has chrome). Clients see one `wl_output` per window and seat `seat0` with
   pointer and keyboard.
-* The socket is `$XDG_RUNTIME_DIR/ghostty-0` (the next free `ghostty-N`
-  when taken), or the name in `GHOSTTY_WAYLAND_SOCKET`; the agent logs it.
-  `capture_wayland_configure(socket, layout)` sets both before the backend
-  starts, for `--wayland-socket` / `--xkb-layout` flags in the agent (not
-  wired up yet). Any client given `WAYLAND_DISPLAY=ghostty-0` joins.
+* The socket is `$XDG_RUNTIME_DIR/ffxiv-0` (the next free `ffxiv-N` when
+  taken), or `--wayland-socket NAME` / `GHOSTTY_WAYLAND_SOCKET`; the agent
+  logs it. Any client started with `WAYLAND_DISPLAY=ffxiv-0` joins, so an
+  app can also be started by hand from a host terminal and then pulled in by
+  name (`/term window pull NAME`).
 * Every `xdg_toplevel` gets its own `wlr_scene` and its own headless output,
   sized to the window geometry (so CSD shadows fall outside). A client picks
   its own size (the first configure is 0×0); one that maps without a size is
