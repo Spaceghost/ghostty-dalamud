@@ -83,6 +83,13 @@ do
   xkb_context_unref(ctx)
 end
 
+-- the launched program's name, for finding a window it handed over to another process
+do
+  local n = wayland_launch_name('gnome-disks'); assert(n == 'gnome-disks') n:destroy()
+  n = wayland_launch_name('  env GDK_SCALE=2 /usr/bin/Gnome-Text-Editor --new-window'); assert(n == 'gnome-text-editor') n:destroy()
+  n = wayland_launch_name('A=1'); assert(n == '') n:destroy()
+end
+
 -- run: parsing
 do
   local ok, cmd = wayland_parse_run('run:foot')

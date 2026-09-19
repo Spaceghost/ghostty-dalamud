@@ -262,6 +262,7 @@ local function wlr_keyboard_notify_key(kb: *wlr_keyboard, ev: *wlr_keyboard_key_
 global WAYLAND_DEFAULT_W: integer <comptime> = 1280
 global WAYLAND_DEFAULT_H: integer <comptime> = 800
 local WAYLAND_OPEN_TIMEOUT: float64 <comptime> = 30.0 -- s, for a launched app or a match to show up
+local WAYLAND_HANDOFF_WAIT: float64 <comptime> = 5.0 -- s, after a launched app exits 0 without a window
 local BTN_LEFT: uint32 <comptime> = 0x110 -- then BTN_RIGHT 0x111, BTN_MIDDLE 0x112
 local AXIS_PER_NOTCH: float64 <comptime> = 15.0 -- wl_pointer.axis units per wheel notch (libinput's)
 
@@ -324,6 +325,9 @@ local Cap = @record{
   match: string,           -- owned, lower case: wid 0 + text
   pid: cint,               -- the app launched for this open, 0 for none
   deadline: float64,       -- os.now() by which a pending open must settle
+  first_new: uint32,       -- run: windows with this id or later appeared after the launch
+  name: string,            -- owned, lower case: the launched program's base name
+  handed_off: boolean,     -- the launched process exited 0 without a window of its own
 }
 
 local Child = @record{ pid: cint, done: boolean, status: cint }
@@ -399,6 +403,33 @@ global function wayland_parse_run(match: string): (boolean, string)
   while j >= i and (match:byte(j) == 32 or match:byte(j) == 9 or match:byte(j) == 10 or match:byte(j) == 13) do j = j - 1 end
   if j < i then return false, (@string){} end
   return true, match:sub(i, j)
+end
+
+-- The launched program's base name, lower case, for finding its window when
+-- the process hands off to another one ("gnome-disks" from
+-- "env FOO=1 /usr/bin/gnome-disks --x"). Empty when there is none.
+global function wayland_launch_name(cmd: string): string
+  local i, n = 1, #cmd
+  while i <= n do
+    while i <= n and (cmd:byte(i) == 32 or cmd:byte(i) == 9) do i = i + 1 end
+    local j = i
+    while j <= n and cmd:byte(j) ~= 32 and cmd:byte(j) ~= 9 do j = j + 1 end
+    if j > i then
+      local word = cmd:sub(i, j - 1)
+      if word ~= 'env' and word:find('=', 1, true) == 0 then -- find gives 0, not nil, when absent
+        local slash = 0
+        for k = 1, #word do if word:byte(k) == 47 then slash = k end end
+        local base = word:sub(slash + 1)
+        word:destroy()
+        local lower = base:lower()
+        base:destroy()
+        return lower
+      end
+      word:destroy()
+    end
+    i = j
+  end
+  return (@string){}
 end
 
 -- A WLIST field: tabs and newlines would break the line format.
@@ -864,32 +895,65 @@ local function find_top(id: uint32): *Top
   return nilptr
 end
 
--- A pending open finds its window: the launched app's (by client pid, or a
--- descendant of it) or the first whose title or app id contains the match.
+local function owned(t: *Top): boolean
+  for i = 0, < #wc.caps do
+    if wc.caps[i].top == t then return true end
+  end
+  return false
+end
+
+-- A pending open finds its window. A launched app's is its own (by client
+-- pid, or a descendant of it), else the first window nobody streams that
+-- appeared after the launch (apps started through D-Bus activation run in
+-- another process), else, once the launched process has exited 0 without a
+-- window (a single-instance app handing over to its running copy), one whose
+-- app id or title contains the program's name. Without run:, the first
+-- window whose title or app id contains the match.
 local function settle(c: *Cap, now: float64): void
-  for i = 0, < #wc.tops do
-    local t = wc.tops[i]
-    if t.mapped then
-      local hit = false
-      if c.pid ~= 0 then hit = descends_from(t.pid, c.pid)
-      else hit = wayland_contains(top_title(t), c.match) or wayland_contains(top_app(t), c.match) end
-      if hit then
-        c.top = t
-        set_why(c, CAPTURE_LIVE, '')
-        focus(t)
-        return
+  for pass = 1, 3 do
+    for i = 0, < #wc.tops do
+      local t = wc.tops[i]
+      if t.mapped then
+        local hit = false
+        if c.pid == 0 then
+          hit = pass == 1 and (wayland_contains(top_title(t), c.match) or wayland_contains(top_app(t), c.match))
+        elseif pass == 1 then
+          hit = descends_from(t.pid, c.pid)
+        elseif pass == 2 then
+          hit = t.id >= c.first_new and not owned(t)
+        elseif c.handed_off and #c.name > 0 then
+          hit = wayland_contains(top_app(t), c.name) or wayland_contains(top_title(t), c.name)
+        end
+        if hit then
+          c.top = t
+          set_why(c, CAPTURE_LIVE, '')
+          focus(t)
+          return
+        end
       end
     end
   end
   if c.pid ~= 0 then
     local ch = child_of(c.pid)
     if ch ~= nilptr and ch.done then
-      local sb: stringbuilder
-      sb:writef('the app exited (status %d) without opening a window here', ch.status)
-      local why = sb:promote()
-      set_why(c, CAPTURE_ENDED, why)
-      why:destroy()
-      return
+      if ch.status == 0 and not c.handed_off then
+        -- it may have handed over: give the other process a moment to show a window
+        c.handed_off = true
+        c.deadline = math.min(c.deadline, now + WAYLAND_HANDOFF_WAIT)
+        settle(c, now)
+        return
+      elseif ch.status ~= 0 or now >= c.deadline then
+        local sb: stringbuilder
+        if ch.status == 0 then
+          sb:writef('the app exited without opening a window here (a copy already running on the desktop may have taken it)')
+        else
+          sb:writef('the app exited (status %d) without opening a window here', ch.status)
+        end
+        local why = sb:promote()
+        set_why(c, CAPTURE_ENDED, why)
+        why:destroy()
+        return
+      end
     end
   end
   if now >= c.deadline then
@@ -920,6 +984,8 @@ local function wl_open(wid: uint32, match: string): (pointer, string)
       return nilptr, string.copy('cannot start the app (fork failed)')
     end
     wc.children:push(Child{ pid = c.pid })
+    c.first_new = wc.next_id
+    c.name = wayland_launch_name(cmd)
     log('started "' .. cmd .. '" (pid ' .. tostring(c.pid) .. ') on ' .. wc.socket)
     cmd:destroy()
   else
@@ -1000,7 +1066,7 @@ local function wl_close(h: pointer): void
   for i = 0, < #wc.caps do
     if wc.caps[i] == c then wc.caps:remove(i) break end
   end
-  c.why:destroy() c.title:destroy() c.match:destroy()
+  c.why:destroy() c.title:destroy() c.match:destroy() c.name:destroy()
   delete(c)
 end
 
