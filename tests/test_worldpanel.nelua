@@ -572,6 +572,34 @@ local function fake_camera(c: *GuCamera): cint
   c.m[14] = 0.1
   return 1
 end
+
+-- Pets with a real camera: none placed between the camera and the player, and
+-- ghostty.camera()'s three values all read (one truncated read broke every pet).
+do
+  world_host.get_camera = fake_camera
+  local code: cstring = [[
+    local w = CONFIG.world
+    local cx, _, cz = ghostty.camera()
+    assert(cx and cz, 'the fake camera is seen')
+    local back = math.atan(-cx, -cz)
+    for id = 301, 305 do assert(w.command(id, 'pet') == nil) end
+    for f = 1, 240 do for id = 301, 305 do assert(w.place(id, 700 + f / 60, false)) end end
+    local p = ghostty.player()
+    for id = 301, 305 do
+      local a = w.anchors[id]
+      local rel = math.abs((math.atan(a.px - p.x, a.pz - p.z) - back + math.pi) % (2 * math.pi) - math.pi)
+      assert(rel >= w.pet.camera_clear - 1e-3, 'a pet sits between the camera and the player')
+    end
+    for id = 301, 305 do w.forget(id) end
+  ]]
+  assert(luaL_loadstring(policy.L, code) == LUA_OK, 'load')
+  if lua_pcall(policy.L, 0, 0, 0) ~= LUA_OK then
+    print(lua_tolstring(policy.L, -1, nilptr))
+    assert(false, 'pets clear of the camera line')
+  end
+  world_host.get_camera = nilptr
+  print('pets clear of the camera OK')
+end
 local function game_player(which: cint, id: uint64, out: *GuObject): cint
   $out = {}
   if which == WORLD_PLAYER then
