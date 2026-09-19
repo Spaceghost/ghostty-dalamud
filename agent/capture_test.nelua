@@ -20,6 +20,7 @@ require 'string'
 require 'stringbuilder'
 require 'vector'
 require 'memory'
+require 'core.protocol'
 
 local CAPTURE_TEST_CLOSING_FRAMES: integer <comptime> = 3
 
