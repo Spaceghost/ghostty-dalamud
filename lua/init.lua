@@ -14,6 +14,8 @@ local bell = require('bell')
 local showcase = require('showcase')
 local platform = require('platform')
 local assistant = require('assistant')
+local themes = require('themes')
+local tooltips = require('tooltips')
 
 -- The agent connection and profiles for where the game runs (native Windows,
 -- or Wine/Proton on Linux): see lua/platform.lua.
@@ -41,6 +43,16 @@ local config = {
   -- the plugin reads it from the controller itself (Windows HID; not yet
   -- verified in game or under Wine). Empty string disables it.
   toggle_gamepad_button = 'select',
+
+  -- Colour theme for the terminals and the glass UI: a name from themes/
+  -- beside the plugin or themes/ in the config directory (yours win). Ships
+  -- spaceghost (the default), gruvbox-dark, catppuccin (mocha),
+  -- catppuccin-macchiato, catppuccin-frappe and catppuccin-latte; any Ghostty
+  -- theme file works too. /term theme lists them, /term theme <name> switches.
+  theme = 'spaceghost',
+  themes = themes,
+  -- Tooltip texts (lua/tooltips.lua), and the delay before they show.
+  tooltips = tooltips,
 
   cursor_blink = true,
   -- Close a terminal (tab, window or world panel) when its shell exits, e.g. ctrl+d.
@@ -80,7 +92,7 @@ local config = {
   -- What the plugin registers with Dalamud.
   host = {
     commands = { '/term', '/tomestone', '/tome' },
-    help = 'Show/hide the terminal. window [n] | new [n] | pin [here|me|target|orbit] | unpin | ask [question] | config | reload',
+    help = 'Show/hide the terminal. window [n] | new [n] | pin [here|me|target|orbit] | unpin | ask [question] | theme [name] | config | reload',
     -- Server info bar entry. 'auto' shows it only while no Umbra toolbar
     -- widget is showing ghostty's status; 'always' | 'never'.
     dtr = {

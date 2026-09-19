@@ -8,6 +8,8 @@
 
 local changelog = require('changelog')
 local vote = require('vote')
+local themes = require('themes')
+local tooltips = require('tooltips')
 
 local S = {}
 
@@ -17,6 +19,9 @@ local PAD = { 'select', 'create', 'start', 'l3', 'r3', 'dpad_up', 'dpad_down', '
 local DTR_MODES = { 'auto', 'always', 'never' }
 
 S.schema = {
+  { 'Theme', {
+    { 'theme', 'theme', 'Theme' },
+  } },
   { 'Keys & controller', {
     { 'toggle_mods', 'combo', MODS, 'Dropdown toggle modifiers (+ `)' },
     { 'world_toggle_mods', 'combo', MODS, 'World terminals toggle modifiers (+ `)' },
@@ -180,8 +185,27 @@ local function sanitize(path, value)
   return math.min(math.max(value, e[3]), e[4])
 end
 
+-- Each setting's shipped value, for its tooltip (captured before saved values).
+S.defaults = {}
+
+local function capture_defaults(config)
+  S.defaults = {}
+  for _, section in ipairs(S.schema) do
+    for _, e in ipairs(section[2]) do
+      local v = get(config, e[1])
+      if type(v) ~= 'table' and type(v) ~= 'function' then S.defaults[e[1]] = v end
+    end
+  end
+  if S.defaults.theme == nil then S.defaults.theme = themes.DEFAULT end
+end
+
 -- Layer saved values over the config (called from init.lua before returning).
 function S.apply(config)
+  -- an init.lua copied before themes and tooltips existed still gets them
+  if config.themes == nil then config.themes = themes end
+  if config.tooltips == nil then config.tooltips = tooltips end
+  if type(config.theme) ~= 'string' or config.theme == '' then config.theme = themes.DEFAULT end
+  capture_defaults(config)
   local chunk = loadfile(file())
   if chunk then
     local ok, saved = pcall(chunk)
@@ -196,7 +220,38 @@ function S.apply(config)
     end
   end
   S.config = config
+  themes.apply(config, S.values)
   return config
+end
+
+-- Switch the theme (the settings window and /term theme) and save it.
+function S.set_theme(name)
+  local config = S.config or CONFIG
+  if type(config) ~= 'table' then return end
+  config.theme = name
+  S.values.theme = name
+  themes.apply(config, S.values)
+  S.save()
+end
+
+-- The tooltip of setting `path`: its sentence and its default.
+local function show_default(v)
+  if type(v) == 'boolean' then return v and 'on' or 'off' end
+  if type(v) == 'number' then
+    if v == math.floor(v) then return string.format('%d', v) end
+    return (string.format('%.3f', v):gsub('0+$', ''))
+  end
+  if v == '' then return 'none' end
+  return tostring(v)
+end
+
+function S.tooltip(path)
+  local tips = (S.config and S.config.tooltips) or tooltips
+  local text = tips.settings and tips.settings[path]
+  if not text then return nil end
+  local d = S.defaults[path]
+  if d ~= nil then text = text .. ' Default: ' .. show_default(d) .. '.' end
+  return text
 end
 
 function S.save()
@@ -272,13 +327,19 @@ function S.draw_settings(ui)
   local save_now = false -- toggles and choices save at once, sliders when released
   ui.text('Changes apply immediately and are saved to settings.lua.')
   ui.separator()
+  local tips = config.tooltips or tooltips
+  local tip = ui.tip or function() end -- an older core has no tooltips
   for si, section in ipairs(S.schema) do
-    if ui.header(section[1], si == 1) then
+    local open = ui.header(section[1], si <= 2)
+    tip(tips.sections and tips.sections[section[1]])
+    if open then
       for _, e in ipairs(section[2]) do
         local path, kind = e[1], e[2]
         local cur = get(config, path)
         local c, v, done = false, cur, false
-        if kind == 'slider' then
+        if kind == 'theme' then
+          c, v = S.draw_theme(ui, e[3] .. '##' .. path, cur, tip, tips)
+        elseif kind == 'slider' then
           c, v, done = ui.slider(e[5] .. '##' .. path, tonumber(cur) or e[3], e[3], e[4])
         elseif kind == 'slider_int' then
           c, v, done = ui.slider_int(e[5] .. '##' .. path, math.floor(tonumber(cur) or e[3]), e[3], e[4])
@@ -292,7 +353,11 @@ function S.draw_settings(ui)
           for i, w in ipairs(type(cur) == 'table' and cur or {}) do words[i] = string.format('%q', w) end
           ui.wrapped(e[3] .. ': ' .. table.concat(words, ' ') .. ' (edit in lua/)', 0.72, 0.74, 0.78)
         end
-        if c then
+        if kind ~= 'theme' then tip(S.tooltip(path)) end
+        if c and kind == 'theme' then
+          S.set_theme(v)
+          changed = true
+        elseif c then
           set(config, path, v)
           S.values[path] = v
           changed = true
@@ -304,12 +369,42 @@ function S.draw_settings(ui)
   end
   S.draw_status(ui)
   ui.separator()
-  if ui.button('Reset all to defaults') then
+  local reset = ui.button('Reset all to defaults')
+  tip(tips.reset)
+  if reset then
     S.reset()
     ui.text('Defaults restore on the next reload (/term reload).')
   end
   if save_now then S.save() end
   return changed
+end
+
+-- The Theme combo: picking one applies it at once (live), hovering one in
+-- the list shows its colours, and the closed combo shows the current one's.
+function S.draw_theme(ui, label, cur, tip, tips)
+  local names = themes.names()
+  if #names == 0 then names = { themes.DEFAULT } end
+  local shown = {}
+  for i, n in ipairs(names) do
+    shown[i] = n
+    if themes.source(n) == 'user' then shown[i] = n .. ' (yours)' end
+  end
+  local current = tostring(cur or themes.DEFAULT)
+  local cur_label = current
+  for i, n in ipairs(names) do if n == current then cur_label = shown[i] end end
+  local c, v, hovered = ui.combo(label, cur_label, shown)
+  if hovered then
+    local name = names[hovered] or current
+    tip(name .. ': ' .. (tips.theme_item or ''), themes.swatch(name), true)
+  else
+    tip((S.tooltip('theme') or tips.theme or ''), themes.swatch(current))
+  end
+  if c then
+    for i, n in ipairs(shown) do
+      if n == v then return true, names[i] end
+    end
+  end
+  return false, current
 end
 
 -- Read-only: how the core is hosted, what it registered, and which lua files
