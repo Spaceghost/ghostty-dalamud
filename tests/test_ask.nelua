@@ -1,0 +1,199 @@
+-- The /ask panel: tests/test_ask.lua drives lua/ask.lua on its own (a
+-- scripted ghostty.ui); here the core's side through the exported host
+-- surface: /ask with a question starts a hidden session running almanac with
+-- the question as one argv element, never a tab; its output reaches Lua line
+-- by line (split across reads, \r\n from the terminal, an unfinished last
+-- line), the session goes when the process ends, /ask term and
+-- assistant.ui = 'terminal' still open the terminal, and a reload ends the
+-- hidden sessions instead of leaving them to come back as tabs.
+require 'core.host'
+require 'string'
+require 'io'
+require 'os'
+require 'arg'
+
+local root: string = arg[1]
+local scratch: string = arg[2]
+
+do
+  local L = luaL_newstate()
+  luaL_openlibs(L)
+  local script = root .. '/tests/test_ask.lua'
+  if luaL_loadfilex(L, (@cstring)(script.data), nilptr) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_pushlstring(L, (@cstring)(root.data), root.size)
+  lua_pushlstring(L, (@cstring)(scratch.data), scratch.size)
+  if lua_pcall(L, 2, 0, 0) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_close(L)
+  script:destroy()
+end
+
+local function log_cb(level: cint, msg: cstring): void io.write('[log ', level, '] ', msg, '\n') end
+local api: GuHostApi = { size = #GuHostApi, log = log_cb }
+assert(gu_init(&api, (@cstring)(root.data)) == 0)
+
+local function lua_run(code: cstring): void
+  if luaL_loadstring(policy.L, code) ~= LUA_OK or lua_pcall(policy.L, 0, 0, 0) ~= LUA_OK then
+    io.stderr:write(code, '\n', (@cstring)(lua_tolstring(policy.L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+end
+
+local function newest(): *Session
+  assert(#host.sessions > 0)
+  return host.sessions[#host.sessions - 1]
+end
+
+-- open_argv joined with US (0x1f), which no test argument contains
+local function argv_is(s: *Session, want: string): boolean
+  local sb: stringbuilder
+  for i = 0, < #s.open_argv do
+    if i > 0 then sb:write('\x1f') end
+    sb:write(s.open_argv[i])
+  end
+  local got = sb:promote()
+  local same = got == want
+  if not same then print('argv:', got) end
+  got:destroy()
+  return same
+end
+
+local function feed(s: *Session, text: string): void
+  s:feed((@*[0]uint8)(text.data), text.size)
+end
+
+do -- the panel remembers its thread in the scratch directory, not beside lua/
+  local sb: stringbuilder
+  sb:write("GHOSTTY_PLUGIN_DIR = [==[", scratch, "]==]; os.remove(GHOSTTY_PLUGIN_DIR .. '/ask-state.lua')\0")
+  local code = sb:promote()
+  lua_run((@cstring)(code.data))
+  code:destroy()
+end
+lua_run("assert(CONFIG.ask and CONFIG.assistant.ui == 'panel' and ghostty.ask_spawn and ghostty.ask_cancel and ghostty.ask_echo and ghostty.ask_pin)")
+
+-- /ask <question>: a hidden session with almanac's JSON lines, not a tab
+do
+  local tabs, n = #host.dropdown_tabs, #host.sessions
+  local q = 'say "hi"; $(id) naïve 日本語'
+  local cmd = 'ask ' .. q
+  assert(gu_command(cmd) == 0)
+  assert(#host.sessions == n + 1 and #host.dropdown_tabs == tabs and #host.windows == 0 and #host.world == 0, 'no terminal')
+  local s = newest()
+  assert(s.capture and s.kind == TransportKind.Agent and not s.assistant)
+  local want = 'almanac\x1fask\x1f--stream-json\x1f--new-thread\x1f--\x1f' .. q
+  assert(argv_is(s, want))
+  assert(ask_job_count() == 1)
+  cmd:destroy() want:destroy()
+  lua_run("assert(CONFIG.ask.state.shown and CONFIG.ask.busy())")
+
+  -- output, as the terminal delivers it: \r\n, split anywhere, noise between
+  s.awaiting_open = false -- as if the agent had opened it
+  feed(s, '{"type": "thread", "id": "T9", "title": "", "new": true, "turns": 0}\r\n{"type": "te')
+  ask_frame(1.0, false)
+  lua_run("assert(CONFIG.ask.state.thread.id == 'T9')")
+  feed(s, 'xt", "text": "Hel"}\r\nsome warning on stderr\r\n{"type": "text", "text": "lo \\u00e9"}\r\n')
+  ask_frame(1.1, false)
+  lua_run("local m = CONFIG.ask.state.messages; assert(m[2].text == 'Hello \u{e9}', m[2].text) assert(m[2].streaming)")
+  assert(s.view.term ~= nilptr and s.captured:len() == 0)
+  -- the last line has no newline yet: it waits for the end
+  feed(s, '{"type": "done", "answer": "Hello \\u00e9!", "thread": "T9", "title": "t"}')
+  ask_frame(1.2, false)
+  lua_run("assert(CONFIG.ask.state.messages[2].streaming)")
+  s:mark_exited(0)
+  local id = s.id
+  ask_frame(1.3, false)
+  lua_run("local m = CONFIG.ask.state.messages; assert(m[2].text == 'Hello \u{e9}!' and not m[2].streaming and not CONFIG.ask.busy())")
+  assert(ask_job_count() == 0 and find_session(id) == nilptr and #host.sessions == n, 'the session is gone')
+end
+
+-- a follow-up: --thread T9
+do
+  assert(gu_command('ask and then?') == 0)
+  local s = newest()
+  assert(s.capture and argv_is(s, 'almanac\x1fask\x1f--stream-json\x1f--thread\x1fT9\x1f--\x1fand then?'))
+  -- the agent refused to start it: the not-found hint in an error bubble
+  local why: string = 'cannot run almanac'
+  local ev: AgentEvent = { typ = PROTO_OPENED, id = 0, data = (@*[0]uint8)(why.data), len = why.size }
+  host.pending_open:clear()
+  host.pending_open:push(s)
+  agent_event(nilptr, &ev)
+  assert(s.exited and not s.process_exited)
+  ask_frame(2.0, false)
+  lua_run("local m = CONFIG.ask.state.messages; assert(m[#m].role == 'error' and m[#m].text:find('not found', 1, true))")
+  assert(ask_job_count() == 0)
+end
+
+-- reap_exited leaves a finished hidden session for ask_frame
+do
+  assert(gu_command('ask third') == 0)
+  local s = newest()
+  s.awaiting_open = false
+  s:mark_exited(0)
+  reap_exited(100.0)
+  reap_exited(200.0)
+  assert(find_session(s.id) == s and ask_job_count() == 1)
+  ask_frame(3.0, false)
+  assert(ask_job_count() == 0)
+end
+
+-- Stop (ghostty.ask_cancel) ends the session at once
+do
+  assert(gu_command('ask fourth') == 0)
+  local s = newest()
+  local id = s.id
+  s.awaiting_open = false
+  lua_run("CONFIG.ask.stop() assert(not CONFIG.ask.busy())")
+  assert(find_session(id) == nilptr and ask_job_count() == 0)
+end
+
+-- /ask term and assistant.ui = 'terminal': the terminal, as before
+lua_run("CONFIG.assistant.view = 'tab'")
+do
+  local tabs = #host.dropdown_tabs
+  assert(gu_command('ask term what is up') == 0)
+  assert(#host.dropdown_tabs == tabs + 1)
+  local s = newest()
+  assert(s.assistant and not s.capture and argv_is(s, 'almanac\x1fask\x1f--\x1fwhat is up'))
+  lua_run("CONFIG.assistant.ui = 'terminal'")
+  assert(gu_command('ask hello') == 0)
+  assert(#host.dropdown_tabs == tabs + 2 and newest().assistant and argv_is(newest(), 'almanac\x1fask\x1f--\x1fhello'))
+  lua_run("CONFIG.assistant.ui = 'panel'")
+end
+
+-- /ask alone toggles the panel; nothing runs
+do
+  local n = #host.sessions
+  lua_run("CONFIG.ask.hide()")
+  assert(gu_command('ask') == 0)
+  lua_run("assert(CONFIG.ask.state.shown)")
+  assert(gu_command('ask') == 0)
+  lua_run("assert(not CONFIG.ask.state.shown)")
+  assert(#host.sessions == n)
+end
+
+-- no lua/ask.lua (an old init.lua copy): /ask opens the terminal
+lua_run("SAVED_ASK = CONFIG.ask; CONFIG.ask = nil")
+do
+  local tabs = #host.dropdown_tabs
+  assert(gu_command('ask q') == 0 and #host.dropdown_tabs == tabs + 1 and newest().assistant)
+end
+lua_run("CONFIG.ask = SAVED_ASK")
+
+-- a reload ends the hidden sessions (a CLOSE, not a DETACH that would bring
+-- them back as tabs)
+do
+  assert(gu_command('ask fifth') == 0)
+  assert(ask_job_count() == 1)
+  assert(gu_command('reload') == 0)
+  assert(ask_job_count() == 0)
+  for i = 0, < #host.sessions do assert(not host.sessions[i].capture) end
+end
+
+lua_run("os.remove(GHOSTTY_PLUGIN_DIR .. '/ask-state.lua')")
+gu_shutdown()
+print('OK')

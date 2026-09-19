@@ -452,7 +452,7 @@ return {
 | `/term send [#id] text`, `/term type [#id] text` | type into a terminal, with or without Enter |
 | `/term bell [ripple\|sonar\|burst\|aura\|calm\|custom\|demo]` | preview the visual bell |
 | `/term showcase`, `/term showcase off` | demo terminals and camera shots for screenshots; needs nothing on disk |
-| `/term ask [question]` | ask a local AI assistant in a terminal of its own (see [Assistant](#assistant-term-ask)) |
+| `/ask [question]`, `/ask new [question]`, `/ask threads`, `/ask pin`, `/ask term [question]` | ask a local AI assistant in a chat panel with follow-ups (see [Ask panel](#ask-panel-ask)); `/term ask` is the same |
 | `/term theme [name]` | switch the colour theme, or list the themes (see [Themes](#themes)) |
 | `/term share [on\|off\|gallery\|path]` | offer your latest screenshot (or `path`) to the gallery; `on`/`off` the prompt after screenshots; `gallery` opens the page (see [Screenshots](#screenshots)) |
 | `/term config` | the settings window |
@@ -476,12 +476,62 @@ right-click opens the popup, shift+click opens a window, ctrl+click shows the
 world screens. The popup closes when it loses focus; <kbd>Esc</kbd> goes to
 the terminal.
 
-## Assistant (`/term ask`)
+## Ask panel (`/ask`)
+
+**New and untested in game**: only the host tests (`tests/test_ask.*`, with a
+scripted ImGui) have run it. It needs an almanac with threads
+(`almanac ask --stream-json`, `almanac threads`).
+
+`/ask <question>` (or `/term ask`, `/agent ask`) answers in a Ghostty glass
+panel instead of a terminal: your question and the answer as chat bubbles,
+the answer streaming in as it is written, with an input box for follow-ups.
+
+```
+/ask which retainers have full inventories?
+/ask and which of them sell the most?
+/ask new what's my next MSQ step?
+```
+
+* **Follow-ups.** Each conversation is an almanac thread: the first question
+  starts one (`almanac ask --new-thread`), the next ones continue it
+  (`--thread ID`), so the model sees what was said before. almanac keeps the
+  threads (`~/.local/state/almanac/threads/`) and trims what it sends back to
+  the model's context. The panel remembers the current thread across
+  `/term reload` and game restarts (`ask-state.lua` in the config directory).
+* **In the panel:** <kbd>Enter</kbd> sends, <kbd>Shift</kbd>+<kbd>Enter</kbd>
+  (or <kbd>Ctrl</kbd>+<kbd>Enter</kbd>) starts a new line, <kbd>Esc</kbd>
+  closes it. **New** starts a thread, **Threads** lists earlier ones (click
+  one to continue it), **Stop** ends an answer, **Pin** floats the panel beside
+  your character as a pet (the same as `/window adopt ask`; "back to UI"
+  returns it). `/ask` alone shows or hides the panel.
+* **Markdown, lightly:** fenced code blocks in the monospace font, headings,
+  bullets, bold and `code` marks dropped, and `https://` links (bare or
+  `[label](url)`) as clickable links under their paragraph that open in your
+  browser (`ghostty.open_url`: https only).
+* **Game actions** are off; the tick box in the panel (or
+  `assistant.game_actions`) adds `--allow-game-actions`, and XivMcp still asks
+  you in game to confirm each action. The panel never approves almanac's own
+  change tools (`--stream-json` never prompts).
+* **Echo** (`assistant.echo`, off): the first paragraph of each answer is also
+  printed in your chat log as an echo line only you see.
+* **How it runs:** the core runs `CONFIG.assistant.stream` (default
+  `almanac ask --stream-json`) plus the thread options, `--` and the question
+  as one argument, through the same transport as the assistant terminal (the
+  agent; ConPTY on native Windows while no agent answers), on a hidden session
+  whose output goes to `lua/ask.lua` line by line instead of a screen. Its
+  JSON lines are the protocol; nothing new crosses the agent connection and
+  the C# shim is unchanged. A `/term reload` ends a running answer (the thread
+  keeps everything up to the last finished one). On native Windows a ConPTY
+  re-renders output and may break long lines; untested there.
+* `/ask term <question>`, or `assistant.ui = 'terminal'` (Settings →
+  Assistant), opens the terminal described below instead.
+
+## Assistant terminal (`/ask term`, `/term ask`)
 
 **New and untested in game**: only the host tests (`tests/test_assistant.*`)
 have run it.
 
-`/term ask <question>` opens a terminal that runs a local AI assistant with
+With `assistant.ui = 'terminal'` (or `/ask term ...`), `/term ask <question>` opens a terminal that runs a local AI assistant with
 your question; `/term ask` alone opens its interactive session. The default
 assistant is almanac, a separate project: `almanac ask -- "<question>"`
 and `almanac chat`. It must be installed where the terminal's command runs
@@ -590,7 +640,7 @@ Tested on the host (`tests/run.sh`): the libghostty-vt binding, cell renderer,
 key encoding, DualSense report parsing, Lua policy, agent protocol and server,
 the plugin's activation state machine, its command / info bar / IPC registration and the config
 migration (`tests/test_hostsurface.nelua`, `tests/test_migrate.*`), the
-per-platform defaults and local fallbacks (`tests/test_platform.*`), `/term ask` (`tests/test_assistant.*`; untested in game), themes and tooltips (`tests/test_themes.*`; untested in game) and the
+per-platform defaults and local fallbacks (`tests/test_platform.*`), `/term ask` (`tests/test_assistant.*`; untested in game), the `/ask` panel (`tests/test_ask.*`; untested in game), themes and tooltips (`tests/test_themes.*`; untested in game) and the
 agent's shared pure logic (`tests/test_agent_logic.nelua`). Both C#
 projects, the Windows DLLs and `ghostty-agent.exe` compile.
 

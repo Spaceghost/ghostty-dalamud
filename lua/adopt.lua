@@ -33,6 +33,8 @@ M.windows = {
   chat2 = { title = '###chat2', plugin = 'ChatTwo', label = 'Chat 2' },
   -- Mappy 3.2.0.0, Windows/MapWindow.cs
   mappy = { title = '###MappyMapWindow', plugin = 'Mappy', label = 'Mappy' },
+  -- ghostty's own /ask panel (lua/ask.lua; its Pin button does this)
+  ask = { title = '###ghostty_ask', label = 'Ask' },
   -- the game's chat log (the ChatLog addon and its panels)
   chat = { native = true, label = 'Chat' },
 }

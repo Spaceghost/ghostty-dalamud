@@ -15,6 +15,7 @@ local rain = require('rain')
 local showcase = require('showcase')
 local platform = require('platform')
 local assistant = require('assistant')
+local ask = require('ask')
 local themes = require('themes')
 local tooltips = require('tooltips')
 local windows = require('windows')
@@ -168,6 +169,11 @@ local config = {
   -- (e.g. assistant.view = 'tab') rather than replacing the table: the core
   -- calls its functions.
   assistant = assistant,
+  -- /ask [question]: the assistant's answers as chat bubbles in a panel, with
+  -- follow-ups (threads), a thread list and a pin onto a pet. /ask new starts
+  -- a new thread, /ask term the terminal. Behaviour: lua/ask.lua; what runs:
+  -- lua/assistant.lua (ui = 'terminal' turns the panel off).
+  ask = ask,
   -- Desktop windows streamed by ghostty-agent onto world panels: /term window
   -- list | pull [match|#wid|run CMD] | close. Sizes, frame rate and windows
   -- pulled at login: lua/windows.lua.

@@ -128,6 +128,10 @@ S.schema = {
   } },
   { 'Assistant (/term ask)', {
     { 'assistant.enabled', 'checkbox', '/term ask opens the assistant' },
+    { 'assistant.ui', 'combo', { 'panel', 'terminal' }, '/ask answers in (panel: chat bubbles with follow-ups)' },
+    { 'assistant.game_actions', 'checkbox', 'The panel offers game actions (the game still asks you first)' },
+    { 'assistant.echo', 'checkbox', 'Also print the start of each answer in the chat' },
+    { 'assistant.stream', 'argv', 'The panel runs' },
     { 'assistant.view', 'combo', { 'pet', 'tab', 'window' }, 'Opens as (pet needs your character; else a tab)' },
     { 'assistant.transport', 'combo', { 'default', 'agent', 'conpty' }, 'Runs through (default: as your first profile)' },
     { 'assistant.chat', 'argv', '/term ask runs' },

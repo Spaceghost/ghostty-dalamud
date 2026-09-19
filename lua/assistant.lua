@@ -1,4 +1,5 @@
--- /term ask: talk to a local AI assistant from a terminal of its own.
+-- /term ask: talk to a local AI assistant, in the /ask panel (lua/ask.lua)
+-- or a terminal of its own.
 --
 -- The default assistant is almanac, a separate project: `almanac chat` is
 -- its interactive REPL and `almanac ask "question"` answers once. Any other
@@ -14,6 +15,24 @@
 local A = {
   -- false turns /term ask off (it then only prints a line in the log).
   enabled = true,
+  -- 'panel': /ask answers in a chat panel in the game (lua/ask.lua), with
+  -- follow-ups in threads; 'terminal': /ask opens a terminal running `chat`
+  -- or `ask` below, as before. `/ask term <question>` always opens the terminal.
+  ui = 'panel',
+  -- The panel runs this argv, then --thread ID (or --new-thread),
+  -- --allow-game-actions when ticked, '--' and the question. It must print
+  -- JSON lines like `almanac ask --stream-json` (see almanac's README).
+  stream = { 'almanac', 'ask', '--stream-json' },
+  -- The panel's thread list and a thread's history: this argv, plus
+  -- `show ID` for one thread.
+  threads = { 'almanac', 'threads', '--json' },
+  -- Offer the model the game's action and chat tools (XivMcp). The game
+  -- still asks you to confirm each one; the panel has a tick box for it.
+  game_actions = false,
+  -- Also print the start of each answer in the game's chat (only you see it),
+  -- at most echo_chars characters.
+  echo = false,
+  echo_chars = 200,
   -- /term ask with no question: the interactive session.
   chat = { 'almanac', 'chat' },
   -- /term ask <question>: this argv with the question appended as one more

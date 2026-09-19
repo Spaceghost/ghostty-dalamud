@@ -36,6 +36,9 @@ local function lua_run(code: cstring): void
   assert(luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, code)
 end
 
+-- these are the terminal's tests: the /ask panel (tests/test_ask.nelua) steps aside
+lua_run("CONFIG.assistant.ui = 'terminal'")
+
 local function newest(): *Session
   assert(#host.sessions > 0)
   return host.sessions[#host.sessions - 1]

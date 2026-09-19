@@ -44,7 +44,16 @@ M['world.order.next'] = 'Swap places with the pet after it (to its right in the 
 
 -- /help lines of the commands of their own (CONFIG.host.verb_commands).
 M['command./window'] = 'Desktop windows on world panels: the picker, or pull [match|#wid] | run CMD | list | close'
-M['command./ask'] = 'Ask the local AI assistant: /ask [question]'
+M['command./ask'] = 'Ask the local AI assistant: /ask [question] | new [question] | threads | pin | term [question]'
+-- The /ask panel (lua/ask.lua).
+M['ask.new'] = 'Start a new conversation; the next question begins a new thread'
+M['ask.threads'] = 'Your earlier conversations; click one to continue it'
+M['ask.chat'] = 'Back to the conversation'
+M['ask.pin'] = 'Float this panel beside your character as a pet; "back to UI" returns it'
+M['ask.game_actions'] = 'Let the assistant use game actions and chat (XivMcp still asks you in game before each one)'
+M['ask.close'] = 'Hide the panel (/ask brings it back); the conversation stays'
+M['ask.send'] = 'Send (Enter); Shift+Enter starts a new line'
+M['ask.stop'] = 'Stop this answer'
 M['command./agent'] = 'ghostty-agent: /agent ask [question] asks the local AI assistant'
 
 -- The toolbar popup's taskbar chips.
@@ -70,7 +79,7 @@ M.sections = {
   ['Light'] = 'How screens react to, and cast, light.',
   ['Character animation'] = 'The pose your character holds while a terminal is out.',
   ['Bell'] = 'The ripple of light when a program rings; preview them all with /term bell demo.',
-  ['Assistant (/term ask)'] = 'Ask a local AI assistant from chat: /term ask <question>. Not yet tried in game.',
+  ['Assistant (/term ask)'] = 'Ask a local AI assistant from chat: /ask <question> answers in a panel with follow-ups (/ask term for a terminal). Not yet tried in game.',
   ['Flat windows in the world'] = 'Plugin windows and the chat as world panels; hold Alt over a window to pull it in. Not yet tried in game.',
   ['Remote windows'] = 'Desktop windows from ghostty-agent on world panels (/window).',
   ['Gallery'] = 'Share screenshots of your terminals to the gallery on spacegho.st; /term share offers your latest.',
@@ -166,6 +175,10 @@ M.settings = {
   ['bell.accent.g'] = 'Green in the custom bell colour; the theme sets it until you change it.',
   ['bell.accent.b'] = 'Blue in the custom bell colour; the theme sets it until you change it.',
   ['assistant.enabled'] = '/term ask opens the assistant.',
+  ['assistant.ui'] = 'panel: /ask answers as chat bubbles in a panel with follow-ups and a thread list; terminal: /ask opens a terminal as before. /ask term always opens the terminal.',
+  ['assistant.game_actions'] = 'The assistant may use game action and chat tools (XivMcp); the game still asks you to confirm each one.',
+  ['assistant.echo'] = 'The first lines of each answer also appear in your chat log (only you see them).',
+  ['assistant.stream'] = 'What the /ask panel runs, plus the thread and the question; it must print JSON lines like almanac ask --stream-json.',
   ['adopt.auto.mappy'] = 'Mappy\'s map window becomes a pet as soon as it opens; "back to UI" puts it back until it is next opened. Off: pull it in by hand (Alt over the window, or /window adopt mappy).',
   ['assistant.view'] = 'Where the assistant opens: beside you, as a tab, or as a window.',
   ['assistant.transport'] = 'Where the assistant runs; default follows your first profile.',

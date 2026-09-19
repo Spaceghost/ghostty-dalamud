@@ -90,6 +90,7 @@ global ImGuiIO <cimport, nodecl> = @record{
 ##  'ImGuiCol_CheckMark','ImGuiCol_SliderGrab','ImGuiCol_SliderGrabActive',
 ##  'ImGuiInputTextFlags_EnterReturnsTrue','ImGuiCol_Button','ImGuiCol_ButtonHovered','ImGuiCol_ButtonActive',
 ##  'ImGuiCol_FrameBg','ImGuiCol_Header','ImGuiCol_HeaderHovered',
+##  'ImGuiInputTextFlags_CtrlEnterForNewLine','ImGuiCol_ScrollbarBg','ImGuiCol_ScrollbarGrab',
 ## }
 ## for _, c in ipairs(consts) do
   global #|c|#: cint <cimport, nodecl, const>
@@ -204,6 +205,11 @@ global ImGuiApi = @record{
   DrawListAddImage: function(dl: *ImDrawList, tex: pointer, p_min: ImVec2, p_max: ImVec2, uv_min: ImVec2, uv_max: ImVec2, col: uint32): void,
   -- a one-line text box (the Windows picker's Run:); callback unused (nilptr)
   InputText: function(label: cstring, buf: cstring, buf_size: csize, flags: cint, callback: pointer, user_data: pointer): boolean,
+  -- the /ask panel's input box and its scrolled conversation (core/ui.nelua); optional
+  InputTextMultiline: function(label: cstring, buf: cstring, buf_size: csize, size: ImVec2, flags: cint, callback: pointer, user_data: pointer): boolean,
+  SetScrollHereY: function(center_y_ratio: float32): void,
+  GetScrollY: function(): float32,
+  GetScrollMaxY: function(): float32,
 }
 
 -- Draw-list callback that makes the renderer restore its own state. Dalamud's
@@ -248,6 +254,8 @@ global imgui: ImGuiApi
 ##  {'DrawListAddCallback','ImDrawList_AddCallback'},
 ##  {'DrawListAddImage','ImDrawList_AddImage',true},
 ##  {'InputText','igInputText',true},
+##  {'InputTextMultiline','igInputTextMultiline',true},{'SetScrollHereY','igSetScrollHereY',true},
+##  {'GetScrollY','igGetScrollY',true},{'GetScrollMaxY','igGetScrollMaxY',true},
 ## }
 
 global ImGuiResolver = @function(name: cstring): pointer

@@ -6,6 +6,7 @@ require 'core.app.boot'
 require 'core.app.ipc'
 require 'core.app.winpicker'
 require 'core.app.gallery'
+require 'core.app.ask'
 
 global function update_status(): void
   local sb: stringbuilder
@@ -72,6 +73,7 @@ global function load_policy(): boolean
   end
   boot_lua_register(policy.L)
   gallery_lua_register(policy.L) -- ghostty.http_upload / game_string for lua/gallery.lua
+  ask_lua_register(policy.L) -- ghostty.ask_spawn / ask_cancel / ask_echo / ask_pin for lua/ask.lua
   ipc_lua_register(policy.L) -- ghostty.window_* for lua/ipc.lua
   ipc_load(install, host.dir) -- GhosttyDalamud.v1.Call's own Lua state (docs/IPC.md)
   settings_badge_refresh()

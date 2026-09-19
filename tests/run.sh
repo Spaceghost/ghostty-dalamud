@@ -16,7 +16,7 @@ LIBS="-L$ROOT/build/ghostty-vt-linux/lib -L$ROOT/build/lua-linux -lm"
 export LD_LIBRARY_PATH="$ROOT/build/ghostty-vt-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 run() { echo "--- $1"; "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cflags="$INC $LIBS" --cache-dir build/nelua-cache -L . -b "tests/$1.nelua"; "build/nelua-cache/$1" "${@:2}"; }
 
-rm -f "$ROOT/animation-reset-done" "$ROOT/world-state.lua" "$ROOT/window-state.lua" "$ROOT/settings.lua" "$ROOT/adopted.lua" # state files the Lua modules write next to lua/
+rm -f "$ROOT/animation-reset-done" "$ROOT/world-state.lua" "$ROOT/window-state.lua" "$ROOT/settings.lua" "$ROOT/adopted.lua" "$ROOT/ask-state.lua" # state files the Lua modules write next to lua/
 unset UMBRA_GHOSTTY_HOME GHOSTTY_HOME # the migration and config home read these
 rm -rf build/test-scratch && mkdir -p build/test-scratch/surface/config
 run test_ghostty
@@ -64,6 +64,8 @@ run test_vote "$ROOT" "$ROOT/build/test-scratch"
 run test_gallery "$ROOT" "$ROOT/build/test-scratch"
 run test_platform "$ROOT" "$ROOT/build/test-scratch"
 run test_assistant "$ROOT"
+mkdir -p build/test-scratch/ask
+run test_ask "$ROOT" "$ROOT/build/test-scratch/ask"
 run test_hostsurface "$ROOT" "$ROOT/build/test-scratch/surface"
 run test_depthpass "$ROOT"
 run test_selftest

@@ -154,6 +154,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     draw_settings()
     draw_window_picker() -- /window (core/app/winpicker.nelua)
   end
+  ask_frame(now, live) -- /ask: answers arriving, and the panel while it is up (core/app/ask.nelua)
   reap_exited(now)
   -- only after the layout came back: saving earlier (or while the agent is
   -- unreachable) would overwrite the state we are about to restore
@@ -267,6 +268,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   showcase_stop() -- demo terminals never outlive the session; yours come back
   teardown_effects()
   panels_shutdown() -- pulled windows back to the flat UI, the hooks into ImGui off
+  ask_shutdown() -- /ask's hidden sessions end (before the others are left running)
   depthpass_shutdown()
   dualsense_reader_close(&host.dualsense) -- no handle or pending read may outlive this module
   -- Leave agent shells running so the next start reattaches to them.

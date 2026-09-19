@@ -65,6 +65,8 @@ global Session = @record{
   fallback: string,         -- the profile to switch to if the agent turns out to be down (Profile.fallback)
   assistant: boolean,       -- /term ask: stays open after its process exits, which it announces itself
   local_fallback: boolean,  -- agent down: run open_argv over ConPTY (an assistant on native Windows)
+  capture: boolean,         -- /ask panel: output goes to `captured` for core/app/ask.nelua, not the screen
+  captured: ByteQueue,
   window_close: function(s: *Session): void, -- Window: let go of the stream (remotewin), once; Panel: give the window back
 }
 
@@ -74,6 +76,11 @@ global Session = @record{
 local FED_UNKNOWN: uint64 <comptime> = 0xffffffffffffffff_u64
 
 function Session:feed(data: *[0]uint8, len: usize): void
+  if self.capture then
+    self.captured:push(data, len)
+    if self.fed ~= FED_UNKNOWN then self.fed = self.fed + len end
+    return
+  end
   self.view:feed(data, len)
   if self.replaying then self.cmd:reset_scan() else self.cmd:scan(data, len) end
   if self.fed ~= FED_UNKNOWN then self.fed = self.fed + len end
@@ -394,6 +401,7 @@ function Session:destroy(): void
   self.title:destroy()
   self.label:destroy()
   self.pending_out:destroy()
+  self.captured:destroy()
   free_open_request(self)
   self.fallback:destroy()
   $self = {}

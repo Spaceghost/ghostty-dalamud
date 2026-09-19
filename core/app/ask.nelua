@@ -1,0 +1,264 @@
+-- /ask as a game-native panel (lua/ask.lua decides everything; README, "Ask
+-- panel"). The core only runs what Lua asks for and draws the window Lua
+-- fills:
+--
+-- * ghostty.ask_spawn(argv, transport, local_fallback) -> job id: the argv
+--   runs like an assistant terminal (through ghostty-agent, or over ConPTY on
+--   native Windows while no agent answers), but on a hidden session whose
+--   output never reaches a screen: every line of it goes to
+--   CONFIG.ask.on_line(job, line), then CONFIG.ask.on_exit(job, status,
+--   refused). almanac's `ask --stream-json` prints one JSON object per line.
+-- * ghostty.ask_cancel(job), ghostty.ask_echo(text) (a line in the game's
+--   chat), ghostty.ask_pin() (the panel onto a world pet: /window adopt ask).
+-- * Per frame, while CONFIG.ask.tick(now) says the panel is up, a Ghostty
+--   glass window ('###ghostty_ask') whose contents CONFIG.ask.draw() draws
+--   with ghostty.ui.
+--
+-- Nothing here reads the answers or decides what runs; the question is one
+-- argv element, never given to a shell.
+require 'core.app.worldview'
+
+local ASK_LINE_MAX <comptime> = 1048576 -- a longer line without a newline is passed on as it is
+
+local AskJob = @record{ id: integer, s: *Session }
+local jobs: vector(AskJob)
+local next_job: integer = 0
+local ask_rect: ImVec4 -- where the panel was drawn last (x0, y0, x1, y1 on the viewport), for the pin's flight
+local ask_drawn = false
+
+local function job_index(id: integer): integer
+  for i = 0, < #jobs do
+    if jobs[i].id == id then return i end
+  end
+  return -1
+end
+
+-- Run `argv` on a hidden session. The job id, or 0 and why.
+global function ask_spawn(argv: *vector(string), transport: string, local_fallback: boolean): (integer, string)
+  if #$argv == 0 then return 0, 'empty command' end
+  local p: Profile = { name = 'ask', transport = transport }
+  if transport == 'agent' and local_fallback and (not host.agent_enabled or host.agent_down) then
+    p.transport = 'conpty'
+  end
+  p.argv = $argv -- borrowed: Session:init copies what it keeps
+  local s = session_open(&p, 200, 50)
+  if s == nilptr then return 0, 'could not start it (no agent configured?)' end
+  s.capture = true
+  s.run_occluded = true
+  s.keep_on_agent = false -- a reload ends it rather than leave it for a tab
+  s.local_fallback = local_fallback and s.kind == TransportKind.Agent
+  next_job = next_job + 1
+  jobs:push(AskJob{ id = next_job, s = s })
+  return next_job, ''
+end
+
+local function end_job(i: integer): void
+  local s = jobs[i].s
+  jobs:remove(i)
+  s.keep_on_agent = false
+  session_remove(s)
+end
+
+global function ask_cancel(id: integer): boolean
+  local i = job_index(id)
+  if i < 0 then return false end
+  end_job(i)
+  return true
+end
+
+-- Hand the complete lines of `s`'s output to Lua; with `all`, the rest too.
+local function drain(id: integer, s: *Session, all: boolean): void
+  while s.captured:len() > 0 do
+    local n = s.captured:len()
+    local p = s.captured:peek()
+    local eol: isize = -1
+    for k: usize = 0, < n do
+      if p[k] == 10 then eol = (@isize)(k) break end
+    end
+    local take: usize = 0
+    local len: usize = 0
+    if eol >= 0 then
+      len, take = (@usize)(eol), (@usize)(eol) + 1
+    elseif all or n >= ASK_LINE_MAX then
+      len, take = n, n
+    else
+      break
+    end
+    while len > 0 and p[len - 1] == 13 do len = len - 1 end -- the terminal's \r\n
+    local line = string{data = (@*[0]byte)(p), size = len}:copy()
+    s.captured:consume(take)
+    policy_ask_line(id, line)
+    line:destroy()
+    if job_index(id) < 0 then return end -- Lua cancelled it from on_line
+  end
+end
+
+local function pump_jobs(): void
+  local i = 0
+  while i < #jobs do
+    local id, s = jobs[i].id, jobs[i].s
+    drain(id, s, s.exited)
+    local k = job_index(id)
+    if k < 0 then
+      i = 0 -- cancelled from on_line: the list moved under us
+    elseif s.exited then
+      local status: integer = s.exit_status
+      local refused = not s.process_exited
+      end_job(k)
+      policy_ask_exit(id, status, refused)
+      i = 0 -- on_exit may have started or cancelled jobs
+    else
+      i = k + 1
+    end
+  end
+end
+
+-- Lua ------------------------------------------------------------------------------------
+
+local function read_argv(L: *lua_State, idx: cint, out: *vector(string)): boolean
+  if lua_type(L, idx) ~= LUA_TTABLE then return false end
+  local n = (@integer)(lua_rawlen(L, idx))
+  for i = 1, n do
+    lua_rawgeti(L, idx, i)
+    local len: usize = 0
+    local p = lua_tolstring(L, -1, &len)
+    if lua_type(L, -1) ~= LUA_TSTRING or len == 0 then lua_pop(L, 1) return false end
+    out:push(string{data = (@*[0]byte)(p), size = len}:copy())
+    lua_pop(L, 1)
+  end
+  return n > 0
+end
+
+-- ghostty.ask_spawn(argv, transport, local_fallback) -> id | nil, why
+local function l_ask_spawn(L: *lua_State): cint
+  local argv: vector(string)
+  local ok = read_argv(L, 1, &argv)
+  local tlen: usize = 0
+  local tp = lua_tolstring(L, 2, &tlen)
+  local transport: string = 'agent'
+  if tp ~= nilptr and tlen > 0 then transport = string{data = (@*[0]byte)(tp), size = tlen} end
+  local id: integer = 0
+  local err: string = 'argv must be a list of non-empty strings'
+  if ok then id, err = ask_spawn(&argv, transport, lua_toboolean(L, 3) ~= 0) end
+  for i = 0, < #argv do argv[i]:destroy() end
+  argv:destroy()
+  if id == 0 then
+    lua_pushnil(L)
+    lua_pushlstring(L, (@cstring)(err.data), err.size)
+    return 2
+  end
+  lua_pushinteger(L, id)
+  return 1
+end
+
+local function l_ask_cancel(L: *lua_State): cint
+  lua_pushboolean(L, ask_cancel((@integer)(lua_tointegerx(L, 1, nilptr))) and 1 or 0)
+  return 1
+end
+
+-- ghostty.ask_echo(text) -> true once printed in the game's chat (the
+-- plugin's own echo line, seen only by you).
+local function l_ask_echo(L: *lua_State): cint
+  local len: usize = 0
+  local p = lua_tolstring(L, 1, &len)
+  if p == nilptr or len == 0 or host.api.chat_print == nilptr then lua_pushboolean(L, 0) return 1 end
+  local sb: stringbuilder
+  sb:write('[ask] ', string{data = (@*[0]byte)(p), size = len}, '\0')
+  local z = sb:promote()
+  local ok = host.api.chat_print((@cstring)(z.data)) ~= 0
+  z:destroy()
+  lua_pushboolean(L, ok and 1 or 0)
+  return 1
+end
+
+-- ghostty.ask_pin() -> true | false, why: the panel onto a pet beside your
+-- character (the same as /window adopt ask), flying out of where it is.
+local function l_ask_pin(L: *lua_State): cint
+  local from: ImVec4
+  if ask_drawn then from = ask_rect end
+  local id, err = panels_pull('ask', from)
+  if id == 0 then
+    lua_pushboolean(L, 0)
+    lua_pushlstring(L, (@cstring)(err.data), err.size)
+    return 2
+  end
+  lua_pushboolean(L, 1)
+  return 1
+end
+
+global function ask_lua_register(L: *lua_State): void
+  lua_getglobal(L, 'ghostty')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return end
+  lua_pushcclosure(L, l_ask_spawn, 0) lua_setfield(L, -2, 'ask_spawn')
+  lua_pushcclosure(L, l_ask_cancel, 0) lua_setfield(L, -2, 'ask_cancel')
+  lua_pushcclosure(L, l_ask_echo, 0) lua_setfield(L, -2, 'ask_echo')
+  lua_pushcclosure(L, l_ask_pin, 0) lua_setfield(L, -2, 'ask_pin')
+  lua_pop(L, 1)
+end
+
+-- Per frame ------------------------------------------------------------------------------
+
+local function draw_panel(focus: boolean): void
+  local vp = imgui.GetMainViewport()
+  imgui.SetNextWindowPos(vec2(vp.Pos.x + vp.Size.x - 48, vp.Pos.y + vp.Size.y * 0.45), ImGuiCond_FirstUseEver, vec2(1, 0.5))
+  imgui.SetNextWindowSize(vec2(540, 640), ImGuiCond_FirstUseEver)
+  if focus then imgui.SetNextWindowFocus() end
+  local rounding = (@float32)(math.max(policy.dropdown.rounding, 8))
+  imgui.PushStyleVarVec2(ImGuiStyleVar_WindowPadding, vec2(14, 12))
+  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowRounding, rounding)
+  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowBorderSize, 0)
+  imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.Ink, 255))
+  imgui.PushStyleColorU32(ImGuiCol_Button, chrome_col(ChromeColor.Chip, 220))
+  imgui.PushStyleColorU32(ImGuiCol_ButtonHovered, chrome_col(ChromeColor.ChipHot, 235))
+  imgui.PushStyleColorU32(ImGuiCol_ButtonActive, chrome_col(ChromeColor.Accent, 200))
+  imgui.PushStyleColorU32(ImGuiCol_FrameBg, chrome_col(ChromeColor.GlassFlat, 235))
+  imgui.PushStyleColorU32(ImGuiCol_Header, chrome_col(ChromeColor.Chip, 200))
+  imgui.PushStyleColorU32(ImGuiCol_HeaderHovered, chrome_col(ChromeColor.ChipHot, 220))
+  imgui.PushStyleColorU32(ImGuiCol_ScrollbarBg, chrome_col(ChromeColor.GlassFlat, 0))
+  imgui.PushStyleColorU32(ImGuiCol_ScrollbarGrab, chrome_col(ChromeColor.Chip, 200))
+  imgui.PushStyleColorU32(ImGuiCol_ResizeGrip, chrome_col(ChromeColor.Accent, 60))
+  imgui.PushStyleColorU32(ImGuiCol_ResizeGripHovered, chrome_col(ChromeColor.Accent, 160))
+  imgui.PushStyleColorU32(ImGuiCol_ResizeGripActive, chrome_col(ChromeColor.Accent, 230))
+  local flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoDocking |
+    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
+  local visible = imgui.Begin('Ask###ghostty_ask', nilptr, flags)
+  imgui.PopStyleVar(3)
+  if visible then
+    -- a press on the panel is its own (gu_frame's click-off must not drop it)
+    if host.lmb_pressed and imgui.IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows) then host.click_used = true end
+    local wp: ImVec2
+    local wsz: ImVec2
+    imgui.GetWindowPos(&wp)
+    imgui.GetWindowSize(&wsz)
+    local mvp = imgui.GetMainViewport().Pos
+    ask_rect = ImVec4{ wp.x - mvp.x, wp.y - mvp.y, wp.x - mvp.x + wsz.x, wp.y - mvp.y + wsz.y }
+    ask_drawn = true
+    dropdown_glass(imgui.GetWindowDrawList(), wp.x, wp.y, wp.x + wsz.x, wp.y + wsz.y, rounding, 36)
+    ui_push_mono, ui_pop_font = host.api.push_mono_font, host.api.pop_font
+    policy_ask_draw()
+  end
+  imgui.End()
+  imgui.PopStyleColor(13)
+end
+
+-- Per frame: the jobs' output to Lua (always, so answers keep arriving while
+-- suspended), then the panel while Lua has it up.
+global function ask_frame(now: float64, live: boolean): void
+  pump_jobs()
+  local shown, focus = policy_ask_tick(now)
+  if not shown then
+    ask_drawn = false
+    return
+  end
+  if live and imgui.BeginChild ~= nilptr then draw_panel(focus) end
+end
+
+-- Shutdown and /term reload: the jobs end with this core (a reloaded Lua has
+-- forgotten them; almanac keeps the thread up to the last finished answer).
+global function ask_shutdown(): void
+  while #jobs > 0 do end_job(#jobs - 1) end
+  jobs:destroy()
+  ask_drawn = false
+end
+
+global function ask_job_count(): integer return #jobs end

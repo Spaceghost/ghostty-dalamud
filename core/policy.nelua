@@ -71,7 +71,8 @@ global POLICY_HOOK_SETTINGS_BADGE <comptime> = 5
 global POLICY_HOOK_THEME <comptime> = 6
 global POLICY_HOOK_ON_EVENT <comptime> = 7
 global POLICY_HOOK_GALLERY <comptime> = 8
-global POLICY_HOOK_COUNT <comptime> = 9
+global POLICY_HOOK_ASK <comptime> = 9
+global POLICY_HOOK_COUNT <comptime> = 10
 
 global Policy = @record{
   L: *lua_State,
@@ -546,7 +547,7 @@ end
   lua_setglobal(L, 'CONFIG')
   -- an init.lua from before a module existed (the user's copy in the config
   -- home is never replaced) gets the shipped module's defaults
-  if luaL_loadstring(L, "for _, n in ipairs({ 'themes', 'tooltips', 'assistant', 'windows', 'adopt', 'rain', 'gallery' }) do if CONFIG[n] == nil then local ok, m = pcall(require, n) if ok then CONFIG[n] = m end end end") == LUA_OK then
+  if luaL_loadstring(L, "for _, n in ipairs({ 'themes', 'tooltips', 'assistant', 'ask', 'windows', 'adopt', 'rain', 'gallery' }) do if CONFIG[n] == nil then local ok, m = pcall(require, n) if ok then CONFIG[n] = m end end end") == LUA_OK then
     if lua_pcall(L, 0, 0, 0) ~= LUA_OK then lua_pop(L, 1) end
   else
     lua_pop(L, 1)
@@ -1504,4 +1505,96 @@ global function policy_gallery_command(args: string): string
   end
   lua_pop(L, 3)
   return out
+end
+
+-- The /ask panel (lua/ask.lua) ------------------------------------------------------
+
+local function push_ask_fn(L: *lua_State, name: cstring): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'ask')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, name)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  return true -- stack: CONFIG, ask, fn
+end
+
+-- CONFIG.ask.command(args) -> true when the panel took `/ask args`; else
+-- false, and the question for the assistant terminal (lua/assistant.lua) in
+-- `question` (owned). Without lua/ask.lua every /ask opens the terminal.
+global function policy_ask_command(args: string): (boolean, string)
+  local question: string
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_ask_fn(L, 'command') then return false, args:copy() end
+  lua_pushlstring(L, (@cstring)(args.data), args.size)
+  local handled = false
+  if lua_pcall(L, 1, 2, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_ASK, 'ask.command')
+    lua_pop(L, 3)
+    return false, args:copy()
+  end
+  handled = lua_toboolean(L, -2) ~= 0
+  if not handled then
+    if lua_type(L, -1) == LUA_TSTRING then question = copy_string_at(L, -1) else question = args:copy() end
+  end
+  lua_pop(L, 4)
+  return handled, question
+end
+
+-- CONFIG.ask.tick(now) -> shown, focus: the panel is up; `focus` once when
+-- it should take the keyboard (opened or asked from the chat box).
+global function policy_ask_tick(now: float64): (boolean, boolean)
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_ask_fn(L, 'tick') then return false, false end
+  lua_pushnumber(L, now)
+  local shown, focus = false, false
+  if lua_pcall(L, 1, 2, 0) == LUA_OK then
+    shown = lua_toboolean(L, -2) ~= 0
+    focus = lua_toboolean(L, -1) ~= 0
+    lua_pop(L, 2)
+  else
+    log_hook_error(L, POLICY_HOOK_ASK, 'ask.tick')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+  return shown, focus
+end
+
+-- CONFIG.ask.draw(): the panel's contents (ghostty.ui), inside its window.
+global function policy_ask_draw(): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_ask_fn(L, 'draw') then return end
+  if lua_pcall(L, 0, 0, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_ASK, 'ask.draw')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.ask.on_line(job, line): one line of a job's output (no line end).
+global function policy_ask_line(job: integer, line: string): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_ask_fn(L, 'on_line') then return end
+  lua_pushinteger(L, job)
+  lua_pushlstring(L, (@cstring)(line.data), line.size)
+  if lua_pcall(L, 2, 0, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_ASK, 'ask.on_line')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.ask.on_exit(job, status, refused): the job ended (refused: it never
+-- started, e.g. the agent could not run the command).
+global function policy_ask_exit(job: integer, status: integer, refused: boolean): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_ask_fn(L, 'on_exit') then return end
+  lua_pushinteger(L, job)
+  lua_pushinteger(L, status)
+  lua_pushboolean(L, refused and 1 or 0)
+  if lua_pcall(L, 3, 0, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_ASK, 'ask.on_exit')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
 end

@@ -150,10 +150,15 @@ local function showcase_start(): cint
   return 0
 end
 
--- /term ask [question]: a terminal running the assistant (lua/assistant.lua),
--- the question as one argv element. Opens as a pet (a tab while no character
+-- /term ask [question]: the /ask panel (lua/ask.lua, core/app/ask.nelua)
+-- when CONFIG.assistant.ui is 'panel'; otherwise, or for `/ask term ...`, a
+-- terminal running the assistant (lua/assistant.lua), the question as one argv element. Opens as a pet (a tab while no character
 -- is loaded), a tab or a window, as CONFIG.assistant.view says.
-global function assistant_command(question: string): cint
+global function assistant_command(asked: string): cint
+  -- the panel (lua/ask.lua) first; it hands back what the terminal should get
+  local handled, question = policy_ask_command(asked)
+  if handled then question:destroy() return 0 end
+  defer question:destroy() end
   local ok, spec, err = policy_assistant_open(question)
   if not ok then
     logf(LOG_WARN, 'ask: %s', err)
@@ -197,6 +202,7 @@ global function run_command(cmd: string): cint
     showcase_stop()
     teardown_effects()
     panels_shutdown() -- pulled windows back to the flat UI; the new policy pulls them in again
+    ask_shutdown() -- /ask's hidden sessions end; the reloaded Lua knows nothing of them
     -- DETACH, never CLOSE: the shells survive, and a reload that fails before
     -- agent_setup must not leave CLOSE frames queued for every one of them
     for i = 0, < #host.sessions do host.sessions[i].keep_on_agent = true end
