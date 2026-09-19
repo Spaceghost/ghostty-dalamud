@@ -64,9 +64,10 @@ pack() {
 }
 
 echo "== $PLUGIN_ZIP"
-rm -rf "$STAGE" && mkdir -p "$STAGE/plugin/lua" "$STAGE/agent"
+rm -rf "$STAGE" && mkdir -p "$STAGE/plugin/lua" "$STAGE/plugin/themes" "$STAGE/agent"
 cp "$PLUGIN/GhosttyDalamud.dll" "$PLUGIN/GhosttyDalamud.json" "$PLUGIN/ghostty_loader.dll" "$PLUGIN/ghostty_core.dll" "$STAGE/plugin/"
 cp "$PLUGIN"/lua/*.lua "$STAGE/plugin/lua/"
+cp "$PLUGIN"/themes/*.theme "$STAGE/plugin/themes/"
 pack "$STAGE/plugin" "$DIST/$PLUGIN_ZIP"
 
 echo "== $AGENT_ZIP"

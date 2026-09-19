@@ -69,6 +69,7 @@ INC="-I$ROOT/vendor/ghostty/include -I$ROOT/vendor/gc-cimgui -I$ROOT/vendor/lua/
 echo "== ghostty-agent (host)"
 "$NELUA" --cc gcc -P nogc --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
 mkdir -p build/dist/lua && cp lua/*.lua build/dist/lua/
+mkdir -p build/dist/themes && cp themes/*.theme build/dist/themes/
 
 if [[ "${SKIP_WIN:-0}" != 1 ]]; then
   echo "== ghostty_core.dll (windows x64)"
@@ -113,12 +114,13 @@ if [[ "${SKIP_SHIM:-0}" != 1 ]]; then
   if [[ -f build/dist/ghostty_core.dll && -f build/dist/ghostty_loader.dll ]]; then
     echo "== build/dist/GhosttyDalamud (plugin folder)"
     P=build/dist/GhosttyDalamud
-    rm -rf "$P.tmp" && mkdir -p "$P.tmp/lua"
+    rm -rf "$P.tmp" && mkdir -p "$P.tmp/lua" "$P.tmp/themes"
     cp build/plugin/GhosttyDalamud/GhosttyDalamud.dll build/plugin/GhosttyDalamud/GhosttyDalamud.json "$P.tmp/"
     [[ -f build/plugin/GhosttyDalamud/GhosttyDalamud.pdb ]] && cp build/plugin/GhosttyDalamud/GhosttyDalamud.pdb "$P.tmp/" || true
     cp build/dist/ghostty_core.dll build/dist/ghostty_loader.dll "$P.tmp/"
     cp lua/*.lua "$P.tmp/lua/"
-    for f in GhosttyDalamud.dll GhosttyDalamud.json ghostty_core.dll ghostty_loader.dll lua/init.lua lua/migrate.lua; do
+    cp themes/*.theme "$P.tmp/themes/"
+    for f in GhosttyDalamud.dll GhosttyDalamud.json ghostty_core.dll ghostty_loader.dll lua/init.lua lua/migrate.lua themes/spaceghost.theme; do
       [[ -f "$P.tmp/$f" ]] || { echo "error: $f missing from the plugin folder"; exit 1; }
     done
     forbid_host_assemblies "$P.tmp"
