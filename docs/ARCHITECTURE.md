@@ -387,9 +387,20 @@ lua/          shipped policy: init.lua, keymap.lua, migrate.lua, assistant.lua (
 themes/       shipped colour themes (Ghostty theme files, read by lua/themes.lua)
 shim/         GhosttyDalamud (plugin) and Umbra.Ghostty (widget) C# projects
 tests/        host tests + run.sh
-tools/        fetch-vendor.sh, build.sh, package.sh, install-dev.sh, zig-cc-win.sh, build-shaders.lua, crash-restart.{nelua,sh} (Linux/Wine only)
+tools/        fetch-vendor.sh, build.sh, package.sh, install-dev.sh, zig-cc*.sh, build-shaders.lua, crash-restart.{nelua,sh} (Linux/Wine only)
+              build-container.sh / build-remote.sh: the Incus build container and the builds that run in it (docs/BUILDING.md)
 vendor/       pinned third-party checkouts (git-ignored, see toolchain.env)
 ```
+
+## Where a build runs
+
+Heavy builds do not run on the gaming PC: it has 15 GB of RAM and the game in
+it, and `tools/build.sh` gets killed for low memory. The default is an Incus
+container on the `fedora` build host, driven by `tools/build-container.sh` and
+`tools/build-remote.sh`, with `build/dist/` copied back here to install and
+test in the game. `bak` flashes Atlas hardware and never builds. The whole
+arrangement, the shared compiler cache and what stays local are in
+[BUILDING.md](BUILDING.md).
 
 ## Pins
 

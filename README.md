@@ -113,6 +113,18 @@ Windows Game Bar or ShareX).
 
 ## Building
 
+The default path is an Incus build container on another machine, because the
+gaming PC has too little memory for a full build:
+
+```sh
+tools/build-container.sh create   # once per Incus host: the container and its toolchain
+tools/build-remote.sh test        # the whole test suite, there
+tools/build-remote.sh             # a full build; build/dist/ comes back here
+```
+
+See [docs/BUILDING.md](docs/BUILDING.md). Locally, on a machine with the
+memory for it:
+
 ```sh
 tools/fetch-vendor.sh      # clones ghostty, nelua, gc-cimgui, umbra-dist; downloads lua + Dalamud dev assemblies
 tools/build.sh             # everything into build/dist/
