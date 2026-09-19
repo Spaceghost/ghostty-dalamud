@@ -786,7 +786,9 @@ global function draw_world(now: float64): void
           (@uint8)(math.min((panel & 0xFF) + lift, 255)), (@uint8)(math.clamp(pl.opacity, 0, 1) * 255))
         local STRIPS <comptime> = 24
         local ROWS <comptime> = 32
-        for k = 0, < STRIPS do
+        -- a remote window showing its picture is the panel itself: no slab behind it
+        local bare = s.kind == TransportKind.Window and remotewin_bare(s)
+        for k = 0, < (bare and 0 or STRIPS) do
           local x0 = vp.x + pl.width * k / STRIPS
           local x1 = vp.x + pl.width * (k + 1) / STRIPS
           for rr = 0, < ROWS do
@@ -816,7 +818,8 @@ global function draw_world(now: float64): void
         host.drawing_world = false
         render_max_run_px = 0
         render_world = false
-        do -- title buttons: sleep unseen, pop-in, full screen, close (brighter when hovered)
+        -- a bare window panel shows its buttons and grip only under the pointer
+        if not bare or hovered or grip ~= 0 or host.world_drag_id == s.id then -- title buttons: sleep unseen, pop-in, full screen, close (brighter when hovered)
           local ink = chrome_col(ChromeColor.Ink, 255)
           local cy0 = vp.y + 4
           -- close ×
@@ -839,10 +842,10 @@ global function draw_world(now: float64): void
           cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_OCCLUDED)
           imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_occluded and not over_window) and chrome_col(ChromeColor.Sleep, 235) or chrome_col(ChromeColor.SleepIdle, 180), 5, 0)
           draw_occluded_icon(dl, cx0, cy0, s.run_occluded, ink)
+          imgui.DrawListAddTriangleFilled(dl, vec2(vp.x + pl.width - 22, vp.y + pl.height - 4),
+            vec2(vp.x + pl.width - 4, vp.y + pl.height - 22), vec2(vp.x + pl.width - 4, vp.y + pl.height - 4),
+            chrome_col(ChromeColor.Accent, (host.world_drag_id == s.id) and 255 or 150))
         end
-        imgui.DrawListAddTriangleFilled(dl, vec2(vp.x + pl.width - 22, vp.y + pl.height - 4),
-          vec2(vp.x + pl.width - 4, vp.y + pl.height - 22), vec2(vp.x + pl.width - 4, vp.y + pl.height - 4),
-          chrome_col(ChromeColor.Accent, (host.world_drag_id == s.id) and 255 or 150))
         if focused then
           -- drawn as short segments so it bends with the panel's curve
           local col = chrome_col(ChromeColor.Accent, 220)
