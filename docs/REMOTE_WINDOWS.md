@@ -1,9 +1,12 @@
 # Remote windows
 
-Any desktop window on a machine running `ghostty-agent` (Linux, Windows,
-macOS) can be pulled into the game as a world panel: a pet, a pin, anything a
-terminal panel can be. The agent captures the window, sends only what changed,
-and plays the plugin's mouse and keys back into it.
+Windows on a machine running `ghostty-agent` can be pulled into the game as
+world panels: a pet, a pin, anything a terminal panel can be. On Windows and
+macOS these are desktop windows the agent captures. On Linux the agent is a
+headless Wayland compositor of its own and the game is its only display: apps
+started into it become windows there and nowhere else (see "Linux: the agent
+is the compositor"). Either way the agent sends only what changed and plays
+the plugin's mouse and keys back into the window.
 
 ```
  FFXIV (plugin core)                               ghostty-agent (any desktop)
@@ -11,7 +14,7 @@ and plays the plugin's mouse and keys back into it.
  │ core/app/remotewin.nelua      │  WOPEN →  │ agent/windows.nelua              │
  │  Session kind Window          │ ← WFRAME  │  streams, tile diff, flow control│
  │  core/wintex.nelua (D3D11)    │  WACK  →  │ agent/capture_*.nelua (backends) │
- │  core/wincodec.nelua (decode) │  WINPUT → │  portal+PipeWire │ Win32 │ macOS │
+ │  core/wincodec.nelua (decode) │  WINPUT → │  wlroots (Linux) │ Win32 │ macOS │
  └───────────────────────────────┘           └──────────────────────────────────┘
 ```
 
@@ -38,16 +41,16 @@ agent → client
 
 | type | name | payload |
 |---|---|---|
-| 24 | WLISTR | lines `wid\tw\th\tapp\ttitle\n`; wid 0 = "ask the desktop to pick" |
+| 24 | WLISTR | lines `wid\tw\th\tapp\ttitle\n`; a wid 0 line describes what WOPEN with wid 0 does |
 | 25 | WOPENED | req u32, sid, w u16, h u16, title UTF-8 (sid 0: failed, the text says why) |
 | 26 | WFRAME | sid, seq u32, w u16, h u16, flags u8, nrect u16, rects… |
 | 27 | WEND | sid, reason UTF-8 (window closed, capture refused, …) |
 
 WOPENED answers WOPEN by its client-chosen `req`, and may come much later
-(the user is choosing in the desktop's picker) and out of order. `wid 0` asks the backend to let
-the user choose (the portal's picker on Wayland); a backend that can list
-windows may also treat `wid 0` + match text as "first window whose title or
-app contains the text, case-insensitive".
+(an app being launched has not shown its window yet) and out of order. `wid 0`
++ match text means "first window whose title or app contains the text,
+case-insensitive", waiting for one to appear; on Linux `wid 0` + `run:CMD`
+starts CMD in the agent's compositor and opens its first window.
 
 WFRAME carries the window's current size `w`×`h` and a list of rectangles
 that changed. Flags: bit 0 KEY (the rectangles cover the whole window; the
@@ -88,7 +91,8 @@ characters, so layouts on the two ends need not match.
 | `agent/windows.nelua` | agent | streams, WLIST/WOPEN/WACK/WINPUT/WCLOSE, flow control, calls a backend |
 | `agent/capture.nelua` | agent | the backend interface and the `--windows` choice |
 | `agent/capture_test.nelua` | agent | synthetic windows (moving pattern) for tests; `--windows test` |
-| `agent/capture_portal.nelua` | agent (Linux) | xdg-desktop-portal ScreenCast + RemoteDesktop, PipeWire; libdbus and libpipewire are dlopened |
+| `agent/capture_wayland.nelua` | agent (Linux) | a headless wlroots 0.20 compositor in the agent: xdg toplevels are the windows, pixman renders them, wlr_seat takes the input; `run:` launches apps into it |
+| `agent/wayland_keys.nelua` | agent (Linux) | USB HID to evdev, codepoint to key in the xkb keymap (for TEXT) |
 | `agent/capture_win32.nelua` | agent (Windows) | EnumWindows, PrintWindow(PW_RENDERFULLCONTENT) with BitBlt fallbacks, window messages / SendInput; pure parts in `agent/capture_win32_logic.nelua` |
 | `agent/capture_mac.nelua` | agent (macOS) | CGWindowList for the list, ScreenCaptureKit for frames, CGEventPostToPid |
 | `core/wintex.nelua` | plugin | a BGRA D3D11 texture per stream, dirty-rect uploads, the SRV as ImTextureID |
@@ -112,8 +116,8 @@ failed WOPENED, both carrying the reason.
 Frames are BGRA top-down (alpha ignored), at the window's own size; the
 generic layer scales frames larger than `max_w`×`max_h` down
 (`wincodec_downscale`), rate-limits to `fps`, diffs and encodes. An open may
-stay pending (the portal's picker is up); the WOPENED goes out when it
-settles.
+stay pending (a launched app has not mapped its window yet); the WOPENED
+goes out when it settles.
 
 ## The generic layer (agent/windows.nelua)
 
@@ -269,6 +273,78 @@ window; it needs WinRT activation and a D3D11 device, so it is not done.
   replaces). Popped into a tab or minimized, a window panel goes back into
   the world as a pet.
 
+## Linux: the agent is the compositor
+
+The game runs under Wine/Proton, and the plugin core is a Windows PE DLL: it
+cannot host a Unix-socket Wayland server or call Linux libraries. The
+Linux-native `ghostty-agent` can, so it is the Wayland server, and the game is
+its only display (`agent/capture_wayland.nelua`). No portal, no picker dialog,
+no host compositor: the host desktop never sees these windows.
+
+* One `wl_display` whose event loop fd the agent's main loop polls; the
+  headless backend; the pixman renderer (software: frames land in CPU memory,
+  which is what is streamed; no GPU); compositor v6, subcompositor, data
+  device, primary selection, viewporter, xdg-shell v6 and xdg-decoration,
+  which always answers server side (that is: no decorations; the game panel
+  has chrome). Clients see one `wl_output` per window and seat `seat0` with
+  pointer and keyboard.
+* The socket is `$XDG_RUNTIME_DIR/ghostty-0` (the next free `ghostty-N`
+  when taken), or the name in `GHOSTTY_WAYLAND_SOCKET`; the agent logs it.
+  `capture_wayland_configure(socket, layout)` sets both before the backend
+  starts, for `--wayland-socket` / `--xkb-layout` flags in the agent (not
+  wired up yet). Any client given `WAYLAND_DISPLAY=ghostty-0` joins.
+* Every `xdg_toplevel` gets its own `wlr_scene` and its own headless output,
+  sized to the window geometry (so CSD shadows fall outside). A client picks
+  its own size (the first configure is 0×0); one that maps without a size is
+  given 1280×800. Rendering happens in `pump` when the scene has damage and
+  the output has no frame pending (the headless output's 60 Hz timer), then
+  the clients get frame done, so they animate at up to 60 fps and the stream
+  layer rate-limits further. Direct scan-out is off: frames are always the
+  composed window.
+* WLIST: the line `0 0 0 launch run:COMMAND to start an app in the game`,
+  then one line per mapped toplevel, `wid` counting up from 1.
+* WOPEN `wid` → that window, live at once. `wid 0` + `run:CMD ARGS` → `sh -c
+  CMD ARGS` in its own session with `WAYLAND_DISPLAY` set to ours,
+  `XDG_SESSION_TYPE=wayland`, `GDK_BACKEND=wayland`, `QT_QPA_PLATFORM=wayland`,
+  `SDL_VIDEODRIVER=wayland`, `MOZ_ENABLE_WAYLAND=1`,
+  `ELECTRON_OZONE_PLATFORM_HINT=wayland`, and `DISPLAY` unset; the stream is
+  pending until a window of that process (or of a descendant, found through
+  `/proc`) maps, ends with "the app exited (status N) without opening a window
+  here" when it exits first, and with "the app opened no window" after 30 s.
+  `wid 0` + other text → the first window whose title or app id contains it,
+  waiting up to 30 s. An unmapped or destroyed window ends its streams with
+  "window closed". Closing a stream asks an app launched for it to close
+  (`xdg_toplevel.close`); other windows stay. Launched processes are reaped
+  by pid only, never the agent's shells.
+* Input: the stream that gets input gets the keyboard focus (one toplevel at a
+  time). Pointer events go to the surface under the point in that window's
+  scene (popups included), with `BTN_LEFT/RIGHT/MIDDLE`. WHEEL `dy` is 1/120
+  notches, +dy away from the user (scroll up), which is a negative Wayland
+  vertical axis value: sent as `value120 = -dy` and `-dy × 15 / 120` axis
+  units (libinput's 15 per notch); +dx scrolls right. KEY maps USB HID
+  usages to evdev keycodes (letters, digits, Enter/Esc/Backspace/Tab/Space,
+  punctuation, F1–F24, arrows, Home/End/PgUp/PgDn/Insert/Delete, keypad,
+  modifiers) and presses the `mods` modifiers around the key; lone modifier
+  keys are not played. TEXT looks each codepoint up in the xkb keymap (layout
+  `us` or `GHOSTTY_XKB_LAYOUT`) at level 1, then level 2 with Shift; newline
+  and tab are Enter and Tab.
+
+Limits, all current:
+
+* No Xwayland yet: X11-only apps do not show up (DISPLAY is unset for them).
+* Popups are constrained to the window and clipped to it.
+* TEXT reaches only characters the layout types at level 1 or 2; others (for
+  "us": accented letters, emoji) are dropped with one log line. text-input-v3
+  is the way to more.
+* Software rendering (pixman) only; GL clients render through their own
+  software fallback.
+* Single-instance apps (GApplication/D-Bus activation) that are already
+  running on the host desktop hand the request to that instance, and the
+  window opens there instead; the launch then ends "without opening a window
+  here". Use their standalone/new-instance flag.
+* Apps launched by the agent die with it (they lose their display); the agent
+  does not kill them on exit itself.
+
 ## Using it
 
 ```
@@ -351,3 +427,25 @@ real Windows.
 game: the texture on Dalamud's device, the view accepted as `ImTextureID` by
 Dalamud's DX11 ImGui renderer, the depth test's shader sampling it, upload
 cost and frame pacing, and input played back into a real window.
+
+Linux Wayland backend, observed 2026-09-19 on this project's dev host (Bazzite
+/ Fedora 44, host wlroots 0.20.2, libwayland-server 1.26.0, xkbcommon 1.13.1,
+pixman 0.46.2; agent built with zig cc), with `yad` 9.3 (GTK 3.24.52) as the client:
+
+* `test_capture_wayland`: the HID table, codepoint lookup against real `us`
+  and `de` keymaps, `run:` parsing, WLIST lines, matching.
+* `test_wayland_compositor` (backend driven directly): `run:yad --text-info
+  --editable --width=640 --height=400` mapped 0.2 s after WOPEN; the first
+  frame was 640×437 (the window geometry: GTK3's CSD titlebar included, its
+  shadow excluded) with ~280k pixels unlike the first; a click into the text
+  view, TEXT `echo hi\n` and KEY Shift+h put "echo hi" and "H" on two lines
+  (332 pixels changed, 3 new frames in the 2 s after); WLIST listed
+  `1 640 437 yad ghostty-wayland-test`; closing the stream closed yad and
+  the window left the list; `run:exit 3` ended with status 3. No window
+  appeared on the host desktop.
+* Through the agent over TCP (a manual run, same host, `--windows wayland`):
+  WOPEN `run:yad …` answered WOPENED sid 1, a 500×337 KEY frame followed,
+  a click and TEXT produced 4 delta frames, WCLOSE closed the app.
+
+Not observed: any other client (GTK4, Qt, Electron, terminals), popups and
+menus, resizes, wheel scrolling having a visible effect, the game side.
