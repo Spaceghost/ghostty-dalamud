@@ -12,6 +12,7 @@ require 'C.stdio'
 require 'core.app.remotewin'
 
 local run_buf: [512]cchar       -- the Run: box
+
 local note: string              -- the last result, shown at the bottom (owned)
 local note_bad = false
 
@@ -111,6 +112,7 @@ global function draw_window_picker(): void
       for i = 0, < #winlist.windows do
         local e = &winlist.windows[i]
         if e.wid == 0 then continue end -- "what WOPEN with wid 0 does": the button below
+        if winlist_entry_never(e) then continue end -- CONFIG.windows.never
         imgui.PushIDInt((@cint)(i))
         local size: [32]cchar
         C.snprintf((@cstring)(&size), #size, '  %dx%d', (@cint)(e.w), (@cint)(e.h))
@@ -145,6 +147,7 @@ global function draw_window_picker(): void
         imgui.Separator()
         for i = 0, < #winlist.apps do
           local a = &winlist.apps[i]
+          if winlist_app_never(a) then continue end -- CONFIG.windows.never
           imgui.PushIDInt((@cint)(10000 + i))
           if imgui.Selectable(label(&buf, a.name, #a.categories > 0 and '   ' or '', a.categories), false, 0, vec2(0, 0)) then
             local sb: stringbuilder

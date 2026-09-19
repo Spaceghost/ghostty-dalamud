@@ -137,6 +137,32 @@ local function l_button(L: *lua_State): cint
   return 1
 end
 
+-- ui.input(label, text) -> changed, text, entered: a one-line text box
+-- (at most 255 bytes); `entered` when Enter was pressed in it. Without the
+-- export (an older Dalamud): nothing drawn, unchanged.
+local function l_input(L: *lua_State): cint
+  local len: usize = 0
+  local cur = (@*[0]cchar)(lua_tolstring(L, 2, &len))
+  if cur == nilptr then len = 0 end
+  local buf: [256]cchar
+  local n = math.min(len, #buf - 1)
+  for i: usize = 0, < n do buf[i] = cur[i] end
+  buf[n] = 0
+  local entered = false
+  if imgui.InputText ~= nilptr then
+    entered = imgui.InputText(arg_string(L, 1), (@cstring)(&buf), #buf, ImGuiInputTextFlags_EnterReturnsTrue, nilptr, nilptr)
+  end
+  local out: cstring = (@cstring)(&buf)
+  local changed = (@usize)(#out) ~= n
+  if not changed then
+    for i: usize = 0, < n do if buf[i] ~= cur[i] then changed = true break end end
+  end
+  lua_pushboolean(L, changed and 1 or 0)
+  lua_pushstring(L, out)
+  lua_pushboolean(L, entered and 1 or 0)
+  return 3
+end
+
 local function l_same_line(L: *lua_State): cint
   imgui.SameLine(0, -1)
   return 0
@@ -191,6 +217,7 @@ global function ui_lua_register(L: *lua_State): void
   lua_pushcclosure(L, l_separator, 0) lua_setfield(L, -2, 'separator')
   lua_pushcclosure(L, l_button, 0) lua_setfield(L, -2, 'button')
   lua_pushcclosure(L, l_same_line, 0) lua_setfield(L, -2, 'same_line')
+  lua_pushcclosure(L, l_input, 0) lua_setfield(L, -2, 'input')
   lua_pushcclosure(L, l_tip, 0) lua_setfield(L, -2, 'tip')
   lua_setfield(L, -2, 'ui')
 end

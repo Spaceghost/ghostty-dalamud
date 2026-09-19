@@ -10,6 +10,7 @@ require 'core.host'
 require 'string'
 require 'vector'
 require 'arg'
+require 'os'
 
 ## cinclude '<sys/socket.h>'
 ## cinclude '<fcntl.h>'
@@ -943,6 +944,7 @@ do
   assert(count(PROTO_WCLOSE) == 0, 'a reload does not close the windows')
   assert(#host.world == 0)
   host.agent_last_try = 1e9
+  world_frame(false) -- not connected yet
   fake_connect('ghostty-agent 3 43')
   pump()
   forget()
@@ -1066,7 +1068,161 @@ do
   print('window reserved chords OK')
 end
 
+-- New windows: a watching agent's pushed lists open them as panels ----------------------------
+local function wopens(): integer return count(PROTO_WOPEN) end
+local function last_wopen_wid(): uint32
+  local p = last(PROTO_WOPEN)
+  if p == nilptr then return 0 end
+  return proto.get_u32((@*[0]uint8)(&p[4]))
+end
+local function stream_of_wid(wid: uint32): *RemoteWin
+  for i = 0, < #host.world do
+    local r = remotewin_of(host.world[i])
+    if r ~= nilptr and r.wid == wid then return r end
+  end
+  return nilptr
+end
+do
+  host.agent:disconnect()
+  host.agent.state = AgentState.Failed
+  world_frame(false)
+  fake_connect('ghostty-agent 3 44')
+  pump()
+  forget()
+  world_frame(false)
+  local watch_sent = false
+  assert(count(PROTO_WLIST) >= 1)
+  for i = 0, < #frames do
+    if frames[i].typ == PROTO_WLIST and frames[i].data == 'watch' then watch_sent = true end
+  end
+  assert(watch_sent, 'WLIST watch on connect')
+  local LAUNCH: string = '0\t0\t0\tlaunch\trun:COMMAND to start an app in the game\n'
+  -- the first list is what was already there
+  forget()
+  send_list(LAUNCH .. '3\t640\t400\tyad\tCalendar\t6aa.1\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 0 and #host.world == 0, 'the baseline opens nothing')
+  -- a tab torn off into a window: opened by its id, where open_at says
+  send_list(LAUNCH .. '3\t640\t400\tyad\tCalendar\t6aa.1\n9\t800\t600\tfirefox\tNew Tab\t\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 1 and last_wopen_wid() == 9 and #host.world == 1, 'a new window: WOPEN #9')
+  local tab = stream_of_wid(9)
+  assert(tab ~= nilptr)
+  forget()
+  send_opened(tab.req, 70, 'New Tab')
+  pump()
+  send_frame(70, 1, &f1, nilptr)
+  pump()
+  for _ = 1, 30 do world_frame(false) end -- shown: its pose is known
+  -- ours (sid:) and 5-column lines (not the compositor's) are never opened
+  send_list(LAUNCH .. '3\t640\t400\tyad\tCalendar\t6aa.1\n9\t800\t600\tfirefox\tNew Tab\t\tsid:70\n10\t300\t200\tfoot\tfoot\t\tsid:71\n14\t300\t200\tnotepad\tUntitled\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 0 and #host.world == 1, 'sid: lines and other desktops are not new windows')
+  -- a dialog: pinned beside its window's panel, a little in front
+  send_list(LAUNCH .. '9\t800\t600\tfirefox\tNew Tab\t\tsid:70\n11\t400\t300\tfirefox\tSave As\t\tparent:9\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 1 and last_wopen_wid() == 11, 'the dialog opened')
+  local dlg = stream_of_wid(11)
+  assert(dlg ~= nilptr and dlg.parent_id == tab.s.id, 'it knows its window')
+  local okp, pp = policy_world_place(tab.s.id, now, false)
+  local okd, pd = policy_world_place(dlg.s.id, now, false)
+  assert(okp and okd and near(pd.yaw, pp.yaw, 1e-4), 'facing the same way')
+  local rx, rz = math.cos(pp.yaw), -math.sin(pp.yaw)
+  local fx, fz = math.sin(pp.yaw), math.cos(pp.yaw)
+  local side = (pd.x - pp.x) * rx + (pd.z - pp.z) * rz
+  local front = (pd.x - pp.x) * fx + (pd.z - pp.z) * fz
+  assert(side > pp.width / pp.ppm / 2 and near(front, 0.15, 1e-3) and near(pd.y, pp.y, 1e-4), 'to its right, a little in front')
+  send_opened(dlg.req, 72, 'Save As')
+  pump()
+  -- closing the window's panel closes its dialog's
+  forget()
+  assert(window_close(tab.s.id))
+  for _ = 1, 120 do world_frame(false) end
+  assert(#host.world == 0, 'the dialog went with its window')
+  -- a refused window is not asked for again while it is listed
+  forget()
+  send_list(LAUNCH .. '15\t400\t300\tgimp\tGIMP\t\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 1 and last_wopen_wid() == 15)
+  local g = stream_of_wid(15)
+  send_opened(g.req, 0, 'window closed')
+  pump()
+  for _ = 1, 200 do world_frame(false) end
+  forget()
+  send_list(LAUNCH .. '15\t400\t300\tgimp\tGIMP\t\n16\t400\t300\tgimp\tGIMP 2\t\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 1 and last_wopen_wid() == 16, 'no second try for #15')
+  -- 'none': the picker only
+  while #host.world > 0 do close_terminal(host.world[0]) end
+  assert(luaL_loadstring(policy.L, "CONFIG.windows.auto_open = 'none'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  forget()
+  send_list(LAUNCH .. '17\t400\t300\tfoot\tfoot\t\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 0 and #host.world == 0, "auto_open 'none'")
+  -- 'related': only beside a panel of the same app or a dialog's window
+  assert(luaL_loadstring(policy.L, "CONFIG.windows.auto_open = 'related'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  send_list(LAUNCH .. '17\t400\t300\tfoot\tfoot\t\n18\t400\t300\txterm\txterm\t\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 0, "'related': an unrelated window stays out")
+  print('window auto open OK')
+end
+
+-- CONFIG.windows.never: kept out everywhere -----------------------------------------------------
+do
+  assert(luaL_loadstring(policy.L, "CONFIG.windows.never = { '1password', 'org.gnome.*', 'secret' } CONFIG.windows.auto_open = 'all'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  while #host.world > 0 do close_terminal(host.world[0]) end
+  for _ = 1, 10 do world_frame(false) end
+  assert(#window_never('1Password', '', '') > 0 and #window_never('', 'org.gnome.Nautilus', '') > 0, 'app id, desktop id with *')
+  assert(#window_never('yad', '', 'My SECRET notes') > 0 and #window_never('yad', '', 'Calendar') == 0, 'a part of the title')
+  forget()
+  local before = logged('1Password is on CONFIG.windows.never')
+  assert(window_command('pull 1Password') == 4 and logged('1Password is on CONFIG.windows.never') > before, '/window pull refused, said')
+  local id, err = window_open(WindowOpenSpec{ run = '/opt/1Password/1password --silent' })
+  assert(id == 0 and err == '1password is on CONFIG.windows.never', 'a run refused')
+  id = window_open(WindowOpenSpec{ match = 'app:org.gnome.Nautilus' })
+  assert(id == 0, 'an app: refused')
+  assert(count(PROTO_WOPEN) == 0 and #host.world == 0, 'nothing asked of the agent')
+  local LAUNCH: string = '0\t0\t0\tlaunch\trun:COMMAND to start an app in the game\n'
+  send_list(LAUNCH .. '20\t400\t300\t1password\tLock\t\n21\t400\t300\torg.gnome.Nautilus\tFiles\t\n22\t400\t300\tyad\tMy secret notes\t\n23\t400\t300\tyad\tCalendar 2\t\n')
+  pump()
+  world_frame(false)
+  assert(count(PROTO_WOPEN) == 1 and last_wopen_wid() == 23, 'auto open skips the kept-out windows')
+  -- a title that comes to match: the panel closes
+  local c2 = stream_of_wid(23)
+  send_opened(c2.req, 80, 'Calendar 2')
+  pump()
+  forget()
+  send_list(LAUNCH .. '23\t400\t300\tyad\tSecret plans\t\tsid:80\n')
+  pump()
+  for _ = 1, 120 do world_frame(false) end
+  host.agent:flush()
+  assert(#host.world == 0 and count(PROTO_WCLOSE) == 1, 'closed when its title came to match')
+  -- apps: the picker and agent.apps leave them out
+  local ap: WinAppEntry = { id = '1password', name = '1Password' }
+  local ok_ap: WinAppEntry = { id = 'org.kde.kate', name = 'Kate' }
+  assert(winlist_app_never(&ap) and not winlist_app_never(&ok_ap))
+  assert(luaL_loadstring(policy.L, "CONFIG.windows.never = {}") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  print('window never OK')
+end
+
 gu_shutdown()
+do -- the next test's core must not restore these windows
+  local ws = dir .. '/window-state.lua'
+  os.remove(ws)
+  ws:destroy()
+end
 wintex_fake = nilptr
 f1:destroy() f2:destroy() scratch:destroy() body:destroy() rects:destroy() uploads:destroy() images:destroy()
 print('remotewin OK')

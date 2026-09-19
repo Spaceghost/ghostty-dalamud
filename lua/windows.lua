@@ -35,6 +35,21 @@ M.opacity = 0.97
 -- Where a new window panel appears, as `/term pin` takes it: 'here' (in front
 -- of you, facing you), 'pet' (floats beside you and follows), 'me', ...
 M.open_at = 'here'
+-- New windows in the agent's own compositor (Linux: a tab torn off into a
+-- window, a dialog, an app started from another one) become panels by
+-- themselves: 'all', 'related' (only a dialog of a window with a panel, or a
+-- window of an app that has one) or 'none' (the Windows picker only). A
+-- dialog is pinned beside its window's panel, another window of an app
+-- beside that app's newest panel, anything else where open_at says.
+M.auto_open = 'all'
+-- Windows and apps never shown in game: not opened by themselves, refused by
+-- /window pull and IPC window.open, left out of the Windows picker and of
+-- agent.apps (XivDesktop's launcher), and a panel whose window comes to match
+-- (a title change) is closed. Each entry is an app id ('firefox'), a desktop
+-- id ('org.gnome.Nautilus') or a part of a title, case-insensitive; '*'
+-- matches anything ('org.gnome.*', '*password*'). Edit it in the settings
+-- window too. Empty by default.
+M.never = {}
 -- Pulled once your character is loaded, each as `/term window pull` arguments,
 -- e.g. { 'Firefox', 'run foot' }. One a saved window panel already brings
 -- back (the same match text) is skipped.
@@ -61,6 +76,32 @@ function M.size(id, w, h, chrome)
   a.width, a.height = pw, math.max(MIN_H, ph)
   a.pixels_per_yalm = M.pixels_per_yalm
   a.opacity = M.opacity
+end
+
+-- Pin panel `id` beside panel `other` as it is shown: facing the same way,
+-- to its right with a small gap, `forward` yalms in front of it (a dialog
+-- over its window). Its size stays; nil or why not.
+function M.beside(id, other, forward)
+  local o = world.anchors[other]
+  local p = o and o._out
+  if not p then return 'the other panel has not been shown yet' end
+  local a = world.anchors[id]
+  if not a then return 'not a world panel' end
+  local half_o = (p.width or M.width) / (p.pixels_per_yalm or M.pixels_per_yalm) / 2
+  local half_n = (a.width or math.max(MIN_W, math.min(MAX_W, M.width))) / (a.pixels_per_yalm or M.pixels_per_yalm) / 2
+  local s = half_o + half_n + 0.15
+  local f = forward or 0
+  local yaw = p.yaw or 0
+  -- the viewer's right is (cos yaw, 0, -sin yaw); the front (sin yaw, 0, cos yaw)
+  local x = p.x + math.cos(yaw) * s + math.sin(yaw) * f
+  local z = p.z - math.sin(yaw) * s + math.cos(yaw) * f
+  local err = world.command(id, 'pet') -- toggle pins a pet where it is told
+  if err then return err end
+  local w, h, ppy, op = a.width, a.height, a.pixels_per_yalm, a.opacity
+  err = world.toggle(id, x, p.y, z, yaw, p.pitch or 0)
+  local n = world.anchors[id]
+  if n then n.width, n.height, n.pixels_per_yalm, n.opacity = w, h, ppy, op end
+  return err
 end
 
 -- `/term pin ...` on a window panel: a new anchor, the same size.

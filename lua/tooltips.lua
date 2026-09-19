@@ -68,6 +68,7 @@ M.sections = {
   ['Character animation'] = 'The pose your character holds while a terminal is out.',
   ['Bell'] = 'The ripple of light when a program rings; preview them all with /term bell demo.',
   ['Assistant (/term ask)'] = 'Ask a local AI assistant from chat: /term ask <question>. Not yet tried in game.',
+  ['Remote windows'] = 'Desktop windows from ghostty-agent on world panels (/window).',
   ['Info bar & hidden UI'] = 'The server info bar entry, and staying visible when the game hides its UI.',
 }
 
@@ -165,6 +166,8 @@ M.settings = {
   ['host.keep_visible.user_hidden'] = 'Terminals stay when you hide the game UI.',
   ['host.keep_visible.cutscene'] = 'Terminals stay during cutscenes.',
   ['host.keep_visible.gpose'] = 'Terminals stay in group pose.',
+  ['windows.auto_open'] = 'Windows that appear in the agent\'s desktop (a torn-off tab, a dialog) open as panels by themselves; related: only dialogs of windows you have out and windows of apps you have out; none: only through the Windows picker.',
+  ['windows.never'] = 'These windows and apps are never shown in game: not opened, left out of the picker and the app list, and closed if one comes to match. An app id (firefox), a desktop id (org.gnome.Nautilus) or part of a title; * matches anything.',
 }
 
 return M
