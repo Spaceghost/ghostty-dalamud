@@ -92,6 +92,10 @@ sleep 0.5
 kill -0 "$AGENT" || { cat build/agent.log; exit 1; }
 build/nelua-cache/test_agent "$PORT" testtoken123 "$AGENT"
 
+echo "--- test_jobs"
+"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -b tests/test_jobs.nelua
+build/nelua-cache/test_jobs "$PORT" testtoken123 "$AGENT"
+
 echo "--- test_agent_windows"
 "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -b tests/test_agent_windows.nelua
 WPORT=$((PORT + 1))
