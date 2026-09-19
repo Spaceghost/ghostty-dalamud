@@ -13,12 +13,13 @@ NELUA="$ROOT/vendor/nelua-lang/nelua"
 INC="-I$ROOT/vendor/ghostty/include -I$ROOT/vendor/gc-cimgui -I$ROOT/vendor/lua/src"
 LIBS="-L$ROOT/build/ghostty-vt-linux/lib -L$ROOT/build/lua-linux -lm"
 export LD_LIBRARY_PATH="$ROOT/build/ghostty-vt-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-run() { echo "--- $1"; "$NELUA" --cc gcc -P nogc --cflags="$INC $LIBS" --cache-dir build/nelua-cache -L . -b "tests/$1.nelua"; "build/nelua-cache/$1" "${@:2}"; }
+run() { echo "--- $1"; "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cflags="$INC $LIBS" --cache-dir build/nelua-cache -L . -b "tests/$1.nelua"; "build/nelua-cache/$1" "${@:2}"; }
 
 rm -f "$ROOT/animation-reset-done" "$ROOT/world-state.lua" "$ROOT/settings.lua" # state files the Lua modules write next to lua/
 unset UMBRA_GHOSTTY_HOME GHOSTTY_HOME # the migration and config home read these
 rm -rf build/test-scratch && mkdir -p build/test-scratch/surface/config
 run test_ghostty
+run test_wincodec
 run test_render
 run test_session
 run test_dualsense
@@ -35,7 +36,7 @@ HEAP=""; getconf GNU_LIBC_VERSION >/dev/null 2>&1 && HEAP="-P glibc_heap" # heap
 HEAP_ENV="glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0"
 echo "--- test_pending"
 # shellcheck disable=SC2086
-"$NELUA" --cc gcc -P nogc $HEAP --cflags="$INC $LIBS" --cache-dir build/nelua-cache -L . -b tests/test_pending.nelua
+"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc $HEAP --cflags="$INC $LIBS" --cache-dir build/nelua-cache -L . -b tests/test_pending.nelua
 GLIBC_TUNABLES=$HEAP_ENV build/nelua-cache/test_pending "$ROOT"
 run test_lights "$ROOT"
 run test_occluders "$ROOT"
@@ -49,14 +50,14 @@ run test_depthpass "$ROOT"
 
 echo "--- test_reinit"
 # shellcheck disable=SC2086
-"$NELUA" --cc gcc -P nogc $HEAP --cflags="$INC $LIBS" --cache-dir build/nelua-cache -L . -b tests/test_reinit.nelua
+"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc $HEAP --cflags="$INC $LIBS" --cache-dir build/nelua-cache -L . -b tests/test_reinit.nelua
 GLIBC_TUNABLES=$HEAP_ENV build/nelua-cache/test_reinit "$ROOT"
 
 run test_agent_logic
 
 echo "--- test_agent"
-"$NELUA" --cc gcc -P nogc --cache-dir build/nelua-cache -L . -o build/ghostty-agent -b agent/agent.nelua
-"$NELUA" --cc gcc -P nogc --cache-dir build/nelua-cache -L . -b tests/test_agent.nelua
+"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -o build/ghostty-agent -b agent/agent.nelua
+"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -b tests/test_agent.nelua
 echo "testtoken123" > build/agent-token
 # a port per run, so test runs at the same time never share an agent
 PORT="${GHOSTTY_TEST_PORT:-$((20000 + $$ % 20000))}"
@@ -68,13 +69,13 @@ kill -0 "$AGENT" || { cat build/agent.log; exit 1; }
 build/nelua-cache/test_agent "$PORT" testtoken123 "$AGENT"
 
 echo "--- host module compiles natively"
-"$NELUA" --cc gcc -P nogc -P noentrypoint --cflags="$INC $LIBS" --cache-dir build/nelua-cache -L . -H -o build/libghostty_umbra_host.so core/host.nelua
+"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc -P noentrypoint --cflags="$INC $LIBS" --cache-dir build/nelua-cache -L . -H -o build/libghostty_umbra_host.so core/host.nelua
 
 echo "--- test_loader"
 rm -rf build/loader-test && mkdir -p build/loader-test build/test-scratch/loader
-"$NELUA" --cc gcc -P nogc -P noentrypoint --cache-dir build/nelua-cache -L . -H -o build/loader-test/libghostty_loader.so core/loader.nelua
+"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc -P noentrypoint --cache-dir build/nelua-cache -L . -H -o build/loader-test/libghostty_loader.so core/loader.nelua
 mv build/loader-test/libghostty_loader.so build/loader-test/ghostty_loader.dll
 cp build/libghostty_umbra_host.so build/loader-test/ghostty_core.dll
-"$NELUA" --cc gcc -P nogc --cache-dir build/nelua-cache -L . -b tests/test_loader.nelua
+"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -b tests/test_loader.nelua
 build/nelua-cache/test_loader "$ROOT/build/loader-test" "$ROOT" "$ROOT/build/test-scratch/loader" "$ROOT/build/libghostty_umbra_host.so"
 echo "ALL OK"
