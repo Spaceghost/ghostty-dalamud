@@ -195,6 +195,15 @@ local function draw_window_glass(dl: *ImDrawList, x0: float32, y0: float32, x1: 
   imgui.DrawListPopClipRect(dl)
 end
 
+-- The same glass for other ImGui windows of the core (the Windows picker,
+-- core/app/winpicker.nelua): the palette and light of this frame, and a
+-- window's glass body with `sheen_h` of light across its top.
+global function dropdown_glass(dl: *ImDrawList, x0: float32, y0: float32, x1: float32, y1: float32, rounding: float32, sheen_h: float32): void
+  local light = frame_light()
+  local pal = chrome_palette((@float32)(policy.dropdown.opacity), policy.dropdown.glass, light)
+  draw_window_glass(dl, x0, y0, x1, y1, rounding, pal, light, sheen_h)
+end
+
 -- A press on this window belongs to it: without this the click-off-to-unfocus
 -- in gu_frame sees the button it just activated block the hover, drops focus
 -- and cancels the press before its release.

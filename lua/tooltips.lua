@@ -33,12 +33,14 @@ M['world.close'] = 'Close this screen'
 M['world.full'] = 'Full screen (double-click the screen does it too)'
 M['world.full.off'] = 'Back to its place in the world'
 M['world.popin'] = 'Back into the dropdown as a tab'
+M['world.pet'] = 'Let it float beside you as a pet'
+M['world.pin'] = 'Pin it in the world, right where it floats'
 M['world.sleep.on'] = 'Sleeps while nobody sees it; click to keep it running'
 M['world.sleep.off'] = 'Keeps running while unseen; click to let it sleep'
 M['world.resize'] = 'Drag to resize'
 
 -- /help lines of the commands of their own (CONFIG.host.verb_commands).
-M['command./window'] = 'Desktop windows on world panels: pull [match|#wid] | run CMD | list | close'
+M['command./window'] = 'Desktop windows on world panels: the picker, or pull [match|#wid] | run CMD | list | close'
 M['command./ask'] = 'Ask the local AI assistant: /ask [question]'
 M['command./agent'] = 'ghostty-agent: /agent ask [question] asks the local AI assistant'
 

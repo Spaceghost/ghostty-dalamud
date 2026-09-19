@@ -683,6 +683,7 @@ global function policy_world_place(id: integer, t: float64, focused: boolean): (
     pl.light_g = (@float32)(lua_field_number(L, r, 'light_g', 1))
     pl.light_b = (@float32)(lua_field_number(L, r, 'light_b', 1))
     pl.light_shadows = lua_field_boolean(L, r, 'light_shadows', false)
+    pl.pet = lua_field_boolean(L, r, 'pet', false)
     ok = true
   end
   lua_pop(L, 3)

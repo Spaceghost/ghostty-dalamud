@@ -79,6 +79,7 @@ global WorldPlacement = @record{
   light_range: float32,     -- yalms
   light_r: float32, light_g: float32, light_b: float32,
   light_shadows: boolean,   -- the light casts shadows (expensive)
+  pet: boolean,             -- its anchor is a pet (the title button offers a pin), else a pin of some kind
 }
 
 global WorldBasis = @record{
@@ -519,9 +520,10 @@ global WORLD_BUTTON_NONE: integer <comptime> = 0
 global WORLD_BUTTON_CLOSE: integer <comptime> = 1
 global WORLD_BUTTON_FULL: integer <comptime> = 2
 global WORLD_BUTTON_POPIN: integer <comptime> = 3
-global WORLD_BUTTON_OCCLUDED: integer <comptime> = 4   -- keep running when unseen
+global WORLD_BUTTON_PET: integer <comptime> = 4        -- pin <-> pet, where the panel is now
+global WORLD_BUTTON_OCCLUDED: integer <comptime> = 5   -- keep running when unseen
 global WORLD_BUTTON_PITCH: float32 <comptime> = 34
-global WORLD_BUTTON_COUNT: integer <comptime> = 4
+global WORLD_BUTTON_COUNT: integer <comptime> = 5
 
 -- Which button (if any) panel pixel (u, v) is on; each owns a 34 px column.
 global function world_title_button(width: float32, u: float32, v: float32): integer

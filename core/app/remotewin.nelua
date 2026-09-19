@@ -53,6 +53,7 @@ global RemoteWin = @record{
   req: uint32,              -- WOPEN request id
   sid: uint32,              -- stream id, 0 until WOPENED
   app: string,              -- what was asked for: the run command's program, the match text, or '' (owned)
+  wid: uint32,              -- the window id asked for (WOPEN by id), else 0
   state: RemoteWinState,
   max_w: integer, max_h: integer, -- what was asked for: larger frames are refused
   w: integer, h: integer,   -- size of the frames (0 before the first)
@@ -121,7 +122,7 @@ local function stream_end(rw: *RemoteWin, why: string, reason: string): void
   rw.ended_at = host.last_time
   rw.frames = 0 -- the text shows instead of the picture
   panel_text(rw.s, why, reason)
-  logf(LOG_INFO, 'window %d: %s%s', rw.s.id, why, reason)
+  sayf(LOG_INFO, 'window %d: %s%s', rw.s.id, why, reason) -- the chat too: a refusal is news
 end
 
 -- Close a window panel: world panels glitch out first (as dismiss_terminal does).
@@ -219,39 +220,134 @@ local function on_frame(rw: *RemoteWin, payload: *[0]uint8, len: usize): void
   end
 end
 
--- WLISTR lines "wid\tw\th\tapp\ttitle\n", one log line each.
-local function log_list(data: *[0]uint8, len: usize): void
-  local text = string{data=(@*[0]byte)(data), size=len}
-  local n = 0
+-- The agent's last WLISTR ---------------------------------------------------------------
+-- Lines "wid\tw\th\tapp\ttitle[\tmore...]\n" (docs/REMOTE_WINDOWS.md): columns after
+-- the title are kept as sent (`extra`), and one that reads "key:K" (or
+-- "key=K") is the window's stable key (a newer agent's; the first extra
+-- column when none is marked). Lines "app\tid\tname\ticon\tcategories" are
+-- apps the agent can start (a newer agent's), shown by the Windows picker.
+
+global WinListEntry = @record{
+  wid: uint32, w: integer, h: integer,
+  app: string, title: string, -- owned
+  key: string,                -- '' when the agent sends none (owned)
+  extra: vector(string),      -- the columns after the title (owned)
+}
+global WinAppEntry = @record{ id: string, name: string, icon: string, categories: string } -- owned
+global WinList = @record{
+  windows: vector(WinListEntry),
+  apps: vector(WinAppEntry),
+  answers: integer,           -- WLISTRs received (a new answer moves it)
+}
+global winlist: WinList
+
+local function winlist_clear(): void
+  for i = 0, < #winlist.windows do
+    local e = &winlist.windows[i]
+    e.app:destroy() e.title:destroy() e.key:destroy()
+    for k = 0, < #e.extra do e.extra[k]:destroy() end
+    e.extra:destroy()
+  end
+  winlist.windows:clear()
+  for i = 0, < #winlist.apps do
+    local a = &winlist.apps[i]
+    a.id:destroy() a.name:destroy() a.icon:destroy() a.categories:destroy()
+  end
+  winlist.apps:clear()
+end
+
+-- A decimal number (no sign), or false.
+local function parse_count(t: string): (boolean, integer)
+  if #t == 0 or #t > 10 then return false, 0 end
+  local n: integer = 0
+  for i = 0, < #t do
+    local c = t.data[i]
+    if c < '0'_b or c > '9'_b then return false, 0 end
+    n = n * 10 + (c - '0'_b)
+  end
+  return true, n
+end
+
+-- `line` split at tabs into views of it.
+local function split_tabs(line: string, out: *vector(string)): void
+  out:clear()
+  if #line == 0 then return end
   local start: usize = 0
-  for pos: usize = 0, < len do
-    if data[pos] == 10 then
-      local line = text:subview(start + 1, pos)
-      local sb: stringbuilder
-      sb:write('window #')
-      local field = 0
-      for k: usize = 0, < line.size do
-        local c = line.data[k]
-        if c == 9 then
-          field = field + 1
-          if field == 1 then sb:write(' ') elseif field == 2 then sb:write('x') elseif field == 3 then sb:write(' [') else sb:write('] ') end
-        else
-          sb:writebyte(c)
+  for k: usize = 0, <= line.size do
+    if k == line.size or line.data[k] == 9 then
+      out:push(string{data = (@*[0]byte)(&line.data[start]), size = k - start})
+      start = k + 1
+    end
+  end
+end
+
+local function key_of(extra: *vector(string)): string
+  for i = 0, < #extra do
+    local c = extra[i]
+    if #c > 4 and (c:subview(1, 4) == 'key:' or c:subview(1, 4) == 'key=') then return c:subview(5):copy() end
+  end
+  if #extra > 0 and extra[0]:find(':', 1, true) == 0 and extra[0]:find('=', 1, true) == 0 then return extra[0]:copy() end
+  return string{}
+end
+
+-- Replace winlist with a WLISTR payload. Malformed lines are skipped.
+global function winlist_parse(data: *[0]uint8, len: usize): void
+  winlist_clear()
+  winlist.answers = winlist.answers + 1
+  if len == 0 then return end
+  local cols: vector(string)
+  local start: usize = 0
+  for pos: usize = 0, <= len do
+    if pos == len or data[pos] == 10 then
+      if pos > start then
+        split_tabs(string{data=(@*[0]byte)(&data[start]), size=pos-start}, &cols)
+        if #cols >= 3 and cols[0] == 'app' then
+          local a: WinAppEntry = { id = cols[1]:copy(), name = cols[2]:copy() }
+          if #cols > 3 then a.icon = cols[3]:copy() end
+          if #cols > 4 then a.categories = cols[4]:copy() end
+          winlist.apps:push(a)
+        elseif #cols >= 5 then
+          local okw, wid = parse_count(cols[0])
+          local okx, w = parse_count(cols[1])
+          local oky, h = parse_count(cols[2])
+          if okw and okx and oky and wid <= 0xffffffff then
+            local e: WinListEntry = { wid = (@uint32)(wid), w = w, h = h, app = cols[3]:copy(), title = cols[4]:copy() }
+            for k = 5, < #cols do e.extra:push(cols[k]:copy()) end
+            e.key = key_of(&e.extra)
+            winlist.windows:push(e)
+          end
         end
       end
-      local msg = sb:promote()
-      log(LOG_INFO, msg)
-      msg:destroy()
-      n = n + 1
       start = pos + 1
     end
   end
-  logf(LOG_INFO, 'window list: %d windows (pull one with /term window pull #wid)', n)
+  cols:destroy()
+end
+
+-- One log line per window (and a summary) for the last WLISTR.
+local function log_list(): void
+  for i = 0, < #winlist.windows do
+    local e = &winlist.windows[i]
+    local sb: stringbuilder
+    sb:writef('window #%d %dx%d [', e.wid, e.w, e.h)
+    sb:write(e.app, '] ', e.title, '  @default')
+    if #e.key > 0 then sb:write(' key ', e.key) end
+    local msg = sb:promote()
+    log(LOG_INFO, msg)
+    msg:destroy()
+  end
+  for i = 0, < #winlist.apps do
+    local a = &winlist.apps[i]
+    logf(LOG_INFO, 'app %s: %s [%s]', a.id, a.name, a.categories)
+  end
+  logf(LOG_INFO, 'window list: %d windows, %d apps @default (pull one with /window pull #wid, or /window for the picker)',
+    #winlist.windows, #winlist.apps)
 end
 
 global function remotewin_event(ev: *AgentEvent): void
   if ev.typ == PROTO_WLISTR then
-    log_list(ev.data, ev.len)
+    winlist_parse(ev.data, ev.len)
+    log_list()
   elseif ev.typ == PROTO_WOPENED then
     local rw = find_req(ev.req)
     if rw == nilptr then
@@ -269,7 +365,7 @@ global function remotewin_event(ev: *AgentEvent): void
     rw.s.title:destroy()
     rw.s.title = text:copy()
     panel_text(rw.s, 'waiting for the first frame of ', text)
-    logf(LOG_INFO, 'window %d: stream %d opened: %s (%dx%d)', rw.s.id, ev.id, text, ev.w, ev.h)
+    sayf(LOG_INFO, 'window %d: stream %d opened: %s (%dx%d)', rw.s.id, ev.id, text, ev.w, ev.h)
   elseif ev.typ == PROTO_WFRAME then
     local rw = find_sid(ev.id)
     if rw ~= nilptr then on_frame(rw, ev.data, ev.len) end
@@ -334,6 +430,8 @@ global WindowInfo = @record{
   state: RemoteWinState,    -- Opening (pending), Live, Ended (also while the panel leaves)
   view: WindowView,         -- World: a pet or a pin (CONFIG.world's anchor says which); Tab: popped in; Full: full screen
   focused: boolean,         -- the panel has the keyboard
+  agent: string,            -- the agent streaming it ('default': CONFIG.agent, the only one so far)
+  key: string,              -- its stable key from the agent's last WLISTR, else '' (see winlist_key)
 }
 
 -- What window_open opens: at most one of `run` (the agent starts the command
@@ -427,6 +525,7 @@ global function window_open(spec: WindowOpenSpec): (integer, string)
   rw.req = next_req
   next_req = next_req + 1
   rw.app = app
+  rw.wid = spec.wid
   rw.max_w, rw.max_h = policy.windows.max_w, policy.windows.max_h
   rw.ptr_x, rw.ptr_y = -1, -1
   rw.drawn_at = host.last_time
@@ -495,6 +594,26 @@ global function window_place(id: integer, args: string): (boolean, string)
   return true, ''
 end
 
+-- A panel's key in the agent's last WLISTR: the entry of the window id it
+-- asked for, else the one entry whose title is the panel's (a panel opened by
+-- `run`/`match` never learns its window id). '' when none (or several) match.
+-- Borrowed from winlist.
+global function winlist_key(rw: *RemoteWin): string
+  local found: string
+  local n = 0
+  for i = 0, < #winlist.windows do
+    local e = &winlist.windows[i]
+    if rw.wid ~= 0 then
+      if e.wid == rw.wid then return e.key end
+    elseif rw.state == RemoteWinState.Live and #rw.s.title > 0 and e.title == rw.s.title then
+      found = e.key
+      n = n + 1
+    end
+  end
+  if n == 1 then return found end
+  return string{}
+end
+
 -- Every window panel, oldest first, into `out` (cleared first).
 global function window_list(out: *vector(WindowInfo)): void
   out:clear()
@@ -513,6 +632,7 @@ global function window_list(out: *vector(WindowInfo)): void
     out:push(WindowInfo{
       id = s.id, sid = rw.sid, title = title, app = rw.app, w = rw.w, h = rw.h,
       state = state, view = view, focused = host.world_focus == s.id,
+      agent = 'default', key = winlist_key(rw),
     })
   end
 end
@@ -544,27 +664,36 @@ global function remotewin_pull(args: string): (boolean, string)
   return id ~= 0, err
 end
 
+-- The Windows picker (core/app/winpicker.nelua draws it): shown, it asks the
+-- agent for a fresh list; the list it shows is the last WLISTR (winlist).
+global function window_picker_show(show: boolean): void
+  host.window_picker_open = show
+  if show then
+    local ok, err = window_agent_list('')
+    if not ok then logf(LOG_INFO, 'windows picker: %s', err) end -- the picker says it too
+  end
+end
+
 -- `/term window list|pull|close ...`. 0 on success, 4 with a logged reason.
 global function remotewin_command(args: string): cint
   local verb: string = args
   local rest: string
   local sp = args:find(' ', 1, true)
   if sp > 0 then verb, rest = args:subview(1, sp - 1), args:subview(sp + 1) end
-  if verb == 'list' then
-    local _, name = split_agent(rest)
-    local ok, err = window_agent_list(name)
-    if not ok then logf(LOG_WARN, 'window list: %s', err) return 4 end
+  if verb == 'list' or (verb == 'pull' and #rest == 0) then
+    -- the Windows picker shows the list (and asks for a fresh one)
+    window_picker_show(true)
     return 0
   elseif verb == 'pull' then
     local ok, err = remotewin_pull(rest)
-    if not ok then logf(LOG_WARN, 'window pull: %s', err) return 4 end
+    if not ok then sayf(LOG_WARN, 'window pull: %s', err) return 4 end
     return 0
   elseif verb == 'close' then
     local ok, err = window_close(0)
-    if not ok then logf(LOG_WARN, 'window close: %s', err) return 4 end
+    if not ok then sayf(LOG_WARN, 'window close: %s', err) return 4 end
     return 0
   end
-  logf(LOG_WARN, 'usage: /term window list | pull [match|#wid|run CMD] [@agent] | close')
+  sayf(LOG_WARN, 'usage: /term window list | pull [match|#wid|run CMD] [@agent] | close')
   return 4
 end
 
@@ -578,21 +707,24 @@ global function window_command(args: string): cint
   if sp > 0 then verb, rest = args:subview(1, sp - 1), args:subview(sp + 1) end
   if verb == 'run' then
     local cmd, _ = split_agent(rest)
-    if #cmd == 0 then logf(LOG_WARN, 'usage: /window run CMD... [@agent]') return 4 end
+    if #cmd == 0 then sayf(LOG_WARN, 'usage: /window run CMD... [@agent]') return 4 end
     local sb: stringbuilder
     sb:write('run ', rest)
     local line = sb:promote()
     local ok, err = remotewin_pull(line)
     line:destroy()
-    if not ok then logf(LOG_WARN, 'window run: %s', err) return 4 end
+    if not ok then sayf(LOG_WARN, 'window run: %s', err) return 4 end
     return 0
   elseif verb == 'list' or verb == 'pull' or verb == 'close' then
     return remotewin_command(args)
+  elseif #args == 0 then
+    window_picker_show(not host.window_picker_open) -- /window alone: the picker, again to close it
+    return 0
   elseif verb == 'desktop' then
-    logf(LOG_WARN, 'window desktop: not available yet (reserved for a whole remote desktop on a panel)')
+    sayf(LOG_WARN, 'window desktop: not available yet (reserved for a whole remote desktop on a panel)')
     return 4
   end
-  logf(LOG_WARN, 'usage: /window pull [match|#wid] | run CMD... | list | close   (each may end with @agent)')
+  sayf(LOG_WARN, 'usage: /window [list] | pull [match|#wid] | run CMD... | close   (each may end with @agent)')
   return 4
 end
 
@@ -602,7 +734,7 @@ global function remotewin_pin(args: string): (boolean, cint)
   if find_window(host.world_focus) == nilptr then return false, 0 end
   local ok, err = window_place(0, args)
   if not ok then
-    logf(LOG_WARN, 'pin: %s', err)
+    sayf(LOG_WARN, 'pin: %s', err)
     return true, 4
   end
   return true, 0
@@ -994,6 +1126,11 @@ global function remotewin_shutdown(): void
   end
   streams:destroy()
   err_text:destroy()
+  winlist_clear()
+  winlist.windows:destroy()
+  winlist.apps:destroy()
+  winlist.answers = 0
+  host.window_picker_open = false
   wintex_shutdown()
   auto_done = false
   old_shim_logged = false

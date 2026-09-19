@@ -225,6 +225,7 @@ local function placement(a, x, y, z, yaw, pitch, width, height, ppy, opacity, cu
   local out = a._out
   if not out then out = {} a._out = out end
   out.run_occluded = a.run_occluded or false
+  out.pet = a.kind == 'pet'
   out.x, out.y, out.z, out.yaw, out.pitch = x, y, z, yaw, pitch
   out.width, out.height, out.pixels_per_yalm, out.opacity, out.curve = width, height, ppy, opacity, curve
   return lit(out, now)
@@ -242,6 +243,12 @@ end
 --   target [up]     follows your target, floating above it, facing you
 --   orbit [r] [spd] circles you (radius yalms, radians per second)
 --   pet             floats behind you facing the camera and trails after you
+--   toggle [x y z yaw [pitch]]
+--                   a pet becomes a pin where it is (the pose the core drew it
+--                   at, else where it was last placed, else as `here`); any
+--                   other anchor becomes a pet. Its own size, opacity, hidden
+--                   and run_occluded stay (the title button, /term pin toggle,
+--                   IPC window.toggle_pet)
 function M.command(id, args)
   M._pet_ids = nil -- pets may come, go, hide or show
   local a = words(args)
@@ -260,6 +267,7 @@ function M.command(id, args)
     anchor.run_occluded = (a[2] == 'on' or a[2] == 'true')
     return nil
   end
+  if how == 'toggle' then return M.toggle(id, tonumber(a[2]), tonumber(a[3]), tonumber(a[4]), tonumber(a[5]), tonumber(a[6])) end
   local p = ghostty.player()
   if not p then return 'no player (log in first)' end
   if how == 'here' then
@@ -288,6 +296,40 @@ function M.command(id, args)
   else
     return 'usage: /term pin [here|me|target|orbit] ...'
   end
+  return nil
+end
+
+-- Fields a panel keeps when it turns from pin to pet and back: only those set
+-- on it (a terminal takes the new kind's default size; a window panel keeps
+-- the size lua/windows.lua gave it).
+local KEEP = { 'width', 'height', 'pixels_per_yalm', 'opacity', 'run_occluded', 'hidden' }
+
+-- Pin <-> pet at the panel's current pose (see `toggle` above).
+function M.toggle(id, x, y, z, yaw, pitch)
+  local old = M.anchors[id]
+  if not old then return 'not a world terminal' end
+  local a
+  if old.kind == 'pet' then
+    if not (x and y and z and yaw) and old._out then
+      local o = old._out
+      x, y, z, yaw, pitch = o.x, o.y, o.z, o.yaw, o.pitch
+    end
+    if x and y and z and yaw then
+      local zone = ghostty.zone()
+      if not zone then return 'no player (log in first)' end
+      a = { kind = 'world', zone = zone, x = x, y = y, z = z, yaw = yaw, pitch = pitch or 0 }
+    else
+      -- never placed yet: in front of you, as `here`
+      local err = M.command(id, 'here')
+      if err then M.anchors[id] = old return err end
+      a = M.anchors[id]
+    end
+  else
+    a = { kind = 'pet', phase = math.random() * 2 * pi }
+  end
+  for _, k in ipairs(KEEP) do a[k] = old[k] end
+  M.anchors[id] = a
+  M._pet_ids = nil
   return nil
 end
 

@@ -244,7 +244,7 @@ local function push_str(L: *lua_State, s: string, k: cstring): void
   lua_setfield(L, -2, k)
 end
 
--- ghostty.window_list() -> { {id, sid, title, app, w, h, state, view, focused}, ... }
+-- ghostty.window_list() -> { {id, sid, title, app, w, h, state, view, focused, agent, key}, ... }
 -- state: 'pending' | 'live' | 'ended'; view: 'world' | 'tab' | 'full'.
 local function l_window_list(L: *lua_State): cint
   local list: vector(WindowInfo)
@@ -266,6 +266,8 @@ local function l_window_list(L: *lua_State): cint
     if w.view == WindowView.Tab then view = 'tab' elseif w.view == WindowView.Full then view = 'full' end
     lua_pushstring(L, view) lua_setfield(L, -2, 'view')
     lua_pushboolean(L, w.focused and 1 or 0) lua_setfield(L, -2, 'focused')
+    push_str(L, w.agent, 'agent')
+    push_str(L, w.key, 'key')
     lua_rawseti(L, -2, i + 1)
   end
   list:destroy()
@@ -343,6 +345,126 @@ local function l_agent_status(L: *lua_State): cint
   local where = sb:promote()
   push_str(L, where, 'agent')
   where:destroy()
+  lua_pushinteger(L, winlist.answers) lua_setfield(L, -2, 'window_lists')
+  return 1
+end
+
+-- World panels (terminals and windows) ----------------------------------------------------
+
+-- ghostty.world_panels() -> { {id, window, focused}, ... } in host.world order,
+-- without panels already glitching out
+local function l_world_panels(L: *lua_State): cint
+  lua_createtable(L, (@cint)(#host.world), 0)
+  local n: cint = 0
+  for i = 0, < #host.world do
+    local s = host.world[i]
+    if not s.leaving then
+      lua_createtable(L, 0, 3)
+      lua_pushinteger(L, s.id) lua_setfield(L, -2, 'id')
+      lua_pushboolean(L, s.kind == TransportKind.Window and 1 or 0) lua_setfield(L, -2, 'window')
+      lua_pushboolean(L, host.world_focus == s.id and 1 or 0) lua_setfield(L, -2, 'focused')
+      n = n + 1
+      lua_rawseti(L, -2, n)
+    end
+  end
+  return 1
+end
+
+-- The world panel of argument 1, or nilptr.
+local function arg_panel(L: *lua_State): *Session
+  local isnum: cint = 0
+  local id = lua_tointegerx(L, 1, &isnum)
+  if isnum == 0 or id < 1 then return nilptr end
+  return world_panel(id)
+end
+
+-- '' -> true; a reason -> nil, reason (the string is destroyed either way)
+local function push_result(L: *lua_State, err: string): cint
+  local rc: cint = 1
+  if #err > 0 then rc = push_fail(L, err) else lua_pushboolean(L, 1) end
+  err:destroy()
+  return rc
+end
+
+-- ghostty.panel_focus(id) -> true: the keyboard, as a click (no walk-up, no camera turn)
+local function l_panel_focus(L: *lua_State): cint
+  local s = arg_panel(L)
+  if s == nilptr then return push_fail(L, 'no such world panel') end
+  return push_result(L, world_panel_focus(s))
+end
+
+-- ghostty.panel_hide(id, hidden) -> true
+local function l_panel_hide(L: *lua_State): cint
+  local s = arg_panel(L)
+  if s == nilptr then return push_fail(L, 'no such world panel') end
+  return push_result(L, world_panel_hide(s, lua_toboolean(L, 2) ~= 0))
+end
+
+-- ghostty.panel_toggle_pet(id) -> true: pin <-> pet where it is (the title button)
+local function l_panel_toggle_pet(L: *lua_State): cint
+  local s = arg_panel(L)
+  if s == nilptr then return push_fail(L, 'no such world panel') end
+  return push_result(L, world_toggle_pet(s))
+end
+
+-- ghostty.terminal_new{profile=, pin=} -> panel id
+local function l_terminal_new(L: *lua_State): cint
+  if lua_type(L, 1) ~= LUA_TTABLE then return push_fail(L, 'terminal_new takes a table') end
+  local profile = lua_field_string(L, 1, 'profile', '')
+  local pin = lua_field_string(L, 1, 'pin', '')
+  local id, err = world_terminal_new(profile, pin)
+  profile:destroy() pin:destroy()
+  if id == 0 then return push_result(L, err) end
+  err:destroy()
+  lua_pushinteger(L, id)
+  return 1
+end
+
+-- The agent's last WLISTR ---------------------------------------------------------------
+
+-- ghostty.agent_windows() -> { windows = {{wid, w, h, app, title, key, extra = {...}}, ...},
+--                              apps = {{id, name, icon, categories}, ...}, answers = n }
+local function l_agent_windows(L: *lua_State): cint
+  lua_createtable(L, 0, 3)
+  lua_createtable(L, (@cint)(#winlist.windows), 0)
+  for i = 0, < #winlist.windows do
+    local e = &winlist.windows[i]
+    lua_createtable(L, 0, 7)
+    lua_pushinteger(L, e.wid) lua_setfield(L, -2, 'wid')
+    lua_pushinteger(L, e.w) lua_setfield(L, -2, 'w')
+    lua_pushinteger(L, e.h) lua_setfield(L, -2, 'h')
+    push_str(L, e.app, 'app')
+    push_str(L, e.title, 'title')
+    push_str(L, e.key, 'key')
+    lua_createtable(L, (@cint)(#e.extra), 0)
+    for k = 0, < #e.extra do
+      lua_pushlstring(L, (@cstring)(e.extra[k].data), e.extra[k].size)
+      lua_rawseti(L, -2, k + 1)
+    end
+    lua_setfield(L, -2, 'extra')
+    lua_rawseti(L, -2, i + 1)
+  end
+  lua_setfield(L, -2, 'windows')
+  lua_createtable(L, (@cint)(#winlist.apps), 0)
+  for i = 0, < #winlist.apps do
+    local a = &winlist.apps[i]
+    lua_createtable(L, 0, 4)
+    push_str(L, a.id, 'id')
+    push_str(L, a.name, 'name')
+    push_str(L, a.icon, 'icon')
+    push_str(L, a.categories, 'categories')
+    lua_rawseti(L, -2, i + 1)
+  end
+  lua_setfield(L, -2, 'apps')
+  lua_pushinteger(L, winlist.answers) lua_setfield(L, -2, 'answers')
+  return 1
+end
+
+-- ghostty.agent_windows_refresh() -> true: WLIST sent (the answer lands in agent_windows)
+local function l_agent_windows_refresh(L: *lua_State): cint
+  local ok, err = window_agent_list('')
+  if not ok then return push_fail(L, err) end
+  lua_pushboolean(L, 1)
   return 1
 end
 
@@ -362,5 +484,12 @@ global function ipc_lua_register(L: *lua_State): void
   lua_pushcclosure(L, l_window_place, 0) lua_setfield(L, -2, 'window_place')
   lua_pushcclosure(L, l_agent_status, 0) lua_setfield(L, -2, 'agent_status')
   lua_pushcclosure(L, l_status, 0) lua_setfield(L, -2, 'status')
+  lua_pushcclosure(L, l_world_panels, 0) lua_setfield(L, -2, 'world_panels')
+  lua_pushcclosure(L, l_panel_focus, 0) lua_setfield(L, -2, 'panel_focus')
+  lua_pushcclosure(L, l_panel_hide, 0) lua_setfield(L, -2, 'panel_hide')
+  lua_pushcclosure(L, l_panel_toggle_pet, 0) lua_setfield(L, -2, 'panel_toggle_pet')
+  lua_pushcclosure(L, l_terminal_new, 0) lua_setfield(L, -2, 'terminal_new')
+  lua_pushcclosure(L, l_agent_windows, 0) lua_setfield(L, -2, 'agent_windows')
+  lua_pushcclosure(L, l_agent_windows_refresh, 0) lua_setfield(L, -2, 'agent_windows_refresh')
   lua_pop(L, 1)
 end

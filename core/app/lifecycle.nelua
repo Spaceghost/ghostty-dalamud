@@ -4,6 +4,7 @@
 require 'core.app.hotkeys'
 require 'core.app.boot'
 require 'core.app.ipc'
+require 'core.app.winpicker'
 
 global function update_status(): void
   local sb: stringbuilder

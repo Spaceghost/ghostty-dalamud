@@ -28,6 +28,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     [PluginService] internal static IGameInteropProvider Interop { get; private set; } = null!;
     [PluginService] internal static IGameConfig GameConfig { get; private set; } = null!;
     [PluginService] internal static IFramework GameFramework { get; private set; } = null!;
+    [PluginService] internal static IChatGui Chat { get; private set; } = null!;
 
     public Plugin()
     {

@@ -88,6 +88,8 @@ global ImGuiIO <cimport, nodecl> = @record{
 ##  'ImGuiCol_PopupBg','ImGuiCol_Border','ImGuiCol_ResizeGrip','ImGuiCol_ResizeGripHovered','ImGuiCol_ResizeGripActive',
 ##  'ImGuiStyleVar_PopupRounding','ImGuiStyleVar_PopupBorderSize','ImGuiSliderFlags_AlwaysClamp',
 ##  'ImGuiCol_CheckMark','ImGuiCol_SliderGrab','ImGuiCol_SliderGrabActive',
+##  'ImGuiInputTextFlags_EnterReturnsTrue','ImGuiCol_Button','ImGuiCol_ButtonHovered','ImGuiCol_ButtonActive',
+##  'ImGuiCol_FrameBg','ImGuiCol_Header','ImGuiCol_HeaderHovered',
 ## }
 ## for _, c in ipairs(consts) do
   global #|c|#: cint <cimport, nodecl, const>
@@ -198,6 +200,8 @@ global ImGuiApi = @record{
   DrawListAddCallback: function(dl: *ImDrawList, callback: pointer, callback_data: pointer): void,
   -- a textured rectangle (remote windows: the ImTextureID is Dalamud's D3D11 shader resource view)
   DrawListAddImage: function(dl: *ImDrawList, tex: pointer, p_min: ImVec2, p_max: ImVec2, uv_min: ImVec2, uv_max: ImVec2, col: uint32): void,
+  -- a one-line text box (the Windows picker's Run:); callback unused (nilptr)
+  InputText: function(label: cstring, buf: cstring, buf_size: csize, flags: cint, callback: pointer, user_data: pointer): boolean,
 }
 
 -- Draw-list callback that makes the renderer restore its own state. Dalamud's
@@ -241,6 +245,7 @@ global imgui: ImGuiApi
 ##  {'OpenPopup','igOpenPopup_Str'},{'BeginPopup','igBeginPopup'},{'EndPopup','igEndPopup'},{'CloseCurrentPopup','igCloseCurrentPopup'},
 ##  {'DrawListAddCallback','ImDrawList_AddCallback'},
 ##  {'DrawListAddImage','ImDrawList_AddImage',true},
+##  {'InputText','igInputText',true},
 ## }
 
 global ImGuiResolver = @function(name: cstring): pointer

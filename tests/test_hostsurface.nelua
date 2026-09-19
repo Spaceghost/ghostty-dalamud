@@ -376,6 +376,14 @@ local function command_add_tagged(name: cstring, help: cstring, tag: cint): cint
   rec('tagged', name)
   return 1
 end
+-- chat_print: short results in the game chat as well as the log
+local chatted: string
+local chats = 0
+local function chat_print(text: cstring): cint
+  chatted:destroy() chatted = string.copy(text)
+  chats = chats + 1
+  return 1
+end
 local function tag_of(name: string): cint
   for i = 0, < 8 do if tagged[i] == name then return i + 1 end end
   return 0
@@ -383,6 +391,7 @@ end
 do
   local newer: GuHostApi = api
   newer.command_add_tagged = command_add_tagged
+  newer.chat_print = chat_print
   assert(gu_init_ex(&newer, &info) == INIT_OK)
   local got = joined()
   ## for _, want in ipairs{'add /term', 'add /tomestone', 'add /tome', 'tagged /window', 'tagged /ask', 'tagged /agent'} do
@@ -397,15 +406,23 @@ do
   gu_event(GuEventKind.Chat, w, 0, 0, 0, 'desktop')
   gu_frame()
   assert(warned:find('window desktop: not available yet', 1, true) > 0, warned)
+  assert(chatted == '[ghostty] window desktop: not available yet (reserved for a whole remote desktop on a panel)', 'said in the chat too: ' .. chatted)
   gu_event(GuEventKind.Chat, w, 0, 0, 0, '')
   gu_frame()
-  assert(warned:find('usage: /window pull', 1, true) == 1, warned)
+  assert(host.window_picker_open, '/window alone: the Windows picker')
+  gu_event(GuEventKind.Chat, w, 0, 0, 0, '')
+  gu_frame()
+  assert(not host.window_picker_open, 'and again: closed')
+  gu_event(GuEventKind.Chat, w, 0, 0, 0, 'teleport')
+  gu_frame()
+  assert(warned:find('usage: /window', 1, true) == 1, warned)
   gu_event(GuEventKind.Chat, w, 0, 0, 0, 'run')
   gu_frame()
   assert(warned:find('usage: /window run', 1, true) == 1, warned)
   gu_event(GuEventKind.Chat, w, 0, 0, 0, 'pull Firefox')
   gu_frame()
   assert(warned:find('window pull: ', 1, true) == 1, 'the same path as /term window pull: ' .. warned)
+  assert(chatted:find('[ghostty] window pull: ', 1, true) == 1, 'a failed pull reaches the chat: ' .. chatted)
   gu_event(GuEventKind.Chat, g, 0, 0, 0, 'status')
   gu_frame()
   assert(warned == 'usage: /agent ask [question]', warned)

@@ -413,14 +413,21 @@ forget()
 do
   assert(remotewin_command('list') == 0)
   host.agent:flush()
-  assert(count(PROTO_WLIST) == 1)
+  assert(count(PROTO_WLIST) == 1 and host.window_picker_open, 'list: the picker, and a fresh list')
+  host.window_picker_open = false
+  assert(remotewin_command('pull') == 0 and host.window_picker_open, 'pull with nothing after it: the picker')
+  assert(window_command('') == 0 and not host.window_picker_open, '/window alone toggles it')
+  assert(window_command('') == 0 and host.window_picker_open)
+  host.window_picker_open = false
+  forget()
   local lines: string = '7\t800\t600\tfirefox\tMozilla Firefox\n0\t0\t0\t\tchoose on the desktop\n'
   local q: ByteQueue
   proto.write_frame(&q, PROTO_WLISTR, (@*[0]uint8)(lines.data), lines.size)
   peer_send(&q)
   q:destroy()
   pump()
-  assert(logged('window #7 800x600 [firefox] Mozilla Firefox') == 1 and logged('window list: 2 windows') == 1, 'listed in the log')
+  assert(logged('window #7 800x600 [firefox] Mozilla Firefox  @default') == 1 and logged('window list: 2 windows, 0 apps') == 1, 'listed in the log')
+  assert(#winlist.windows == 2 and winlist.windows[0].wid == 7 and winlist.windows[1].wid == 0 and winlist.answers == 1, 'kept for the picker and IPC')
   print('window list OK')
 end
 
@@ -704,7 +711,7 @@ end
 
 -- A lost connection ends a stream; a closed panel sends WCLOSE ------------------------------------
 do
-  assert(remotewin_command('pull') == 0)
+  assert(window_open(WindowOpenSpec{}) ~= 0) -- the desktop chooses
   local s3 = host.world[0]
   local rw3 = remotewin_of(s3)
   host.agent:flush()
@@ -723,7 +730,7 @@ do
   host.agent:flush()
   local c = last(PROTO_WCLOSE)
   assert(c ~= nilptr and proto.get_u32(c) == 21 and #host.sessions == 0, 'closing the panel closes the stream')
-  assert(remotewin_command('pull') == 0)
+  assert(window_open(WindowOpenSpec{}) ~= 0)
   local s4 = host.world[0]
   host.agent:disconnect()
   host.agent.state = AgentState.Failed
