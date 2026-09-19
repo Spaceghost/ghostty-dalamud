@@ -52,6 +52,7 @@ global WindowsCfg = @record{
   max_w: integer,           -- largest frame the agent sends; bigger windows are scaled down there
   max_h: integer,
   fps: integer,
+  open_at: string,          -- where a new window panel goes, as /term pin takes it ('here': in front of you)
   autopull: vector(string), -- CONFIG.windows.auto: `/term window pull` arguments to run once a character is loaded
 }
 
@@ -397,6 +398,8 @@ local function read_settings(L: *lua_State, t: cint): void
   local wn: cint = lua_gettop(L)
   policy.windows.agent:destroy()
   policy.windows.agent = lua_field_string(L, wn, 'agent', '')
+  policy.windows.open_at:destroy()
+  policy.windows.open_at = lua_field_string(L, wn, 'open_at', 'here')
   policy.windows.max_w = math.clamp(lua_field_integer(L, wn, 'max_w', 1920), 64, 4096)
   policy.windows.max_h = math.clamp(lua_field_integer(L, wn, 'max_h', 1200), 64, 4096)
   policy.windows.fps = math.clamp(lua_field_integer(L, wn, 'fps', 30), 1, 120)
@@ -434,6 +437,7 @@ global function policy_unload(): void
   policy.agent.host:destroy()
   policy.agent.token:destroy()
   policy.agent.token_file:destroy()
+  policy.windows.open_at:destroy()
   policy.windows.agent:destroy()
   for i = 0, < #policy.windows.autopull do policy.windows.autopull[i]:destroy() end
   policy.windows.autopull:destroy()
@@ -508,6 +512,13 @@ end
   -- keep the config table reachable as a global for keymap callbacks
   lua_pushvalue(L, -1)
   lua_setglobal(L, 'CONFIG')
+  -- an init.lua from before a module existed (the user's copy in the config
+  -- home is never replaced) gets the shipped module's defaults
+  if luaL_loadstring(L, "if CONFIG.windows == nil then local ok, m = pcall(require, 'windows') if ok then CONFIG.windows = m end end") == LUA_OK then
+    if lua_pcall(L, 0, 0, 0) ~= LUA_OK then lua_pop(L, 1) end
+  else
+    lua_pop(L, 1)
+  end
 
   local t: cint = lua_gettop(L)
   read_settings(L, t)

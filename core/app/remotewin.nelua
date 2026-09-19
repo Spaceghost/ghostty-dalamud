@@ -407,8 +407,11 @@ global function window_open(spec: WindowOpenSpec): (integer, string)
   end
   -- a window's shape until its first frame says otherwise
   policy_windows_size(s.id, 16, 10, REMOTEWIN_TITLE + REMOTEWIN_PAD)
-  if #spec.pin > 0 then
-    local perr = policy_windows_pin(s.id, spec.pin)
+  -- where it goes: what the caller asked for, else CONFIG.windows.open_at
+  -- (in front of you by default; 'pet' makes it a pet)
+  local place: string = #spec.pin > 0 and spec.pin or policy.windows.open_at
+  if #place > 0 and place ~= 'pet' then
+    local perr = policy_windows_pin(s.id, place)
     if #perr > 0 then
       match:destroy() app:destroy()
       close_terminal(s) -- nothing was asked of the agent yet

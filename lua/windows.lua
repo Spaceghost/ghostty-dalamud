@@ -32,6 +32,9 @@ M.fps = 30
 M.pixels_per_yalm = 700
 M.width = 1600
 M.opacity = 0.97
+-- Where a new window panel appears, as `/term pin` takes it: 'here' (in front
+-- of you, facing you), 'pet' (floats beside you and follows), 'me', ...
+M.open_at = 'here'
 -- Pulled once your character is loaded, each as `/term window pull` arguments,
 -- e.g. { 'Firefox', 'run foot' }.
 M.auto = {}
