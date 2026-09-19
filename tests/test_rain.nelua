@@ -1,0 +1,316 @@
+-- Rain on world panels: the seeded simulation (determinism, drop counts, the
+-- wiper's sweep and what it clears, the fade), lua/rain.lua (weather, force,
+-- HUD panels), and the two drawing passes through a fake ImGui.
+require 'core.policy'
+require 'core.rain'
+require 'core.app.rain'
+require 'math'
+require 'arg'
+
+local function near(a: float64, b: float64, eps: float64): boolean return math.abs(a - b) < eps end
+
+local function params(intensity: float32, wiper: RainWiper): RainParams
+  return RainParams{
+    intensity = intensity, max_drops = 90, size_min = 2.5, size_max = 7, trickle_speed = 70,
+    period_light = 12, period_heavy = 6, continuous_at = 0.85, wiper = wiper, opacity = 0.85, fade = 3,
+  }
+end
+
+local W: float32, H: float32 = 800, 500
+
+-- The same seed and steps give the same drops; another seed does not.
+do
+  local prm = params(0.8, RainWiper.Back)
+  local a: RainPanel, b: RainPanel, c: RainPanel
+  a:init(3, 42) b:init(3, 42) c:init(3, 43)
+  for i = 1, 600 do
+    a:step(&prm, W, H, 1 / 60) b:step(&prm, W, H, 1 / 60) c:step(&prm, W, H, 1 / 60)
+  end
+  local same, differ = true, false
+  for i = 0, < RAIN_MAX_DROPS do
+    local da, db, dc = a.drops[i], b.drops[i], c.drops[i]
+    if da.kind ~= db.kind or da.x ~= db.x or da.y ~= db.y or da.r ~= db.r then same = false end
+    if da.kind ~= dc.kind or da.x ~= dc.x or da.y ~= dc.y then differ = true end
+  end
+  assert(same and a.angle == b.angle and a.live == b.live, 'deterministic for a seed')
+  assert(differ, 'another seed rains differently')
+  print('deterministic OK')
+end
+
+-- Drop counts stay within bounds at each intensity (no wiper: they settle).
+do
+  local levels: [4]float32 = { 0.1, 0.35, 0.7, 1.0 }
+  local last = 0
+  for li = 0, < 4 do
+    local prm = params(levels[li], RainWiper.None)
+    local p: RainPanel
+    p:init(1, 7)
+    local want = (@integer)(math.floor(90 * levels[li] + 0.5))
+    for i = 1, 60 * 30 do
+      p:step(&prm, W, H, 1 / 60)
+      local n = p:count()
+      assert(n == p.live, 'live count tracks the drops')
+      assert(n >= 0 and n <= want and n <= RAIN_MAX_DROPS, 'within bounds')
+    end
+    assert(p.live >= want * 0.6, 'the glass fills toward the count for the intensity')
+    assert(p.live >= last, 'more rain, more drops')
+    last = p.live
+  end
+  local big = params(1, RainWiper.None)
+  big.max_drops = 1000
+  local p: RainPanel
+  p:init(1, 7)
+  for i = 1, 60 * 20 do p:step(&big, W, H, 1 / 60) end
+  assert(p.live <= RAIN_MAX_DROPS, 'never past the fixed buffer')
+  print('drop counts OK')
+end
+
+-- Drops trickle: some move down and leave the panel; merged drops grow.
+do
+  local prm = params(1, RainWiper.None)
+  local p: RainPanel
+  p:init(2, 99)
+  local moved = false
+  for i = 1, 60 * 30 do
+    p:step(&prm, W, H, 1 / 60)
+    for k = 0, < RAIN_MAX_DROPS do
+      if p.drops[k].kind == 1 and p.drops[k].moving then moved = true end
+    end
+  end
+  assert(moved, 'large drops trickle')
+  print('trickle OK')
+end
+
+-- The wiper's arc: rests along the bottom, eases out to the far side and back.
+do
+  assert(rain_wiper_angle(0) == RAIN_WIPER_REST and rain_wiper_angle(1) == RAIN_WIPER_REST)
+  assert(near(rain_wiper_angle(0.5), RAIN_WIPER_OUT, 1e-4), 'out at mid-sweep')
+  local prev = rain_wiper_angle(0)
+  for i = 1, 50 do
+    local a = rain_wiper_angle(i / 100)
+    assert(a >= prev, 'out')
+    prev = a
+  end
+  for i = 51, 99 do
+    local a = rain_wiper_angle(i / 100)
+    assert(a <= prev, 'and back')
+    prev = a
+  end
+  assert(rain_wiper_angle(0.05) - RAIN_WIPER_REST < rain_wiper_angle(0.25) - rain_wiper_angle(0.2), 'eased from rest')
+  local prm = params(0.3, RainWiper.Back)
+  local lp = rain_wiper_period(0.1, &prm)
+  assert(lp >= 6 and lp <= 12, 'light rain: every 6 to 12 s')
+  assert(rain_wiper_period(0.3, &prm) < lp, 'heavier, more often')
+  assert(rain_wiper_period(0.9, &prm) == RAIN_SWEEP, 'heavy: continuous')
+
+  -- over time: rests until due, sweeps once in RAIN_SWEEP, rests again
+  local p: RainPanel
+  p:init(5, 1)
+  prm.fade = 0.05
+  local steps_out = 0
+  local max_angle: float32 = 0
+  for i = 1, 60 * 30 do
+    p:step(&prm, W, H, 1 / 60)
+    if p.angle > RAIN_WIPER_REST then steps_out = steps_out + 1 end
+    max_angle = math.max(max_angle, p.angle)
+  end
+  local period = rain_wiper_period(p.level, &prm)
+  local sweeps = steps_out / (RAIN_SWEEP * 60)
+  assert(max_angle > RAIN_WIPER_OUT - 0.05, 'reaches the far side')
+  assert(sweeps > 30 / period - 1.5 and sweeps < 30 / period + 1.5, 'one sweep per period')
+  print('wiper sweep OK')
+end
+
+-- Drops in the swept area are cleared as the blade passes, leaving smears;
+-- drops outside it (top corners, past the arm) stay.
+do
+  local p: RainPanel
+  p:init(6, 5)
+  local px, py, len = rain_wiper_geom(W, H)
+  local function put(p: *RainPanel, i: integer, x: float32, y: float32): void
+    p.drops[i] = { kind = 1, x = x, y = y, r = 3, rmax = 3, age = 1 }
+  end
+  put(&p, 0, px + len * 0.6, py - 30)            -- just above the rest position, right
+  put(&p, 1, px, py - len * 0.7)                 -- straight up
+  put(&p, 2, px - len * 0.8, py - len * 0.3)     -- far left
+  put(&p, 3, 4, 4)                               -- top-left corner: past the arm
+  put(&p, 4, W - 4, 4)                           -- top-right corner
+  put(&p, 5, px, py - len * 0.05)                -- inside the blade's start, by the pivot
+  p.live = 6
+  -- follow one sweep in frame steps, the blade clearing what it crosses
+  local prev = rain_wiper_angle(0)
+  local checked = false
+  for i = 1, 84 do
+    local a = rain_wiper_angle(i / 84)
+    p:wipe(prev, a, W, H)
+    prev = a
+    if a > 1.2 and a < 2.0 and not checked then
+      checked = true
+      assert(p.drops[0].kind == 2, 'passed: wiped, now a smear')
+      assert(p.drops[2].kind == 1, 'not reached yet: still there')
+    end
+  end
+  assert(checked)
+  assert(p.drops[1].kind == 2 and p.drops[2].kind == 2, 'swept area cleared')
+  assert(p.drops[3].kind == 1 and p.drops[4].kind == 1, 'corners past the arm stay')
+  assert(p.drops[5].kind == 1, 'short of the blade stays')
+  assert(p.live == 3)
+  -- the smears fade on their own
+  local prm = params(1, RainWiper.None)
+  for i = 1, 60 do p:step(&prm, W, H, 1 / 60) end
+  for i = 0, < 3 do assert(p.drops[i].kind ~= 2, 'smear gone') end
+
+  -- and through the stepping: a full glass in continuous rain is kept clear in the swept area
+  local q: RainPanel
+  q:init(9, 17)
+  local heavy = params(1, RainWiper.Back)
+  heavy.fade = 0.05
+  for i = 1, 60 * 20 do q:step(&heavy, W, H, 1 / 60) end
+  local inside, outside = 0, 0
+  for k = 0, < RAIN_MAX_DROPS do
+    local d = &q.drops[k]
+    if d.kind == 1 then
+      local dist = math.sqrt((d.x - px) ^ 2 + (d.y - py) ^ 2)
+      if dist > len * 0.3 and dist < len * 0.9 and d.y < py - 20 then inside = inside + 1 else outside = outside + 1 end
+    end
+  end
+  local nw: RainPanel
+  nw:init(9, 17)
+  local dry_wiper = params(1, RainWiper.None)
+  dry_wiper.fade = 0.05
+  for i = 1, 60 * 20 do nw:step(&dry_wiper, W, H, 1 / 60) end
+  local inside_nw = 0
+  for k = 0, < RAIN_MAX_DROPS do
+    local d = &nw.drops[k]
+    if d.kind == 1 and math.sqrt((d.x - px) ^ 2 + (d.y - py) ^ 2) > len * 0.3 and math.sqrt((d.x - px) ^ 2 + (d.y - py) ^ 2) < len * 0.9 and d.y < py - 20 then
+      inside_nw = inside_nw + 1
+    end
+  end
+  assert(inside < inside_nw, 'the wiper keeps its arc clearer than no wiper')
+  print('wiper clears OK')
+end
+
+-- Not raining: nothing lands and the wiper rests.
+do
+  local prm = params(0, RainWiper.Back)
+  local p: RainPanel
+  p:init(7, 1)
+  for i = 1, 600 do p:step(&prm, W, H, 1 / 60) end
+  assert(p.live == 0 and p:count() == 0 and not p.wiping and p.angle == RAIN_WIPER_REST, 'dry')
+  print('off when dry OK')
+end
+
+-- The fade: the level rises over `fade` seconds, falls again, and the glass is
+-- clear once it is gone.
+do
+  local prm = params(1, RainWiper.Back)
+  local p: RainPanel
+  p:init(8, 3)
+  for i = 1, 60 do p:step(&prm, W, H, 1 / 60) end
+  assert(near(p.level, 1 / 3, 0.01), 'a third of the way after 1 s of 3')
+  for i = 1, 180 do p:step(&prm, W, H, 1 / 60) end
+  assert(p.level == 1, 'fully in')
+  local full = p.live
+  assert(full > 0)
+  prm.intensity = 0
+  for i = 1, 90 do p:step(&prm, W, H, 1 / 60) end
+  assert(near(p.level, 0.5, 0.01) and p.live < full, 'fading out, drops evaporating')
+  for i = 1, 120 do p:step(&prm, W, H, 1 / 60) end
+  assert(p.level == 0 and p.live == 0 and p:count() == 0, 'gone')
+  print('fade OK')
+end
+
+-- lua/rain.lua: dry without weather, forced by /term rain, HUD panels stay dry.
+do
+  local root: string = arg[1]
+  assert(policy_load(root), policy.error)
+  local ok, prm = policy_rain_frame()
+  assert(ok and prm.intensity == 0, 'no weather: dry')
+  assert(prm.max_drops == 90 and prm.wiper == RainWiper.Back and near(prm.fade, 3, 1e-4), 'defaults')
+  local err = policy_rain_command('on')
+  assert(#err == 0)
+  ok, prm = policy_rain_frame()
+  assert(ok and near(prm.intensity, 0.7, 1e-4), 'forced on')
+  err = policy_rain_command('bogus')
+  assert(#err > 0, 'usage')
+  err:destroy()
+  local L = policy.L
+  assert(luaL_loadstring(L, [[
+    ghostty.env = function() return 43200, 0, 8 end
+    CONFIG.rain.mode = 'auto'
+    CONFIG.rain.wiper_style = 'front'
+  ]]) == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
+  ok, prm = policy_rain_frame()
+  assert(ok and prm.intensity == 1 and prm.wiper == RainWiper.Front, 'showers: full rain')
+  assert(luaL_loadstring(L, "ghostty.env = function() return 43200, 0, 0 end") == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
+  ok, prm = policy_rain_frame()
+  assert(prm.intensity == 0, 'no weather indoors: dry')
+  assert(luaL_loadstring(L, "ghostty.env = function() return 43200, 0.4, 3 end") == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
+  ok, prm = policy_rain_frame()
+  assert(near(prm.intensity, 0.4, 1e-4), 'unlisted weather: the game\'s rain amount')
+  assert(policy_rain_panel(4), 'world panels get rain')
+  assert(luaL_loadstring(L, "require('world').anchors[4] = { kind = 'hud' }") == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
+  assert(not policy_rain_panel(4), 'HUD panels stay dry')
+  assert(luaL_loadstring(L, "require('world').anchors[4] = nil CONFIG.rain.wiper_style = 'back'") == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
+  err = policy_rain_command('off')
+  ok, prm = policy_rain_frame()
+  assert(prm.intensity == 0, 'forced off')
+  print('rain policy OK')
+end
+
+-- Drawing: one reserved batch per pass, all inside (about) the panel; nothing
+-- when it is dry.
+local reserved: integer = 0
+local batches: integer = 0
+local nvtx: integer = 0
+local out_of_panel: integer = 0
+local function fake_uv(out: *ImVec2): void $out = vec2(0.5, 0.5) end
+local function fake_reserve(dl: *ImDrawList, idx: cint, vtx: cint): void
+  assert(idx == vtx and vtx % 3 == 0, 'whole triangles')
+  reserved = reserved + vtx
+  batches = batches + 1
+end
+local function fake_vtx(dl: *ImDrawList, pos: ImVec2, uv: ImVec2, col: uint32): void
+  nvtx = nvtx + 1
+  if pos.x < 100 - 30 or pos.x > 100 + 800 + 30 or pos.y < 50 - 30 or pos.y > 50 + 500 + 30 then out_of_panel = out_of_panel + 1 end
+end
+do
+  imgui.GetFontTexUvWhitePixel = fake_uv
+  imgui.DrawListPrimReserve = fake_reserve
+  imgui.DrawListPrimVtx = fake_vtx
+  local pl: WorldPlacement = { width = 800, height = 500, opacity = 0.9, tint_r = 1, tint_g = 1, tint_b = 1 }
+  local o = vec2(100, 50)
+  local now: float64 = 100
+  for i = 1, 60 do
+    rain_panel_back(nilptr, o, &pl, 11, now, 1)
+    rain_panel_front(nilptr, o, &pl, 11)
+    now = now + 1 / 60
+  end
+  assert(reserved == 0 and nvtx == 0, 'forced off: nothing drawn')
+
+  local err = policy_rain_command('on')
+  for i = 1, 60 * 8 do
+    reserved, batches, nvtx = 0, 0, 0
+    rain_panel_back(nilptr, o, &pl, 11, now, 1)
+    local back = batches
+    rain_panel_front(nilptr, o, &pl, 11)
+    assert(back <= 1 and batches - back <= 1, 'one batch per pass')
+    assert(reserved == nvtx, 'reserved what was drawn')
+    now = now + 1 / 60
+  end
+  assert(nvtx > 0 and out_of_panel == 0, 'drops and wiper drawn on the panel')
+  -- a docked HUD panel next to it stays dry
+  local L = policy.L
+  assert(luaL_loadstring(L, "require('world').anchors[12] = { kind = 'hud' }") == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
+  reserved = 0
+  for i = 1, 60 do
+    rain_panel_back(nilptr, o, &pl, 12, now, 1)
+    rain_panel_front(nilptr, o, &pl, 12)
+    now = now + 1 / 60
+  end
+  assert(reserved == 0, 'HUD panel: no rain')
+  err = policy_rain_command('auto')
+  rain_reset()
+  print('drawing OK')
+end
+print('OK')
