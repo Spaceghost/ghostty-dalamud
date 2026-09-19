@@ -1,0 +1,53 @@
+-- Window capture backends for ghostty-agent (docs/REMOTE_WINDOWS.md).
+--
+-- A backend finds desktop windows, hands over their latest pixels and plays
+-- input into them. agent/windows.nelua does everything else (streams, scaling,
+-- rate, diffing, encoding, flow control), so a backend is only the platform.
+-- Handles are the backend's own; every string a backend returns is a copy the
+-- caller frees unless marked borrowed.
+require 'string'
+
+global CaptureFrame = @record{
+  pixels: *[0]uint8,   -- BGRA, top-down, alpha ignored; borrowed until the next call on the handle
+  w: integer,
+  h: integer,
+  stride: usize,       -- bytes a row
+  serial: uint64,      -- changes whenever the pixels do (0: no frame yet)
+}
+
+-- One WINPUT, decoded. Coordinates are pixels of the window as captured (the
+-- generic layer has already undone any scaling).
+global CaptureInput = @record{
+  kind: uint8,         -- WIN_INPUT_*
+  x: integer, y: integer,
+  button: integer,     -- 0 left, 1 right, 2 middle
+  down: boolean,
+  dx: integer, dy: integer, -- wheel, 1/120 notches, +dy = away from the user
+  hid: uint16,         -- USB HID usage (keyboard page)
+  mods: uint8,         -- WIN_MOD_*
+  text: string,        -- borrowed, valid during the call
+}
+
+global CAPTURE_PENDING: integer <comptime> = 0 -- being set up (e.g. the desktop's picker is open)
+global CAPTURE_LIVE: integer <comptime> = 1
+global CAPTURE_ENDED: integer <comptime> = 2   -- closed, refused or failed; `why` says which
+
+global CaptureBackend = @record{
+  name: string,
+  -- WLISTR text, "wid\tw\th\tapp\ttitle\n" lines
+  list: function(): string,
+  -- start capturing window `wid` (0: let the user pick, or the first whose
+  -- title/app contains `match`); nilptr and why on an immediate failure
+  open: function(wid: uint32, match: string): (pointer, string),
+  state: function(h: pointer): (integer, string),  -- CAPTURE_*, why (borrowed)
+  title: function(h: pointer): string,             -- borrowed
+  frame: function(h: pointer, out: *CaptureFrame): boolean,
+  input: function(h: pointer, ev: *CaptureInput): void,
+  close: function(h: pointer): void,
+  -- once per main loop turn: dispatch D-Bus / PipeWire, take due snapshots
+  pump: function(): void,
+  -- POSIX: descriptors whose readability should wake the loop; returns the count
+  poll_fds: function(fds: *[0]cint, max: integer): integer,
+  -- the longest the main loop may sleep while streams are open (ms), -1 for no limit
+  wait_ms: function(): integer,
+}
