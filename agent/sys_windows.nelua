@@ -9,6 +9,7 @@ require 'agent.logic'
 require 'core.sys.fsbase'
 
 ## cinclude '<windows.h>'
+## cinclude '<bcrypt.h>' -- windows.h leaves it out under WIN32_LEAN_AND_MEAN (os.now defines that)
 ## linklib 'user32'
 ## linklib 'bcrypt'
 

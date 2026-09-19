@@ -46,7 +46,7 @@ global PROTO_LIST: uint8 <comptime> = 8
 global PROTO_CLIP_SET: uint8 <comptime> = 9   -- text: put on the host's system clipboard
 global PROTO_CLIP_GET: uint8 <comptime> = 10  -- ask for the host's system clipboard
 global PROTO_WLIST: uint8 <comptime> = 11     -- version 3: desktop windows the agent can capture
-global PROTO_WOPEN: uint8 <comptime> = 12     -- wid u32, max_w u16, max_h u16, fps u8 [, match text]
+global PROTO_WOPEN: uint8 <comptime> = 12     -- req u32, wid u32, max_w u16, max_h u16, fps u8 [, match text]
 global PROTO_WACK: uint8 <comptime> = 13      -- sid, seq u32: frame presented
 global PROTO_WINPUT: uint8 <comptime> = 14    -- sid, kind u8, body
 global PROTO_WCLOSE: uint8 <comptime> = 15    -- sid
@@ -60,7 +60,7 @@ global PROTO_LISTR: uint8 <comptime> = 21
 global PROTO_CLIP: uint8 <comptime> = 22      -- reply to CLIP_GET: the clipboard text
 global PROTO_ATTACHED: uint8 <comptime> = 23  -- version 2: ATTACH replayed
 global PROTO_WLISTR: uint8 <comptime> = 24    -- lines "wid\tw\th\tapp\ttitle\n"
-global PROTO_WOPENED: uint8 <comptime> = 25   -- sid, w u16, h u16, title (sid 0: failed, text says why)
+global PROTO_WOPENED: uint8 <comptime> = 25   -- req u32, sid, w u16, h u16, title (sid 0: failed, text says why)
 global PROTO_WFRAME: uint8 <comptime> = 26    -- sid, seq u32, w u16, h u16, flags u8, nrect u16, rects
 global PROTO_WEND: uint8 <comptime> = 27      -- sid, reason
 
