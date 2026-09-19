@@ -514,7 +514,7 @@ end
   lua_setglobal(L, 'CONFIG')
   -- an init.lua from before a module existed (the user's copy in the config
   -- home is never replaced) gets the shipped module's defaults
-  if luaL_loadstring(L, "if CONFIG.windows == nil then local ok, m = pcall(require, 'windows') if ok then CONFIG.windows = m end end") == LUA_OK then
+  if luaL_loadstring(L, "for _, n in ipairs({ 'themes', 'tooltips', 'assistant', 'windows', 'adopt', 'rain' }) do if CONFIG[n] == nil then local ok, m = pcall(require, n) if ok then CONFIG[n] = m end end end") == LUA_OK then
     if lua_pcall(L, 0, 0, 0) ~= LUA_OK then lua_pop(L, 1) end
   else
     lua_pop(L, 1)
