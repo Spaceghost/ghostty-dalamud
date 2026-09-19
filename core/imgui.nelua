@@ -24,8 +24,13 @@ global ImDrawCmd <cimport, nodecl> = @record{
   UserCallbackData: pointer,
 }
 global ImVector_ImDrawCmd <cimport, nodecl> = @record{ Size: cint, Capacity: cint, Data: *[0]ImDrawCmd }
--- Only the buffers are used (world-space panels remap vertices after drawing).
-global ImDrawList <cimport, nodecl> = @record{ CmdBuffer: ImVector_ImDrawCmd, VtxBuffer: ImVector_ImDrawVert }
+global ImVector_ImDrawIdx <cimport, nodecl> = @record{ Size: cint, Capacity: cint, Data: *[0]uint16 }
+global ImDrawCmdHeader <cimport, nodecl> = @record{ ClipRect: ImVec4, TextureId: pointer, VtxOffset: cuint }
+-- Only the buffers are used (world-space panels remap vertices after drawing;
+-- /term selftest counts them) and the texture of the next command.
+global ImDrawList <cimport, nodecl> = @record{
+  CmdBuffer: ImVector_ImDrawCmd, IdxBuffer: ImVector_ImDrawIdx, VtxBuffer: ImVector_ImDrawVert, _CmdHeader: ImDrawCmdHeader,
+}
 global ImFont <cimport, nodecl> = @record{}
 global ImGuiViewport <cimport, nodecl> = @record{ ID: uint32, Flags: cint, Pos: ImVec2, Size: ImVec2, WorkPos: ImVec2, WorkSize: ImVec2 }
 global ImVector_ImWchar <cimport, nodecl> = @record{ Size: cint, Capacity: cint, Data: *[0]uint16 }
