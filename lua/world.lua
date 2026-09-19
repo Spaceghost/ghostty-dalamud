@@ -29,6 +29,11 @@ M.pet = {
   stiffness = 5.0,       -- spring stiffness: higher follows more tightly
   damping = 0.8,         -- 1 = settle with no overshoot; lower swings like a pendulum before settling
   walk_speed = 0.6,      -- yalms per second above which the character counts as moving
+  run_speed = 5.5,       -- yalms per second at which run_back is fully applied (running is ~6)
+  run_back = 0.35,       -- radians the slots swing further back while running
+  behind_clear = 0.8,    -- radians either side of straight behind you a pet never enters
+  camera_clear = 0.85,   -- radians either side of the camera-to-you line a pet never enters
+  stack_out = 1.1,       -- yalms further out per pet pair that no longer fits beside you
   bob = 0.025,            -- vertical bob in yalms
   drift = 0.0,           -- radians they wander (small, so a focused pet holds still)
   curve = 9.0,           -- curve radius in yalms (concave toward the character); larger = flatter, 0 = flat
@@ -497,6 +502,19 @@ local function spring(a, key, target, dt, k, zeta)
   return x
 end
 
+-- (x, z) moved around `p` to the nearest edge of the cone of half_angle
+-- radians about direction `back`, when inside it
+local function clear_of(x, z, p, back, half_angle)
+  local ox, oz = x - p.x, z - p.z
+  local rr = math.sqrt(ox * ox + oz * oz)
+  local rel = wrap(atan(ox, oz) - back)
+  if rr > 1e-3 and math.abs(rel) < half_angle then
+    local edge = back + (rel < 0 and -half_angle or half_angle)
+    return p.x + sin(edge) * rr, p.z + cos(edge) * rr
+  end
+  return x, z
+end
+
 function M.place_pet(id, a, p, t, focused)
   local cfg = M.pet
   update_body(p, t)
@@ -518,10 +536,21 @@ function M.place_pet(id, a, p, t, focused)
   for i, other in ipairs(ids) do if other == id then k = i end end
   local side_sign = (k % 2 == 1) and 1 or -1
   local level = (k - 1) // 2
-  local slot = side_sign * (cfg.side + level * cfg.step)
+  -- running swings the slots a little further back; never into the cone
+  -- straight behind you (between you and the usual camera): pairs that no
+  -- longer fit beside you stack further out instead
+  local run = math.max(0, math.min(1, (body.speed - cfg.walk_speed) / math.max(cfg.run_speed - cfg.walk_speed, 0.1)))
+  local max_side = pi - cfg.behind_clear
+  local want = cfg.side + level * cfg.step + run * cfg.run_back
+  local extra = 0
+  if want > max_side then
+    extra = math.ceil((want - max_side) / math.max(cfg.step, 0.1)) * cfg.stack_out
+    want = max_side
+  end
+  local slot = side_sign * want
   local ang = body.heading + slot + sin(t * 0.11 + a.phase) * cfg.drift
   -- stay clear of the character: never closer than the panel's half width plus a margin
-  local dist = math.max(cfg.distance, half_w + 0.9) 
+  local dist = math.max(cfg.distance, half_w + 0.9) + extra
   local tx = p.x + sin(ang) * dist
   local tz = p.z + cos(ang) * dist
   local ty = p.y + math.max(cfg.height_above, half_h + 0.2) + sin(t * 0.9 + a.phase) * cfg.bob
@@ -551,6 +580,16 @@ function M.place_pet(id, a, p, t, focused)
       end
     end
   end
+  -- the springs lag while you run or turn: keep the pet out of the cone behind
+  -- you (your facing while moving; the pets' frame while standing still)
+  -- and never between the camera and you, wherever the camera turns (focusing
+  -- a pet turns it; the other pets step aside rather than fill the view)
+  x, z = clear_of(x, z, p, (body.speed > cfg.walk_speed and p.rotation or body.heading) + pi, cfg.behind_clear)
+  if M._ct ~= t then
+    local fx, _, fz = ghostty.camera and ghostty.camera()
+    M._ct, M._cam_back = t, (fx and (fx * fx + fz * fz) > 1e-4) and atan(-fx, -fz) or nil
+  end
+  if M._cam_back then x, z = clear_of(x, z, p, M._cam_back, cfg.camera_clear) end
   a.placed_at, a.px, a.pz = t, x, z
   a.x, a.z = x, z -- keep the spring from fighting the constraint
 
