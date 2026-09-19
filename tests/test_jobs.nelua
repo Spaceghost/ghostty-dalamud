@@ -1,0 +1,381 @@
+-- End to end for raw jobs (docs/JOBS.md) against a real ghostty-agent on a
+-- scratch port, plus the pure parts of the Claude runner (agent/claude.nelua).
+-- The plugin's AgentClient knows nothing about jobs yet, so this speaks the
+-- frames straight onto the socket.
+require 'core.sys.net'
+require 'core.protocol'
+require 'agent.claude'
+require 'string'
+require 'vector'
+require 'io'
+require 'os'
+require 'arg'
+
+## cinclude '<unistd.h>'
+local function usleep(us: cuint): cint <cimport, nodecl> end
+
+local port: uint16 = (@uint16)(tointeger(arg[1]))
+local token: string = arg[2]
+local agent_pid: string = arg[3]
+
+-- A bare protocol connection ------------------------------------------------
+local Conn = @record{
+  sock: NetSocket,
+  inq: ByteQueue,
+  outq: ByteQueue,
+  paused: boolean, -- stop reading the socket: the agent's queue backs up
+}
+
+-- Events seen on any connection.
+local jopened_req: uint32 = 0
+local jopened_jid: uint32 = 0
+local jopened_pid: uint32 = 0
+local jopened_err: string = ''
+local jopened_count = 0
+local out_text: string = ''
+local err_text: string = ''
+local out_bytes: usize = 0
+local err_bytes: usize = 0
+local collect = true
+local jexit_jid: uint32 = 0
+local jexit_status: int32 = 0
+local jexit_count = 0
+local proto_err_count = 0
+
+local function reset_events(): void
+  jopened_count = 0
+  jopened_err = ''
+  out_text = ''
+  err_text = ''
+  out_bytes = 0
+  err_bytes = 0
+  jexit_count = 0
+  proto_err_count = 0
+end
+
+local function on_frame(typ: uint8, p: *[0]uint8, len: usize): void
+  if typ == PROTO_JOPENED then
+    if len < 12 then return end
+    jopened_req = proto.get_u32(p)
+    jopened_jid = proto.get_u32((@*[0]uint8)(&p[4]))
+    jopened_pid = proto.get_u32((@*[0]uint8)(&p[8]))
+    jopened_err = string{data=(@*[0]byte)(&p[12]), size=len-12}:copy()
+    jopened_count = jopened_count + 1
+  elseif typ == PROTO_JOUT then
+    if len < 5 then return end
+    local stream = p[4]
+    local text = string{data=(@*[0]byte)(&p[5]), size=len-5}
+    if stream == JOB_OUT then
+      out_bytes = out_bytes + len - 5
+      if collect then out_text = out_text .. text end
+    elseif stream == JOB_ERR then
+      err_bytes = err_bytes + len - 5
+      if collect then err_text = err_text .. text end
+    end
+  elseif typ == PROTO_JEXIT then
+    if len < 8 then return end
+    jexit_jid = proto.get_u32(p)
+    jexit_status = (@int32)(proto.get_u32((@*[0]uint8)(&p[4])))
+    jexit_count = jexit_count + 1
+  elseif typ == PROTO_ERR then
+    io.stderr:write('agent error: ', string{data=(@*[0]byte)(p), size=len}, '\n')
+    proto_err_count = proto_err_count + 1
+  end
+end
+
+function Conn:pump(): void
+  while self.outq:len() > 0 do
+    local n = net.send(self.sock, self.outq:peek(), self.outq:len())
+    if n <= 0 then break end
+    self.outq:consume((@usize)(n))
+  end
+  if not self.paused then
+    local buf: [65536]uint8
+    for _ = 1, 64 do
+      local n = net.recv(self.sock, &buf, 65536)
+      if n <= 0 then break end
+      self.inq:push(&buf, (@usize)(n))
+    end
+    while true do
+      local ok, typ, payload, len = proto.read_frame(&self.inq)
+      if not ok then break end
+      on_frame(typ, payload, len)
+      proto.frame_consume(&self.inq, len)
+    end
+  end
+  usleep(5000)
+end
+
+function Conn:open(): void
+  local conn = net.connect('127.0.0.1', port)
+  assert(net.is_valid(conn.sock), 'connect')
+  self.sock = conn.sock
+  for _ = 1, 400 do
+    local st = net.connect_poll(&conn)
+    if st == 1 then break end
+    assert(st >= 0, 'connect failed')
+    usleep(5000)
+  end
+  proto.write_frame(&self.outq, PROTO_HELLO, (@*[0]uint8)(token.data), token.size)
+  for _ = 1, 200 do self:pump() end
+end
+
+function Conn:close(): void
+  net.close(self.sock)
+  self.sock = net.invalid()
+  self.inq:destroy()
+  self.outq:destroy()
+end
+
+local function push_str(v: *vector(uint8), s: string): void
+  for i: usize = 0, < s.size do v:push((@uint8)(s.data[i])) end
+end
+
+-- JOPEN: req, flags, argv NUL separated, an empty entry, env.
+local function send_jopen(c: *Conn, req: uint32, flags: uint8, argv: *vector(string)): void
+  local body: vector(uint8)
+  local hd: [5]uint8
+  proto.put_u32(&hd, req)
+  hd[4] = flags
+  for i = 0, < 5 do body:push(hd[i]) end
+  for i = 0, < #argv do
+    push_str(&body, argv[i])
+    body:push(0)
+  end
+  body:push(0) -- the argv/env boundary; no env follows
+  proto.write_frame(&c.outq, PROTO_JOPEN, (@*[0]uint8)(&body[0]), #body)
+  body:destroy()
+end
+
+local function send_jid(c: *Conn, typ: uint8, jid: uint32): void
+  local b: [4]uint8
+  proto.put_u32(&b, jid)
+  proto.write_frame(&c.outq, typ, &b, 4)
+end
+
+local function send_jdata(c: *Conn, jid: uint32, text: string): void
+  local body: vector(uint8)
+  local b: [4]uint8
+  proto.put_u32(&b, jid)
+  for i = 0, < 4 do body:push(b[i]) end
+  push_str(&body, text)
+  proto.write_frame(&c.outq, PROTO_JDATA, (@*[0]uint8)(&body[0]), #body)
+  body:destroy()
+end
+
+local function argv_of3(a: string, b: string, c: string): vector(string)
+  local v: vector(string)
+  v:push(a)
+  if #b > 0 then v:push(b) end
+  if #c > 0 then v:push(c) end
+  return v
+end
+
+-- The pure parts: the Claude command line --------------------------------------
+do
+  local ok, argv, cwd, why = claude_job_argv('')
+  assert(ok, why)
+  local line: string = ''
+  for i = 0, < #argv do line = line .. (i > 0 and ' ' or '') .. argv[i] end
+  print('claude default argv:', line)
+  assert(line == 'claude -p --output-format stream-json --input-format stream-json --include-partial-messages --verbose',
+         'the default is a structured, non-interactive session')
+  assert(#cwd == 0, 'no working directory unless the options name one')
+end
+
+do
+  local opts: string = '{"model":"claude-opus-4","permission_prompts":"none","permission_mode":"plan",' ..
+                       '"mcp_config":["/tmp/a.json","/tmp/b.json"],"add_dir":["/srv/one","/srv/two"],' ..
+                       '"resume":"11111111-2222-3333-4444-555555555555","cwd":"/srv/work","partial":false,' ..
+                       '"args":["--max-budget-usd","5"]}'
+  local ok, argv, cwd, why = claude_job_argv(opts)
+  assert(ok, why)
+  local line: string = ''
+  for i = 0, < #argv do line = line .. (i > 0 and ' ' or '') .. argv[i] end
+  print('claude argv:', line)
+  assert(line:find('--model claude-opus-4', 1, true) > 0)
+  assert(line:find('--permission-prompts none', 1, true) > 0)
+  assert(line:find('--permission-mode plan', 1, true) > 0)
+  assert(line:find('--mcp-config /tmp/a.json /tmp/b.json', 1, true) > 0)
+  assert(line:find('--add-dir /srv/one /srv/two', 1, true) > 0)
+  assert(line:find('--resume 11111111-2222-3333-4444-555555555555', 1, true) > 0)
+  assert(line:find('--max-budget-usd 5', 1, true) > 0)
+  assert(line:find('--include-partial-messages', 1, true) == 0, '"partial": false drops the partial messages')
+  assert(cwd == '/srv/work', 'the working directory comes back beside the argv')
+end
+
+do -- escapes, and a key the agent does not know
+  local ok, argv, cwd, why = claude_job_argv('{"prompt":"say \\"hi\\"\\n\\u00e9"}')
+  assert(ok, why)
+  assert(argv[#argv - 1] == 'say "hi"\n\xc3\xa9', 'JSON escapes and \\u are decoded')
+  local bad, bargv, bcwd, bwhy = claude_job_argv('{"no_such_option":"x"}')
+  assert(not bad and bwhy:find('unknown key', 1, true) > 0, bwhy)
+  local bad2, b2argv, b2cwd, b2why = claude_job_argv('not json')
+  assert(not bad2 and #b2why > 0)
+end
+
+-- End to end ------------------------------------------------------------------
+local c: Conn
+c:open()
+
+do -- /bin/cat: stdin in, stdout out, EOF ends it
+  reset_events()
+  local argv = argv_of3('/bin/cat', '', '')
+  send_jopen(&c, 7, 0, &argv)
+  for _ = 1, 200 do c:pump() if jopened_count > 0 then break end end
+  assert(jopened_count == 1 and jopened_req == 7, 'JOPENED answers the JOPEN it was asked for')
+  assert(jopened_jid > 0 and #jopened_err == 0, 'a job id and no error: ' .. jopened_err)
+  assert(jopened_pid > 0, 'JOPENED carries the pid')
+  local jid = jopened_jid
+  print('cat job', jid, 'pid', jopened_pid)
+  send_jdata(&c, jid, 'hello jobs\n')
+  for _ = 1, 400 do c:pump() if out_bytes > 0 then break end end
+  assert(out_text == 'hello jobs\n', 'stdout comes back untouched: ' .. out_text)
+  send_jdata(&c, jid, '') -- no bytes: the job sees EOF on its stdin
+  for _ = 1, 400 do c:pump() if jexit_count > 0 then break end end
+  assert(jexit_count == 1 and jexit_jid == jid and jexit_status == 0, 'cat exits 0 once its stdin closes')
+end
+
+do -- stderr is tagged apart from stdout, and the status comes through
+  reset_events()
+  local argv = argv_of3('/bin/sh', '-c', 'printf on-out; printf on-err 1>&2; exit 7')
+  send_jopen(&c, 8, 0, &argv)
+  for _ = 1, 600 do c:pump() if jexit_count > 0 then break end end
+  assert(jopened_count == 1 and jopened_jid > 0)
+  assert(out_text == 'on-out', 'stdout: ' .. out_text)
+  assert(err_text == 'on-err', 'stderr: ' .. err_text)
+  assert(jexit_count == 1 and jexit_status == 7, 'the exit status reaches the client')
+end
+
+do -- JCLOSE kills a job that would otherwise run on
+  reset_events()
+  local argv = argv_of3('/bin/sh', '-c', 'sleep 30')
+  send_jopen(&c, 9, 0, &argv)
+  for _ = 1, 200 do c:pump() if jopened_count > 0 then break end end
+  assert(jopened_jid > 0)
+  local jid = jopened_jid
+  send_jid(&c, PROTO_JCLOSE, jid)
+  for _ = 1, 600 do c:pump() if jexit_count > 0 then break end end
+  print('closed job exit status', jexit_status)
+  assert(jexit_count == 1 and jexit_jid == jid and jexit_status == 128 + 9, 'JCLOSE kills it (SIGKILL)')
+end
+
+do -- a job without the keep flag dies with the connection that opened it
+  reset_events()
+  local other: Conn
+  other:open()
+  local argv = argv_of3('/bin/sh', '-c', 'sleep 30')
+  send_jopen(&other, 10, 0, &argv)
+  for _ = 1, 200 do other:pump() if jopened_count > 0 then break end end
+  assert(jopened_jid > 0 and jopened_pid > 0)
+  local gone_pid = jopened_pid
+  other:close()
+  for _ = 1, 400 do c:pump() end
+  local f = io.open('/proc/' .. tostring(gone_pid) .. '/stat', 'rb')
+  local alive = f:isopen()
+  if alive then
+    local st = f:read('a')
+    f:close()
+    -- a reaped child may still show as a zombie for a moment; anything else is a leak
+    alive = st:find(') Z ', 1, true) == 0
+    st:destroy()
+  end
+  assert(not alive, 'a job without the keep flag does not outlive its connection')
+end
+
+do -- the keep flag: the job survives, and JATTACH replays what it missed
+  reset_events()
+  local keeper: Conn
+  keeper:open()
+  local argv = argv_of3('/bin/sh', '-c', 'printf keep-me-1; sleep 0.4; printf keep-me-2; sleep 20')
+  send_jopen(&keeper, 11, JOB_FLAG_KEEP, &argv)
+  for _ = 1, 200 do keeper:pump() if jopened_count > 0 then break end end
+  assert(jopened_jid > 0)
+  local jid = jopened_jid
+  for _ = 1, 200 do keeper:pump() if out_bytes > 0 then break end end
+  assert(out_text == 'keep-me-1', 'the kept job started: ' .. out_text)
+  keeper:close() -- the game went away; the job keeps running
+
+  reset_events()
+  local back: Conn
+  back:open()
+  send_jid(&back, PROTO_JATTACH, jid)
+  for _ = 1, 600 do back:pump() if out_text:find('keep-me-2', 1, true) > 0 then break end end
+  print('replay after JATTACH:', out_text)
+  assert(out_text == 'keep-me-1keep-me-2', 'JATTACH replays the whole output, in order')
+  assert(jexit_count == 0, 'the kept job is still running')
+  send_jid(&back, PROTO_JCLOSE, jid)
+  for _ = 1, 600 do back:pump() if jexit_count > 0 then break end end
+  assert(jexit_count == 1, 'the re-attached job can be closed again')
+  -- a jid nobody owns any more: JEXIT 0xFFFFFFFF, not silence
+  reset_events()
+  send_jid(&back, PROTO_JATTACH, jid)
+  for _ = 1, 400 do back:pump() if jexit_count > 0 then break end end
+  assert(jexit_count == 1 and jexit_status == -1 and proto_err_count == 0, 'JATTACH of an unknown jid gets JEXIT')
+  back:close()
+end
+
+do -- a bad argv, and a command that does not exist
+  reset_events()
+  local empty: vector(string)
+  send_jopen(&c, 12, 0, &empty)
+  for _ = 1, 400 do c:pump() if jopened_count > 0 then break end end
+  assert(jopened_count == 1 and jopened_jid == 0 and #jopened_err > 0, 'an empty argv is refused with a reason')
+  print('empty argv:', jopened_err)
+
+  reset_events()
+  local argv = argv_of3('/nonexistent-ghostty-job', '', '')
+  send_jopen(&c, 13, 0, &argv)
+  for _ = 1, 600 do c:pump() if jexit_count > 0 then break end end
+  assert(jopened_jid > 0, 'the fork succeeded')
+  assert(jexit_count == 1 and jexit_status == 127, 'a command that cannot be run exits 127')
+end
+
+do -- "@claude": the agent builds the command line, the client carries no flags
+  reset_events()
+  local argv = argv_of3('@claude', '{"claude":"/bin/echo","partial":false,"model":"sonnet"}', '')
+  send_jopen(&c, 14, 0, &argv)
+  for _ = 1, 600 do c:pump() if jexit_count > 0 then break end end
+  print('@claude expansion:', out_text)
+  assert(jopened_jid > 0 and jexit_status == 0)
+  assert(out_text == '-p --output-format stream-json --input-format stream-json --verbose --model sonnet\n',
+         'the agent expands @claude into claude\'s flags')
+
+  reset_events()
+  local bad = argv_of3('@claude', '{"nope":"x"}', '')
+  send_jopen(&c, 15, 0, &bad)
+  for _ = 1, 400 do c:pump() if jopened_count > 0 then break end end
+  assert(jopened_count == 1 and jopened_jid == 0 and jopened_err:find('unknown key', 1, true) > 0, jopened_err)
+end
+
+do -- 8 MiB of output while the client stops reading: flow control, nothing lost
+  reset_events()
+  collect = false
+  local argv = argv_of3('/bin/sh', '-c', 'head -c 8388608 /dev/zero | tr "\\0" x')
+  send_jopen(&c, 16, 0, &argv)
+  for _ = 1, 200 do c:pump() if jopened_count > 0 then break end end
+  assert(jopened_jid > 0)
+  c.paused = true -- the agent's queue for us fills up; it must stop reading the job
+  for _ = 1, 300 do c:pump() end
+  local f = io.open('/proc/' .. agent_pid .. '/status', 'rb')
+  assert(f:isopen(), 'agent /proc status')
+  local st = f:read('a')
+  f:close()
+  local at = st:find('VmRSS:', 1, true)
+  assert(at > 0)
+  local kb = 0
+  local i = at + 6
+  while i <= #st and (st:byte(i) == 32 or st:byte(i) == 9) do i = i + 1 end
+  while i <= #st and st:byte(i) >= 48 and st:byte(i) <= 57 do kb = kb * 10 + (st:byte(i) - 48) i = i + 1 end
+  print('agent VmRSS kB while 8 MiB of job output goes unread:', kb)
+  assert(kb > 0 and kb < 24 * 1024, 'the agent stops reading the job instead of buffering it all')
+  c.paused = false
+  for _ = 1, 20000 do c:pump() if jexit_count > 0 then break end end
+  print('job output bytes:', out_bytes, 'exit', jexit_status)
+  assert(out_bytes == 8388608, 'every byte arrives once flow control lets go')
+  assert(jexit_count == 1 and jexit_status == 0)
+  collect = true
+end
+
+c:close()
+print('OK')

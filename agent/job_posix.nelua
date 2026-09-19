@@ -1,0 +1,199 @@
+-- ghostty-agent's raw jobs on Linux/macOS: a child process on three pipes
+-- instead of a PTY (docs/JOBS.md). agent/jobs.nelua drives it; the Windows
+-- build gets the stub in agent/job_windows.nelua.
+--
+-- The job runs as the user who runs the agent, with the agent's environment
+-- plus whatever JOPEN carries. Nothing sandboxes it.
+require 'string'
+require 'vector'
+require 'agent.logic'
+
+## cinclude '<sys/types.h>'
+## cinclude '<sys/wait.h>'
+## cinclude '<signal.h>'
+## cinclude '<unistd.h>'
+## cinclude '<fcntl.h>'
+## cinclude '<errno.h>'
+## cinclude '<stdlib.h>'
+
+local function fork(): cint <cimport, nodecl> end
+local function pipe(fds: *[2]cint): cint <cimport, nodecl> end
+local function dup2(oldfd: cint, newfd: cint): cint <cimport, nodecl> end
+local function execvp(file: cstring, argv: *[0]cstring): cint <cimport, nodecl> end
+local function setenv(name: cstring, value: cstring, overwrite: cint): cint <cimport, nodecl> end
+local function unsetenv(name: cstring): cint <cimport, nodecl> end
+local function chdir(path: cstring): cint <cimport, nodecl> end
+local function setsid(): cint <cimport, nodecl> end
+local function _exit(status: cint): void <cimport, nodecl> end
+local function read(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function write(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function close(fd: cint): cint <cimport, nodecl> end
+local function waitpid(pid: cint, status: *cint, options: cint): cint <cimport, nodecl> end
+local function kill(pid: cint, sig: cint): cint <cimport, nodecl> end
+local function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
+local WNOHANG: cint <cimport, nodecl, const>
+local SIGKILL: cint <cimport, nodecl, const>
+local SIGPIPE: cint <cimport, nodecl, const>
+local SIG_DFL: pointer <cimport, nodecl, const>
+local function signal(sig: cint, handler: pointer): pointer <cimport, nodecl> end
+local F_GETFL: cint <cimport, nodecl, const>
+local F_SETFL: cint <cimport, nodecl, const>
+local O_NONBLOCK: cint <cimport, nodecl, const>
+local F_SETFD: cint <cimport, nodecl, const>
+local FD_CLOEXEC: cint <cimport, nodecl, const>
+local errno: cint <cimport, nodecl>
+local EAGAIN: cint <cimport, nodecl, const>
+local EINTR: cint <cimport, nodecl, const>
+
+local function WIFEXITED(s: cint): boolean <cimport, nodecl> end
+local function WEXITSTATUS(s: cint): cint <cimport, nodecl> end
+local function WIFSIGNALED(s: cint): boolean <cimport, nodecl> end
+local function WTERMSIG(s: cint): cint <cimport, nodecl> end
+
+global AgentJobProc = @record{
+  pid: cint,
+  in_fd: cint,   -- the job's stdin, -1 once closed
+  out_fd: cint,  -- its stdout, -1 at EOF
+  err_fd: cint,  -- its stderr, -1 at EOF
+}
+
+global JOB_SPAWN_MAX_ARGV: usize <comptime> = 256
+
+local function nonblock_cloexec(fd: cint): void
+  local flags = fcntl(fd, F_GETFL, 0)
+  fcntl(fd, F_SETFL, flags | O_NONBLOCK)
+  fcntl(fd, F_SETFD, FD_CLOEXEC) -- a later job must not hold this pipe open
+end
+
+-- Start argv[0] on pipes, in `cwd` when it is not empty. False and a reason
+-- when a pipe or the fork fails; a command that cannot be run exits with 127.
+function AgentJobProc.spawn(argv: *vector(string), env: *vector(string), cwd: string): (boolean, AgentJobProc, string)
+  local none: AgentJobProc = { pid = -1, in_fd = -1, out_fd = -1, err_fd = -1 }
+  if #argv == 0 then return false, none, 'no command' end
+  local ip: [2]cint, op: [2]cint, ep: [2]cint
+  if pipe(&ip) ~= 0 then return false, none, 'pipe failed' end
+  if pipe(&op) ~= 0 then close(ip[0]) close(ip[1]) return false, none, 'pipe failed' end
+  if pipe(&ep) ~= 0 then close(ip[0]) close(ip[1]) close(op[0]) close(op[1]) return false, none, 'pipe failed' end
+  local pid = fork()
+  if pid < 0 then
+    close(ip[0]) close(ip[1]) close(op[0]) close(op[1]) close(ep[0]) close(ep[1])
+    return false, none, 'fork failed'
+  end
+  if pid == 0 then
+    -- child: its own process group, so a signal for the job does not hit the agent
+    setsid()
+    signal(SIGPIPE, SIG_DFL) -- the agent ignores it; a job's own pipes should behave
+    dup2(ip[0], 0)
+    dup2(op[1], 1)
+    dup2(ep[1], 2)
+    close(ip[0]) close(ip[1])
+    close(op[0]) close(op[1])
+    close(ep[0]) close(ep[1])
+    if #cwd > 0 then chdir((@cstring)(cwd.data)) end
+    unsetenv('TMUX')
+    for i = 0, < #env do
+      local ok, k, v = agent_env_split(env[i])
+      if ok then
+        if k == 'PWD' or k == 'CWD' then
+          chdir((@cstring)(v.data))
+        else
+          setenv((@cstring)(k.data), (@cstring)(v.data), 1)
+        end
+      end
+    end
+    local cargv: [JOB_SPAWN_MAX_ARGV]cstring
+    local n = (@usize)(#argv)
+    if n > JOB_SPAWN_MAX_ARGV - 1 then n = JOB_SPAWN_MAX_ARGV - 1 end
+    for i = 0, < n do cargv[i] = (@cstring)(argv[i].data) end
+    cargv[n] = nilptr
+    execvp(cargv[0], &cargv)
+    _exit(127)
+  end
+  close(ip[0]) close(op[1]) close(ep[1])
+  nonblock_cloexec(ip[1])
+  nonblock_cloexec(op[0])
+  nonblock_cloexec(ep[0])
+  return true, (@AgentJobProc){ pid = pid, in_fd = ip[1], out_fd = op[0], err_fd = ep[0] }, (@string){}
+end
+
+-- Bytes read (> 0), 0 when none is ready, -1 at EOF or on error.
+function AgentJobProc.read_fd(fd: cint, buf: *[0]uint8, cap: usize): isize
+  if fd < 0 then return -1 end
+  local n = read(fd, buf, cap)
+  if n > 0 then return n end
+  if n < 0 and (errno == EAGAIN or errno == EINTR) then return 0 end
+  return -1
+end
+
+function AgentJobProc:read_out(buf: *[0]uint8, cap: usize): isize
+  return AgentJobProc.read_fd(self.out_fd, buf, cap)
+end
+
+function AgentJobProc:read_err(buf: *[0]uint8, cap: usize): isize
+  return AgentJobProc.read_fd(self.err_fd, buf, cap)
+end
+
+function AgentJobProc:out_done(): void
+  if self.out_fd >= 0 then close(self.out_fd) end
+  self.out_fd = -1
+end
+
+function AgentJobProc:err_done(): void
+  if self.err_fd >= 0 then close(self.err_fd) end
+  self.err_fd = -1
+end
+
+-- Bytes taken (>= 0; 0 when the pipe is full), -1 when the job closed its stdin.
+function AgentJobProc:write_in(p: *[0]uint8, n: usize): isize
+  if self.in_fd < 0 then return -1 end
+  while true do
+    local w = write(self.in_fd, p, n)
+    if w >= 0 then return w end
+    if errno == EAGAIN then return 0 end
+    if errno ~= EINTR then return -1 end
+  end
+  return -1
+end
+
+-- The job sees EOF on its stdin (JDATA with no bytes, and what a Claude
+-- session needs to finish its turn stream).
+function AgentJobProc:close_in(): void
+  if self.in_fd >= 0 then close(self.in_fd) end
+  self.in_fd = -1
+end
+
+-- The job is a process group of its own (setsid above), so a signal reaches
+-- whatever it started as well.
+function AgentJobProc:signal(sig: cint): void
+  if self.pid > 0 then kill(-self.pid, sig) kill(self.pid, sig) end
+end
+
+function AgentJobProc:kill(): void
+  self:signal(SIGKILL)
+end
+
+-- True once the process ended, with its status (128 + signal when killed).
+function AgentJobProc:poll_exit(): (boolean, int32)
+  if self.pid <= 0 then return true, 0 end
+  local status: cint = 0
+  if waitpid(self.pid, &status, WNOHANG) ~= self.pid then return false, 0 end
+  self.pid = -1
+  if WIFEXITED(status) then return true, WEXITSTATUS(status) end
+  if WIFSIGNALED(status) then return true, 128 + WTERMSIG(status) end
+  return true, 0
+end
+
+-- Everything is closed; a process still running is killed and reaped.
+function AgentJobProc:close(): void
+  self:close_in()
+  self:out_done()
+  self:err_done()
+  if self.pid > 0 then
+    self:kill()
+    local status: cint = 0
+    waitpid(self.pid, &status, 0)
+    self.pid = -1
+  end
+end
+
+global JOB_HAVE_PROCS: boolean <comptime> = true

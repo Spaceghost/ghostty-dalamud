@@ -12,7 +12,10 @@
 -- clipboard, token file under %APPDATA%) and agent/winloop.nelua (one wait
 -- on socket, process and pipe events). agent/logic.nelua holds the pure parts.
 -- Remote desktop windows (protocol version 3) are agent/windows.nelua, over a
--- capture backend from agent/capture.nelua (--windows).
+-- capture backend from agent/capture.nelua (--windows). Raw jobs (protocol
+-- version 4, docs/JOBS.md) are agent/jobs.nelua over agent/job_posix.nelua:
+-- a process on pipes whose output a client parses, with the Claude Code
+-- command line built in agent/claude.nelua. Jobs run as this user.
 --
 -- Usage: ghostty-agent [--listen 127.0.0.1:7777] [--token-file PATH]
 --                      [--clipboard-file PATH] [--replay-bytes N] [--term xterm-256color]
@@ -32,6 +35,7 @@ require 'core.sys.net'
 require 'core.protocol'
 require 'agent.logic'
 require 'agent.windows'
+require 'agent.jobs'
 ## if ccinfo.is_windows then
 require 'agent.pty_windows'
 require 'agent.sys_windows'
@@ -92,6 +96,7 @@ local OUTQ_HIGH: usize <comptime> = 1024 * 1024      -- a client this far behind
 
 local agent: Agent
 local windows: AgentWindows
+local jobs: AgentJobs
 
 local function log(msg: string): void
   io.stderr:write('[ghostty-agent] ', msg, '\n')
@@ -406,6 +411,8 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     text:destroy()
   elseif typ == PROTO_HELLO then
     send_text(c, PROTO_OK, 'already authenticated')
+  elseif jobs:handle(ci, &c.outq, typ, payload, len) then
+    -- a raw job frame (agent/jobs.nelua)
   elseif windows:handle(ci, &c.outq, typ, payload, len) then
     -- a window frame (agent/windows.nelua)
   else
@@ -490,6 +497,7 @@ local function reap(): void
   while i >= 0 do
     if not agent.clients[i].alive then
       windows:client_gone((@usize)(i))
+      jobs:client_gone((@usize)(i))
       for si = 0, < #agent.sessions do
         session_detach(&agent.sessions[si], (@usize)(i))
         -- shift indexes above i
@@ -553,10 +561,12 @@ local function client_queue(ci: usize): *ByteQueue
   return nilptr
 end
 
--- The main loop's sleep, capped by what the window streams need (ms).
+-- The main loop's sleep, capped by what the window streams and the jobs need (ms).
 local function windows_cap(ms: integer): integer
   local w = windows:wait_ms(os.now())
-  if w >= 0 and w < ms then return w end
+  if w >= 0 and w < ms then ms = w end
+  local j = jobs:wait_ms()
+  if j >= 0 and j < ms then ms = j end
   return ms
 end
 
@@ -734,6 +744,7 @@ local function main(): integer
     local ok, why = windows:init(windows_name, client_queue)
     if ok then log('windows: ' .. windows.backend.name) else log('windows unavailable: ' .. why) end
   end
+  jobs:init(client_queue, log) -- raw jobs (docs/JOBS.md); they run as this user
 
   ## if ccinfo.is_windows then
   local listen_ev = winloop_watch(agent.listen_sock, true)
@@ -784,6 +795,7 @@ local function main(): integer
     for si = 0, < #agent.sessions do pump_session(si) end
     windows:pump()
     windows:tick(os.now())
+    jobs:pump(os.now())
     for ci = 0, < #agent.clients do flush_client(ci) end
     reap()
   end
@@ -812,6 +824,13 @@ local function main(): integer
         if n < 512 then fds[n] = { fd = wfds[k], events = POLLIN } n = n + 1 end
       end
     end
+    do -- the jobs' stdout and stderr pipes (agent/jobs.nelua)
+      local jfds: [128]cint
+      local jn = jobs:poll_fds(&jfds, 128)
+      for k = 0, < jn do
+        if n < 512 then fds[n] = { fd = jfds[k], events = POLLIN } n = n + 1 end
+      end
+    end
     poll(&fds, n, windows_cap(250))
 
     local c = net.accept(agent.listen_sock)
@@ -824,10 +843,12 @@ local function main(): integer
     for si = 0, < #agent.sessions do pump_session(si) end
     windows:pump()
     windows:tick(os.now())
+    jobs:pump(os.now())
     for ci = 0, < #agent.clients do flush_client(ci) end
     reap()
   end
   log('stopping')
+  jobs:shutdown() -- jobs are not orphaned behind the agent, kept or not
   ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
   capture_wayland_shutdown() -- apps launched into the compositor are ended, not orphaned
   ## end

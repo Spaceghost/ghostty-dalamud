@@ -123,7 +123,7 @@ local function conn_open_at(at: uint16): Conn
   send(&c, PROTO_HELLO, (@*[0]uint8)(token.data), token.size)
   local ok, m = take(&c, PROTO_OK, 0, 3)
   assert(ok, 'handshake')
-  assert(msg_text(&m, 0):find('ghostty-agent 3 ', 1, true) == 1, 'a version 3 agent')
+  assert(msg_text(&m, 0):find('ghostty-agent 4 ', 1, true) == 1, 'a version 4 agent')
   m.data:destroy()
   return c
 end
