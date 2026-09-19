@@ -16,8 +16,12 @@
 
 -- Poses to hold while a terminal is out. `timeline` is the looping base
 -- ActionTimeline of the emote (Emote sheet, ActionTimeline[0]).
+-- `seated` is the emote's variant for sitting (Emote.ActionTimeline[2..4],
+-- ground and chair): played over the sit instead of replacing it, so a
+-- seated character keeps sitting. Presets without one leave a seated
+-- character alone.
 local PRESETS = {
-  { name = 'device',     timeline = 6302, label = 'Glowing device (/tomestone)' },
+  { name = 'device',     timeline = 6302, seated = 6303, label = 'Glowing device (/tomestone)' },
   { name = 'book',       timeline = 7357, label = 'Reading a book (/read)' },
   { name = 'pen',        timeline = 8144, label = 'Pen and paper (/pen)' },
   { name = 'photograph', timeline = 8151, label = 'Camera (/photograph)' },
@@ -51,6 +55,21 @@ function M.preset_names()
   for i, p in ipairs(PRESETS) do names[i] = p.name end
   return names
 end
+
+-- The seated variant of the current preset (0: none).
+function M.seated_timeline()
+  if (M.custom_timeline or 0) > 0 then return M.custom_seated or 0 end
+  for _, p in ipairs(PRESETS) do
+    if p.name == M.preset then return p.seated or 0 end
+  end
+  return PRESETS[1].seated or 0
+end
+
+-- Sitting on the ground or a chair (and /sit, /groundsit, /doze): the game
+-- holds these as an emote loop; replacing the base pose would stand the
+-- character up and the game would sit it down again.
+local EMOTE_LOOP, IN_POSITION_LOOP = 3, 11
+local function seated_mode(mode) return mode == EMOTE_LOOP or mode == IN_POSITION_LOOP end
 
 -- The timeline to hold right now (preset, or the custom id).
 function M.timeline()
@@ -127,12 +146,25 @@ function M.on_toggle(visible)
     saved = { mode, param, base }
     energy = 0
     applied_speed = nil
+    if seated_mode(mode) then
+      -- over the sit, not instead of it (the character stays seated)
+      saved.seated = true
+      local st = M.seated_timeline()
+      if st > 0 then ghostty.anim_play(st) end
+      return
+    end
     if M.lock_movement then
       ghostty.anim_set(ANIM_LOCK, 0, M.timeline(), true)
     else
       ghostty.anim_set(KEEP, 0, M.timeline(), false)
     end
     ghostty.anim_play(M.timeline())
+  elseif saved and saved.seated then
+    set_speed(1.0)
+    local mode, param = ghostty.anim_state()
+    saved = nil
+    -- put the device away: the game's own SetMode replays the sit loop
+    if mode and seated_mode(mode) then ghostty.anim_set(mode, param, 0, true) end
   elseif saved then
     set_speed(1.0)
     if M.lock_movement then
@@ -171,8 +203,33 @@ function M.on_frame(t)
   if t >= next_guard then
     next_guard = t + M.guard_interval
     local mode, param, base, playing = ghostty.anim_state()
-    if mode and (base ~= M.timeline() or (playing and playing ~= 0 and playing ~= M.timeline())) then
-      -- something replaced the pose (idle variation, emote): put the device back
+    if not mode then return end
+    if saved.seated then
+      if not seated_mode(mode) then
+        -- stood up while the device was out: hold it the standing way
+        saved = { mode, param, 0 }
+        ghostty.anim_set(KEEP, 0, M.timeline(), false)
+        ghostty.anim_play(M.timeline())
+        return
+      end
+      local st = M.seated_timeline()
+      -- keep the seated variant going; restart it only once it has stopped
+      if st > 0 and playing and playing ~= st then ghostty.anim_play(st) end
+      return
+    end
+    if seated_mode(mode) then
+      -- sat down while the device was out: switch to the seated variant
+      -- instead of standing the character back up
+      ghostty.anim_set(KEEP, 0, 0, false)
+      saved.seated = true
+      local st = M.seated_timeline()
+      if st > 0 then ghostty.anim_play(st) end
+      return
+    end
+    if base ~= M.timeline() then
+      -- something replaced the base pose (idle variation, emote): put it back.
+      -- The base loops by itself, so nothing is restarted while the base is
+      -- still ours: restarting it is what made the device blink.
       if M.lock_movement then
         ghostty.anim_set(ANIM_LOCK, 0, M.timeline(), true)
       else
