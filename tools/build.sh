@@ -18,6 +18,11 @@
 # DALAMUD_LIB_PATH (Dalamud dev assemblies, default ~/.cache/dalamud-dev),
 # UMBRA_LIB_PATH (Umbra assemblies, default vendor/umbra-dist/dist),
 # ZIG_GLOBAL_CACHE_DIR (default ~/.cache/zig-global),
+# BUILD_COMMIT (default: `git rev-parse HEAD`, plus "-dirty" when core/,
+# lua/ or agent/ have uncommitted changes), BUILD_ID (default:
+# <UTC time>-<commit, 12>-<6 random hex>); both are stamped into
+# ghostty_core.dll (core/buildinfo.nelua, `/term selftest`, gu_version) and
+# written to build/dist/build-info.json,
 # SKIP_SHIM=1 (no C#; refreshes only the native files and lua/ of an existing
 # build/dist/GhosttyDalamud), SKIP_UMBRA=1 (no widget), SKIP_WIN=1 (no
 # Windows core, loader or agent), SKIP_DEPS=1 (reuse the Nelua,
@@ -64,6 +69,20 @@ if [[ "${SKIP_DEPS:-0}" != 1 ]]; then
   fi
 fi
 
+# Build stamp: which commit this core is, and which build (docs/CI.md, "In-game tests")
+if [[ -z "${BUILD_COMMIT:-}" ]]; then
+  BUILD_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+  if [[ "$BUILD_COMMIT" != unknown ]] && ! git -C "$ROOT" diff --quiet HEAD -- core lua agent 2>/dev/null; then
+    BUILD_COMMIT="$BUILD_COMMIT-dirty"
+  fi
+fi
+BUILD_ID="${BUILD_ID:-$(date -u +%Y%m%dT%H%M%SZ)-${BUILD_COMMIT:0:12}-$(od -An -N3 -tx1 /dev/urandom | tr -d ' \n')}"
+for v in "$BUILD_COMMIT" "$BUILD_ID"; do
+  [[ "$v" =~ ^[A-Za-z0-9._-]{1,96}$ ]] || { echo "error: build stamp '$v' must be [A-Za-z0-9._-], at most 96 characters"; exit 1; }
+done
+STAMP=(-P "build_commit='$BUILD_COMMIT'" -P "build_id='$BUILD_ID'")
+echo "== build stamp: commit $BUILD_COMMIT, build $BUILD_ID"
+
 INC="-I$ROOT/vendor/ghostty/include -I$ROOT/vendor/gc-cimgui -I$ROOT/vendor/lua/src"
 
 echo "== ghostty-agent (host)"
@@ -74,9 +93,10 @@ mkdir -p build/dist/themes && cp themes/*.theme build/dist/themes/
 if [[ "${SKIP_WIN:-0}" != 1 ]]; then
   echo "== ghostty_core.dll (windows x64)"
   rm -f build/dist/ghostty_umbra.dll build/dist/ghostty_umbra.pdb # the name before the standalone plugin
-  ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc -P noentrypoint -P "writestderr='hooked'" -P "abort='hooked'" \
+  ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc -P noentrypoint -P "writestderr='hooked'" -P "abort='hooked'" "${STAMP[@]}" \
     --cflags="-O2 $INC -L$ROOT/build/win/lib -L$ROOT/build/lua-win" \
     --cache-dir build/win/cache -L . -H -o build/dist/ghostty_core.dll core/host.nelua
+  printf '{"commit":"%s","build_id":"%s"}\n' "$BUILD_COMMIT" "$BUILD_ID" >build/dist/build-info.json
   echo "== ghostty_loader.dll (windows x64)"
   ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc -P noentrypoint -P "writestderr='hooked'" -P "abort='hooked'" \
     --cflags="-O2 $INC -L$ROOT/build/win/lib -L$ROOT/build/lua-win" \

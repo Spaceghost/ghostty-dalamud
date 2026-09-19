@@ -1,0 +1,23 @@
+-- What tools/build.sh stamped into this core: the git commit it was built
+-- from and a build id unique to that build (`-P "build_commit='...'"
+-- -P "build_id='...'"`). A core built without them (tests, a hand-run
+-- nelua) says 'unknown' / 'unstamped'. `/term selftest` puts both in its
+-- report so a CI run can prove which build ran in the game.
+## local function stamp(v, default)
+##   if type(v) ~= 'string' or v == '' then return default end
+##   static_assert(v:match('^[%w%._%-]+$') and #v <= 96, 'build stamp must be [A-Za-z0-9._-], at most 96 characters: ' .. v)
+##   return v
+## end
+## BUILDINFO_COMMIT = stamp(pragmas.build_commit, 'unknown')
+## BUILDINFO_ID = stamp(pragmas.build_id, 'unstamped')
+## BUILDINFO_VERSION = 'ghostty-dalamud 0.2.0'
+
+global BUILD_COMMIT: string <comptime> = #[BUILDINFO_COMMIT]#
+global BUILD_ID: string <comptime> = #[BUILDINFO_ID]#
+global BUILD_VERSION: string <comptime> = #[BUILDINFO_VERSION]#
+
+-- gu_version's text: 'ghostty-dalamud 0.2.0 (<commit>, build <id>)'; the
+-- loader logs it for every core it loads.
+global function build_version_cstr(): cstring
+  return #[BUILDINFO_VERSION .. ' (' .. BUILDINFO_COMMIT .. ', build ' .. BUILDINFO_ID .. ')']#
+end

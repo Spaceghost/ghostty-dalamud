@@ -47,6 +47,9 @@ run test_platform "$ROOT" "$ROOT/build/test-scratch"
 run test_assistant "$ROOT"
 run test_hostsurface "$ROOT" "$ROOT/build/test-scratch/surface"
 run test_depthpass "$ROOT"
+run test_selftest
+mkdir -p build/test-scratch/selftest
+run test_selftest_run "$ROOT" "$ROOT/build/test-scratch/selftest"
 
 echo "--- test_reinit"
 # shellcheck disable=SC2086

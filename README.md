@@ -102,7 +102,10 @@ The .NET SDK does not need root: `dotnet-install.sh --channel 10.0 --install-dir
 
 `tools/ci/run.sh test build` does the same with pinned, checksum-verified Zig
 and Dalamud assemblies; it is what GitHub Actions and the self-hosted runners
-run (see [docs/CI.md](docs/CI.md)).
+run (see [docs/CI.md](docs/CI.md)). `tools/ci/run.sh ingame` puts a build into
+a running game and runs `/term selftest` there through XivMcp, from a
+self-hosted runner on the gaming PC ([docs/CI.md, "In-game
+tests"](docs/CI.md#in-game-tests); not yet run against the game).
 
 Output:
 
@@ -419,6 +422,7 @@ return {
 | `/term theme [name]` | switch the colour theme, or list the themes (see [Themes](#themes)) |
 | `/term config` | the settings window |
 | `/term reload` | reload the Lua configuration |
+| `/term selftest [list\|all\|suite...]` | deterministic checks inside the game, report in `selftest/latest.json` of the config directory (see [docs/CI.md](docs/CI.md#in-game-tests); not yet run in game) |
 
 Keys (`lua/init.lua`, `lua/keymap.lua`): <kbd>ctrl</kbd>+<kbd>`</kbd> toggles
 the drop-down and <kbd>ctrl</kbd>+<kbd>shift</kbd>+<kbd>`</kbd> the terminals in
