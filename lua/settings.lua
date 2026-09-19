@@ -139,6 +139,7 @@ S.schema = {
   { 'Remote windows', {
     { 'windows.auto_open', 'combo', { 'all', 'related', 'none' }, 'New windows of the agent become panels (related: dialogs and windows of apps you have out)' },
     { 'windows.never', 'list', 'Never show in game (app id, desktop id or part of a title; * matches anything)' },
+  } },
   { 'Gallery', {
     { 'gallery.prompt', 'checkbox', 'Offer to share screenshots taken while a terminal is on screen' },
     { 'gallery.credit', 'checkbox', 'Credit shared screenshots to my character' },
