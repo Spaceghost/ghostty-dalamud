@@ -2,6 +2,7 @@
 -- the host-side test build still links.
 require 'string'
 require 'vector'
+require 'core.sys.wincmdline'
 
 global ConPty = @record{
   hpc: pointer,
@@ -83,39 +84,6 @@ local function to_wide(s: string): *[0]uint16
   return w
 end
 
--- Quote argv into a Windows command line (CommandLineToArgvW rules).
-local function build_cmdline(argv: *vector(string)): string
-  local sb: stringbuilder
-  for i = 0, < #argv do
-    if i > 0 then sb:write(' ') end
-    local a = argv[i]
-    local needs = #a == 0 or a:find(' ', 1, true) > 0 or a:find('\t', 1, true) > 0 or a:find('"', 1, true) > 0
-    if not needs then
-      sb:write(a)
-    else
-      sb:write('"')
-      local bs = 0
-      for k = 1, #a do
-        local c = a:byte(k)
-        if c == 92 then
-          bs = bs + 1
-        elseif c == 34 then
-          for _ = 1, bs * 2 + 1 do sb:write('\\') end
-          bs = 0
-          sb:write('"')
-        else
-          for _ = 1, bs do sb:write('\\') end
-          bs = 0
-          sb:write(string.char(c))
-        end
-      end
-      for _ = 1, bs * 2 do sb:write('\\') end
-      sb:write('"')
-    end
-  end
-  return sb:promote()
-end
-
 require 'stringbuilder'
 
 function ConPty:open(argv: *vector(string), cwd: string, cols: uint16, rows: uint16): boolean
@@ -143,7 +111,7 @@ function ConPty:open(argv: *vector(string), cwd: string, cols: uint16, rows: uin
   si.StartupInfo.cb = SIZEOF_STARTUPINFOEXW
   si.lpAttributeList = self.attr_list
   local pi: PROCESS_INFORMATION
-  local cmdline = build_cmdline(argv)
+  local cmdline = win_cmdline(argv)
   local wcmd = to_wide(cmdline)
   cmdline:destroy()
   local wcwd: *[0]uint16 = nilptr

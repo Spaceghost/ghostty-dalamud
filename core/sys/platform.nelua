@@ -1,0 +1,33 @@
+-- Which platform the code runs on, as Lua sees it through ghostty.platform():
+-- 'windows' (native Windows), 'wine' (a Windows build running under Wine or
+-- Proton: ntdll exports wine_get_version), 'linux', 'macos' or 'posix'.
+-- The name is a static string; callers never free it.
+require 'string'
+
+## if ccinfo.is_windows then
+## cinclude '<windows.h>'
+local function GetModuleHandleA(name: cstring): pointer <cimport, nodecl> end
+local function GetProcAddress(mod: pointer, name: cstring): pointer <cimport, nodecl> end
+
+global function platform_is_wine(): boolean
+  local ntdll = GetModuleHandleA('ntdll.dll')
+  return ntdll ~= nilptr and GetProcAddress(ntdll, 'wine_get_version') ~= nilptr
+end
+
+global function platform_name(): string
+  if platform_is_wine() then return 'wine' end
+  return 'windows'
+end
+## else
+global function platform_is_wine(): boolean return false end
+
+global function platform_name(): string
+  ## if ccinfo.is_linux then
+    return 'linux'
+  ## elseif ccinfo.is_apple then
+    return 'macos'
+  ## else
+    return 'posix'
+  ## end
+end
+## end
