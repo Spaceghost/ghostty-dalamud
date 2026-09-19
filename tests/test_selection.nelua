@@ -159,3 +159,43 @@ do
   v:destroy()
   print('wheel OK')
 end
+
+-- Links: a URL in a row's text around a column, and a cell's OSC 8 hyperlink
+do
+  local function at(row: string, col: integer): string
+    local a, b = link_in_row(row, col)
+    if a == 0 then return '' end
+    return row:sub(a, b)
+  end
+  local row: string = 'see https://example.org/a_(b)?c=1. and (http://x.io/y), mailto:me@x.org!'
+  assert(at(row, 4) == 'https://example.org/a_(b)?c=1', 'the scheme, balanced brackets kept, the full stop left out')
+  assert(at(row, 20) == 'https://example.org/a_(b)?c=1', 'from the middle')
+  assert(at(row, 34) == '', 'the full stop after it')
+  assert(at(row, 45) == 'http://x.io/y', 'the unbalanced closing bracket left out')
+  assert(at(row, 64) == 'mailto:me@x.org', 'mailto, the ! left out')
+  assert(at(row, 0) == '' and at(row, 3) == '', 'plain words and blanks')
+  assert(at('go to example.org now', 8) == '', 'no scheme: not a link')
+  assert(at('file:///etc/passwd', 3) == '', 'file: is not a web link')
+  assert(at('https://a.org/\1\1x', 2) == 'https://a.org/', 'a wide character ends it')
+  assert(at('xhttps://a.orghttps://b.org', 20) == 'https://b.org' and at('xhttps://a.orghttps://b.org', 5) == 'https://a.org', 'two glued links')
+  assert(link_is_web('HTTPS://A.ORG') and link_is_web('mailto:a@b') and not link_is_web('https://') and not link_is_web('ftp://x'))
+
+  local v: TermView
+  assert(v:init(60, 4))
+  feed(&v, 'plain https://example.org/page, text\r\n')
+  feed(&v, 'click \27]8;;https://osc8.example/target\27\\here\27]8;;\27\\ ok\r\n')
+  v:update()
+  local u = selection_link_at(&v, 12, 0, 60)
+  assert(u == 'https://example.org/page', 'a URL in the text')
+  u:destroy()
+  u = selection_link_at(&v, 3, 0, 60)
+  assert(#u == 0, 'no link under a word')
+  u = selection_link_at(&v, 7, 1, 60)
+  print('osc 8:', u)
+  assert(u == 'https://osc8.example/target', 'the OSC 8 hyperlink of the cell, not its text')
+  u:destroy()
+  u = selection_link_at(&v, 12, 1, 60)
+  assert(#u == 0, 'past the hyperlink')
+  v:destroy()
+  print('links OK')
+end

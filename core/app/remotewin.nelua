@@ -26,6 +26,7 @@
 -- either. What is left, over the window's picture, is mapped from panel
 -- pixels to window pixels (the letterbox removed) and sent as WINPUT.
 require 'core.app.terminal'
+require 'core.links'
 require 'core.keychords'
 require 'core.wincodec'
 require 'core.wintex'
@@ -178,6 +179,12 @@ local auto_wait = false      -- a stream just opened: wait for the list that mar
 local known_wids: vector(uint32) -- the windows of the last list decided on
 local never_at: float64 = 0      -- CONFIG.windows.never last checked against the open panels
 local refused_wids: vector(uint32) -- auto-opened and refused: not again while listed
+-- Links apps in the compositor opened (`ghostty-agent --open-url`): the list
+-- marks their window "raise:N"; each new N shows it (open_raised).
+local RaiseSeen = @record{ wid: uint32, n: uint32 }
+local raises_seen: vector(RaiseSeen)
+local raise_dirty = false    -- a list came: look at its raise: marks
+local raise_baseline = false -- the next list's marks are old news (a reconnect)
 
 -- Session:close of a window panel: stop the stream and free it. Closed by
 -- its ×, /window close or IPC, the window closes too (WCLOSE); a reload or
@@ -332,6 +339,7 @@ global WinListEntry = @record{
   sid: uint32,                -- "sid:N": this connection streams it already (a watching agent's)
   parent: uint32,             -- "parent:WID": a dialog of that window
   compositor: boolean,        -- a window of the agent's own compositor (the line has the launch column)
+  raise: uint32,              -- "raise:N": a link from an app asked to show it (N counts up per request)
 }
 global WinAppEntry = @record{ id: string, name: string, icon: string, categories: string } -- owned
 global WinList = @record{
@@ -428,6 +436,9 @@ global function winlist_parse(data: *[0]uint8, len: usize): boolean -- true: it 
               elseif #c > 7 and c:subview(1, 7) == 'parent:' then
                 local okn, n = parse_count(c:subview(8))
                 if okn and n <= 0xffffffff then e.parent = (@uint32)(n) end
+              elseif #c > 6 and c:subview(1, 6) == 'raise:' then
+                local okn, n = parse_count(c:subview(7))
+                if okn and n <= 0xffffffff then e.raise = (@uint32)(n) end
               end
             end
             e.key = key_of(&e.extra)
@@ -684,13 +695,32 @@ local function ask_agent(rw: *RemoteWin): boolean
   return host.agent:wopen(rw.req, wid, (@uint16)(rw.max_w), (@uint16)(rw.max_h), (@uint8)(policy.windows.fps), text)
 end
 
+-- A link panel: asked for with WOPEN "url:" (remotewin_open_link).
+local function is_link(match: string): boolean
+  return #match > 4 and match:subview(1, 4) == 'url:'
+end
+
+-- A link to the desktop's browser (Dalamud's Util.OpenLink through the shim).
+-- `why` (when not empty) says why it did not open in the game; the chat
+-- says so too.
+local function host_open_link(url: string, why: string): void
+  local z = url:copy() -- NUL-terminated for the host
+  local ok = host.api.open_url ~= nilptr and host.api.open_url((@cstring)(z.data)) ~= 0
+  if not ok then
+    sayf(LOG_WARN, 'link not opened: the desktop browser could not be asked (%s)', z)
+  elseif #why > 0 then
+    sayf(LOG_INFO, 'link opened in your desktop browser: %s', why)
+  end
+  z:destroy()
+end
+
 global function remotewin_event(ev: *AgentEvent): void
   if ev.typ == PROTO_WLISTR then
     if not winlist_parse(ev.data, ev.len) then
       learn_keys()
       never_sweep()
       auto_wait = false
-      if watching then auto_dirty = true end
+      if watching then auto_dirty = true raise_dirty = true end
       if loud_lists > 0 then loud_lists = loud_lists - 1 log_list() end -- not the ones sent for keys
     end -- the app list is the picker's, not the log's
   elseif ev.typ == PROTO_WGEOM then
@@ -703,6 +733,33 @@ global function remotewin_event(ev: *AgentEvent): void
       return
     end
     local text = string{data=(@*[0]byte)(ev.data), size=ev.len}
+    if ev.id == 0 and is_link(rw.match) then
+      -- the compositor's browser could not have it: the desktop's gets it
+      local url = rw.match:subview(5):copy()
+      rw.state = RemoteWinState.Ended
+      rw.ended_at = host.last_time
+      close_panel(rw.s)
+      host_open_link(url, text)
+      url:destroy()
+      return
+    end
+    if ev.id ~= 0 and is_link(rw.match) then
+      -- the browser's window is on a panel already (the agent names that
+      -- stream): the link is a new tab there, this panel goes
+      local other = find_sid(ev.id)
+      if other ~= nilptr and other ~= rw then
+        rw.state = RemoteWinState.Ended
+        rw.ended_at = host.last_time
+        close_panel(rw.s)
+        if not other.s.leaving then bring_forward(other.s) end
+        logf(LOG_INFO, 'window %d: a link opened in its browser', other.s.id)
+        return
+      end
+      -- not asked for again by the URL (a restart would open the link again):
+      -- the window's key from the next list brings it back
+      rw.match:destroy()
+      rw.match = {}
+    end
     if ev.id == 0 then
       if rw.wid ~= 0 then refused_wids:push(rw.wid) end -- not asked for again while it is listed
       if #rw.fallback > 0 then
@@ -980,6 +1037,50 @@ global function window_open(spec: WindowOpenSpec): (integer, string)
   panel_text(s, 'waiting for the window', '\u{2026}')
   return s.id, ''
 end
+
+-- Links ----------------------------------------------------------------------------------
+
+-- The agent has its own compositor (Linux): its list has the launch line or
+-- compositor windows.
+local function agent_has_compositor(): boolean
+  for i = 0, < #winlist.windows do
+    local e = &winlist.windows[i]
+    if (e.wid == 0 and e.app == 'launch') or e.compositor then return true end
+  end
+  return false
+end
+
+-- A link Ctrl+clicked in a terminal (terminal_link_open). http, https and
+-- mailto: with CONFIG.windows.links 'game' (the default) the browser of the
+-- agent's compositor opens it as a panel where CONFIG.windows.open_at says,
+-- or as a new tab in the browser's panel (focused); when there is no agent,
+-- no compositor, or window_open fails, and later when the agent refuses it
+-- (WOPENED sid 0), the desktop's browser gets it and the chat says why.
+-- 'host': the desktop's browser. Other schemes (file://, ...) are not opened.
+global function remotewin_open_link(url: string): void
+  if not link_is_web(url) then
+    sayf(LOG_INFO, 'link not opened: %s (only http, https and mailto links open)', url)
+    return
+  end
+  if policy.windows.links == 'host' then host_open_link(url, '') return end
+  local why: string
+  local agent, err = agent_for('')
+  if agent == nilptr then
+    why = err
+  elseif not agent_has_compositor() then
+    why = 'the agent has no compositor to open it in (Linux only)'
+  else
+    local sb: stringbuilder
+    sb:write('url:', url)
+    local m = sb:promote()
+    local id, oerr = window_open(WindowOpenSpec{ match = m, caller = 'a link' })
+    m:destroy()
+    if id ~= 0 then return end
+    why = oerr
+  end
+  host_open_link(url, why)
+end
+terminal_link_open = remotewin_open_link
 
 -- Close window panel `id` (it glitches out like a dismissed terminal; the
 -- stream closes with it). `id` 0: the focused window panel, else the newest.
@@ -1270,6 +1371,51 @@ local function auto_open_new(): void
   end
 end
 
+-- The windows the latest list marks "raise:N" with a new N: an app in the
+-- compositor opened a link (`ghostty-agent --open-url`). A window with a
+-- panel gets focus, another becomes a panel. The first list after
+-- (re)connecting only notes the marks.
+local function open_raised(): void
+  raise_dirty = false
+  for i = 0, < #winlist.windows do
+    local e = &winlist.windows[i]
+    if e.raise == 0 or e.wid == 0 then continue end
+    local seen, known = false, false
+    for k = 0, < #raises_seen do
+      if raises_seen[k].wid == e.wid then
+        seen = raises_seen[k].n == e.raise
+        raises_seen[k].n = e.raise
+        known = true
+        break
+      end
+    end
+    if not known then raises_seen:push(RaiseSeen{ wid = e.wid, n = e.raise }) end
+    if seen or raise_baseline then continue end
+    local rw = panel_of_entry(e)
+    if rw ~= nilptr then
+      if not rw.s.leaving then bring_forward(rw.s) end
+      logf(LOG_INFO, 'window %d: an app opened a link in it', rw.s.id)
+      continue
+    end
+    local opening = false
+    for k = 0, < #streams do
+      if streams[k].state == RemoteWinState.Opening and streams[k].wid == e.wid then opening = true end
+    end
+    if opening then continue end
+    local id, oerr = window_open(WindowOpenSpec{ wid = e.wid, caller = 'a link an app opened' })
+    if id == 0 then logf(LOG_WARN, 'window #%d (%s): a link opened in it, but no panel: %s', e.wid, e.title, oerr) end
+  end
+  raise_baseline = false
+  -- forget windows that are gone
+  local k: integer = #raises_seen - 1
+  while k >= 0 do
+    local here = false
+    for i = 0, < #winlist.windows do if winlist.windows[i].wid == raises_seen[k].wid then here = true break end end
+    if not here then raises_seen:remove(k) end
+    k = k - 1
+  end
+end
+
 -- Persistence ------------------------------------------------------------------------------
 -- Window panels are saved beside the terminal layout (save_world_state in
 -- core/app/worldview.nelua calls remotewin_save_state), in lua/windows.lua's
@@ -1398,7 +1544,9 @@ global function remotewin_tick(now: float64, in_world: boolean): void
   if windows_ok and not watching then
     watching = host.agent:wlist_watch()
     watch_baseline, auto_dirty, auto_wait = true, false, false
+    raise_baseline, raise_dirty = true, false
   end
+  if raise_dirty and watching and in_world and player_loaded() then open_raised() end
   if auto_dirty and not auto_wait and watching and in_world and player_loaded() then auto_open_new() end
   -- CONFIG.windows.never may have changed (the settings window)
   if now - never_at > 0.5 or now < never_at then

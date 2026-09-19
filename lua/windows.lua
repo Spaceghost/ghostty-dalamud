@@ -42,6 +42,12 @@ M.open_at = 'here'
 -- dialog is pinned beside its window's panel, another window of an app
 -- beside that app's newest panel, anything else where open_at says.
 M.auto_open = 'all'
+-- Where a link Ctrl+clicked in a terminal opens (http, https and mailto):
+-- 'game' in the browser of the agent's compositor (Linux), as a panel, the
+-- browser's panel if it has one already; 'host' in the desktop's browser.
+-- 'game' falls back to the desktop's browser, saying why in the chat, when
+-- the agent is not connected, has no compositor or refuses the link.
+M.links = 'game'
 -- Windows and apps never shown in game: not opened by themselves, refused by
 -- /window pull and IPC window.open, left out of the Windows picker and of
 -- agent.apps (XivDesktop's launcher), and a panel whose window comes to match

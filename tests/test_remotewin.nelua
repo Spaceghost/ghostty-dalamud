@@ -1217,6 +1217,114 @@ do
   print('window never OK')
 end
 
+-- Links: Ctrl+clicked in a terminal, opened by the compositor's browser as a panel ------------
+local opened_urls: vector(string)
+local function fake_open_url(url: cstring): cint
+  opened_urls:push(string.copy(url))
+  return 1
+end
+local function newest_stream(): *RemoteWin
+  if #host.world == 0 then return nilptr end
+  return remotewin_of(host.world[#host.world - 1])
+end
+do
+  assert(luaL_loadstring(policy.L, "CONFIG.windows.never = {}") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  assert(policy.windows.links == 'game', "CONFIG.windows.links defaults to 'game'")
+  while #host.world > 0 do close_terminal(host.world[0]) end
+  for _ = 1, 10 do world_frame(false) end
+  host.api.open_url = fake_open_url
+  local LAUNCH: string = '0\t0\t0\tlaunch\trun:COMMAND to start an app in the game\n'
+  send_list(LAUNCH)
+  pump()
+  world_frame(false)
+  forget()
+  -- a link: WOPEN url:, a panel where open_at says
+  assert(terminal_link_open ~= nilptr, 'the terminal knows where links go')
+  terminal_link_open('https://example.org/a')
+  assert(last_wopen_text() == 'url:https://example.org/a' and #host.world == 1 and #opened_urls == 0, 'WOPEN url:, not the desktop')
+  local br = newest_stream()
+  send_opened(br.req, 80, 'Example - Browser')
+  pump()
+  world_frame(false)
+  assert(br.state == RemoteWinState.Live and br.sid == 80 and #br.match == 0, 'live; not asked for again by its URL')
+  -- a second link: the agent names the same stream, the new panel goes and the browser's has focus
+  forget()
+  host.world_focus = 0
+  remotewin_open_link('https://example.org/b')
+  assert(last_wopen_text() == 'url:https://example.org/b' and #host.world == 2)
+  local second = newest_stream()
+  send_opened(second.req, 80, 'Example - Browser')
+  pump()
+  for _ = 1, 120 do world_frame(false) end
+  assert(#host.world == 1 and remotewin_of(host.world[0]) == br and host.world_focus == br.s.id, 'one browser panel, focused')
+  assert(logged('a link opened in its browser') == 1)
+  assert(count(PROTO_WCLOSE) == 0, 'the browser\'s stream stays')
+  -- refused by the agent: the desktop's browser, and the chat says why
+  forget()
+  remotewin_open_link('https://example.org/c')
+  local third = newest_stream()
+  send_opened(third.req, 0, 'firefox is running on your desktop, so the link would open there')
+  pump()
+  for _ = 1, 120 do world_frame(false) end
+  assert(#opened_urls == 1 and opened_urls[0] == 'https://example.org/c' and #host.world == 1, 'refused: to the desktop')
+  assert(logged('link opened in your desktop browser: firefox is running on your desktop') == 1, 'says why')
+  -- file:// and other schemes are not opened at all
+  forget()
+  remotewin_open_link('file:///etc/passwd')
+  host.agent:flush()
+  assert(count(PROTO_WOPEN) == 0 and #opened_urls == 1 and logged('link not opened: file:///etc/passwd') == 1, 'file: stays shut')
+  -- an app in the compositor opened a link (raise:N): a window without a panel becomes one
+  forget()
+  send_list(LAUNCH .. '9\t800\t600\tfirefox\tExample - Browser\t6aa.3\tsid:80\n30\t800\t600\tfirefox\tOther\t\traise:5\n')
+  pump()
+  world_frame(false)
+  assert(count(PROTO_WOPEN) == 1 and last_wopen_wid() == 30, 'raise:5 opens window #30')
+  local raised = stream_of_wid(30)
+  send_opened(raised.req, 81, 'Other')
+  pump()
+  world_frame(false)
+  forget()
+  send_list(LAUNCH .. '9\t800\t600\tfirefox\tExample - Browser\t6aa.3\tsid:80\n30\t800\t600\tfirefox\tOther\t\tsid:81\traise:5\n')
+  pump()
+  world_frame(false)
+  assert(count(PROTO_WOPEN) == 0, 'the same mark: nothing again')
+  host.world_focus = 0
+  send_list(LAUNCH .. '9\t800\t600\tfirefox\tExample - Browser\t6aa.3\tsid:80\traise:6\n30\t800\t600\tfirefox\tOther\t\tsid:81\traise:5\n')
+  pump()
+  world_frame(false)
+  assert(count(PROTO_WOPEN) == 0 and host.world_focus == br.s.id and logged('an app opened a link in it') == 1, 'a new mark on a panel: focused')
+  -- CONFIG.windows.links = 'host': the desktop's browser, nothing said
+  assert(luaL_loadstring(policy.L, "CONFIG.windows.links = 'host'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  forget()
+  local said = logged('link opened in your desktop browser')
+  remotewin_open_link('http://example.org/d')
+  host.agent:flush()
+  assert(count(PROTO_WOPEN) == 0 and #opened_urls == 2 and opened_urls[1] == 'http://example.org/d' and logged('link opened in your desktop browser') == said, "'host'")
+  assert(luaL_loadstring(policy.L, "CONFIG.windows.links = 'game'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  -- an agent without a compositor (Windows, macOS): the desktop's browser
+  send_list('7\t800\t600\tfirefox\tMozilla Firefox\n')
+  pump()
+  world_frame(false)
+  forget()
+  remotewin_open_link('https://example.org/e')
+  host.agent:flush()
+  assert(count(PROTO_WOPEN) == 0 and #opened_urls == 3 and logged('link opened in your desktop browser: the agent has no compositor') == 1, 'no compositor')
+  -- no agent: the desktop's browser
+  host.agent:disconnect()
+  host.agent.state = AgentState.Failed
+  world_frame(false)
+  remotewin_open_link('mailto:someone@example.org')
+  assert(#opened_urls == 4 and opened_urls[3] == 'mailto:someone@example.org' and logged('link opened in your desktop browser: the agent is not connected') == 1, 'no agent')
+  host.api.open_url = nilptr
+  while #host.world > 0 do close_terminal(host.world[0]) end
+  for i = 0, < #opened_urls do opened_urls[i]:destroy() end
+  opened_urls:destroy()
+  print('links OK')
+end
+
 -- App icons that appear late: looked for again every few seconds -------------------------------
 local tex_asked: string
 local function fake_texture_file(path: cstring, w: *uint32, h: *uint32): pointer

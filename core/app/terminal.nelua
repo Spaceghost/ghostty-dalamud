@@ -47,6 +47,10 @@ global function copy_from(s: *Session): void
   text:destroy()
 end
 
+-- Where a Ctrl+clicked link goes (core/app/remotewin.nelua remotewin_open_link:
+-- the agent's compositor or the desktop's browser, by CONFIG.windows.links).
+global terminal_link_open: function(url: string): void
+
 -- Mouse selection on one terminal. (x, y) is the pointer in pixels from the
 -- grid origin (`valid` is false when it maps nowhere, e.g. off a world panel),
 -- `press` is true on the frame the left button went down over the grid and
@@ -54,6 +58,15 @@ end
 global function terminal_mouse(s: *Session, x: float32, y: float32, valid: boolean, press: boolean, down: boolean, now: float64): boolean
   local col, row = selection_cell_at(x, y, s.cell_w, s.cell_h, s.cols, s.rows)
   local unit = false
+  if press and valid and imgui.GetIO().KeyCtrl and terminal_link_open ~= nilptr then
+    -- Ctrl+click on a link (OSC 8, or a URL in the text) opens it
+    local url = selection_link_at(&s.view, col, row, s.cols)
+    if #url > 0 then
+      terminal_link_open(url)
+      url:destroy()
+      return false
+    end
+  end
   if press and valid then
     local clicks = selection_click(&s.sel, now, col, row)
     unit = selection_press(&s.view, &s.sel, col, row, clicks, imgui.GetIO().KeyShift)

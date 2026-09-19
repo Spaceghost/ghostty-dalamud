@@ -57,6 +57,7 @@ global WindowsCfg = @record{
   autopull: vector(string), -- CONFIG.windows.auto: `/term window pull` arguments to run once a character is loaded
   never: vector(string),    -- CONFIG.windows.never: windows and apps never shown in game (app id, desktop id, title part; * globs)
   auto_open: string,        -- CONFIG.windows.auto_open: new windows of the agent's compositor as panels: 'all', 'related', 'none'
+  links: string,            -- CONFIG.windows.links: where terminal links open: 'game' (the agent's compositor, a panel) or 'host'
   reserved_chords: vector(string), -- CONFIG.windows.reserved_chords: keys never sent to a window or typed into a terminal (core/keychords.nelua)
 }
 
@@ -408,6 +409,8 @@ local function read_settings(L: *lua_State, t: cint): void
   policy.windows.open_at = lua_field_string(L, wn, 'open_at', 'here')
   policy.windows.auto_open:destroy()
   policy.windows.auto_open = lua_field_string(L, wn, 'auto_open', 'all')
+  policy.windows.links:destroy()
+  policy.windows.links = lua_field_string(L, wn, 'links', 'game')
   policy.windows.max_w = math.clamp(lua_field_integer(L, wn, 'max_w', 1920), 64, 4096)
   policy.windows.max_h = math.clamp(lua_field_integer(L, wn, 'max_h', 1200), 64, 4096)
   policy.windows.fps = math.clamp(lua_field_integer(L, wn, 'fps', 30), 1, 120)
@@ -461,6 +464,7 @@ global function policy_unload(): void
   policy.agent.token_file:destroy()
   policy.windows.open_at:destroy()
   policy.windows.auto_open:destroy()
+  policy.windows.links:destroy()
   policy.windows.agent:destroy()
   for i = 0, < #policy.windows.autopull do policy.windows.autopull[i]:destroy() end
   policy.windows.autopull:destroy()
