@@ -32,6 +32,14 @@ global function draw_settings(): void
   if not host.settings_open then return end
   imgui.SetNextWindowSize(vec2(560, 680), ImGuiCond_FirstUseEver)
   local open = true
+  -- a theme other than spaceghost lends the window its accent; spaceghost
+  -- keeps Dalamud's own look
+  local themed = chrome_themed()
+  if themed then
+    imgui.PushStyleColorU32(ImGuiCol_CheckMark, chrome_col(ChromeColor.Accent, 255))
+    imgui.PushStyleColorU32(ImGuiCol_SliderGrab, chrome_col(ChromeColor.Accent, 200))
+    imgui.PushStyleColorU32(ImGuiCol_SliderGrabActive, chrome_col(ChromeColor.Accent, 255))
+  end
   if imgui.Begin('Ghostty settings###ghostty_settings', &open, ImGuiWindowFlags_NoDocking) then
     if policy_settings_draw() then
       policy_refresh()
@@ -42,6 +50,7 @@ global function draw_settings(): void
     settings_badge_refresh()
   end
   imgui.End()
+  if themed then imgui.PopStyleColor(3) end
   host.settings_open = open
 end
 

@@ -60,6 +60,7 @@ global function bell_demo_tick(now: float64): void
       host.bell_demo_step = 0
     end
   end
+  if host.bell_demo_label_until < 0 then host.bell_demo_label_until = now + 2.4 end -- a caption set outside a frame
   if now < host.bell_demo_label_until and #host.bell_demo_label > 0 then
     local vp = imgui.GetMainViewport()
     local dl = imgui.GetForegroundDrawList()
@@ -69,9 +70,22 @@ global function bell_demo_tick(now: float64): void
     local x = vp.Pos.x + (vp.Size.x - tsz.x) * 0.5
     local y = vp.Pos.y + vp.Size.y * 0.18
     local a = (@uint8)(math.clamp((host.bell_demo_label_until - now) / 0.4, 0, 1) * 230)
-    imgui.DrawListAddRectFilled(dl, vec2(x - 16, y - 10), vec2(x + tsz.x + 16, y + tsz.y + 10), im_col32(12, 16, 22, a), 10, 0)
-    imgui.DrawListAddText(dl, imgui.GetFont(), size, vec2(x, y), im_col32(230, 222, 200, a), (@cstring)(host.bell_demo_label.data), nilptr, 0, nilptr)
+    imgui.DrawListAddRectFilled(dl, vec2(x - 16, y - 10), vec2(x + tsz.x + 16, y + tsz.y + 10), chrome_col(ChromeColor.Label, a), 10, 0)
+    imgui.DrawListAddText(dl, imgui.GetFont(), size, vec2(x, y), chrome_col(ChromeColor.LabelInk, a), (@cstring)(host.bell_demo_label.data), nilptr, 0, nilptr)
   end
+end
+
+-- /term theme [name]: list the themes (log and caption), or switch to one
+-- at once (saved like a choice in the settings window).
+global function theme_command(args: string): cint
+  local msg = policy_theme_command(args)
+  policy_refresh()
+  if #msg == 0 then return 4 end
+  logf(LOG_INFO, '%s', msg)
+  host.bell_demo_label:destroy()
+  host.bell_demo_label = msg
+  host.bell_demo_label_until = -1
+  return 0
 end
 
 -- /term showcase off: close the demo terminals and show the player's own again.
@@ -306,6 +320,9 @@ global function run_command(cmd: string): cint
   elseif verb == 'ask' then
     -- /term ask [question]: the rest of the line, untouched, is the question
     return assistant_command(arg)
+  elseif verb == 'theme' or verb == 'themes' then
+    -- /term theme [name]: list or switch
+    return theme_command(arg)
   elseif verb == 'bell' then
     -- /term bell [ripple|sonar|burst|aura|calm|custom|demo]
     return bell_command(arg)

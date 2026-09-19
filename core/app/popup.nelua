@@ -3,6 +3,7 @@
 -- The popup terminal (Umbra toolbar widget, or our own anchored window): a
 -- taskbar of every terminal plus a terminal.
 require 'core.app.lifecycle'
+require 'core.tooltip'
 
 local POPUP_BAR: float32 <comptime> = 30
 
@@ -31,11 +32,19 @@ global function popup_chip(dl: *ImDrawList, cx: float32, x2: float32, y1: float3
   local w = math.min(tsz.x + 14, 260)
   if cx + w <= x2 - 4 then
     local hot = mouse.x >= cx and mouse.x < cx + w and mouse.y >= y1 + 3 and mouse.y < y1 + POPUP_BAR - 3
-    imgui.DrawListAddRectFilled(dl, vec2(cx, y1 + 3), vec2(cx + w, y1 + POPUP_BAR - 3), hot and im_col32(120, 90, 50, 240) or im_col32(50, 44, 40, 220), 6, 0)
+    imgui.DrawListAddRectFilled(dl, vec2(cx, y1 + 3), vec2(cx + w, y1 + POPUP_BAR - 3), hot and chrome_col(ChromeColor.ChipHot, 240) or chrome_col(ChromeColor.Chip, 220), 6, 0)
     bell_chip_glow(dl, vec2(cx, y1 + 3), vec2(cx + w, y1 + POPUP_BAR - 3), t.id)
     imgui.DrawListPushClipRect(dl, vec2(cx, y1), vec2(cx + w - 4, y1 + POPUP_BAR), true)
-    imgui.DrawListAddText(dl, imgui.GetFont(), imgui.GetFontSize(), vec2(cx + 7, y1 + (POPUP_BAR - imgui.GetFontSize()) * 0.5), im_col32(235, 225, 210, 255), (@cstring)(label.data), nilptr, 0, nilptr)
+    imgui.DrawListAddText(dl, imgui.GetFont(), imgui.GetFontSize(), vec2(cx + 7, y1 + (POPUP_BAR - imgui.GetFontSize()) * 0.5), chrome_col(ChromeColor.ChipInk, 255), (@cstring)(label.data), nilptr, 0, nilptr)
     imgui.DrawListPopClipRect(dl)
+    if hot and imgui.GetTime ~= nilptr and tooltip_due(0x7c1b0000_u64 + (@uint64)(t.id), true, imgui.GetTime()) then
+      local key: string = 'chip.'
+      local k = key .. (@string)(where)
+      local text = policy_tooltip(k, '')
+      tooltip_show(text, nilptr, 0)
+      text:destroy()
+      k:destroy()
+    end
     if hot and host.lmb_pressed then
       host.click_used = true
       popup_click_id = t.id
