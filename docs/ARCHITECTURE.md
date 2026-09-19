@@ -29,7 +29,7 @@
   `UiBuilder.Draw` to `gu_frame` and the /xlplugins buttons, chat commands and
   info bar clicks to `gu_event`, and fills `GuHostApi` with callbacks (log,
   fonts, key state, camera, objects, animation, lights, shadow boards,
-  commands, info bar, UI-hide flags, IPC, opening a link in the browser). The core
+  commands, info bar, UI-hide flags, IPC, opening a link in the browser, a line in the chat). The core
   decides what to register, when, and under which names (`core/app/hostsurface.nelua`,
   `CONFIG.host` in lua/init.lua).
 * **Umbra is optional.** `Umbra.Ghostty.dll` keeps its file, assembly name and
@@ -310,9 +310,10 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_wincodec` | remote window frames: changed tiles, QOI both ways, banding, WFRAME write/parse/apply, malformed input, downscaling |
 | `test_capture_mac` | the macOS capture backend's pure parts: HID to kVK keycodes, key flags, mouse event types and click counts, frame pixels to global points, the Block literal layout, `run:APP`, window picking and WLISTR lines, UTF-16 text chunks, CGImage layouts to BGRA (the backend itself has never run on a Mac) |
 | `test_agent_windows` | remote windows end to end over TCP against `--windows test`: list, open by id and match, KEY and delta frames rebuilt, scaling, flow control, every input kind, close, WEND, failures, streams per connection, `--windows off` |
-| `test_capture_wayland` | the Wayland backend's pure parts: USB HID to evdev, codepoint to key and Shift in real xkb keymaps (us, de), `run:` parsing, WLIST lines, matching (only with `vendor/wayland-sdk`) |
-| `test_wayland_compositor` | the agent's Wayland compositor with a real client (`yad`, GTK3): launch through `run:`, map, frame size and content, click and TEXT/KEY/WHEEL input changing the pixels, WLIST, close, a launch that exits without a window; writes `first.png` and `typed.png` to `build/test-scratch/wayland` (only with `vendor/wayland-sdk`; skipped without yad) |
-| `test_e2e_wayland` | the plugin's agent client against a real `ghostty-agent --windows wayland`: `run:yad`, KEY and delta frames with WACK pacing, click and TEXT reaching the app, SIGTERM ending the apps the agent launched (only with `vendor/wayland-sdk` and yad) |
+| `test_capture_wayland` | the Wayland backend's pure parts: USB HID to evdev, codepoint to key and Shift in real xkb keymaps (us, de), `run:` parsing, `app:`/`desktop:` forms and nested desktop commands, WLIST lines with launch ids, window keys and their scores, the render node choice and nvidia-smi parsing, matching (only with `vendor/wayland-sdk`) |
+| `test_desktop_entries` | installed apps (`agent/desktop_entries.nelua`): .desktop parsing, Exec field codes, lookup by id and fuzzy name, `app`/`term` list lines, icon lookup in a made-up theme tree, icon cache jobs (PNG copied, SVG rendered by the host's rsvg-convert or ImageMagick) |
+| `test_wayland_compositor` | the agent's Wayland compositor with a real client (`yad`, GTK3): launch through `run:`, map, frame size and content, click and TEXT/KEY/WHEEL input changing the pixels, WLIST, close, a launch that exits without a window; context menus outside the window (xdg and X11) with their boxes; an X11 client through Xwayland; release and re-attach by key; WLIST `apps` and `app:` launches with cached icons; a nested desktop (cage); text-input-v3 and the clipboard read back through `yad --entry`; writes PNGs to `build/test-scratch/wayland` (only with `vendor/wayland-sdk`; skipped without yad) |
+| `test_e2e_wayland` | the plugin's agent client against a real `ghostty-agent --windows wayland`: `run:yad`, KEY and delta frames with WACK pacing, click and TEXT reaching the app, WGEOM for a context menu, the clipboard both ways (`--clipboard-file`), a disconnect keeping the app and WOPEN `key:` re-attaching it, a Flatpak GTK4 app staying mapped, SIGTERM ending the apps the agent launched (only with `vendor/wayland-sdk` and yad) |
 
 The last step checks that the core also compiles as a native host module.
 

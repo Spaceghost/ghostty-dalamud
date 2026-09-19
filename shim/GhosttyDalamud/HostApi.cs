@@ -74,6 +74,7 @@ internal static unsafe class HostApi
         Api->BgSetTransparency = &BgSetTransparency;
         Api->BgDestroy      = &BgDestroy;
         Api->CommandAddTagged = &CommandAddTagged;
+        Api->ChatPrint      = &ChatPrint;
         Api->AddonRect      = &AddonRect;
         Api->AddonShow      = &AddonShow;
         Api->ChatSend       = &ChatSend;
@@ -181,6 +182,14 @@ internal static unsafe class HostApi
     private static void IpcUnregister()
     {
         try { GhosttyIpc.Unregister(); } catch { /* the core is shutting down either way */ }
+    }
+
+    // a line in the game chat; what to say and when is the core's
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int ChatPrint(byte* text)
+    {
+        if (text == null) return 0;
+        try { Plugin.Chat.Print(Str(text)); return 1; } catch { return 0; }
     }
 
     // the core only passes https links; opening one is Dalamud's job

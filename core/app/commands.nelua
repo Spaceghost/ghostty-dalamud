@@ -228,11 +228,31 @@ global function run_command(cmd: string): cint
     toggle_visible()
     return 0
   elseif verb == 'pin' then
+    -- /term pin toggle: the focused world panel, pin <-> pet where it is (its title button)
+    local focused = world_panel(host.world_focus)
+    if arg == 'toggle' then
+      if focused == nilptr then sayf(LOG_WARN, 'pin toggle: no focused world panel') return 4 end
+      local e = world_toggle_pet(focused)
+      local rc: cint = 0
+      if #e > 0 then sayf(LOG_WARN, 'pin: %s', e) rc = 4 end
+      e:destroy()
+      return rc
+    end
     -- a focused window panel moves (core/app/remotewin.nelua)
     local on_window, wrc = remotewin_pin(arg)
     if on_window then return wrc end
     local on_panel, prc = panels_pin(arg) -- a focused pulled window moves the same way (core/app/panels.nelua)
     if on_panel then return prc end
+    -- so does a focused world terminal (hide: out of sight and asleep)
+    if focused ~= nilptr then
+      local e: string
+      if arg == 'hide' or arg == 'hide off' then e = world_panel_hide(focused, arg == 'hide')
+      else e = policy_world_command(focused.id, arg) end
+      local rc: cint = 0
+      if #e > 0 then sayf(LOG_WARN, 'pin: %s', e) rc = 4 end
+      e:destroy()
+      return rc
+    end
     -- pin the active dropdown tab (or a new session) into the world
     local s: *Session = nilptr
     local from_tab = host.dropdown_active >= 0 and host.dropdown_active < #host.dropdown_tabs

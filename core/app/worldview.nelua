@@ -328,6 +328,22 @@ end
 -- core/world.nelua) runs the gesture, lua/world.lua drop() pins it on release.
 
 -- Alt, Shift, Ctrl as held (raw on Windows: the game may have the keyboard).
+-- The pin <-> pet button's icon in its 26 px square at (x, y): on a pet a
+-- push pin (click: pin it where it floats), on a pin a paw (click: a pet).
+local function draw_pet_icon(dl: *ImDrawList, x: float32, y: float32, pet: boolean, ink: uint32): void
+  if pet then
+    imgui.DrawListAddRectFilled(dl, vec2(x + 9, y + 5), vec2(x + 17, y + 12), ink, 3.5, 0)   -- head
+    imgui.DrawListAddLine(dl, vec2(x + 7, y + 13), vec2(x + 19, y + 13), ink, 2.0)           -- collar
+    imgui.DrawListAddLine(dl, vec2(x + 13, y + 13), vec2(x + 13, y + 22), ink, 1.6)          -- needle
+  else
+    imgui.DrawListAddRectFilled(dl, vec2(x + 8, y + 13), vec2(x + 18, y + 21), ink, 4, 0)    -- pad
+    imgui.DrawListAddRectFilled(dl, vec2(x + 4.5, y + 9), vec2(x + 8, y + 12.5), ink, 1.8, 0) -- toes
+    imgui.DrawListAddRectFilled(dl, vec2(x + 9, y + 5.5), vec2(x + 12.5, y + 9.5), ink, 1.8, 0)
+    imgui.DrawListAddRectFilled(dl, vec2(x + 13.5, y + 5.5), vec2(x + 17, y + 9.5), ink, 1.8, 0)
+    imgui.DrawListAddRectFilled(dl, vec2(x + 18, y + 9), vec2(x + 21.5, y + 12.5), ink, 1.8, 0)
+  end
+end
+
 local function drag_mods(): (boolean, boolean, boolean)
   ## if ccinfo.is_windows then
     return (GetAsyncKeyState(0x12) & 0x8000) ~= 0, (GetAsyncKeyState(0x10) & 0x8000) ~= 0, (GetAsyncKeyState(0x11) & 0x8000) ~= 0
@@ -471,6 +487,116 @@ local function camera_tick(wdt: float32): void
   end
 end
 
+-- World panel operations: the title buttons, /term pin and IPC (lua/ipc.lua) --------------
+
+-- A world panel (terminal or window) by id, or nilptr.
+global function world_panel(id: integer): *Session
+  if id == 0 then return nilptr end
+  for i = 0, < #host.world do
+    if host.world[i].id == id then return host.world[i] end
+  end
+  return nilptr
+end
+
+-- Pin <-> pet (lua/world.lua `toggle`): a pet becomes a pin at the pose it
+-- was last shown at (presented included), anything else a pet. '' or why
+-- not (owned either way).
+global function world_toggle_pet(s: *Session): string
+  local sb: stringbuilder
+  sb:write('toggle')
+  if s.posed then sb:writef(' %.5f %.5f %.5f %.6f %.6f', s.pose_x, s.pose_y, s.pose_z, s.pose_yaw, s.pose_pitch) end
+  local args = sb:promote()
+  local err = policy_world_command(s.id, args)
+  args:destroy()
+  if #err == 0 and host.walk.id == s.id then end_walk(WORLD_WALK_CANCELLED) end -- it moves or stays: walking there means nothing now
+  return err
+end
+
+-- Hide or show world panel `s` (lua/world.lua's `hidden`). Hidden it is not
+-- drawn, loses the keyboard and full screen, and sleeps at once as an unseen
+-- panel does after a while: a window stops acknowledging frames (the agent
+-- stops sending), a terminal detaches (not while a full-screen program runs
+-- in it: a replay would lose its modes). Shown again, it wakes when next drawn.
+-- '' or why not (owned).
+global function world_panel_hide(s: *Session, hidden: boolean): string
+  local err = policy_world_command(s.id, hidden and 'hide' or 'hide off')
+  if #err > 0 or not hidden then return err end
+  if host.world_focus == s.id then host.world_focus = 0 end
+  if host.world_full_id == s.id then host.world_full_id = 0 end
+  if host.world_drag_id == s.id then host.world_drag_id = 0 end
+  if host.drag.id == s.id then host.drag.id = 0 end
+  if host.walk.id == s.id then end_walk(WORLD_WALK_CANCELLED) end
+  s.posed = false
+  if s.kind == TransportKind.Window or s.view.term == nilptr or not ghostty_terminal_mode_enabled(s.view.term, 1049, false) then
+    s:sleep()
+  end
+  return err
+end
+
+-- Give world panel `s` the keyboard as a click on it would (focused, and no
+-- ImGui window keeps focus beside it), without the click's walk-up or camera
+-- turn. A pet still turns your character to face it once, as on a click.
+-- '' or why not (owned).
+global function world_panel_focus(s: *Session): string
+  if s.leaving then return string.copy('the panel is closing') end
+  set_world_visible(true)
+  host.world_focus = s.id
+  host.last_click_id = 0
+  if imgui.SetWindowFocusNil ~= nilptr then imgui.SetWindowFocusNil() end
+  return string{}
+end
+
+-- A new world terminal of `profile` ('' the default; a number: its place in
+-- CONFIG.profiles counting from 1; else its name), a pet or at `pin`'s place
+-- (as /term pin takes it), as /term pet opens one. Its id, or 0 and why (owned).
+global function world_terminal_new(profile: string, pin: string): (integer, string)
+  if not player_loaded() then return 0, string.copy('no player (log in first)') end
+  local idx: integer = policy.default_profile - 1
+  if #profile > 0 then
+    local n: integer = 0
+    local digits = #profile <= 6
+    for i = 0, < #profile do
+      local c = profile.data[i]
+      if c < '0'_b or c > '9'_b then digits = false break end
+      n = n * 10 + (c - '0'_b)
+    end
+    idx = -1
+    if digits then
+      if n >= 1 and n <= #policy.profiles then idx = n - 1 end
+    else
+      for i = 0, < #policy.profiles do
+        if policy.profiles[i].name == profile then idx = i break end
+      end
+    end
+    if idx < 0 then
+      local sb: stringbuilder
+      sb:write('no such profile: ', profile)
+      return 0, sb:promote()
+    end
+  end
+  local s = session_new(idx, 80, 24)
+  if s == nilptr then return 0, string.copy('no terminal could be opened') end
+  if #pin == 0 then
+    if not make_pet(s) then
+      session_remove(s)
+      return 0, string.copy('the pet could not be placed')
+    end
+  else
+    local err = policy_world_command(s.id, pin)
+    if #err > 0 then
+      session_remove(s)
+      local sb: stringbuilder
+      sb:write('pin: ', err)
+      err:destroy()
+      return 0, sb:promote()
+    end
+    host.world:push(s)
+    set_world_visible(true)
+    logf(LOG_INFO, 'session %d: pinned in world (%s)', s.id, pin)
+  end
+  return s.id, string{}
+end
+
 global function draw_world(now: float64): void
   defer lights_sync() end -- panel lights: however this frame ends
   defer occluders_sync(&host.world_tuning) end -- and shadow boards
@@ -584,6 +710,9 @@ global function draw_world(now: float64): void
       if host.walk.id == s.id then host.walk.tx, host.walk.tz = placed_x, placed_z end
       if not carried then present_panel(s, &pl, &cam, &occ, &pc, wdt, full_this) end
     end
+    -- the pose it is shown at: pin <-> pet turns it into a pin right there
+    s.posed = ok and not carried
+    if s.posed then s.pose_x, s.pose_y, s.pose_z, s.pose_yaw, s.pose_pitch = pl.x, pl.y, pl.z, pl.yaw, pl.pitch end
     -- the shadow board follows the pose the panel is drawn at (carried or
     -- presented); full screen leaves the world, so the board goes
     occluder_panel(s.id, ok and not s.sleeping and prez * (1 - ft) > 0, &pl, &host.world_tuning)
@@ -655,6 +784,7 @@ global function draw_world(now: float64): void
         local on_close = button == WORLD_BUTTON_CLOSE
         local on_full = button == WORLD_BUTTON_FULL
         local on_popin = button == WORLD_BUTTON_POPIN
+        local on_pet = button == WORLD_BUTTON_PET
         local on_occluded = button == WORLD_BUTTON_OCCLUDED
         if button ~= WORLD_BUTTON_NONE then grip = 0 end
         if ft > 0 then grip = 0 end -- no resizing while full screen
@@ -667,6 +797,7 @@ global function draw_world(now: float64): void
             if on_close then key = 'world.close'
             elseif on_full then key = ft > 0.5 and 'world.full.off' or 'world.full'
             elseif on_popin then key = 'world.popin'
+            elseif on_pet then key = pl.pet and 'world.pin' or 'world.pet'
             elseif on_occluded then key = s.run_occluded and 'world.sleep.off' or 'world.sleep.on' end
             local text = policy_tooltip(key, '')
             tooltip_show(text, nilptr, 0)
@@ -699,6 +830,8 @@ global function draw_world(now: float64): void
             host.world_full_toggle_id = s.id
           elseif click and on_popin then
             host.world_popin_id = s.id
+          elseif click and on_pet then
+            host.world_pet_toggle_id = s.id
           elseif click and on_occluded then
             host.world_occluded_toggle_id = s.id
           end
@@ -843,6 +976,10 @@ global function draw_world(now: float64): void
           imgui.DrawListAddLine(dl, vec2(cx0 + 6, cy0 + 8), vec2(cx0 + 20, cy0 + 8), ink, 2.0)
           imgui.DrawListAddLine(dl, vec2(cx0 + 13, cy0 + 12), vec2(cx0 + 13, cy0 + 21), ink, 2.0)
           imgui.DrawListAddTriangleFilled(dl, vec2(cx0 + 8, cy0 + 12), vec2(cx0 + 18, cy0 + 12), vec2(cx0 + 13, cy0 + 7), ink)
+          -- pin <-> pet: a pin on a pet (pin it here), a paw on a pin (make it a pet)
+          cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_PET)
+          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_pet and not over_window) and chrome_col(ChromeColor.Popin, 235) or chrome_col(ChromeColor.PopinIdle, 180), 5, 0)
+          draw_pet_icon(dl, cx0, cy0, pl.pet, ink)
           -- keep running when unseen: moon (sleeps) or play (keeps running)
           cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_OCCLUDED)
           imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_occluded and not over_window) and chrome_col(ChromeColor.Sleep, 235) or chrome_col(ChromeColor.SleepIdle, 180), 5, 0)
@@ -889,6 +1026,16 @@ global function draw_world(now: float64): void
     local ts = find_session(oid)
     if ts ~= nilptr then
       local e = policy_world_command(oid, ts.run_occluded and 'occluded off' or 'occluded on')
+      e:destroy()
+    end
+  end
+  if host.world_pet_toggle_id ~= 0 then
+    local tid = host.world_pet_toggle_id
+    host.world_pet_toggle_id = 0
+    local ts = world_panel(tid)
+    if ts ~= nilptr then
+      local e = world_toggle_pet(ts)
+      if #e > 0 then sayf(LOG_WARN, 'pin: %s', e) end
       e:destroy()
     end
   end

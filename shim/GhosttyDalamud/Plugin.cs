@@ -28,7 +28,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     [PluginService] internal static IGameInteropProvider Interop { get; private set; } = null!;
     [PluginService] internal static IGameConfig GameConfig { get; private set; } = null!;
     [PluginService] internal static IFramework GameFramework { get; private set; } = null!;
-    [PluginService] internal static IChatGui ChatGui { get; private set; } = null!;
+    [PluginService] internal static IChatGui Chat { get; private set; } = null!;
     [PluginService] internal static IGameGui GameGui { get; private set; } = null!;
 
     public Plugin()
@@ -60,7 +60,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         Pi.UiBuilder.OpenMainUi   += OnOpenMain;
         Pi.UiBuilder.OpenConfigUi += OnOpenConfig;
         Pi.ActivePluginsChanged   += OnPluginsChanged;
-        if (Native.Chat != null) ChatGui.ChatMessageUnhandled += OnChat;
+        if (Native.Chat != null) Chat.ChatMessageUnhandled += OnChat;
     }
 
     private static void OnDraw() => Native.Frame();
@@ -81,7 +81,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         Pi.UiBuilder.OpenMainUi   -= OnOpenMain;
         Pi.UiBuilder.OpenConfigUi -= OnOpenConfig;
         Pi.ActivePluginsChanged   -= OnPluginsChanged;
-        ChatGui.ChatMessageUnhandled -= OnChat;
+        Chat.ChatMessageUnhandled -= OnChat;
         HostApi.UnhookWalkInput(); // before the core it calls goes away
         Native.Shutdown();         // the core removes its commands, info bar entry and IPC first
         Native.Unload();

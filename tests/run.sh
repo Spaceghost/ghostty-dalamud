@@ -27,6 +27,7 @@ source "$ROOT/tools/wayland-flags.sh" # the agent's Wayland compositor, when ven
 wlrun() { echo "--- $1"; "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${WAYLAND_DEFINE[@]}" --cflags="$INC $LIBS $WAYLAND_CFLAGS" --cache-dir build/nelua-cache -L . -b "tests/$1.nelua"; "build/nelua-cache/$1" "${@:2}"; }
 if [[ ${#WAYLAND_DEFINE[@]} -gt 0 ]]; then wlrun test_capture_wayland; else echo "--- test_capture_wayland skipped (no vendor/wayland-sdk or libwlroots-0.20)"; fi
 run test_capture_mac
+run test_desktop_entries "$ROOT/build/test-scratch"
 run test_render
 run test_session
 run test_dualsense
@@ -103,12 +104,14 @@ if [[ ${#WAYLAND_DEFINE[@]} -gt 0 ]]; then
   "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${WAYLAND_DEFINE[@]}" --cflags="$WAYLAND_CFLAGS" --cache-dir build/nelua-cache -L . -o build/ghostty-agent-wayland -b agent/agent.nelua
   "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -b tests/test_e2e_wayland.nelua
   LPORT=$((PORT + 2)); LSOCK="ghostty-test-$$"; LTITLE="ghostty-e2e-$$"
+  rm -f build/agent-wayland-clipboard
   env -u DISPLAY build/ghostty-agent-wayland --listen "127.0.0.1:$LPORT" --token-file build/agent-token --windows wayland \
+    --clipboard-file build/agent-wayland-clipboard \
     --wayland-socket "$LSOCK" >build/agent-wayland.log 2>&1 &
   LAGENT=$!
   sleep 0.5
   kill -0 "$LAGENT" || { cat build/agent-wayland.log; exit 1; }
-  build/nelua-cache/test_e2e_wayland "$LPORT" testtoken123 "$ROOT/build/test-scratch/wayland" "$LTITLE" || { cat build/agent-wayland.log; kill "$LAGENT"; exit 1; }
+  build/nelua-cache/test_e2e_wayland "$LPORT" testtoken123 "$ROOT/build/test-scratch/wayland" "$LTITLE" "$ROOT/build/agent-wayland-clipboard" || { cat build/agent-wayland.log; kill "$LAGENT"; exit 1; }
   # stopping the agent ends the app it launched (SIGTERM -> capture_wayland_shutdown)
   kill -TERM "$LAGENT"; wait "$LAGENT" || true
   sleep 0.3

@@ -1,0 +1,202 @@
+-- The Windows picker: `/window`, `/window list` and `/window pull` with
+-- nothing after it open it (window_picker_show in core/app/remotewin.nelua,
+-- which asks the agent for a fresh list). It shows the agent's last WLISTR
+-- (`winlist`): its open windows, each pulled onto a pet with a click; the apps
+-- a newer agent lists ("app" lines), started the same way; a Run: box whose
+-- Enter does `/window run TEXT`; and a button that leaves the choice to the
+-- desktop (the agent's own picker). Results go to the chat as well as the
+-- log (say), and the last one stays at the bottom of the picker.
+--
+-- Drawn in the dropdown's glass (dropdown_glass) with ImGui's own widgets.
+require 'C.stdio'
+require 'core.app.remotewin'
+
+local run_buf: [512]cchar       -- the Run: box
+local note: string              -- the last result, shown at the bottom (owned)
+local note_bad = false
+
+local function set_note(ok: boolean, what: string, err: string): void
+  note:destroy()
+  local sb: stringbuilder
+  if ok then sb:write(what) else sb:write(what, ': ', err) end
+  note = sb:promote()
+  note_bad = not ok
+  if not ok then say(LOG_WARN, note) end
+end
+
+-- One pick: a window by id (0: the desktop chooses), a match text, or a command to run.
+local function pick(spec: WindowOpenSpec, what: string): void
+  local id, err = window_open(spec)
+  if id ~= 0 then
+    set_note(true, what, '')
+    host.window_picker_open = false -- done; the panel appears beside you
+  else
+    set_note(false, what, err)
+  end
+end
+
+-- a, b and c joined into `buf` (cut to fit, NUL-terminated), for ImGui labels.
+local function append(buf: *[256]cchar, n: usize, part: string): usize
+  for i = 0, < #part do
+    if n + 1 >= 256 then break end
+    local ch = part.data[i]
+    if ch < 32 then ch = 32 end -- control characters (a tab in a title) as spaces
+    buf[n] = (@cchar)(ch)
+    n = n + 1
+  end
+  return n
+end
+
+local function label(buf: *[256]cchar, a: string, b: string, c: string): cstring
+  local n = append(buf, append(buf, append(buf, 0, a), b), c)
+  buf[n] = 0
+  return (@cstring)(buf)
+end
+
+global function draw_window_picker(): void
+  if not host.window_picker_open then return end
+  if imgui.InputText == nilptr or imgui.BeginChild == nilptr or imgui.Selectable == nilptr then return end
+  local vp = imgui.GetMainViewport()
+  imgui.SetNextWindowPos(vec2(vp.Pos.x + vp.Size.x * 0.5, vp.Pos.y + vp.Size.y * 0.4), ImGuiCond_FirstUseEver, vec2(0.5, 0.5))
+  imgui.SetNextWindowSize(vec2(560, 460), ImGuiCond_FirstUseEver)
+  local rounding = (@float32)(policy.dropdown.rounding)
+  imgui.PushStyleVarVec2(ImGuiStyleVar_WindowPadding, vec2(14, 12))
+  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowRounding, rounding)
+  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowBorderSize, 0)
+  imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.Ink, 255))
+  imgui.PushStyleColorU32(ImGuiCol_Button, chrome_col(ChromeColor.Chip, 220))
+  imgui.PushStyleColorU32(ImGuiCol_ButtonHovered, chrome_col(ChromeColor.ChipHot, 235))
+  imgui.PushStyleColorU32(ImGuiCol_ButtonActive, chrome_col(ChromeColor.Accent, 200))
+  imgui.PushStyleColorU32(ImGuiCol_FrameBg, chrome_col(ChromeColor.GlassFlat, 230))
+  imgui.PushStyleColorU32(ImGuiCol_Header, chrome_col(ChromeColor.Chip, 200))
+  imgui.PushStyleColorU32(ImGuiCol_HeaderHovered, chrome_col(ChromeColor.ChipHot, 220))
+  local flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoSavedSettings |
+    ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar
+  local visible = imgui.Begin('###ghostty_window_picker', nilptr, flags)
+  imgui.PopStyleVar(3)
+  if visible then
+    -- a press on the picker is its own (gu_frame's click-off must not drop it)
+    if host.lmb_pressed and imgui.IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows) then host.click_used = true end
+    local wp: ImVec2
+    local wsz: ImVec2
+    imgui.GetWindowPos(&wp)
+    imgui.GetWindowSize(&wsz)
+    local dl = imgui.GetWindowDrawList()
+    dropdown_glass(dl, wp.x, wp.y, wp.x + wsz.x, wp.y + wsz.y, rounding, 36)
+    local buf: [256]cchar
+
+    imgui.TextUnformatted('Windows', nilptr)
+    imgui.SameLine(math.max(wsz.x - 150, 90), -1)
+    if imgui.SmallButton('Refresh') then
+      local ok, err = window_agent_list('')
+      set_note(ok, 'asked the agent for its windows', err)
+    end
+    imgui.SameLine(0, -1)
+    if imgui.SmallButton('Close') then host.window_picker_open = false end
+    imgui.Separator()
+
+    local agent_ok = host.agent_enabled and host.agent:ready() and host.agent:windows_ok()
+    if not agent_ok then
+      local why: string = 'the agent is not connected'
+      if host.agent_enabled and host.agent:ready() then why = AGENT_WINDOWS_TOO_OLD end
+      imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkDim, 255))
+      imgui.TextUnformatted(label(&buf, why, '', ''), nilptr)
+      imgui.PopStyleColor(1)
+    end
+
+    -- the agent's windows (and apps), scrolled when many
+    local list_h = math.max(wsz.y - 190, 80)
+    if imgui.BeginChild('##ghostty_picker_list', vec2(0, list_h), false, 0) then
+      local shown = 0
+      for i = 0, < #winlist.windows do
+        local e = &winlist.windows[i]
+        if e.wid == 0 then continue end -- "what WOPEN with wid 0 does": the button below
+        imgui.PushIDInt((@cint)(i))
+        local size: [32]cchar
+        C.snprintf((@cstring)(&size), #size, '  %dx%d', (@cint)(e.w), (@cint)(e.h))
+        local name: string = #e.title > 0 and e.title or e.app
+        if imgui.Selectable(label(&buf, name, #e.app > 0 and #e.title > 0 and ' \u{2014} ' or '', #e.title > 0 and e.app or ''), false, 0, vec2(0, 0)) then
+          local what: string
+          do
+            local sb: stringbuilder
+            sb:writef('pulled #%d ', e.wid)
+            sb:write(name)
+            what = sb:promote()
+          end
+          pick(WindowOpenSpec{ wid = e.wid }, what)
+          what:destroy()
+        end
+        imgui.SameLine(0, -1)
+        imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkFaint, 255))
+        imgui.TextUnformatted((@cstring)(&size), nilptr)
+        imgui.PopStyleColor(1)
+        imgui.PopID()
+        shown = shown + 1
+        if not host.window_picker_open then break end -- picked: winlist may change under us next frame only, but stop here
+      end
+      if shown == 0 then
+        imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkDim, 255))
+        imgui.TextUnformatted(winlist.answers == 0 and 'asking the agent for its windows\u{2026}' or 'no windows open on the desktop', nilptr)
+        imgui.PopStyleColor(1)
+      end
+      if #winlist.apps > 0 and host.window_picker_open then
+        imgui.Spacing()
+        imgui.TextUnformatted('Apps', nilptr)
+        imgui.Separator()
+        for i = 0, < #winlist.apps do
+          local a = &winlist.apps[i]
+          imgui.PushIDInt((@cint)(10000 + i))
+          if imgui.Selectable(label(&buf, a.name, #a.categories > 0 and '   ' or '', a.categories), false, 0, vec2(0, 0)) then
+            local sb: stringbuilder
+            sb:write('app:', a.id) -- the agent starts the app with this id
+            local m = sb:promote()
+            local sb2: stringbuilder
+            sb2:write('started ', a.name)
+            local what = sb2:promote()
+            pick(WindowOpenSpec{ match = m }, what)
+            m:destroy() what:destroy()
+          end
+          imgui.PopID()
+          if not host.window_picker_open then break end
+        end
+      end
+    end
+    imgui.EndChild()
+
+    -- Run: a command the agent starts, its window on a pet
+    imgui.TextUnformatted('Run:', nilptr)
+    imgui.SameLine(0, -1)
+    local enter = imgui.InputText('##ghostty_picker_run', (@cstring)(&run_buf), #run_buf, ImGuiInputTextFlags_EnterReturnsTrue, nilptr, nilptr)
+    imgui.SameLine(0, -1)
+    if (imgui.Button('Run', vec2(0, 0)) or enter) and run_buf[0] ~= 0 then
+      local cmd = string.copy((@cstring)(&run_buf))
+      local sb: stringbuilder
+      sb:write('run ', cmd)
+      local line = sb:promote()
+      local sb2: stringbuilder
+      sb2:write('run ', cmd)
+      local what = sb2:promote()
+      local ok, err = remotewin_pull(line)
+      set_note(ok, what, err)
+      if ok then
+        run_buf[0] = 0
+        host.window_picker_open = false
+      end
+      line:destroy() what:destroy() cmd:destroy()
+    end
+    if imgui.Button('Let the desktop choose', vec2(0, 0)) then pick(WindowOpenSpec{}, 'asked the desktop to choose a window') end
+    if #note > 0 then
+      imgui.PushStyleColorU32(ImGuiCol_Text, note_bad and chrome_col(ChromeColor.Close, 255) or chrome_col(ChromeColor.InkDim, 255))
+      imgui.TextUnformatted(label(&buf, note, '', ''), nilptr)
+      imgui.PopStyleColor(1)
+    end
+  end
+  imgui.End()
+  imgui.PopStyleColor(7)
+end
+
+global function window_picker_shutdown(): void
+  note:destroy()
+  note_bad = false
+  run_buf[0] = 0
+end

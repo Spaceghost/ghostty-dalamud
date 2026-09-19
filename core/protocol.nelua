@@ -26,6 +26,9 @@
 -- Version 1 agents greet with "ghostty-agent 1", report a failed OPEN or an
 -- unknown ATTACH id as ERR text, acknowledge ATTACH with OK "attached" and
 -- ignore `fed`; the client translates those into the version 2 events.
+--   WGEOM (agent -> client, additive): where the window and its popups are in
+--   a stream's picture; docs/REMOTE_WINDOWS.md. Clients that do not know it
+--   ignore it (the picture still maps input 1:1).
 --   CLIP_SET text -> OK            CLIP_GET -> CLIP text   (host system clipboard)
 --   TITLE   id, text (forwarded from OSC title changes seen by the agent; optional)
 --
@@ -63,6 +66,7 @@ global PROTO_WLISTR: uint8 <comptime> = 24    -- lines "wid\tw\th\tapp\ttitle\n"
 global PROTO_WOPENED: uint8 <comptime> = 25   -- req u32, sid, w u16, h u16, title (sid 0: failed, text says why)
 global PROTO_WFRAME: uint8 <comptime> = 26    -- sid, seq u32, w u16, h u16, flags u8, nrect u16, rects
 global PROTO_WEND: uint8 <comptime> = 27      -- sid, reason
+global PROTO_WGEOM: uint8 <comptime> = 28     -- sid, seq u32, n u16, n x (x u16, y u16, w u16, h u16): window, then popups
 
 -- WINPUT kinds
 global WIN_INPUT_MOVE: uint8 <comptime> = 1   -- x i16, y i16

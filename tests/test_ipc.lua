@@ -137,6 +137,40 @@ do
   refused({ method = 'window.place', params = { id = 4 } }, 'pin is required')
   refused({ method = 'window.place', params = { id = 4, pin = '' } }, 'pin must not be empty')
   assert(#queued == 7, 'nothing refused was queued')
+  -- the panel methods for XivDesktop
+  call({ method = 'window.hide', params = { id = 4, hidden = true } })
+  eq(json.decode(queued[8]).params, { id = 4, hidden = true })
+  call({ method = 'window.toggle_pet', params = { id = 4 } })
+  call({ method = 'agent.windows.refresh' })
+  call({ method = 'terminal.new' })
+  call({ method = 'terminal.new', params = { profile = 2, pin = 'here' } })
+  eq(json.decode(queued[12]).params, { profile = 2, pin = 'here' })
+  call({ method = 'terminal.new', params = { profile = 'pwsh' } })
+  call({ method = 'focus.cycle' })
+  eq(json.decode(queued[14]).params, { dir = 'next' })
+  call({ method = 'focus.cycle', params = { dir = -1 } })
+  eq(json.decode(queued[15]).params, { dir = 'prev' })
+  assert(#queued == 15)
+  refused({ method = 'window.hide', params = { id = 4 } }, 'hidden must be true or false')
+  refused({ method = 'window.hide', params = { id = 4, hidden = 'yes' } }, 'hidden must be true or false')
+  refused({ method = 'window.hide', params = { hidden = true } }, 'id must be')
+  refused({ method = 'window.toggle_pet', params = { id = -1 } }, 'id must be')
+  refused({ method = 'agent.windows.refresh', params = { agent = 'bak' } }, 'default')
+  refused({ method = 'terminal.new', params = { profile = 0 } }, 'profile must be')
+  refused({ method = 'terminal.new', params = { profile = '' } }, 'profile must not be empty')
+  refused({ method = 'terminal.new', params = { profile = true } }, 'profile must be a string')
+  refused({ method = 'terminal.new', params = { pin = 3 } }, 'pin must be a string')
+  refused({ method = 'focus.cycle', params = { dir = 'up' } }, 'dir must be')
+  assert(#queued == 15, 'nothing refused was queued')
+  -- reads from the snapshot
+  snap = json.encode({ rev = 3, windows = json.array(), requests = json.array(), agent = { connected = false }, status = 'ghostty 2',
+    agent_windows = { { wid = 7, w = 800, h = 600, app = 'firefox', title = 'Mozilla Firefox', key = 'k7', extra = { 'key:k7' } } },
+    agent_apps = { { id = 'foot', name = 'Foot', icon = 'foot', categories = 'System;TerminalEmulator;' } },
+    focus = { id = 12, kind = 'window' } })
+  eq(call({ method = 'agent.windows' }).result, { { wid = 7, w = 800, h = 600, app = 'firefox', title = 'Mozilla Firefox', key = 'k7', extra = { 'key:k7' } } })
+  eq(call({ method = 'agent.apps' }).result[1].id, 'foot')
+  eq(call({ method = 'focus.get' }).result, { id = 12, kind = 'window' })
+  assert(#queued == 15, 'reads queue nothing')
   queue_full = true
   refused({ method = 'window.focus', params = { id = 4 } }, 'too many changes waiting')
   queue_full = false
@@ -145,7 +179,18 @@ end
 
 -- lua/ipc.lua, the frame side ----------------------------------------------------------------
 do
-  local panels, next_id, calls = {}, 10, {}
+  local panels, next_id, calls, focus_calls = {}, 10, {}, {}
+  local world_list = {}
+  ghostty.world_panels = function() return world_list end
+  ghostty.panel_focus = function(id)
+    focus_calls[#focus_calls + 1] = id
+    for _, p in ipairs(world_list) do p.focused = p.id == id end
+    return true
+  end
+  ghostty.agent_windows = function()
+    return { windows = { { wid = 7, w = 800, h = 600, app = 'firefox', title = 'Mozilla Firefox', key = '', extra = {} } },
+      apps = {}, answers = 1 }
+  end
   package.loaded.world = { anchors = {} }
   local world = package.loaded.world
   ghostty.log = function() end
@@ -173,14 +218,17 @@ do
 
   local s1 = json.decode(ipc.snapshot())
   eq(s1, { rev = s1.rev, windows = json.array(), requests = json.array(), status = 'ghostty',
-    agent = { connected = true, version = 3, windows_ok = true, agent = '127.0.0.1:7777' } })
+    agent = { connected = true, version = 3, windows_ok = true, agent = '127.0.0.1:7777' },
+    agent_windows = { { wid = 7, w = 800, h = 600, app = 'firefox', title = 'Mozilla Firefox', key = '', extra = json.array() } },
+    agent_apps = json.array(), focus = { id = 0 } })
   assert(json.decode(ipc.snapshot()).rev == s1.rev, 'nothing changed: the same rev')
 
   ipc.run(queued[1]) -- window.open run yad, for XivDesktop
   assert(calls[1].run == 'yad --title x' and calls[1].caller == 'XivDesktop')
   local s2 = json.decode(ipc.snapshot())
   assert(s2.rev == s1.rev + 1, 'a new panel moves rev')
-  eq(s2.windows[1], { id = 11, sid = 0, title = '', app = 'yad --title x', w = 0, h = 0, state = 'pending', kind = 'pet', focused = false })
+  eq(s2.windows[1], { id = 11, sid = 0, title = '', app = 'yad --title x', w = 0, h = 0, state = 'pending', kind = 'pet', focused = false,
+    hidden = false, anchor = 'pet', agent = 'default', key = '' })
   eq(s2.requests[1], { request = json.decode(queued[1]).request, method = 'window.open', ok = true, result = { id = 11 } })
 
   panels[1].state, panels[1].sid, panels[1].title = 'live', 3, 'Yad'
@@ -188,6 +236,12 @@ do
   assert(s3.rev == s2.rev + 1 and s3.windows[1].state == 'live' and s3.windows[1].title == 'Yad', 'a state change moves rev')
   world.anchors[11] = { kind = 'world' }
   assert(json.decode(ipc.snapshot()).windows[1].kind == 'pin', 'a pinned panel')
+  world.anchors[11] = { kind = 'follow', player = true, hidden = true }
+  local sh = json.decode(ipc.snapshot())
+  assert(sh.windows[1].kind == 'pin' and sh.windows[1].anchor == 'me' and sh.windows[1].hidden == true, 'the anchor as it is, hidden')
+  world.anchors[11] = { kind = 'orbit' }
+  assert(json.decode(ipc.snapshot()).windows[1].anchor == 'orbit')
+  world.anchors[11] = { kind = 'world' }
   panels[1].view = 'full'
   assert(json.decode(ipc.snapshot()).windows[1].kind == 'full')
   panels[1].view = 'world'
@@ -204,5 +258,40 @@ do
   for i = 1, 40 do ipc.run(json.encode({ request = 200 + i, method = 'window.close', params = { id = 1 } })) end
   local s6 = json.decode(ipc.snapshot())
   assert(#s6.requests == ipc.max_results and s6.requests[#s6.requests].request == 240 and s6.requests[1].request == 225)
+
+  -- focus: focus.get from the world panels; focus.cycle skips hidden ones and wraps
+  world_list = { { id = 21, window = true, focused = false }, { id = 22, window = false, focused = false }, { id = 23, window = true, focused = false } }
+  world.anchors[21], world.anchors[22], world.anchors[23] = { kind = 'pet' }, { kind = 'world', hidden = true }, { kind = 'pet' }
+  local function run(method, params, request)
+    ipc.run(json.encode({ request = request, method = method, params = params }))
+    local r = json.decode(ipc.snapshot())
+    return r.requests[#r.requests], r
+  end
+  local q, r = run('focus.cycle', { dir = 'next' }, 300)
+  assert(q.ok and q.result.id == 21 and r.focus.id == 21 and r.focus.kind == 'window', 'nothing focused: next is the first')
+  q = run('focus.cycle', { dir = 'next' }, 301)
+  assert(q.result.id == 23, 'the hidden terminal is skipped')
+  q = run('focus.cycle', { dir = 'next' }, 302)
+  assert(q.result.id == 21, 'wraps')
+  q = run('focus.cycle', { dir = 'prev' }, 303)
+  assert(q.result.id == 23, 'back wraps too')
+  q = run('window.focus', { id = 22 }, 304)
+  assert(not q.ok and q.error:find('hidden'), 'a hidden panel is not focused')
+  assert(#focus_calls == 4)
+  world.anchors[21].hidden, world.anchors[23].hidden = true, true
+  q = run('focus.cycle', { dir = 'next' }, 305)
+  assert(not q.ok and q.error == 'no world panel shown')
+  -- the rest reach their ghostty.* function
+  local seen = {}
+  ghostty.panel_hide = function(id, hidden) seen.hide = { id, hidden } return true end
+  ghostty.panel_toggle_pet = function(id) seen.toggle = id return nil, 'not a world terminal' end
+  ghostty.agent_windows_refresh = function() seen.refresh = true return true end
+  ghostty.terminal_new = function(t) seen.new = t return 31 end
+  assert(run('window.hide', { id = 21, hidden = false }, 310).ok and seen.hide[1] == 21 and seen.hide[2] == false)
+  q = run('window.toggle_pet', { id = 21 }, 311)
+  assert(not q.ok and q.error == 'not a world terminal' and seen.toggle == 21)
+  assert(run('agent.windows.refresh', {}, 312).ok and seen.refresh)
+  q = run('terminal.new', { profile = 2 }, 313)
+  assert(q.ok and q.result.id == 31 and seen.new.profile == '2' and seen.new.pin == nil, 'a numeric profile goes as text')
   print('ipc frame side OK')
 end

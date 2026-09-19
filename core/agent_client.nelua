@@ -236,6 +236,15 @@ function AgentClient:wlist(): boolean
   return true
 end
 
+-- Ask for the apps the agent can start (WLIST "apps"); answered by a WLISTR
+-- of app lines. An agent from before app lists answers with its windows.
+function AgentClient:wlist_apps(): boolean
+  if not self:windows_ok() then return windows_refuse(self) end
+  local what: string = 'apps'
+  proto.write_frame(&self.outq, PROTO_WLIST, (@*[0]uint8)(what.data), what.size)
+  return true
+end
+
 -- Open window `wid` (0: the desktop picks, or the first matching `match`)
 -- as a stream no larger than max_w x max_h at up to `fps`. Answered, maybe
 -- much later, by a WOPENED event carrying `req`.

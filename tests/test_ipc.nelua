@@ -276,8 +276,113 @@ expect('{"method":"window.list"}', string.format([[
   local n = #r.result.requests
   local a, b = r.result.requests[n - 1], r.result.requests[n]
   assert(a.request == %d and a.ok == false and a.error ~= '', RAW)
-  assert(b.request == %d and b.ok == false and b.error == 'no such window panel', RAW)
+  assert(b.request == %d and b.ok == false and b.error == 'no such world panel', RAW)
   assert(r.result.windows[1].kind == 'pet', 'unchanged')]], req4, req5))
+
+-- XivDesktop's panel methods -----------------------------------------------------------
+-- focus: as a click (the keyboard; no walk-up, no camera turn)
+host.world_focus = 0
+host.cam_active = false
+expect(string.format('{"method":"window.focus","params":{"id":%d}}', pid), 'assert(r.ok)')
+frame()
+assert(host.world_focus == pid and host.walk.id == 0 and not host.cam_active, 'focused as by a click, without walking or turning')
+expect('{"method":"focus.get"}', string.format('assert(r.result.id == %d and r.result.kind == "window", RAW)', pid))
+-- hide: not placed, asleep (no WACK), unfocused; shown again: placed, awake once drawn
+local hs = find_session(pid)
+expect(string.format('{"method":"window.hide","params":{"id":%d,"hidden":true}}', pid), 'assert(r.ok)')
+frame()
+assert(hs.sleeping and host.world_focus == 0, 'hidden: asleep and unfocused')
+do
+  local ok, _ = policy_world_place(pid, now, false)
+  assert(not ok, 'hidden: not placed, so not drawn')
+end
+expect('{"method":"window.list"}', 'assert(r.result.windows[1].hidden == true and r.result.windows[1].anchor == "pet", RAW)')
+expect('{"method":"focus.get"}', 'assert(r.result.id == 0 and r.result.kind == nil, RAW)')
+expect(string.format('{"method":"window.focus","params":{"id":%d}}', pid), 'assert(r.ok)')
+frame()
+expect('{"method":"window.list"}', [[
+  local q = r.result.requests[#r.result.requests]
+  assert(not q.ok and q.error:find('hidden'), RAW)]])
+expect(string.format('{"method":"window.hide","params":{"id":%d,"hidden":false}}', pid), 'assert(r.ok)')
+frame()
+do
+  local ok, _ = policy_world_place(pid, now, false)
+  assert(ok, 'shown again: placed (it wakes when next drawn)')
+end
+expect('{"method":"window.list"}', 'assert(r.result.windows[1].hidden == false, RAW)')
+hs:wake()
+-- toggle_pet: a pet becomes a pin where it was last shown, and back
+hs.posed, hs.pose_x, hs.pose_y, hs.pose_z, hs.pose_yaw, hs.pose_pitch = true, 12.5, 1.25, 23.5, 0.75, 0
+expect(string.format('{"method":"window.toggle_pet","params":{"id":%d}}', pid), 'assert(r.ok)')
+frame()
+expect('{"method":"window.list"}', 'assert(r.result.windows[1].kind == "pin" and r.result.windows[1].anchor == "pin", RAW)')
+do
+  local ok, pl = policy_world_place(pid, now, false)
+  assert(ok and math.abs(pl.x - 12.5) < 1e-3 and math.abs(pl.y - 1.25) < 1e-3 and math.abs(pl.z - 23.5) < 1e-3 and math.abs(pl.yaw - 0.75) < 1e-4,
+    'pinned right where it was shown, facing the same way')
+end
+expect(string.format('{"method":"window.toggle_pet","params":{"id":%d}}', pid), 'assert(r.ok)')
+frame()
+expect('{"method":"window.list"}', 'assert(r.result.windows[1].kind == "pet" and r.result.windows[1].anchor == "pet", RAW)')
+-- agent.windows: WLISTR, extra columns passed through, a key matched to the panel by title
+forget()
+expect('{"method":"agent.windows.refresh"}', 'assert(r.ok)')
+frame()
+assert(count(PROTO_WLIST) == 2, 'WLIST sent for the windows and for the apps')
+do
+  -- the two answers: the windows, then (WLIST "apps") the apps alone
+  local lines: string = '5\t640\t400\tyad\tYad Window\tkey:yad-1\tmore\n7\t800\t600\tfirefox\tMozilla Firefox\n0\t0\t0\t\tchoose on the desktop\nbad line\n'
+  local apps: string = 'app\tfoot\tFoot\tfoot\tSystem;TerminalEmulator;\nterm\thtop\thtop\t\tSystem;\thtop\n'
+  local q: ByteQueue
+  proto.write_frame(&q, PROTO_WLISTR, (@*[0]uint8)(lines.data), lines.size)
+  proto.write_frame(&q, PROTO_WLISTR, (@*[0]uint8)(apps.data), apps.size)
+  peer_send(&q)
+  q:destroy()
+end
+frame()
+expect('{"method":"agent.windows"}', [[
+  local w = r.result
+  assert(#w == 3 and w[1].wid == 5 and w[1].key == 'yad-1' and w[1].extra[1] == 'key:yad-1' and w[1].extra[2] == 'more', RAW)
+  assert(w[2].wid == 7 and w[2].app == 'firefox' and w[2].title == 'Mozilla Firefox' and w[2].key == '' and #w[2].extra == 0, RAW)
+  assert(w[3].wid == 0, RAW)]])
+expect('{"method":"agent.apps"}', 'assert(#r.result == 1 and r.result[1].id == "foot" and r.result[1].categories == "System;TerminalEmulator;", RAW)')
+expect('{"method":"agent.status"}', 'assert(r.result.window_lists == 2, RAW)')
+expect('{"method":"window.list"}', 'assert(r.result.windows[1].key == "yad-1" and r.result.windows[1].agent == "default", RAW)')
+assert(logged('window #5 640x400 [yad] Yad Window  @default key yad-1') == 1, 'the key in the /window list log line')
+-- terminal.new: a world terminal, a pet unless pinned; focus.cycle steps through the world panels
+local n_world = #host.world
+expect('{"method":"terminal.new","caller":"XivDesktop"}', 'assert(r.ok)')
+expect('{"method":"terminal.new","params":{"profile":"nope"}}', 'assert(r.ok)')
+expect('{"method":"terminal.new","params":{"pin":"here"}}', 'assert(r.ok)')
+frame()
+local tid = expect('{"method":"window.list"}', [[
+  local n = #r.result.requests
+  local a, b, c = r.result.requests[n - 2], r.result.requests[n - 1], r.result.requests[n]
+  assert(a.ok and a.method == 'terminal.new' and a.result.id > 0, RAW)
+  assert(not b.ok and b.error == 'no such profile: nope', RAW)
+  assert(c.ok, RAW)
+  return a.result.id]])
+assert(#host.world == n_world + 2, 'two world terminals')
+do
+  local L = policy.L
+  lua_getglobal(L, 'require') lua_pushstring(L, 'world') assert(lua_pcall(L, 1, 1, 0) == LUA_OK)
+  lua_getfield(L, -1, 'anchors') lua_rawgeti(L, -1, tid) lua_getfield(L, -1, 'kind')
+  assert(string.copy(lua_tolstring(L, -1, nilptr)) == 'pet', 'terminal.new: a pet by default')
+  lua_settop(L, 0)
+end
+host.world_focus = 0
+expect('{"method":"focus.cycle"}', 'assert(r.ok)')
+frame()
+assert(host.world_focus == pid, 'focus.cycle: the first world panel')
+expect('{"method":"focus.cycle","params":{"dir":"next"}}', 'assert(r.ok)')
+frame()
+assert(host.world_focus == tid, 'then the next')
+expect('{"method":"focus.get"}', string.format('assert(r.result.id == %d and r.result.kind == "terminal", RAW)', tid))
+expect('{"method":"focus.cycle","params":{"dir":"prev"}}', 'assert(r.ok)')
+frame()
+assert(host.world_focus == pid, 'and back')
+host.world_focus = 0
+while #host.world > n_world do close_terminal(host.world[#host.world - 1]) end
 
 -- no character: open fails with the reason
 player_here = false

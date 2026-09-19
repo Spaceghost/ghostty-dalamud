@@ -50,6 +50,7 @@ internal unsafe struct GuHostApi
     public delegate* unmanaged[Cdecl]<nint, float, int> BgSetTransparency;
     public delegate* unmanaged[Cdecl]<nint, int> BgDestroy;
     public delegate* unmanaged[Cdecl]<byte*, byte*, int, int> CommandAddTagged;
+    public delegate* unmanaged[Cdecl]<byte*, int> ChatPrint;
     public delegate* unmanaged[Cdecl]<byte*, float*, float*, float*, float*, int> AddonRect;
     public delegate* unmanaged[Cdecl]<byte*, int, int> AddonShow;
     public delegate* unmanaged[Cdecl]<byte*, int> ChatSend;

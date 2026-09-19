@@ -151,6 +151,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     draw_windows()
     draw_anchored_popup()
     draw_settings()
+    draw_window_picker() -- /window (core/app/winpicker.nelua)
   end
   reap_exited(now)
   -- only after the layout came back: saving earlier (or while the agent is
@@ -265,6 +266,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   if host.layout_restored then save_world_state() end
   for i = #host.sessions - 1, 0, -1 do session_remove(host.sessions[i]) end
   remotewin_shutdown() -- its panels went with their sessions (WCLOSE queued)
+  window_picker_shutdown()
   chatpanel_forget_log()
   ipc_shutdown() -- the channel was unregistered with the other surfaces
   agent_final_flush() -- the queued DETACH/CLOSE frames, before the socket goes away

@@ -17,6 +17,7 @@
 -- Usage: ghostty-agent [--listen 127.0.0.1:7777] [--token-file PATH]
 --                      [--clipboard-file PATH] [--replay-bytes N] [--term xterm-256color]
 --                      [--windows auto|off|test|wayland|win32|mac]
+--                      [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|none]
 require 'string'
 require 'vector'
 require 'stringbuilder'
@@ -390,6 +391,9 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     text:destroy()
   elseif typ == PROTO_CLIP_SET then
     if len <= CLIP_MAX and clipboard_set(payload, len) then
+      ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
+      capture_wayland_clipboard_changed() -- apps in the compositor paste the game's copy
+      ## end
       send_text(c, PROTO_OK, 'clipboard set')
     else
       send_text(c, PROTO_ERR, 'clipboard unavailable')
@@ -561,6 +565,7 @@ local function main(): integer
   local windows_name: string = 'auto'
   local wayland_socket: string = '' -- empty: GHOSTTY_WAYLAND_SOCKET, else ffxiv-0, ffxiv-1, ...
   local xkb_layout: string = ''     -- empty: GHOSTTY_XKB_LAYOUT, else us
+  local render_node: string = ''    -- empty: GHOSTTY_WAYLAND_RENDER_NODE, else auto
   agent.replay_bytes = 256 * 1024
   agent.term = 'xterm-256color'
   agent.next_id = 1
@@ -575,8 +580,9 @@ local function main(): integer
     elseif a == '--windows' and i < #arg then windows_name = arg[i+1] i = i + 1
     elseif a == '--wayland-socket' and i < #arg then wayland_socket = arg[i+1] i = i + 1 -- Linux compositor only
     elseif a == '--xkb-layout' and i < #arg then xkb_layout = arg[i+1] i = i + 1
+    elseif a == '--wayland-render-node' and i < #arg then render_node = arg[i+1] i = i + 1 -- PATH, auto or none
     elseif a == '--help' or a == '-h' then
-      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME] [--wayland-socket NAME] [--xkb-layout LAYOUT]\n')
+      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME] [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|none]\n')
       return 0
     else
       io.stderr:write('unknown argument: ', a, '\n')
@@ -605,6 +611,8 @@ local function main(): integer
   end
   ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
   capture_wayland_configure(wayland_socket, xkb_layout)
+  capture_wayland_set_render_node(render_node)
+  capture_wayland_set_clipboard(clipboard_get, clipboard_set) -- the compositor's apps share the host clipboard
   ## end
   do
     local ok, why = windows:init(windows_name, client_queue)

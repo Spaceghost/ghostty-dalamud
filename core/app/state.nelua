@@ -84,6 +84,9 @@ global GuHostApi = @record{
   -- a chat command of its own (CONFIG.host.verb_commands): its handler posts
   -- GuEventKind.Chat with `a` = tag and the arguments as text; 1 = ok
   command_add_tagged: function(name: cstring, help: cstring, tag: cint): cint,
+  -- a line in the game's chat for the person (short results: a window refused,
+  -- a command that failed); nilptr in older shims: the log only
+  chat_print: function(text: cstring): cint,
   -- flat windows pulled into the world (core/app/chatpanel.nelua, docs/ADOPT.md)
   addon_rect: function(name: cstring, x: *float32, y: *float32, w: *float32, h: *float32): cint, -- 1 shown, 2 loaded but hidden, 0 none
   addon_show: function(name: cstring, shown: cint): cint, -- a game addon (AtkUnitBase) shown or hidden; 1 = ok
@@ -154,6 +157,8 @@ global Host = @record{
   cam_saved_d: float32,             -- zoom to restore afterwards
   cam_restore: boolean,
   world_occluded_toggle_id: integer, -- title button: keep running when unseen
+  world_pet_toggle_id: integer,      -- title button: pin <-> pet where the panel is
+  window_picker_open: boolean,       -- the Windows picker (/window, core/app/winpicker.nelua)
   world_tuning: WorldTuning,        -- CONFIG.world.present / walk, read each frame
   walk: WorldWalk,                  -- walking up to the clicked panel
   walk_time: float64,
@@ -233,6 +238,26 @@ global function logf(level: cint, fmt: string, ...: varargs): void
   sb:writef(fmt, ...)
   local s = sb:promote()
   log(level, s)
+  s:destroy()
+end
+
+-- A short result the person should see, not only the log (/xllog): logged,
+-- and printed to the game chat where the shim can (chat_print).
+global function say(level: cint, msg: string): void
+  log(level, msg)
+  if host.api.chat_print == nilptr then return end
+  local sb: stringbuilder
+  sb:write('[ghostty] ', msg, '\0')
+  local z = sb:promote()
+  host.api.chat_print((@cstring)(z.data))
+  z:destroy()
+end
+
+global function sayf(level: cint, fmt: string, ...: varargs): void
+  local sb: stringbuilder
+  sb:writef(fmt, ...)
+  local s = sb:promote()
+  say(level, s)
   s:destroy()
 end
 

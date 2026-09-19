@@ -110,6 +110,7 @@ end
 global function panels_pin(args: string): (boolean, cint)
   local s = find_session(host.world_focus)
   if s == nilptr or s.kind ~= TransportKind.Panel then return false, 0 end
+  if args == 'hide' or args == 'hide off' then return false, 0 end -- hiding is the same for every panel
   local err = policy_windows_pin(s.id, args) -- the same as a window panel: a new anchor, the same size
   if #err > 0 then
     logf(LOG_WARN, 'pin: %s', err)
