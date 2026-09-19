@@ -275,6 +275,9 @@ global WAYLAND_DEFAULT_W: integer <comptime> = 1280
 global WAYLAND_DEFAULT_H: integer <comptime> = 800
 local WAYLAND_OPEN_TIMEOUT: float64 <comptime> = 30.0 -- s, for a launched app or a match to show up
 local WAYLAND_HANDOFF_WAIT: float64 <comptime> = 5.0 -- s, after a launched app exits 0 without a window
+-- Outputs advertise 60 Hz: a refresh of 0 makes GTK4 divide by zero timing its
+-- frames (SIGFPE, seen with GNOME Calculator and Text Editor 1.6 s after mapping)
+local WAYLAND_REFRESH_MHZ: int32 <comptime> = 60000
 local BTN_LEFT: uint32 <comptime> = 0x110 -- then BTN_RIGHT 0x111, BTN_MIDDLE 0x112
 local AXIS_PER_NOTCH: float64 <comptime> = 15.0 -- wl_pointer.axis units per wheel notch (libinput's)
 
@@ -628,7 +631,7 @@ local function on_map(l: *wl_listener, data: pointer): void
     local st: wlr_output_state
     wlr_output_state_init(&st)
     wlr_output_state_set_enabled(&st, true)
-    wlr_output_state_set_custom_mode(&st, (@int32)(w * wc.scale), (@int32)(h * wc.scale), 0)
+    wlr_output_state_set_custom_mode(&st, (@int32)(w * wc.scale), (@int32)(h * wc.scale), WAYLAND_REFRESH_MHZ)
     -- apps render at this scale: crisp text on a panel seen up close
     wlr_output_state_set_scale(&st, (@float32)(wc.scale))
     wlr_output_commit_state(t.output, &st)
@@ -814,7 +817,7 @@ local function render(t: *Top): void
   if not resize and not wlr_scene_output_needs_frame(t.sout) then return end
   local st: wlr_output_state
   wlr_output_state_init(&st)
-  if resize then wlr_output_state_set_custom_mode(&st, (@int32)(w), (@int32)(h), 0) end
+  if resize then wlr_output_state_set_custom_mode(&st, (@int32)(w), (@int32)(h), WAYLAND_REFRESH_MHZ) end
   if wlr_scene_output_build_state(t.sout, &st, nilptr) then
     if (st.committed & WLR_OUTPUT_STATE_BUFFER) ~= 0 and st.buffer ~= nilptr then grab(t, st.buffer, w, h) end
     wlr_output_commit_state(t.output, &st)
