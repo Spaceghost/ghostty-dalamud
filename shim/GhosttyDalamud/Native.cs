@@ -120,6 +120,8 @@ internal static unsafe class Native
     public static delegate* unmanaged[Cdecl]<void> Shutdown;
     public static delegate* unmanaged[Cdecl]<byte*> Version;
     public static delegate* unmanaged[Cdecl]<float*, float*, int, int, void> WalkInput;
+    // optional: a core (or loader) from before GhosttyDalamud.v1.Call has none
+    public static delegate* unmanaged[Cdecl]<byte*, byte*, nuint, nuint> Call;
 
     public static void Load(string dllPath)
     {
@@ -140,6 +142,7 @@ internal static unsafe class Native
             nint shutdown   = NativeLibrary.GetExport(lib, "gu_shutdown");
             nint version    = NativeLibrary.GetExport(lib, "gu_version");
             nint walkInput  = NativeLibrary.GetExport(lib, "gu_walk_input");
+            NativeLibrary.TryGetExport(lib, "gu_call", out nint call);
             InitEx     = (delegate* unmanaged[Cdecl]<GuHostApi*, GuInitInfo*, int>)initEx;
             Frame      = (delegate* unmanaged[Cdecl]<void>)frame;
             Event      = (delegate* unmanaged[Cdecl]<int, int, int, float, float, byte*, void>)evt;
@@ -150,6 +153,7 @@ internal static unsafe class Native
             Shutdown   = (delegate* unmanaged[Cdecl]<void>)shutdown;
             Version    = (delegate* unmanaged[Cdecl]<byte*>)version;
             WalkInput  = (delegate* unmanaged[Cdecl]<float*, float*, int, int, void>)walkInput;
+            Call       = (delegate* unmanaged[Cdecl]<byte*, byte*, nuint, nuint>)call;
             _lib       = lib;
         }
         catch
@@ -170,6 +174,25 @@ internal static unsafe class Native
     {
         byte[] bytes = Encoding.UTF8.GetBytes(text + "\0");
         fixed (byte* p = bytes) Event((int)kind, a, b, x, y, p);
+    }
+
+    // gu_call: JSON in, JSON out (docs/IPC.md). The core answers in at most
+    // CallMax bytes (a larger answer comes back as a "response too large" error).
+    public const int CallMax = 65536;
+
+    public static string CallJson(string request)
+    {
+        byte[] req = Encoding.UTF8.GetBytes(request + "\0");
+        byte[] buf = System.Buffers.ArrayPool<byte>.Shared.Rent(CallMax);
+        try
+        {
+            fixed (byte* r = req) fixed (byte* b = buf)
+            {
+                nuint n = Call(r, b, (nuint)CallMax);
+                return Encoding.UTF8.GetString(b, (int)n);
+            }
+        }
+        finally { System.Buffers.ArrayPool<byte>.Shared.Return(buf); }
     }
 
     public static string StatusText()

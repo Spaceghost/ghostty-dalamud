@@ -59,6 +59,7 @@ local Fns = @record{
   shutdown: function(): void,
   version: function(): cstring,
   walk_input: function(left: *float32, forward: *float32, allowed: cint, legacy: cint): void,
+  call: function(request: cstring, out: *[0]cchar, cap: usize): usize,
 }
 -- the head of GuHostApi: a core reads only the fields within `size`
 local Api = @record{ size: usize, log: function(level: cint, msg: cstring): void }
@@ -132,7 +133,7 @@ local loader_path = file('ghostty_loader.dll')
 local lib = dlopen((@cstring)(loader_path.data), RTLD_NOW)
 if lib == nilptr then error(dlerror()) end
 local fns: Fns
-## for _, name in ipairs{'init_ex', 'init', 'event', 'frame', 'popup_draw', 'popup_reset', 'popup_size', 'toggle', 'command', 'status', 'shutdown', 'version', 'walk_input'} do
+## for _, name in ipairs{'init_ex', 'init', 'event', 'frame', 'popup_draw', 'popup_reset', 'popup_size', 'toggle', 'command', 'status', 'shutdown', 'version', 'walk_input', 'call'} do
   fns.#|name|# = (@#[Fns.value.fields[name].type]#)(dlsym(lib, #['gu_' .. name]#))
   assert(fns.#|name|# ~= nilptr, #['loader exports gu_' .. name]#)
 ## end
@@ -142,6 +143,11 @@ local buf: [64]cchar
 local function status(): string
   local n = fns.status(&buf, 64)
   return string.copy(string{data=(@*[0]byte)(&buf), size=n})
+end
+local cbuf: [4096]cchar
+local function ipc(request: cstring): string
+  local n = fns.call(request, &cbuf, #cbuf)
+  return string.copy(string{data=(@*[0]byte)(&cbuf), size=n})
 end
 
 -- start: a private copy of the core, started with the shim's arguments (the
@@ -168,6 +174,12 @@ fns.popup_draw(nilptr, 0, 0, 10, 10, 0)
 fns.popup_reset()
 fns.event(3, 0, 0, 0, 0, '') -- OpenConfig
 fns.frame()
+do
+  local r = ipc('{"method":"status"}')
+  -- no ImGui here, so no frame got to publish a snapshot: the core's own answer
+  assert(r == '{"error":"ghostty is starting; ask again after the next frame","ok":false}', 'IPC calls reach the core')
+  r:destroy()
+end
 
 -- reload-core as a command: the copy is shut down, freed, deleted and replaced
 assert(fns.command('reload-core') == 0, 'reload-core')
@@ -204,6 +216,11 @@ fns.walk_input(&left, &forward, 1, 0)
 fns.popup_draw(nilptr, 0, 0, 10, 10, 0)
 fns.event(3, 0, 0, 0, 0, '')
 fns.toggle()
+do
+  local r = ipc('{"method":"status"}')
+  assert(r == '{"ok":false,"error":"ghostty is not running"}', 'IPC without a core')
+  r:destroy()
+end
 assert(frames_until(&fns, 1.5, 'dll failed', 2) < 0, 'no retry until the file changes again')
 assert(not exists('ghostty_core.live-5.dll'), 'the broken copy is deleted')
 
