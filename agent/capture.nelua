@@ -64,7 +64,7 @@ require 'agent.capture_test'
 
 -- Platform backends compiled into this agent. Flip one to true when its file lands.
 ## CAPTURE_BUILT = { wayland = WAYLAND and true or false, -- -D WAYLAND: tools/wayland-flags.sh
-##    win32 = true, mac = false }
+##    win32 = true, mac = true } -- each is also limited to its platform below
 ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
 require 'agent.capture_wayland'
 ## end

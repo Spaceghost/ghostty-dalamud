@@ -1,0 +1,418 @@
+-- The pure parts of the macOS capture backend (agent/capture_mac.nelua), kept
+-- apart so tests/test_capture_mac.nelua checks them on any host: USB HID to
+-- macOS virtual keycodes, modifier and event type values, window pixels to
+-- global display points, the hand-built Block literal layout, `run:` parsing,
+-- window picking and WLISTR lines, UTF-16 chunks for typed text, CGImage
+-- pixel layouts to BGRA. Nothing here calls a framework.
+--
+-- Constant values are Apple's (CGEventTypes.h, Events.h, CGImage.h,
+-- Block_private.h); they are ABI and do not change between macOS versions.
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'memory'
+require 'math'
+
+-- CGEventType
+global MAC_EV_LEFT_DOWN: integer <comptime> = 1
+global MAC_EV_LEFT_UP: integer <comptime> = 2
+global MAC_EV_RIGHT_DOWN: integer <comptime> = 3
+global MAC_EV_RIGHT_UP: integer <comptime> = 4
+global MAC_EV_MOVED: integer <comptime> = 5
+global MAC_EV_LEFT_DRAGGED: integer <comptime> = 6
+global MAC_EV_RIGHT_DRAGGED: integer <comptime> = 7
+global MAC_EV_OTHER_DOWN: integer <comptime> = 25
+global MAC_EV_OTHER_UP: integer <comptime> = 26
+global MAC_EV_OTHER_DRAGGED: integer <comptime> = 27
+
+-- CGEventFlags
+global MAC_FLAG_SHIFT: uint64 <comptime> = 0x20000
+global MAC_FLAG_CONTROL: uint64 <comptime> = 0x40000
+global MAC_FLAG_ALTERNATE: uint64 <comptime> = 0x80000
+global MAC_FLAG_COMMAND: uint64 <comptime> = 0x100000
+global MAC_FLAG_NUMPAD: uint64 <comptime> = 0x200000
+global MAC_FLAG_FN: uint64 <comptime> = 0x800000
+
+-- The Apple Block ABI (clang's "Block Implementation Specification"). A block
+-- is an object whose first word is its class; calling it calls `invoke` with
+-- the block itself as the first argument, then the declared arguments.
+--
+--   offset  0  isa         &_NSConcreteStackBlock (libSystem)
+--           8  flags       int32, MAC_BLOCK_HAS_SIGNATURE
+--          12  reserved    int32, 0
+--          16  invoke      void (*)(MacBlock *self, ...)
+--          24  descriptor  *MacBlockDesc
+--          32  ctx         the one captured variable: a plain pointer
+--
+--   descriptor: reserved u64 (0), size u64 (sizeof MacBlock = 40), then
+--   (because of HAS_SIGNATURE, no copy/dispose helpers) an Objective-C type
+--   encoding such as "v@?@" (void, the block, one object).
+--
+-- The backend builds these on its own stack and passes them where an API
+-- takes a block. Every API that keeps a block calls Block_copy first, which
+-- for a stack block mallocs `size` bytes, copies them and marks the copy as
+-- a malloc block; `ctx` is a raw pointer (no copy/dispose helpers needed), so
+-- the copy is complete. Global blocks would need no copy but cannot carry a
+-- per-call ctx.
+global MAC_BLOCK_HAS_SIGNATURE: int32 <comptime> = 1 << 30
+global MacBlockDesc = @record{ reserved: uint64, size: uint64, signature: cstring }
+global MacBlock = @record{
+  isa: pointer,
+  flags: int32,
+  reserved: int32,
+  invoke: pointer,
+  descriptor: *MacBlockDesc,
+  ctx: pointer,
+}
+
+-- USB HID usage (keyboard page 7) to a macOS virtual keycode (kVK_*), -1 when
+-- the Mac has no such key.
+global function capmac_hid_to_kvk(hid: uint16): integer
+  -- a..z (0x04..0x1d)
+  local letters: [26]uint8 = {
+    0x00, 0x0b, 0x08, 0x02, 0x0e, 0x03, 0x05, 0x04, 0x22, 0x26, 0x28, 0x25, 0x2e, -- a..m
+    0x2d, 0x1f, 0x23, 0x0c, 0x0f, 0x01, 0x11, 0x20, 0x09, 0x0d, 0x07, 0x10, 0x06, -- n..z
+  }
+  -- 1..9, 0 (0x1e..0x27)
+  local digits: [10]uint8 = { 0x12, 0x13, 0x14, 0x15, 0x17, 0x16, 0x1a, 0x1c, 0x19, 0x1d }
+  -- F1..F12 (0x3a..0x45)
+  local fkeys: [12]uint8 = { 0x7a, 0x78, 0x63, 0x76, 0x60, 0x61, 0x62, 0x64, 0x65, 0x6d, 0x67, 0x6f }
+  -- F13..F20 (0x68..0x6f); F21..F24 have no Mac key
+  local fkeys2: [8]uint8 = { 0x69, 0x6b, 0x71, 0x6a, 0x40, 0x4f, 0x50, 0x5a }
+  -- keypad 1..9, 0 (0x59..0x62)
+  local keypad: [10]uint8 = { 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5b, 0x5c, 0x52 }
+  if hid >= 0x04 and hid <= 0x1d then return letters[hid - 0x04] end
+  if hid >= 0x1e and hid <= 0x27 then return digits[hid - 0x1e] end
+  if hid >= 0x3a and hid <= 0x45 then return fkeys[hid - 0x3a] end
+  if hid >= 0x68 and hid <= 0x6f then return fkeys2[hid - 0x68] end
+  if hid >= 0x59 and hid <= 0x62 then return keypad[hid - 0x59] end
+  switch hid do
+  case 0x28 then return 0x24 -- return
+  case 0x29 then return 0x35 -- escape
+  case 0x2a then return 0x33 -- backspace: kVK_Delete
+  case 0x2b then return 0x30 -- tab
+  case 0x2c then return 0x31 -- space
+  case 0x2d then return 0x1b -- minus
+  case 0x2e then return 0x18 -- equal
+  case 0x2f then return 0x21 -- [
+  case 0x30 then return 0x1e -- ]
+  case 0x31 then return 0x2a -- backslash
+  case 0x32 then return 0x2a -- non-US #, where ANSI has backslash
+  case 0x33 then return 0x29 -- ;
+  case 0x34 then return 0x27 -- '
+  case 0x35 then return 0x32 -- `
+  case 0x36 then return 0x2b -- ,
+  case 0x37 then return 0x2f -- .
+  case 0x38 then return 0x2c -- /
+  case 0x39 then return 0x39 -- caps lock
+  case 0x49 then return 0x72 -- insert: kVK_Help, where Mac keyboards had it
+  case 0x4a then return 0x73 -- home
+  case 0x4b then return 0x74 -- page up
+  case 0x4c then return 0x75 -- delete forward
+  case 0x4d then return 0x77 -- end
+  case 0x4e then return 0x79 -- page down
+  case 0x4f then return 0x7c -- right
+  case 0x50 then return 0x7b -- left
+  case 0x51 then return 0x7d -- down
+  case 0x52 then return 0x7e -- up
+  case 0x53 then return 0x47 -- num lock: kVK_ANSI_KeypadClear
+  case 0x54 then return 0x4b -- keypad /
+  case 0x55 then return 0x43 -- keypad *
+  case 0x56 then return 0x4e -- keypad -
+  case 0x57 then return 0x45 -- keypad +
+  case 0x58 then return 0x4c -- keypad enter
+  case 0x63 then return 0x41 -- keypad .
+  case 0x64 then return 0x0a -- non-US backslash: kVK_ISO_Section
+  case 0x67 then return 0x51 -- keypad =
+  case 0x7f then return 0x4a -- mute
+  case 0x80 then return 0x48 -- volume up
+  case 0x81 then return 0x49 -- volume down
+  case 0xe0 then return 0x3b -- left control
+  case 0xe1 then return 0x38 -- left shift
+  case 0xe2 then return 0x3a -- left alt: option
+  case 0xe3 then return 0x37 -- left super: command
+  case 0xe4 then return 0x3e -- right control
+  case 0xe5 then return 0x3c -- right shift
+  case 0xe6 then return 0x3d -- right option
+  case 0xe7 then return 0x36 -- right command
+  end
+  return -1
+end
+
+-- CGEventFlags for key `kvk` with WIN_MOD_* `mods` (1 ctrl, 2 shift, 4 alt,
+-- 8 super). Arrows carry NumericPad|Fn and the navigation and function keys
+-- Fn, as a real Mac keyboard sends them; some apps look.
+global function capmac_key_flags(kvk: integer, mods: uint8): uint64
+  local f: uint64 = 0
+  if mods & 1 ~= 0 then f = f | MAC_FLAG_CONTROL end
+  if mods & 2 ~= 0 then f = f | MAC_FLAG_SHIFT end
+  if mods & 4 ~= 0 then f = f | MAC_FLAG_ALTERNATE end
+  if mods & 8 ~= 0 then f = f | MAC_FLAG_COMMAND end
+  if kvk >= 0x7b and kvk <= 0x7e then
+    f = f | MAC_FLAG_NUMPAD | MAC_FLAG_FN
+  elseif kvk >= 0x72 and kvk <= 0x7a then -- help, home, pgup, fwd delete, F4, end, F2, pgdn, F1
+    f = f | MAC_FLAG_FN
+  elseif kvk == 0x40 or kvk == 0x4f or kvk == 0x50 or kvk == 0x5a or (kvk >= 0x60 and kvk <= 0x71) then
+    f = f | MAC_FLAG_FN -- the other F-keys
+  end
+  return f
+end
+
+-- The CGEventType for a mouse event. `button` is 0 left, 1 right, 2 middle;
+-- `held` a bit per button already down (bit 0 left, 1 right, 2 middle).
+-- Moves while a button is held are drags of the lowest held button.
+global function capmac_mouse_type(is_button: boolean, button: integer, down: boolean, held: integer): integer
+  if is_button then
+    if button == 0 then return down and MAC_EV_LEFT_DOWN or MAC_EV_LEFT_UP end
+    if button == 1 then return down and MAC_EV_RIGHT_DOWN or MAC_EV_RIGHT_UP end
+    return down and MAC_EV_OTHER_DOWN or MAC_EV_OTHER_UP
+  end
+  if held & 1 ~= 0 then return MAC_EV_LEFT_DRAGGED end
+  if held & 2 ~= 0 then return MAC_EV_RIGHT_DRAGGED end
+  if held & 4 ~= 0 then return MAC_EV_OTHER_DRAGGED end
+  return MAC_EV_MOVED
+end
+
+-- Wheel lines for a delta in 1/120 notches; a partial notch still scrolls one.
+global function capmac_wheel_lines(v: integer): integer
+  if v == 0 then return 0 end
+  local n = v // 120
+  if v < 0 then n = -((-v) // 120) end
+  if n == 0 then n = v > 0 and 1 or -1 end
+  return n
+end
+
+-- A pixel of the captured frame (fw x fh) to global display points, given the
+-- window's bounds in points (CGWindowList: top-left origin, the same space
+-- CGEvent uses). The ratio comes from the frame itself, so Retina and
+-- mixed-scale displays need no separate scale factor.
+global function capmac_to_global(x: integer, y: integer, fw: integer, fh: integer,
+                                 bx: float64, by: float64, bw: float64, bh: float64): (float64, float64)
+  local gx, gy = bx + x, by + y
+  if fw > 0 then gx = bx + (x + 0.5) * bw / fw end
+  if fh > 0 then gy = by + (y + 0.5) * bh / fh end
+  return gx, gy
+end
+
+-- The pixel size to ask ScreenCaptureKit for: points x scale, rounded, at least 1.
+global function capmac_pixels(points: float64, scale: float64): integer
+  if scale <= 0 then scale = 1 end
+  local n = (@integer)(points * scale + 0.5)
+  if n < 1 then n = 1 end
+  return n
+end
+
+-- "run:NAME" (spaces around NAME trimmed): true and a copy of NAME.
+global function capmac_parse_run(match: string): (boolean, string)
+  if #match < 4 or match:sub(1, 4) ~= 'run:' then return false, (@string){} end
+  local i, j = 5, #match
+  while i <= j and (match.data[i-1] == ' '_b or match.data[i-1] == '\t'_b) do i = i + 1 end
+  while j >= i and (match.data[j-1] == ' '_b or match.data[j-1] == '\t'_b) do j = j - 1 end
+  if j < i then return false, (@string){} end
+  return true, match:sub(i, j)
+end
+
+-- Case-insensitive `needle` in `hay` (ASCII folding); an empty needle matches.
+global function capmac_contains(hay: string, needle: string): boolean
+  if #needle == 0 then return true end
+  local a, b = hay:lower(), needle:lower()
+  local at = a:find(b, 1, true)
+  a:destroy()
+  b:destroy()
+  return at > 0
+end
+
+-- Does window owner `app` belong to the app `open -a NAME` started? Names
+-- compare without a trailing ".app" and without case.
+global function capmac_app_is(app: string, name: string): boolean
+  local a, b = app:lower(), name:lower()
+  local n = #b
+  if n > 4 and b:sub(-4) == '.app' then n = n - 4 end
+  local same = #a == n and memory.equals(a.data, b.data, (@usize)(n))
+  a:destroy()
+  b:destroy()
+  return same
+end
+
+-- One window as the backend saw it in CGWindowListCopyWindowInfo. Strings are
+-- owned by whoever filled the vector.
+global MacWinInfo = @record{
+  wid: uint32,
+  pid: int32,
+  layer: integer,
+  x: float64, y: float64, w: float64, h: float64, -- points, top-left origin
+  scale: float64,     -- backing scale of the display under its centre
+  app: string,
+  title: string,
+}
+
+-- Windows worth listing and picking: normal layer, not tiny, not the agent's own.
+global function capmac_listable(win: *MacWinInfo, self_pid: int32): boolean
+  return win.layer == 0 and win.w >= 16 and win.h >= 16 and win.pid ~= self_pid
+end
+
+local function write_clean(sb: *stringbuilder, s: string): void
+  for i = 0, < #s do
+    local c = s.data[i]
+    if c == '\t'_b or c == '\n'_b or c == '\r'_b then c = ' '_b end
+    sb:writebyte(c)
+  end
+end
+
+-- The WLISTR text: the launch line, notes about missing permissions, then a
+-- `wid\tw\th\tapp\ttitle\n` line per listable window (sizes in pixels).
+global function capmac_list_text(wins: *vector(MacWinInfo), self_pid: int32, screen_ok: boolean, input_ok: boolean): string
+  local sb: stringbuilder
+  sb:write('0\t0\t0\tlaunch\trun:APP opens an app (open -a) and streams its first window\n')
+  if not screen_ok then
+    sb:write('0\t0\t0\tnote\tno Screen Recording permission: titles hidden, capture refused (System Settings > Privacy & Security > Screen Recording)\n')
+  end
+  if not input_ok then
+    sb:write('0\t0\t0\tnote\tno Accessibility permission: input is dropped (System Settings > Privacy & Security > Accessibility)\n')
+  end
+  for i = 0, < #wins do
+    local win = &wins[i]
+    if capmac_listable(win, self_pid) then
+      sb:writef('%d\t%d\t%d\t', win.wid, capmac_pixels(win.w, win.scale), capmac_pixels(win.h, win.scale))
+      write_clean(&sb, win.app)
+      sb:writebyte('\t'_b)
+      write_clean(&sb, win.title)
+      sb:writebyte('\n'_b)
+    end
+  end
+  return sb:promote()
+end
+
+-- The window an open means, as an index into `wins`, or -1: `wid` exactly
+-- when not 0 (any layer: the caller named it), else the first listable window
+-- (front to back) whose title or app contains `match`.
+global function capmac_pick(wins: *vector(MacWinInfo), self_pid: int32, wid: uint32, match: string): integer
+  for i = 0, < #wins do
+    local win = &wins[i]
+    if wid ~= 0 then
+      if win.wid == wid then return i end
+    elseif capmac_listable(win, self_pid) and (capmac_contains(win.title, match) or capmac_contains(win.app, match)) then
+      return i
+    end
+  end
+  return -1
+end
+
+-- The first listable window of the app `name` (see capmac_app_is), or -1.
+global function capmac_pick_app(wins: *vector(MacWinInfo), self_pid: int32, name: string): integer
+  for i = 0, < #wins do
+    if capmac_listable(&wins[i], self_pid) and capmac_app_is(wins[i].app, name) then return i end
+  end
+  return -1
+end
+
+-- UTF-8 to UTF-16 units into `out` (replacing it). Malformed bytes become U+FFFD.
+global function capmac_utf16(s: string, out: *vector(uint16)): void
+  out:clear()
+  local i: usize = 0
+  local n = s.size
+  while i < n do
+    local c = (@uint32)(s.data[i])
+    local cp: uint32 = 0xfffd
+    local len: usize = 1
+    if c < 0x80 then
+      cp = c
+    elseif c >= 0xc2 and c < 0xe0 then len = 2 cp = c & 0x1f
+    elseif c >= 0xe0 and c < 0xf0 then len = 3 cp = c & 0x0f
+    elseif c >= 0xf0 and c < 0xf5 then len = 4 cp = c & 0x07
+    else len = 0 end
+    if len > 1 then
+      if i + len > n then
+        len = 0
+      else
+        for k = 1, < len do
+          local cc = (@uint32)(s.data[i + k])
+          if cc & 0xc0 ~= 0x80 then len = 0 break end
+          cp = (cp << 6) | (cc & 0x3f)
+        end
+      end
+      if len == 0 or (len == 3 and (cp < 0x800 or (cp >= 0xd800 and cp < 0xe000)))
+         or (len == 4 and (cp < 0x10000 or cp > 0x10ffff)) then
+        cp = 0xfffd
+        if len == 0 then len = 1 end
+      end
+    elseif len == 0 then
+      len = 1
+    end
+    if cp >= 0x10000 then
+      cp = cp - 0x10000
+      out:push((@uint16)(0xd800 | (cp >> 10)))
+      out:push((@uint16)(0xdc00 | (cp & 0x3ff)))
+    else
+      out:push((@uint16)(cp))
+    end
+    i = i + len
+  end
+end
+
+-- Where a chunk starting at `start` of `n` units ends (exclusive): at most
+-- `max` units, never between the halves of a surrogate pair.
+-- CGEventKeyboardSetUnicodeString takes at most 20 units an event.
+global function capmac_chunk_end(units: *vector(uint16), start: integer, max: integer): integer
+  local e = start + max
+  if e >= #units then return #units end
+  if units[e] >= 0xdc00 and units[e] < 0xe000 and e - 1 > start then e = e - 1 end
+  return e
+end
+
+-- Click counting for kCGMouseEventClickState: a press within `interval`
+-- seconds and 4 points of the last press of the same button counts on.
+global MacClicks = @record{ t: float64, x: float64, y: float64, button: integer, n: integer }
+
+global function capmac_click(c: *MacClicks, now: float64, x: float64, y: float64, button: integer, interval: float64): integer
+  if c.n > 0 and button == c.button and now - c.t <= interval
+     and math.abs(x - c.x) <= 4 and math.abs(y - c.y) <= 4 then
+    c.n = c.n + 1
+  else
+    c.n = 1
+  end
+  c.t, c.x, c.y, c.button = now, x, y, button
+  return c.n
+end
+
+-- CGImage bitmap info
+global MAC_ALPHA_MASK: uint32 <comptime> = 0x1f
+global MAC_ORDER_MASK: uint32 <comptime> = 0x7000
+global MAC_ORDER_32_LITTLE: uint32 <comptime> = 0x2000
+global MAC_ORDER_32_BIG: uint32 <comptime> = 0x4000
+
+-- A 32-bit CGImage's pixels (`bitmap_info` from CGImageGetBitmapInfo) to
+-- tightly packed BGRA in `dst`. False for layouts it does not know (not 32
+-- bits a pixel, alpha-only). The window server normally hands out
+-- little-endian premultiplied-first, which already is BGRA in memory.
+global function capmac_to_bgra(src: *[0]uint8, stride: usize, w: integer, h: integer,
+                               bpp: integer, bitmap_info: uint32, dst: *vector(uint8)): boolean
+  if bpp ~= 32 or w <= 0 or h <= 0 then return false end
+  local alpha = bitmap_info & MAC_ALPHA_MASK
+  if alpha == 7 then return false end -- kCGImageAlphaOnly
+  local little = bitmap_info & MAC_ORDER_MASK == MAC_ORDER_32_LITTLE
+  -- alpha (or the skipped byte) first: 2 PremultipliedFirst, 4 First, 6 NoneSkipFirst
+  local first = alpha == 2 or alpha == 4 or alpha == 6
+  -- memory order of b, g, r in each 4 bytes
+  local bi, gi, ri: usize
+  if little then
+    if first then bi, gi, ri = 0, 1, 2 else bi, gi, ri = 1, 2, 3 end -- BGRA / ABGR
+  else
+    if first then bi, gi, ri = 3, 2, 1 else bi, gi, ri = 2, 1, 0 end -- ARGB / RGBA
+  end
+  dst:resize((@usize)(w * h * 4))
+  local row = (@usize)(w * 4)
+  for y = 0, < h do
+    local s = (@*[0]uint8)(&src[(@usize)(y) * stride])
+    local d = (@*[0]uint8)(&dst[(@usize)(y) * row])
+    if bi == 0 and gi == 1 and ri == 2 then
+      memory.copy(d, s, row)
+    else
+      for x: usize = 0, < (@usize)(w) do
+        local p = x * 4
+        d[p], d[p+1], d[p+2], d[p+3] = s[p+bi], s[p+gi], s[p+ri], 255
+      end
+    end
+  end
+  return true
+end

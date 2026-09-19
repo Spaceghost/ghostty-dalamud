@@ -1,0 +1,1191 @@
+-- The macOS capture backend (`--windows mac`, the default on macOS; see
+-- docs/REMOTE_WINDOWS.md). Compiles; has never run on a Mac.
+--
+--   list   CGWindowListCopyWindowInfo: on-screen layer 0 windows
+--   frames ScreenCaptureKit (macOS 12.3+): one SCStream per window with a
+--          desktop-independent window filter, BGRA at the window's pixel
+--          size, 60 fps at most; CGWindowListCreateImage snapshots before
+--          12.3 (deprecated API, 1x, taken when the generic layer asks)
+--   input  CGEvent mouse, wheel and keys posted to the window's process
+--          (CGEventPostToPid), or, after a FOCUS, to the HID tap
+--   focus  NSRunningApplication activateWithOptions:
+--
+-- No SDK is used: the agent is cross-compiled with Zig, which ships macOS
+-- libc headers and libSystem stubs but no framework headers or stubs. Every
+-- framework function is looked up with dlopen/dlsym and called through a
+-- typed function pointer; Objective-C goes through objc_msgSend cast to the
+-- exact signature of each message (the C compiler then does the ABI, so no
+-- objc_msgSend_stret/fpret is needed; no message used here returns a struct).
+-- Completion handlers are Block literals built by hand (MacBlock in
+-- agent/capture_mac_logic.nelua documents the layout) and the stream's
+-- output/delegate is a class made at run time (NSObject subclass with a
+-- `ctx` ivar, SCStreamOutput and SCStreamDelegate methods).
+--
+-- Threads: the agent's loop is single-threaded poll(). ScreenCaptureKit calls
+-- back on dispatch queues; those callbacks touch only a handle's locked part
+-- (state, why, the middle frame buffer) and write a byte to a self-pipe so
+-- poll() wakes. Frames are triple-buffered: the callback fills `back`
+-- unlocked, swaps it with `mid` under the lock; frame() swaps `mid` with
+-- `front`, which the main thread hands out. No copy happens under the lock.
+-- A handle is reference counted (the main thread, each callback in flight,
+-- a started stream) and freed by whoever drops the last reference.
+--
+-- Permissions: Screen Recording for window titles and capture (checked with
+-- CGPreflightScreenCaptureAccess, asked once with CGRequestScreenCaptureAccess),
+-- Accessibility / event posting for input (CGPreflightPostEventAccess or
+-- AXIsProcessTrusted). They belong to the process that runs the agent, or to
+-- the terminal app it was started from. Missing ones show in WLIST and in
+-- the reason a capture ends.
+--
+-- Loaded by agent/capture.nelua (CAPTURE_BUILT.mac, Apple targets only).
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'memory'
+require 'math'
+require 'os'
+require 'io'
+require 'agent.capture_mac_logic'
+
+## cinclude '<dlfcn.h>'
+## cinclude '<pthread.h>'
+## cinclude '<spawn.h>'
+## cinclude '<unistd.h>'
+## cinclude '<fcntl.h>'
+## cinclude '<sys/wait.h>'
+## cinclude '<crt_externs.h>'
+
+local function dlopen(path: cstring, mode: cint): pointer <cimport, nodecl> end
+local function dlsym(h: pointer, name: cstring): pointer <cimport, nodecl> end
+local RTLD_LAZY: cint <cimport, nodecl, const>
+-- ((void *)-2) in <dlfcn.h>, hidden there under strict POSIX: search every loaded image
+local RTLD_DEFAULT: pointer <const> = (@pointer)((@usize)(-2))
+local function pthread_mutex_init(m: pointer, attr: pointer): cint <cimport, nodecl> end
+local function pthread_mutex_destroy(m: pointer): cint <cimport, nodecl> end
+local function pthread_mutex_lock(m: pointer): cint <cimport, nodecl> end
+local function pthread_mutex_unlock(m: pointer): cint <cimport, nodecl> end
+local function posix_spawn(pid: *cint, path: cstring, fa: pointer, attr: pointer, argv: *[0]cstring, envp: pointer): cint <cimport, nodecl> end
+local function _NSGetEnviron(): *pointer <cimport, nodecl> end
+local function pipe(fds: *[2]cint): cint <cimport, nodecl> end
+local function read(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function write(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
+local function waitpid(pid: cint, status: *cint, options: cint): cint <cimport, nodecl> end
+local function getpid(): cint <cimport, nodecl> end
+local F_GETFL: cint <cimport, nodecl, const>
+local F_SETFL: cint <cimport, nodecl, const>
+local F_SETFD: cint <cimport, nodecl, const>
+local FD_CLOEXEC: cint <cimport, nodecl, const>
+local O_NONBLOCK: cint <cimport, nodecl, const>
+local WNOHANG: cint <cimport, nodecl, const>
+local function WIFEXITED(s: cint): boolean <cimport, nodecl> end
+local function WEXITSTATUS(s: cint): cint <cimport, nodecl> end
+
+local CGPoint = @record{ x: float64, y: float64 }
+local CGRect = @record{ x: float64, y: float64, w: float64, h: float64 } -- origin, size
+local CMTime = @record{ value: int64, timescale: int32, flags: uint32, epoch: int64 }
+
+local MAC_LIST_ON_SCREEN: uint32 <comptime> = 1          -- kCGWindowListOptionOnScreenOnly
+local MAC_LIST_INCLUDING: uint32 <comptime> = 8          -- kCGWindowListOptionIncludingWindow
+local MAC_LIST_NO_DESKTOP: uint32 <comptime> = 16        -- kCGWindowListExcludeDesktopElements
+local MAC_CF_UTF8: uint32 <comptime> = 0x08000100        -- kCFStringEncodingUTF8
+local MAC_CF_SINT64: integer <comptime> = 4              -- kCFNumberSInt64Type
+local MAC_CF_FLOAT64: integer <comptime> = 6             -- kCFNumberFloat64Type
+local MAC_BGRA: uint32 <comptime> = 0x42475241           -- kCVPixelFormatType_32BGRA ('BGRA')
+local MAC_CLICK_STATE: uint32 <comptime> = 1             -- kCGMouseEventClickState
+-- undocumented CGEventFields the window server fills for real clicks; set
+-- so apps that check which window a pid-posted click is for accept it
+local MAC_WINDOW_UNDER_POINTER: uint32 <comptime> = 91
+local MAC_WINDOW_UNDER_POINTER_FOR_EVENT: uint32 <comptime> = 92
+local MAC_ACTIVATE_IGNORING_OTHER_APPS: usize <comptime> = 2 -- NSApplicationActivateIgnoringOtherApps
+
+local MAC_LAUNCH_TIMEOUT: float64 <comptime> = 30.0
+local MAC_FIRST_FRAME_TIMEOUT: float64 <comptime> = 10.0
+local MAC_GEOMETRY_EVERY: float64 <comptime> = 0.5      -- window gone / resized checks
+local MAC_INPUT_GEOMETRY_AGE: float64 <comptime> = 0.1  -- bounds older than this are refreshed before input
+local MAC_DOUBLE_CLICK: float64 <comptime> = 0.5
+
+-- Function pointer shapes shared by several symbols.
+local FnPV = @function(pointer): void
+local FnPP = @function(pointer): pointer
+local FnPU = @function(pointer): usize
+local FnB = @function(): uint8
+
+-- Everything looked up at load. Optional ones may be nilptr.
+local Mac = @record{
+  loaded: boolean, ok: boolean, why: string,   -- `why` is a literal
+  sck: boolean,                                -- ScreenCaptureKit usable
+  -- CoreFoundation
+  CFRelease: FnPV,
+  CFArrayGetCount: function(pointer): isize,
+  CFArrayGetValueAtIndex: function(pointer, isize): pointer,
+  CFDictionaryGetValue: function(pointer, pointer): pointer,
+  CFNumberGetValue: function(pointer, isize, pointer): uint8,
+  CFStringGetLength: function(pointer): isize,
+  CFStringGetMaximumSizeForEncoding: function(isize, uint32): isize,
+  CFStringGetCString: function(pointer, pointer, isize, uint32): uint8,
+  CFDataGetBytePtr: FnPP,
+  CFDataGetLength: function(pointer): isize,
+  -- CoreGraphics
+  CGMainDisplayID: function(): uint32,
+  CGWindowListCopyWindowInfo: function(uint32, uint32): pointer,
+  CGRectMakeWithDictionaryRepresentation: function(pointer, *CGRect): uint8,
+  CGGetDisplaysWithPoint: function(CGPoint, uint32, *uint32, *uint32): int32,
+  CGDisplayCopyDisplayMode: function(uint32): pointer,
+  CGDisplayModeGetWidth: FnPU,
+  CGDisplayModeGetPixelWidth: FnPU,
+  CGDisplayModeRelease: FnPV,
+  CGEventCreateMouseEvent: function(pointer, uint32, CGPoint, uint32): pointer,
+  CGEventCreateScrollWheelEvent2: function(pointer, uint32, uint32, int32, int32, int32): pointer,
+  CGEventCreateKeyboardEvent: function(pointer, uint16, boolean): pointer,
+  CGEventKeyboardSetUnicodeString: function(pointer, culong, *[0]uint16): void,
+  CGEventSetFlags: function(pointer, uint64): void,
+  CGEventSetLocation: function(pointer, CGPoint): void,
+  CGEventSetIntegerValueField: function(pointer, uint32, int64): void,
+  CGEventPost: function(uint32, pointer): void,
+  CGEventPostToPid: function(cint, pointer): void,
+  CGWindowListCreateImage: function(CGRect, uint32, uint32, uint32): pointer,  -- optional (removed in 15)
+  CGImageGetWidth: FnPU,
+  CGImageGetHeight: FnPU,
+  CGImageGetBytesPerRow: FnPU,
+  CGImageGetBitsPerPixel: FnPU,
+  CGImageGetBitmapInfo: function(pointer): uint32,
+  CGImageGetDataProvider: FnPP,
+  CGDataProviderCopyData: FnPP,
+  CGPreflightScreenCaptureAccess: FnB,      -- optional (10.15+)
+  CGRequestScreenCaptureAccess: FnB,        -- optional
+  CGPreflightPostEventAccess: FnB,          -- optional (10.15+)
+  CGRequestPostEventAccess: FnB,            -- optional
+  AXIsProcessTrusted: FnB,                  -- optional (ApplicationServices)
+  kCGWindowNumber: pointer, kCGWindowOwnerPID: pointer, kCGWindowOwnerName: pointer,
+  kCGWindowName: pointer, kCGWindowLayer: pointer, kCGWindowBounds: pointer,
+  -- CoreMedia / CoreVideo (with ScreenCaptureKit)
+  CMSampleBufferGetImageBuffer: FnPP,
+  CMSampleBufferGetSampleAttachmentsArray: function(pointer, uint8): pointer,
+  CVPixelBufferLockBaseAddress: function(pointer, uint64): int32,
+  CVPixelBufferUnlockBaseAddress: function(pointer, uint64): int32,
+  CVPixelBufferGetBaseAddress: FnPP,
+  CVPixelBufferGetBytesPerRow: FnPU,
+  CVPixelBufferGetWidth: FnPU,
+  CVPixelBufferGetHeight: FnPU,
+  CVPixelBufferGetPixelFormatType: function(pointer): uint32,
+  SCStreamFrameInfoStatus: pointer,         -- the NSString key
+  -- libobjc
+  objc_msgSend: pointer,                    -- cast per message, see msg_* below
+  objc_getClass: function(cstring): pointer,
+  objc_getProtocol: function(cstring): pointer,
+  sel_registerName: function(cstring): pointer,
+  objc_allocateClassPair: function(pointer, cstring, usize): pointer,
+  objc_registerClassPair: FnPV,
+  class_addIvar: function(pointer, cstring, usize, uint8, cstring): uint8,
+  class_addMethod: function(pointer, pointer, pointer, cstring): uint8,
+  class_addProtocol: function(pointer, pointer): uint8,
+  class_getInstanceVariable: function(pointer, cstring): pointer,
+  ivar_getOffset: function(pointer): isize,
+  objc_autoreleasePoolPush: function(): pointer,
+  objc_autoreleasePoolPop: FnPV,
+  -- libdispatch, libclosure (libSystem)
+  dispatch_queue_create: function(cstring, pointer): pointer,
+  dispatch_async_f: function(pointer, pointer, pointer): void,
+  dispatch_release: FnPV,
+  stack_block: pointer,                     -- &_NSConcreteStackBlock
+  -- the capture output class and its `ctx` ivar offset
+  output_class: pointer,
+  ctx_offset: isize,
+  -- the self-pipe: callbacks write, pump drains
+  wake_r: cint, wake_w: cint,
+  self_pid: int32,
+  asked_screen: boolean,
+  input_warned: boolean,
+}
+local mac: Mac
+
+local MacBuf = @record{ px: vector(uint8), w: integer, h: integer, serial: uint64 }
+
+local MacCap = @record{
+  -- set on the main thread before any callback can see the handle
+  wid: uint32,
+  pid: int32,
+  title: string,
+  launch_name: string,       -- run:NAME while waiting for its window
+  launch_pid: cint,          -- the `open -a` child, 0 when reaped
+  launch_deadline: float64,
+  legacy: boolean,           -- CGWindowListCreateImage snapshots instead of a stream
+  -- main thread only
+  bx: float64, by: float64, bw: float64, bh: float64, -- bounds in points
+  geo_at: float64,
+  started_at: float64,
+  front: MacBuf,
+  held: integer,             -- mouse buttons down, bit per button
+  clicks: MacClicks,
+  tap: boolean,              -- post to the HID tap (after FOCUS)
+  utf16: vector(uint16),
+  -- callback thread only
+  back: MacBuf,
+  -- under `lock`
+  lock: [16]uint64,          -- pthread_mutex_t (64 bytes on Darwin), 8-aligned
+  refs: integer,
+  closed: boolean,
+  published: boolean,        -- `stream` is started and belongs to the handle
+  state: integer,
+  why: string,
+  mid: MacBuf,
+  fresh: boolean,
+  serial: uint64,
+  -- the stream (set by the content callback before it publishes)
+  stream: pointer,
+  output: pointer,
+  queue: pointer,
+  pixel_w: integer, pixel_h: integer, -- what the stream was configured for
+}
+
+local mac_caps: vector(*MacCap)
+local mac_reap: vector(cint) -- `open` children still to wait for
+
+------------------------------------------------------------------------------
+-- Loading
+
+local function sym(h: pointer, name: cstring): pointer
+  if h == nilptr then return nilptr end
+  return dlsym(h, name)
+end
+
+-- The value of an exported `const CFStringRef` (or NSString *) variable.
+local function sym_ref(h: pointer, name: cstring): pointer
+  local p = sym(h, name)
+  if p == nilptr then return nilptr end
+  return $(@*pointer)(p)
+end
+
+local function mac_load(): void
+  if mac.loaded then return end
+  mac.loaded = true
+  mac.wake_r, mac.wake_w = -1, -1
+  local cf = dlopen('/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation', RTLD_LAZY)
+  local cg = dlopen('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics', RTLD_LAZY)
+  local objc = dlopen('/usr/lib/libobjc.A.dylib', RTLD_LAZY)
+  if cf == nilptr or cg == nilptr or objc == nilptr then
+    mac.why = 'CoreFoundation, CoreGraphics or libobjc could not be loaded'
+    return
+  end
+  local as = dlopen('/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices', RTLD_LAZY)
+  dlopen('/System/Library/Frameworks/AppKit.framework/AppKit', RTLD_LAZY) -- NSRunningApplication, for FOCUS
+  local sck = dlopen('/System/Library/Frameworks/ScreenCaptureKit.framework/ScreenCaptureKit', RTLD_LAZY)
+  local cm = dlopen('/System/Library/Frameworks/CoreMedia.framework/CoreMedia', RTLD_LAZY)
+  local cv = dlopen('/System/Library/Frameworks/CoreVideo.framework/CoreVideo', RTLD_LAZY)
+
+  mac.CFRelease = (@FnPV)(sym(cf, 'CFRelease'))
+  mac.CFArrayGetCount = (@function(pointer): isize)(sym(cf, 'CFArrayGetCount'))
+  mac.CFArrayGetValueAtIndex = (@function(pointer, isize): pointer)(sym(cf, 'CFArrayGetValueAtIndex'))
+  mac.CFDictionaryGetValue = (@function(pointer, pointer): pointer)(sym(cf, 'CFDictionaryGetValue'))
+  mac.CFNumberGetValue = (@function(pointer, isize, pointer): uint8)(sym(cf, 'CFNumberGetValue'))
+  mac.CFStringGetLength = (@function(pointer): isize)(sym(cf, 'CFStringGetLength'))
+  mac.CFStringGetMaximumSizeForEncoding = (@function(isize, uint32): isize)(sym(cf, 'CFStringGetMaximumSizeForEncoding'))
+  mac.CFStringGetCString = (@function(pointer, pointer, isize, uint32): uint8)(sym(cf, 'CFStringGetCString'))
+  mac.CFDataGetBytePtr = (@FnPP)(sym(cf, 'CFDataGetBytePtr'))
+  mac.CFDataGetLength = (@function(pointer): isize)(sym(cf, 'CFDataGetLength'))
+
+  mac.CGMainDisplayID = (@function(): uint32)(sym(cg, 'CGMainDisplayID'))
+  mac.CGWindowListCopyWindowInfo = (@function(uint32, uint32): pointer)(sym(cg, 'CGWindowListCopyWindowInfo'))
+  mac.CGRectMakeWithDictionaryRepresentation = (@function(pointer, *CGRect): uint8)(sym(cg, 'CGRectMakeWithDictionaryRepresentation'))
+  mac.CGGetDisplaysWithPoint = (@function(CGPoint, uint32, *uint32, *uint32): int32)(sym(cg, 'CGGetDisplaysWithPoint'))
+  mac.CGDisplayCopyDisplayMode = (@function(uint32): pointer)(sym(cg, 'CGDisplayCopyDisplayMode'))
+  mac.CGDisplayModeGetWidth = (@FnPU)(sym(cg, 'CGDisplayModeGetWidth'))
+  mac.CGDisplayModeGetPixelWidth = (@FnPU)(sym(cg, 'CGDisplayModeGetPixelWidth'))
+  mac.CGDisplayModeRelease = (@FnPV)(sym(cg, 'CGDisplayModeRelease'))
+  mac.CGEventCreateMouseEvent = (@function(pointer, uint32, CGPoint, uint32): pointer)(sym(cg, 'CGEventCreateMouseEvent'))
+  mac.CGEventCreateScrollWheelEvent2 = (@function(pointer, uint32, uint32, int32, int32, int32): pointer)(sym(cg, 'CGEventCreateScrollWheelEvent2'))
+  mac.CGEventCreateKeyboardEvent = (@function(pointer, uint16, boolean): pointer)(sym(cg, 'CGEventCreateKeyboardEvent'))
+  mac.CGEventKeyboardSetUnicodeString = (@function(pointer, culong, *[0]uint16): void)(sym(cg, 'CGEventKeyboardSetUnicodeString'))
+  mac.CGEventSetFlags = (@function(pointer, uint64): void)(sym(cg, 'CGEventSetFlags'))
+  mac.CGEventSetLocation = (@function(pointer, CGPoint): void)(sym(cg, 'CGEventSetLocation'))
+  mac.CGEventSetIntegerValueField = (@function(pointer, uint32, int64): void)(sym(cg, 'CGEventSetIntegerValueField'))
+  mac.CGEventPost = (@function(uint32, pointer): void)(sym(cg, 'CGEventPost'))
+  mac.CGEventPostToPid = (@function(cint, pointer): void)(sym(cg, 'CGEventPostToPid'))
+  mac.CGWindowListCreateImage = (@function(CGRect, uint32, uint32, uint32): pointer)(sym(cg, 'CGWindowListCreateImage'))
+  mac.CGImageGetWidth = (@FnPU)(sym(cg, 'CGImageGetWidth'))
+  mac.CGImageGetHeight = (@FnPU)(sym(cg, 'CGImageGetHeight'))
+  mac.CGImageGetBytesPerRow = (@FnPU)(sym(cg, 'CGImageGetBytesPerRow'))
+  mac.CGImageGetBitsPerPixel = (@FnPU)(sym(cg, 'CGImageGetBitsPerPixel'))
+  mac.CGImageGetBitmapInfo = (@function(pointer): uint32)(sym(cg, 'CGImageGetBitmapInfo'))
+  mac.CGImageGetDataProvider = (@FnPP)(sym(cg, 'CGImageGetDataProvider'))
+  mac.CGDataProviderCopyData = (@FnPP)(sym(cg, 'CGDataProviderCopyData'))
+  mac.CGPreflightScreenCaptureAccess = (@FnB)(sym(cg, 'CGPreflightScreenCaptureAccess'))
+  mac.CGRequestScreenCaptureAccess = (@FnB)(sym(cg, 'CGRequestScreenCaptureAccess'))
+  mac.CGPreflightPostEventAccess = (@FnB)(sym(cg, 'CGPreflightPostEventAccess'))
+  mac.CGRequestPostEventAccess = (@FnB)(sym(cg, 'CGRequestPostEventAccess'))
+  mac.AXIsProcessTrusted = (@FnB)(sym(as, 'AXIsProcessTrusted'))
+  mac.kCGWindowNumber = sym_ref(cg, 'kCGWindowNumber')
+  mac.kCGWindowOwnerPID = sym_ref(cg, 'kCGWindowOwnerPID')
+  mac.kCGWindowOwnerName = sym_ref(cg, 'kCGWindowOwnerName')
+  mac.kCGWindowName = sym_ref(cg, 'kCGWindowName')
+  mac.kCGWindowLayer = sym_ref(cg, 'kCGWindowLayer')
+  mac.kCGWindowBounds = sym_ref(cg, 'kCGWindowBounds')
+
+  mac.objc_msgSend = sym(objc, 'objc_msgSend')
+  mac.objc_getClass = (@function(cstring): pointer)(sym(objc, 'objc_getClass'))
+  mac.objc_getProtocol = (@function(cstring): pointer)(sym(objc, 'objc_getProtocol'))
+  mac.sel_registerName = (@function(cstring): pointer)(sym(objc, 'sel_registerName'))
+  mac.objc_allocateClassPair = (@function(pointer, cstring, usize): pointer)(sym(objc, 'objc_allocateClassPair'))
+  mac.objc_registerClassPair = (@FnPV)(sym(objc, 'objc_registerClassPair'))
+  mac.class_addIvar = (@function(pointer, cstring, usize, uint8, cstring): uint8)(sym(objc, 'class_addIvar'))
+  mac.class_addMethod = (@function(pointer, pointer, pointer, cstring): uint8)(sym(objc, 'class_addMethod'))
+  mac.class_addProtocol = (@function(pointer, pointer): uint8)(sym(objc, 'class_addProtocol'))
+  mac.class_getInstanceVariable = (@function(pointer, cstring): pointer)(sym(objc, 'class_getInstanceVariable'))
+  mac.ivar_getOffset = (@function(pointer): isize)(sym(objc, 'ivar_getOffset'))
+  mac.objc_autoreleasePoolPush = (@function(): pointer)(sym(objc, 'objc_autoreleasePoolPush'))
+  mac.objc_autoreleasePoolPop = (@FnPV)(sym(objc, 'objc_autoreleasePoolPop'))
+
+  mac.dispatch_queue_create = (@function(cstring, pointer): pointer)(dlsym(RTLD_DEFAULT, 'dispatch_queue_create'))
+  mac.dispatch_async_f = (@function(pointer, pointer, pointer): void)(dlsym(RTLD_DEFAULT, 'dispatch_async_f'))
+  mac.dispatch_release = (@FnPV)(dlsym(RTLD_DEFAULT, 'dispatch_release'))
+  mac.stack_block = dlsym(RTLD_DEFAULT, '_NSConcreteStackBlock')
+
+  mac.CMSampleBufferGetImageBuffer = (@FnPP)(sym(cm, 'CMSampleBufferGetImageBuffer'))
+  mac.CMSampleBufferGetSampleAttachmentsArray = (@function(pointer, uint8): pointer)(sym(cm, 'CMSampleBufferGetSampleAttachmentsArray'))
+  mac.CVPixelBufferLockBaseAddress = (@function(pointer, uint64): int32)(sym(cv, 'CVPixelBufferLockBaseAddress'))
+  mac.CVPixelBufferUnlockBaseAddress = (@function(pointer, uint64): int32)(sym(cv, 'CVPixelBufferUnlockBaseAddress'))
+  mac.CVPixelBufferGetBaseAddress = (@FnPP)(sym(cv, 'CVPixelBufferGetBaseAddress'))
+  mac.CVPixelBufferGetBytesPerRow = (@FnPU)(sym(cv, 'CVPixelBufferGetBytesPerRow'))
+  mac.CVPixelBufferGetWidth = (@FnPU)(sym(cv, 'CVPixelBufferGetWidth'))
+  mac.CVPixelBufferGetHeight = (@FnPU)(sym(cv, 'CVPixelBufferGetHeight'))
+  mac.CVPixelBufferGetPixelFormatType = (@function(pointer): uint32)(sym(cv, 'CVPixelBufferGetPixelFormatType'))
+  mac.SCStreamFrameInfoStatus = sym_ref(sck, 'SCStreamFrameInfoStatus')
+
+  -- what nothing works without
+  if mac.CFRelease == nilptr or mac.CFArrayGetCount == nilptr or mac.CFArrayGetValueAtIndex == nilptr
+     or mac.CFDictionaryGetValue == nilptr or mac.CFNumberGetValue == nilptr or mac.CFStringGetLength == nilptr
+     or mac.CFStringGetMaximumSizeForEncoding == nilptr or mac.CFStringGetCString == nilptr
+     or mac.CGMainDisplayID == nilptr or mac.CGWindowListCopyWindowInfo == nilptr
+     or mac.CGRectMakeWithDictionaryRepresentation == nilptr or mac.CGEventCreateMouseEvent == nilptr
+     or mac.CGEventCreateKeyboardEvent == nilptr or mac.CGEventPost == nilptr or mac.CGEventPostToPid == nilptr
+     or mac.CGEventSetFlags == nilptr or mac.CGEventSetLocation == nilptr or mac.CGEventSetIntegerValueField == nilptr
+     or mac.CGEventKeyboardSetUnicodeString == nilptr or mac.CGEventCreateScrollWheelEvent2 == nilptr
+     or mac.kCGWindowNumber == nilptr or mac.kCGWindowOwnerPID == nilptr or mac.kCGWindowOwnerName == nilptr
+     or mac.kCGWindowName == nilptr or mac.kCGWindowLayer == nilptr or mac.kCGWindowBounds == nilptr
+     or mac.objc_msgSend == nilptr or mac.objc_getClass == nilptr or mac.sel_registerName == nilptr
+     or mac.objc_autoreleasePoolPush == nilptr or mac.objc_autoreleasePoolPop == nilptr then
+    mac.why = 'a CoreGraphics or Objective-C runtime function is missing (macOS 10.13 or newer needed)'
+    return
+  end
+  -- ScreenCaptureKit and what streaming needs from around it
+  mac.sck = sck ~= nilptr and mac.objc_getClass('SCStream') ~= nilptr and mac.objc_getClass('SCShareableContent') ~= nilptr
+    and mac.CMSampleBufferGetImageBuffer ~= nilptr and mac.CVPixelBufferLockBaseAddress ~= nilptr
+    and mac.CVPixelBufferGetBaseAddress ~= nilptr and mac.dispatch_queue_create ~= nilptr
+    and mac.dispatch_async_f ~= nilptr and mac.dispatch_release ~= nilptr and mac.stack_block ~= nilptr
+    and mac.objc_allocateClassPair ~= nilptr and mac.class_addMethod ~= nilptr and mac.class_addIvar ~= nilptr
+  if not mac.sck and (mac.CGWindowListCreateImage == nilptr or mac.CGDataProviderCopyData == nilptr) then
+    mac.why = 'neither ScreenCaptureKit nor CGWindowListCreateImage is available'
+    return
+  end
+  -- opens this process's window server connection before any capture call
+  -- (command line tools that skip it have been seen to fail in SCK)
+  mac.CGMainDisplayID()
+  local fds: [2]cint
+  if pipe(&fds) ~= 0 then mac.why = 'pipe failed' return end
+  for i = 0, < 2 do
+    fcntl(fds[i], F_SETFL, fcntl(fds[i], F_GETFL, 0) | O_NONBLOCK)
+    fcntl(fds[i], F_SETFD, FD_CLOEXEC)
+  end
+  mac.wake_r, mac.wake_w = fds[0], fds[1]
+  mac.self_pid = getpid()
+  mac.ok = true
+end
+
+------------------------------------------------------------------------------
+-- Objective-C messages, each through objc_msgSend cast to its exact type
+
+local function sel(name: cstring): pointer return mac.sel_registerName(name) end
+local function cls(name: cstring): pointer return mac.objc_getClass(name) end
+
+local function msg(o: pointer, s: cstring): pointer
+  return (@function(pointer, pointer): pointer)(mac.objc_msgSend)(o, sel(s))
+end
+local function msg_p(o: pointer, s: cstring, a: pointer): pointer
+  return (@function(pointer, pointer, pointer): pointer)(mac.objc_msgSend)(o, sel(s), a)
+end
+local function msg_pp(o: pointer, s: cstring, a: pointer, b: pointer): pointer
+  return (@function(pointer, pointer, pointer, pointer): pointer)(mac.objc_msgSend)(o, sel(s), a, b)
+end
+local function msg_ppp(o: pointer, s: cstring, a: pointer, b: pointer, c: pointer): pointer
+  return (@function(pointer, pointer, pointer, pointer, pointer): pointer)(mac.objc_msgSend)(o, sel(s), a, b, c)
+end
+local function msg_usize(o: pointer, s: cstring): usize
+  return (@function(pointer, pointer): usize)(mac.objc_msgSend)(o, sel(s))
+end
+local function msg_u32(o: pointer, s: cstring): uint32
+  return (@function(pointer, pointer): uint32)(mac.objc_msgSend)(o, sel(s))
+end
+local function msg_at(o: pointer, s: cstring, i: usize): pointer
+  return (@function(pointer, pointer, usize): pointer)(mac.objc_msgSend)(o, sel(s), i)
+end
+local function msg_set_usize(o: pointer, s: cstring, v: usize): void
+  local send = (@function(pointer, pointer, usize): void)(mac.objc_msgSend)
+  send(o, sel(s), v)
+end
+local function msg_set_u32(o: pointer, s: cstring, v: uint32): void
+  local send = (@function(pointer, pointer, uint32): void)(mac.objc_msgSend)
+  send(o, sel(s), v)
+end
+local function msg_set_bool(o: pointer, s: cstring, v: boolean): void
+  local send = (@function(pointer, pointer, boolean): void)(mac.objc_msgSend)
+  send(o, sel(s), v)
+end
+local function msg_set_time(o: pointer, s: cstring, t: CMTime): void
+  local send = (@function(pointer, pointer, CMTime): void)(mac.objc_msgSend)
+  send(o, sel(s), t)
+end
+local function msg_cstr(o: pointer, s: cstring): cstring
+  return (@function(pointer, pointer): cstring)(mac.objc_msgSend)(o, sel(s))
+end
+local function release(o: pointer): void
+  if o ~= nilptr then msg(o, 'release') end
+end
+
+-- [error localizedDescription] as a new string ("" for nil).
+local function error_text(err: pointer): string
+  if err == nilptr then return (@string){} end
+  local d = msg(err, 'localizedDescription')
+  if d == nilptr then return (@string){} end
+  local c = msg_cstr(d, 'UTF8String')
+  if c == nilptr then return (@string){} end
+  return string.copy(c)
+end
+
+------------------------------------------------------------------------------
+-- CoreFoundation reading
+
+local function cf_string(s: pointer): string
+  if s == nilptr then return (@string){} end
+  local len = mac.CFStringGetLength(s)
+  local max = mac.CFStringGetMaximumSizeForEncoding(len, MAC_CF_UTF8) + 1
+  if max <= 1 then return (@string){} end
+  local buf: vector(uint8)
+  buf:resize((@usize)(max))
+  local out: string
+  if mac.CFStringGetCString(s, &buf[0], max, MAC_CF_UTF8) ~= 0 then out = string.copy((@cstring)(&buf[0])) end
+  buf:destroy()
+  return out
+end
+
+local function cf_int(n: pointer): int64
+  local v: int64 = 0
+  if n ~= nilptr then mac.CFNumberGetValue(n, MAC_CF_SINT64, &v) end
+  return v
+end
+
+-- The backing scale of the display under a point (pixels per point), 1 when unknown.
+local function display_scale(x: float64, y: float64): float64
+  if mac.CGGetDisplaysWithPoint == nilptr or mac.CGDisplayCopyDisplayMode == nilptr then return 1 end
+  local d: uint32 = 0
+  local n: uint32 = 0
+  if mac.CGGetDisplaysWithPoint(CGPoint{x, y}, 1, &d, &n) ~= 0 or n == 0 then d = mac.CGMainDisplayID() end
+  local mode = mac.CGDisplayCopyDisplayMode(d)
+  if mode == nilptr then return 1 end
+  local w, pw = mac.CGDisplayModeGetWidth(mode), mac.CGDisplayModeGetPixelWidth(mode)
+  mac.CGDisplayModeRelease(mode)
+  if w == 0 or pw == 0 then return 1 end
+  return (@float64)(pw) / (@float64)(w)
+end
+
+-- CGWindowListCopyWindowInfo(option, relative) into `out` (strings owned).
+local function read_windows(option: uint32, relative: uint32, out: *vector(MacWinInfo)): void
+  local arr = mac.CGWindowListCopyWindowInfo(option, relative)
+  if arr == nilptr then return end
+  local n = mac.CFArrayGetCount(arr)
+  for i = 0, < n do
+    local d = mac.CFArrayGetValueAtIndex(arr, i)
+    local win: MacWinInfo
+    win.wid = (@uint32)(cf_int(mac.CFDictionaryGetValue(d, mac.kCGWindowNumber)))
+    win.pid = (@int32)(cf_int(mac.CFDictionaryGetValue(d, mac.kCGWindowOwnerPID)))
+    win.layer = cf_int(mac.CFDictionaryGetValue(d, mac.kCGWindowLayer))
+    local r: CGRect
+    local bd = mac.CFDictionaryGetValue(d, mac.kCGWindowBounds)
+    if bd ~= nilptr and mac.CGRectMakeWithDictionaryRepresentation(bd, &r) ~= 0 then
+      win.x, win.y, win.w, win.h = r.x, r.y, r.w, r.h
+    end
+    win.scale = 1
+    win.app = cf_string(mac.CFDictionaryGetValue(d, mac.kCGWindowOwnerName))
+    win.title = cf_string(mac.CFDictionaryGetValue(d, mac.kCGWindowName)) -- empty without Screen Recording
+    out:push(win)
+  end
+  mac.CFRelease(arr)
+end
+
+local function free_windows(wins: *vector(MacWinInfo)): void
+  for i = 0, < #wins do
+    wins[i].app:destroy()
+    wins[i].title:destroy()
+  end
+  wins:destroy()
+end
+
+local function screen_ok(): boolean
+  if mac.CGPreflightScreenCaptureAccess == nilptr then return true end -- before 10.15: no such permission
+  return mac.CGPreflightScreenCaptureAccess() ~= 0
+end
+
+local function input_ok(): boolean
+  if mac.CGPreflightPostEventAccess ~= nilptr then return mac.CGPreflightPostEventAccess() ~= 0 end
+  if mac.AXIsProcessTrusted ~= nilptr then return mac.AXIsProcessTrusted() ~= 0 end
+  return true
+end
+
+------------------------------------------------------------------------------
+-- Handles
+
+local function lock(c: *MacCap): void pthread_mutex_lock(&c.lock) end
+local function unlock(c: *MacCap): void pthread_mutex_unlock(&c.lock) end
+
+local function wake(): void
+  local b: uint8 = 1
+  write(mac.wake_w, &b, 1) -- full pipe: poll wakes anyway
+end
+
+-- ENDED with `why` (copied), unless it already ended. Any thread.
+local function set_ended(c: *MacCap, why: string): void
+  lock(c)
+  if c.state ~= CAPTURE_ENDED then
+    c.state = CAPTURE_ENDED
+    c.why:destroy()
+    c.why = string.copy(why)
+  end
+  unlock(c)
+  wake()
+end
+
+local function ref(c: *MacCap): void
+  lock(c)
+  c.refs = c.refs + 1
+  unlock(c)
+end
+
+local function unref(c: *MacCap): void
+  lock(c)
+  c.refs = c.refs - 1
+  local last = c.refs == 0
+  unlock(c)
+  if not last then return end
+  pthread_mutex_destroy(&c.lock)
+  c.title:destroy()
+  c.launch_name:destroy()
+  c.why:destroy()
+  c.front.px:destroy()
+  c.back.px:destroy()
+  c.mid.px:destroy()
+  c.utf16:destroy()
+  delete(c)
+end
+
+-- A stack Block literal (see MacBlock) whose invoke gets `ctx` back.
+local block_desc_err: MacBlockDesc = { 0, #MacBlock, 'v@?@' }
+local block_desc_content: MacBlockDesc = { 0, #MacBlock, 'v@?@@' }
+
+local function make_block(invoke: pointer, desc: *MacBlockDesc, ctx: pointer): MacBlock
+  return MacBlock{
+    isa = mac.stack_block, flags = MAC_BLOCK_HAS_SIGNATURE, reserved = 0,
+    invoke = invoke, descriptor = desc, ctx = ctx,
+  }
+end
+
+------------------------------------------------------------------------------
+-- ScreenCaptureKit callbacks (dispatch threads)
+
+local function output_ctx(self: pointer): *MacCap
+  return $(@**MacCap)((@pointer)((@usize)(self) + (@usize)(mac.ctx_offset)))
+end
+
+-- Is this sample a complete frame? (SCStreamFrameInfoStatus == SCFrameStatusComplete)
+local function sample_complete(sbuf: pointer): boolean
+  if mac.CMSampleBufferGetSampleAttachmentsArray == nilptr or mac.SCStreamFrameInfoStatus == nilptr then return true end
+  local arr = mac.CMSampleBufferGetSampleAttachmentsArray(sbuf, 0)
+  if arr == nilptr or mac.CFArrayGetCount(arr) < 1 then return false end
+  local d = mac.CFArrayGetValueAtIndex(arr, 0)
+  local st = mac.CFDictionaryGetValue(d, mac.SCStreamFrameInfoStatus)
+  return st ~= nilptr and cf_int(st) == 0
+end
+
+-- stream:didOutputSampleBuffer:ofType:
+local function on_sample(self: pointer, cmd: pointer, stream: pointer, sbuf: pointer, typ: isize): void
+  if typ ~= 0 or sbuf == nilptr then return end -- SCStreamOutputTypeScreen only
+  local c = output_ctx(self)
+  if c == nilptr or not sample_complete(sbuf) then return end
+  local pb = mac.CMSampleBufferGetImageBuffer(sbuf)
+  if pb == nilptr then return end
+  if mac.CVPixelBufferGetPixelFormatType ~= nilptr and mac.CVPixelBufferGetPixelFormatType(pb) ~= MAC_BGRA then return end
+  if mac.CVPixelBufferLockBaseAddress(pb, 1) ~= 0 then return end -- kCVPixelBufferLock_ReadOnly
+  local base = (@*[0]uint8)(mac.CVPixelBufferGetBaseAddress(pb))
+  local stride = mac.CVPixelBufferGetBytesPerRow(pb)
+  local w, h = (@integer)(mac.CVPixelBufferGetWidth(pb)), (@integer)(mac.CVPixelBufferGetHeight(pb))
+  if base ~= nilptr and w > 0 and h > 0 then
+    local row = (@usize)(w * 4)
+    c.back.px:resize(row * (@usize)(h))
+    if stride == row then
+      memory.copy(&c.back.px[0], base, row * (@usize)(h))
+    else
+      for y = 0, < h do memory.copy(&c.back.px[(@usize)(y) * row], &base[(@usize)(y) * stride], row) end
+    end
+    c.back.w, c.back.h = w, h
+  end
+  mac.CVPixelBufferUnlockBaseAddress(pb, 1)
+  if base == nilptr or w <= 0 or h <= 0 then return end
+  lock(c)
+  if not c.closed then
+    c.back, c.mid = c.mid, c.back
+    c.serial = c.serial + 1
+    c.mid.serial = c.serial
+    c.fresh = true
+    if c.state == CAPTURE_PENDING then c.state = CAPTURE_LIVE end
+  end
+  unlock(c)
+  wake()
+end
+
+-- stream:didStopWithError: (SCStreamDelegate)
+local function on_stream_error(self: pointer, cmd: pointer, stream: pointer, err: pointer): void
+  local c = output_ctx(self)
+  if c == nilptr then return end
+  local text = error_text(err)
+  local sb: stringbuilder
+  sb:write('capture stopped')
+  if #text > 0 then sb:write(': ', text) end
+  local why = sb:promote()
+  set_ended(c, why)
+  why:destroy()
+  text:destroy()
+end
+
+-- On the sample queue after the stream stopped: nothing more will call the
+-- output, so the stream objects go and the stream's reference is dropped.
+local function stream_final(ctx: pointer): void
+  local c = (@*MacCap)(ctx)
+  release(c.stream)
+  release(c.output)
+  c.stream, c.output = nilptr, nilptr
+  mac.dispatch_release(c.queue) -- the running item keeps the queue alive until it returns
+  c.queue = nilptr
+  unref(c)
+end
+
+-- stopCaptureWithCompletionHandler:
+local function on_stopped(blk: *MacBlock, err: pointer): void
+  local c = (@*MacCap)(blk.ctx)
+  mac.dispatch_async_f(c.queue, c, (@pointer)(stream_final))
+end
+
+-- Once per stream, by whichever of close and the content callback sees the
+-- other: stop it; the stream's reference goes in stream_final.
+local function stop_stream(c: *MacCap): void
+  local blk = make_block((@pointer)(on_stopped), &block_desc_err, c)
+  msg_p(c.stream, 'stopCaptureWithCompletionHandler:', &blk)
+end
+
+-- updateConfiguration:completionHandler: (a failed resize keeps the old size)
+local function on_updated(blk: *MacBlock, err: pointer): void end
+
+-- startCaptureWithCompletionHandler:
+local function on_started(blk: *MacBlock, err: pointer): void
+  local c = (@*MacCap)(blk.ctx)
+  if err ~= nilptr then
+    local text = error_text(err)
+    local sb: stringbuilder
+    sb:write('ScreenCaptureKit refused the capture')
+    if #text > 0 then sb:write(': ', text) end
+    if not screen_ok() then sb:write(' (no Screen Recording permission)') end
+    local why = sb:promote()
+    set_ended(c, why)
+    why:destroy()
+    text:destroy()
+  end
+  unref(c)
+end
+
+-- getShareableContent...completionHandler: find the window, make and start
+-- its stream, publish it on the handle.
+local function on_content(blk: *MacBlock, content: pointer, err: pointer): void
+  local c = (@*MacCap)(blk.ctx)
+  defer unref(c) end
+  lock(c)
+  local closed = c.closed
+  unlock(c)
+  if closed then return end
+  if content == nilptr then
+    local text = error_text(err)
+    local sb: stringbuilder
+    sb:write('ScreenCaptureKit gave no windows')
+    if #text > 0 then sb:write(': ', text) end
+    if not screen_ok() then sb:write(' (no Screen Recording permission: System Settings > Privacy & Security > Screen Recording)') end
+    local why = sb:promote()
+    set_ended(c, why)
+    why:destroy()
+    text:destroy()
+    return
+  end
+  local windows = msg(content, 'windows')
+  local n: usize = 0
+  if windows ~= nilptr then n = msg_usize(windows, 'count') end
+  local win: pointer = nilptr
+  for i: usize = 0, < n do
+    local w = msg_at(windows, 'objectAtIndex:', i)
+    if msg_u32(w, 'windowID') == c.wid then win = w break end
+  end
+  if win == nilptr then set_ended(c, 'ScreenCaptureKit does not offer this window') return end
+
+  local filter = msg_p(msg(cls('SCContentFilter'), 'alloc'), 'initWithDesktopIndependentWindow:', win)
+  local config = msg(msg(cls('SCStreamConfiguration'), 'alloc'), 'init')
+  msg_set_usize(config, 'setWidth:', (@usize)(c.pixel_w))
+  msg_set_usize(config, 'setHeight:', (@usize)(c.pixel_h))
+  msg_set_u32(config, 'setPixelFormat:', MAC_BGRA)
+  msg_set_time(config, 'setMinimumFrameInterval:', CMTime{ value = 1, timescale = 60, flags = 1 }) -- CMTimeMake(1, 60)
+  msg_set_bool(config, 'setShowsCursor:', false)
+  msg_set_usize(config, 'setQueueDepth:', 3)
+  local output = msg(msg(mac.output_class, 'alloc'), 'init')
+  $(@**MacCap)((@pointer)((@usize)(output) + (@usize)(mac.ctx_offset))) = c
+  local stream = msg_ppp(msg(cls('SCStream'), 'alloc'), 'initWithFilter:configuration:delegate:', filter, config, output)
+  release(filter)
+  release(config)
+  if stream == nilptr then
+    release(output)
+    set_ended(c, 'ScreenCaptureKit could not make a stream for this window')
+    return
+  end
+  local queue = mac.dispatch_queue_create('ghostty-agent.capture', nilptr) -- serial
+  local add_err: pointer = nilptr
+  local added = (@function(pointer, pointer, pointer, isize, pointer, *pointer): boolean)(mac.objc_msgSend)(
+    stream, sel('addStreamOutput:type:sampleHandlerQueue:error:'), output, 0, queue, &add_err)
+  if not added then
+    release(stream)
+    release(output)
+    mac.dispatch_release(queue)
+    set_ended(c, 'ScreenCaptureKit refused the stream output')
+    return
+  end
+  c.stream, c.output, c.queue = stream, output, queue
+  ref(c) -- the stream's, dropped in stream_final
+  ref(c) -- the start handler's
+  local sblk = make_block((@pointer)(on_started), &block_desc_err, c)
+  msg_p(stream, 'startCaptureWithCompletionHandler:', &sblk)
+  lock(c)
+  local now_closed = c.closed
+  if not now_closed then c.published = true end
+  unlock(c)
+  if now_closed then stop_stream(c) end -- closed while this ran: close saw no stream
+end
+
+-- The output class, made once: NSObject + ctx ivar + the two callbacks.
+local function make_output_class(): boolean
+  if mac.output_class ~= nilptr then return true end
+  local k = mac.objc_allocateClassPair(cls('NSObject'), 'GhosttyAgentCaptureOutput', 0)
+  if k == nilptr then
+    k = cls('GhosttyAgentCaptureOutput') -- made before (it cannot be unmade)
+  else
+    mac.class_addIvar(k, 'ctx', #pointer, 3, '^v') -- alignment is log2
+    mac.class_addMethod(k, sel('stream:didOutputSampleBuffer:ofType:'), (@pointer)(on_sample), 'v@:@^vq')
+    mac.class_addMethod(k, sel('stream:didStopWithError:'), (@pointer)(on_stream_error), 'v@:@@')
+    local p1, p2 = mac.objc_getProtocol('SCStreamOutput'), mac.objc_getProtocol('SCStreamDelegate')
+    if p1 ~= nilptr then mac.class_addProtocol(k, p1) end
+    if p2 ~= nilptr then mac.class_addProtocol(k, p2) end
+    mac.objc_registerClassPair(k)
+  end
+  if k == nilptr then return false end
+  local iv = mac.class_getInstanceVariable(k, 'ctx')
+  if iv == nilptr then return false end
+  mac.ctx_offset = mac.ivar_getOffset(iv)
+  mac.output_class = k
+  return true
+end
+
+------------------------------------------------------------------------------
+-- Main thread
+
+-- Refresh bounds and pid of the handle's window; false when it is gone.
+local function refresh_geometry(c: *MacCap, now: float64): boolean
+  local wins: vector(MacWinInfo)
+  read_windows(MAC_LIST_INCLUDING, c.wid, &wins)
+  local at = capmac_pick(&wins, mac.self_pid, c.wid, '')
+  if at >= 0 then
+    local w = &wins[at]
+    c.bx, c.by, c.bw, c.bh, c.pid = w.x, w.y, w.w, w.h, w.pid
+  end
+  free_windows(&wins)
+  c.geo_at = now
+  return at >= 0
+end
+
+-- Start capturing `c.wid` (geometry known): the stream, or snapshots.
+local function start_capture(c: *MacCap, now: float64): void
+  local scale = display_scale(c.bx + c.bw / 2, c.by + c.bh / 2)
+  c.pixel_w, c.pixel_h = capmac_pixels(c.bw, scale), capmac_pixels(c.bh, scale)
+  c.started_at = now
+  if not screen_ok() then
+    if not mac.asked_screen and mac.CGRequestScreenCaptureAccess ~= nilptr then
+      mac.asked_screen = true
+      mac.CGRequestScreenCaptureAccess() -- shows the system prompt once
+    end
+    set_ended(c, 'no Screen Recording permission: allow ghostty-agent (or the terminal running it) in System Settings > Privacy & Security > Screen Recording, then restart it')
+    return
+  end
+  if mac.sck and make_output_class() then
+    ref(c) -- the content handler's
+    local blk = make_block((@pointer)(on_content), &block_desc_content, c)
+    local pool = mac.objc_autoreleasePoolPush()
+    local send = (@function(pointer, pointer, boolean, boolean, pointer): void)(mac.objc_msgSend)
+    send(
+      cls('SCShareableContent'), sel('getShareableContentExcludingDesktopWindows:onScreenWindowsOnly:completionHandler:'),
+      true, false, &blk)
+    mac.objc_autoreleasePoolPop(pool)
+    return
+  end
+  c.legacy = true
+  lock(c)
+  if c.state == CAPTURE_PENDING then c.state = CAPTURE_LIVE end
+  unlock(c)
+end
+
+-- A CGWindowListCreateImage snapshot into `front` (the pre-12.3 path).
+local function snapshot(c: *MacCap): boolean
+  local img = mac.CGWindowListCreateImage(CGRect{ math.huge, math.huge, 0, 0 }, -- CGRectNull: the window's bounds
+    MAC_LIST_INCLUDING, c.wid, 1 | 16) -- kCGWindowImageBoundsIgnoreFraming | NominalResolution
+  if img == nilptr then return false end
+  local ok = false
+  local data = mac.CGDataProviderCopyData(mac.CGImageGetDataProvider(img))
+  if data ~= nilptr then
+    local w, h = (@integer)(mac.CGImageGetWidth(img)), (@integer)(mac.CGImageGetHeight(img))
+    local stride = mac.CGImageGetBytesPerRow(img)
+    if (@usize)(mac.CFDataGetLength(data)) >= stride * (@usize)(h) then
+      ok = capmac_to_bgra((@*[0]uint8)(mac.CFDataGetBytePtr(data)), stride, w, h,
+        (@integer)(mac.CGImageGetBitsPerPixel(img)), mac.CGImageGetBitmapInfo(img), &c.front.px)
+    end
+    if ok then
+      c.front.w, c.front.h = w, h
+      c.front.serial = c.front.serial + 1
+    end
+    mac.CFRelease(data)
+  end
+  mac.CFRelease(img)
+  return ok
+end
+
+local function mac_list(): string
+  local wins: vector(MacWinInfo)
+  read_windows(MAC_LIST_ON_SCREEN | MAC_LIST_NO_DESKTOP, 0, &wins)
+  for i = 0, < #wins do
+    local w = &wins[i]
+    if capmac_listable(w, mac.self_pid) then w.scale = display_scale(w.x + w.w / 2, w.y + w.h / 2) end
+  end
+  local text = capmac_list_text(&wins, mac.self_pid, screen_ok(), input_ok())
+  free_windows(&wins)
+  return text
+end
+
+local function new_cap(): *MacCap
+  local c = new(@MacCap)
+  pthread_mutex_init(&c.lock, nilptr)
+  c.refs = 1
+  c.state = CAPTURE_PENDING
+  mac_caps:push(c)
+  return c
+end
+
+-- `open -a NAME` without a shell (NAME is passed as one argument).
+local function launch(name: string): cint
+  local cname = string.copy(name)
+  local argv: [4]cstring = { 'open', '-a', (@cstring)(cname.data), nilptr }
+  local pid: cint = 0
+  local rc = posix_spawn(&pid, '/usr/bin/open', nilptr, nilptr, &argv, $_NSGetEnviron())
+  cname:destroy()
+  if rc ~= 0 then return 0 end
+  return pid
+end
+
+local function set_title(c: *MacCap, w: *MacWinInfo): void
+  c.title:destroy()
+  if #w.title > 0 then c.title = w.app .. ' - ' .. w.title else c.title = string.copy(w.app) end
+end
+
+local function mac_open(wid: uint32, match: string): (pointer, string)
+  local now = os.now()
+  local is_run, name = capmac_parse_run(match)
+  if wid == 0 and is_run then
+    local pid = launch(name)
+    if pid == 0 then
+      local why = 'could not run open -a ' .. name
+      name:destroy()
+      return nilptr, why
+    end
+    local c = new_cap()
+    c.launch_name, c.launch_pid, c.launch_deadline = name, pid, now + MAC_LAUNCH_TIMEOUT
+    c.title = 'launching ' .. name
+    return c, (@string){}
+  end
+  local wins: vector(MacWinInfo)
+  -- by id: any window the server knows, on screen or not; by match: on screen
+  if wid ~= 0 then read_windows(MAC_LIST_INCLUDING, wid, &wins)
+  else read_windows(MAC_LIST_ON_SCREEN | MAC_LIST_NO_DESKTOP, 0, &wins) end
+  local at = capmac_pick(&wins, mac.self_pid, wid, match)
+  if at < 0 then
+    free_windows(&wins)
+    if wid == 0 and #match == 0 then return nilptr, string.copy('no window picker on macOS: give a wid, a title/app match or run:APP') end
+    return nilptr, string.copy('no such window')
+  end
+  local c = new_cap()
+  local w = &wins[at]
+  c.wid, c.pid = w.wid, w.pid
+  c.bx, c.by, c.bw, c.bh, c.geo_at = w.x, w.y, w.w, w.h, now
+  set_title(c, w)
+  free_windows(&wins)
+  start_capture(c, now)
+  return c, (@string){}
+end
+
+local function mac_state(h: pointer): (integer, string)
+  local c = (@*MacCap)(h)
+  lock(c)
+  local st, why = c.state, c.why
+  unlock(c)
+  return st, why -- `why` is only set once, on ENDED, so it stays valid
+end
+
+local function mac_title(h: pointer): string
+  return (@*MacCap)(h).title
+end
+
+local function mac_frame(h: pointer, out: *CaptureFrame): boolean
+  local c = (@*MacCap)(h)
+  if c.legacy then
+    if not snapshot(c) and c.front.serial == 0 then return false end
+  else
+    lock(c)
+    if c.fresh then
+      c.front, c.mid = c.mid, c.front
+      c.fresh = false
+    end
+    unlock(c)
+  end
+  if c.front.serial == 0 or c.front.w <= 0 or c.front.h <= 0 then return false end
+  out.pixels = (@*[0]uint8)(&c.front.px[0])
+  out.w, out.h = c.front.w, c.front.h
+  out.stride = (@usize)(c.front.w * 4)
+  out.serial = c.front.serial
+  return true
+end
+
+-- Post and release `ev`: to the window's process, or to the HID tap after a
+-- FOCUS (moves the real cursor; for apps that ignore pid-posted events).
+local function post(c: *MacCap, ev: pointer): void
+  if ev == nilptr then return end
+  if c.tap or c.pid <= 0 then mac.CGEventPost(0, ev) -- kCGHIDEventTap
+  else mac.CGEventPostToPid(c.pid, ev) end
+  mac.CFRelease(ev)
+end
+
+local function mouse(c: *MacCap, typ: integer, p: CGPoint, button: integer, clicks: integer): void
+  local ev = mac.CGEventCreateMouseEvent(nilptr, (@uint32)(typ), p, (@uint32)(button))
+  if ev == nilptr then return end
+  if clicks > 0 then mac.CGEventSetIntegerValueField(ev, MAC_CLICK_STATE, clicks) end
+  mac.CGEventSetIntegerValueField(ev, MAC_WINDOW_UNDER_POINTER, c.wid)
+  mac.CGEventSetIntegerValueField(ev, MAC_WINDOW_UNDER_POINTER_FOR_EVENT, c.wid)
+  post(c, ev)
+end
+
+local function mac_input(h: pointer, ev: *CaptureInput): void
+  local c = (@*MacCap)(h)
+  if c.wid == 0 then return end -- still launching
+  if not input_ok() then
+    if not mac.input_warned then
+      mac.input_warned = true
+      io.stderr:write('ghostty-agent: window input dropped: no Accessibility permission (System Settings > Privacy & Security > Accessibility)\n')
+      if mac.CGRequestPostEventAccess ~= nilptr then mac.CGRequestPostEventAccess() end
+    end
+    return
+  end
+  local now = os.now()
+  local kind = ev.kind
+  if kind == WIN_INPUT_MOVE or kind == WIN_INPUT_BUTTON or kind == WIN_INPUT_WHEEL then
+    if now - c.geo_at > MAC_INPUT_GEOMETRY_AGE then refresh_geometry(c, now) end
+    local fw, fh = c.front.w, c.front.h
+    if fw <= 0 then fw, fh = c.pixel_w, c.pixel_h end
+    local gx, gy = capmac_to_global(ev.x, ev.y, fw, fh, c.bx, c.by, c.bw, c.bh)
+    local p = CGPoint{ gx, gy }
+    if kind == WIN_INPUT_MOVE then
+      local b = 0
+      if c.held & 1 == 0 then b = c.held & 2 ~= 0 and 1 or (c.held & 4 ~= 0 and 2 or 0) end
+      mouse(c, capmac_mouse_type(false, 0, false, c.held), p, b, 0)
+    elseif kind == WIN_INPUT_BUTTON then
+      local b = math.clamp(ev.button, 0, 2)
+      local n = 1
+      if ev.down then
+        n = capmac_click(&c.clicks, now, gx, gy, b, MAC_DOUBLE_CLICK)
+        c.held = c.held | (1 << b)
+      else
+        n = c.clicks.button == b and c.clicks.n or 1
+        c.held = c.held & ~(1 << b)
+      end
+      mouse(c, capmac_mouse_type(true, b, ev.down, c.held), p, b, n)
+    else
+      mouse(c, capmac_mouse_type(false, 0, false, c.held), p, 0, 0) -- the wheel goes where the pointer is
+      local w = mac.CGEventCreateScrollWheelEvent2(nilptr, 1, 2, -- kCGScrollEventUnitLine, two wheels
+        (@int32)(capmac_wheel_lines(ev.dy)), (@int32)(-capmac_wheel_lines(ev.dx)), 0)
+      if w ~= nilptr then
+        mac.CGEventSetLocation(w, p)
+        post(c, w)
+      end
+    end
+  elseif kind == WIN_INPUT_KEY then
+    local kvk = capmac_hid_to_kvk(ev.hid)
+    if kvk < 0 then return end
+    local k = mac.CGEventCreateKeyboardEvent(nilptr, (@uint16)(kvk), ev.down)
+    if k == nilptr then return end
+    mac.CGEventSetFlags(k, capmac_key_flags(kvk, ev.mods))
+    post(c, k)
+  elseif kind == WIN_INPUT_TEXT then
+    capmac_utf16(ev.text, &c.utf16)
+    local i = 0
+    while i < #c.utf16 do
+      local e = capmac_chunk_end(&c.utf16, i, 20)
+      for pass = 0, < 2 do
+        local k = mac.CGEventCreateKeyboardEvent(nilptr, 0, pass == 0)
+        if k ~= nilptr then
+          mac.CGEventKeyboardSetUnicodeString(k, (@culong)(e - i), (@*[0]uint16)(&c.utf16[i]))
+          post(c, k)
+        end
+      end
+      i = e
+    end
+  elseif kind == WIN_INPUT_FOCUS then
+    local pool = mac.objc_autoreleasePoolPush()
+    local app_class = cls('NSRunningApplication')
+    if app_class ~= nilptr and c.pid > 0 then
+      local app = (@function(pointer, pointer, cint): pointer)(mac.objc_msgSend)(
+        app_class, sel('runningApplicationWithProcessIdentifier:'), c.pid)
+      if app ~= nilptr then
+        local send = (@function(pointer, pointer, usize): boolean)(mac.objc_msgSend)
+        send(app, sel('activateWithOptions:'), MAC_ACTIVATE_IGNORING_OTHER_APPS)
+      end
+    end
+    mac.objc_autoreleasePoolPop(pool)
+    c.tap = true -- the window is in front now: real events reach it, and apps that ignore pid-posted ones
+  end
+end
+
+local function mac_close(h: pointer): void
+  local c = (@*MacCap)(h)
+  for i = 0, < #mac_caps do
+    if mac_caps[i] == c then mac_caps:remove(i) break end
+  end
+  if c.launch_pid > 0 then mac_reap:push(c.launch_pid) c.launch_pid = 0 end
+  lock(c)
+  c.closed = true
+  local published = c.published
+  unlock(c)
+  if published then stop_stream(c) end
+  unref(c)
+end
+
+-- A run:NAME handle: reap `open`, look for the app's window, give up after the timeout.
+local function pump_launch(c: *MacCap, now: float64): void
+  if c.launch_pid > 0 then
+    local status: cint = 0
+    if waitpid(c.launch_pid, &status, WNOHANG) == c.launch_pid then
+      c.launch_pid = 0
+      if not WIFEXITED(status) or WEXITSTATUS(status) ~= 0 then
+        local why = 'open -a ' .. c.launch_name .. ' failed (no such app?)'
+        set_ended(c, why)
+        why:destroy()
+        return
+      end
+    end
+  end
+  local wins: vector(MacWinInfo)
+  read_windows(MAC_LIST_ON_SCREEN | MAC_LIST_NO_DESKTOP, 0, &wins)
+  local at = capmac_pick_app(&wins, mac.self_pid, c.launch_name)
+  if at >= 0 then
+    local w = &wins[at]
+    c.wid, c.pid = w.wid, w.pid
+    c.bx, c.by, c.bw, c.bh, c.geo_at = w.x, w.y, w.w, w.h, now
+    set_title(c, w)
+    free_windows(&wins)
+    start_capture(c, now)
+    return
+  end
+  free_windows(&wins)
+  if now > c.launch_deadline then
+    local why = c.launch_name .. ' showed no window in 30 s'
+    set_ended(c, why)
+    why:destroy()
+  end
+end
+
+local function mac_pump(): void
+  local buf: [64]uint8
+  while read(mac.wake_r, &buf, 64) > 0 do end
+  local now = os.now()
+  for i = 0, < #mac_caps do
+    local c = mac_caps[i]
+    local st = mac_state(c)
+    if st == CAPTURE_ENDED then continue end
+    if c.wid == 0 then
+      pump_launch(c, now)
+    elseif now - c.geo_at >= MAC_GEOMETRY_EVERY then
+      if not refresh_geometry(c, now) then
+        set_ended(c, 'window closed')
+        continue
+      end
+      -- follow resizes: the stream is reconfigured to the new pixel size
+      local scale = display_scale(c.bx + c.bw / 2, c.by + c.bh / 2)
+      local pw, ph = capmac_pixels(c.bw, scale), capmac_pixels(c.bh, scale)
+      lock(c)
+      local published = c.published
+      unlock(c)
+      if published and (pw ~= c.pixel_w or ph ~= c.pixel_h) then
+        c.pixel_w, c.pixel_h = pw, ph
+        local config = msg(msg(cls('SCStreamConfiguration'), 'alloc'), 'init')
+        msg_set_usize(config, 'setWidth:', (@usize)(pw))
+        msg_set_usize(config, 'setHeight:', (@usize)(ph))
+        msg_set_u32(config, 'setPixelFormat:', MAC_BGRA)
+        msg_set_time(config, 'setMinimumFrameInterval:', CMTime{ value = 1, timescale = 60, flags = 1 })
+        msg_set_bool(config, 'setShowsCursor:', false)
+        msg_set_usize(config, 'setQueueDepth:', 3)
+        local blk = make_block((@pointer)(on_updated), &block_desc_err, nilptr)
+        msg_pp(c.stream, 'updateConfiguration:completionHandler:', config, &blk)
+        release(config)
+      end
+      if st == CAPTURE_PENDING and not c.legacy and now - c.started_at > MAC_FIRST_FRAME_TIMEOUT then
+        set_ended(c, 'no frame from ScreenCaptureKit in 10 s')
+      end
+    end
+  end
+  local i = 0
+  while i < #mac_reap do
+    local status: cint = 0
+    if waitpid(mac_reap[i], &status, WNOHANG) ~= 0 then mac_reap:remove(i) else i = i + 1 end
+  end
+end
+
+local function mac_poll_fds(fds: *[0]cint, max: integer): integer
+  if max < 1 or mac.wake_r < 0 then return 0 end
+  fds[0] = mac.wake_r
+  return 1
+end
+
+-- Frames wake the loop through the pipe; the timeouts only drive the window
+-- checks (gone, resized) and run:APP waits.
+local function mac_wait_ms(): integer
+  local best = -1
+  for i = 0, < #mac_caps do
+    local c = mac_caps[i]
+    local ms = c.wid == 0 and 250 or (@integer)(MAC_GEOMETRY_EVERY * 1000)
+    if best < 0 or ms < best then best = ms end
+  end
+  return best
+end
+
+global function capture_mac_backend(): (boolean, CaptureBackend, string)
+  mac_load()
+  if not mac.ok then return false, (@CaptureBackend){}, mac.why end
+  return true, CaptureBackend{
+    name = 'mac', list = mac_list, open = mac_open, state = mac_state, title = mac_title,
+    frame = mac_frame, input = mac_input, close = mac_close, pump = mac_pump,
+    poll_fds = mac_poll_fds, wait_ms = mac_wait_ms,
+  }, ''
+end
