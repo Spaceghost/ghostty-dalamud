@@ -1,0 +1,200 @@
+-- The macOS capture backend's pure parts (agent/capture_mac_logic.nelua) on
+-- any host. Nothing here proves the backend works on a Mac: it never ran on
+-- one. These pin the tables and the maths it relies on.
+require 'agent.capture_mac_logic'
+require 'string'
+require 'vector'
+
+-- HID usage to kVK: letters, digits, the named keys, modifiers, unknowns
+do
+  assert(capmac_hid_to_kvk(0x04) == 0x00) -- a
+  assert(capmac_hid_to_kvk(0x16) == 0x01) -- s
+  assert(capmac_hid_to_kvk(0x1d) == 0x06) -- z
+  assert(capmac_hid_to_kvk(0x0c) == 0x22) -- i
+  assert(capmac_hid_to_kvk(0x1e) == 0x12) -- 1
+  assert(capmac_hid_to_kvk(0x22) == 0x17) -- 5
+  assert(capmac_hid_to_kvk(0x27) == 0x1d) -- 0
+  assert(capmac_hid_to_kvk(0x28) == 0x24) -- return
+  assert(capmac_hid_to_kvk(0x29) == 0x35) -- escape
+  assert(capmac_hid_to_kvk(0x2a) == 0x33) -- backspace
+  assert(capmac_hid_to_kvk(0x2b) == 0x30) -- tab
+  assert(capmac_hid_to_kvk(0x2c) == 0x31) -- space
+  assert(capmac_hid_to_kvk(0x38) == 0x2c) -- slash
+  assert(capmac_hid_to_kvk(0x3a) == 0x7a) -- F1
+  assert(capmac_hid_to_kvk(0x45) == 0x6f) -- F12
+  assert(capmac_hid_to_kvk(0x68) == 0x69) -- F13
+  assert(capmac_hid_to_kvk(0x6f) == 0x5a) -- F20
+  assert(capmac_hid_to_kvk(0x70) == -1)   -- F21: no Mac key
+  assert(capmac_hid_to_kvk(0x4a) == 0x73 and capmac_hid_to_kvk(0x4d) == 0x77) -- home, end
+  assert(capmac_hid_to_kvk(0x4b) == 0x74 and capmac_hid_to_kvk(0x4e) == 0x79) -- pgup, pgdn
+  assert(capmac_hid_to_kvk(0x4c) == 0x75) -- forward delete
+  assert(capmac_hid_to_kvk(0x4f) == 0x7c and capmac_hid_to_kvk(0x50) == 0x7b)
+  assert(capmac_hid_to_kvk(0x51) == 0x7d and capmac_hid_to_kvk(0x52) == 0x7e)
+  assert(capmac_hid_to_kvk(0x62) == 0x52 and capmac_hid_to_kvk(0x61) == 0x5c) -- keypad 0, 9
+  assert(capmac_hid_to_kvk(0xe0) == 0x3b and capmac_hid_to_kvk(0xe3) == 0x37) -- ctrl, command
+  assert(capmac_hid_to_kvk(0xe7) == 0x36)
+  assert(capmac_hid_to_kvk(0x00) == -1 and capmac_hid_to_kvk(0x46) == -1) -- none, print screen
+  -- no two HID letters or digits share a keycode
+  local seen: [128]boolean
+  for hid = 0x04, 0x27 do
+    local k = capmac_hid_to_kvk((@uint16)(hid))
+    assert(k >= 0 and k < 128 and not seen[k])
+    seen[k] = true
+  end
+end
+
+-- modifier and key flags
+do
+  assert(capmac_key_flags(0x00, 0) == 0)
+  assert(capmac_key_flags(0x00, 1) == MAC_FLAG_CONTROL)
+  assert(capmac_key_flags(0x00, 2 | 8) == MAC_FLAG_SHIFT | MAC_FLAG_COMMAND)
+  assert(capmac_key_flags(0x00, 4) == 0x80000)
+  assert(capmac_key_flags(0x7e, 0) == MAC_FLAG_NUMPAD | MAC_FLAG_FN) -- up
+  assert(capmac_key_flags(0x73, 2) == MAC_FLAG_FN | MAC_FLAG_SHIFT) -- shift+home
+  assert(capmac_key_flags(0x7a, 0) == MAC_FLAG_FN) -- F1
+  assert(capmac_key_flags(0x6f, 0) == MAC_FLAG_FN) -- F12
+  assert(capmac_key_flags(0x24, 0) == 0) -- return
+end
+
+-- mouse event types, drags while held
+do
+  assert(capmac_mouse_type(true, 0, true, 0) == MAC_EV_LEFT_DOWN)
+  assert(capmac_mouse_type(true, 0, false, 1) == MAC_EV_LEFT_UP)
+  assert(capmac_mouse_type(true, 1, true, 0) == MAC_EV_RIGHT_DOWN)
+  assert(capmac_mouse_type(true, 2, false, 4) == MAC_EV_OTHER_UP)
+  assert(capmac_mouse_type(false, 0, false, 0) == MAC_EV_MOVED)
+  assert(capmac_mouse_type(false, 0, false, 1) == MAC_EV_LEFT_DRAGGED)
+  assert(capmac_mouse_type(false, 0, false, 2) == MAC_EV_RIGHT_DRAGGED)
+  assert(capmac_mouse_type(false, 0, false, 4) == MAC_EV_OTHER_DRAGGED)
+  assert(capmac_wheel_lines(0) == 0 and capmac_wheel_lines(120) == 1 and capmac_wheel_lines(-240) == -2)
+  assert(capmac_wheel_lines(30) == 1 and capmac_wheel_lines(-30) == -1 and capmac_wheel_lines(250) == 2)
+  local c: MacClicks
+  assert(capmac_click(&c, 1.0, 10, 10, 0, 0.5) == 1)
+  assert(capmac_click(&c, 1.2, 11, 10, 0, 0.5) == 2)
+  assert(capmac_click(&c, 1.3, 11, 10, 0, 0.5) == 3)
+  assert(capmac_click(&c, 1.4, 11, 10, 1, 0.5) == 1) -- another button
+  assert(capmac_click(&c, 2.4, 11, 10, 1, 0.5) == 1) -- too late
+  assert(capmac_click(&c, 2.5, 30, 10, 1, 0.5) == 1) -- too far
+end
+
+-- frame pixels to global points: Retina (2x) and 1x, pixel centres
+do
+  local gx, gy = capmac_to_global(0, 0, 1600, 1200, 100, 50, 800, 600)
+  assert(gx == 100.25 and gy == 50.25)
+  gx, gy = capmac_to_global(1599, 1199, 1600, 1200, 100, 50, 800, 600)
+  assert(gx == 899.75 and gy == 649.75)
+  gx, gy = capmac_to_global(10, 20, 800, 600, -800, 0, 800, 600) -- a display left of the main one
+  assert(gx == -789.5 and gy == 20.5)
+  assert(capmac_pixels(800, 2) == 1600 and capmac_pixels(801.5, 1) == 802 and capmac_pixels(0, 2) == 1)
+end
+
+-- the Block literal layout the Block ABI requires on 64-bit
+do
+  local b: MacBlock
+  assert(#MacBlock == 40)
+  assert((@usize)(&b.flags) - (@usize)(&b) == 8)
+  assert((@usize)(&b.reserved) - (@usize)(&b) == 12)
+  assert((@usize)(&b.invoke) - (@usize)(&b) == 16)
+  assert((@usize)(&b.descriptor) - (@usize)(&b) == 24)
+  assert((@usize)(&b.ctx) - (@usize)(&b) == 32)
+  local d: MacBlockDesc
+  assert(#MacBlockDesc == 24 and (@usize)(&d.signature) - (@usize)(&d) == 16)
+  assert(MAC_BLOCK_HAS_SIGNATURE == 0x40000000)
+end
+
+-- run:NAME
+do
+  local ok, name = capmac_parse_run('run:TextEdit')
+  assert(ok and name == 'TextEdit')
+  name:destroy()
+  ok, name = capmac_parse_run('run:  Visual Studio Code ')
+  assert(ok and name == 'Visual Studio Code')
+  name:destroy()
+  ok = capmac_parse_run('run:')
+  assert(not ok)
+  ok = capmac_parse_run('run: ')
+  assert(not ok)
+  ok = capmac_parse_run('Safari')
+  assert(not ok)
+  ok = capmac_parse_run('ru')
+  assert(not ok)
+  assert(capmac_app_is('TextEdit', 'textedit.app') and capmac_app_is('Safari', 'Safari'))
+  assert(not capmac_app_is('Safari Technology Preview', 'Safari'))
+  assert(not capmac_app_is('app', '.app'))
+end
+
+-- the list from a fake CGWindowListCopyWindowInfo result
+do
+  local wins: vector(MacWinInfo)
+  wins:push(MacWinInfo{ wid = 7, pid = 10, layer = 25, x = 0, y = 0, w = 800, h = 24, scale = 2, app = 'Control Center', title = 'menu' })
+  wins:push(MacWinInfo{ wid = 41, pid = 11, layer = 0, x = 10, y = 30, w = 800, h = 600, scale = 2, app = 'Safari', title = 'Start\tPage' })
+  wins:push(MacWinInfo{ wid = 42, pid = 99, layer = 0, x = 0, y = 0, w = 400, h = 300, scale = 1, app = 'ghostty-agent', title = 'self' })
+  wins:push(MacWinInfo{ wid = 43, pid = 12, layer = 0, x = 0, y = 0, w = 8, h = 8, scale = 1, app = 'Tiny', title = 'dot' })
+  wins:push(MacWinInfo{ wid = 44, pid = 13, layer = 0, x = 0, y = 0, w = 640, h = 480, scale = 1, app = 'TextEdit', title = '' })
+  local text = capmac_list_text(&wins, 99, true, true)
+  assert(text == '0\t0\t0\tlaunch\trun:APP opens an app (open -a) and streams its first window\n'
+              .. '41\t1600\t1200\tSafari\tStart Page\n'
+              .. '44\t640\t480\tTextEdit\t\n')
+  text:destroy()
+  text = capmac_list_text(&wins, 99, false, false)
+  assert(text:find('no Screen Recording permission', 1, true) > 0)
+  assert(text:find('no Accessibility permission', 1, true) > 0)
+  assert(text:find('\n41\t1600\t1200\tSafari', 1, true) > 0)
+  text:destroy()
+  assert(capmac_pick(&wins, 99, 44, '') == 4)
+  assert(capmac_pick(&wins, 99, 7, '') == 0)   -- by id: any layer
+  assert(capmac_pick(&wins, 99, 45, '') == -1)
+  assert(capmac_pick(&wins, 99, 0, 'start') == 1)
+  assert(capmac_pick(&wins, 99, 0, 'textedit') == 4)
+  assert(capmac_pick(&wins, 99, 0, 'self') == -1) -- the agent's own
+  assert(capmac_pick(&wins, 99, 0, 'menu') == -1) -- not layer 0
+  assert(capmac_pick(&wins, 99, 0, '') == 1)
+  assert(capmac_pick_app(&wins, 99, 'TextEdit.app') == 4)
+  assert(capmac_pick_app(&wins, 99, 'Mail') == -1)
+  wins:destroy()
+end
+
+-- UTF-16 and its chunks
+do
+  local u: vector(uint16)
+  capmac_utf16('aé€😀', &u)
+  assert(#u == 5 and u[0] == 0x61 and u[1] == 0xe9 and u[2] == 0x20ac and u[3] == 0xd83d and u[4] == 0xde00)
+  capmac_utf16('a\xffb\xe2\x82', &u) -- a stray byte and a cut sequence
+  assert(#u == 5 and u[0] == 0x61 and u[1] == 0xfffd and u[2] == 0x62 and u[3] == 0xfffd and u[4] == 0xfffd)
+  capmac_utf16('\xed\xa0\x80', &u) -- an encoded surrogate
+  assert(#u == 1 and u[0] == 0xfffd)
+  -- 19 letters then an emoji: the pair is not split at 20
+  capmac_utf16('abcdefghijklmnopqrs😀z', &u)
+  assert(#u == 22)
+  assert(capmac_chunk_end(&u, 0, 20) == 19)
+  assert(capmac_chunk_end(&u, 19, 20) == 22)
+  capmac_utf16('hi', &u)
+  assert(capmac_chunk_end(&u, 0, 20) == 2)
+  u:destroy()
+end
+
+-- CGImage layouts to BGRA
+do
+  local out: vector(uint8)
+  -- little-endian premultiplied first: BGRA already; row padding dropped
+  local src: [12]uint8 = { 1, 2, 3, 255, 4, 5, 6, 255, 0, 0, 0, 0 }
+  assert(capmac_to_bgra(&src, 12, 2, 1, 32, 0x2000 | 2, &out))
+  assert(#out == 8 and out[0] == 1 and out[1] == 2 and out[2] == 3 and out[4] == 4 and out[6] == 6)
+  -- big-endian (default) premultiplied last: RGBA in memory
+  local rgba: [4]uint8 = { 10, 20, 30, 128 }
+  assert(capmac_to_bgra(&rgba, 4, 1, 1, 32, 1, &out))
+  assert(out[0] == 30 and out[1] == 20 and out[2] == 10 and out[3] == 255)
+  -- big-endian first: ARGB
+  local argb: [4]uint8 = { 128, 10, 20, 30 }
+  assert(capmac_to_bgra(&argb, 4, 1, 1, 32, 2, &out))
+  assert(out[0] == 30 and out[1] == 20 and out[2] == 10)
+  -- little-endian last: ABGR
+  local abgr: [4]uint8 = { 128, 30, 20, 10 }
+  assert(capmac_to_bgra(&abgr, 4, 1, 1, 32, 0x2000 | 1, &out))
+  assert(out[0] == 30 and out[1] == 20 and out[2] == 10)
+  assert(not capmac_to_bgra(&abgr, 4, 1, 1, 24, 0, &out))
+  assert(not capmac_to_bgra(&abgr, 4, 1, 1, 32, 7, &out))
+  out:destroy()
+end
+
+print('test_capture_mac OK')
