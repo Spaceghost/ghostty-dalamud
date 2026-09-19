@@ -413,7 +413,7 @@ forget()
 do
   assert(remotewin_command('list') == 0)
   host.agent:flush()
-  assert(count(PROTO_WLIST) == 1 and host.window_picker_open, 'list: the picker, and a fresh list')
+  assert(count(PROTO_WLIST) == 2 and host.window_picker_open, 'list: the picker, a fresh window list and the app list')
   host.window_picker_open = false
   assert(remotewin_command('pull') == 0 and host.window_picker_open, 'pull with nothing after it: the picker')
   assert(window_command('') == 0 and not host.window_picker_open, '/window alone toggles it')

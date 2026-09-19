@@ -15,12 +15,20 @@
 -- answers 'backend not built', and the agent runs without windows.
 require 'string'
 
+-- A rectangle of a frame: x, y from its top-left corner, in its pixels.
+global CaptureBox = @record{ x: integer, y: integer, w: integer, h: integer }
+
 global CaptureFrame = @record{
   pixels: *[0]uint8,   -- BGRA, top-down, alpha ignored; borrowed until the next call on the handle
   w: integer,
   h: integer,
   stride: usize,       -- bytes a row
   serial: uint64,      -- changes whenever the pixels do (0: no frame yet)
+  -- optional: where things are in the picture when it is more than the
+  -- window: boxes[0] the window, then its popups (menus drawn outside it);
+  -- nbox 0 means the whole frame is the window. Borrowed like `pixels`.
+  boxes: *[0]CaptureBox,
+  nbox: integer,
 }
 
 -- One WINPUT, decoded. Coordinates are pixels of the window as captured (the
@@ -51,13 +59,18 @@ global CaptureBackend = @record{
   title: function(h: pointer): string,             -- borrowed
   frame: function(h: pointer, out: *CaptureFrame): boolean,
   input: function(h: pointer, ev: *CaptureInput): void,
-  close: function(h: pointer): void,
+  close: function(h: pointer): void,   -- WCLOSE: the stream ends (an app launched for it is asked to close)
   -- once per main loop turn: dispatch D-Bus / PipeWire, take due snapshots
   pump: function(): void,
   -- POSIX: descriptors whose readability should wake the loop; returns the count
   poll_fds: function(fds: *[0]cint, max: integer): integer,
   -- the longest the main loop may sleep while streams are open (ms), -1 for no limit
   wait_ms: function(): integer,
+  -- optional (nilptr: none): WLISTR text of installed apps for WLIST "apps"
+  apps: function(): string,
+  -- optional (nilptr: `close`): the stream's client went away; forget the
+  -- handle but leave the window and its app alone, to be opened again
+  release: function(h: pointer): void,
 }
 
 require 'agent.capture_test'

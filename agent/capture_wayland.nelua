@@ -15,12 +15,19 @@
 -- (always server side: the game panel draws the chrome). Every xdg_toplevel
 -- gets its own wlr_scene and its own headless output sized to the window's
 -- geometry; rendering that output yields the window's pixels. Popups render
--- into their toplevel's scene, constrained to the window and clipped to it.
+-- into their toplevel's scene.
 --
--- Limits (docs/REMOTE_WINDOWS.md): Wayland clients only (no Xwayland yet;
--- DISPLAY is unset for launched apps), popups clipped to the window, TEXT
--- typed through keymap lookup (levels 1 and 2 of the layout; other characters
--- are dropped), software rendering only.
+-- X11 apps come in through wlroots' Xwayland (started with the first X11
+-- client): their toplevels are windows like xdg ones, their override-redirect
+-- windows (menus, tooltips) are drawn into the window they belong to.
+--
+-- A window's picture is the window and its popups: menus may reach outside
+-- the window (by up to POPUP_MARGIN), the picture grows to hold them and
+-- CaptureFrame.boxes says where the window is in it (WGEOM).
+--
+-- Limits (docs/REMOTE_WINDOWS.md): TEXT typed
+-- through keymap lookup (levels 1 and 2 of the layout; other characters are
+-- dropped), software rendering only.
 --
 -- Loaded by agent/capture.nelua when the agent was built with -D WAYLAND
 -- (tools/wayland-flags.sh: vendor/wayland-sdk headers, host libwlroots-0.20).
@@ -33,6 +40,7 @@ require 'os'
 require 'math'
 require 'core.protocol'
 require 'agent.wayland_keys'
+require 'agent.desktop_entries'
 
 ## cdefine 'WLR_USE_UNSTABLE'
 ## cinclude '<time.h>'
@@ -63,6 +71,11 @@ require 'agent.wayland_keys'
 ## cinclude '<wlr/types/wlr_xdg_decoration_v1.h>'
 ## cinclude '<wlr/types/wlr_server_decoration.h>'
 ## cinclude '<wlr/util/edges.h>'
+## cinclude '<wlr/xwayland.h>'
+## cinclude '<wlr/types/wlr_text_input_v3.h>'
+## cinclude '<wlr/types/wlr_primary_selection.h>'
+## cinclude '<string.h>'
+## cinclude '<errno.h>'
 ## linklib 'wlroots-0.20'
 ## linklib 'wayland-server'
 ## linklib 'pixman-1'
@@ -83,6 +96,10 @@ local function unsetenv(name: cstring): cint <cimport, nodecl> end
 local function waitpid(pid: cint, status: *cint, options: cint): cint <cimport, nodecl> end
 local function kill(pid: cint, sig: cint): cint <cimport, nodecl> end
 local function usleep(us: cuint): cint <cimport, nodecl> end
+local function getpid(): cint <cimport, nodecl> end
+local function symlink(target: cstring, path: cstring): cint <cimport, nodecl> end
+local function unlink(path: cstring): cint <cimport, nodecl> end
+local function access(path: cstring, mode: cint): cint <cimport, nodecl> end
 local O_RDWR: cint <cimport, nodecl, const>
 local WNOHANG: cint <cimport, nodecl, const>
 local SIGTERM: cint <cimport, nodecl, const>
@@ -132,6 +149,7 @@ local wlr_allocator <cimport, nodecl, ctypedef> = @record{}
 local wlr_buffer <cimport, nodecl, ctypedef> = @record{}
 local wlr_surface <cimport, nodecl, ctypedef> = @record{
   resource: *wl_resource,
+  mapped: boolean,
   events: record{ commit: wl_signal, map: wl_signal, unmap: wl_signal, destroy: wl_signal },
 }
 local wlr_output <cimport, nodecl, ctypedef> = @record{ width: int32, height: int32, frame_pending: boolean }
@@ -142,6 +160,7 @@ local wlr_scene <cimport, nodecl, ctypedef> = @record{ tree: wlr_scene_tree }
 local wlr_scene_output <cimport, nodecl, ctypedef> = @record{}
 local wlr_scene_buffer <cimport, nodecl, ctypedef> = @record{}
 local wlr_scene_surface <cimport, nodecl, ctypedef> = @record{ surface: *wlr_surface }
+local wlr_compositor <cimport, nodecl, ctypedef> = @record{}
 local wlr_xdg_shell <cimport, nodecl, ctypedef> = @record{
   events: record{ new_surface: wl_signal, new_toplevel: wl_signal, new_popup: wl_signal },
 }
@@ -177,7 +196,11 @@ local wlr_xdg_toplevel_decoration_v1 <cimport, nodecl, ctypedef> = @record{
   toplevel: *wlr_xdg_toplevel,
   events: record{ destroy: wl_signal, request_mode: wl_signal },
 }
-local wlr_seat <cimport, nodecl, ctypedef> = @record{}
+local wlr_data_source <cimport, nodecl, forwarddecl, ctypedef> = @record{}
+local wlr_seat <cimport, nodecl, ctypedef> = @record{
+  selection_source: *wlr_data_source,
+  events: record{ request_set_selection: wl_signal, set_selection: wl_signal, request_set_primary_selection: wl_signal },
+}
 local wlr_keyboard_modifiers <cimport, nodecl, ctypedef> = @record{ depressed: uint32, latched: uint32, locked: uint32, group: uint32 }
 local wlr_keyboard <cimport, nodecl, ctypedef> = @record{
   keycodes: [32]uint32,
@@ -209,7 +232,7 @@ local function wlr_renderer_init_wl_display(r: *wlr_renderer, d: *wl_display): b
 local function wlr_renderer_destroy(r: *wlr_renderer): void <cimport, nodecl> end
 local function wlr_allocator_autocreate(b: *wlr_backend, r: *wlr_renderer): *wlr_allocator <cimport, nodecl> end
 local function wlr_allocator_destroy(a: *wlr_allocator): void <cimport, nodecl> end
-local function wlr_compositor_create(d: *wl_display, version: uint32, r: *wlr_renderer): pointer <cimport, nodecl> end
+local function wlr_compositor_create(d: *wl_display, version: uint32, r: *wlr_renderer): *wlr_compositor <cimport, nodecl> end
 local function wlr_subcompositor_create(d: *wl_display): pointer <cimport, nodecl> end
 local function wlr_data_device_manager_create(d: *wl_display): pointer <cimport, nodecl> end
 local function wlr_primary_selection_v1_device_manager_create(d: *wl_display): pointer <cimport, nodecl> end
@@ -270,11 +293,106 @@ local function wlr_keyboard_init(kb: *wlr_keyboard, impl: *wlr_keyboard_impl, na
 local function wlr_keyboard_set_keymap(kb: *wlr_keyboard, km: *xkb_keymap): boolean <cimport, nodecl> end
 local function wlr_keyboard_finish(kb: *wlr_keyboard): void <cimport, nodecl> end
 local function wlr_keyboard_notify_key(kb: *wlr_keyboard, ev: *wlr_keyboard_key_event): void <cimport, nodecl> end
+-- selections (clipboard) and text-input-v3
+local wl_array <cimport, nodecl, ctypedef> = @record{ size: usize, alloc: usize, data: pointer }
+local wlr_data_source_impl <cimport, nodecl, ctypedef> = @record{
+  send: function(*wlr_data_source, cstring, int32): void,
+  destroy: function(*wlr_data_source): void,
+}
+wlr_data_source = @record{ impl: *wlr_data_source_impl, mime_types: wl_array }
+local wlr_seat_request_set_selection_event <cimport, nodecl, ctypedef> = @record{ source: *wlr_data_source, serial: uint32 }
+local wlr_seat_request_set_primary_selection_event <cimport, nodecl, ctypedef> = @record{ source: pointer, serial: uint32 }
+local wl_event_source <cimport, nodecl, ctypedef> = @record{}
+local function wl_array_add(a: *wl_array, size: usize): pointer <cimport, nodecl> end
+local function wl_display_next_serial(d: *wl_display): uint32 <cimport, nodecl> end
+local function wl_event_loop_add_fd(l: *wl_event_loop, fd: cint, mask: uint32, cb: function(cint, uint32, pointer): cint, data: pointer): *wl_event_source <cimport, nodecl> end
+local function wl_event_source_remove(s: *wl_event_source): cint <cimport, nodecl> end
+local WL_EVENT_READABLE: uint32 <cimport, nodecl, const>
+local WL_EVENT_WRITABLE: uint32 <cimport, nodecl, const>
+local WL_EVENT_HANGUP: uint32 <cimport, nodecl, const>
+local WL_EVENT_ERROR: uint32 <cimport, nodecl, const>
+local function wlr_data_source_init(s: *wlr_data_source, impl: *wlr_data_source_impl): void <cimport, nodecl> end
+local function wlr_data_source_send(s: *wlr_data_source, mime: cstring, fd: int32): void <cimport, nodecl> end
+local function wlr_seat_set_selection(s: *wlr_seat, src: *wlr_data_source, serial: uint32): void <cimport, nodecl> end
+local function wlr_seat_set_primary_selection(s: *wlr_seat, src: pointer, serial: uint32): void <cimport, nodecl> end
+local function strdup(s: cstring): cstring <cimport, nodecl> end
+local function pipe2(fds: *[2]cint, flags: cint): cint <cimport, nodecl> end
+local function read(fd: cint, buf: pointer, n: usize): isize <cimport, nodecl> end
+local function write(fd: cint, buf: pointer, n: usize): isize <cimport, nodecl> end
+local function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
+local O_CLOEXEC: cint <cimport, nodecl, const>
+local O_NONBLOCK: cint <cimport, nodecl, const>
+local F_SETFL: cint <cimport, nodecl, const>
+local errno: cint <cimport, nodecl>
+local EAGAIN: cint <cimport, nodecl, const>
+local EINTR: cint <cimport, nodecl, const>
+local wlr_text_input_v3 <cimport, nodecl, ctypedef> = @record{
+  resource: *wl_resource,
+  focused_surface: *wlr_surface,
+  current_enabled: boolean,
+  events: record{ enable: wl_signal, commit: wl_signal, disable: wl_signal, destroy: wl_signal },
+}
+local wlr_text_input_manager_v3 <cimport, nodecl, ctypedef> = @record{
+  events: record{ new_text_input: wl_signal },
+}
+local function wlr_text_input_manager_v3_create(d: *wl_display): *wlr_text_input_manager_v3 <cimport, nodecl> end
+local function wlr_text_input_v3_send_enter(ti: *wlr_text_input_v3, s: *wlr_surface): void <cimport, nodecl> end
+local function wlr_text_input_v3_send_leave(ti: *wlr_text_input_v3): void <cimport, nodecl> end
+local function wlr_text_input_v3_send_commit_string(ti: *wlr_text_input_v3, text: cstring): void <cimport, nodecl> end
+local function wlr_text_input_v3_send_done(ti: *wlr_text_input_v3): void <cimport, nodecl> end
+
+local function wlr_scene_subsurface_tree_create(parent: *wlr_scene_tree, s: *wlr_surface): *wlr_scene_tree <cimport, nodecl> end
+local function wlr_scene_node_set_position(n: *wlr_scene_node, x: cint, y: cint): void <cimport, nodecl> end
+local function wlr_scene_node_coords(n: *wlr_scene_node, x: *cint, y: *cint): boolean <cimport, nodecl> end
+local function wlr_scene_output_set_position(so: *wlr_scene_output, x: cint, y: cint): void <cimport, nodecl> end
+
+-- Xwayland (wlroots' XWM): X11 windows are wlr_xwayland_surfaces whose
+-- wl_surface Xwayland commits like any client's.
+local wlr_xwayland_server <cimport, nodecl, ctypedef> = @record{
+  pid: cint,
+  events: record{ start: wl_signal, ready: wl_signal, destroy: wl_signal },
+}
+local wlr_xwayland <cimport, nodecl, ctypedef> = @record{
+  server: *wlr_xwayland_server,
+  display_name: cstring,
+  events: record{ destroy: wl_signal, ready: wl_signal, new_surface: wl_signal },
+}
+local wlr_xwayland_surface <cimport, nodecl, forwarddecl, ctypedef> = @record{}
+wlr_xwayland_surface = @record{
+  window_id: uint32,
+  surface: *wlr_surface,
+  x: int16, y: int16, width: uint16, height: uint16,
+  override_redirect: boolean,
+  title: cstring,
+  class: cstring,
+  instance: cstring,
+  pid: cint,
+  parent: *wlr_xwayland_surface,
+  events: record{
+    destroy: wl_signal, request_configure: wl_signal, request_activate: wl_signal,
+    associate: wl_signal, dissociate: wl_signal,
+  },
+  data: pointer,
+}
+local wlr_xwayland_surface_configure_event <cimport, nodecl, ctypedef> = @record{
+  surface: *wlr_xwayland_surface, x: int16, y: int16, width: uint16, height: uint16, mask: uint16,
+}
+local function wlr_xwayland_create(d: *wl_display, c: *wlr_compositor, lazy: boolean): *wlr_xwayland <cimport, nodecl> end
+local function wlr_xwayland_destroy(x: *wlr_xwayland): void <cimport, nodecl> end
+local function wlr_xwayland_set_seat(x: *wlr_xwayland, s: *wlr_seat): void <cimport, nodecl> end
+local function wlr_xwayland_surface_configure(s: *wlr_xwayland_surface, x: int16, y: int16, w: uint16, h: uint16): void <cimport, nodecl> end
+local function wlr_xwayland_surface_activate(s: *wlr_xwayland_surface, on: boolean): void <cimport, nodecl> end
+local function wlr_xwayland_surface_close(s: *wlr_xwayland_surface): void <cimport, nodecl> end
+local function wlr_xwayland_surface_restack(s: *wlr_xwayland_surface, sibling: *wlr_xwayland_surface, mode: cint): void <cimport, nodecl> end
+local XCB_STACK_MODE_ABOVE: cint <comptime> = 0
 
 global WAYLAND_DEFAULT_W: integer <comptime> = 1280
 global WAYLAND_DEFAULT_H: integer <comptime> = 800
 local WAYLAND_OPEN_TIMEOUT: float64 <comptime> = 30.0 -- s, for a launched app or a match to show up
 local WAYLAND_HANDOFF_WAIT: float64 <comptime> = 5.0 -- s, after a launched app exits 0 without a window
+local X11_SCREEN_W: integer <comptime> = 3840 -- the X screen Xwayland sees (see start_xwayland)
+local X11_SCREEN_H: integer <comptime> = 2160
+local POPUP_MARGIN: integer <comptime> = 600 -- logical px popups may reach beyond their window
 -- Outputs advertise 60 Hz: a refresh of 0 makes GTK4 divide by zero timing its
 -- frames (SIGFPE, seen with GNOME Calculator and Text Editor 1.6 s after mapping)
 local WAYLAND_REFRESH_MHZ: int32 <comptime> = 60000
@@ -302,11 +420,27 @@ local function owner_of(l: *wl_listener): pointer
   return (@*Hook)(l).owner
 end
 
--- One xdg_toplevel: its scene, its output, its latest pixels.
-local Top = @record{
+local Top <forwarddecl> = @record{}
+local XSurf <forwarddecl> = @record{}
+
+-- Something drawn into a window's output beside the window itself: an
+-- xdg_popup (menus, tooltips, combo lists) or an X11 override-redirect window.
+local Popup = @record{
+  p: *wlr_xdg_popup,         -- an xdg popup, or
+  x: *XSurf,                 -- an X11 override-redirect window
+  top: *Top,                 -- the window it shows in (nilptr: none)
+  tree: *wlr_scene_tree,     -- its node in that window's scene
+  on_commit: Hook, on_destroy: Hook,
+}
+
+-- One window: an xdg_toplevel, or an X11 toplevel through Xwayland (`x11`).
+-- Its scene, its output, its latest pixels.
+Top = @record{
   id: uint32,
-  xdg: *wlr_xdg_toplevel,
-  pid: cint,                 -- the client process
+  xdg: *wlr_xdg_toplevel,    -- xdg windows (nilptr for X11)
+  x11: *XSurf,               -- X11 windows (nilptr for xdg)
+  pid: cint,                 -- the client process (X11: _NET_WM_PID)
+  scale: integer,            -- the output scale the window renders at
   scene: *wlr_scene,
   output: *wlr_output,       -- made on the first map, sized to the window
   sout: *wlr_scene_output,
@@ -316,19 +450,36 @@ local Top = @record{
   pixels: vector(uint8),     -- BGRA top-down, w*4 a row
   w: integer, h: integer,
   serial: uint64,
+  popups: vector(*Popup),
+  launch: string,            -- the launch id when a launch of ours opened it
+  ox: integer, oy: integer,  -- the picture's corner relative to the window's (logical; <= 0)
+  lay: vector(CaptureBox),   -- the window and its shown popups, logical, window-relative
+  boxes: vector(CaptureBox), -- the same in the latest picture's pixels (CaptureFrame.boxes)
   on_commit: Hook, on_map: Hook, on_unmap: Hook, on_destroy: Hook,
   on_maximize: Hook, on_fullscreen: Hook,
+}
+
+-- One Xwayland surface, from creation to destruction. While its wl_surface
+-- is mapped it is a window (`top`) or, override-redirect, a popup (`pop`).
+XSurf = @record{
+  xs: *wlr_xwayland_surface,
+  top: *Top,
+  pop: *Popup,
+  on_destroy: Hook, on_associate: Hook, on_dissociate: Hook,
+  on_configure: Hook, on_activate: Hook,
+  on_map: Hook, on_unmap: Hook,
+}
+
+-- A client's text input (text-input-v3).
+local TI = @record{
+  ti: *wlr_text_input_v3,
+  on_destroy: Hook,
 }
 
 local Deco = @record{
   d: *wlr_xdg_toplevel_decoration_v1,
   top: *Top,
   on_destroy: Hook, on_mode: Hook,
-}
-
-local Popup = @record{
-  p: *wlr_xdg_popup,
-  on_commit: Hook, on_destroy: Hook,
 }
 
 -- A capture handle: one WOPEN.
@@ -343,6 +494,8 @@ local Cap = @record{
   first_new: uint32,       -- run: windows with this id or later appeared after the launch
   name: string,            -- owned, lower case: the launched program's base name
   handed_off: boolean,     -- the launched process exited 0 without a window of its own
+  launch: string,          -- owned: the launch id of the app started for this open
+  key: string,             -- owned: "key:..." match text, re-attaching a saved window
 }
 
 local Child = @record{ pid: cint, done: boolean, status: cint }
@@ -360,8 +513,17 @@ local wc: record{
   renderer: *wlr_renderer,
   allocator: *wlr_allocator,
   seat: *wlr_seat,
+  compositor: *wlr_compositor,
   xdg_shell: *wlr_xdg_shell,
+  xwayland: *wlr_xwayland,    -- nilptr: no X11 apps (no Xwayland binary, or GHOSTTY_XWAYLAND=off)
+  x_display: string,          -- ":N" once Xwayland listens
+  x_link: string,             -- $XDG_RUNTIME_DIR/<socket>-x11 -> /tmp/.X11-unix/XN
+  x_started: float64,         -- os.now() when the first X11 client made Xwayland start (0: not yet)
   deco_mgr: *wlr_xdg_decoration_manager_v1,
+  instance: string,           -- this agent run, in launch ids (hex of start time and pid)
+  launches: integer,          -- launches so far
+  icon_pids: vector(cint),    -- icon cache jobs still running (WLIST "apps")
+  icon_queued: vector(string), -- the icons they make
   xkb_ctx: *xkb_context,
   keymap: *xkb_keymap,
   socket: string,
@@ -374,6 +536,10 @@ local wc: record{
   next_id: uint32,
   scale: integer,          -- output scale apps render at (GHOSTTY_WAYLAND_SCALE, default 2)
   on_new_toplevel: Hook, on_new_popup: Hook, on_new_deco: Hook,
+  on_x_surface: Hook, on_x_ready: Hook, on_x_start: Hook,
+  on_new_ti: Hook, on_req_sel: Hook, on_req_psel: Hook, on_set_sel: Hook,
+  tis: vector(*TI),          -- text inputs (text-input-v3) of the clients
+  kb_surface: *wlr_surface,   -- the surface with the keyboard focus
   warned_format: boolean,
   warned_text: boolean,
 }
@@ -421,6 +587,50 @@ global function wayland_parse_run(match: string): (boolean, string)
   return true, match:sub(i, j)
 end
 
+-- "PREFIX:REST" -> true and REST without surrounding blanks; false when the
+-- text does not start with the prefix or nothing follows it ("app:",
+-- "desktop:" match forms of WOPEN).
+global function wayland_match_form(match: string, prefix: string): (boolean, string)
+  if #match < #prefix or match:subview(1, #prefix) ~= prefix then return false, (@string){} end
+  local i, j = #prefix + 1, #match
+  while i <= j and (match:byte(i) == 32 or match:byte(i) == 9) do i = i + 1 end
+  while j >= i and (match:byte(j) == 32 or match:byte(j) == 9 or match:byte(j) == 10 or match:byte(j) == 13) do j = j - 1 end
+  if j < i then return false, (@string){} end
+  return true, match:sub(i, j)
+end
+
+-- Nested desktops ("desktop:NAME [ARGS]"): a whole Wayland compositor as
+-- one client of ours, its output one window. Tried in this order when no
+-- name is given; cage runs one app and needs to be told which.
+global WAYLAND_DESKTOPS: [6]string = { 'labwc', 'sway', 'wayfire', 'river', 'weston', 'Hyprland' }
+
+-- The command for "desktop:SPEC" (SPEC is NAME ARGS or empty), given which
+-- programs are installed. False and why when none fits.
+global function wayland_desktop_command(spec: string, installed: function(string): boolean): (boolean, string, string)
+  if #spec == 0 then
+    for i = 0, < #WAYLAND_DESKTOPS do
+      if installed(WAYLAND_DESKTOPS[i]) then return true, string.copy(WAYLAND_DESKTOPS[i]), (@string){} end
+    end
+    return false, (@string){}, string.copy('no nested desktop is installed (labwc, sway, wayfire, river, weston, Hyprland)')
+  end
+  local sp = spec:find(' ', 1, true)
+  local name = sp > 0 and spec:subview(1, sp - 1) or spec
+  local args = sp > 0 and spec:subview(sp + 1) or (@string){}
+  if not installed(name) then return false, (@string){}, name .. ' is not installed on the agent\'s machine' end
+  local sb: stringbuilder
+  if name == 'cage' then
+    -- cage runs exactly one app, after `--`
+    while #args > 0 and args:byte(1) == 32 do args = args:subview(2) end
+    if #args == 0 then return false, (@string){}, string.copy('cage runs one app: desktop:cage APP') end
+    sb:write('cage')
+    if #args < 2 or args:subview(1, 2) ~= '--' then sb:write(' --') end
+    sb:write(' ', args)
+  else
+    sb:write(spec)
+  end
+  return true, sb:promote(), (@string){}
+end
+
 -- The launched program's base name, lower case, for finding its window when
 -- the process hands off to another one ("gnome-disks" from
 -- "env FOO=1 /usr/bin/gnome-disks --x"). Empty when there is none.
@@ -457,16 +667,71 @@ local function write_field(sb: *stringbuilder, s: string): void
   end
 end
 
--- One WLISTR line: "wid\tw\th\tapp\ttitle\n".
-global function wayland_list_line(sb: *stringbuilder, wid: uint32, w: integer, h: integer, app: string, title: string): void
+-- One WLISTR line: "wid\tw\th\tapp\ttitle\tlaunch\n"; `launch` is the
+-- window's launch id (empty when the agent did not start it).
+global function wayland_list_line(sb: *stringbuilder, wid: uint32, w: integer, h: integer, app: string, title: string, launch: string): void
   sb:writef('%d\t%d\t%d\t', wid, w, h)
   write_field(sb, app)
   sb:writebyte(9)
   write_field(sb, title)
+  sb:writebyte(9)
+  write_field(sb, launch)
   sb:writebyte(10)
 end
 
-global WAYLAND_LAUNCH_LINE: string <comptime> = '0\t0\t0\tlaunch\trun:COMMAND to start an app in the game\n'
+-- A window's key, as a plugin saves it with its panel: the launch id (empty
+-- when unknown), the app and the title. WOPEN "key:LAUNCH\tAPP\tTITLE".
+global WindowKey = @record{ launch: string, app: string, title: string }
+
+-- "key:LAUNCH\tAPP\tTITLE" -> true and the key (views into `match`).
+-- "key:LAUNCH" alone (the WLISTR column as is) is a key of the launch id
+-- only; "key:LAUNCH\tAPP" has no title. An empty key is not one.
+global function wayland_parse_key(match: string): (boolean, WindowKey)
+  local k: WindowKey
+  if #match < 4 or match:subview(1, 4) ~= 'key:' then return false, k end
+  local rest = match:subview(5)
+  while #rest > 0 and (rest:byte(#rest) == 10 or rest:byte(#rest) == 13 or rest:byte(#rest) == 32) do rest = rest:subview(1, #rest - 1) end
+  local t1 = rest:find('\t', 1, true)
+  if t1 == 0 then
+    k.launch = rest
+    return #rest > 0, k
+  end
+  local t2 = rest:find('\t', t1 + 1, true)
+  k.launch = rest:subview(1, t1 - 1)
+  if t2 == 0 then
+    k.app = rest:subview(t1 + 1)
+    return true, k
+  end
+  k.app = rest:subview(t1 + 1, t2 - 1)
+  k.title = rest:subview(t2 + 1)
+  while #k.title > 0 and (k.title:byte(#k.title) == 10 or k.title:byte(#k.title) == 13) do k.title = k.title:subview(1, #k.title - 1) end
+  return true, k
+end
+
+-- How well window `c` fits saved key `k`, 0 for not at all. A window already
+-- streamed never fits (two panels would fight over it). The same launch id
+-- fits whatever the title became; otherwise the app must be equal when the
+-- key has one (a key without one needs the title), and the same title
+-- weighs more than one that contains the other.
+global function wayland_key_score(k: WindowKey, c: WindowKey, streamed: boolean): integer
+  if streamed then return 0 end
+  if #k.launch > 0 and c.launch == k.launch then return 100 end
+  local title_eq = #k.title > 0 and c.title == k.title
+  local title_near = #k.title > 0 and #c.title > 0 and (c.title:find(k.title, 1, true) > 0 or k.title:find(c.title, 1, true) > 0)
+  local score = 0
+  if #k.app > 0 then
+    if c.app ~= k.app then return 0 end
+    score = 10
+  elseif title_eq or title_near then
+    score = 5
+  else
+    return 0
+  end
+  if title_eq then score = score + 20 elseif title_near then score = score + 5 end
+  return score
+end
+
+global WAYLAND_LAUNCH_LINE: string <comptime> = '0\t0\t0\tlaunch\trun:COMMAND or app:NAME to start an app in the game\n'
 
 -- Case-insensitive (ASCII) "haystack contains needle"; an empty needle matches.
 global function wayland_contains(hay: string, needle_lower: string): boolean
@@ -522,8 +787,9 @@ local function spawn(cmd: string): cint
   local null = open('/dev/null', O_RDWR)
   if null >= 0 then dup2(null, 0) end
   for fd = 3, 1023 do close(fd) end
-  unsetenv('DISPLAY')
   unsetenv('WAYLAND_SOCKET')
+  -- X11 apps reach our Xwayland; nothing reaches the host's X server
+  if #wc.x_display > 0 then setenv('DISPLAY', (@cstring)(wc.x_display.data), 1) else unsetenv('DISPLAY') end
   setenv('WAYLAND_DISPLAY', (@cstring)(wc.socket.data), 1)
   if #wc.runtime_dir > 0 then setenv('XDG_RUNTIME_DIR', (@cstring)(wc.runtime_dir.data), 1) end
   setenv('XDG_SESSION_TYPE', 'wayland', 1)
@@ -559,27 +825,289 @@ local function child_of(pid: cint): *Child
 end
 
 --------------------------------------------------------------------------------
--- Toplevels
+-- Text input (text-input-v3): TEXT as committed strings to a client that
+-- takes them, so any character arrives, not only what the keymap can type
+
+local function same_client(a: *wl_resource, b: *wl_resource): boolean
+  return a ~= nilptr and b ~= nilptr and wl_resource_get_client(a) == wl_resource_get_client(b)
+end
+
+-- Keyboard focus moved to `surf` (nilptr: nowhere): text inputs follow it,
+-- entering the surface for its own client's and leaving the others'.
+local function ti_focus(surf: *wlr_surface): void
+  for i = 0, < #wc.tis do
+    local ti = wc.tis[i].ti
+    if ti.focused_surface ~= surf then
+      if ti.focused_surface ~= nilptr then wlr_text_input_v3_send_leave(ti) end
+      if surf ~= nilptr and same_client(ti.resource, surf.resource) then wlr_text_input_v3_send_enter(ti, surf) end
+    end
+  end
+end
+
+-- The enabled text input on the focused surface, or nilptr.
+local function ti_active(surf: *wlr_surface): *wlr_text_input_v3
+  if surf == nilptr then return nilptr end
+  for i = 0, < #wc.tis do
+    local ti = wc.tis[i].ti
+    if ti.focused_surface == surf and ti.current_enabled then return ti end
+  end
+  return nilptr
+end
+
+local function on_ti_destroy(l: *wl_listener, data: pointer): void
+  local x = (@*TI)(owner_of(l))
+  unhook(&x.on_destroy)
+  for i = 0, < #wc.tis do
+    if wc.tis[i] == x then wc.tis:remove(i) break end
+  end
+  delete(x)
+end
+
+local function on_new_ti(l: *wl_listener, data: pointer): void
+  local x = new(@TI)
+  x.ti = (@*wlr_text_input_v3)(data)
+  hook(&x.on_destroy, &x.ti.events.destroy, on_ti_destroy, x)
+  wc.tis:push(x)
+  local surf = wc.kb_surface
+  if surf ~= nilptr and same_client(x.ti.resource, surf.resource) then wlr_text_input_v3_send_enter(x.ti, surf) end
+end
+
+--------------------------------------------------------------------------------
+-- Clipboard. Apps set and read the seat's selection as on any desktop
+-- (request_set_selection granted). Bridged to the host clipboard (which the
+-- game's copies and pastes already go through, CLIP_SET/CLIP_GET) with
+-- functions the agent hands in (capture_wayland_set_clipboard):
+--   * When nothing else owns it, the selection is our "host" source, which
+--     reads the host clipboard when an app pastes: pastes get whatever was
+--     copied last in the game, on the desktop or in another app.
+--   * When an app copies text, it is read from the app, put on the host
+--     clipboard, and our host source takes the selection back (it serves
+--     the same text from then on).
+-- X11 apps take part through Xwayland's selection bridge. The primary
+-- selection (middle click) works between apps but is not bridged.
+
+local ClipGet = @function(): (boolean, string)
+local ClipSet = @function(*[0]uint8, usize): boolean
+local clip_get_fn: ClipGet
+local clip_set_fn: ClipSet
+
+local CLIP_MIMES: [5]string = { 'text/plain;charset=utf-8', 'text/plain', 'UTF8_STRING', 'TEXT', 'STRING' }
+local CLIP_READ_MAX: usize <comptime> = 1024 * 1024
+
+-- One transfer between a pipe and a buffer: writing our text to an app that
+-- pastes, or reading an app's copied text.
+local Xfer = @record{
+  fd: cint,
+  src: *wl_event_source,
+  buf: vector(uint8),
+  off: usize,
+}
+
+local proxy_src: wlr_data_source
+local proxy_impl: wlr_data_source_impl
+local proxy_live = false
+
+local function xfer_end(x: *Xfer): void
+  if x.src ~= nilptr then wl_event_source_remove(x.src) end
+  close(x.fd)
+  x.buf:destroy()
+  delete(x)
+end
+
+local function on_xfer_write(fd: cint, mask: uint32, data: pointer): cint
+  local x = (@*Xfer)(data)
+  while x.off < #x.buf do
+    local n = write(fd, &x.buf[x.off], #x.buf - x.off)
+    if n < 0 then
+      if errno == EAGAIN then return 0 end
+      if errno ~= EINTR then break end
+    else
+      x.off = x.off + (@usize)(n)
+    end
+  end
+  xfer_end(x)
+  return 0
+end
+
+-- An app pastes from our host source: the host clipboard, now.
+local function proxy_send(src: *wlr_data_source, mime: cstring, fd: int32): void
+  local ok, text: string = false, (@string){}
+  if clip_get_fn ~= nilptr then ok, text = clip_get_fn() end
+  local x = new(@Xfer)
+  x.fd = fd
+  if ok and #text > 0 then
+    x.buf:resize((@usize)(#text))
+    memory.copy(&x.buf[0], text.data, (@usize)(#text))
+  end
+  text:destroy()
+  fcntl(fd, F_SETFL, O_NONBLOCK)
+  x.src = wl_event_loop_add_fd(wc.loop, fd, WL_EVENT_WRITABLE, on_xfer_write, x)
+  if x.src == nilptr then xfer_end(x) end
+end
+
+local function proxy_destroy(src: *wlr_data_source): void
+  proxy_live = false -- replaced; wlroots freed its mime types, the struct is ours
+end
+
+-- Our host source takes the selection (nothing else owns it, or an app's
+-- text has gone to the host).
+local function proxy_install(): void
+  if proxy_live or clip_get_fn == nilptr then return end
+  proxy_impl.send = proxy_send
+  proxy_impl.destroy = proxy_destroy
+  wlr_data_source_init(&proxy_src, &proxy_impl)
+  for i = 0, < #CLIP_MIMES do
+    local slot = (@*cstring)(wl_array_add(&proxy_src.mime_types, #@cstring))
+    if slot ~= nilptr then $slot = strdup((@cstring)(CLIP_MIMES[i].data)) end
+  end
+  proxy_live = true
+  wlr_seat_set_selection(wc.seat, &proxy_src, wl_display_next_serial(wc.display))
+end
+
+-- The agent's host clipboard (agent.nelua: wl-copy/wl-paste, or the
+-- --clipboard-file). Without it the selection stays among the apps.
+global function capture_wayland_set_clipboard(get: ClipGet, set: ClipSet): void
+  clip_get_fn, clip_set_fn = get, set
+  if wc.started and wc.seat.selection_source == nilptr then proxy_install() end
+end
+
+local function on_xfer_read(fd: cint, mask: uint32, data: pointer): cint
+  local x = (@*Xfer)(data)
+  local done = false
+  local chunk: [16384]uint8
+  while true do
+    local n = read(fd, &chunk, 16384)
+    if n > 0 then
+      if #x.buf + (@usize)(n) <= CLIP_READ_MAX then
+        local at = #x.buf
+        x.buf:resize(at + (@usize)(n))
+        memory.copy(&x.buf[at], &chunk, (@usize)(n))
+      else
+        x.off = 1 -- too big to bridge
+      end
+    elseif n == 0 then
+      done = true
+      break
+    elseif errno ~= EINTR then
+      if errno ~= EAGAIN then done = true end
+      break
+    end
+  end
+  if done then
+    if x.off == 0 and #x.buf > 0 and clip_set_fn ~= nilptr then
+      clip_set_fn(&x.buf[0], #x.buf)
+      log('clipboard: ' .. tostring(#x.buf) .. ' bytes copied in an app went to the host clipboard')
+    end
+    xfer_end(x)
+    proxy_install()
+  end
+  return 0
+end
+
+-- An app set the selection: read its text (the best text type it offers).
+-- Not text (an image, files): it stays the app's, among the apps.
+local function clip_read_app(src: *wlr_data_source): void
+  local mime: cstring = nilptr
+  local n = src.mime_types.size // #@cstring
+  local arr = (@*[0]cstring)(src.mime_types.data)
+  for k = 0, < #CLIP_MIMES do
+    for i = 0, < (@integer)(n) do
+      if (@string)(arr[i]) == CLIP_MIMES[k] then mime = arr[i] break end
+    end
+    if mime ~= nilptr then break end
+  end
+  if mime == nilptr then return end
+  local fds: [2]cint
+  if pipe2(&fds, O_CLOEXEC | O_NONBLOCK) ~= 0 then return end
+  wlr_data_source_send(src, mime, fds[1]) -- the source owns (and closes) the write end
+  local x = new(@Xfer)
+  x.fd = fds[0]
+  x.src = wl_event_loop_add_fd(wc.loop, fds[0], WL_EVENT_READABLE, on_xfer_read, x)
+  if x.src == nilptr then xfer_end(x) end
+  wl_display_flush_clients(wc.display)
+end
+
+local function on_set_selection(l: *wl_listener, data: pointer): void
+  if clip_get_fn == nilptr then return end
+  local src = wc.seat.selection_source
+  if src == &proxy_src then return end
+  if src == nilptr then proxy_install() return end -- its app went: back to the host's
+  clip_read_app(src)
+end
+
+-- Apps copy as on any desktop: granted.
+local function on_request_selection(l: *wl_listener, data: pointer): void
+  local ev = (@*wlr_seat_request_set_selection_event)(data)
+  wlr_seat_set_selection(wc.seat, ev.source, ev.serial)
+end
+
+local function on_request_primary(l: *wl_listener, data: pointer): void
+  local ev = (@*wlr_seat_request_set_primary_selection_event)(data)
+  wlr_seat_set_primary_selection(wc.seat, ev.source, ev.serial)
+end
+
+-- The game copied (CLIP_SET, already on the host clipboard): an app's own
+-- selection gives way to our host source, so pastes here get the new text.
+global function capture_wayland_clipboard_changed(): void
+  if wc.started and wc.seat.selection_source ~= &proxy_src then proxy_install() end
+end
+
+--------------------------------------------------------------------------------
+-- Toplevels (xdg and X11)
 
 local function top_title(t: *Top): string
-  if t.xdg.title ~= nilptr then return (@string)(t.xdg.title) end
+  local s: cstring = nilptr
+  if t.x11 ~= nilptr then s = t.x11.xs.title else s = t.xdg.title end
+  if s ~= nilptr then return (@string)(s) end
   return ''
 end
 
+-- The app: the xdg app id, or the X11 WM_CLASS class (else its instance).
 local function top_app(t: *Top): string
-  if t.xdg.app_id ~= nilptr then return (@string)(t.xdg.app_id) end
+  local s: cstring = nilptr
+  if t.x11 ~= nilptr then
+    s = t.x11.xs.class
+    if s == nilptr then s = t.x11.xs.instance end
+  else
+    s = t.xdg.app_id
+  end
+  if s ~= nilptr then return (@string)(s) end
   return ''
 end
 
--- Give `t` the keyboard (and xdg "activated"). One toplevel has it at a time.
+local function top_surface(t: *Top): *wlr_surface
+  if t.x11 ~= nilptr then return t.x11.xs.surface end
+  return t.xdg.base.surface
+end
+
+-- Ask the app to close the window (xdg close, X11 WM_DELETE_WINDOW).
+local function top_close(t: *Top): void
+  if t.x11 ~= nilptr then wlr_xwayland_surface_close(t.x11.xs)
+  else wlr_xdg_toplevel_send_close(t.xdg) end
+end
+
+-- Give `t` the keyboard (and xdg "activated", X11 focus and top of the
+-- stack). One toplevel has it at a time.
 local function focus(t: *Top): void
   if wc.focused == t or not t.mapped then return end
+  local prev = wc.focused
+  if prev ~= nilptr and prev.x11 ~= nilptr then wlr_xwayland_surface_activate(prev.x11.xs, false) end
   wc.focused = t
-  wlr_seat_keyboard_notify_enter(wc.seat, t.xdg.base.surface, (@*[0]uint32)(&keyboard.keycodes), keyboard.num_keycodes, &keyboard.modifiers)
+  if t.x11 ~= nilptr then
+    wlr_xwayland_surface_activate(t.x11.xs, true)
+    wlr_xwayland_surface_restack(t.x11.xs, nilptr, XCB_STACK_MODE_ABOVE)
+  end
+  wlr_seat_keyboard_notify_enter(wc.seat, top_surface(t), (@*[0]uint32)(&keyboard.keycodes), keyboard.num_keycodes, &keyboard.modifiers)
+  wc.kb_surface = top_surface(t)
+  ti_focus(wc.kb_surface)
 end
 
--- The window's size: its xdg geometry (the surface's extent when unset).
+-- The window's size: its xdg geometry (the surface's extent when unset), or
+-- the X11 window's size.
 local function top_size(t: *Top): (integer, integer)
+  if t.x11 ~= nilptr then
+    return math.max(1, (@integer)(t.x11.xs.width)), math.max(1, (@integer)(t.x11.xs.height))
+  end
   local g = t.xdg.base.geometry
   return math.max(1, (@integer)(g.width)), math.max(1, (@integer)(g.height))
 end
@@ -592,6 +1120,82 @@ local function end_caps_of(t: *Top, why: string): void
       set_why(c, CAPTURE_ENDED, why)
     end
   end
+end
+
+-- A new window, not mapped yet, with its own scene.
+local function top_new(pid: cint): *Top
+  local t = new(@Top)
+  t.id = wc.next_id
+  wc.next_id = wc.next_id + 1
+  t.pid = pid
+  t.scale = wc.scale
+  -- No direct scan-out: with one surface covering the output, the scene would
+  -- hand the client's own buffer (shadows and all) to the output instead of
+  -- rendering, and that is not the window's pixels. wlroots reads this
+  -- variable when the scene is created.
+  setenv('WLR_SCENE_DISABLE_DIRECT_SCANOUT', '1', 1)
+  t.scene = wlr_scene_create()
+  unsetenv('WLR_SCENE_DISABLE_DIRECT_SCANOUT')
+  wc.tops:push(t)
+  return t
+end
+
+-- The window shows: its output, sized to it, on the first map.
+local function top_mapped(t: *Top): void
+  t.mapped = true
+  local w, h = top_size(t)
+  if t.xdg ~= nilptr and (w <= 1 or h <= 1) and not t.sized then
+    -- a client that commits no size of its own gets the default
+    t.sized = true
+    wlr_xdg_toplevel_set_size(t.xdg, WAYLAND_DEFAULT_W, WAYLAND_DEFAULT_H)
+    w, h = WAYLAND_DEFAULT_W, WAYLAND_DEFAULT_H
+  end
+  if t.output == nilptr then
+    t.output = wlr_headless_add_output(wc.backend, (@cuint)(w * t.scale), (@cuint)(h * t.scale))
+    if t.output == nilptr then log('cannot add an output for window ' .. tostring(t.id)) return end
+    wlr_output_init_render(t.output, wc.allocator, wc.renderer)
+    local st: wlr_output_state
+    wlr_output_state_init(&st)
+    wlr_output_state_set_enabled(&st, true)
+    wlr_output_state_set_custom_mode(&st, (@int32)(w * t.scale), (@int32)(h * t.scale), WAYLAND_REFRESH_MHZ)
+    -- apps render at this scale: crisp text on a panel seen up close
+    wlr_output_state_set_scale(&st, (@float32)(t.scale))
+    wlr_output_commit_state(t.output, &st)
+    wlr_output_state_finish(&st)
+    wlr_output_create_global(t.output, wc.display)
+    t.sout = wlr_scene_output_create(t.scene, t.output)
+  end
+  if wc.focused == nilptr then focus(t) end
+  log('window ' .. tostring(t.id) .. (t.x11 ~= nilptr and ' (X11)' or '') .. ' mapped: ' .. top_app(t) .. ' "' .. top_title(t) .. '"')
+end
+
+local function top_unmapped(t: *Top): void
+  t.mapped = false
+  end_caps_of(t, 'window closed')
+  if wc.focused == t then wc.focused = nilptr end
+end
+
+-- Forget `t`: its streams end, its output and scene go. Popups still shown
+-- in it lose their place and show nowhere.
+local function top_free(t: *Top): void
+  end_caps_of(t, 'window closed')
+  if wc.focused == t then wc.focused = nilptr end
+  for i = 0, < #t.popups do
+    local pp = t.popups[i]
+    pp.top = nilptr
+    pp.tree = nilptr -- goes with the scene below
+    if pp.p ~= nilptr then pp.p.base.data = nilptr end
+  end
+  t.popups:destroy()
+  t.lay:destroy() t.boxes:destroy() t.launch:destroy()
+  if t.deco ~= nilptr then (@*Deco)(t.deco).top = nilptr end
+  if t.output ~= nilptr then wlr_output_destroy(t.output) end -- takes the scene output along
+  wlr_scene_node_destroy(&t.scene.tree.node)
+  for i = 0, < #wc.tops do
+    if wc.tops[i] == t then wc.tops:remove(i) break end
+  end
+  t.pixels:destroy()
+  delete(t)
 end
 
 local function on_commit(l: *wl_listener, data: pointer): void
@@ -615,39 +1219,11 @@ local function on_commit(l: *wl_listener, data: pointer): void
 end
 
 local function on_map(l: *wl_listener, data: pointer): void
-  local t = (@*Top)(owner_of(l))
-  t.mapped = true
-  local w, h = top_size(t)
-  if (w <= 1 or h <= 1) and not t.sized then
-    -- a client that commits no size of its own gets the default
-    t.sized = true
-    wlr_xdg_toplevel_set_size(t.xdg, WAYLAND_DEFAULT_W, WAYLAND_DEFAULT_H)
-    w, h = WAYLAND_DEFAULT_W, WAYLAND_DEFAULT_H
-  end
-  if t.output == nilptr then
-    t.output = wlr_headless_add_output(wc.backend, (@cuint)(w * wc.scale), (@cuint)(h * wc.scale))
-    if t.output == nilptr then log('cannot add an output for window ' .. tostring(t.id)) return end
-    wlr_output_init_render(t.output, wc.allocator, wc.renderer)
-    local st: wlr_output_state
-    wlr_output_state_init(&st)
-    wlr_output_state_set_enabled(&st, true)
-    wlr_output_state_set_custom_mode(&st, (@int32)(w * wc.scale), (@int32)(h * wc.scale), WAYLAND_REFRESH_MHZ)
-    -- apps render at this scale: crisp text on a panel seen up close
-    wlr_output_state_set_scale(&st, (@float32)(wc.scale))
-    wlr_output_commit_state(t.output, &st)
-    wlr_output_state_finish(&st)
-    wlr_output_create_global(t.output, wc.display)
-    t.sout = wlr_scene_output_create(t.scene, t.output)
-  end
-  if wc.focused == nilptr then focus(t) end
-  log('window ' .. tostring(t.id) .. ' mapped: ' .. top_app(t) .. ' "' .. top_title(t) .. '"')
+  top_mapped((@*Top)(owner_of(l)))
 end
 
 local function on_unmap(l: *wl_listener, data: pointer): void
-  local t = (@*Top)(owner_of(l))
-  t.mapped = false
-  end_caps_of(t, 'window closed')
-  if wc.focused == t then wc.focused = nilptr end
+  top_unmapped((@*Top)(owner_of(l)))
 end
 
 -- A state request must be answered with a configure, even when nothing changes.
@@ -660,34 +1236,17 @@ local function on_top_destroy(l: *wl_listener, data: pointer): void
   local t = (@*Top)(owner_of(l))
   unhook(&t.on_commit) unhook(&t.on_map) unhook(&t.on_unmap) unhook(&t.on_destroy)
   unhook(&t.on_maximize) unhook(&t.on_fullscreen)
-  end_caps_of(t, 'window closed')
-  if wc.focused == t then wc.focused = nilptr end
-  if t.deco ~= nilptr then (@*Deco)(t.deco).top = nilptr end
-  if t.output ~= nilptr then wlr_output_destroy(t.output) end -- takes the scene output along
-  wlr_scene_node_destroy(&t.scene.tree.node)
   t.xdg.base.data = nilptr
-  for i = 0, < #wc.tops do
-    if wc.tops[i] == t then wc.tops:remove(i) break end
-  end
-  t.pixels:destroy()
-  delete(t)
+  top_free(t)
 end
 
 local function on_new_toplevel(l: *wl_listener, data: pointer): void
   local xdg = (@*wlr_xdg_toplevel)(data)
-  local t = new(@Top)
-  t.id = wc.next_id
-  wc.next_id = wc.next_id + 1
-  t.xdg = xdg
+  local pid: cint = 0
   local uid: cuint, gid: cuint = 0, 0
-  wl_client_get_credentials(wl_resource_get_client(xdg.resource), &t.pid, &uid, &gid)
-  -- No direct scan-out: with one surface covering the output, the scene would
-  -- hand the client's own buffer (shadows and all) to the output instead of
-  -- rendering, and that is not the window's pixels. wlroots reads this
-  -- variable when the scene is created.
-  setenv('WLR_SCENE_DISABLE_DIRECT_SCANOUT', '1', 1)
-  t.scene = wlr_scene_create()
-  unsetenv('WLR_SCENE_DISABLE_DIRECT_SCANOUT')
+  wl_client_get_credentials(wl_resource_get_client(xdg.resource), &pid, &uid, &gid)
+  local t = top_new(pid)
+  t.xdg = xdg
   -- popups find their parent's tree through wlr_xdg_surface.data
   xdg.base.data = wlr_scene_xdg_surface_create(&t.scene.tree, xdg.base)
   hook(&t.on_commit, &xdg.base.surface.events.commit, on_commit, t)
@@ -696,11 +1255,10 @@ local function on_new_toplevel(l: *wl_listener, data: pointer): void
   hook(&t.on_destroy, &xdg.events.destroy, on_top_destroy, t)
   hook(&t.on_maximize, &xdg.events.request_maximize, on_state_request, t)
   hook(&t.on_fullscreen, &xdg.events.request_fullscreen, on_state_request, t)
-  wc.tops:push(t)
 end
 
 --------------------------------------------------------------------------------
--- Popups: into the parent's scene tree, kept inside the toplevel's window
+-- Popups: into their window's scene
 
 -- The toplevel a popup chain hangs off, or nilptr.
 local function popup_root(p: *wlr_xdg_popup): *wlr_xdg_toplevel
@@ -716,12 +1274,31 @@ local function popup_root(p: *wlr_xdg_popup): *wlr_xdg_toplevel
   return nilptr
 end
 
+local function top_of_xdg(x: *wlr_xdg_toplevel): *Top
+  if x == nilptr then return nilptr end
+  for i = 0, < #wc.tops do
+    if wc.tops[i].xdg == x then return wc.tops[i] end
+  end
+  return nilptr
+end
+
+local function popup_detach(pp: *Popup): void
+  if pp.top == nilptr then return end
+  for i = 0, < #pp.top.popups do
+    if pp.top.popups[i] == pp then pp.top.popups:remove(i) break end
+  end
+  pp.top = nilptr
+end
+
 local function on_popup_commit(l: *wl_listener, data: pointer): void
   local pp = (@*Popup)(owner_of(l))
   if not pp.p.base.initial_commit then return end
   local root = popup_root(pp.p)
   if root ~= nilptr then
-    local box = root.base.geometry -- the window, in the toplevel surface's coordinates
+    -- the window and a margin around it, in the toplevel surface's
+    -- coordinates: menus may reach outside the window (the picture grows)
+    local g = root.base.geometry
+    local box: wlr_box = { x = g.x - POPUP_MARGIN, y = g.y - POPUP_MARGIN, width = g.width + 2 * POPUP_MARGIN, height = g.height + 2 * POPUP_MARGIN }
     wlr_xdg_popup_unconstrain_from_box(pp.p, &box)
   end
   wlr_xdg_surface_schedule_configure(pp.p.base)
@@ -730,6 +1307,7 @@ end
 local function on_popup_destroy(l: *wl_listener, data: pointer): void
   local pp = (@*Popup)(owner_of(l))
   unhook(&pp.on_commit) unhook(&pp.on_destroy)
+  popup_detach(pp)
   delete(pp)
 end
 
@@ -740,8 +1318,159 @@ local function on_new_popup(l: *wl_listener, data: pointer): void
   p.base.data = wlr_scene_xdg_surface_create((@*wlr_scene_tree)(parent.data), p.base)
   local pp = new(@Popup)
   pp.p = p
+  pp.tree = (@*wlr_scene_tree)(p.base.data)
+  pp.top = top_of_xdg(popup_root(p))
+  if pp.top ~= nilptr then pp.top.popups:push(pp) end
   hook(&pp.on_commit, &p.base.surface.events.commit, on_popup_commit, pp)
   hook(&pp.on_destroy, &p.events.destroy, on_popup_destroy, pp)
+end
+
+--------------------------------------------------------------------------------
+-- X11 windows through Xwayland: a mapped X11 toplevel is a window like an
+-- xdg one (its own scene and output, at scale 1: X11 apps draw at 1x); an
+-- override-redirect one (menu, tooltip, drag icon) is drawn into the window
+-- it belongs to, at its root position relative to that window's.
+
+-- The window an override-redirect X11 window belongs to: its X11 parent's
+-- (transient-for), else the X11 window of its process it lies over, else
+-- one of its process, else the focused X11 window.
+local function x11_owner(xs: *wlr_xwayland_surface): *Top
+  local p = xs.parent
+  for _ = 1, 16 do
+    if p == nilptr then break end
+    local xp = (@*XSurf)(p.data)
+    if xp ~= nilptr then
+      if xp.top ~= nilptr then return xp.top end
+      if xp.pop ~= nilptr and xp.pop.top ~= nilptr then return xp.pop.top end
+    end
+    p = p.parent
+  end
+  local px, py = (@integer)(xs.x), (@integer)(xs.y)
+  local same_pid: *Top = nilptr
+  for i = 0, < #wc.tops do
+    local t = wc.tops[i]
+    if t.x11 ~= nilptr and t.mapped then
+      local o = t.x11.xs
+      local ox, oy = (@integer)(o.x), (@integer)(o.y)
+      local inside = px >= ox and py >= oy and px < ox + (@integer)(o.width) and py < oy + (@integer)(o.height)
+      local mine = xs.pid ~= 0 and xs.pid == o.pid
+      if inside and (mine or xs.pid == 0) then return t end
+      if mine and same_pid == nilptr then same_pid = t end
+    end
+  end
+  if same_pid ~= nilptr then return same_pid end
+  if wc.focused ~= nilptr and wc.focused.x11 ~= nilptr then return wc.focused end
+  return nilptr
+end
+
+-- An X11 popup's node follows its root position (X11 coordinates are the
+-- root window's, one space for all windows).
+local function x11_place(pp: *Popup): void
+  if pp.x == nilptr or pp.top == nilptr or pp.tree == nilptr or pp.top.x11 == nilptr then return end
+  local o = pp.top.x11.xs
+  local xs = pp.x.xs
+  wlr_scene_node_set_position(&pp.tree.node, (@cint)(xs.x) - (@cint)(o.x), (@cint)(xs.y) - (@cint)(o.y))
+end
+
+local function x_unmapped(x: *XSurf): void
+  if x.pop ~= nilptr then
+    local pp = x.pop
+    if pp.tree ~= nilptr then wlr_scene_node_destroy(&pp.tree.node) end
+    popup_detach(pp)
+    delete(pp)
+    x.pop = nilptr
+  end
+  if x.top ~= nilptr then
+    top_free(x.top)
+    x.top = nilptr
+  end
+end
+
+local function on_x_map(l: *wl_listener, data: pointer): void
+  local x = (@*XSurf)(owner_of(l))
+  local xs = x.xs
+  if x.top ~= nilptr or x.pop ~= nilptr then return end
+  if xs.override_redirect then
+    local t = x11_owner(xs)
+    if t == nilptr then return end -- no window to show it in
+    local pp = new(@Popup)
+    pp.x = x
+    pp.top = t
+    pp.tree = wlr_scene_subsurface_tree_create(&t.scene.tree, xs.surface)
+    t.popups:push(pp)
+    x.pop = pp
+    x11_place(pp)
+    return
+  end
+  local t = top_new(xs.pid)
+  t.x11 = x
+  t.scale = 1 -- X11 apps draw at 1x; an output scale would only stretch them
+  wlr_scene_subsurface_tree_create(&t.scene.tree, xs.surface)
+  x.top = t
+  top_mapped(t)
+end
+
+local function on_x_unmap(l: *wl_listener, data: pointer): void
+  x_unmapped((@*XSurf)(owner_of(l)))
+end
+
+local function on_x_associate(l: *wl_listener, data: pointer): void
+  local x = (@*XSurf)(owner_of(l))
+  hook(&x.on_map, &x.xs.surface.events.map, on_x_map, x)
+  hook(&x.on_unmap, &x.xs.surface.events.unmap, on_x_unmap, x)
+end
+
+local function on_x_dissociate(l: *wl_listener, data: pointer): void
+  local x = (@*XSurf)(owner_of(l))
+  x_unmapped(x)
+  unhook(&x.on_map) unhook(&x.on_unmap)
+end
+
+-- X11 windows place and size themselves: granted as asked.
+local function on_x_configure(l: *wl_listener, data: pointer): void
+  local ev = (@*wlr_xwayland_surface_configure_event)(data)
+  wlr_xwayland_surface_configure(ev.surface, ev.x, ev.y, ev.width, ev.height)
+end
+
+local function on_x_activate(l: *wl_listener, data: pointer): void
+  local x = (@*XSurf)(owner_of(l))
+  if x.top ~= nilptr then focus(x.top) end
+end
+
+local function on_x_destroy(l: *wl_listener, data: pointer): void
+  local x = (@*XSurf)(owner_of(l))
+  x_unmapped(x)
+  unhook(&x.on_map) unhook(&x.on_unmap)
+  unhook(&x.on_destroy) unhook(&x.on_associate) unhook(&x.on_dissociate)
+  unhook(&x.on_configure) unhook(&x.on_activate)
+  x.xs.data = nilptr
+  delete(x)
+end
+
+local function on_x_surface(l: *wl_listener, data: pointer): void
+  local xs = (@*wlr_xwayland_surface)(data)
+  local x = new(@XSurf)
+  x.xs = xs
+  xs.data = x
+  hook(&x.on_destroy, &xs.events.destroy, on_x_destroy, x)
+  hook(&x.on_associate, &xs.events.associate, on_x_associate, x)
+  hook(&x.on_dissociate, &xs.events.dissociate, on_x_dissociate, x)
+  hook(&x.on_configure, &xs.events.request_configure, on_x_configure, x)
+  hook(&x.on_activate, &xs.events.request_activate, on_x_activate, x)
+end
+
+-- Xwayland runs from the first X11 client on (lazy) and stops 10 s after the
+-- last one leaves; each start is logged with how long it took.
+local function on_x_start(l: *wl_listener, data: pointer): void
+  wc.x_started = os.now()
+end
+
+local function on_x_ready(l: *wl_listener, data: pointer): void
+  if wc.x_started > 0 then
+    log(string.format('Xwayland ready on DISPLAY=%s after %.0f ms', wc.x_display, (os.now() - wc.x_started) * 1000.0))
+  else
+    log('Xwayland ready on DISPLAY=' .. wc.x_display)
+  end
 end
 
 --------------------------------------------------------------------------------
@@ -809,17 +1538,65 @@ local function grab(t: *Top, buf: *wlr_buffer, w: integer, h: integer): void
   t.serial = t.serial + 1
 end
 
+-- The window and its shown popups (t.lay, logical, the window's corner at
+-- 0,0; popups kept within POPUP_MARGIN of it) and the rectangle around all
+-- of them: the picture.
+local function top_layout(t: *Top): (integer, integer, integer, integer)
+  local w, h = top_size(t)
+  t.lay:clear()
+  t.lay:push(CaptureBox{ x = 0, y = 0, w = w, h = h })
+  local x0, y0, x1, y1 = 0, 0, w, h
+  for i = 0, < #t.popups do
+    local pp = t.popups[i]
+    if pp.x ~= nilptr then x11_place(pp) end
+    if pp.tree ~= nilptr then
+      local surf: *wlr_surface = nilptr
+      local pw, ph = 0, 0
+      if pp.p ~= nilptr then
+        surf, pw, ph = pp.p.base.surface, (@integer)(pp.p.base.geometry.width), (@integer)(pp.p.base.geometry.height)
+      else
+        surf, pw, ph = pp.x.xs.surface, (@integer)(pp.x.xs.width), (@integer)(pp.x.xs.height)
+      end
+      if surf ~= nilptr and surf.mapped and pw > 0 and ph > 0 then
+        local lx: cint, ly: cint = 0, 0
+        wlr_scene_node_coords(&pp.tree.node, &lx, &ly)
+        local bx0, by0 = math.max((@integer)(lx), -POPUP_MARGIN), math.max((@integer)(ly), -POPUP_MARGIN)
+        local bx1, by1 = math.min((@integer)(lx) + pw, w + POPUP_MARGIN), math.min((@integer)(ly) + ph, h + POPUP_MARGIN)
+        if bx1 > bx0 and by1 > by0 then
+          t.lay:push(CaptureBox{ x = bx0, y = by0, w = bx1 - bx0, h = by1 - by0 })
+          x0, y0 = math.min(x0, bx0), math.min(y0, by0)
+          x1, y1 = math.max(x1, bx1), math.max(y1, by1)
+        end
+      end
+    end
+  end
+  return x0, y0, x1 - x0, y1 - y0
+end
+
 local function render(t: *Top): void
   if not t.mapped or t.sout == nilptr or t.output.frame_pending then return end
-  local lw, lh = top_size(t)
-  local w, h = lw * wc.scale, lh * wc.scale -- output pixels
+  local ux, uy, uw, uh = top_layout(t)
+  local w, h = uw * t.scale, uh * t.scale -- output pixels
   local resize = w ~= t.output.width or h ~= t.output.height
-  if not resize and not wlr_scene_output_needs_frame(t.sout) then return end
+  local moved = ux ~= t.ox or uy ~= t.oy
+  if moved then
+    -- the output shows the scene from the picture's corner on
+    wlr_scene_output_set_position(t.sout, (@cint)(ux), (@cint)(uy))
+    t.ox, t.oy = ux, uy
+  end
+  if not resize and not moved and not wlr_scene_output_needs_frame(t.sout) then return end
   local st: wlr_output_state
   wlr_output_state_init(&st)
   if resize then wlr_output_state_set_custom_mode(&st, (@int32)(w), (@int32)(h), WAYLAND_REFRESH_MHZ) end
   if wlr_scene_output_build_state(t.sout, &st, nilptr) then
-    if (st.committed & WLR_OUTPUT_STATE_BUFFER) ~= 0 and st.buffer ~= nilptr then grab(t, st.buffer, w, h) end
+    if (st.committed & WLR_OUTPUT_STATE_BUFFER) ~= 0 and st.buffer ~= nilptr then
+      grab(t, st.buffer, w, h)
+      t.boxes:clear()
+      for i = 0, < #t.lay do
+        local b = t.lay[i]
+        t.boxes:push(CaptureBox{ x = (b.x - ux) * t.scale, y = (b.y - uy) * t.scale, w = b.w * t.scale, h = b.h * t.scale })
+      end
+    end
     wlr_output_commit_state(t.output, &st)
   end
   wlr_output_state_finish(&st)
@@ -855,12 +1632,17 @@ end
 local function pointer_to(t: *Top, x: integer, y: integer, time: uint32): void
   local sx: float64, sy: float64 = 0, 0
   -- frames are output pixels; the scene is in logical coordinates
-  local lx, ly = (x + 0.5) / wc.scale, (y + 0.5) / wc.scale
+  -- picture pixels -> the scene's logical coordinates (the window's corner at 0,0)
+  local lx, ly = t.ox + (x + 0.5) / t.scale, t.oy + (y + 0.5) / t.scale
   local node = wlr_scene_node_at(&t.scene.tree.node, lx, ly, &sx, &sy)
   local surf: *wlr_surface = nilptr
   if node ~= nilptr and node.type == WLR_SCENE_NODE_BUFFER then
     local ss = wlr_scene_surface_try_from_buffer(wlr_scene_buffer_from_node(node))
     if ss ~= nilptr then surf = ss.surface end
+  end
+  if surf == nilptr and t.x11 ~= nilptr then
+    -- over nothing: X11 still wants it (a click outside ends a menu's grab)
+    surf, sx, sy = top_surface(t), lx, ly
   end
   if surf == nilptr then wlr_seat_pointer_notify_clear_focus(wc.seat) return end
   wlr_seat_pointer_notify_enter(wc.seat, surf, sx, sy)
@@ -869,7 +1651,7 @@ end
 
 -- UTF-8 -> keys through the keymap; characters the layout cannot type at
 -- level 1 or 2 are dropped (logged once).
-local function type_text(text: string): void
+local function type_keys(text: string): void
   sync_mods(0)
   local i = 1
   while i <= #text do
@@ -896,6 +1678,32 @@ local function type_text(text: string): void
   end
 end
 
+-- TEXT: committed as strings through the focused client's enabled text
+-- input (any character), newlines and tabs as the Enter and Tab keys; a
+-- client without one gets keys through the keymap.
+local function type_text(text: string): void
+  local ti = ti_active(wc.kb_surface)
+  if ti == nilptr then type_keys(text) return end
+  local start = 1
+  for i = 1, #text + 1 do
+    local b: uint8 = i <= #text and text:byte(i) or 0
+    if i > #text or b == 10 or b == 13 or b == 9 then
+      if i > start then
+        local run = text:sub(start, i - 1)
+        wlr_text_input_v3_send_commit_string(ti, (@cstring)(run.data))
+        wlr_text_input_v3_send_done(ti)
+        run:destroy()
+      end
+      if i <= #text then
+        sync_mods(0)
+        local code = b == 9 and WL_KEY_TAB or WL_KEY_ENTER
+        key(code, true) key(code, false)
+      end
+      start = i + 1
+    end
+  end
+end
+
 --------------------------------------------------------------------------------
 -- The backend
 
@@ -906,7 +1714,7 @@ local function wl_list(): string
     local t = wc.tops[i]
     if t.mapped then
       local w, h = top_size(t)
-      wayland_list_line(&sb, t.id, w, h, top_app(t), top_title(t))
+      wayland_list_line(&sb, t.id, w, h, top_app(t), top_title(t), t.launch)
     end
   end
   return sb:promote()
@@ -934,6 +1742,27 @@ end
 -- app id or title contains the program's name. Without run:, the first
 -- window whose title or app id contains the match.
 local function settle(c: *Cap, now: float64): void
+  if #c.key > 0 then
+    -- a saved window: the best fit nobody streams, waiting briefly for it
+    local _, k = wayland_parse_key(c.key)
+    local best: *Top, best_score = nilptr, 0
+    for i = 0, < #wc.tops do
+      local t = wc.tops[i]
+      if t.mapped then
+        local cand: WindowKey = { launch = t.launch, app = top_app(t), title = top_title(t) }
+        local sc = wayland_key_score(k, cand, owned(t))
+        if sc > best_score then best, best_score = t, sc end
+      end
+    end
+    if best ~= nilptr then
+      c.top = best
+      set_why(c, CAPTURE_LIVE, '')
+      focus(best)
+    elseif now >= c.deadline then
+      set_why(c, CAPTURE_ENDED, 'no such window (the app is not running: launch it again)')
+    end
+    return
+  end
   for pass = 1, 3 do
     for i = 0, < #wc.tops do
       local t = wc.tops[i]
@@ -951,6 +1780,7 @@ local function settle(c: *Cap, now: float64): void
         if hit then
           c.top = t
           set_why(c, CAPTURE_LIVE, '')
+          if #c.launch > 0 and #t.launch == 0 then t.launch = string.copy(c.launch) end
           focus(t)
           return
         end
@@ -985,6 +1815,13 @@ local function settle(c: *Cap, now: float64): void
   end
 end
 
+local function on_path(name: string): boolean
+  local p = desktop_which(name)
+  local found = #p > 0
+  p:destroy()
+  return found
+end
+
 local function wl_open(wid: uint32, match: string): (pointer, string)
   if wid ~= 0 then
     local t = find_top(wid)
@@ -996,10 +1833,43 @@ local function wl_open(wid: uint32, match: string): (pointer, string)
     focus(t)
     return c, (@string){}
   end
+  local is_run, cmd = wayland_parse_run(match)
+  local is_desk, spec = wayland_match_form(match, 'desktop:')
+  if not is_desk and match == 'desktop:' then is_desk = true end
+  if is_desk then
+    local ok, dcmd, why = wayland_desktop_command(spec, on_path)
+    spec:destroy()
+    if not ok then return nilptr, why end
+    -- wlroots compositors pick their Wayland backend from WAYLAND_DISPLAY;
+    -- ours offers shared memory buffers only, so they render in software
+    is_run, cmd = true, 'env WLR_RENDERER=pixman WLR_NO_HARDWARE_CURSORS=1 ' .. dcmd
+    dcmd:destroy()
+  end
+  local is_app, app = wayland_match_form(match, 'app:')
+  if is_app then
+    -- an installed app by desktop id or name: its Exec, as run: would
+    local dirs = desktop_data_dirs()
+    local es = desktop_scan(&dirs)
+    local k = desktop_find(&es, app)
+    local why: string
+    if k < 0 then
+      why = 'no installed app matches "' .. app .. '"'
+    elseif es[k].terminal then
+      why = es[k].name .. ' runs in a terminal: open "' .. es[k].exec .. '" as a terminal panel'
+    else
+      is_run, cmd = true, string.copy(es[k].exec)
+      log('app "' .. app .. '" is ' .. es[k].id .. ': ' .. cmd)
+    end
+    for i = 0, < #es do es[i]:destroy() end
+    es:destroy()
+    for i = 0, < #dirs do dirs[i]:destroy() end
+    dirs:destroy()
+    app:destroy()
+    if #why > 0 then return nilptr, why end
+  end
   local c = new(@Cap)
   c.state = CAPTURE_PENDING
   c.deadline = os.now() + WAYLAND_OPEN_TIMEOUT
-  local is_run, cmd = wayland_parse_run(match)
   if is_run then
     c.pid = spawn(cmd)
     if c.pid < 0 then
@@ -1008,16 +1878,99 @@ local function wl_open(wid: uint32, match: string): (pointer, string)
       return nilptr, string.copy('cannot start the app (fork failed)')
     end
     wc.children:push(Child{ pid = c.pid })
+    wc.launches = wc.launches + 1
+    c.launch = string.format('%s.%d', wc.instance, wc.launches)
     c.first_new = wc.next_id
     c.name = wayland_launch_name(cmd)
     log('started "' .. cmd .. '" (pid ' .. tostring(c.pid) .. ') on ' .. wc.socket)
     cmd:destroy()
+  elseif #match >= 4 and match:subview(1, 4) == 'key:' then
+    local ok = wayland_parse_key(match)
+    if not ok then delete(c) return nilptr, string.copy('bad key: key:LAUNCH or key:LAUNCH<tab>APP<tab>TITLE') end
+    c.key = string.copy(match)
+    c.deadline = os.now() + WAYLAND_HANDOFF_WAIT
   else
     c.match = match:lower()
   end
   wc.caps:push(c)
   settle(c, os.now())
   return c, (@string){}
+end
+
+-- WLIST "apps": the installed apps as `app` / `term` lines
+-- (desktop_list_line), each with a PNG icon under $HOME
+-- (~/.cache/ghostty-agent/icons) that a sandboxed game can read. Icons not
+-- cached yet are copied (PNG) or rendered (SVG, XPM: rsvg-convert, else
+-- ImageMagick) by one background job, so a path may name a file that
+-- appears a moment later; an icon that cannot be made has an empty field.
+local function wl_apps(): string
+  local dirs = desktop_data_dirs()
+  local es = desktop_scan(&dirs)
+  local idirs = desktop_icon_dirs()
+  local cache = desktop_icon_cache_dir()
+  do -- icons queued by jobs that ended are made or failed: forget them
+    local k = #wc.icon_pids - 1
+    while k >= 0 do
+      local ch = child_of(wc.icon_pids[k])
+      if ch == nilptr or ch.done then wc.icon_pids:remove((@usize)(k)) end
+      k = k - 1
+    end
+    if #wc.icon_pids == 0 then
+      for q = 0, < #wc.icon_queued do wc.icon_queued[q]:destroy() end
+      wc.icon_queued:clear()
+    end
+  end
+  local renderer = desktop_icon_renderer()
+  local jobs: stringbuilder
+  local njobs = 0
+  local sb: stringbuilder
+  for i = 0, < #es do
+    local src, size = desktop_find_icon(es[i].icon, &idirs)
+    local png: string
+    if #src > 0 then
+      png = desktop_icon_png(cache, desktop_short_id(es[i].id), size)
+      local queued = false
+      for q = 0, < #wc.icon_queued do if wc.icon_queued[q] == png then queued = true break end end
+      if not queued and access((@cstring)(png.data), 0) ~= 0 then
+        if desktop_icon_job(&jobs, src, png, renderer) then
+          njobs = njobs + 1
+          wc.icon_queued:push(string.copy(png))
+        else
+          png:destroy() png = (@string){}
+        end
+      end
+    end
+    desktop_list_line(&sb, &es[i], png)
+    png:destroy() src:destroy()
+  end
+  -- nested desktops that are installed: "desktop\tNAME\tNAME\t\t\n", opened with desktop:NAME
+  for i = 0, < #WAYLAND_DESKTOPS do
+    local p = desktop_which(WAYLAND_DESKTOPS[i])
+    if #p > 0 then sb:write('desktop\t', WAYLAND_DESKTOPS[i], '\t', WAYLAND_DESKTOPS[i], '\t\t\n') end
+    p:destroy()
+  end
+  if njobs > 0 then
+    local script: stringbuilder
+    script:write('mkdir -p ') desktop_sh_quote(&script, cache) script:write('\n')
+    local body = jobs:promote()
+    script:write(body)
+    body:destroy()
+    local cmd = script:promote()
+    local pid = spawn(cmd)
+    if pid > 0 then wc.children:push(Child{ pid = pid }) wc.icon_pids:push(pid) end
+    cmd:destroy()
+    log(string.format('apps: %d listed; caching %d icons in %s (%s)', #es, njobs, cache, #renderer > 0 and renderer or 'no SVG renderer: PNG icons only'))
+  else
+    jobs:destroy()
+  end
+  renderer:destroy() cache:destroy()
+  for i = 0, < #es do es[i]:destroy() end
+  es:destroy()
+  for i = 0, < #dirs do dirs[i]:destroy() end
+  dirs:destroy()
+  for i = 0, < #idirs do idirs[i]:destroy() end
+  idirs:destroy()
+  return sb:promote()
 end
 
 local function wl_state(h: pointer): (integer, string)
@@ -1038,7 +1991,8 @@ local function wl_frame(h: pointer, out: *CaptureFrame): boolean
   local c = (@*Cap)(h)
   local t = c.top
   if t == nilptr or t.serial == 0 then return false end
-  $out = { pixels = (@*[0]uint8)(&t.pixels[0]), w = t.w, h = t.h, stride = (@usize)(t.w) * 4, serial = t.serial }
+  $out = { pixels = (@*[0]uint8)(&t.pixels[0]), w = t.w, h = t.h, stride = (@usize)(t.w) * 4, serial = t.serial,
+           boxes = #t.boxes > 0 and (@*[0]CaptureBox)(&t.boxes[0]) or nilptr, nbox = #t.boxes }
   return true
 end
 
@@ -1083,15 +2037,26 @@ local function wl_input(h: pointer, ev: *CaptureInput): void
   wl_display_flush_clients(wc.display)
 end
 
-local function wl_close(h: pointer): void
-  local c = (@*Cap)(h)
-  -- an app launched for this stream is asked to close with it
-  if c.pid ~= 0 and c.top ~= nilptr then wlr_xdg_toplevel_send_close(c.top.xdg) end
+local function forget_cap(c: *Cap): void
   for i = 0, < #wc.caps do
     if wc.caps[i] == c then wc.caps:remove(i) break end
   end
-  c.why:destroy() c.title:destroy() c.match:destroy() c.name:destroy()
+  c.why:destroy() c.title:destroy() c.match:destroy() c.name:destroy() c.launch:destroy() c.key:destroy()
   delete(c)
+end
+
+local function wl_close(h: pointer): void
+  local c = (@*Cap)(h)
+  -- an app launched for this stream (or re-attached by its key) is asked
+  -- to close with it
+  if c.top ~= nilptr and (c.pid ~= 0 or (#c.key > 0 and #c.top.launch > 0)) then top_close(c.top) end
+  forget_cap(c)
+end
+
+-- The client went away (a plugin reload, the game quitting): the stream
+-- goes, the window and the app launched for it stay, to be opened again.
+local function wl_release(h: pointer): void
+  forget_cap((@*Cap)(h))
 end
 
 local function wl_pump(): void
@@ -1139,6 +2104,53 @@ global function capture_wayland_socket(): string
   return wc.socket
 end
 
+-- Xwayland, lazily: wlroots listens on the next free X display now and
+-- starts the server when the first X11 client connects. GHOSTTY_XWAYLAND=off
+-- leaves it out; without the Xwayland binary there is none either. A link
+-- $XDG_RUNTIME_DIR/<socket>-x11 to the display's socket gives a name that
+-- stays the same when the number does not: DISPLAY=$XDG_RUNTIME_DIR/ffxiv-0-x11
+-- (libxcb takes a socket path).
+local function start_xwayland(): void
+  local mode = os.getenv('GHOSTTY_XWAYLAND')
+  if mode == 'off' or mode == '0' then log('Xwayland off (GHOSTTY_XWAYLAND)') return end
+  if access('/usr/bin/Xwayland', 1) ~= 0 and access('/usr/local/bin/Xwayland', 1) ~= 0 then
+    log('no Xwayland binary: X11-only apps will not show')
+    return
+  end
+  local t0 = os.now()
+  wc.xwayland = wlr_xwayland_create(wc.display, wc.compositor, mode ~= 'eager')
+  if wc.xwayland == nilptr then log('cannot start Xwayland: X11-only apps will not show') return end
+  wlr_xwayland_set_seat(wc.xwayland, wc.seat)
+  -- X11 apps keep their menus on the "monitor" (all our outputs overlap at
+  -- 0,0, one per window, each the window's size); one big output that is
+  -- never drawn gives them a screen to open menus beyond their window in
+  do
+    local o = wlr_headless_add_output(wc.backend, X11_SCREEN_W, X11_SCREEN_H)
+    if o ~= nilptr then
+      wlr_output_init_render(o, wc.allocator, wc.renderer)
+      local st: wlr_output_state
+      wlr_output_state_init(&st)
+      wlr_output_state_set_enabled(&st, true)
+      wlr_output_state_set_custom_mode(&st, X11_SCREEN_W, X11_SCREEN_H, WAYLAND_REFRESH_MHZ)
+      wlr_output_commit_state(o, &st)
+      wlr_output_state_finish(&st)
+      wlr_output_create_global(o, wc.display)
+    end
+  end
+  hook(&wc.on_x_surface, &wc.xwayland.events.new_surface, on_x_surface, nilptr)
+  hook(&wc.on_x_ready, &wc.xwayland.events.ready, on_x_ready, nilptr)
+  if wc.xwayland.server ~= nilptr then hook(&wc.on_x_start, &wc.xwayland.server.events.start, on_x_start, nilptr) end
+  if mode == 'eager' then wc.x_started = t0 end
+  wc.x_display = string.copy((@string)(wc.xwayland.display_name))
+  local disp = wc.x_display:sub(2)
+  local target = '/tmp/.X11-unix/X' .. disp
+  wc.x_link = wc.runtime_dir .. '/' .. wc.socket .. '-x11'
+  unlink((@cstring)(wc.x_link.data))
+  if symlink((@cstring)(target.data), (@cstring)(wc.x_link.data)) ~= 0 then wc.x_link:destroy() wc.x_link = (@string){} end
+  log('X11 apps: DISPLAY=' .. wc.x_display .. (#wc.x_link > 0 and (' or DISPLAY=' .. wc.x_link) or '') .. (mode == 'eager' and '' or ' (Xwayland starts with the first X11 client)'))
+  target:destroy() disp:destroy()
+end
+
 local function start(): (boolean, string)
   local level = WLR_ERROR
   if #os.getenv('GHOSTTY_WAYLAND_DEBUG') > 0 then level = WLR_DEBUG end
@@ -1155,7 +2167,7 @@ local function start(): (boolean, string)
   wlr_renderer_init_wl_display(wc.renderer, wc.display) -- wl_shm and friends
   wc.allocator = wlr_allocator_autocreate(wc.backend, wc.renderer)
   if wc.allocator == nilptr then return false, 'cannot create a buffer allocator' end
-  wlr_compositor_create(wc.display, 6, wc.renderer)
+  wc.compositor = wlr_compositor_create(wc.display, 6, wc.renderer)
   wlr_subcompositor_create(wc.display)
   wlr_data_device_manager_create(wc.display)
   wlr_primary_selection_v1_device_manager_create(wc.display)
@@ -1184,6 +2196,13 @@ local function start(): (boolean, string)
   wc.seat = wlr_seat_create(wc.display, 'seat0')
   wlr_seat_set_capabilities(wc.seat, WL_SEAT_CAPABILITY_POINTER | WL_SEAT_CAPABILITY_KEYBOARD)
   wlr_seat_set_keyboard(wc.seat, &keyboard)
+  hook(&wc.on_req_sel, &wc.seat.events.request_set_selection, on_request_selection, nilptr)
+  hook(&wc.on_req_psel, &wc.seat.events.request_set_primary_selection, on_request_primary, nilptr)
+  hook(&wc.on_set_sel, &wc.seat.events.set_selection, on_set_selection, nilptr)
+  do
+    local tim = wlr_text_input_manager_v3_create(wc.display)
+    if tim ~= nilptr then hook(&wc.on_new_ti, &tim.events.new_text_input, on_new_ti, nilptr) end
+  end
 
   -- a fixed name first, so apps and scripts can find it; the next free one after
   local want = #opt_socket > 0 and opt_socket or os.getenv('GHOSTTY_WAYLAND_SOCKET')
@@ -1204,8 +2223,11 @@ local function start(): (boolean, string)
   end
   if not wlr_backend_start(wc.backend) then return false, 'cannot start the headless backend' end
   wc.next_id = 1
+  wc.instance = string.format('%x', ((@int64)(os.time()) << 20) ~ (@int64)(getpid()))
   wc.started = true
   log('compositor on WAYLAND_DISPLAY=' .. wc.socket .. ' (' .. wc.runtime_dir .. ')')
+  proxy_install()
+  start_xwayland()
   return true, ''
 end
 
@@ -1221,6 +2243,7 @@ global function capture_wayland_backend(): (boolean, CaptureBackend, string)
     list = wl_list, open = wl_open, state = wl_state, title = wl_title,
     frame = wl_frame, input = wl_input, close = wl_close,
     pump = wl_pump, poll_fds = wl_poll_fds, wait_ms = wl_wait_ms,
+    apps = wl_apps, release = wl_release,
   }, ''
 end
 
@@ -1246,8 +2269,16 @@ global function capture_wayland_shutdown(): void
       wc.children[i].done = true
     end
   end
+  if wc.xwayland ~= nilptr then
+    unhook(&wc.on_x_surface) unhook(&wc.on_x_ready) unhook(&wc.on_x_start)
+    wlr_xwayland_destroy(wc.xwayland) -- its surfaces go, and their hooks with them
+    wc.xwayland = nilptr
+    if #wc.x_link > 0 then unlink((@cstring)(wc.x_link.data)) end
+    wc.x_display:destroy() wc.x_link:destroy()
+  end
   wl_display_destroy_clients(wc.display) -- toplevels go, and their hooks with them
   unhook(&wc.on_new_toplevel) unhook(&wc.on_new_popup) unhook(&wc.on_new_deco)
+  unhook(&wc.on_req_sel) unhook(&wc.on_req_psel) unhook(&wc.on_set_sel) unhook(&wc.on_new_ti)
   wlr_keyboard_finish(&keyboard)
   wlr_backend_destroy(wc.backend)
   wlr_allocator_destroy(wc.allocator)

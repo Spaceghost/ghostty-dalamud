@@ -390,6 +390,9 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     text:destroy()
   elseif typ == PROTO_CLIP_SET then
     if len <= CLIP_MAX and clipboard_set(payload, len) then
+      ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
+      capture_wayland_clipboard_changed() -- apps in the compositor paste the game's copy
+      ## end
       send_text(c, PROTO_OK, 'clipboard set')
     else
       send_text(c, PROTO_ERR, 'clipboard unavailable')
@@ -605,6 +608,7 @@ local function main(): integer
   end
   ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
   capture_wayland_configure(wayland_socket, xkb_layout)
+  capture_wayland_set_clipboard(clipboard_get, clipboard_set) -- the compositor's apps share the host clipboard
   ## end
   do
     local ok, why = windows:init(windows_name, client_queue)

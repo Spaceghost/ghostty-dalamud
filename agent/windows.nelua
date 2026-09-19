@@ -9,8 +9,10 @@
 -- queue is already over WINDOWS_OUTQ_MAX).
 --
 -- A stream belongs to the connection that opened it: other connections cannot
--- see or touch it, and it closes when that connection goes. Nothing about
--- windows outlives a client (unlike PTY sessions).
+-- see or touch it, and it closes when that connection goes. The window
+-- itself may stay (a backend's `release`): the Linux compositor keeps it
+-- and its app for the next connection to open again (WOPEN "key:").
+
 require 'vector'
 require 'memory'
 require 'math'
@@ -41,6 +43,7 @@ local WinStream = @record{
   prev: vector(uint8),   -- what the client has, pw x ph, stride pw * 4
   scaled: vector(uint8),
   rects: vector(WinRect),
+  geom: vector(CaptureBox), -- the WGEOM last sent, in frame pixels as sent
   scratch: vector(uint8),
   body: vector(uint8),
 }
@@ -86,16 +89,47 @@ local function send_opened(q: *ByteQueue, req: uint32, sid: uint32, w: integer, 
   q:push((@*[0]uint8)(text.data), text.size)
 end
 
--- Close the backend's handle and forget stream `i`.
-local function drop(self: *AgentWindows, i: usize): void
+-- Close the backend's handle and forget stream `i`. `gone`: its client went
+-- away (not WCLOSE), so a backend that can keeps the window and its app.
+local function drop(self: *AgentWindows, i: usize, gone: boolean): void
   local s = &self.streams[i]
-  self.backend.close(s.h)
+  if gone and self.backend.release ~= nilptr then self.backend.release(s.h) else self.backend.close(s.h) end
   s.prev:destroy()
   s.scaled:destroy()
   s.rects:destroy()
+  s.geom:destroy()
   s.scratch:destroy()
   s.body:destroy()
   self.streams:remove(i)
+end
+
+-- WGEOM before the first WFRAME of a seq whose boxes differ from the last
+-- ones sent: the window's and its popups' rectangles in the picture, scaled
+-- as the frame is (factor f).
+local function send_geom(s: *WinStream, q: *ByteQueue, fr: *CaptureFrame, f: integer): void
+  local n = math.min(fr.nbox, 64)
+  local same = n == #s.geom
+  local b: [64]CaptureBox
+  for i = 0, < n do
+    local r = fr.boxes[i]
+    b[i] = { x = r.x // f, y = r.y // f, w = (r.w + f - 1) // f, h = (r.h + f - 1) // f }
+    if same and (b[i].x ~= s.geom[i].x or b[i].y ~= s.geom[i].y or b[i].w ~= s.geom[i].w or b[i].h ~= s.geom[i].h) then same = false end
+  end
+  if same then return end
+  s.geom:clear()
+  local body: [4 + 4 + 2 + 64 * 8]uint8
+  proto.put_u32(&body, s.sid)
+  proto.put_u32((@*[0]uint8)(&body[4]), s.seq)
+  proto.put_u16((@*[0]uint8)(&body[8]), (@uint16)(n))
+  for i = 0, < n do
+    s.geom:push(b[i])
+    local o = 10 + i * 8
+    proto.put_u16((@*[0]uint8)(&body[o]), (@uint16)(math.max(0, b[i].x)))
+    proto.put_u16((@*[0]uint8)(&body[o + 2]), (@uint16)(math.max(0, b[i].y)))
+    proto.put_u16((@*[0]uint8)(&body[o + 4]), (@uint16)(math.max(0, b[i].w)))
+    proto.put_u16((@*[0]uint8)(&body[o + 6]), (@uint16)(math.max(0, b[i].h)))
+  end
+  proto.write_frame(q, PROTO_WGEOM, &body, (@usize)(10 + n * 8))
 end
 
 -- One frame: scale, announce the stream if this is its first, diff against
@@ -119,6 +153,7 @@ local function stream_send(self: *AgentWindows, s: *WinStream, q: *ByteQueue, fr
   end
   if #s.rects == 0 then return end
   s.seq = s.seq + 1
+  send_geom(s, q, fr, f)
   wincodec_write_frames(q, s.sid, s.seq, src, stride, w, h, key, &s.rects, &s.scratch, &s.body)
   -- keep what the client now shows: all of it, or the rectangles just sent
   local row = (@usize)(w * 4)
@@ -183,7 +218,15 @@ end
 function AgentWindows:handle(ci: usize, q: *ByteQueue, typ: uint8, payload: *[0]uint8, len: usize): boolean
   if typ == PROTO_WLIST then
     if not self.ok then proto.write_frame(q, PROTO_ERR, (@*[0]uint8)(self.why.data), self.why.size) return true end
-    local text = self.backend.list()
+    -- WLIST "apps": the installed apps instead of the windows (none when the
+    -- backend has no list of them)
+    local arg = string{data=(@*[0]byte)(payload), size=len}
+    local text: string
+    if arg == 'apps' then
+      if self.backend.apps ~= nilptr then text = self.backend.apps() end
+    else
+      text = self.backend.list()
+    end
     proto.write_frame(q, PROTO_WLISTR, (@*[0]uint8)(text.data), text.size)
     text:destroy()
   elseif typ == PROTO_WOPEN then
@@ -231,7 +274,7 @@ function AgentWindows:handle(ci: usize, q: *ByteQueue, typ: uint8, payload: *[0]
     if len < 4 then return true end
     local sid = proto.get_u32(payload)
     for i = 0, < #self.streams do
-      if self.streams[i].sid == sid and self.streams[i].client == ci then drop(self, i) break end
+      if self.streams[i].sid == sid and self.streams[i].client == ci then drop(self, i, false) break end
     end
   else
     return false
@@ -254,7 +297,7 @@ function AgentWindows:tick(now: float64): void
       if st == CAPTURE_PENDING then i = i + 1 continue end
       if st == CAPTURE_ENDED then
         send_opened(q, s.req, 0, 0, 0, #why > 0 and why or 'capture ended')
-        drop(self, i)
+        drop(self, i, false)
         continue
       end
       -- live: announce with the first frame when there is one, else without a size
@@ -270,7 +313,7 @@ function AgentWindows:tick(now: float64): void
     if st == CAPTURE_ENDED then
       local reason = #why > 0 and why or 'capture ended'
       proto.write_frame_id(q, PROTO_WEND, s.sid, (@*[0]uint8)(reason.data), reason.size)
-      drop(self, i)
+      drop(self, i, false)
       continue
     end
     if st == CAPTURE_LIVE and s.seq - s.acked < WINDOWS_UNACKED_MAX and now >= s.due
@@ -314,7 +357,7 @@ end
 function AgentWindows:client_gone(ci: usize): void
   local i: integer = #self.streams - 1
   while i >= 0 do
-    if self.streams[i].client == ci then drop(self, (@usize)(i))
+    if self.streams[i].client == ci then drop(self, (@usize)(i), true)
     elseif self.streams[i].client > ci then self.streams[i].client = self.streams[i].client - 1 end
     i = i - 1
   end

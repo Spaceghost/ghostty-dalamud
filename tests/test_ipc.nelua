@@ -328,11 +328,14 @@ expect('{"method":"window.list"}', 'assert(r.result.windows[1].kind == "pet" and
 forget()
 expect('{"method":"agent.windows.refresh"}', 'assert(r.ok)')
 frame()
-assert(count(PROTO_WLIST) == 1, 'WLIST sent')
+assert(count(PROTO_WLIST) == 2, 'WLIST sent for the windows and for the apps')
 do
-  local lines: string = '5\t640\t400\tyad\tYad Window\tkey:yad-1\tmore\n7\t800\t600\tfirefox\tMozilla Firefox\n0\t0\t0\t\tchoose on the desktop\napp\tfoot\tFoot\tfoot\tSystem;TerminalEmulator;\nbad line\n'
+  -- the two answers: the windows, then (WLIST "apps") the apps alone
+  local lines: string = '5\t640\t400\tyad\tYad Window\tkey:yad-1\tmore\n7\t800\t600\tfirefox\tMozilla Firefox\n0\t0\t0\t\tchoose on the desktop\nbad line\n'
+  local apps: string = 'app\tfoot\tFoot\tfoot\tSystem;TerminalEmulator;\nterm\thtop\thtop\t\tSystem;\thtop\n'
   local q: ByteQueue
   proto.write_frame(&q, PROTO_WLISTR, (@*[0]uint8)(lines.data), lines.size)
+  proto.write_frame(&q, PROTO_WLISTR, (@*[0]uint8)(apps.data), apps.size)
   peer_send(&q)
   q:destroy()
 end
@@ -343,7 +346,7 @@ expect('{"method":"agent.windows"}', [[
   assert(w[2].wid == 7 and w[2].app == 'firefox' and w[2].title == 'Mozilla Firefox' and w[2].key == '' and #w[2].extra == 0, RAW)
   assert(w[3].wid == 0, RAW)]])
 expect('{"method":"agent.apps"}', 'assert(#r.result == 1 and r.result[1].id == "foot" and r.result[1].categories == "System;TerminalEmulator;", RAW)')
-expect('{"method":"agent.status"}', 'assert(r.result.window_lists == 1, RAW)')
+expect('{"method":"agent.status"}', 'assert(r.result.window_lists == 2, RAW)')
 expect('{"method":"window.list"}', 'assert(r.result.windows[1].key == "yad-1" and r.result.windows[1].agent == "default", RAW)')
 assert(logged('window #5 640x400 [yad] Yad Window  @default key yad-1') == 1, 'the key in the /window list log line')
 -- terminal.new: a world terminal, a pet unless pinned; focus.cycle steps through the world panels
