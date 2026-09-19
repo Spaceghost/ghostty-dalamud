@@ -586,7 +586,11 @@ function M.place_pet(id, a, p, t, focused)
   -- a pet turns it; the other pets step aside rather than fill the view)
   x, z = clear_of(x, z, p, (body.speed > cfg.walk_speed and p.rotation or body.heading) + pi, cfg.behind_clear)
   if M._ct ~= t then
-    local fx, _, fz = ghostty.camera and ghostty.camera()
+    local fx, fz
+    if ghostty.camera then
+      local cx, _, cz = ghostty.camera()
+      fx, fz = cx, cz
+    end
     M._ct, M._cam_back = t, (fx and (fx * fx + fz * fz) > 1e-4) and atan(-fx, -fz) or nil
   end
   if M._cam_back then x, z = clear_of(x, z, p, M._cam_back, cfg.camera_clear) end
