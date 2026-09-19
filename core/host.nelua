@@ -176,6 +176,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     imgui.SetWindowFocusNil()
   end
   update_status()
+  ipc_frame() -- queued IPC changes, then the snapshot IPC reads answer from (after the status: it is in there)
 end
 
 -- Draw the popup terminal into `dl` at the given rectangle: the Umbra toolbar
@@ -230,6 +231,14 @@ global function gu_status(buf: *[0]cchar, cap: usize): usize <cexport, codename 
   return n
 end
 
+-- GhosttyDalamud.v1.Call (docs/IPC.md): one JSON request from another plugin,
+-- on any thread. The JSON response goes to `out` (at most `cap` bytes with its
+-- NUL); returns its length. Reads answer from the last frame's snapshot,
+-- changes are queued for the next frame (core/app/ipc.nelua).
+global function gu_call(request: cstring, out: *[0]cchar, cap: usize): usize <cexport, codename 'gu_call'>
+  return ipc_call(request, out, cap)
+end
+
 global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   defer surface_reset() end -- whatever state we were in, forget the shim's callbacks
   if not host.initialized then return end
@@ -244,6 +253,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   if host.layout_restored then save_world_state() end
   for i = #host.sessions - 1, 0, -1 do session_remove(host.sessions[i]) end
   remotewin_shutdown() -- its panels went with their sessions (WCLOSE queued)
+  ipc_shutdown() -- the channel was unregistered with the other surfaces
   agent_final_flush() -- the queued DETACH/CLOSE frames, before the socket goes away
   host.sessions:destroy()
   host.dropdown_tabs:destroy()

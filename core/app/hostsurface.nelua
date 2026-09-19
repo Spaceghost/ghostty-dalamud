@@ -134,6 +134,7 @@ local function read_commands(): void
   for i = 0, < #surface.commands do surface.commands[i]:destroy() end
   surface.commands:clear()
   surface.command_ok:clear()
+  surface.command_tag:clear()
   local L = policy.L
   local found = false
   if L ~= nilptr and policy.loaded then
@@ -161,7 +162,57 @@ local function read_commands(): void
     surface.commands:push(string.copy('/tomestone'))
     surface.commands:push(string.copy('/tome'))
   end
-  for i = 0, < #surface.commands do surface.command_ok:push(false) end
+  for i = 0, < #surface.commands do
+    surface.command_ok:push(false)
+    surface.command_tag:push(0)
+  end
+  -- CONFIG.host.verb_commands = { ['/window'] = 'window', ... }: each name
+  -- stands for one /term verb. Missing (an init.lua from before them): these.
+  for i = 0, < #surface.verbs do surface.verbs[i]:destroy() end
+  surface.verbs:clear()
+  local verb_found = false
+  if L ~= nilptr and policy.loaded then
+    local n = push_config_table(L, 'host', nilptr)
+    if n > 0 then
+      lua_getfield(L, -1, 'verb_commands')
+      if lua_type(L, -1) == LUA_TTABLE then
+        verb_found = true
+        lua_pushnil(L)
+        while lua_next(L, -2) ~= 0 do
+          if lua_type(L, -2) == LUA_TSTRING and lua_type(L, -1) == LUA_TSTRING then
+            local ksz: usize, vsz: usize = 0, 0
+            local k = lua_tolstring(L, -2, &ksz)
+            local v = lua_tolstring(L, -1, &vsz)
+            surface.commands:push(string.copy(string{data=(@*[0]byte)(k), size=ksz}))
+            surface.verbs:push(string.copy(string{data=(@*[0]byte)(v), size=vsz}))
+            surface.command_ok:push(false)
+            surface.command_tag:push((@cint)(#surface.verbs))
+          end
+          lua_pop(L, 1)
+        end
+      end
+      lua_pop(L, n + 1)
+    end
+  end
+  if not verb_found then
+    ## for _, cv in ipairs{{'/window', 'window'}, {'/ask', 'ask'}, {'/agent', 'agent'}} do
+    surface.commands:push(string.copy(#[cv[1]]#))
+    surface.verbs:push(string.copy(#[cv[2]]#))
+    surface.command_ok:push(false)
+    surface.command_tag:push((@cint)(#surface.verbs))
+    ## end
+  end
+end
+
+-- What a tagged command answers to in /help: lua/tooltips.lua's
+-- 'command./window' and so on, else a line of our own.
+local function verb_help(name: string, verb: string): string
+  local fallback: string = 'Same as /term ' .. verb
+  local key = 'command.' .. name
+  local help = policy_tooltip(key, fallback)
+  key:destroy()
+  fallback:destroy()
+  return help
 end
 
 -- CONFIG.host.dtr.on_click(button, mods) -> 'toggle' | 'popup' | 'window' |
@@ -209,9 +260,22 @@ local function register_commands(now: uint64, loud: boolean): void
   surface.command_retry_ms = now
   if host.api.command_add == nilptr then return end
   for i = 0, < #surface.commands do
-    if not surface.command_ok[i] then
+    local tag = surface.command_tag[i]
+    if tag > 0 and host.api.command_add_tagged == nilptr then
+      if not surface.verbs_unsupported then
+        surface.verbs_unsupported = true
+        logf(LOG_WARN, 'command %s not registered: the plugin shim is too old for commands of their own (use /term %s)', surface.commands[i], surface.verbs[tag - 1])
+      end
+    elseif not surface.command_ok[i] then
       local name = surface.commands[i]
-      local ok = host.api.command_add(cstr(name), cstr(surface.cfg.help)) ~= 0
+      local ok: boolean
+      if tag > 0 then
+        local help = verb_help(name, surface.verbs[tag - 1])
+        ok = host.api.command_add_tagged(cstr(name), cstr(help), tag) ~= 0
+        help:destroy()
+      else
+        ok = host.api.command_add(cstr(name), cstr(surface.cfg.help)) ~= 0
+      end
       surface.command_ok[i] = ok
       if ok then logf(LOG_INFO, 'command %s registered', name)
       elseif loud then logf(LOG_WARN, 'command %s not registered (taken?); retrying every %d s', name, COMMAND_RETRY_MS // 1000) end
@@ -401,7 +465,12 @@ end
 local function handle_event(e: *QueuedEvent): void
   if e.kind == GuEventKind.Chat then
     local text = string{data=&e.text, size=e.len}
-    if run_command(text) == 3 then logf(LOG_WARN, 'unknown command: %s', text) end
+    if e.a > 0 and e.a <= #surface.verbs then
+      -- a command of its own (/window, /ask, /agent): its verb decides
+      run_verb_command(surface.verbs[e.a - 1], text)
+    elseif run_command(text) == 3 then
+      logf(LOG_WARN, 'unknown command: %s', text)
+    end
     return
   end
   if boot.state ~= HostState.Active then return end -- suspended: the legacy core owns the UI
@@ -445,6 +514,9 @@ global function surface_reset(): void
   for i = 0, < #surface.commands do surface.commands[i]:destroy() end
   surface.commands:destroy()
   surface.command_ok:destroy()
+  surface.command_tag:destroy()
+  for i = 0, < #surface.verbs do surface.verbs[i]:destroy() end
+  surface.verbs:destroy()
   surface.cfg.help:destroy() surface.cfg.dtr_mode:destroy() surface.cfg.dtr_title:destroy() surface.cfg.dtr_tooltip:destroy()
   surface.dtr_text:destroy()
   surface.last_action:destroy()

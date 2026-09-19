@@ -52,6 +52,7 @@ global RemoteWin = @record{
   s: *Session,              -- the panel (the stream is freed with it)
   req: uint32,              -- WOPEN request id
   sid: uint32,              -- stream id, 0 until WOPENED
+  app: string,              -- what was asked for: the run command's program, the match text, or '' (owned)
   state: RemoteWinState,
   max_w: integer, max_h: integer, -- what was asked for: larger frames are refused
   w: integer, h: integer,   -- size of the frames (0 before the first)
@@ -148,6 +149,7 @@ local function remotewin_closed(s: *Session): void
       wintex_release(&rw.tex)
       rw.pixels:destroy()
       rw.dirty:destroy()
+      rw.app:destroy()
       streams:remove(i)
       delete(rw)
       return
@@ -277,7 +279,7 @@ global function remotewin_event(ev: *AgentEvent): void
   end
 end
 
--- Commands --------------------------------------------------------------------------
+-- Agents ----------------------------------------------------------------------------
 
 -- The agent a request goes to. Only the CONFIG.agent connection streams
 -- windows so far: '' or 'default' names it.
@@ -310,63 +312,233 @@ local function split_agent(args: string): (string, string)
   return rest, name
 end
 
--- `/term window pull [match|#wid|run CMD...] [@agent]`: a pet showing the
--- window once the agent (or the desktop's picker) has it. False with a reason.
-global function remotewin_pull(args: string): (boolean, string)
-  local rest, name = split_agent(args)
-  local agent, err = agent_for(name)
-  if agent == nilptr then return false, err end
-  if not player_loaded() then return false, 'no player (log in first)' end
-  local wid: uint32 = 0
+-- The window API -----------------------------------------------------------------------
+-- One set of functions behind `/term window ...`, `/term pin` on a window
+-- panel, the auto pulls and the IPC methods other plugins call (core/app/ipc.nelua,
+-- lua/ipc.lua, docs/IPC.md). Call them from the frame's thread only (gu_frame,
+-- a chat command, the IPC queue drained in gu_frame). A failure comes back as
+-- false (window_open: 0) and a reason; the reason is borrowed and stays valid
+-- until the next window_* call.
+
+-- Where a window panel is (WindowInfo.view).
+global WindowView = @enum(cint){ World = 0, Tab, Full }
+
+-- One window panel as window_list reports it. `title` and `app` are borrowed
+-- from the panel: copy them before the panel can close (the next frame).
+global WindowInfo = @record{
+  id: integer,              -- the panel (session) id every other window_* call takes
+  sid: uint32,              -- the agent's stream id, 0 while pending
+  title: string,            -- the window's title once the agent opened it, else ''
+  app: string,              -- what was asked for (see RemoteWin.app)
+  w: integer, h: integer,   -- size of the window's frames (0 before the first)
+  state: RemoteWinState,    -- Opening (pending), Live, Ended (also while the panel leaves)
+  view: WindowView,         -- World: a pet or a pin (CONFIG.world's anchor says which); Tab: popped in; Full: full screen
+  focused: boolean,         -- the panel has the keyboard
+}
+
+-- What window_open opens: at most one of `run` (the agent starts the command
+-- and streams its window), `wid` (a window id from `/term window list`) and
+-- `match` (a window whose title or app contains it); none of them: the
+-- agent's own choice (a desktop picker where it has one). `agent` names the
+-- connection ('' = CONFIG.agent, the only one so far), `pin` places the panel
+-- as `/term pin` takes it ('' = a pet), `caller` names who asked (logged).
+global WindowOpenSpec = @record{
+  run: string, match: string, wid: uint32, agent: string, pin: string, caller: string,
+}
+
+local err_text: string -- the last reason that had to be built (see above)
+local function fail_owned(reason: string): (boolean, string)
+  err_text:destroy()
+  err_text = reason
+  return false, err_text
+end
+
+-- A window panel by id; 0 or anything else (a terminal, a closed panel): nilptr.
+local function find_window(id: integer): *Session
+  if id == 0 then return nilptr end
+  local s = find_session(id)
+  if s == nilptr or s.kind ~= TransportKind.Window then return nilptr end
+  return s
+end
+
+-- The program of a command line: its first word without the directory.
+local function program_of(cmd: string): string
+  local prog: string = cmd
+  local sp = prog:find(' ', 1, true)
+  if sp > 0 then prog = prog:subview(1, sp - 1) end
+  local cut = 0
+  for i = 1, #prog do
+    if prog.data[i - 1] == '/'_b or prog.data[i - 1] == '\\'_b then cut = i end
+  end
+  if cut > 0 then prog = prog:subview(cut + 1) end
+  return prog:copy()
+end
+
+-- Open a window panel: a pet (or `spec.pin`'s place) showing the window once
+-- the agent (or the desktop's picker) has it. The panel's id, or 0 and why.
+global function window_open(spec: WindowOpenSpec): (integer, string)
+  local agent, err = agent_for(spec.agent)
+  if agent == nilptr then return 0, err end
+  if not player_loaded() then return 0, 'no player (log in first)' end
   local match: string
-  local owned = false
-  if #rest > 1 and rest.data[0] == '#'_b then
-    local digits = rest:subview(2)
-    for i = 0, < #digits do
-      if digits.data[i] < '0'_b or digits.data[i] > '9'_b then return false, 'usage: /term window pull #wid (a number from /term window list)' end
-      wid = wid * 10 + (digits.data[i] - '0'_b)
-    end
-  elseif #rest > 4 and rest:subview(1, 4) == 'run ' then
-    -- the agent starts the command and streams its window (the Linux compositor backend)
+  local app: string
+  if #spec.run > 0 then
     local sb: stringbuilder
-    sb:write('run:', rest:subview(5))
+    sb:write('run:', spec.run) -- the agent starts the command (the Linux compositor backend)
     match = sb:promote()
-    owned = true
+    app = program_of(spec.run)
   else
-    match = rest
+    match = spec.match:copy()
+    app = spec.match:copy()
   end
   local s = session_new_local('window', 60, 8)
   if s == nilptr then
-    if owned then match:destroy() end
-    return false, 'no session'
+    match:destroy() app:destroy()
+    return 0, 'no session'
   end
   s.kind = TransportKind.Window
   s.window_close = remotewin_closed
   s.cell_w, s.cell_h = 8, 16
   s.appear = 0
   if not make_pet(s) then
-    if owned then match:destroy() end
+    match:destroy() app:destroy()
     session_remove(s)
-    return false, 'the pet could not be placed'
+    return 0, 'the pet could not be placed'
   end
   -- a window's shape until its first frame says otherwise
   policy_windows_size(s.id, 16, 10, REMOTEWIN_TITLE + REMOTEWIN_PAD)
+  if #spec.pin > 0 then
+    local perr = policy_windows_pin(s.id, spec.pin)
+    if #perr > 0 then
+      match:destroy() app:destroy()
+      close_terminal(s) -- nothing was asked of the agent yet
+      local sb: stringbuilder
+      sb:write('pin: ', perr)
+      perr:destroy()
+      local _, reason = fail_owned(sb:promote())
+      return 0, reason
+    end
+  end
   local rw = new(@RemoteWin)
   rw.s = s
   rw.req = next_req
   next_req = next_req + 1
+  rw.app = app
   rw.max_w, rw.max_h = policy.windows.max_w, policy.windows.max_h
   rw.ptr_x, rw.ptr_y = -1, -1
   rw.drawn_at = host.last_time
   streams:push(rw)
-  local ok = agent:wopen(rw.req, wid, (@uint16)(rw.max_w), (@uint16)(rw.max_h), (@uint8)(policy.windows.fps), match)
-  if owned then match:destroy() end
+  local ok = agent:wopen(rw.req, spec.wid, (@uint16)(rw.max_w), (@uint16)(rw.max_h), (@uint8)(policy.windows.fps), match)
   if not ok then
-    session_remove(s)
-    return false, 'the agent refused the request'
+    match:destroy()
+    close_terminal(s) -- its stream goes with it (remotewin_closed)
+    return 0, 'the agent refused the request'
   end
+  do
+    local sb: stringbuilder
+    sb:writef('window %d: asked the agent for ', s.id)
+    if spec.wid ~= 0 then sb:writef('#%d', spec.wid)
+    elseif #match > 0 then sb:write(match)
+    else sb:write('its own choice') end
+    if #spec.pin > 0 then sb:write(', pinned ', spec.pin) end
+    if #spec.caller > 0 then sb:write(' (for ', spec.caller, ')') end
+    local line = sb:promote()
+    log(LOG_INFO, line)
+    line:destroy()
+  end
+  match:destroy()
   panel_text(s, 'waiting for the window', '\u{2026}')
+  return s.id, ''
+end
+
+-- Close window panel `id` (it glitches out like a dismissed terminal; the
+-- stream closes with it). `id` 0: the focused window panel, else the newest.
+global function window_close(id: integer): (boolean, string)
+  local s: *Session = nilptr
+  if id == 0 then
+    s = find_window(host.world_focus)
+    if s == nilptr and #streams > 0 then s = streams[#streams - 1].s end
+    if s == nilptr then return false, 'no window panel' end
+  else
+    s = find_window(id)
+    if s == nilptr then return false, 'no such window panel' end
+  end
+  close_panel(s)
   return true, ''
+end
+
+-- Give window panel `id` the keyboard (and show the world panels).
+global function window_focus(id: integer): (boolean, string)
+  local s = find_window(id)
+  if s == nilptr then return false, 'no such window panel' end
+  if s.leaving then return false, 'the window panel is closing' end
+  bring_forward(s)
+  return true, ''
+end
+
+-- Move window panel `id` as `/term pin ARGS` would (here, me, target, orbit,
+-- pet, ...), keeping its size. `id` 0: the focused window panel.
+global function window_place(id: integer, args: string): (boolean, string)
+  local s = find_window(id)
+  if id == 0 then
+    s = find_window(host.world_focus)
+    if s == nilptr then return false, 'no focused window panel' end
+  elseif s == nilptr then
+    return false, 'no such window panel'
+  end
+  local err = policy_windows_pin(s.id, args)
+  if #err > 0 then return fail_owned(err) end
+  err:destroy()
+  return true, ''
+end
+
+-- Every window panel, oldest first, into `out` (cleared first).
+global function window_list(out: *vector(WindowInfo)): void
+  out:clear()
+  for i = 0, < #streams do
+    local rw = streams[i]
+    local s = rw.s
+    local view = WindowView.Tab
+    for k = 0, < #host.world do
+      if host.world[k] == s then view = WindowView.World break end
+    end
+    if view == WindowView.World and host.world_full_id == s.id then view = WindowView.Full end
+    local state = rw.state
+    if s.leaving then state = RemoteWinState.Ended end
+    local title: string
+    if rw.state ~= RemoteWinState.Opening then title = s.title end
+    out:push(WindowInfo{
+      id = s.id, sid = rw.sid, title = title, app = rw.app, w = rw.w, h = rw.h,
+      state = state, view = view, focused = host.world_focus == s.id,
+    })
+  end
+end
+
+-- Ask the agent for its window list (answered in the log, WLISTR).
+global function window_agent_list(agent_name: string): (boolean, string)
+  local agent, err = agent_for(agent_name)
+  if agent == nilptr then return false, err end
+  agent:wlist()
+  return true, ''
+end
+
+-- `/term window pull [match|#wid|run CMD...] [@agent]` arguments to window_open.
+global function remotewin_pull(args: string): (boolean, string)
+  local rest, name = split_agent(args)
+  local spec: WindowOpenSpec = { agent = name }
+  if #rest > 1 and rest.data[0] == '#'_b then
+    local digits = rest:subview(2)
+    for i = 0, < #digits do
+      if digits.data[i] < '0'_b or digits.data[i] > '9'_b then return false, 'usage: /term window pull #wid (a number from /term window list)' end
+      spec.wid = spec.wid * 10 + (digits.data[i] - '0'_b)
+    end
+  elseif #rest > 4 and rest:subview(1, 4) == 'run ' then
+    spec.run = rest:subview(5)
+  else
+    spec.match = rest
+  end
+  local id, err = window_open(spec)
+  return id ~= 0, err
 end
 
 -- `/term window list|pull|close ...`. 0 on success, 4 with a logged reason.
@@ -377,38 +549,57 @@ global function remotewin_command(args: string): cint
   if sp > 0 then verb, rest = args:subview(1, sp - 1), args:subview(sp + 1) end
   if verb == 'list' then
     local _, name = split_agent(rest)
-    local agent, err = agent_for(name)
-    if agent == nilptr then logf(LOG_WARN, 'window list: %s', err) return 4 end
-    agent:wlist()
+    local ok, err = window_agent_list(name)
+    if not ok then logf(LOG_WARN, 'window list: %s', err) return 4 end
     return 0
   elseif verb == 'pull' then
     local ok, err = remotewin_pull(rest)
     if not ok then logf(LOG_WARN, 'window pull: %s', err) return 4 end
     return 0
   elseif verb == 'close' then
-    local s = find_session(host.world_focus)
-    if s == nilptr or s.kind ~= TransportKind.Window then
-      -- no focused window panel: the newest one
-      s = nilptr
-      if #streams > 0 then s = streams[#streams - 1].s end
-    end
-    if s == nilptr then logf(LOG_WARN, 'window close: no window panel') return 4 end
-    close_panel(s)
+    local ok, err = window_close(0)
+    if not ok then logf(LOG_WARN, 'window close: %s', err) return 4 end
     return 0
   end
   logf(LOG_WARN, 'usage: /term window list | pull [match|#wid|run CMD] [@agent] | close')
   return 4
 end
 
+-- `/window pull [match|#wid] | run CMD... | list | close | desktop`, with an
+-- optional trailing `@agent`: the same functions as IPC and `/term window`.
+-- 0 on success, 4 with a logged reason.
+global function window_command(args: string): cint
+  local verb: string = args
+  local rest: string
+  local sp = args:find(' ', 1, true)
+  if sp > 0 then verb, rest = args:subview(1, sp - 1), args:subview(sp + 1) end
+  if verb == 'run' then
+    local cmd, _ = split_agent(rest)
+    if #cmd == 0 then logf(LOG_WARN, 'usage: /window run CMD... [@agent]') return 4 end
+    local sb: stringbuilder
+    sb:write('run ', rest)
+    local line = sb:promote()
+    local ok, err = remotewin_pull(line)
+    line:destroy()
+    if not ok then logf(LOG_WARN, 'window run: %s', err) return 4 end
+    return 0
+  elseif verb == 'list' or verb == 'pull' or verb == 'close' then
+    return remotewin_command(args)
+  elseif verb == 'desktop' then
+    logf(LOG_WARN, 'window desktop: not available yet (reserved for a whole remote desktop on a panel)')
+    return 4
+  end
+  logf(LOG_WARN, 'usage: /window pull [match|#wid] | run CMD... | list | close   (each may end with @agent)')
+  return 4
+end
+
 -- `/term pin ...` on the focused window panel: moved, same size. False when
 -- the focused panel is not a window (the terminal pin applies).
 global function remotewin_pin(args: string): (boolean, cint)
-  local s = find_session(host.world_focus)
-  if s == nilptr or s.kind ~= TransportKind.Window then return false, 0 end
-  local err = policy_windows_pin(s.id, args)
-  if #err > 0 then
+  if find_window(host.world_focus) == nilptr then return false, 0 end
+  local ok, err = window_place(0, args)
+  if not ok then
     logf(LOG_WARN, 'pin: %s', err)
-    err:destroy()
     return true, 4
   end
   return true, 0
@@ -795,9 +986,11 @@ global function remotewin_shutdown(): void
     wintex_release(&streams[i].tex)
     streams[i].pixels:destroy()
     streams[i].dirty:destroy()
+    streams[i].app:destroy()
     delete(streams[i])
   end
   streams:destroy()
+  err_text:destroy()
   wintex_shutdown()
   auto_done = false
   old_shim_logged = false

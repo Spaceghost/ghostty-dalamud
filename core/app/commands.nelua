@@ -180,6 +180,8 @@ global function assistant_command(question: string): cint
   return 0
 end
 
+local window_hint_shown = false -- `/term window pull|list|close` points at /window once
+
 global function run_command(cmd: string): cint
   -- "verb arg...": verbs match whole words ("minimize" is not "min")
   local verb: string = cmd
@@ -363,7 +365,13 @@ global function run_command(cmd: string): cint
     local sub = arg
     local ssp = arg:find(' ', 1, true)
     if ssp > 0 then sub = arg:subview(1, ssp - 1) end
-    if sub == 'list' or sub == 'pull' or sub == 'close' then return remotewin_command(arg) end
+    if sub == 'list' or sub == 'pull' or sub == 'close' then
+      if not window_hint_shown then
+        window_hint_shown = true
+        logf(LOG_INFO, 'hint: /window %s does the same (/window pull | run CMD | list | close)', arg)
+      end
+      return remotewin_command(arg)
+    end
     local n = policy.default_profile
     if #arg > 0 then
       local ok, id = parse_id(arg)
@@ -393,4 +401,30 @@ global function run_command(cmd: string): cint
     return 0
   end
   return 3
+end
+
+-- A command of its own (CONFIG.host.verb_commands) standing for one /term
+-- verb, with its arguments: /window -> window_command, /ask -> the
+-- assistant, /agent ask -> the assistant too. 0 on success, like run_command.
+global function run_verb_command(verb: string, args: string): cint
+  local a: string = args
+  while #a > 0 and a.data[0] == ' '_b do a = a:subview(2) end
+  if verb == 'window' then
+    return window_command(a)
+  elseif verb == 'ask' then
+    return assistant_command(a)
+  elseif verb == 'agent' then
+    if a == 'ask' then return assistant_command('') end
+    if #a > 4 and a:subview(1, 4) == 'ask ' then return assistant_command(a:subview(5)) end
+    logf(LOG_WARN, 'usage: /agent ask [question]')
+    return 4
+  end
+  -- any other verb: the /term line it stands for
+  local sb: stringbuilder
+  sb:write(verb, ' ', a)
+  local line = sb:promote()
+  local rc = run_command(line)
+  if rc == 3 then logf(LOG_WARN, 'unknown command: %s', line) end
+  line:destroy()
+  return rc
 end

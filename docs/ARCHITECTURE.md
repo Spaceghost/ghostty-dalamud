@@ -37,6 +37,10 @@
   `GhosttyDalamud.v1.Status / PopupSize / PopupDraw / PopupReset / Post` over
   IPC and show "ghostty offline" when the plugin is absent. While the widget
   polls, the info bar entry hides itself (`host.dtr.mode = 'auto'`).
+* **Other plugins** open and move remote-window panels through
+  `GhosttyDalamud.v1.Call` (JSON in, JSON out; [IPC.md](IPC.md)). Calls come
+  on the caller's thread: reads answer from a snapshot the frame publishes,
+  changes are queued for the next frame (`core/app/ipc.nelua`, `lua/ipc.lua`).
 * **One core per process.** Activation goes INACTIVE → PENDING → ACTIVE ⇄
   SUSPENDED: init is refused (and retried every 2 s) while the legacy
   Umbra-hosted `ghostty_umbra.dll` is mapped or another core holds the
