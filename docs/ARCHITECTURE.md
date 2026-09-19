@@ -232,7 +232,13 @@ vendor/       pinned third-party checkouts (git-ignored, see toolchain.env)
 ## Pins
 
 `toolchain.env` pins Nelua (the project's fork, `NELUA_REPOSITORY`), ghostty,
-gc-cimgui (Dalamud's submodule commit), umbra-dist, Lua, Zig and .NET. Dalamud's ImGui uses 16-bit
+gc-cimgui (Dalamud's submodule commit), umbra-dist, Lua, Zig and .NET, and the
+Wayland SDK: the Fedora 44 `-devel` RPMs of wlroots 0.20.2, wayland 1.26.0,
+wayland-protocols 1.48, pixman 0.46.2, libxkbcommon 1.13.1 and libdrm, fetched
+from Koji by NVR with their sha256 and unpacked (headers only) into
+`vendor/wayland-sdk/include`. The agent links the host's own libraries against
+them (`tools/wayland-flags.sh`); without them it builds without the Linux
+window backend. Dalamud's ImGui uses 16-bit
 `ImWchar` (verified against `Dalamud.Bindings.ImGui`'s generated `ImGuiIO`),
 so `InputQueueCharacters` holds BMP code points.
 
@@ -268,6 +274,8 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_agent` | `ghostty-agent` end to end over TCP |
 | `test_wincodec` | remote window frames: changed tiles, QOI both ways, banding, WFRAME write/parse/apply, malformed input, downscaling |
 | `test_agent_windows` | remote windows end to end over TCP against `--windows test`: list, open by id and match, KEY and delta frames rebuilt, scaling, flow control, every input kind, close, WEND, failures, streams per connection, `--windows off` |
+| `test_capture_wayland` | the Wayland backend's pure parts: USB HID to evdev, codepoint to key and Shift in real xkb keymaps (us, de), `run:` parsing, WLIST lines, matching (only with `vendor/wayland-sdk`) |
+| `test_wayland_compositor` | the agent's Wayland compositor with a real client (`yad`, GTK3): launch through `run:`, map, frame size and content, click and TEXT/KEY/WHEEL input changing the pixels, WLIST, close, a launch that exits without a window; writes `first.png` and `typed.png` to `build/test-scratch/wayland` (only with `vendor/wayland-sdk`; skipped without yad) |
 
 The last step checks that the core also compiles as a native host module.
 
