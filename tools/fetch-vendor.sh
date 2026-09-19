@@ -36,6 +36,14 @@ if [[ ! -f "$V/lua/src/lua.h" ]]; then
 fi
 echo "lua $LUA_VERSION"
 
+if [[ ! -f "$V/stb/stb_truetype.h" ]] || ! echo "$STB_TRUETYPE_SHA256  $V/stb/stb_truetype.h" | sha256sum -c --quiet - >/dev/null 2>&1; then
+  mkdir -p "$V/stb"
+  curl -fsSL "$STB_TRUETYPE_URL" -o "$V/stb/stb_truetype.h.tmp"
+  echo "$STB_TRUETYPE_SHA256  $V/stb/stb_truetype.h.tmp" | sha256sum -c --quiet -
+  mv "$V/stb/stb_truetype.h.tmp" "$V/stb/stb_truetype.h"
+fi
+echo "stb_truetype $(grep -m1 -o 'v[0-9.]*' "$V/stb/stb_truetype.h")"
+
 # Wayland SDK headers (Linux only; SKIP_WAYLAND=1 to skip). Needs rpm2cpio and
 # cpio. Without it the agent builds with no Wayland compositor backend.
 if [[ "$(uname -s)" == Linux && "${SKIP_WAYLAND:-0}" != 1 && ! -f "$V/wayland-sdk/.pinned" ]] ||

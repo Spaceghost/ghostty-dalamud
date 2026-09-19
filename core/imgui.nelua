@@ -179,6 +179,8 @@ global ImGuiApi = @record{
   DrawListPushClipRect: function(dl: *ImDrawList, min: ImVec2, max: ImVec2, intersect: boolean): void,
   DrawListPopClipRect: function(dl: *ImDrawList): void,
   FontCalcTextSizeA: function(pOut: *ImVec2, font: *ImFont, size: float32, max_width: float32, wrap_width: float32, text_begin: cstring, text_end: cstring, remaining: *cstring): void,
+  -- the font's glyph for a BMP code point (16-bit ImWchar), nilptr when it has none (core/glyphfb.nelua)
+  FontFindGlyphNoFallback: function(font: *ImFont, c: uint16): pointer,
   -- raw triangles with per-vertex colour (soft gradients: the visual bell)
   DrawListPrimReserve: function(dl: *ImDrawList, idx_count: cint, vtx_count: cint): void,
   DrawListPrimVtx: function(dl: *ImDrawList, pos: ImVec2, uv: ImVec2, col: uint32): void,
@@ -237,7 +239,7 @@ global imgui: ImGuiApi
 ##  {'DrawListAddRectFilled','ImDrawList_AddRectFilled'},{'DrawListAddRect','ImDrawList_AddRect'},{'DrawListAddTriangleFilled','ImDrawList_AddTriangleFilled'},
 ##  {'DrawListAddLine','ImDrawList_AddLine'},{'DrawListAddText','ImDrawList_AddText_FontPtr'},
 ##  {'DrawListPushClipRect','ImDrawList_PushClipRect'},{'DrawListPopClipRect','ImDrawList_PopClipRect'},
-##  {'FontCalcTextSizeA','ImFont_CalcTextSizeA'},
+##  {'FontCalcTextSizeA','ImFont_CalcTextSizeA'},{'FontFindGlyphNoFallback','ImFont_FindGlyphNoFallback',true},
 ##  {'DrawListPrimReserve','ImDrawList_PrimReserve'},{'DrawListPrimVtx','ImDrawList_PrimVtx'},
 ##  {'GetFontTexUvWhitePixel','igGetFontTexUvWhitePixel'},
 ##  {'DrawListAddCircle','ImDrawList_AddCircle'},{'DrawListAddCircleFilled','ImDrawList_AddCircleFilled'},{'DrawListAddPolyline','ImDrawList_AddPolyline'},

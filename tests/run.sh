@@ -11,7 +11,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 NELUA="$ROOT/vendor/nelua-lang/nelua"
 export ZIG="${ZIG:-zig}" # tools/zig-cc.sh compiles every host build
-INC="-I$ROOT/vendor/ghostty/include -I$ROOT/vendor/gc-cimgui -I$ROOT/vendor/lua/src"
+INC="-I$ROOT/vendor/ghostty/include -I$ROOT/vendor/gc-cimgui -I$ROOT/vendor/lua/src -I$ROOT/vendor/stb"
 LIBS="-L$ROOT/build/ghostty-vt-linux/lib -L$ROOT/build/lua-linux -lm"
 export LD_LIBRARY_PATH="$ROOT/build/ghostty-vt-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 run() { echo "--- $1"; "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cflags="$INC $LIBS" --cache-dir build/nelua-cache -L . -b "tests/$1.nelua"; "build/nelua-cache/$1" "${@:2}"; }
@@ -29,6 +29,7 @@ if [[ ${#WAYLAND_DEFINE[@]} -gt 0 ]]; then wlrun test_capture_wayland; else echo
 run test_capture_mac
 run test_desktop_entries "$ROOT/build/test-scratch"
 run test_render
+run test_glyphfb "$ROOT"
 run test_session
 run test_dualsense
 run test_selection

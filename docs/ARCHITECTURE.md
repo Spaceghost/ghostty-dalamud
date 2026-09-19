@@ -403,6 +403,7 @@ so `InputQueueCharacters` holds BMP code points.
 |---|---|
 | `test_ghostty` | libghostty-vt binding: sized-struct sizes against `ghostty_type_json()` |
 | `test_render` | a terminal rendered through a fake ImGui, checked by its draw calls |
+| `test_glyphfb` | fallback glyphs (`core/glyphfb.nelua`): code points above U+FFFF and BMP glyphs the ImGui font lacks rasterized with stb_truetype from `fonts/` into a fake D3D11 atlas and drawn as tinted images at their cells (2D snapped, world unsnapped), the cache, a full atlas starting over, device changes |
 | `test_session` | session behaviour without a transport, local sessions, agent LIST parsing, `/term send` escapes, gamepad gestures, key repeat |
 | `test_dualsense` | DualSense input reports (USB, Bluetooth with its CRC, Bluetooth simple, short and foreign reports), Create edges, ids in HID interface paths, the HID reader against fake devices: scan, devices passed over by their path, open, report queue, unplug, rescans backing off, device arrivals, close |
 | `test_selection` | mouse selection: hit mapping, click counting, word and line units, copied text |

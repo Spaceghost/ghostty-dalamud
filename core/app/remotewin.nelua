@@ -1705,7 +1705,7 @@ end
 -- Drawing ---------------------------------------------------------------------------------
 
 -- Dalamud's D3D11 device, or nilptr (an older shim: no scene depth callback).
-local function ui_device(): pointer
+global function ui_device(): pointer
   if host.api.get_scene_depth == nilptr then return nilptr end
   local sd: GuSceneDepth
   if host.api.get_scene_depth(&sd) == 0 then return nilptr end
