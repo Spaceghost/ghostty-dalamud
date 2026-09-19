@@ -1,0 +1,510 @@
+-- Other plugins' ImGui windows on world panels ("adopted", docs/ADOPT.md;
+-- the pure parts are core/adopt.nelua). Not yet observed in game.
+--
+-- Frame ordering. Dalamud calls each plugin's UiBuilder.Draw in turn, in an
+-- order no plugin controls, so when ghostty's draw runs another plugin's
+-- window may or may not have been drawn yet this frame. Two ImGui context
+-- hooks take the work out of that order:
+--
+-- * RenderPre runs inside ImGui::Render(), after every plugin's Draw and
+--   before the draw lists are gathered for the renderer. There the adopted
+--   window's draw lists (its child windows and popups too) are complete: they
+--   are copied into a snapshot and emptied, so the window never reaches the
+--   screen, and its flags get NoMouseInputs so clicks pass through it.
+-- * The snapshot is drawn on the next frame, inside the panel's content area
+--   (worldview calls adopt_panel), where it is bent with everything else. One
+--   frame late, but in the panel's own place between its depth callbacks.
+-- * NewFramePre runs at the start of ImGui::NewFrame(), after Dalamud's
+--   backend queued this frame's mouse events. While the pointer is on the
+--   focused pet over the window, the queued mouse positions are rewritten to
+--   the matching point inside the real window, so hovering, clicks, the wheel
+--   and text fields all work in it. ghostty's own code keeps seeing the real
+--   pointer: GetMousePos, IsWindowHovered(AnyWindow) and SetWindowFocus(nil)
+--   are wrapped while a remap is active.
+--
+-- The window keeps its real place on the screen. One that sticks out of the
+-- display is moved inside it (ImGui culls what lies outside), and moved back
+-- on release.
+require 'core.app.panelkit'
+
+global AdoptWin = @record{
+  s: *Session,
+  name: string,             -- as asked for (`/window adopt NAME`), saved for a reload (owned)
+  title: string,            -- the ImGui window name (owned)
+  title_z: string,          -- the same with a NUL, for FindWindowByName (owned)
+  plugin: string,           -- InternalName or '' (owned)
+  label: string,            -- shown in the title strip (owned)
+  entry: AdoptEntry,
+  drawn: boolean,           -- RenderPre found it drawn this frame
+  snap: AdoptSnap,          -- what it drew last frame
+  x: float32, y: float32, w: float32, h: float32, -- its rectangle when taken
+  orig_x: float32, orig_y: float32, moved: boolean, orig_flags: cint, have_orig: boolean,
+  sized_w: float32, sized_h: float32, -- the window size the pet was sized for
+  remap: boolean,           -- the pointer goes into it on the next frame
+  target: ImVec2,           -- where
+  captured: boolean,        -- a button went down while remapped and is still held
+  flight_pending: boolean,  -- fly out from its flat rectangle once taken
+  automatic: boolean,       -- adopted by CONFIG.adopt.auto: goes back quietly when its window closes
+  quiet: boolean,           -- closing because its window closed (not "back to UI")
+}
+
+local wins: vector(*AdoptWin)
+local ctx: *ImGuiContext = nilptr
+local hook_render: uint32 = 0
+local hook_newframe: uint32 = 0
+local hooks_on = false
+local remapping = false      -- this frame's mouse was rewritten (NewFramePre)
+local real_mouse: ImVec2     -- the real pointer, while remapping
+local orig_mouse_pos: function(out: *ImVec2): void
+local orig_window_hovered: function(flags: cint): boolean
+local orig_focus_nil: function(): void
+local warned_internal = false
+-- Automatic windows given back by hand: left flat until their window closes.
+local declined: vector(string)
+
+global function adopt_declined(name: string): boolean
+  for i = 0, < #declined do
+    if declined[i] == name then return true end
+  end
+  return false
+end
+
+-- Leave automatic `name` flat until its window closes (given back by hand, or refused).
+global function adopt_decline(name: string): void
+  if not adopt_declined(name) then declined:push(name:copy()) end
+end
+
+-- The window of automatic `name` closed: it may be adopted again.
+global function adopt_undecline(name: string): void
+  for i = 0, < #declined do
+    if declined[i] == name then
+      declined[i]:destroy()
+      declined:remove(i)
+      return
+    end
+  end
+end
+
+global function adopt_of(s: *Session): *AdoptWin
+  for i = 0, < #wins do
+    if wins[i].s == s then return wins[i] end
+  end
+  return nilptr
+end
+
+global function adopt_count(): integer return #wins end
+global function adopt_at(i: integer): *AdoptWin return wins[i] end
+
+-- Whether ImGui window `w` (any pointer from the context) belongs to an
+-- adopted window: itself, a child, a popup opened from it, or a tooltip
+-- while the pointer is inside it.
+local function adopted_owner(w: *ImGuiWindow): *AdoptWin
+  if w == nilptr then return nilptr end
+  for i = 0, < #wins do
+    local aw = wins[i]
+    local root = imgui_int.FindWindowByName((@cstring)(aw.title_z.data))
+    if root ~= nilptr then
+      if w == root or w.RootWindow == (@pointer)(root) or w.RootWindowPopupTree == (@pointer)(root) then return aw end
+      if remapping and aw.remap and (w.Flags & ImGuiWindowFlags_Tooltip) ~= 0 then return aw end
+    end
+  end
+  return nilptr
+end
+
+-- Some other ImGui window (not adopted, taking the mouse) covers screen point (x, y).
+local function other_window_at(x: float32, y: float32): boolean
+  if ctx == nilptr then return false end
+  for i = 0, < ctx.Windows.Size do
+    local w = (@*ImGuiWindow)(ctx.Windows.Data[i])
+    if w == nilptr or not w.Active or w.Hidden or w.IsFallbackWindow then continue end
+    if (w.Flags & (ImGuiWindowFlags_ChildWindow | ImGuiWindowFlags_NoMouseInputs)) ~= 0 then continue end
+    if x >= w.Pos.x and y >= w.Pos.y and x < w.Pos.x + w.Size.x and y < w.Pos.y + w.Size.y then
+      if adopted_owner(w) == nilptr then return true end
+    end
+  end
+  return false
+end
+
+-- Wrappers: ghostty's own code sees the real pointer while a remap is on ----------------
+
+local function wrapped_mouse_pos(out: *ImVec2): void
+  if remapping then $out = real_mouse return end
+  orig_mouse_pos(out)
+end
+
+local function wrapped_window_hovered(flags: cint): boolean
+  if remapping and (flags & ImGuiHoveredFlags_AnyWindow) ~= 0 then return other_window_at(real_mouse.x, real_mouse.y) end
+  return orig_window_hovered(flags)
+end
+
+local function wrapped_focus_nil(): void
+  if remapping then return end -- a click on the pet must not take the keyboard from the window's text field
+  orig_focus_nil()
+end
+
+-- The pointer the rest of the frame is about: the real one.
+global function adopt_real_pointer(): ImVec2
+  local p: ImVec2
+  imgui.GetMousePos(&p)
+  return p
+end
+
+global function adopt_remapping(): boolean return remapping end
+
+-- Snapshots at RenderPre ----------------------------------------------------------------------
+
+local function take_list(aw: *AdoptWin, w: *ImGuiWindow, popup: boolean): void
+  if w == nilptr or not w.Active or w.Hidden or w.DrawList == nilptr then return end
+  adopt_snap_take(&aw.snap, w.DrawList, w.Pos.x, w.Pos.y, w.Pos.x + w.Size.x, w.Pos.y + w.Size.y, popup)
+  w.DrawList.CmdBuffer.Size = 0 -- emptied: ImGui skips a list without commands
+  w.Flags = adopt_frame_flags(w.Flags, aw.remap)
+  -- child windows, in the order ImGui draws them
+  for i = 0, < w.DC.ChildWindows.Size do
+    local c = (@*ImGuiWindow)(w.DC.ChildWindows.Data[i])
+    if c ~= nilptr and c.Active and not c.Hidden then take_list(aw, c, popup) end
+  end
+end
+
+local function on_render_pre(c: *ImGuiContext, hook: *ImGuiContextHook): void
+  if ctx == nilptr or c ~= ctx then return end
+  for i = 0, < #wins do
+    local aw = wins[i]
+    aw.drawn = false
+    if aw.entry.state == AdoptState.Released then continue end
+    local root = imgui_int.FindWindowByName((@cstring)(aw.title_z.data))
+    if root == nilptr or not root.Active or root.Hidden then continue end
+    aw.drawn = true
+    if not aw.have_orig then
+      aw.have_orig = true
+      aw.orig_x, aw.orig_y, aw.orig_flags = root.Pos.x, root.Pos.y, root.Flags
+    end
+    adopt_snap_clear(&aw.snap)
+    aw.snap.frame = ctx.FrameCount
+    aw.x, aw.y, aw.w, aw.h = root.Pos.x, root.Pos.y, root.Size.x, root.Size.y
+    take_list(aw, root, false)
+    -- its popups (and, while the pointer is in it, tooltips), back to front
+    for k = 0, < ctx.Windows.Size do
+      local w = (@*ImGuiWindow)(ctx.Windows.Data[k])
+      if w == nilptr or w == root or w.RootWindow ~= (@pointer)(w) then continue end
+      local popup = (w.Flags & (ImGuiWindowFlags_Popup | ImGuiWindowFlags_Modal)) ~= 0 and w.RootWindowPopupTree == (@pointer)(root)
+      local tip = aw.remap and remapping and (w.Flags & ImGuiWindowFlags_Tooltip) ~= 0
+      if popup or tip then take_list(aw, w, true) end
+    end
+  end
+end
+
+-- The mouse at NewFramePre -------------------------------------------------------------------------
+
+local function on_new_frame_pre(c: *ImGuiContext, hook: *ImGuiContextHook): void
+  if ctx == nilptr or c ~= ctx then return end
+  local q = &ctx.InputEventsQueue
+  local target: *AdoptWin = nilptr
+  for i = 0, < #wins do
+    if wins[i].remap then target = wins[i] break end
+  end
+  if target ~= nilptr then
+    if not remapping then
+      orig_mouse_pos(&real_mouse) -- still the real pointer (not rewritten last frame)
+      adopt_peek_mouse(q, &real_mouse)
+    end
+    if adopt_rewrite_mouse(q, target.target.x, target.target.y, &real_mouse) == 0 and imgui_int.IOAddMousePosEvent ~= nilptr then
+      imgui_int.IOAddMousePosEvent(&ctx.IO, target.target.x, target.target.y)
+    end
+    remapping = true
+  else
+    if remapping and not adopt_peek_mouse(q, &real_mouse) and imgui_int.IOAddMousePosEvent ~= nilptr then
+      imgui_int.IOAddMousePosEvent(&ctx.IO, real_mouse.x, real_mouse.y) -- the pointer comes back where it really is
+    end
+    remapping = false
+  end
+end
+
+-- Hooks ----------------------------------------------------------------------------------------------
+
+local function install_hooks(): (boolean, string)
+  if hooks_on then return true, '' end
+  if not imgui_int_bound then imgui_internal_bind(resolve_imgui) end
+  if not imgui_internal_ready() then
+    return false, 'this cimgui has no igAddContextHook / igFindWindowByName (imgui_internal exports)'
+  end
+  ctx = imgui_int.GetCurrentContext()
+  if ctx == nilptr then return false, 'no ImGui context' end
+  local h: ImGuiContextHook
+  h.Type = ImGuiContextHookType_RenderPre
+  h.Callback = (@pointer)(on_render_pre)
+  hook_render = imgui_int.AddContextHook(ctx, &h)
+  local h2: ImGuiContextHook
+  h2.Type = ImGuiContextHookType_NewFramePre
+  h2.Callback = (@pointer)(on_new_frame_pre)
+  hook_newframe = imgui_int.AddContextHook(ctx, &h2)
+  orig_mouse_pos, orig_window_hovered, orig_focus_nil = imgui.GetMousePos, imgui.IsWindowHovered, imgui.SetWindowFocusNil
+  imgui.GetMousePos = wrapped_mouse_pos
+  imgui.IsWindowHovered = wrapped_window_hovered
+  if orig_focus_nil ~= nilptr then imgui.SetWindowFocusNil = wrapped_focus_nil end
+  hooks_on = true
+  log(LOG_INFO, 'adopt: ImGui RenderPre and NewFramePre hooks on')
+  return true, ''
+end
+
+-- Hooks off (no window adopted any more, reload, shutdown): a hook left behind
+-- would call into a core that is gone. RemoveContextHook only marks it; ImGui
+-- never calls a marked hook.
+local function remove_hooks(): void
+  if not hooks_on then return end
+  if ctx ~= nilptr and imgui_int.RemoveContextHook ~= nilptr then
+    imgui_int.RemoveContextHook(ctx, hook_render)
+    imgui_int.RemoveContextHook(ctx, hook_newframe)
+  end
+  if imgui.GetMousePos == wrapped_mouse_pos then imgui.GetMousePos = orig_mouse_pos end
+  if imgui.IsWindowHovered == wrapped_window_hovered then imgui.IsWindowHovered = orig_window_hovered end
+  if imgui.SetWindowFocusNil == wrapped_focus_nil then imgui.SetWindowFocusNil = orig_focus_nil end
+  hooks_on = false
+  remapping = false
+  ctx = nilptr
+  log(LOG_INFO, 'adopt: hooks off')
+end
+
+-- Adopt and release ---------------------------------------------------------------------------------
+
+-- The names pulled, one per line, for CONFIG.adopt.save (chat panels add theirs).
+global function adopt_names(sb: *stringbuilder): void
+  for i = 0, < #wins do
+    -- automatic ones come back by themselves
+    if wins[i].entry.state ~= AdoptState.Released and not wins[i].automatic then sb:write(wins[i].name, '\n') end
+  end
+end
+
+local function free_win(aw: *AdoptWin): void
+  adopt_snap_destroy(&aw.snap)
+  aw.name:destroy()
+  aw.title:destroy()
+  aw.title_z:destroy()
+  aw.plugin:destroy()
+  aw.label:destroy()
+  delete(aw)
+end
+
+-- Give the window back: its place and its flags as they were.
+local function give_back(aw: *AdoptWin): void
+  if aw.entry.state == AdoptState.Released then return end
+  aw.entry.state = AdoptState.Released
+  aw.remap = false
+  if hooks_on then
+    local w = imgui_int.FindWindowByName((@cstring)(aw.title_z.data))
+    if w ~= nilptr then
+      if aw.have_orig then w.Flags = adopt_restore_flags(w.Flags, aw.orig_flags) end
+      if aw.moved and imgui_int.SetWindowPos ~= nilptr then imgui_int.SetWindowPos(w, vec2(aw.orig_x, aw.orig_y), 0) end
+    end
+  end
+  logf(LOG_INFO, 'adopt: %s given back to the flat UI', aw.name)
+end
+
+-- Session:close of an adopted panel (its x, "back to UI", /window release, a pop-in).
+local function adopt_closed(s: *Session): void
+  for i = 0, < #wins do
+    local aw = wins[i]
+    if aw.s == s then
+      if aw.automatic and not aw.quiet then adopt_decline(aw.name) end
+      give_back(aw)
+      wins:remove(i)
+      free_win(aw)
+      if #wins == 0 then remove_hooks() end
+      panels_dirty = true
+      return
+    end
+  end
+end
+
+-- Adopt the ImGui window `title` (`name` as asked; `plugin` may be ''),
+-- flying out of `from` when it has a size. The panel's id, or 0 and why.
+global function adopt_window(name: string, title: string, plugin: string, label: string, from: ImVec4, automatic: boolean): (integer, string)
+  for i = 0, < #wins do
+    if wins[i].title == title then return 0, 'already in the world' end
+  end
+  if not player_loaded() then return 0, 'no player (log in first)' end
+  if #plugin > 0 and host.api.plugin_loaded ~= nilptr then
+    local z = plugin .. '\0'
+    local loaded = host.api.plugin_loaded((@cstring)(z.data)) ~= 0
+    z:destroy()
+    if not loaded then return 0, 'its plugin is not loaded' end
+  end
+  local ok, err = install_hooks()
+  if not ok then
+    if not warned_internal then
+      warned_internal = true
+      logf(LOG_WARN, 'adopt: %s', err)
+    end
+    return 0, err
+  end
+  local s = session_new_local('adopted', 20, 4)
+  if s == nilptr then return 0, 'no session' end
+  s.kind = TransportKind.Panel
+  s.window_close = adopt_closed
+  s.appear = 0
+  if not make_pet(s) then
+    session_remove(s)
+    if #wins == 0 then remove_hooks() end
+    return 0, 'the pet could not be placed'
+  end
+  local aw = new(@AdoptWin)
+  aw.s = s
+  aw.name = name:copy()
+  aw.title = title:copy()
+  aw.title_z = title .. '\0'
+  aw.plugin = plugin:copy()
+  aw.label = label:copy()
+  aw.entry = { state = AdoptState.Waiting, since = host.last_time }
+  aw.automatic = automatic
+  s.title:destroy()
+  s.title = label:copy()
+  wins:push(aw)
+  adopt_lua_size(s.id, 400, 300, 2 * PANEL_PAD, PANEL_TITLE + PANEL_PAD) -- until the window's own size is known
+  if from.z - from.x > 8 then
+    aw.flight_pending = false
+    panel_flight_start(s.id, ImVec4{ from.x, from.y - PANEL_TITLE, from.z, from.w })
+  else
+    aw.flight_pending = true
+  end
+  logf(LOG_INFO, 'adopt: %s (%s) pulled into the world as panel %d', name, title, s.id)
+  panels_dirty = true
+  return s.id, ''
+end
+
+-- Release adopted window `name` ('' = the focused adopted panel, else the newest).
+global function adopt_release(name: string): (boolean, string)
+  local aw: *AdoptWin = nilptr
+  for i = #wins - 1, 0, -1 do
+    local w = wins[i]
+    if (#name == 0 and (w.s.id == host.world_focus or aw == nilptr)) or w.name == name or w.title == name then
+      aw = w
+      if #name > 0 or w.s.id == host.world_focus then break end
+    end
+  end
+  if aw == nilptr then return false, 'not adopted' end
+  close_terminal(aw.s) -- Session:close -> adopt_closed gives it back at once
+  return true, ''
+end
+
+-- Whether ImGui window name `title` is adopted.
+global function adopt_has_title(title: string): boolean
+  for i = 0, < #wins do
+    if wins[i].title == title then return true end
+  end
+  return false
+end
+
+-- Per frame -----------------------------------------------------------------------------------------
+
+-- Before the world draws: the life cycle of each adopted window, keeping it
+-- on the screen, sizing its pet; the remap is decided again by the draw.
+global function adopt_tick(now: float64, in_world: boolean): void
+  local i: integer = #wins - 1
+  while i >= 0 do
+    local aw = wins[i]
+    aw.remap = false
+    local act = adopt_step(&aw.entry, aw.drawn, now)
+    if act == AdoptAction.Take then
+      -- keep it inside the display: ImGui culls what lies outside
+      local vp = imgui.GetMainViewport()
+      local moved, nx, ny = adopt_on_screen(aw.x, aw.y, aw.w, aw.h, vp.Pos.x, vp.Pos.y, vp.Size.x, vp.Size.y)
+      local w = imgui_int.FindWindowByName((@cstring)(aw.title_z.data))
+      if moved and w ~= nilptr and imgui_int.SetWindowPos ~= nilptr then
+        imgui_int.SetWindowPos(w, vec2(nx, ny), 0)
+        aw.moved = true
+        logf(LOG_INFO, 'adopt: %s moved inside the screen (%.0f, %.0f) while in the world', aw.name, nx, ny)
+      end
+      if aw.flight_pending then
+        aw.flight_pending = false
+        panel_flight_start(aw.s.id, ImVec4{ aw.x, aw.y - PANEL_TITLE, aw.x + aw.w, aw.y + aw.h })
+      end
+    elseif act == AdoptAction.Lose then
+      adopt_snap_clear(&aw.snap) -- the panel says so instead of showing an old picture
+      aw.snap.frame = 0
+      if aw.automatic then
+        -- its plugin closed it: an automatic one goes back quietly (and comes back when it opens)
+        aw.quiet = true
+        logf(LOG_INFO, 'adopt: %s closed by its plugin', aw.name)
+        close_terminal(aw.s)
+        i = math.min(i, #wins) - 1
+        continue
+      end
+    elseif act == AdoptAction.GiveUp then
+      logf(LOG_WARN, 'adopt: %s: %s', aw.name, aw.entry.seen_at > 0 and 'not drawn for a long time; given back' or 'its window never appeared')
+      close_terminal(aw.s)
+      i = math.min(i, #wins) - 1
+      continue
+    end
+    -- the pet takes the window's size (the plugin or a remapped drag may resize it)
+    if aw.drawn and (math.abs(aw.w - aw.sized_w) > 1 or math.abs(aw.h - aw.sized_h) > 1) then
+      aw.sized_w, aw.sized_h = aw.w, aw.h
+      adopt_lua_size(aw.s.id, aw.w, aw.h, 2 * PANEL_PAD, PANEL_TITLE + PANEL_PAD)
+    end
+    -- popped in (or minimized): back to the flat UI
+    local in_list = false
+    for k = 0, < #host.world do
+      if host.world[k] == aw.s then in_list = true break end
+    end
+    if not in_list and not aw.s.leaving and in_world then
+      close_terminal(aw.s)
+      i = math.min(i, #wins) - 1
+      continue
+    end
+    i = i - 1
+  end
+end
+
+-- The content of adopted panel `s` (worldview, where a terminal would be drawn).
+global function adopt_panel(s: *Session, dl: *ImDrawList, vp: ImVec2, width: float32, height: float32,
+                            focused: boolean, on_content: boolean, mu: float32, mv: float32, click: boolean): void
+  local aw = adopt_of(s)
+  if aw == nilptr then return end
+  local real = adopt_real_pointer()
+  local over_other = other_window_at(real.x, real.y)
+  if panel_title_strip(dl, vp, width, aw.label, mu, mv, click, over_other) then
+    host.world_close_id = s.id -- the same as the x: glitch out, then give it back
+  end
+  local bx0, by0 = PANEL_PAD, PANEL_TITLE
+  local bw, bh = width - 2 * PANEL_PAD, height - PANEL_TITLE - PANEL_PAD
+  if #aw.snap.lists == 0 or aw.snap.frame == 0 then
+    local why: string = 'waiting for the window '
+    if aw.entry.state == AdoptState.Lost then why = 'the window is not drawn (closed or hidden by its plugin): ' end
+    panel_status(dl, vp, width, height, why, aw.name)
+    return
+  end
+  local m = adopt_fit(aw.x, aw.y, aw.w, aw.h, bx0, by0, bw, bh)
+  local box: ImVec4 = { bx0, by0, bx0 + bw, by0 + bh }
+  local popup_box: ImVec4 = { -width, -height, 2 * width, 2 * height }
+  adopt_snap_emit(dl, &aw.snap, &m, vp, box, popup_box, width / 24)
+  -- the pointer: into the window while the pet has focus and it is over the window
+  local wx, wy = adopt_to_window(&m, mu, mv)
+  local inside = adopt_snap_inside(&aw.snap, wx, wy) and mv >= PANEL_TITLE
+  if aw.captured and not host.lmb_down and not host.rmb_down then aw.captured = false end
+  local hit = on_content or (aw.captured and focused)
+  local p = adopt_pointer(real.x, real.y, &m, hit, mu, mv, over_other, focused, aw.captured, inside)
+  -- only one window takes the pointer
+  for i = 0, < #wins do
+    if wins[i] ~= aw and wins[i].remap then p.remap = false end
+  end
+  aw.remap = p.remap
+  aw.target = vec2(p.x, p.y)
+  if p.remap then
+    if host.lmb_pressed or host.rmb_down then aw.captured = true end
+    if click then host.last_click_id = 0 end -- clicks in the window never make a double click on the panel
+    imgui.SetNextFrameWantCaptureMouse(true)
+  end
+end
+
+-- Shutdown and /term reload: the panels closed with their sessions (each gave
+-- its window back); forget the rest.
+global function adopt_shutdown(): void
+  for i = 0, < #wins do
+    give_back(wins[i])
+    wins[i].s.window_close = nilptr
+    free_win(wins[i])
+  end
+  wins:destroy()
+  remove_hooks()
+  warned_internal = false
+  for i = 0, < #declined do declined[i]:destroy() end
+  declined:destroy()
+end

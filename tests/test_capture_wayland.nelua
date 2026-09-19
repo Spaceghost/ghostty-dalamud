@@ -88,6 +88,9 @@ do
   local n = wayland_launch_name('gnome-disks'); assert(n == 'gnome-disks') n:destroy()
   n = wayland_launch_name('  env GDK_SCALE=2 /usr/bin/Gnome-Text-Editor --new-window'); assert(n == 'gnome-text-editor') n:destroy()
   n = wayland_launch_name('A=1'); assert(n == '') n:destroy()
+  n = wayland_flatpak_id('flatpak run --branch=stable --arch=x86_64 --command=1password com.onepassword.OnePassword --silent'); assert(n == 'com.onepassword.OnePassword') n:destroy()
+  n = wayland_flatpak_id('/usr/bin/flatpak run org.gnome.Calculator'); assert(n == 'org.gnome.Calculator') n:destroy()
+  n = wayland_flatpak_id('yad --title=x'); assert(n == '') n:destroy()
 end
 
 -- app: / desktop: match forms

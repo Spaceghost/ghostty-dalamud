@@ -128,6 +128,9 @@ S.schema = {
     { 'assistant.chat', 'argv', '/term ask runs' },
     { 'assistant.ask', 'argv', '/term ask <question> runs, plus the question' },
   } },
+  { 'Flat windows in the world', {
+    { 'adopt.auto.mappy', 'checkbox', 'Mappy\'s map is a world panel whenever it is open' },
+  } },
   { 'Remote windows', {
     { 'windows.auto_open', 'combo', { 'all', 'related', 'none' }, 'New windows of the agent become panels (related: dialogs and windows of apps you have out)' },
     { 'windows.never', 'list', 'Never show in game (app id, desktop id or part of a title; * matches anything)' },

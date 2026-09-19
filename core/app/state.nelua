@@ -87,6 +87,11 @@ global GuHostApi = @record{
   -- a line in the game's chat for the person (short results: a window refused,
   -- a command that failed); nilptr in older shims: the log only
   chat_print: function(text: cstring): cint,
+  -- flat windows pulled into the world (core/app/chatpanel.nelua, docs/ADOPT.md)
+  addon_rect: function(name: cstring, x: *float32, y: *float32, w: *float32, h: *float32): cint, -- 1 shown, 2 loaded but hidden, 0 none
+  addon_show: function(name: cstring, shown: cint): cint, -- a game addon (AtkUnitBase) shown or hidden; 1 = ok
+  chat_send: function(text: cstring): cint,              -- a line through the game's chat box; 1 = queued
+  config_uint: function(name: cstring, out: *uint32): cint, -- a UiConfig option (log colours); 1 = found
   -- an image file as an ImTextureID (Dalamud's ITextureProvider.GetFromFile),
   -- nilptr until it has loaded; asked again each frame it is drawn. nilptr in
   -- older shims: the Windows picker shows letters instead of app icons

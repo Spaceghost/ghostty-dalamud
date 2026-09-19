@@ -144,7 +144,14 @@
 9. World panels (`core/app/worldview.nelua`) are drawn in panel pixels into
    the background draw list and every vertex is mapped onto the panel through
    the game's view-projection matrix (`core/world.nelua`).
-10. Remote windows (docs/REMOTE_WINDOWS.md): WFRAMEs read in step 3 are
+10. Flat windows pulled into the world ([ADOPT.md](ADOPT.md)): two ImGui
+   context hooks outside the plugins' draw order. RenderPre moves an adopted
+   window's finished draw lists into a snapshot and empties them; the pet
+   draws the snapshot the next frame in step 9. NewFramePre rewrites the
+   queued mouse position into the window while the pointer is on its focused
+   pet. The game's chat is drawn by the core from lines the shim forwards
+   (`gu_chat`). Not yet observed in game.
+11. Remote windows (docs/REMOTE_WINDOWS.md): WFRAMEs read in step 3 are
    decoded into each stream's CPU copy (`core/app/remotewin.nelua`) and
    acknowledged; `remotewin_tick` ends streams whose connection went and
    closes ended panels; a window panel's content, where a terminal would be
@@ -283,6 +290,8 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_policy` | loading `lua/init.lua`: defaults, profiles, key actions, showcase entries |
 | `test_world`, `test_worldpanel`, `test_worlddrag` | world panels: projection and hit testing, the presented pose and walk-up, drag placement and snapping, all against a fake game |
 | `test_remotewin` | remote window panels against a fake version 3 agent, a fake ImGui and a fake texture table: open, KEY and delta frames, dirty-box uploads, WACK (held while asleep), the textured quads over the letterboxed picture, pointer / button / wheel / key / text input with the chrome keeping its clicks, WEND, WCLOSE, an older shim, a version 2 agent refused; WGEOM popups past the panel's edge and their input, window keys saved and restored across `/term reload`, refused keys and reconnects, reserved chords, WLIST watch opening new windows and dialogs beside their panels, `CONFIG.windows.never`, late app icons |
+| `test_adopt` (`.nelua` + `.lua`) | flat windows in the world, pure parts ([ADOPT.md](ADOPT.md)): window ↔ panel mapping, CPU clipping and strips, the draw-list copy through a fake ImGui, snapshots, the pointer remap and mouse event rewrite, keeping a window on screen, flags, the adopt/lose/give-up state machine, the pull grip, window names, the chat ring, wrapping, the input line and colours; lua/adopt.lua's names, sizes, saved list and colours |
+| `test_adopt_app` | the same in an embedded core against fake ImGui internals and a fake shim: hooks on and off, RenderPre snapshots emptying the window, click-through, moved on screen and back, the pet drawing it, the pointer remapped (queued events rewritten, the core still sees the real pointer), lost and regained, reload and restore, release, the chat pet (lines, addons hidden and shown, typing sent), the pull grip, Mappy adopted automatically (closed, reopened, given back, the settings switch) |
 | `test_host` | the exported host surface without ImGui: init, status, commands, the controller toggle's source and its foreground check, shutdown |
 | `test_lights` | panel lights against fake game light callbacks |
 | `test_occluders` | panel shadow boards against fake background object callbacks: placement, lifecycle, an older `GuHostApi` |

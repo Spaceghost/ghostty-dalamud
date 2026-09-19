@@ -58,13 +58,14 @@ local CoreFns = @record{
   version: function(): cstring,
   walk_input: function(left: *float32, forward: *float32, allowed: cint, legacy: cint): void,
   call: function(request: cstring, out: *[0]cchar, cap: usize): usize,
+  chat: function(kind: cint, sender: cstring, text: cstring): void,
 }
 ## local core_exports = {
 ##   {'init_ex', 'gu_init_ex'}, {'init', 'gu_init'}, {'event', 'gu_event'}, {'frame', 'gu_frame'},
 ##   {'popup_draw', 'gu_popup_draw'}, {'popup_reset', 'gu_popup_reset'}, {'popup_size', 'gu_popup_size'},
 ##   {'toggle', 'gu_toggle'}, {'command', 'gu_command'}, {'status', 'gu_status'},
 ##   {'shutdown', 'gu_shutdown'}, {'version', 'gu_version'}, {'walk_input', 'gu_walk_input'},
-##   {'call', 'gu_call'},
+##   {'call', 'gu_call'}, {'chat', 'gu_chat'},
 ## }
 
 local Loader = @record{
@@ -592,6 +593,15 @@ end
 global function gu_walk_input(left: *float32, forward: *float32, allowed: cint, legacy: cint): void <cexport, codename 'gu_walk_input'>
   if enter() then
     if loader.fns.walk_input ~= nilptr then loader.fns.walk_input(left, forward, allowed, legacy) end
+    leave()
+  end
+end
+
+-- A chat message for the chat pet (core/app/chatpanel.nelua), from any thread;
+-- dropped while no core (or one without gu_chat) is loaded.
+global function gu_chat(kind: cint, sender: cstring, text: cstring): void <cexport, codename 'gu_chat'>
+  if enter() then
+    if loader.fns.chat ~= nilptr then loader.fns.chat(kind, sender, text) end
     leave()
   end
 end

@@ -68,6 +68,7 @@ M.sections = {
   ['Character animation'] = 'The pose your character holds while a terminal is out.',
   ['Bell'] = 'The ripple of light when a program rings; preview them all with /term bell demo.',
   ['Assistant (/term ask)'] = 'Ask a local AI assistant from chat: /term ask <question>. Not yet tried in game.',
+  ['Flat windows in the world'] = 'Plugin windows and the chat as world panels; hold Alt over a window to pull it in. Not yet tried in game.',
   ['Remote windows'] = 'Desktop windows from ghostty-agent on world panels (/window).',
   ['Info bar & hidden UI'] = 'The server info bar entry, and staying visible when the game hides its UI.',
 }
@@ -157,6 +158,7 @@ M.settings = {
   ['bell.accent.g'] = 'Green in the custom bell colour; the theme sets it until you change it.',
   ['bell.accent.b'] = 'Blue in the custom bell colour; the theme sets it until you change it.',
   ['assistant.enabled'] = '/term ask opens the assistant.',
+  ['adopt.auto.mappy'] = 'Mappy\'s map window becomes a pet as soon as it opens; "back to UI" puts it back until it is next opened. Off: pull it in by hand (Alt over the window, or /window adopt mappy).',
   ['assistant.view'] = 'Where the assistant opens: beside you, as a tab, or as a window.',
   ['assistant.transport'] = 'Where the assistant runs; default follows your first profile.',
   ['assistant.chat'] = 'What /term ask runs on its own; change it in lua/assistant.lua.',

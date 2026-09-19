@@ -1,0 +1,423 @@
+-- Flat UI windows pulled into the world (docs/ADOPT.md): the pieces worldview,
+-- the frame and the commands call. Adopted ImGui windows live in
+-- core/app/adopt.nelua, the game's chat in core/app/chatpanel.nelua; both
+-- are Sessions of kind Panel.
+--
+--   /window adopt NAME | release [NAME] | adopted   (also /term adopt, /term release)
+--
+-- The pull gesture: while the pull modifier (CONFIG.adopt.pull_modifier,
+-- Alt) is held, the flat window under the pointer (any plugin's ImGui window,
+-- or the game's chat log) shows a glowing "pull into world" grip above its
+-- top edge, drawn on ImGui's foreground list; a click on it pulls the window
+-- into the world, flying out from where it was.
+require 'core.app.adopt'
+require 'core.app.chatpanel'
+
+-- worldview: the content of a panel of kind Panel.
+global function panel_content(s: *Session, dl: *ImDrawList, vp: ImVec2, width: float32, height: float32,
+                              focused: boolean, on_content: boolean, mu: float32, mv: float32, click: boolean): void
+  if adopt_of(s) ~= nilptr then
+    adopt_panel(s, dl, vp, width, height, focused, on_content, mu, mv, click)
+  elseif chatpanel_of(s) ~= nilptr then
+    chatpanel_panel(s, dl, vp, width, height, focused, on_content, mu, mv, click)
+  end
+end
+
+-- Pull and release by name ------------------------------------------------------------------
+
+local pull_err: string -- the last refusal CONFIG.adopt.resolve gave (the reason is borrowed)
+
+-- Pull `name` (CONFIG.adopt.resolve: a known name, 'chat', or any ImGui
+-- window title) into the world, flying out of `from` when given. The panel's
+-- id, or 0 and why (borrowed until the next call).
+global function panels_pull(name: string, from: ImVec4): (integer, string)
+  local kind, title, plugin, label = adopt_lua_resolve(name)
+  defer kind:destroy() plugin:destroy() label:destroy() end
+  if kind == 'native' then
+    title:destroy()
+    return chatpanel_pull()
+  end
+  if kind ~= 'imgui' then
+    pull_err:destroy()
+    pull_err = title
+    return 0, pull_err
+  end
+  local id, err = adopt_window(name, title, plugin, label, from, false)
+  title:destroy()
+  return id, err
+end
+
+global function panels_release(name: string): (boolean, string)
+  if #name > 0 then
+    local kind, title, plugin, label = adopt_lua_resolve(name)
+    local native = kind == 'native'
+    local ok: boolean, err: string
+    if native then
+      ok, err = chatpanel_release()
+    else
+      ok, err = adopt_release(#title > 0 and title or name)
+      if not ok then ok, err = adopt_release(name) end
+    end
+    kind:destroy() title:destroy() plugin:destroy() label:destroy()
+    return ok, err
+  end
+  -- no name: the focused pulled panel, else the newest adopted window, else the chat
+  if chatpanel_open() then
+    local s = find_session(host.world_focus)
+    if s ~= nilptr and chatpanel_of(s) ~= nilptr then return chatpanel_release() end
+  end
+  if adopt_count() > 0 then return adopt_release('') end
+  if chatpanel_open() then return chatpanel_release() end
+  return false, 'nothing is pulled into the world'
+end
+
+local function log_pulled(): void
+  local n = 0
+  for i = 0, < adopt_count() do
+    local aw = adopt_at(i)
+    logf(LOG_INFO, 'adopted: %s (%s) on panel %d', aw.name, aw.title, aw.s.id)
+    n = n + 1
+  end
+  if chatpanel_open() then
+    log(LOG_INFO, 'adopted: the game\'s chat')
+    n = n + 1
+  end
+  if n == 0 then log(LOG_INFO, 'adopted: nothing (pull with /window adopt NAME, or hold Alt over a window)') end
+end
+
+-- `/window adopt NAME`, `/window release [NAME]`, `/window adopted` (verb
+-- and its arguments). 0 on success, 4 with a logged reason, 3 not ours.
+global function panels_command(verb: string, rest: string): cint
+  if verb == 'adopt' or verb == 'pull-ui' then
+    if #rest == 0 then log(LOG_WARN, 'usage: /window adopt NAME (chat2, chat, or a window title)') return 4 end
+    local r: ImVec4
+    local id, err = panels_pull(rest, r)
+    if id == 0 then logf(LOG_WARN, 'adopt %s: %s', rest, err) return 4 end
+    return 0
+  elseif verb == 'release' then
+    local ok, err = panels_release(rest)
+    if not ok then logf(LOG_WARN, 'release: %s', err) return 4 end
+    return 0
+  elseif verb == 'adopted' then
+    log_pulled()
+    return 0
+  end
+  return 3
+end
+
+-- `/term pin ...` on a focused pulled panel moves it (keeping its size). False
+-- when the focused panel is not one.
+global function panels_pin(args: string): (boolean, cint)
+  local s = find_session(host.world_focus)
+  if s == nilptr or s.kind ~= TransportKind.Panel then return false, 0 end
+  if args == 'hide' or args == 'hide off' then return false, 0 end -- hiding is the same for every panel
+  local err = policy_windows_pin(s.id, args) -- the same as a window panel: a new anchor, the same size
+  if #err > 0 then
+    logf(LOG_WARN, 'pin: %s', err)
+    err:destroy()
+    return true, 4
+  end
+  return true, 0
+end
+
+-- The pull gesture -------------------------------------------------------------------------------
+
+local grip_title: string       -- the ImGui window the grip belongs to ('' = none)
+local grip_native = false      -- the grip belongs to the game's chat
+local grip_win: ImVec4         -- that window's rectangle
+local grip_seen_at: float64 = 0
+
+local function modifier_held(io: *ImGuiIO): boolean
+  local m = adopt_lua_field('pull_modifier', 'alt')
+  defer m:destroy() end
+  if m == 'ctrl' then return io.KeyCtrl and not io.KeyAlt
+  elseif m == 'shift' then return io.KeyShift and not io.KeyAlt and not io.KeyCtrl
+  elseif m == 'alt' then return io.KeyAlt and not io.KeyCtrl end
+  return false
+end
+
+-- A C string as a borrowed Nelua string.
+local function cview(p: cstring): string
+  local s = string{ data = (@*[0]byte)(p), size = 0 }
+  while s.data[s.size] ~= 0 do s.size = s.size + 1 end
+  return s
+end
+
+local function lower_has(name: cstring, needle: string): boolean
+  local s = cview(name)
+  if s.size < #needle then return false end
+  for i = 0, s.size - #needle do
+    local ok = true
+    for k = 0, < #needle do
+      local c = s.data[i + k]
+      if c >= 'A'_b and c <= 'Z'_b then c = c + 32 end
+      if c ~= needle.data[k] then ok = false break end
+    end
+    if ok then return true end
+  end
+  return false
+end
+
+-- The frontmost flat ImGui window under screen point (x, y) that may be
+-- pulled: a plugin's own top-level window, not ghostty's, not adopted.
+local function window_under(ctx: *ImGuiContext, x: float32, y: float32, prefer: string): *ImGuiWindow
+  for i = ctx.Windows.Size - 1, 0, -1 do
+    local w = (@*ImGuiWindow)(ctx.Windows.Data[i])
+    if w == nilptr or not w.Active or w.Hidden or w.IsFallbackWindow or w.RootWindow ~= (@pointer)(w) then continue end
+    if (w.Flags & (ImGuiWindowFlags_ChildWindow | ImGuiWindowFlags_Popup | ImGuiWindowFlags_Tooltip | ImGuiWindowFlags_NoMouseInputs)) ~= 0 then continue end
+    if w.Name == nilptr or lower_has(w.Name, 'ghostty') then continue end
+    local r: ImVec4 = { w.Pos.x, w.Pos.y, w.Pos.x + w.Size.x, w.Pos.y + w.Size.y }
+    local g = adopt_grip_rect(r.x, r.y, w.Size.x, w.Size.y, imgui.GetMainViewport().Pos.y)
+    local on_grip = #prefer > 0 and adopt_in_rect(g, x, y) and cview(w.Name) == prefer
+    if adopt_in_rect(r, x, y) or on_grip then return w end
+  end
+  return nilptr
+end
+
+-- A glowing grip: a rounded pill with an arrow out of the screen.
+local function draw_grip(dl: *ImDrawList, g: ImVec4, hot: boolean, now: float64): void
+  local pulse = (@float32)(0.5 + 0.5 * math.sin(now * 5))
+  for i = 1, 3 do
+    local pad = (@float32)(i * 3)
+    local a = (@uint8)(math.clamp((hot and 70 or 40) * (1 + pulse) / i, 0, 255))
+    imgui.DrawListAddRectFilled(dl, vec2(g.x - pad, g.y - pad), vec2(g.z + pad, g.w + pad), chrome_col(ChromeColor.Glow, a), 12 + pad, 0)
+  end
+  imgui.DrawListAddRectFilled(dl, vec2(g.x, g.y), vec2(g.z, g.w), chrome_col(ChromeColor.Accent, hot and 250 or 200), 12, 0)
+  local ink = chrome_col(ChromeColor.Ink, 255)
+  local ax, ay = g.x + 14, g.y + (g.w - g.y) * 0.5
+  imgui.DrawListAddLine(dl, vec2(ax - 5, ay + 5), vec2(ax + 4, ay - 4), ink, 2)
+  imgui.DrawListAddTriangleFilled(dl, vec2(ax + 6, ay - 6), vec2(ax - 1, ay - 5), vec2(ax + 5, ay + 1), ink)
+  local size = imgui.GetFontSize()
+  imgui.DrawListAddText(dl, imgui.GetFont(), size, vec2(ax + 12, ay - size * 0.5), ink, 'pull into world', nilptr, 0, nilptr)
+end
+
+-- Per frame, after the world is drawn (a character loaded, the UI live).
+local function pull_gesture(now: float64): void
+  local io = imgui.GetIO()
+  if not modifier_held(io) or host.world_rez < 0.5 then
+    grip_title:destroy()
+    grip_native = false
+    return
+  end
+  if not imgui_int_bound then imgui_internal_bind(resolve_imgui) end
+  if imgui_int.GetCurrentContext == nilptr then return end
+  local ctx = imgui_int.GetCurrentContext()
+  if ctx == nilptr then return end
+  local mouse = adopt_real_pointer()
+  local top = imgui.GetMainViewport().Pos.y
+  local target: ImVec4
+  local title: cstring = nilptr
+  local native = false
+  local w = window_under(ctx, mouse.x, mouse.y, grip_title)
+  if w ~= nilptr then
+    target = { w.Pos.x, w.Pos.y, w.Pos.x + w.Size.x, w.Pos.y + w.Size.y }
+    title = w.Name
+  elseif not chatpanel_open() then
+    local have, flat = chatpanel_flat_rect()
+    if have then
+      local vp = imgui.GetMainViewport().Pos
+      flat = ImVec4{ flat.x + vp.x, flat.y + vp.y, flat.z + vp.x, flat.w + vp.y }
+      local g = adopt_grip_rect(flat.x, flat.y, flat.z - flat.x, flat.w - flat.y, top)
+      if adopt_grip_shown(true, flat, g, mouse.x, mouse.y) then target, native = flat, true end
+    end
+  end
+  grip_title:destroy()
+  grip_native = native
+  if title == nilptr and not native then return end
+  if title ~= nilptr then grip_title = string.copy(title) end
+  grip_win = target
+  grip_seen_at = now
+  local g = adopt_grip_rect(target.x, target.y, target.z - target.x, target.w - target.y, top)
+  local hot = adopt_in_rect(g, mouse.x, mouse.y)
+  draw_grip(imgui.GetForegroundDrawList(), g, hot, now)
+  if not hot then return end
+  imgui.SetNextFrameWantCaptureMouse(true) -- the press is the grip's, not the game's
+  if not host.lmb_pressed then return end
+  host.click_used = true
+  local id: integer
+  local err: string
+  if native then
+    id, err = chatpanel_pull()
+  else
+    local vp = imgui.GetMainViewport().Pos
+    local from: ImVec4 = { target.x - vp.x, target.y - vp.y, target.z - vp.x, target.w - vp.y }
+    local name = string.copy(title)
+    id, err = panels_pull(name, from)
+    name:destroy()
+  end
+  if id == 0 then logf(LOG_WARN, 'pull into world: %s', err) end
+  grip_title:destroy()
+  grip_native = false
+end
+
+-- Restoring what was pulled -------------------------------------------------------------------------
+
+local restore_names: vector(string)
+local restore_started = false
+local restore_at: float64 = 0
+
+local function save_pulled(): void
+  local sb: stringbuilder
+  adopt_names(&sb)
+  if chatpanel_open() then sb:write('chat\n') end
+  local names = sb:promote()
+  adopt_lua_save(names)
+  names:destroy()
+end
+
+-- Once a character is in the world: pull again what was pulled before a
+-- reload or a restart; each name is tried for a while (its plugin may load
+-- after us).
+local function restore_tick(now: float64): void
+  if not restore_started then
+    restore_started = true
+    restore_at = now
+    local saved = adopt_lua_names('saved')
+    local start = 0
+    for i = 0, < #saved do
+      if saved.data[i] == '\n'_b then
+        if i > start then restore_names:push(saved:subview(start + 1, i):copy()) end
+        start = i + 1
+      end
+    end
+    if start < #saved then restore_names:push(saved:subview(start + 1):copy()) end
+    saved:destroy()
+    if #restore_names > 0 then logf(LOG_INFO, 'adopt: pulling %d window(s) back into the world', #restore_names) end
+  end
+  if #restore_names == 0 then return end
+  if now - restore_at > ADOPT_WAIT_LIMIT then
+    for i = 0, < #restore_names do logf(LOG_WARN, 'adopt: %s did not come back', restore_names[i]) restore_names[i]:destroy() end
+    restore_names:clear()
+    return
+  end
+  local i: integer = #restore_names - 1
+  while i >= 0 do
+    local r: ImVec4
+    local kind, title, plugin, label = adopt_lua_resolve(restore_names[i])
+    local ready = kind == 'native'
+    local already = (kind == 'imgui' and adopt_has_title(title)) or (kind == 'native' and chatpanel_open())
+    if already then
+      kind:destroy() title:destroy() plugin:destroy() label:destroy()
+      restore_names[i]:destroy()
+      restore_names:remove(i)
+      i = i - 1
+      continue
+    end
+    if kind == 'imgui' then
+      if not imgui_int_bound then imgui_internal_bind(resolve_imgui) end
+      local z = title .. '\0'
+      local w = imgui_int.FindWindowByName ~= nilptr and imgui_int.FindWindowByName((@cstring)(z.data)) or nilptr
+      ready = w ~= nilptr and w.Active
+      z:destroy()
+    end
+    kind:destroy() title:destroy() plugin:destroy() label:destroy()
+    if ready then
+      local id, err = panels_pull(restore_names[i], r)
+      if id == 0 then logf(LOG_WARN, 'adopt %s: %s', restore_names[i], err) end
+      restore_names[i]:destroy()
+      restore_names:remove(i)
+    end
+    i = i - 1
+  end
+end
+
+-- Automatic windows ---------------------------------------------------------------------------------
+-- CONFIG.adopt.auto (Mappy by default): each listed window becomes a world
+-- panel whenever it is open, unless it was given back by hand since it opened.
+
+local AUTO_EVERY <comptime> = 0.5
+local auto_at: float64 = 0
+local chat_auto_done = false -- an automatic chat is pulled once per load
+
+local function auto_tick(now: float64): void
+  if now - auto_at < AUTO_EVERY then return end
+  auto_at = now
+  local names = adopt_lua_names('auto_names')
+  defer names:destroy() end
+  if #names == 0 then return end
+  if not imgui_int_bound then imgui_internal_bind(resolve_imgui) end
+  local start = 0
+  for i = 0, #names do
+    if i < #names and names.data[i] ~= '\n'_b then continue end
+    if i > start then
+      local name = names:subview(start + 1, i)
+      local kind, title, plugin, label = adopt_lua_resolve(name)
+      if kind == 'imgui' and imgui_int.FindWindowByName ~= nilptr then
+        local z = title .. '\0'
+        local w = imgui_int.FindWindowByName((@cstring)(z.data))
+        z:destroy()
+        local open = w ~= nilptr and w.Active and not w.Hidden
+        if not open then
+          adopt_undecline(name) -- closed: the next time it opens it comes out again
+        elseif not adopt_has_title(title) and not adopt_declined(name) then
+          local from: ImVec4 = { w.Pos.x, w.Pos.y, w.Pos.x + w.Size.x, w.Pos.y + w.Size.y }
+          local vp = imgui.GetMainViewport().Pos
+          from = { from.x - vp.x, from.y - vp.y, from.z - vp.x, from.w - vp.y }
+          local id, err = adopt_window(name, title, plugin, label, from, true)
+          if id == 0 then
+            logf(LOG_WARN, 'adopt.auto %s: %s', name, err)
+            adopt_decline(name) -- not again until its window closes and opens
+          end
+        end
+      elseif kind == 'native' and not chatpanel_open() and not chat_auto_done then
+        chat_auto_done = true
+        local id, err = chatpanel_pull()
+        if id == 0 then logf(LOG_WARN, 'adopt.auto %s: %s', name, err) end
+      end
+      kind:destroy() title:destroy() plugin:destroy() label:destroy()
+    end
+    start = i + 1
+  end
+end
+
+-- Per frame, before the world draws (gu_frame): the chat queue, the adopted
+-- windows' life cycle, restoring after a reload.
+global function panels_tick(now: float64, live: boolean, in_world: boolean): void
+  chatpanel_tick(now, live and in_world)
+  adopt_tick(now, live and in_world)
+  if live and in_world then
+    restore_tick(now)
+    auto_tick(now)
+  end
+  -- saved once something was pulled or given back (not while restoring: the
+  -- list would lose what has not come back yet)
+  if panels_dirty and (#restore_names == 0 or not restore_started) then
+    panels_dirty = false
+    save_pulled()
+  end
+end
+
+-- Per frame, after the world is drawn.
+global function panels_after_world(now: float64): void
+  pull_gesture(now)
+end
+
+-- The kill switch: every pulled window goes back to the flat UI; the list on
+-- disk stays, and they come back once ghostty runs again.
+global function panels_let_go(): void
+  while adopt_count() > 0 do
+    local n = adopt_count()
+    close_terminal(adopt_at(n - 1).s)
+    if adopt_count() == n then break end -- never loop on a panel that did not close
+  end
+  if chatpanel_open() then chatpanel_release() end
+  panels_dirty = false
+  restore_started = false
+end
+
+-- Shutdown and /term reload: every pulled window goes back to the flat UI.
+-- The list on disk stays, so the next core pulls them in again.
+global function panels_shutdown(): void
+  adopt_shutdown()
+  chatpanel_shutdown()
+  panel_flights_clear()
+  grip_title:destroy()
+  grip_native = false
+  for i = 0, < #restore_names do restore_names[i]:destroy() end
+  restore_names:destroy()
+  pull_err:destroy()
+  restore_started = false
+  panels_dirty = false
+  auto_at = 0
+  chat_auto_done = false
+end

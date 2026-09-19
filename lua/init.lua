@@ -17,6 +17,7 @@ local assistant = require('assistant')
 local themes = require('themes')
 local tooltips = require('tooltips')
 local windows = require('windows')
+local adopt = require('adopt')
 
 -- The agent connection and profiles for where the game runs (native Windows,
 -- or Wine/Proton on Linux): see lua/platform.lua.
@@ -167,6 +168,11 @@ local config = {
   -- list | pull [match|#wid|run CMD] | close. Sizes, frame rate and windows
   -- pulled at login: lua/windows.lua.
   windows = windows,
+  -- Flat windows pulled into the world and back: /window adopt chat2 (ChatTwo),
+  -- /window adopt chat (the game's chat), /window release; or hold Alt over a
+  -- window and click its "pull into world" grip. Names, sizes, the modifier
+  -- and chat colours: lua/adopt.lua (docs/ADOPT.md).
+  adopt = adopt,
   -- The settings window (/term config) and its saved overrides (settings.lua).
   settings = settings,
   -- Pinned automatically once your character is loaded, e.g. { 'orbit 4 0.2', 'me' }.

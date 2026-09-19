@@ -29,6 +29,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     [PluginService] internal static IGameConfig GameConfig { get; private set; } = null!;
     [PluginService] internal static IFramework GameFramework { get; private set; } = null!;
     [PluginService] internal static IChatGui Chat { get; private set; } = null!;
+    [PluginService] internal static IGameGui GameGui { get; private set; } = null!;
     [PluginService] internal static ITextureProvider Textures { get; private set; } = null!;
 
     public Plugin()
@@ -60,6 +61,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
         Pi.UiBuilder.OpenMainUi   += OnOpenMain;
         Pi.UiBuilder.OpenConfigUi += OnOpenConfig;
         Pi.ActivePluginsChanged   += OnPluginsChanged;
+        if (Native.Chat != null) Chat.ChatMessageUnhandled += OnChat;
     }
 
     private static void OnDraw() => Native.Frame();
@@ -67,12 +69,20 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private static void OnOpenConfig() => Native.Post(GuEvent.OpenConfig, 0, 0, 0, 0, string.Empty);
     private static void OnPluginsChanged(IActivePluginsChangedEventArgs args) => Native.Post(GuEvent.PluginsChanged, 0, 0, 0, 0, string.Empty);
 
+    // every line the chat log shows, as plain text, for the chat pet (core/app/chatpanel.nelua)
+    private static void OnChat(Dalamud.Game.Chat.IChatMessage m)
+    {
+        try { Native.PostChat((int)m.LogKind, m.Sender?.TextValue ?? string.Empty, m.Message?.TextValue ?? string.Empty); }
+        catch { /* never break the chat */ }
+    }
+
     public void Dispose()
     {
         Pi.UiBuilder.Draw         -= OnDraw;
         Pi.UiBuilder.OpenMainUi   -= OnOpenMain;
         Pi.UiBuilder.OpenConfigUi -= OnOpenConfig;
         Pi.ActivePluginsChanged   -= OnPluginsChanged;
+        Chat.ChatMessageUnhandled -= OnChat;
         HostApi.UnhookWalkInput(); // before the core it calls goes away
         Native.Shutdown();         // the core removes its commands, info bar entry and IPC first
         Native.Unload();

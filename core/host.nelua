@@ -78,6 +78,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
       -- nothing runs per frame from here: let go of what the game still shows or does for us
       host.disabled_teardown = true
       teardown_effects()
+      panels_let_go() -- pulled windows back to the flat UI (they come back when switched on again)
       dualsense_reader_close(&host.dualsense)
       host.world_focus = 0
       agent_hold_sessions() -- the connection goes unread from here on
@@ -143,6 +144,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
   host.terminal_focused = host.terminal_focused_now
   host.terminal_focused_now = false
   remotewin_tick(now, live and in_world) -- window streams: lost connections, closing, auto pulls
+  panels_tick(now, live, in_world) -- flat windows pulled into the world: chat lines, life cycle, restore
   if live then
     poll_toggle_key()
     draw_dropdown(now, dt)
@@ -163,6 +165,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     policy_anim_frame(now)
     apply_world_pins(now)
     draw_world(now)
+    panels_after_world(now) -- the "pull into world" grip over flat windows
     draw_bell(now) -- after the world screens: light behind one is cut out, not painted over it
   else
     occluders_destroy_all() -- no character (loading screen, logout): boards go before the scene they sit in
@@ -240,6 +243,14 @@ global function gu_call(request: cstring, out: *[0]cchar, cap: usize): usize <ce
   return ipc_call(request, out, cap)
 end
 
+-- A chat message from the game (the shim's IChatGui handler): its XivChatType,
+-- sender and text as plain UTF-8. Any thread; the frame picks it up
+-- (core/app/chatpanel.nelua).
+global function gu_chat(kind: cint, sender: cstring, text: cstring): void <cexport, codename 'gu_chat'>
+  if not host.initialized then return end
+  chatpanel_post(kind, sender, text)
+end
+
 global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   defer surface_reset() end -- whatever state we were in, forget the shim's callbacks
   if not host.initialized then return end
@@ -247,6 +258,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   selftest_shutdown() -- a run not handing over to the next core reports itself interrupted
   showcase_stop() -- demo terminals never outlive the session; yours come back
   teardown_effects()
+  panels_shutdown() -- pulled windows back to the flat UI, the hooks into ImGui off
   depthpass_shutdown()
   dualsense_reader_close(&host.dualsense) -- no handle or pending read may outlive this module
   -- Leave agent shells running so the next start reattaches to them.
@@ -255,6 +267,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   for i = #host.sessions - 1, 0, -1 do session_remove(host.sessions[i]) end
   remotewin_shutdown() -- its panels went with their sessions (no WCLOSE: the agent keeps their windows)
   window_picker_shutdown()
+  chatpanel_forget_log()
   keychords_shutdown() -- run-time reserved chords (IPC keys.reserve) go with this core
   ipc_shutdown() -- the channel was unregistered with the other surfaces
   agent_final_flush() -- the queued DETACH/CLOSE frames, before the socket goes away

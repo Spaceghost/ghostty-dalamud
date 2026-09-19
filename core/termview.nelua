@@ -16,6 +16,7 @@ global GlyphDraw = @record{
   bold: boolean,
   underline: boolean,
   strike: boolean,
+  cp: uint32, -- non-zero: drawn by core/boxdraw.nelua, not the font
 }
 
 global TermView = @record{
