@@ -3,6 +3,7 @@
 -- Status text, the settings window and (re)loading lua/init.lua.
 require 'core.app.hotkeys'
 require 'core.app.boot'
+require 'core.app.ipc'
 
 global function update_status(): void
   local sb: stringbuilder
@@ -63,6 +64,8 @@ global function load_policy(): boolean
     return false
   end
   boot_lua_register(policy.L)
+  ipc_lua_register(policy.L) -- ghostty.window_* for lua/ipc.lua
+  ipc_load(install, host.dir) -- GhosttyDalamud.v1.Call's own Lua state (docs/IPC.md)
   settings_badge_refresh()
   host.dropdown_font_size = policy.dropdown.font_size
   host.popup_font_size = policy.popup_font_size
