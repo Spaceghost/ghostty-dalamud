@@ -463,7 +463,8 @@ function M.place_pet(id, a, p, t, focused)
 
   local width = a.width or cfg.width
   local height = a.height or cfg.height
-  local ppy = math.max(cfg.pixels_per_yalm or 0, 50) -- a settings slider at 0 must not make NaN pets
+  -- an anchor's own density wins (window panels, lua/windows.lua); a settings slider at 0 must not make NaN pets
+  local ppy = math.max(a.pixels_per_yalm or cfg.pixels_per_yalm or 0, 50)
   local half_w = width / ppy / 2
   local half_h = height / ppy / 2
 
@@ -534,7 +535,7 @@ function M.place_pet(id, a, p, t, focused)
     a.faced = false
   end
 
-  return placement(a, x, y, z, yaw, 0, width, height, ppy, M.defaults.opacity,
+  return placement(a, x, y, z, yaw, 0, width, height, ppy, a.opacity or M.defaults.opacity,
     cfg.curve > 0 and math.max(cfg.curve, half_w * 2.5) or 0, t)
 end
 
