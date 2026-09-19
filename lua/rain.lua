@@ -31,6 +31,10 @@ M.weather = {
   [8] = 1.0,    -- Showers
   [9] = 0.35,   -- Thunder
   [10] = 0.9,   -- Thunderstorms
+  -- zone variants with the same names (Weather sheet, checked through xiv-mcp)
+  [62] = 0.55, [64] = 0.55,                          -- Rain
+  [210] = 1.0,                                       -- Showers
+  [57] = 0.35, [58] = 0.35, [88] = 0.35, [203] = 0.35, [204] = 0.35, -- Thunder
 }
 
 -- The rain intensity the weather gives: the listed weather or the game's rain
