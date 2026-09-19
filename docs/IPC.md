@@ -56,7 +56,7 @@ The core and its Lua state belong to ghostty's own `UiBuilder.Draw`
   at its end. They are at most one frame old.
 * **Changes** (`window.open`, `window.close`, `window.focus`,
   `window.place`, `window.hide`, `window.toggle_pet`,
-  `agent.windows.refresh`, `terminal.new`, `focus.cycle`) are checked, given
+  `agent.windows.refresh`, `terminal.new`, `focus.cycle`, `keys.reserve`) are checked, given
   a request id and queued. The response
   says only that: `{"queued": true, "request": 1726732800001}`. At the end of
   the next frame ghostty runs them in order, in its own Lua state, through
@@ -152,8 +152,8 @@ open, and no window is asked for. `agent` may only be `"default"` so far.
 The result in `requests`: `{"id": panel}` once the panel exists (still
 `pending` until the agent answers), or why not: `the agent is not
 connected`, `agent too old for windows: update ghostty-agent`, `no player
-(log in first)`, `pin: …`. A window the agent then refuses shows as `ended`
-with the reason on the panel.
+(log in first)`, `pin: …`, `NAME is on CONFIG.windows.never`. A window the
+agent then refuses shows as `ended` with the reason on the panel.
 
 ### window.close
 
@@ -249,6 +249,27 @@ they were opened, wrapping; hidden panels are skipped. With none focused,
 camera turn. The result in `requests`: `{"id": panel}`, or `no world panel
 shown`.
 
+### keys.reserve
+
+```json
+{"method": "keys.reserve", "params": {"chords": ["super+*", "alt+shift+q"]}, "caller": "XivDesktop"}
+```
+
+Keys this plugin reads for itself: while a remote window panel or a world
+terminal has the keyboard, a key pressed with a chord's modifiers held is
+not sent to the window (neither as KEY nor as text) and not typed into the
+terminal. A chord is modifiers (`ctrl`, `shift`, `alt`, `super`) and a key
+(a keymap name: `a`, `1`, `f5`, `enter`, `left`, `space`, …, or `*` for any
+key) joined by `+`, case-insensitive; it matches whenever its modifiers are
+held, whatever else is. `*` needs a modifier. The list replaces the
+caller's earlier one (`caller` names it; without one, the list of callers
+without a name); `[]` gives them back. At most 64 chords. The result in
+`requests`: `{"chords": n}` (how many the caller holds now), or why a
+chord was refused (`chord "hyper+x": unknown key …`; nothing changes then).
+They add to `CONFIG.windows.reserved_chords` (lua/windows.lua, default
+`{"super+*"}`). A reloaded plugin core forgets them: call again after
+ghostty restarts (its `status` changes).
+
 ### agent.windows
 
 ```json
@@ -262,7 +283,8 @@ shown`.
 ]}
 ```
 
-The windows of the agent's last list (WLISTR), as it sent them: `wid` for
+The windows of the agent's last list (WLISTR), as it sent them (without
+those on `CONFIG.windows.never`): `wid` for
 `window.open`, the size, `app`, `title`. Columns a newer agent adds after the
 title are passed through in `extra`; `key` is the one written `key:K` (or
 `key=K`), else a plain first extra column, else `""`. A `wid` 0 entry says
@@ -290,7 +312,10 @@ Asks the agent for its list again (WLIST). The answer arrives a moment later:
 ```
 
 The apps the agent can start, from `app` lines in its list, where a newer
-agent sends them; `[]` otherwise.
+agent sends them, without those on `CONFIG.windows.never` (so a launcher
+built on this leaves them out too); `[]` otherwise. `icon` is a PNG path on
+the agent's machine that may appear a moment after the list (the agent
+renders icons in the background): look for it again later.
 
 ### agent.status
 
@@ -343,7 +368,8 @@ and a WLISTR with extra columns, a key and an app line through
 `agent.windows`, `agent.apps` and `window.list`, `terminal.new` (a pet, a bad
 profile, a pin), `focus.cycle` over a window and a terminal, WCLOSE,
 malformed JSON, an unknown method, the queue limit, a response too large,
-`/term reload`, and the channel gone after shutdown); `tests/test_loader.nelua`
+`/term reload`, `keys.reserve`, the `never` list filtering `agent.apps` and
+`agent.windows`, and the channel gone after shutdown); `tests/test_loader.nelua`
 (`gu_call` through the loader, with and without a core). The threading is by
 design and review: the host build's lock is a no-op, as for the event queue.
 **Not yet observed in game**, and no plugin has called it yet.

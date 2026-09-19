@@ -26,6 +26,7 @@
 -- either. What is left, over the window's picture, is mapped from panel
 -- pixels to window pixels (the letterbox removed) and sent as WINPUT.
 require 'core.app.terminal'
+require 'core.keychords'
 require 'core.wincodec'
 require 'core.wintex'
 
@@ -54,6 +55,18 @@ global RemoteWin = @record{
   sid: uint32,              -- stream id, 0 until WOPENED
   app: string,              -- what was asked for: the run command's program, the match text, or '' (owned)
   wid: uint32,              -- the window id asked for (WOPEN by id), else 0
+  -- persistence (docs/REMOTE_WINDOWS.md "Window keys"): saved with the layout, opened again by key
+  match: string,            -- the match text first asked for ('run:…', 'app:…', a name; '' by wid or the desktop's choice) (owned)
+  key: string,              -- 'key:…' that opens this window again, '' until an agent list names it (owned)
+  fallback: string,         -- opened by key: the match text to ask for when the key is refused (owned)
+  reopen: boolean,          -- the connection went: asked for again once it is back
+  -- WGEOM: where the window and its popups are in the picture
+  geom: vector(WinRect),    -- the boxes of the frame shown: [0] the window, then popups; empty: the whole picture
+  geom_next: vector(WinRect), -- the latest WGEOM, applied when its seq is presented
+  geom_seq: uint32,
+  geom_pending: boolean,
+  fit_x: float32, fit_y: float32, fit_scale: float32, -- box 0 on the panel as last drawn (panel pixels; scale: per picture pixel)
+  parent_id: integer,       -- a dialog opened by itself: its window's panel (closing that closes this one)
   state: RemoteWinState,
   max_w: integer, max_h: integer, -- what was asked for: larger frames are refused
   w: integer, h: integer,   -- size of the frames (0 before the first)
@@ -140,19 +153,61 @@ local function close_panel(s: *Session): void
   close_terminal(s)
 end
 
--- Session:close of a window panel: stop the stream and free it.
+local function free_stream(rw: *RemoteWin): void
+  wintex_release(&rw.tex)
+  rw.pixels:destroy()
+  rw.dirty:destroy()
+  rw.app:destroy()
+  rw.match:destroy()
+  rw.key:destroy()
+  rw.fallback:destroy()
+  rw.geom:destroy()
+  rw.geom_next:destroy()
+  delete(rw)
+end
+
+-- Saved window panels are asked for again once per layout (start, /term reload).
+local restore_done = false
+
+-- New windows (WLIST "watch"): the agent pushes its list whenever a window
+-- maps or unmaps; windows that appear become panels (auto_open_new).
+local watching = false       -- WLIST "watch" sent on this connection
+local watch_baseline = false -- the next list decided on is what was already there
+local auto_dirty = false     -- a list came: decide on new windows
+local auto_wait = false      -- a stream just opened: wait for the list that marks it (sid:)
+local known_wids: vector(uint32) -- the windows of the last list decided on
+local never_at: float64 = 0      -- CONFIG.windows.never last checked against the open panels
+local refused_wids: vector(uint32) -- auto-opened and refused: not again while listed
+
+-- Session:close of a window panel: stop the stream and free it. Closed by
+-- its ×, /window close or IPC, the window closes too (WCLOSE); a reload or
+-- quit (keep_on_agent, as for terminals) leaves it to the agent, which keeps
+-- the window and its app for the next WOPEN by key.
 local function remotewin_closed(s: *Session): void
   for i = 0, < #streams do
     local rw = streams[i]
     if rw.s == s then
-      if rw.state == RemoteWinState.Live and rw.sid ~= 0 then host.agent:wclose(rw.sid) end
+      local closing_children = false
+      if s.keep_on_agent then
+        restore_done = false -- the layout is being taken down: the next one restores it
+      else
+        if rw.state == RemoteWinState.Live and rw.sid ~= 0 then host.agent:wclose(rw.sid) end
+        closing_children = true
+      end
       -- still Opening: its WOPENED finds no stream and is closed then
-      wintex_release(&rw.tex)
-      rw.pixels:destroy()
-      rw.dirty:destroy()
-      rw.app:destroy()
       streams:remove(i)
-      delete(rw)
+      free_stream(rw)
+      if closing_children then
+        -- its dialogs go with it, as the app's do
+        local k: integer = #streams - 1
+        while k >= 0 do
+          if streams[k].parent_id == s.id and not streams[k].s.leaving then
+            streams[k].parent_id = 0
+            close_panel(streams[k].s)
+          end
+          k = math.min(k - 1, #streams - 1)
+        end
+      end
       return
     end
   end
@@ -184,6 +239,41 @@ local function ack(rw: *RemoteWin): void
   rw.ack_pending = false
 end
 
+-- Box 0 of the frame shown (the window, in picture pixels), inside the
+-- picture; the whole picture when the agent sends no WGEOM (older agents).
+global function remotewin_window_box(rw: *RemoteWin): (integer, integer, integer, integer)
+  if #rw.geom == 0 then return 0, 0, rw.w, rw.h end
+  local b = rw.geom[0]
+  local x = math.clamp((@integer)(b.x), 0, math.max(rw.w - 1, 0))
+  local y = math.clamp((@integer)(b.y), 0, math.max(rw.h - 1, 0))
+  local w = math.clamp((@integer)(b.w), 1, math.max(rw.w - x, 1))
+  local h = math.clamp((@integer)(b.h), 1, math.max(rw.h - y, 1))
+  return x, y, w, h
+end
+
+-- WGEOM: sid, seq u32, n u16, n x (x, y, w, h u16). Kept until the frame with
+-- that seq is presented (on_frame's END), so boxes and pixels change together.
+local GEOM_MAX <comptime> = 64
+local function on_geom(data: *[0]uint8, len: usize): void
+  if len < 10 then return end
+  local sid = proto.get_u32(data)
+  local seq = proto.get_u32((@*[0]uint8)(&data[4]))
+  local n = (@usize)(proto.get_u16((@*[0]uint8)(&data[8])))
+  if n == 0 or len < 10 + n * 8 then return end
+  local rw: *RemoteWin = nilptr
+  for i = 0, < #streams do
+    if streams[i].sid == sid and streams[i].state == RemoteWinState.Live then rw = streams[i] break end
+  end
+  if rw == nilptr then return end
+  rw.geom_next:clear()
+  for k: usize = 0, < math.min(n, GEOM_MAX) do
+    local p = (@*[0]uint8)(&data[10 + k * 8])
+    rw.geom_next:push(WinRect{ x = proto.get_u16(p), y = proto.get_u16((@*[0]uint8)(&p[2])),
+      w = proto.get_u16((@*[0]uint8)(&p[4])), h = proto.get_u16((@*[0]uint8)(&p[6])) })
+  end
+  rw.geom_seq, rw.geom_pending = seq, true
+end
+
 local function on_frame(rw: *RemoteWin, payload: *[0]uint8, len: usize): void
   local ok, f = wincodec_parse(payload, len)
   if not ok or f.w == 0 or f.h == 0 then return end
@@ -210,12 +300,19 @@ local function on_frame(rw: *RemoteWin, payload: *[0]uint8, len: usize): void
     note_dirty(rw, fr.r)
   end
   if (f.flags & WINCODEC_FLAG_END) ~= 0 then
+    -- the boxes that came with this seq (or an earlier one) hold from here on
+    if rw.geom_pending and (@int32)(f.seq - rw.geom_seq) >= 0 then
+      rw.geom_pending = false
+      rw.geom:clear()
+      for k = 0, < #rw.geom_next do rw.geom:push(rw.geom_next[k]) end
+    end
     rw.frames = rw.frames + 1
     rw.ack_seq, rw.ack_pending = f.seq, true
     ack(rw)
     if not rw.sized then
       rw.sized = true
-      policy_windows_size(rw.s.id, rw.w, rw.h, 0) -- the panel is the picture, edge to edge
+      local _, _, bw, bh = remotewin_window_box(rw)
+      policy_windows_size(rw.s.id, bw, bh, 0) -- the panel is the window, edge to edge (popups hang outside)
     end
   end
 end
@@ -232,6 +329,9 @@ global WinListEntry = @record{
   app: string, title: string, -- owned
   key: string,                -- '' when the agent sends none (owned)
   extra: vector(string),      -- the columns after the title (owned)
+  sid: uint32,                -- "sid:N": this connection streams it already (a watching agent's)
+  parent: uint32,             -- "parent:WID": a dialog of that window
+  compositor: boolean,        -- a window of the agent's own compositor (the line has the launch column)
 }
 global WinAppEntry = @record{ id: string, name: string, icon: string, categories: string } -- owned
 global WinList = @record{
@@ -319,8 +419,19 @@ global function winlist_parse(data: *[0]uint8, len: usize): boolean -- true: it 
           local oky, h = parse_count(cols[2])
           if okw and okx and oky and wid <= 0xffffffff then
             local e: WinListEntry = { wid = (@uint32)(wid), w = w, h = h, app = cols[3]:copy(), title = cols[4]:copy() }
-            for k = 5, < #cols do e.extra:push(cols[k]:copy()) end
+            for k = 5, < #cols do
+              e.extra:push(cols[k]:copy())
+              local c = cols[k]
+              if #c > 4 and c:subview(1, 4) == 'sid:' then
+                local okn, n = parse_count(c:subview(5))
+                if okn and n <= 0xffffffff then e.sid = (@uint32)(n) end
+              elseif #c > 7 and c:subview(1, 7) == 'parent:' then
+                local okn, n = parse_count(c:subview(8))
+                if okn and n <= 0xffffffff then e.parent = (@uint32)(n) end
+              end
+            end
             e.key = key_of(&e.extra)
+            e.compositor = #e.extra > 0 and e.extra[0]:find(':', 1, true) == 0
             windows:push(e)
           end
         end
@@ -361,6 +472,76 @@ global function winlist_parse(data: *[0]uint8, len: usize): boolean -- true: it 
   return apps_answer
 end
 
+-- CONFIG.windows.never ---------------------------------------------------------------
+-- Windows and apps never shown in game (lua/windows.lua): an app id, a
+-- desktop id or a part of a title, case-insensitive, '*' matching anything.
+
+local function lower_b(c: byte): byte
+  if c >= 'A'_b and c <= 'Z'_b then return c + 32 end
+  return c
+end
+
+-- `pat` ('*' any run) against all of `text`, ignoring case.
+local function glob_ci(pat: string, text: string): boolean
+  local p: usize, t: usize = 0, 0
+  local star: isize, mark: isize = -1, 0
+  while t < text.size do
+    if p < pat.size and pat.data[p] ~= '*'_b and lower_b(pat.data[p]) == lower_b(text.data[t]) then
+      p, t = p + 1, t + 1
+    elseif p < pat.size and pat.data[p] == '*'_b then
+      star, mark = (@isize)(p), (@isize)(t)
+      p = p + 1
+    elseif star >= 0 then
+      p = (@usize)(star) + 1
+      mark = mark + 1
+      t = (@usize)(mark)
+    else
+      return false
+    end
+  end
+  while p < pat.size and pat.data[p] == '*'_b do p = p + 1 end
+  return p == pat.size
+end
+
+local function contains_ci(text: string, part: string): boolean
+  if #part == 0 or #part > #text then return false end
+  for i: usize = 0, text.size - part.size do
+    local ok = true
+    for k: usize = 0, < part.size do
+      if lower_b(text.data[i + k]) ~= lower_b(part.data[k]) then ok = false break end
+    end
+    if ok then return true end
+  end
+  return false
+end
+
+-- The CONFIG.windows.never entry that keeps out a window or app of `app`
+-- (its app id), `id` (a desktop id) or with `title` (a part of it matches,
+-- or all of it with a '*' entry); '' when none does. Borrowed from policy.
+global function window_never(app: string, id: string, title: string): string
+  for i = 0, < #policy.windows.never do
+    local p = policy.windows.never[i]
+    if #p == 0 then continue end
+    if (#app > 0 and glob_ci(p, app)) or (#id > 0 and glob_ci(p, id)) then return p end
+    if #title > 0 then
+      if p:find('*', 1, true) > 0 then
+        if glob_ci(p, title) then return p end
+      elseif contains_ci(title, p) then
+        return p
+      end
+    end
+  end
+  return string{}
+end
+
+global function winlist_entry_never(e: *WinListEntry): boolean
+  return #window_never(e.app, '', e.title) > 0
+end
+
+global function winlist_app_never(a: *WinAppEntry): boolean
+  return #window_never(a.id, a.id, a.name) > 0
+end
+
 -- One log line per window (and a summary) for the last WLISTR.
 local function log_list(): void
   for i = 0, < #winlist.windows do
@@ -381,9 +562,139 @@ local function log_list(): void
     #winlist.windows, #winlist.apps)
 end
 
+-- Window keys ------------------------------------------------------------------------
+-- A panel's window gets a key from the agent's list, sent after its WOPENED:
+-- `key:<launch id>` for a window the agent launched (the list's sixth
+-- column), else `key:\tAPP\tTITLE`. The key goes into the saved layout and
+-- opens the window again after a reload, a game restart or a reconnect.
+
+local loud_lists = 0 -- WLISTs someone asked for (/window list, the picker, IPC): their answers are logged
+
+-- `key:` text for list entry `e`. Owned.
+local function key_for(e: *WinListEntry): string
+  local sb: stringbuilder
+  if #e.key > 0 then sb:write('key:', e.key) else sb:write('key:\t', e.app, '\t', e.title) end
+  return sb:promote()
+end
+
+local function is_launch(match: string): boolean
+  return (#match > 4 and (match:subview(1, 4) == 'run:' or match:subview(1, 4) == 'app:')) or
+    (#match >= 8 and match:subview(1, 8) == 'desktop:')
+end
+
+-- Another stream already holds this key.
+local function key_taken(rw: *RemoteWin, key: string): boolean
+  for i = 0, < #streams do
+    if streams[i] ~= rw and streams[i].key == key then return true end
+  end
+  return false
+end
+
+-- The list entry that is `rw`'s window: by the window id it asked for, else
+-- the one entry with its title (not another panel's), preferring the launched
+-- window a launch asked for. nilptr when unsure.
+local function entry_of(rw: *RemoteWin): *WinListEntry
+  local found: *WinListEntry = nilptr
+  local n, launched = 0, 0
+  local launched_e: *WinListEntry = nilptr
+  for i = 0, < #winlist.windows do
+    local e = &winlist.windows[i]
+    if e.wid == 0 then continue end
+    if e.sid ~= 0 and rw.state == RemoteWinState.Live then
+      if e.sid == rw.sid then return e end -- a watching agent marks our streams
+      continue
+    end
+    if rw.wid ~= 0 then
+      if e.wid == rw.wid then return e end
+      continue
+    end
+    if #rw.s.title == 0 or e.title ~= rw.s.title then continue end
+    local k = key_for(e)
+    local mine = #rw.key > 0 and #e.key > 0 and k == rw.key
+    local taken = key_taken(rw, k)
+    k:destroy()
+    if mine then return e end
+    if not taken then
+      found, n = e, n + 1
+      if #e.key > 0 then launched_e, launched = e, launched + 1 end
+    end
+  end
+  if n == 1 then return found end
+  if launched == 1 and is_launch(rw.match) then return launched_e end
+  return nilptr
+end
+
+-- A fresh window list: every live panel learns (or refreshes) its key.
+local function learn_keys(): void
+  for i = 0, < #streams do
+    local rw = streams[i]
+    if rw.state ~= RemoteWinState.Live then continue end
+    local e = entry_of(rw)
+    if e == nilptr then continue end
+    if #e.title > 0 and e.title ~= rw.s.title then -- the title changed since WOPENED
+      rw.s.title:destroy()
+      rw.s.title = e.title:copy()
+    end
+    local k = key_for(e)
+    if k ~= rw.key then
+      logf(LOG_INFO, 'window %d: key %s', rw.s.id, k)
+      rw.key:destroy()
+      rw.key = k
+    else
+      k:destroy()
+    end
+  end
+end
+
+-- Close every panel whose window CONFIG.windows.never now keeps out (it
+-- was opened by a partial name, or its title changed): WCLOSE, as its ×.
+local function never_sweep(): void
+  if #policy.windows.never == 0 then return end
+  local i: integer = #streams - 1
+  while i >= 0 do
+    local rw = streams[i]
+    if rw.state == RemoteWinState.Live and not rw.s.leaving then
+      local e = entry_of(rw)
+      local app: string = e ~= nilptr and e.app or ''
+      local p = window_never(app, '', rw.s.title)
+      if #p > 0 then
+        sayf(LOG_WARN, '%s is on CONFIG.windows.never (%s): its panel closes', #app > 0 and app or rw.s.title, p)
+        close_panel(rw.s)
+      end
+    end
+    i = math.min(i - 1, #streams - 1)
+  end
+end
+
+-- Ask the agent for window `rw` (again): by key when one is known and a
+-- match text to fall back on, else by the match text or window id.
+local function ask_agent(rw: *RemoteWin): boolean
+  rw.req = next_req
+  next_req = next_req + 1
+  rw.state = RemoteWinState.Opening
+  rw.sid = 0
+  local text: string = rw.match
+  rw.fallback:destroy()
+  rw.fallback = {}
+  if #rw.key > 0 then
+    text = rw.key
+    rw.fallback = rw.match:copy()
+  end
+  local wid: uint32 = #rw.key > 0 and 0 or rw.wid
+  return host.agent:wopen(rw.req, wid, (@uint16)(rw.max_w), (@uint16)(rw.max_h), (@uint8)(policy.windows.fps), text)
+end
+
 global function remotewin_event(ev: *AgentEvent): void
   if ev.typ == PROTO_WLISTR then
-    if not winlist_parse(ev.data, ev.len) then log_list() end -- the app list is the picker's, not the log's
+    if not winlist_parse(ev.data, ev.len) then
+      learn_keys()
+      never_sweep()
+      auto_wait = false
+      if watching then auto_dirty = true end
+      if loud_lists > 0 then loud_lists = loud_lists - 1 log_list() end -- not the ones sent for keys
+    end -- the app list is the picker's, not the log's
+  elseif ev.typ == PROTO_WGEOM then
+    on_geom(ev.data, ev.len)
   elseif ev.typ == PROTO_WOPENED then
     local rw = find_req(ev.req)
     if rw == nilptr then
@@ -393,15 +704,33 @@ global function remotewin_event(ev: *AgentEvent): void
     end
     local text = string{data=(@*[0]byte)(ev.data), size=ev.len}
     if ev.id == 0 then
+      if rw.wid ~= 0 then refused_wids:push(rw.wid) end -- not asked for again while it is listed
+      if #rw.fallback > 0 then
+        -- the key found no window (the app is gone, or an agent restarted):
+        -- the match text again, which launches a launch again
+        logf(LOG_INFO, 'window %d: %s refused (%s); asking for %s', rw.s.id, rw.key, text, rw.fallback)
+        rw.key:destroy()
+        rw.key = {}
+        panel_text(rw.s, 'starting it again: ', rw.fallback)
+        if not ask_agent(rw) then stream_end(rw, 'window refused: ', 'the agent refused the request') end
+        return
+      end
       stream_end(rw, 'window refused: ', text)
       return
     end
     rw.sid = ev.id
     rw.state = RemoteWinState.Live
+    rw.fallback:destroy()
+    rw.fallback = {}
     rw.s.title:destroy()
     rw.s.title = text:copy()
     panel_text(rw.s, 'waiting for the first frame of ', text)
     sayf(LOG_INFO, 'window %d: stream %d opened: %s (%dx%d)', rw.s.id, ev.id, text, ev.w, ev.h)
+    never_sweep() -- a match text found a window that is kept out
+    -- its key comes from the agent's list (learn_keys); new windows wait for
+    -- that list too (in it the window carries our sid)
+    auto_wait = watching
+    host.agent:wlist()
   elseif ev.typ == PROTO_WFRAME then
     local rw = find_sid(ev.id)
     if rw ~= nilptr then on_frame(rw, ev.data, ev.len) end
@@ -478,6 +807,8 @@ global WindowInfo = @record{
 -- as `/term pin` takes it ('' = a pet), `caller` names who asked (logged).
 global WindowOpenSpec = @record{
   run: string, match: string, wid: uint32, agent: string, pin: string, caller: string,
+  key: string,     -- a saved window: 'key:…' asked for first, `match` (or `run`) when it is refused
+  restore: integer, -- a saved window: its entry (from 1) in lua/windows.lua's saved state, whose anchor it takes
 }
 
 local err_text: string -- the last reason that had to be built (see above)
@@ -508,12 +839,71 @@ local function program_of(cmd: string): string
   return prog:copy()
 end
 
+-- What `spec` asks for, when CONFIG.windows.never keeps it out ('' when
+-- not): the listed window of a wid, the program of a run, the app of an
+-- app:, the app and title of a key, a match text taken as an app id.
+-- Windows only a partial name finds are closed once open (never_sweep).
+local function never_for_open(spec: WindowOpenSpec): string
+  if #policy.windows.never == 0 then return string{} end
+  if spec.wid ~= 0 then
+    for i = 0, < #winlist.windows do
+      local e = &winlist.windows[i]
+      if e.wid == spec.wid and winlist_entry_never(e) then return (#e.app > 0 and e.app or e.title):copy() end
+    end
+  end
+  if #spec.run > 0 then
+    local prog = program_of(spec.run)
+    if #window_never(prog, prog, '') > 0 then return prog end
+    prog:destroy()
+  end
+  local m = spec.match
+  if #m > 4 and m:subview(1, 4) == 'app:' then
+    local id = m:subview(5)
+    if #window_never(id, id, '') > 0 then return id:copy() end
+    for i = 0, < #winlist.apps do
+      local a = &winlist.apps[i]
+      if a.id == id and winlist_app_never(a) then return a.name:copy() end
+    end
+  elseif #m > 4 and m:subview(1, 4) == 'run:' then
+    local prog = program_of(m:subview(5))
+    if #window_never(prog, prog, '') > 0 then return prog end
+    prog:destroy()
+  elseif #m > 0 and #window_never(m, m, '') > 0 then
+    return m:copy()
+  end
+  local k = spec.key
+  if #k > 5 and k:subview(1, 4) == 'key:' then
+    -- key:LAUNCH\tAPP\tTITLE
+    local rest = k:subview(5)
+    local t1 = rest:find('\t', 1, true)
+    if t1 > 0 then
+      local after = rest:subview(t1 + 1)
+      local t2 = after:find('\t', 1, true)
+      local app: string = t2 > 0 and after:subview(1, t2 - 1) or after
+      local title: string = t2 > 0 and after:subview(t2 + 1) or ''
+      if #window_never(app, '', title) > 0 then return (#app > 0 and app or title):copy() end
+    end
+  end
+  return string{}
+end
+
 -- Open a window panel: a pet (or `spec.pin`'s place) showing the window once
 -- the agent (or the desktop's picker) has it. The panel's id, or 0 and why.
 global function window_open(spec: WindowOpenSpec): (integer, string)
   local agent, err = agent_for(spec.agent)
   if agent == nilptr then return 0, err end
   if not player_loaded() then return 0, 'no player (log in first)' end
+  do -- CONFIG.windows.never: refused here, with a word in the chat
+    local what = never_for_open(spec)
+    if #what > 0 then
+      local sb: stringbuilder
+      sb:write(what, ' is on CONFIG.windows.never')
+      local _, reason = fail_owned(sb:promote())
+      say(LOG_WARN, reason)
+      what:destroy()
+      return 0, reason
+    end
+  end
   local match: string
   local app: string
   if #spec.run > 0 then
@@ -544,7 +934,7 @@ global function window_open(spec: WindowOpenSpec): (integer, string)
   -- where it goes: what the caller asked for, else CONFIG.windows.open_at
   -- (in front of you by default; 'pet' makes it a pet)
   local place: string = #spec.pin > 0 and spec.pin or policy.windows.open_at
-  if #place > 0 and place ~= 'pet' then
+  if #place > 0 and place ~= 'pet' and spec.restore == 0 then
     local perr = policy_windows_pin(s.id, place)
     if #perr > 0 then
       match:destroy() app:destroy()
@@ -558,24 +948,27 @@ global function window_open(spec: WindowOpenSpec): (integer, string)
   end
   local rw = new(@RemoteWin)
   rw.s = s
-  rw.req = next_req
-  next_req = next_req + 1
   rw.app = app
+  rw.match = match -- owned by the stream from here
   rw.wid = spec.wid
+  rw.key = spec.key:copy()
   rw.max_w, rw.max_h = policy.windows.max_w, policy.windows.max_h
   rw.ptr_x, rw.ptr_y = -1, -1
   rw.drawn_at = host.last_time
   streams:push(rw)
-  local ok = agent:wopen(rw.req, spec.wid, (@uint16)(rw.max_w), (@uint16)(rw.max_h), (@uint8)(policy.windows.fps), match)
-  if not ok then
-    match:destroy()
+  if spec.restore > 0 then
+    -- a saved panel: its anchor (pin or pet, place, size) as it was saved
+    if policy_windows_restore(s.id, spec.restore) then rw.sized = true end
+  end
+  if not ask_agent(rw) then
     close_terminal(s) -- its stream goes with it (remotewin_closed)
     return 0, 'the agent refused the request'
   end
   do
     local sb: stringbuilder
     sb:writef('window %d: asked the agent for ', s.id)
-    if spec.wid ~= 0 then sb:writef('#%d', spec.wid)
+    if #rw.key > 0 then sb:write(rw.key, ' (else ', #match > 0 and match or 'nothing', ')')
+    elseif spec.wid ~= 0 then sb:writef('#%d', spec.wid)
     elseif #match > 0 then sb:write(match)
     else sb:write('its own choice') end
     if #spec.pin > 0 then sb:write(', pinned ', spec.pin) end
@@ -584,7 +977,6 @@ global function window_open(spec: WindowOpenSpec): (integer, string)
     log(LOG_INFO, line)
     line:destroy()
   end
-  match:destroy()
   panel_text(s, 'waiting for the window', '\u{2026}')
   return s.id, ''
 end
@@ -678,6 +1070,7 @@ global function window_agent_list(agent_name: string): (boolean, string)
   local agent, err = agent_for(agent_name)
   if agent == nilptr then return false, err end
   agent:wlist()
+  loud_lists = loud_lists + 1
   agent:wlist_apps() -- a newer agent answers with its installed apps; an older one with its windows again
   return true, ''
 end
@@ -777,6 +1170,162 @@ global function remotewin_pin(args: string): (boolean, cint)
   return true, 0
 end
 
+-- New windows ------------------------------------------------------------------------------
+-- A watching agent (Linux: its own compositor) pushes its window list when a
+-- window maps or unmaps. A window in it that is new since the last list, not
+-- ours (no sid: column) and not being opened by a panel becomes a panel by
+-- itself (CONFIG.windows.auto_open): a Firefox tab torn off into a window, a
+-- dialog, a window an app opens. The first list after (re)connecting is the
+-- baseline: what is already there is left to the picker.
+
+local function listed(v: *vector(uint32), wid: uint32): boolean
+  for i = 0, < #v do if v[i] == wid then return true end end
+  return false
+end
+
+-- The live panel showing list entry `e` (by our sid on it, else by the
+-- window id it was opened with), or nilptr.
+local function panel_of_entry(e: *WinListEntry): *RemoteWin
+  for i = 0, < #streams do
+    local rw = streams[i]
+    if rw.state == RemoteWinState.Live and not rw.s.leaving and
+       ((e.sid ~= 0 and rw.sid == e.sid) or (rw.wid ~= 0 and rw.wid == e.wid)) then return rw end
+  end
+  return nilptr
+end
+
+local function panel_of_wid(wid: uint32): *RemoteWin
+  if wid == 0 then return nilptr end
+  for i = 0, < #winlist.windows do
+    if winlist.windows[i].wid == wid then return panel_of_entry(&winlist.windows[i]) end
+  end
+  return nilptr
+end
+
+-- The newest panel showing a window of `app`.
+local function panel_of_app(app: string): *RemoteWin
+  if #app == 0 then return nilptr end
+  local best: *RemoteWin = nilptr
+  local best_i = -1
+  for i = 0, < #winlist.windows do
+    local e = &winlist.windows[i]
+    if e.app ~= app then continue end
+    local rw = panel_of_entry(e)
+    if rw ~= nilptr then
+      for k = 0, < #streams do
+        if streams[k] == rw and k > best_i then best, best_i = rw, k end
+      end
+    end
+  end
+  return best
+end
+
+local function auto_open_new(): void
+  for i = 0, < #streams do
+    -- a panel still opening may be waiting for one of these windows: decide
+    -- once it opened (the agent pushes the list again then)
+    if streams[i].state == RemoteWinState.Opening then return end
+  end
+  auto_dirty = false
+  local mode = policy.windows.auto_open
+  if not watch_baseline and mode ~= 'none' then
+    for i = 0, < #winlist.windows do
+      local e = &winlist.windows[i]
+      if e.wid == 0 or e.sid ~= 0 or not e.compositor or winlist_entry_never(e) then continue end
+      if listed(&known_wids, e.wid) or listed(&refused_wids, e.wid) or panel_of_entry(e) ~= nilptr then continue end
+      local parent = panel_of_wid(e.parent)
+      local beside = parent ~= nilptr and parent or panel_of_app(e.app)
+      if mode == 'related' and beside == nilptr then continue end
+      local pin: string = beside ~= nilptr and 'pet' or ''
+      local id, err = window_open(WindowOpenSpec{ wid = e.wid, pin = pin, caller = 'a new window' })
+      if id == 0 then
+        logf(LOG_WARN, 'window #%d (%s): not opened: %s', e.wid, e.title, err)
+        refused_wids:push(e.wid)
+        continue
+      end
+      if beside ~= nilptr then
+        local berr = policy_windows_beside(id, beside.s.id, parent ~= nilptr and 0.15 or 0)
+        if #berr > 0 then
+          logf(LOG_INFO, 'window %d: not beside window %d (%s)', id, beside.s.id, berr)
+          local perr = policy_windows_pin(id, policy.windows.open_at)
+          perr:destroy()
+        end
+        berr:destroy()
+      end
+      if parent ~= nilptr then
+        local rw = remotewin_of(find_window(id))
+        if rw ~= nilptr then rw.parent_id = parent.s.id end
+      end
+      logf(LOG_INFO, 'window %d: new window #%d %s%s', id, e.wid, e.title, parent ~= nilptr and ' (a dialog)' or '')
+    end
+  end
+  watch_baseline = false
+  -- remember what this list held; refusals only while their window is listed
+  known_wids:clear()
+  for i = 0, < #winlist.windows do known_wids:push(winlist.windows[i].wid) end
+  local k: integer = #refused_wids - 1
+  while k >= 0 do
+    if not listed(&known_wids, refused_wids[k]) then refused_wids:remove(k) end
+    k = k - 1
+  end
+end
+
+-- Persistence ------------------------------------------------------------------------------
+-- Window panels are saved beside the terminal layout (save_world_state in
+-- core/app/worldview.nelua calls remotewin_save_state), in lua/windows.lua's
+-- window-state.lua: key, match text, title and the world anchor. On start and
+-- after /term reload each is asked for by key, else by its match text.
+
+-- The live and pending window panels into lua/windows.lua's saved state.
+-- Nothing before the saved ones were asked for (that would overwrite them).
+global function remotewin_save_state(): void
+  if not restore_done then return end
+  local list: vector(WindowSaveEntry)
+  for i = 0, < #streams do
+    local rw = streams[i]
+    if rw.state == RemoteWinState.Ended or rw.s.leaving then continue end
+    if #rw.key == 0 and #rw.match == 0 then continue end -- the desktop chose it: nothing to ask for again
+    list:push(WindowSaveEntry{ id = rw.s.id, key = rw.key, match = rw.match, title = rw.s.title })
+  end
+  policy_windows_save(&list)
+  list:destroy()
+end
+
+local function restore_saved(): void
+  local saved: vector(WindowSaveEntry)
+  policy_windows_saved(&saved)
+  for i = 0, < #saved do
+    local e = &saved[i]
+    local spec: WindowOpenSpec = { match = e.match, key = e.key, restore = i + 1, caller = 'the saved layout' }
+    local id, err = window_open(spec)
+    if id == 0 then logf(LOG_WARN, 'window %s: not restored: %s', #e.key > 0 and e.key or e.match, err) end
+    e.key:destroy() e.match:destroy() e.title:destroy()
+  end
+  if #saved > 0 then logf(LOG_INFO, 'windows: %d saved window panels asked for again', #saved) end
+  saved:destroy()
+end
+
+-- A CONFIG.windows.auto entry whose window a restored panel already shows.
+local function pulled_already(args: string): boolean
+  local rest, _ = split_agent(args)
+  local m: string = rest
+  local owned: string
+  if #rest > 4 and rest:subview(1, 4) == 'run ' then
+    local sb: stringbuilder
+    sb:write('run:', rest:subview(5))
+    owned = sb:promote()
+    m = owned
+  elseif #rest > 0 and rest.data[0] == '#'_b then
+    return false
+  end
+  local found = false
+  for i = 0, < #streams do
+    if streams[i].state ~= RemoteWinState.Ended and #m > 0 and streams[i].match == m then found = true break end
+  end
+  owned:destroy()
+  return found
+end
+
 -- Per frame -----------------------------------------------------------------------------
 
 -- Connection loss, panels that wandered out of the world, closing ended
@@ -784,13 +1333,40 @@ end
 global function remotewin_tick(now: float64, in_world: boolean): void
   agent_window_event = remotewin_event
   local ready = host.agent_enabled and host.agent:ready()
+  local windows_ok = ready and host.agent:windows_ok()
+  if not ready then
+    loud_lists = 0 -- a new connection answers only what is asked of it
+    watching = false
+  end
   local live = 0
   local i: integer = #streams - 1
   while i >= 0 do
     local rw = streams[i]
     local s = rw.s
-    if rw.state ~= RemoteWinState.Ended and not ready then
-      stream_end(rw, 'window closed: ', 'agent connection lost')
+    if rw.state ~= RemoteWinState.Ended and not ready and not rw.reopen then
+      if #rw.key > 0 or #rw.match > 0 then
+        -- asked for again once the agent is back (by key: the same window)
+        rw.buttons = 0 -- nothing is held on a window we cannot reach
+        for k = 0, < MAX_KEYS do rw.keys[k] = false end
+        rw.reopen = true
+        rw.state = RemoteWinState.Opening
+        rw.sid, rw.req, rw.frames = 0, 0, 0
+        rw.geom:clear()
+        rw.geom_pending = false
+        panel_text(s, 'agent connection lost; waiting for it', '\u{2026}')
+        logf(LOG_INFO, 'window %d: agent connection lost; asking again when it is back', s.id)
+      else
+        stream_end(rw, 'window closed: ', 'agent connection lost')
+      end
+    elseif rw.reopen and ready then
+      rw.reopen = false
+      if not windows_ok then
+        stream_end(rw, 'window closed: ', AGENT_WINDOWS_TOO_OLD)
+      elseif not ask_agent(rw) then
+        stream_end(rw, 'window closed: ', 'the agent refused the request')
+      else
+        panel_text(s, 'waiting for the window', '\u{2026}')
+      end
     end
     if rw.state == RemoteWinState.Live then live = live + 1 end
     -- a window has no tab or floating window: popped in or minimized, it goes back out
@@ -803,7 +1379,8 @@ global function remotewin_tick(now: float64, in_world: boolean): void
       if not make_pet(s) then
         close_terminal(s)
       elseif rw.sized then
-        policy_windows_size(s.id, rw.w, rw.h, 0) -- a new anchor: the window's shape again
+        local _, _, bw, bh = remotewin_window_box(rw)
+        policy_windows_size(s.id, bw, bh, 0) -- a new anchor: the window's shape again
       end
     elseif rw.state == RemoteWinState.Ended and now - rw.ended_at > CLOSE_AFTER and not s.leaving then
       close_panel(s)
@@ -812,6 +1389,22 @@ global function remotewin_tick(now: float64, in_world: boolean): void
     if i >= #streams then i = #streams - 1 end
   end
   if host.agent_enabled then host.agent.read_chunks = live > 0 and 64 or 0 end -- up to 1 MiB a frame while streaming
+  -- the window panels saved with the layout, once per layout (start, /term reload)
+  if not restore_done and in_world and windows_ok and player_loaded() then
+    restore_done = true
+    restore_saved()
+  end
+  -- the window list pushed on every change; new windows become panels
+  if windows_ok and not watching then
+    watching = host.agent:wlist_watch()
+    watch_baseline, auto_dirty, auto_wait = true, false, false
+  end
+  if auto_dirty and not auto_wait and watching and in_world and player_loaded() then auto_open_new() end
+  -- CONFIG.windows.never may have changed (the settings window)
+  if now - never_at > 0.5 or now < never_at then
+    never_at = now
+    never_sweep()
+  end
   if not auto_done and in_world and ready then
     auto_done = true
     if #policy.windows.autopull > 0 then
@@ -819,8 +1412,13 @@ global function remotewin_tick(now: float64, in_world: boolean): void
         logf(LOG_WARN, 'windows.auto: %s', AGENT_WINDOWS_TOO_OLD)
       else
         for k = 0, < #policy.windows.autopull do
-          local ok, err = remotewin_pull(policy.windows.autopull[k])
-          if not ok then logf(LOG_WARN, 'windows.auto %s: %s', policy.windows.autopull[k], err) end
+          local arg = policy.windows.autopull[k]
+          if pulled_already(arg) then
+            logf(LOG_INFO, 'windows.auto %s: already restored', arg)
+            continue
+          end
+          local ok, err = remotewin_pull(arg)
+          if not ok then logf(LOG_WARN, 'windows.auto %s: %s', arg, err) end
         end
       end
     end
@@ -925,6 +1523,7 @@ local function poll_keys(rw: *RemoteWin, now: float64): void
   local mods = mods_of(io)
   -- AltGr arrives as ctrl + alt and types characters: not a chord
   local chord = io.KeyCtrl ~= io.KeyAlt or io.KeySuper
+  local eaten: uint32 = 0 -- the character of a reserved key, dropped from the typed text once
   for i = 0, < math.min(input_key_count(), MAX_KEYS) do
     local k = input_key(i)
     local hid = remotewin_hid(k.name)
@@ -933,9 +1532,15 @@ local function poll_keys(rw: *RemoteWin, now: float64): void
       if not down then
         rw.keys[i] = false
         if rw.key_mods[i] ~= KEY_OURS then send_key(rw, hid, false, rw.key_mods[i]) end
+      elseif (k.codepoint >= 32 and not chord) and keychord_reserved(mods, k.name) then
+        rw.keys[i], rw.key_mods[i] = true, KEY_OURS -- another plugin's chord (CONFIG.windows.reserved_chords)
+        eaten = k.codepoint
       elseif k.codepoint < 32 or chord then -- a character key without a chord comes as TEXT
         if toggle_chord(io, k.name) then
           rw.keys[i], rw.key_mods[i] = true, KEY_OURS -- the toggle is ours; not held on the window
+        elseif keychord_reserved(mods, k.name) then
+          rw.keys[i], rw.key_mods[i] = true, KEY_OURS -- another plugin's chord: not the window's
+          if k.codepoint >= 32 then eaten = k.codepoint end
         elseif k.name == 'escape' and now - rw.last_esc < ESC_TWICE then
           rw.keys[i], rw.key_mods[i] = true, KEY_OURS
           rw.last_esc = 0
@@ -952,10 +1557,15 @@ local function poll_keys(rw: *RemoteWin, now: float64): void
   if q.Size > 0 then
     local buf: [256]uint8
     local n: usize = 0
+    local all_reserved = keychord_reserves_all(mods) -- e.g. 'alt+shift+*' while alt and shift are held
     for i = 0, < q.Size do
       local c = (@uint32)(q.Data[i])
+      if eaten ~= 0 and (c == eaten or (eaten >= 97 and eaten <= 122 and c == eaten - 32)) then
+        eaten = 0 -- a reserved key's character: dropped once (shift makes it uppercase)
+        continue
+      end
       -- control characters come as keys; surrogate halves cannot be encoded alone
-      if c >= 32 and c ~= 127 and (c < 0xD800 or c > 0xDFFF) and not chord and n + 3 <= #buf then
+      if c >= 32 and c ~= 127 and (c < 0xD800 or c > 0xDFFF) and not chord and not all_reserved and n + 3 <= #buf then
         if c < 0x80 then
           buf[n] = (@uint8)(c) n = n + 1
         elseif c < 0x800 then
@@ -984,11 +1594,84 @@ global function remotewin_map(ix: float32, iy: float32, iw: float32, ih: float32
   return inside, x, y
 end
 
--- The pointer and buttons over the picture of a focused panel.
-local function poll_pointer(rw: *RemoteWin, s: *Session, on_content: boolean, click: boolean,
-                            ix: float32, iy: float32, iw: float32, ih: float32, mu: float32, mv: float32): void
-  local inside, x, y = remotewin_map(ix, iy, iw, ih, rw.w, rw.h, mu, mv)
-  inside = inside and on_content
+-- The projection of the panel being drawn, for points off its edges (its
+-- popups): worldview sets it right before remotewin_panel.
+local proj_cam: GuCamera
+local proj_b: WorldBasis
+local proj_p: ImVec2         -- the pointer, viewport-relative
+local proj_full = false      -- full screen: `proj_full_uv` is the pointer in panel pixels
+local proj_full_uv: ImVec2
+local proj_set = false
+
+global function remotewin_projection(cam: *GuCamera, b: *WorldBasis, p: ImVec2, full: boolean, full_uv: ImVec2): void
+  proj_cam, proj_b, proj_p, proj_full, proj_full_uv, proj_set = $cam, $b, p, full, full_uv, true
+end
+
+-- Popup box k on the panel, in panel pixels: box 0's placement offset by
+-- (box k - box 0) at the same scale.
+local function popup_rect(rw: *RemoteWin, k: integer): (float32, float32, float32, float32)
+  local bx, by = remotewin_window_box(rw)
+  local g = rw.geom[k]
+  return rw.fit_x + ((@integer)(g.x) - bx) * rw.fit_scale, rw.fit_y + ((@integer)(g.y) - by) * rw.fit_scale,
+    (@integer)(g.w) * rw.fit_scale, (@integer)(g.h) * rw.fit_scale
+end
+
+global RemoteWinTarget = @enum(cint){ None = 0, Window, Popup, Outside }
+
+-- What the pointer is over: the window (box 0, on the panel), a popup (also
+-- off the panel's edges), or, while popups are open, the rest of the panel
+-- (a click there closes them: it goes to the stream too). The point in
+-- picture pixels, clamped into the picture.
+global function remotewin_target(rw: *RemoteWin, on_content: boolean, mu: float32, mv: float32): (RemoteWinTarget, integer, integer)
+  local sc = rw.fit_scale
+  if sc <= 0 or rw.w <= 0 or rw.h <= 0 then return RemoteWinTarget.None, 0, 0 end
+  local bx, by, bw, bh = remotewin_window_box(rw)
+  local popups = #rw.geom > 1
+  local u, v = mu, mv
+  local target = RemoteWinTarget.None
+  if on_content then
+    local fx, fy = (mu - rw.fit_x) / sc, (mv - rw.fit_y) / sc
+    if fx >= 0 and fy >= 0 and fx < bw and fy < bh then target = RemoteWinTarget.Window end
+  end
+  if target == RemoteWinTarget.None and popups then
+    local hit = on_content
+    if not on_content and proj_set and not imgui.IsWindowHovered(ImGuiHoveredFlags_AnyWindow) then
+      if proj_full then
+        u, v, hit = proj_full_uv.x, proj_full_uv.y, true
+      else
+        -- the popups' bounding box, hit-tested on the panel's surface extended
+        local x0, y0, x1, y1: float32 = 3.4e38, 3.4e38, -3.4e38, -3.4e38
+        for k = 1, < #rw.geom do
+          local px, py, pw, ph = popup_rect(rw, k)
+          x0, y0, x1, y1 = math.min(x0, px), math.min(y0, py), math.max(x1, px + pw), math.max(y1, py + ph)
+        end
+        local ok, on, hu, hv = world_hit_area(&proj_cam, &proj_b, proj_p, x0, y0, x1, y1)
+        if ok and on then u, v, hit = hu, hv, true end
+      end
+    end
+    if hit then
+      for k = 1, < #rw.geom do
+        local px, py, pw, ph = popup_rect(rw, k)
+        if u >= px and v >= py and u < px + pw and v < py + ph then target = RemoteWinTarget.Popup break end
+      end
+      if target == RemoteWinTarget.None and on_content then target = RemoteWinTarget.Outside end
+    end
+  end
+  local x = math.clamp((@integer)(math.floor(bx + (u - rw.fit_x) / sc)), 0, rw.w - 1)
+  local y = math.clamp((@integer)(math.floor(by + (v - rw.fit_y) / sc)), 0, rw.h - 1)
+  return target, x, y
+end
+
+-- The pointer and buttons over the picture of a focused panel (and its popups).
+local function poll_pointer(rw: *RemoteWin, s: *Session, on_content: boolean, click: boolean, mu: float32, mv: float32): void
+  local target, x, y = remotewin_target(rw, on_content, mu, mv)
+  local inside = target ~= RemoteWinTarget.None
+  local off_panel = target == RemoteWinTarget.Popup and not on_content
+  if off_panel then
+    -- a menu hanging off the panel: the mouse is ours there, not the game's camera
+    if not host.lmb_down and not host.rmb_down then imgui.SetNextFrameWantCaptureMouse(true) end
+    if click then host.click_used = true end -- not a click on the bare world (that would unfocus)
+  end
   local held = rw.buttons ~= 0
   if (inside or held) and (x ~= rw.ptr_x or y ~= rw.ptr_y) then
     rw.ptr_x, rw.ptr_y = x, y
@@ -1039,6 +1722,24 @@ global function remotewin_fit(width: float32, height: float32, w: integer, h: in
   local scale = math.min(aw / w, ah / h)
   local iw, ih = w * scale, h * scale
   return ax + (aw - iw) * 0.5, ay + (ah - ih) * 0.5, iw, ih
+end
+
+-- Picture pixels (bx, by, bw, bh) of the texture as a grid of quads at (x, y),
+-- w x h panel pixels, so it bends with the curve.
+local function draw_box(rw: *RemoteWin, dl: *ImDrawList, x: float32, y: float32, w: float32, h: float32,
+                        bx: integer, by: integer, bw: integer, bh: integer, strips: integer, rows: integer): void
+  local col = im_col32(255, 255, 255, 255)
+  local tw, th = (@float32)(rw.w), (@float32)(rw.h)
+  for k = 0, < strips do
+    local a0, a1 = (@float32)(k) / strips, (@float32)(k + 1) / strips
+    local u0, u1 = (bx + bw * a0) / tw, (bx + bw * a1) / tw
+    for r = 0, < rows do
+      local b0, b1 = (@float32)(r) / rows, (@float32)(r + 1) / rows
+      local v0, v1 = (by + bh * b0) / th, (by + bh * b1) / th
+      imgui.DrawListAddImage(dl, rw.tex.srv, vec2(x + w * a0, y + h * b0), vec2(x + w * a1, y + h * b1),
+        vec2(u0, v0), vec2(u1, v1), col)
+    end
+  end
 end
 
 -- Window panel `s` shows its picture: worldview then draws no slab behind it
@@ -1125,21 +1826,17 @@ global function remotewin_panel(s: *Session, dl: *ImDrawList, vp: ImVec2, width:
     draw_title(s, dl, vp, width)
     return
   end
-  local ix, iy, iw, ih = remotewin_fit(width, height, rw.w, rw.h)
-  local col = im_col32(255, 255, 255, 255)
-  for k = 0, < STRIPS do
-    local u0, u1 = (@float32)(k) / STRIPS, (@float32)(k + 1) / STRIPS
-    for r = 0, < ROWS do
-      local v0, v1 = (@float32)(r) / ROWS, (@float32)(r + 1) / ROWS
-      imgui.DrawListAddImage(dl, rw.tex.srv, vec2(vp.x + ix + iw * u0, vp.y + iy + ih * v0),
-        vec2(vp.x + ix + iw * u1, vp.y + iy + ih * v1), vec2(u0, v0), vec2(u1, v1), col)
-    end
-  end
+  -- the window (box 0 of the picture) fitted to the panel; popups are drawn
+  -- after the panel's chrome (remotewin_popups)
+  local bx, by, bw, bh = remotewin_window_box(rw)
+  local ix, iy, iw, ih = remotewin_fit(width, height, bw, bh)
+  rw.fit_x, rw.fit_y, rw.fit_scale = ix, iy, iw / bw
+  draw_box(rw, dl, vp.x + ix, vp.y + iy, iw, ih, bx, by, bw, bh, STRIPS, ROWS)
   draw_title(s, dl, vp, width)
   -- input: only a focused panel's, and only one terminal or window types per frame
   local keyboard = terminal_claim_keyboard(focused)
   if focused then
-    poll_pointer(rw, s, on_content, click, ix, iy, iw, ih, mu, mv)
+    poll_pointer(rw, s, on_content, click, mu, mv)
     if keyboard then
       imgui.SetNextFrameWantCaptureKeyboard(true)
       input_claim_keyboard(imgui.GetIO())
@@ -1150,18 +1847,41 @@ global function remotewin_panel(s: *Session, dl: *ImDrawList, vp: ImVec2, width:
   rw.focused_last = keyboard
 end
 
+-- The window's popups (menus, tooltips, combo lists: WGEOM boxes after the
+-- first) as quads of their own at the window's scale, where they are
+-- relative to it, also past the panel's edges: worldview calls this after
+-- the panel's chrome, so they are on top, and bends them with the panel.
+global function remotewin_popups(s: *Session, dl: *ImDrawList, vp: ImVec2): void
+  local rw = remotewin_of(s)
+  if rw == nilptr or #rw.geom < 2 or not remotewin_bare(s) or rw.fit_scale <= 0 then return end
+  local cell = math.max(rw.fit_scale * 64, 8) -- about as fine a grid as the window's
+  for k = 1, < #rw.geom do
+    local g = rw.geom[k]
+    local gx, gy = (@integer)(g.x), (@integer)(g.y)
+    local gw = math.min((@integer)(g.w), rw.w - gx)
+    local gh = math.min((@integer)(g.h), rw.h - gy)
+    if gw <= 0 or gh <= 0 then continue end
+    local px, py, pw, ph = popup_rect(rw, k)
+    pw, ph = gw * rw.fit_scale, gh * rw.fit_scale
+    local strips = math.clamp((@integer)(math.ceil(pw / cell)), 1, STRIPS)
+    local rows = math.clamp((@integer)(math.ceil(ph / cell)), 1, ROWS)
+    draw_box(rw, dl, vp.x + px, vp.y + py, pw, ph, gx, gy, gw, gh, strips, rows)
+  end
+end
+
 -- Shutdown and /term reload: the panels were closed with their sessions;
 -- forget what is left of this module's state.
 global function remotewin_shutdown(): void
   for i = 0, < #streams do
     streams[i].s.window_close = nilptr
-    wintex_release(&streams[i].tex)
-    streams[i].pixels:destroy()
-    streams[i].dirty:destroy()
-    streams[i].app:destroy()
-    delete(streams[i])
+    free_stream(streams[i])
   end
   streams:destroy()
+  restore_done = false
+  loud_lists = 0
+  watching, watch_baseline, auto_dirty, auto_wait = false, false, false, false
+  known_wids:destroy()
+  refused_wids:destroy()
   err_text:destroy()
   winlist_clear()
   winlist.windows:destroy()

@@ -10,6 +10,7 @@ require 'core.host'
 require 'string'
 require 'vector'
 require 'arg'
+require 'os'
 
 ## cinclude '<sys/socket.h>'
 ## cinclude '<fcntl.h>'
@@ -678,6 +679,127 @@ do
   print('window input OK')
 end
 
+-- WGEOM: a menu past the window's edge ---------------------------------------------------------
+-- The picture grows to hold the window (box 0) and its popup; the panel keeps
+-- the window's shape, the popup hangs off it and takes clicks there.
+local function send_geom(sid: uint32, seq: uint32, n: integer, boxes: [8]uint16): void
+  local b: [10 + 8 * 4]uint8
+  proto.put_u32(&b, sid)
+  proto.put_u32((@*[0]uint8)(&b[4]), seq)
+  proto.put_u16((@*[0]uint8)(&b[8]), (@uint16)(n))
+  for i = 0, < n * 4 do proto.put_u16((@*[0]uint8)(&b[10 + i * 2]), boxes[i]) end
+  local q: ByteQueue
+  proto.write_frame(&q, PROTO_WGEOM, &b, (@usize)(10 + n * 8))
+  peer_send(&q)
+  q:destroy()
+end
+local function send_key_frame(sid: uint32, seq: uint32, pw: integer, ph: integer): void
+  local px: vector(uint8)
+  px:resize((@usize)(pw * ph * 4))
+  for i = 0, < pw * ph do px[i * 4 + 3] = 255 end
+  local q: ByteQueue
+  wincodec_diff(nilptr, 0, (@*[0]uint8)(&px[0]), (@usize)(pw * 4), pw, ph, &rects)
+  wincodec_write_frames(&q, sid, seq, (@*[0]uint8)(&px[0]), (@usize)(pw * 4), pw, ph, true, &rects, &scratch, &body)
+  peer_send(&q)
+  q:destroy()
+  px:destroy()
+end
+do
+  local ok0, pl0 = policy_world_place(s.id, now, false)
+  assert(ok0)
+  local PW <comptime> = 96
+  local PH <comptime> = 60
+  -- the boxes come before the frame of their seq and wait for it
+  send_geom(SID, 10, 2, { 0, 0, W, H, 60, 30, 36, 30 })
+  pump()
+  assert(#rw.geom == 0 and rw.geom_pending, 'WGEOM kept until its frame is presented')
+  send_key_frame(SID, 10, PW, PH)
+  pump()
+  assert(rw.w == PW and rw.h == PH and #rw.geom == 2 and not rw.geom_pending, 'applied with its frame')
+  local bx, by, bw, bh = remotewin_window_box(rw)
+  assert(bx == 0 and by == 0 and bw == W and bh == H, 'box 0 is the window')
+  local ok, pl = policy_world_place(s.id, now, false)
+  assert(ok and near(pl.width, pl0.width, 0.01) and near(pl.height, pl0.height, 0.01), 'a menu does not resize the panel')
+  world_frame(false)
+  assert(#images > 24 * 16, 'the window, then the popup')
+  local ix, iy, iw, ih = remotewin_fit(pl.width, pl.height, W, H)
+  local sc = iw / W
+  local vp = viewport.Pos
+  -- box 0: the window's part of the texture over the whole picture area
+  assert(near(images[0].ua.x, 0, 1e-4) and near(images[24 * 16 - 1].ub.x, W / (@float32)(PW), 1e-4)
+    and near(images[24 * 16 - 1].ub.y, H / (@float32)(PH), 1e-4), 'box 0 UVs')
+  assert(near(images[24 * 16 - 1].b.x, vp.x + ix + iw, 0.01), 'box 0 fills the panel')
+  -- the popup: its own quads at the same scale, past the panel's right and bottom edges
+  local minx, miny, maxx, maxy: float32 = 1e9, 1e9, -1e9, -1e9
+  local umin, umax: float32 = 1e9, -1e9
+  for i = 24 * 16, < #images do
+    minx, miny = math.min(minx, images[i].a.x), math.min(miny, images[i].a.y)
+    maxx, maxy = math.max(maxx, images[i].b.x), math.max(maxy, images[i].b.y)
+    umin, umax = math.min(umin, images[i].ua.x), math.max(umax, images[i].ub.x)
+  end
+  assert(near(minx, vp.x + ix + 60 * sc, 0.05) and near(miny, vp.y + iy + 30 * sc, 0.05), 'popup placed by (box - box 0)')
+  assert(near(maxx - minx, 36 * sc, 0.05) and near(maxy - miny, 30 * sc, 0.05), 'popup at the window scale')
+  assert(maxx > vp.x + pl.width and maxy > vp.y + pl.height, 'it hangs off the panel')
+  assert(near(umin, 60 / (@float32)(PW), 1e-4) and near(umax, 1, 1e-4), 'popup UVs')
+  -- focus the panel, then point and click at the part of the menu off the panel
+  now = now + 1
+  mouse_at = panel_screen(s.id, ix + iw * 0.5, iy + ih * 0.5)
+  world_frame(true)
+  world_frame(false)
+  assert(host.world_focus == s.id)
+  now = now + 1
+  forget()
+  local u, v = ix + 88.5 * sc, iy + 52.5 * sc -- picture pixel (88, 52): the popup, outside the panel
+  assert(u > pl.width and v > pl.height)
+  mouse_at = panel_screen(s.id, u, v)
+  world_frame(false)
+  local m = last_input(WIN_INPUT_MOVE)
+  assert(m ~= nilptr and math.abs(i16(m, 0) - 88) <= 1 and math.abs(i16(m, 2) - 52) <= 1, 'MOVE over the popup, in picture pixels')
+  assert(want_mouse, 'the menu keeps the mouse from the game')
+  world_frame(true)
+  local bd = last_input(WIN_INPUT_BUTTON)
+  assert(bd ~= nilptr and bd[5] == 1 and math.abs(i16(bd, 0) - 88) <= 1, 'a click on the menu reaches the window')
+  assert(host.click_used and host.world_focus == s.id, 'and is not a click on the bare world')
+  world_frame(false)
+  -- inside the window: box 0's origin plus the window pixel
+  forget()
+  now = now + 1
+  mouse_at = panel_screen(s.id, ix + 10.5 * sc, iy + 20.5 * sc)
+  world_frame(false)
+  m = last_input(WIN_INPUT_MOVE)
+  assert(m ~= nilptr and math.abs(i16(m, 0) - 10) <= 1 and math.abs(i16(m, 2) - 20) <= 1, 'window pixels')
+  -- off the panel but not on the menu: nothing
+  forget()
+  mouse_at = panel_screen(s.id, pl.width + 200, 10)
+  world_frame(false)
+  assert(inputs(WIN_INPUT_MOVE) == 0, 'beside the panel, off the menu: not the window')
+  -- the menu closes: the picture is the window again
+  send_geom(SID, 11, 1, { 0, 0, W, H, 0, 0, 0, 0 })
+  send_key_frame(SID, 11, W, H)
+  pump()
+  world_frame(false)
+  assert(#rw.geom == 1 and #images == 24 * 16, 'no popup quads')
+  -- a window inside a larger picture (a menu above-left of it): box 0's origin
+  send_geom(SID, 12, 2, { 20, 10, W, H, 0, 0, 30, 12 })
+  send_key_frame(SID, 12, W + 20, H + 10)
+  pump()
+  world_frame(false)
+  bx, by = remotewin_window_box(rw)
+  assert(bx == 20 and by == 10 and near(images[0].ua.x, 20 / (@float32)(W + 20), 1e-4), 'box 0 UVs start at its origin')
+  forget()
+  now = now + 1
+  mouse_at = panel_screen(s.id, ix + 5.5 * sc, iy + 5.5 * sc)
+  world_frame(false)
+  m = last_input(WIN_INPUT_MOVE)
+  assert(m ~= nilptr and math.abs(i16(m, 0) - 25) <= 1 and math.abs(i16(m, 2) - 15) <= 1, 'panel point -> box 0 origin + window pixel')
+  send_geom(SID, 13, 1, { 0, 0, W, H, 0, 0, 0, 0 })
+  send_key_frame(SID, 13, W, H)
+  pump()
+  host.world_focus = 0
+  world_frame(false)
+  print('window popups OK')
+end
+
 -- An older shim: no D3D11 device -------------------------------------------------------------
 do
   host.api.get_scene_depth = nilptr
@@ -740,7 +862,395 @@ do
   print('window lifetime OK')
 end
 
+-- Persistence: keys, the saved layout, reload, refusal, reconnect -------------------------------
+local function send_opened(req: uint32, sid: uint32, title: string): void
+  local ob: vector(uint8)
+  ob:resize(12 + title.size)
+  proto.put_u32((@*[0]uint8)(&ob[0]), req)
+  proto.put_u32((@*[0]uint8)(&ob[4]), sid)
+  if title.size > 0 then memory.copy(&ob[12], title.data, title.size) end
+  local q: ByteQueue
+  proto.write_frame(&q, PROTO_WOPENED, (@*[0]uint8)(&ob[0]), #ob)
+  peer_send(&q)
+  q:destroy()
+  ob:destroy()
+end
+local function send_list(lines: string): void
+  local q: ByteQueue
+  proto.write_frame(&q, PROTO_WLISTR, (@*[0]uint8)(lines.data), lines.size)
+  peer_send(&q)
+  q:destroy()
+end
+local function last_wopen_text(): string
+  peer_collect()
+  local i = #frames - 1
+  while i >= 0 do
+    if frames[i].typ == PROTO_WOPEN then return frames[i].data:subview(14) end
+    i = i - 1
+  end
+  return ''
+end
+local function read_file(path: string): string
+  local f = io.open(path, 'rb')
+  if not f:isopen() then return string{} end
+  local t = f:read('a')
+  f:destroy()
+  return t
+end
+do
+  fake_connect('ghostty-agent 3 43')
+  pump()
+  forget()
+  world_frame(false) -- nothing saved yet: nothing restored
+  assert(#host.world == 0)
+  -- a launched window learns its key from the list the WOPENED asks for
+  assert(window_command('run yad --calendar') == 0)
+  local s5 = host.world[0]
+  local rw5 = remotewin_of(s5)
+  assert(last_wopen_text() == 'run:yad --calendar')
+  forget()
+  send_opened(rw5.req, 30, 'Calendar')
+  pump()
+  assert(count(PROTO_WLIST) == 1, 'WOPENED: the list is asked for, for the key')
+  send_list('0\t0\t0\tlaunch\trun:COMMAND to start an app in the game\n3\t640\t400\tyad\tCalendar\t6aa.1\n4\t300\t200\tfoot\tCalendar\t\n')
+  pump()
+  assert(rw5.key == 'key:6aa.1', 'a launch: key:<launch id>')
+  assert(logged('window #3 640x400') == 0, 'a list asked for keys is not logged')
+  -- a window the agent did not launch: key:\tAPP\tTITLE
+  assert(window_open(WindowOpenSpec{ match = 'Firefox' }) ~= 0)
+  local s6 = host.world[1]
+  local rw6 = remotewin_of(s6)
+  forget()
+  send_opened(rw6.req, 31, 'Mozilla Firefox')
+  pump()
+  send_list('3\t640\t400\tyad\tCalendar\t6aa.1\n7\t800\t600\tfirefox\tMozilla Firefox\t\n')
+  pump()
+  assert(rw6.key == 'key:\tfirefox\tMozilla Firefox' and rw5.key == 'key:6aa.1', 'app and title')
+  -- saved with the layout: key, match text, anchor
+  host.layout_restored = true
+  world_frame(false)
+  local ok5, pl5 = policy_world_place(s5.id, now, false)
+  assert(ok5)
+  save_world_state()
+  local path = dir .. '/window-state.lua'
+  local saved = read_file(path)
+  assert(saved:find('key:6aa.1', 1, true) > 0 and saved:find('run:yad --calendar', 1, true) > 0, 'saved: key and match')
+  assert(saved:find('Firefox', 1, true) > 0 and saved:find('kind = "world"', 1, true) > 0, 'saved: the anchor')
+  saved:destroy()
+  -- /term reload: no WCLOSE (the agent keeps the windows); both asked for by key after it
+  forget()
+  assert(run_command('reload') == 0)
+  host.agent:flush()
+  assert(count(PROTO_WCLOSE) == 0, 'a reload does not close the windows')
+  assert(#host.world == 0)
+  host.agent_last_try = 1e9
+  world_frame(false) -- not connected yet
+  fake_connect('ghostty-agent 3 43')
+  pump()
+  forget()
+  world_frame(false)
+  assert(#host.world == 2, 'both panels back')
+  local r1 = remotewin_of(host.world[0])
+  local r2 = remotewin_of(host.world[1])
+  assert(r1.key == 'key:6aa.1' and r1.match == 'run:yad --calendar' and r2.key == 'key:\tfirefox\tMozilla Firefox', 'keys and match texts')
+  assert(count(PROTO_WOPEN) == 2, 'asked for by key')
+  local okr, plr = policy_world_place(host.world[0].id, now, false)
+  assert(okr and near(plr.x, pl5.x, 1e-3) and near(plr.z, pl5.z, 1e-3) and near(plr.width, pl5.width, 0.01) and near(plr.height, pl5.height, 0.01),
+    'the saved anchor: place and size')
+  -- a key the agent no longer knows: the match text again (a relaunch), then its new key
+  forget()
+  send_opened(r1.req, 0, 'no such window (the app is not running: launch it again)')
+  pump()
+  assert(r1.state == RemoteWinState.Opening and last_wopen_text() == 'run:yad --calendar', 'refused: launched again')
+  assert(#r1.key == 0)
+  send_opened(r1.req, 40, 'Calendar')
+  send_opened(r2.req, 41, 'Mozilla Firefox')
+  pump()
+  send_list('3\t640\t400\tyad\tCalendar\t7bb.1\n7\t800\t600\tfirefox\tMozilla Firefox\t\n')
+  pump()
+  assert(r1.state == RemoteWinState.Live and r1.key == 'key:7bb.1', 'the new key')
+  -- the connection goes: panels wait and ask again by key when it is back
+  host.agent:disconnect()
+  host.agent.state = AgentState.Failed
+  world_frame(false)
+  assert(r1.state == RemoteWinState.Opening and r1.reopen and #host.world == 2, 'waiting, not closed')
+  for _ = 1, 200 do world_frame(false) end
+  assert(#host.world == 2, 'still there')
+  fake_connect('ghostty-agent 3 43')
+  pump()
+  forget()
+  world_frame(false)
+  assert(count(PROTO_WOPEN) == 2 and not r1.reopen, 'asked for again')
+  local found = false
+  for i = 0, < #frames do
+    if frames[i].typ == PROTO_WOPEN and frames[i].data:subview(14) == 'key:7bb.1' then found = true end
+  end
+  assert(found, 'by key')
+  send_opened(r1.req, 50, 'Calendar')
+  pump()
+  -- the panel's ×: WCLOSE, and it is not saved any more
+  forget()
+  assert(window_close(host.world[0].id))
+  for _ = 1, 120 do world_frame(false) end
+  host.agent:flush()
+  local c = last(PROTO_WCLOSE)
+  assert(c ~= nilptr and proto.get_u32(c) == 50, 'closed by its ×: WCLOSE')
+  save_world_state()
+  saved = read_file(path)
+  assert(saved:find('7bb', 1, true) == 0 and saved:find('Firefox', 1, true) > 0, 'only the open panel saved')
+  saved:destroy()
+  while #host.world > 0 do close_terminal(host.world[0]) end
+  print('window persistence OK')
+end
+
+-- Reserved chords: super+* (the default) never reaches the window ------------------------------
+do
+  assert(keychord_reserved(KEYCHORD_SUPER, 'q') and keychord_reserved(KEYCHORD_SUPER | KEYCHORD_SHIFT, 'enter'), 'super+*')
+  assert(not keychord_reserved(KEYCHORD_CTRL, 'c') and not keychord_reserves_all(KEYCHORD_ALT | KEYCHORD_SHIFT), 'others not')
+  local okp, c = keychord_parse('Ctrl+Alt+Return')
+  assert(okp and c.mods == KEYCHORD_CTRL | KEYCHORD_ALT and c.key == 'enter', 'parsed')
+  local okb, _, why = keychord_parse('*')
+  assert(not okb and #why > 0, '* alone is refused')
+  assert(window_open(WindowOpenSpec{ match = 'x' }) ~= 0)
+  local s7 = host.world[0]
+  local rw7 = remotewin_of(s7)
+  send_opened(rw7.req, 60, 'x')
+  pump()
+  send_frame(60, 1, &f1, nilptr)
+  pump()
+  for _ = 1, 60 do world_frame(false) end
+  local ok, pl = policy_world_place(s7.id, now, false)
+  now = now + 1
+  mouse_at = panel_screen(s7.id, pl.width * 0.5, pl.height * 0.5)
+  world_frame(true)
+  world_frame(false)
+  assert(host.world_focus == s7.id)
+  forget()
+  io_state.KeySuper = true
+  keys_down[ImGuiKey_Q] = true
+  keys_down[ImGuiKey_Enter] = true
+  world_frame(false)
+  keys_down[ImGuiKey_Q] = false
+  keys_down[ImGuiKey_Enter] = false
+  world_frame(false)
+  io_state.KeySuper = false
+  assert(inputs(WIN_INPUT_KEY) == 0, 'super chords stay with XivDesktop')
+  forget()
+  io_state.KeyCtrl = true
+  keys_down[ImGuiKey_C] = true
+  world_frame(false)
+  keys_down[ImGuiKey_C] = false
+  world_frame(false)
+  io_state.KeyCtrl = false
+  assert(inputs(WIN_INPUT_KEY) == 2, 'ctrl+c still goes')
+  -- configured otherwise: alt+shift+*
+  assert(luaL_loadstring(policy.L, "CONFIG.windows.reserved_chords = { 'alt+shift+*' }") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  forget()
+  io_state.KeyAlt, io_state.KeyShift = true, true
+  keys_down[ImGuiKey_H] = true
+  chars[0] = 72
+  io_state.InputQueueCharacters.Size = 1
+  world_frame(false)
+  keys_down[ImGuiKey_H] = false
+  world_frame(false)
+  io_state.KeyAlt, io_state.KeyShift = false, false
+  assert(inputs(WIN_INPUT_KEY) == 0 and inputs(WIN_INPUT_TEXT) == 0, 'alt+shift+h reserved')
+  forget()
+  io_state.KeySuper = true
+  keys_down[ImGuiKey_Q] = true
+  world_frame(false)
+  keys_down[ImGuiKey_Q] = false
+  world_frame(false)
+  io_state.KeySuper = false
+  assert(inputs(WIN_INPUT_KEY) == 2, 'super is the window\'s again')
+  close_terminal(s7)
+  print('window reserved chords OK')
+end
+
+-- New windows: a watching agent's pushed lists open them as panels ----------------------------
+local function wopens(): integer return count(PROTO_WOPEN) end
+local function last_wopen_wid(): uint32
+  local p = last(PROTO_WOPEN)
+  if p == nilptr then return 0 end
+  return proto.get_u32((@*[0]uint8)(&p[4]))
+end
+local function stream_of_wid(wid: uint32): *RemoteWin
+  for i = 0, < #host.world do
+    local r = remotewin_of(host.world[i])
+    if r ~= nilptr and r.wid == wid then return r end
+  end
+  return nilptr
+end
+do
+  host.agent:disconnect()
+  host.agent.state = AgentState.Failed
+  world_frame(false)
+  fake_connect('ghostty-agent 3 44')
+  pump()
+  forget()
+  world_frame(false)
+  local watch_sent = false
+  assert(count(PROTO_WLIST) >= 1)
+  for i = 0, < #frames do
+    if frames[i].typ == PROTO_WLIST and frames[i].data == 'watch' then watch_sent = true end
+  end
+  assert(watch_sent, 'WLIST watch on connect')
+  local LAUNCH: string = '0\t0\t0\tlaunch\trun:COMMAND to start an app in the game\n'
+  -- the first list is what was already there
+  forget()
+  send_list(LAUNCH .. '3\t640\t400\tyad\tCalendar\t6aa.1\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 0 and #host.world == 0, 'the baseline opens nothing')
+  -- a tab torn off into a window: opened by its id, where open_at says
+  send_list(LAUNCH .. '3\t640\t400\tyad\tCalendar\t6aa.1\n9\t800\t600\tfirefox\tNew Tab\t\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 1 and last_wopen_wid() == 9 and #host.world == 1, 'a new window: WOPEN #9')
+  local tab = stream_of_wid(9)
+  assert(tab ~= nilptr)
+  forget()
+  send_opened(tab.req, 70, 'New Tab')
+  pump()
+  send_frame(70, 1, &f1, nilptr)
+  pump()
+  for _ = 1, 30 do world_frame(false) end -- shown: its pose is known
+  -- ours (sid:) and 5-column lines (not the compositor's) are never opened
+  send_list(LAUNCH .. '3\t640\t400\tyad\tCalendar\t6aa.1\n9\t800\t600\tfirefox\tNew Tab\t\tsid:70\n10\t300\t200\tfoot\tfoot\t\tsid:71\n14\t300\t200\tnotepad\tUntitled\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 0 and #host.world == 1, 'sid: lines and other desktops are not new windows')
+  -- a dialog: pinned beside its window's panel, a little in front
+  send_list(LAUNCH .. '9\t800\t600\tfirefox\tNew Tab\t\tsid:70\n11\t400\t300\tfirefox\tSave As\t\tparent:9\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 1 and last_wopen_wid() == 11, 'the dialog opened')
+  local dlg = stream_of_wid(11)
+  assert(dlg ~= nilptr and dlg.parent_id == tab.s.id, 'it knows its window')
+  local okp, pp = policy_world_place(tab.s.id, now, false)
+  local okd, pd = policy_world_place(dlg.s.id, now, false)
+  assert(okp and okd and near(pd.yaw, pp.yaw, 1e-4), 'facing the same way')
+  local rx, rz = math.cos(pp.yaw), -math.sin(pp.yaw)
+  local fx, fz = math.sin(pp.yaw), math.cos(pp.yaw)
+  local side = (pd.x - pp.x) * rx + (pd.z - pp.z) * rz
+  local front = (pd.x - pp.x) * fx + (pd.z - pp.z) * fz
+  assert(side > pp.width / pp.ppm / 2 and near(front, 0.15, 1e-3) and near(pd.y, pp.y, 1e-4), 'to its right, a little in front')
+  send_opened(dlg.req, 72, 'Save As')
+  pump()
+  -- closing the window's panel closes its dialog's
+  forget()
+  assert(window_close(tab.s.id))
+  for _ = 1, 120 do world_frame(false) end
+  assert(#host.world == 0, 'the dialog went with its window')
+  -- a refused window is not asked for again while it is listed
+  forget()
+  send_list(LAUNCH .. '15\t400\t300\tgimp\tGIMP\t\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 1 and last_wopen_wid() == 15)
+  local g = stream_of_wid(15)
+  send_opened(g.req, 0, 'window closed')
+  pump()
+  for _ = 1, 200 do world_frame(false) end
+  forget()
+  send_list(LAUNCH .. '15\t400\t300\tgimp\tGIMP\t\n16\t400\t300\tgimp\tGIMP 2\t\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 1 and last_wopen_wid() == 16, 'no second try for #15')
+  -- 'none': the picker only
+  while #host.world > 0 do close_terminal(host.world[0]) end
+  assert(luaL_loadstring(policy.L, "CONFIG.windows.auto_open = 'none'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  forget()
+  send_list(LAUNCH .. '17\t400\t300\tfoot\tfoot\t\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 0 and #host.world == 0, "auto_open 'none'")
+  -- 'related': only beside a panel of the same app or a dialog's window
+  assert(luaL_loadstring(policy.L, "CONFIG.windows.auto_open = 'related'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  send_list(LAUNCH .. '17\t400\t300\tfoot\tfoot\t\n18\t400\t300\txterm\txterm\t\n')
+  pump()
+  world_frame(false)
+  assert(wopens() == 0, "'related': an unrelated window stays out")
+  print('window auto open OK')
+end
+
+-- CONFIG.windows.never: kept out everywhere -----------------------------------------------------
+do
+  assert(luaL_loadstring(policy.L, "CONFIG.windows.never = { '1password', 'org.gnome.*', 'secret' } CONFIG.windows.auto_open = 'all'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  while #host.world > 0 do close_terminal(host.world[0]) end
+  for _ = 1, 10 do world_frame(false) end
+  assert(#window_never('1Password', '', '') > 0 and #window_never('', 'org.gnome.Nautilus', '') > 0, 'app id, desktop id with *')
+  assert(#window_never('yad', '', 'My SECRET notes') > 0 and #window_never('yad', '', 'Calendar') == 0, 'a part of the title')
+  forget()
+  local before = logged('1Password is on CONFIG.windows.never')
+  assert(window_command('pull 1Password') == 4 and logged('1Password is on CONFIG.windows.never') > before, '/window pull refused, said')
+  local id, err = window_open(WindowOpenSpec{ run = '/opt/1Password/1password --silent' })
+  assert(id == 0 and err == '1password is on CONFIG.windows.never', 'a run refused')
+  id = window_open(WindowOpenSpec{ match = 'app:org.gnome.Nautilus' })
+  assert(id == 0, 'an app: refused')
+  assert(count(PROTO_WOPEN) == 0 and #host.world == 0, 'nothing asked of the agent')
+  local LAUNCH: string = '0\t0\t0\tlaunch\trun:COMMAND to start an app in the game\n'
+  send_list(LAUNCH .. '20\t400\t300\t1password\tLock\t\n21\t400\t300\torg.gnome.Nautilus\tFiles\t\n22\t400\t300\tyad\tMy secret notes\t\n23\t400\t300\tyad\tCalendar 2\t\n')
+  pump()
+  world_frame(false)
+  assert(count(PROTO_WOPEN) == 1 and last_wopen_wid() == 23, 'auto open skips the kept-out windows')
+  -- a title that comes to match: the panel closes
+  local c2 = stream_of_wid(23)
+  send_opened(c2.req, 80, 'Calendar 2')
+  pump()
+  forget()
+  send_list(LAUNCH .. '23\t400\t300\tyad\tSecret plans\t\tsid:80\n')
+  pump()
+  for _ = 1, 120 do world_frame(false) end
+  host.agent:flush()
+  assert(#host.world == 0 and count(PROTO_WCLOSE) == 1, 'closed when its title came to match')
+  -- apps: the picker and agent.apps leave them out
+  local ap: WinAppEntry = { id = '1password', name = '1Password' }
+  local ok_ap: WinAppEntry = { id = 'org.kde.kate', name = 'Kate' }
+  assert(winlist_app_never(&ap) and not winlist_app_never(&ok_ap))
+  assert(luaL_loadstring(policy.L, "CONFIG.windows.never = {}") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  print('window never OK')
+end
+
+-- App icons that appear late: looked for again every few seconds -------------------------------
+local tex_asked: string
+local function fake_texture_file(path: cstring, w: *uint32, h: *uint32): pointer
+  tex_asked:destroy()
+  tex_asked = string.copy(path)
+  $w, $h = 128, 128
+  return (@pointer)(0x777)
+end
+do
+  local path = dir .. '/build/late-icon-test.png'
+  os.remove(path)
+  local t0 = now
+  assert(winpicker_icon(path, t0) == nilptr, 'not there yet')
+  host.api.texture_file = fake_texture_file
+  local f = io.open(path, 'wb')
+  f:write('png')
+  f:close()
+  f:destroy()
+  assert(winpicker_icon(path, t0 + 1) == nilptr, 'not looked for again at once')
+  assert(winpicker_icon(path, t0 + 3.5) == (@pointer)(0x777) and tex_asked == path, 'found a few seconds later: the texture')
+  host.api.texture_file = nilptr
+  assert(winpicker_icon(path, t0 + 4) == nilptr, 'an older shim: the letter')
+  os.remove(path)
+  path:destroy()
+  tex_asked:destroy()
+  print('window picker icons OK')
+end
+
 gu_shutdown()
+do -- the next test's core must not restore these windows
+  local ws = dir .. '/window-state.lua'
+  os.remove(ws)
+  ws:destroy()
+end
 wintex_fake = nilptr
 f1:destroy() f2:destroy() scratch:destroy() body:destroy() rects:destroy() uploads:destroy() images:destroy()
 print('remotewin OK')

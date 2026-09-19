@@ -92,6 +92,10 @@ global GuHostApi = @record{
   addon_show: function(name: cstring, shown: cint): cint, -- a game addon (AtkUnitBase) shown or hidden; 1 = ok
   chat_send: function(text: cstring): cint,              -- a line through the game's chat box; 1 = queued
   config_uint: function(name: cstring, out: *uint32): cint, -- a UiConfig option (log colours); 1 = found
+  -- an image file as an ImTextureID (Dalamud's ITextureProvider.GetFromFile),
+  -- nilptr until it has loaded; asked again each frame it is drawn. nilptr in
+  -- older shims: the Windows picker shows letters instead of app icons
+  texture_file: function(path: cstring, w: *uint32, h: *uint32): pointer,
 }
 
 global LOG_INFO: cint <comptime> = 1

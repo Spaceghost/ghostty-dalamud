@@ -245,6 +245,16 @@ function AgentClient:wlist_apps(): boolean
   return true
 end
 
+-- Subscribe to the window list (WLIST "watch"): answered at once, then pushed
+-- again whenever a window maps or unmaps or one of our streams opens or
+-- closes. An agent from before watching answers once and never again.
+function AgentClient:wlist_watch(): boolean
+  if not self:windows_ok() then return windows_refuse(self) end
+  local what: string = 'watch'
+  proto.write_frame(&self.outq, PROTO_WLIST, (@*[0]uint8)(what.data), what.size)
+  return true
+end
+
 -- Open window `wid` (0: the desktop picks, or the first matching `match`)
 -- as a stream no larger than max_w x max_h at up to `fps`. Answered, maybe
 -- much later, by a WOPENED event carrying `req`.

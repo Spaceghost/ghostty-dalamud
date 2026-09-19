@@ -131,6 +131,10 @@ S.schema = {
   { 'Flat windows in the world', {
     { 'adopt.auto.mappy', 'checkbox', 'Mappy\'s map is a world panel whenever it is open' },
   } },
+  { 'Remote windows', {
+    { 'windows.auto_open', 'combo', { 'all', 'related', 'none' }, 'New windows of the agent become panels (related: dialogs and windows of apps you have out)' },
+    { 'windows.never', 'list', 'Never show in game (app id, desktop id or part of a title; * matches anything)' },
+  } },
   { 'Info bar & hidden UI', {
     { 'host.dtr.mode', 'combo', DTR_MODES, 'Server info bar entry (auto: only without the Umbra widget)' },
     { 'popup.close_on_blur', 'checkbox', 'Info bar popup closes when you click elsewhere' },
@@ -265,6 +269,11 @@ function S.save()
   for _, k in ipairs(keys) do
     local v = S.values[k]
     local lit = type(v) == 'string' and string.format('%q', v) or tostring(v)
+    if type(v) == 'table' then -- a list of strings (kind 'list')
+      local items = {}
+      for i, s in ipairs(v) do items[i] = string.format('%q', tostring(s)) end
+      lit = '{ ' .. table.concat(items, ', ') .. ' }'
+    end
     out[#out + 1] = string.format('  [%q] = %s,\n', k, lit)
   end
   out[#out + 1] = '}\n'
@@ -350,6 +359,8 @@ function S.draw_settings(ui)
           c, v = ui.checkbox(e[3] .. '##' .. path, cur and true or false)
         elseif kind == 'combo' then
           c, v = ui.combo(e[4] .. '##' .. path, tostring(cur or ''), e[3])
+        elseif kind == 'list' then
+          c, v = S.draw_list(ui, path, e[3], cur)
         elseif kind == 'argv' then
           -- a command line, read-only here: edit it in the Lua module
           local words = {}
@@ -364,7 +375,7 @@ function S.draw_settings(ui)
           set(config, path, v)
           S.values[path] = v
           changed = true
-          if kind == 'checkbox' or kind == 'combo' then save_now = true end
+          if kind == 'checkbox' or kind == 'combo' or kind == 'list' then save_now = true end
         end
         if done then save_now = true end
       end
@@ -380,6 +391,38 @@ function S.draw_settings(ui)
   end
   if save_now then S.save() end
   return changed
+end
+
+-- A list of strings: each with a remove button, and a box to add one
+-- (Enter or Add). Returns changed and the new list (a copy).
+S.drafts = {}
+function S.draw_list(ui, path, label, cur)
+  local list = type(cur) == 'table' and cur or {}
+  ui.text(label)
+  local out, changed = {}, false
+  for i, item in ipairs(list) do
+    if ui.button('x##' .. path .. i) then
+      changed = true
+    else
+      out[#out + 1] = item
+    end
+    ui.same_line()
+    ui.text(tostring(item))
+  end
+  if #list == 0 then ui.wrapped('(none)', 0.72, 0.74, 0.78) end
+  if ui.input then
+    local _, draft, entered = ui.input('##add' .. path, S.drafts[path] or '')
+    S.drafts[path] = draft
+    ui.same_line()
+    local add = ui.button('Add##' .. path)
+    draft = draft:match('^%s*(.-)%s*$')
+    if (add or entered) and draft ~= '' then
+      out[#out + 1] = draft
+      S.drafts[path] = ''
+      changed = true
+    end
+  end
+  return changed, out
 end
 
 -- The Theme combo: picking one applies it at once (live), hovering one in

@@ -12,6 +12,78 @@ require 'C.stdio'
 require 'core.app.remotewin'
 
 local run_buf: [512]cchar       -- the Run: box
+
+-- App icons ---------------------------------------------------------------------
+-- The agent names each app's icon as a PNG path it renders in the background,
+-- so the file may appear a moment after the list. A missing file is looked
+-- for again every ICON_RETRY seconds; meanwhile, and without the shim's
+-- texture_file (Dalamud's ITextureProvider), the app's first letter stands in.
+local ICON_RETRY <comptime> = 3.0
+local IconFile = @record{ path: string, native: string, exists: boolean, checked_at: float64 } -- owned
+local icons: vector(IconFile)
+
+-- The agent's Linux path as this process opens it: under Wine a path from
+-- / is on drive Z: (the host's root in a default prefix).
+local function native_path(path: string): string
+  ## if ccinfo.is_windows then
+    if #path > 0 and path.data[0] == '/'_b then
+      local sb: stringbuilder
+      sb:write('Z:')
+      for i = 0, < #path do sb:writebyte(path.data[i] == '/'_b and '\\'_b or path.data[i]) end
+      return sb:promote()
+    end
+  ## end
+  return path:copy()
+end
+
+local function file_exists(path: string): boolean
+  local f = C.fopen((@cstring)(path.data), 'rb')
+  if f == nilptr then return false end
+  C.fclose(f)
+  return true
+end
+
+-- The icon's texture, or nilptr (not there yet, not loaded yet, no shim support).
+global function winpicker_icon(path: string, now: float64): pointer
+  if #path == 0 then return nilptr end
+  local ic: *IconFile = nilptr
+  for i = 0, < #icons do
+    if icons[i].path == path then ic = &icons[i] break end
+  end
+  if ic == nilptr then
+    icons:push(IconFile{ path = path:copy(), native = native_path(path), checked_at = -1e9 })
+    ic = &icons[#icons - 1]
+  end
+  if not ic.exists and (now - ic.checked_at >= ICON_RETRY or now < ic.checked_at) then
+    ic.checked_at = now
+    ic.exists = file_exists(ic.native) -- the agent may still be rendering it
+  end
+  if not ic.exists or host.api.texture_file == nilptr then return nilptr end
+  local w: uint32, h: uint32 = 0, 0
+  return host.api.texture_file((@cstring)(ic.native.data), &w, &h)
+end
+
+-- The icon (or the first letter of `name`) in a `size` square at the cursor.
+local function draw_icon(a: *WinAppEntry, size: float32, now: float64): void
+  local p: ImVec2
+  imgui.GetCursorScreenPos(&p)
+  local dl = imgui.GetWindowDrawList()
+  local tex = winpicker_icon(a.icon, now)
+  if tex ~= nilptr and imgui.DrawListAddImage ~= nilptr then
+    imgui.DrawListAddImage(dl, tex, p, vec2(p.x + size, p.y + size), vec2(0, 0), vec2(1, 1), im_col32(255, 255, 255, 255))
+  else
+    imgui.DrawListAddRectFilled(dl, p, vec2(p.x + size, p.y + size), chrome_col(ChromeColor.Chip, 230), 4, 0)
+    if #a.name > 0 then
+      local letter: [2]cchar = { (@cchar)(a.name.data[0]), 0 }
+      if letter[0] >= 'a'_b and letter[0] <= 'z'_b then letter[0] = letter[0] - 32 end
+      local fs = imgui.GetFontSize()
+      imgui.DrawListAddText(dl, imgui.GetFont(), fs, vec2(p.x + (size - fs * 0.5) * 0.5, p.y + (size - fs) * 0.5),
+        chrome_col(ChromeColor.Ink, 255), (@cstring)(&letter), nilptr, 0, nilptr)
+    end
+  end
+  imgui.Dummy(vec2(size, size))
+  imgui.SameLine(0, -1)
+end
 local note: string              -- the last result, shown at the bottom (owned)
 local note_bad = false
 
@@ -111,6 +183,7 @@ global function draw_window_picker(): void
       for i = 0, < #winlist.windows do
         local e = &winlist.windows[i]
         if e.wid == 0 then continue end -- "what WOPEN with wid 0 does": the button below
+        if winlist_entry_never(e) then continue end -- CONFIG.windows.never
         imgui.PushIDInt((@cint)(i))
         local size: [32]cchar
         C.snprintf((@cstring)(&size), #size, '  %dx%d', (@cint)(e.w), (@cint)(e.h))
@@ -145,7 +218,9 @@ global function draw_window_picker(): void
         imgui.Separator()
         for i = 0, < #winlist.apps do
           local a = &winlist.apps[i]
+          if winlist_app_never(a) then continue end -- CONFIG.windows.never
           imgui.PushIDInt((@cint)(10000 + i))
+          draw_icon(a, imgui.GetFontSize() + 4, host.last_time)
           if imgui.Selectable(label(&buf, a.name, #a.categories > 0 and '   ' or '', a.categories), false, 0, vec2(0, 0)) then
             local sb: stringbuilder
             sb:write('app:', a.id) -- the agent starts the app with this id
@@ -196,6 +271,8 @@ global function draw_window_picker(): void
 end
 
 global function window_picker_shutdown(): void
+  for i = 0, < #icons do icons[i].path:destroy() icons[i].native:destroy() end
+  icons:destroy()
   note:destroy()
   note_bad = false
   run_buf[0] = 0

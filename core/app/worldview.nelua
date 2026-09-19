@@ -147,6 +147,7 @@ global function save_world_state(): void
   layout_push(&entries, &host.world, 'world')
   policy_world_save(&entries)
   entries:destroy()
+  remotewin_save_state() -- window panels, by their window keys
 end
 
 -- World screens nobody can see stop streaming after a moment (unless marked
@@ -944,6 +945,7 @@ global function draw_world(now: float64): void
         -- background, title and border still are)
         local cell_px = s.cell_h * (maxy - miny) / math.max(pl.height, 1)
         if s.kind == TransportKind.Window then -- a remote window's picture (core/app/remotewin.nelua)
+          remotewin_projection(&cam, &b, rel, ft >= 0.5, vec2(mouse.x - full_at.x, mouse.y - full_at.y)) -- for its popups
           remotewin_panel(s, dl, vp, pl.width, pl.height, focused, on_grid, mu, mv, click)
         elseif s.kind == TransportKind.Panel then -- a flat window pulled into the world (core/app/panels.nelua)
           panel_content(s, dl, vp, pl.width, pl.height, focused, on_grid, mu, mv, click)
@@ -1002,6 +1004,7 @@ global function draw_world(now: float64): void
           imgui.DrawListAddLine(dl, vec2(vp.x + pl.width - 1.5, vp.y), vec2(vp.x + pl.width - 1.5, vp.y + pl.height), col, 3.0)
         end
         bell_panel_border(dl, vp, pl.width, pl.height, s.id)
+        if s.kind == TransportKind.Window then remotewin_popups(s, dl, vp) end -- menus over everything of the panel
         if carried then
           draw_drag_grip(dl, vp, pl.width, pl.height, host.drag.u, host.drag.v)
         elseif drag_alt and host.drag.id == 0 and drag_in.hover_id == s.id then

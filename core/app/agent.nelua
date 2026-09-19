@@ -41,12 +41,12 @@ local function find_agent_session(id: uint32): *Session
   return nilptr
 end
 
--- Remote window replies (WLISTR, WOPENED, WFRAME, WEND) belong to
+-- Remote window replies (WLISTR, WOPENED, WFRAME, WEND, WGEOM) belong to
 -- core/app/remotewin.nelua, which sets this before sending its first request.
 global agent_window_event: function(ev: *AgentEvent): void
 
 global function agent_event(ctx: pointer, ev: *AgentEvent): void
-  if ev.typ >= PROTO_WLISTR and ev.typ <= PROTO_WEND then
+  if ev.typ >= PROTO_WLISTR and ev.typ <= PROTO_WGEOM then
     if agent_window_event ~= nilptr then agent_window_event(ev) end
   elseif ev.typ == PROTO_OPENED then
     -- OPENED answers the OPENs in order. A closed terminal leaves a nilptr in

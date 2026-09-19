@@ -346,6 +346,15 @@ expect('{"method":"agent.windows"}', [[
   assert(w[2].wid == 7 and w[2].app == 'firefox' and w[2].title == 'Mozilla Firefox' and w[2].key == '' and #w[2].extra == 0, RAW)
   assert(w[3].wid == 0, RAW)]])
 expect('{"method":"agent.apps"}', 'assert(#r.result == 1 and r.result[1].id == "foot" and r.result[1].categories == "System;TerminalEmulator;", RAW)')
+-- CONFIG.windows.never: other plugins do not see them either
+assert(luaL_loadstring(policy.L, "CONFIG.windows.never = { 'foot', 'firefox' }") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+policy_refresh()
+frame()
+expect('{"method":"agent.apps"}', 'assert(#r.result == 0, RAW)')
+expect('{"method":"agent.windows"}', 'assert(#r.result == 2 and r.result[1].wid == 5 and r.result[2].wid == 0, RAW)')
+assert(luaL_loadstring(policy.L, "CONFIG.windows.never = {}") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+policy_refresh()
+frame()
 expect('{"method":"agent.status"}', 'assert(r.result.window_lists == 2, RAW)')
 expect('{"method":"window.list"}', 'assert(r.result.windows[1].key == "yad-1" and r.result.windows[1].agent == "default", RAW)')
 assert(logged('window #5 640x400 [yad] Yad Window  @default key yad-1') == 1, 'the key in the /window list log line')
@@ -398,6 +407,27 @@ frame()
 assert(#host.world == 0 and find_session(pid) == nilptr, 'closed')
 assert(count(PROTO_WCLOSE) == 1, 'the stream closed')
 expect('{"method":"window.list"}', 'assert(#r.result.windows == 0 and r.result.requests[#r.result.requests].ok, RAW)')
+
+-- keys.reserve: a plugin's chords are neither sent to windows nor typed into terminals
+do
+  expect('{"method":"keys.reserve","params":{"chords":["alt+shift+q","ctrl+alt+*"]},"caller":"XivDesktop"}', 'assert(r.ok and r.result.queued, RAW)')
+  frame()
+  expect('{"method":"window.list"}', 'local q = r.result.requests[#r.result.requests]; assert(q.method == "keys.reserve" and q.ok and q.result.chords == 2, RAW)')
+  assert(keychord_reserved(KEYCHORD_ALT | KEYCHORD_SHIFT, 'q') and not keychord_reserved(KEYCHORD_ALT | KEYCHORD_SHIFT, 'w'), 'a named chord')
+  assert(keychord_reserved(KEYCHORD_CTRL | KEYCHORD_ALT, 'f5') and keychord_reserves_all(KEYCHORD_CTRL | KEYCHORD_ALT), 'a wildcard chord')
+  assert(keychord_reserved(KEYCHORD_SUPER, 'a') and not keychord_reserved(KEYCHORD_CTRL, 'a'), 'CONFIG.windows.reserved_chords: super+* by default')
+  -- a bad chord changes nothing
+  expect('{"method":"keys.reserve","params":{"chords":["hyper+x"]},"caller":"XivDesktop"}', 'assert(r.ok, RAW)')
+  frame()
+  expect('{"method":"window.list"}', 'local q = r.result.requests[#r.result.requests]; assert(not q.ok and q.error:find("hyper"), RAW)')
+  assert(keychord_reserved(KEYCHORD_ALT | KEYCHORD_SHIFT, 'q'), 'kept')
+  expect('{"method":"keys.reserve","params":{"chords":"super+*"}}', 'assert(not r.ok and r.error:find("array"), RAW)')
+  expect('{"method":"keys.reserve","params":{"chords":["super +x"]}}', 'assert(not r.ok, RAW)')
+  -- [] lets them go
+  expect('{"method":"keys.reserve","params":{"chords":[]},"caller":"XivDesktop"}', 'assert(r.ok, RAW)')
+  frame()
+  assert(not keychord_reserved(KEYCHORD_ALT | KEYCHORD_SHIFT, 'q') and keychords_count('', true) == 0, 'released')
+end
 
 -- refusals through the channel
 expect('{"method":"window.list",', 'assert(r.ok == false and r.error:find("malformed JSON"), RAW)')

@@ -31,7 +31,7 @@ client → agent
 
 | type | name | payload |
 |---|---|---|
-| 11 | WLIST | – , or `apps` (installed apps instead of windows, below) |
+| 11 | WLIST | – , or `apps` (installed apps instead of windows, below), or `watch` (the window list now and whenever it changes, below) |
 | 12 | WOPEN | req u32, wid u32, max_w u16, max_h u16, fps u8, then optional UTF-8 match text |
 | 13 | WACK | sid, seq u32 |
 | 14 | WINPUT | sid, kind u8, body (below) |
@@ -76,24 +76,32 @@ A client that ignores it still maps input correctly (WINPUT coordinates
 are picture pixels), but shows the picture shrinking while a menu is open
 and black where neither window nor popup is.
 
-What the plugin has to do with WGEOM (core/app/remotewin.nelua; not done):
+What the plugin does with WGEOM (core/app/remotewin.nelua):
 
-1. Keep the latest boxes per stream, parsed as above, applied when the
-   frame with that `seq` is presented.
-2. Size and place the panel from box 0 only: the panel's aspect and
-   letterbox come from the window's w×h, not the picture's, so opening a
-   menu does not resize or shift the window on the panel.
-3. Draw the texture's box-0 region into the panel as today (UVs = box 0 /
-   picture size), then each other box as its own quad at the same scale,
-   offset from the window's placement by (box − box 0), even where that is
-   outside the panel (menus hang over the panel's edge in the world).
-   Nothing outside the boxes is drawn (it is black in the picture).
-4. Input: a panel point maps to picture pixel = box 0's origin + the point
-   in window pixels; points over a popup quad outside the panel go to the
-   stream too (map through that quad), so a menu below the panel can be
-   clicked. A click outside every box still goes to the stream (it closes
-   the menu).
-5. Old agents never send WGEOM: treat "no boxes" as box 0 = the whole picture.
+1. The latest boxes are kept per stream and applied when the frame with
+   that `seq` (or a later one) ends, so boxes and pixels change together.
+2. The panel's size and letterbox come from box 0 only, so opening a menu
+   neither resizes nor shifts the window on the panel.
+3. Box 0's region of the texture fills the panel (UVs = box 0 / picture
+   size). Each other box is its own grid of quads at the same scale, offset
+   from box 0's placement by (box − box 0), also past the panel's edges,
+   drawn after the panel's chrome (worldview calls `remotewin_popups`) and
+   bent onto the panel's surface extended. Nothing outside the boxes is
+   drawn.
+4. Input: a panel point is box 0's origin + the point in window pixels.
+   While popups are shown, the pointer off the panel is hit-tested against
+   the popups' bounding box on the panel's extended surface
+   (`world_hit_area` in core/world.nelua, world_hit's grid over any
+   rectangle), so a menu below or beside the panel takes moves, clicks and
+   the wheel; there the panel keeps the mouse from the game and the click
+   does not count as a click on the bare world. A click on the panel outside
+   box 0 (the letterbox) goes to the stream too while popups are open (it
+   closes them).
+5. No WGEOM (older agents, Windows, macOS): box 0 is the whole picture.
+
+Limits: on a curved panel a popup past the side edges follows the cylinder
+and the depth test's surface for it is approximate; a popup over the title
+buttons is drawn over them but the buttons keep their clicks.
 
 Flow control: the agent keeps at most 2 unacknowledged `seq` per stream. The
 client sends WACK with the `seq` it presented. A stream nobody acknowledges
@@ -128,7 +136,9 @@ characters, so layouts on the two ends need not match.
 | `agent/capture_mac.nelua` | agent (macOS) | CGWindowList for the list, ScreenCaptureKit for frames, CGEventPostToPid |
 | `core/wintex.nelua` | plugin | a BGRA D3D11 texture per stream, dirty-rect uploads, the SRV as ImTextureID |
 | `core/app/remotewin.nelua` | plugin | Session kind Window: open/close, draw on a panel, pointer and keys back, `/term window` |
-| `lua/windows.lua` | plugin | agents to ask, sizes, fps, which windows auto-pull |
+| `lua/windows.lua` | plugin | agents to ask, sizes, fps, which windows auto-pull, `auto_open`, `never`, `reserved_chords`; saved window panels (`window-state.lua`), `beside` |
+| `core/keychords.nelua` | plugin | reserved chords (`CONFIG.windows.reserved_chords`, IPC `keys.reserve`) |
+| `core/app/winpicker.nelua` | plugin | the Windows picker, app icons retried until the agent has rendered them |
 
 ## Backend interface (agent/capture.nelua)
 
@@ -311,25 +321,70 @@ window; it needs WinRT activation and a D3D11 device, so it is not done.
   window opened, refused or closed, and a `/window` command that failed
   (`say` in `core/app/state.nelua`, through the shim's `chat_print`; an older
   shim without it: the log only).
-* Window panels are not saved with the layout and do not survive
-  `/term reload` (their streams belong to the connection, which a reload
-  replaces). The Linux agent now keeps the windows (see "Window keys");
-  what the plugin has to do to use that:
-  1. On WOPENED for a panel, send WLIST and remember from its line for
-     that window (matched by title/app, or by wid when opened by wid) the
-     key: launch id, app, title. Refresh the title from later WLISTs or
-     WOPENED titles as it changes, keeping the launch id.
-  2. Save window panels in the world layout like terminal panels (place,
-     size, pet/pin), plus the key and the match text they were first
-     opened with (`run:…`, `app:…`, `desktop:…`, a name).
-  3. On start and after `/term reload`, for each saved window panel send
-     WOPEN `key:LAUNCH\tAPP\tTITLE`; on a refusal ("no such window") send
-     the saved match text instead (launching the app again, if it was a
-     launch) and save the new key.
-  4. Closing a panel with its × sends WCLOSE (the app closes); a reload or
-     quit just drops the connection (the app stays). Do not send WCLOSE on
-     shutdown. Popped into a tab or minimized, a window panel goes back into
-  the world as a pet.
+* Window keys and persistence. After WOPENED the plugin asks for the list
+  (WLIST) and takes the window's line in it: the one carrying its `sid:`
+  (a watching agent), else the window id it asked for, else the one line
+  with its title (not another panel's; a launch prefers the launched
+  window). Its key is `key:<launch id>` (the sixth column) for a window the
+  agent launched, else `key:\tAPP\tTITLE`; later lists refresh the title
+  and the key. `save_world_state` (core/app/worldview.nelua) also calls
+  `remotewin_save_state`: every live or pending window panel goes to
+  `window-state.lua` beside `world-state.lua` (lua/windows.lua
+  `save_state`) with its key, the match text it was first opened with
+  (`run:…`, `app:…`, a name; `''` for a wid) and its world anchor (pin or
+  pet, place, size). On start and after `/term reload`, once the agent
+  streams windows and the character is loaded, each is asked for again:
+  WOPEN by key, the panel taking its saved anchor; a refused key ("no such
+  window") sends the saved match text instead (launching the app again)
+  and the new key is learnt. Nothing is saved before that restore ran, so a
+  start without an agent keeps the file. `CONFIG.windows.auto` entries whose
+  match text a restored panel already has are skipped.
+* A lost connection no longer ends window panels that have a key or a match
+  text: they show "agent connection lost; waiting for it…" and are asked for
+  again (by key, else match) when the connection is back. The desktop's own
+  choice (no key, no match) still ends.
+* Closing a panel with its ×, `/window close` or IPC `window.close` sends
+  WCLOSE (the agent closes a launched app). A reload or quit sends none
+  (`keep_on_agent`, as terminals): the agent keeps the window and its app
+  for the next WOPEN by key. Popped into a tab or minimized, a window panel
+  goes back into the world as a pet.
+* Keys another plugin owns. XivDesktop reads sway-style chords (Super+… by
+  default, Alt+Shift+… or Ctrl+Alt+… when configured).
+  `CONFIG.windows.reserved_chords` (lua/windows.lua, default `{ 'super+*' }`)
+  lists chords, as modifiers and a key name or `*` joined by `+`
+  (core/keychords.nelua); a key pressed while a chord's modifiers are held
+  is neither sent to a focused window panel (no KEY, its character dropped
+  from TEXT; with a `*` chord all typed text goes) nor typed into a focused
+  terminal. Plugins add their own at run time with IPC `keys.reserve`
+  ([IPC.md](IPC.md)). The toggle chords stay the plugin's.
+* New windows (Linux compositor). On connect the plugin sends WLIST `watch`:
+  the agent answers with its list and pushes it again whenever a window
+  maps or unmaps or one of this connection's streams opens or closes; lines
+  it streams carry `sid:N`, a dialog `parent:WID`. Each pushed list also
+  replaces the picker's and IPC's list. The first list after connecting is
+  the baseline. Later, a window of the compositor (a line with the launch
+  column) that is new, has no `sid:`, is not already shown and is not on
+  `CONFIG.windows.never` is opened by its id (`CONFIG.windows.auto_open`:
+  `all` by default, `related` only when a dialog's window or the same app
+  has a panel, `none`). A dialog is pinned beside its window's panel
+  (same facing, to its right, 0.15 yalm in front: lua/windows.lua `beside`)
+  and closes when that panel is closed; another window of an app with a
+  panel goes beside the app's newest panel; anything else where `open_at`
+  says. While a panel is still opening, or until the list that marks a
+  just-opened stream arrives, nothing is decided (the new window may be the
+  one that panel waits for). A refused window is not asked for again while
+  it is listed. Windows, macOS and older agents list no launch column, so
+  nothing opens by itself there.
+* `CONFIG.windows.never` (empty by default; also in the settings window,
+  "Remote windows"): app ids, desktop ids or title parts, case-insensitive,
+  `*` matching anything (`org.gnome.*`). Such windows are never opened by
+  themselves; `/window pull`, `/window run` and IPC `window.open` refuse them
+  ("1Password is on CONFIG.windows.never", in the chat too) when the wid,
+  program, `app:` id, key or match text names them; they are left out of
+  the Windows picker and of IPC `agent.windows` / `agent.apps`; and a panel
+  whose window comes to match (found by a partial name, or its title
+  changed) is closed (WCLOSE, as its ×), checked on every list and twice a
+  second.
 
 ## Linux: the agent is the compositor
 
@@ -601,11 +656,20 @@ The **Windows picker** (`core/app/winpicker.nelua`) is a small ImGui window
 in the dropdown's glass. It asks the agent for a fresh list when it opens
 (Refresh asks again) and shows the last one: each open window, pulled onto a
 pet with a click; a **Run:** box whose Enter (or Run) does `/window run TEXT`;
-the apps a newer agent lists (`app` lines), started by sending WOPEN with the
-match text `app:ID` (an assumption until the agent side defines it); and
+the apps a newer agent lists (`app` lines) with their icons, started by
+sending WOPEN with the match text `app:ID`; and
 **Let the desktop choose** (WOPEN with nothing: the agent's own picker, which
 is what `/window pull` without arguments used to do). A pick that works
 closes the picker; one that fails says why at its bottom and in the chat.
+
+App icons: the agent's ICON column is a PNG path it may still be rendering.
+The picker looks for a missing file again every 3 s and shows the app's
+first letter meanwhile. The PNG is loaded by Dalamud through the shim's new
+`texture_file` host callback, a logic-free forwarder to
+`ITextureProvider.GetFromFile(path).TryGetWrap` (Dalamud keeps a shared
+texture while it is asked for each frame; the core had no image loading of
+its own). Under Wine the path is opened as `Z:\home\…`. An older shim has no
+`texture_file`: letters only.
 
 Every world panel, terminal or window, has a pin <-> pet title button next to
 pop-in: a paw on pins (it becomes a pet), a push pin on pets (it is pinned in
@@ -621,7 +685,9 @@ same and points at `/window` once per session. `/ask [question]` and
 `@agent` may only name `default` so far. `lua/windows.lua` (`CONFIG.windows`)
 holds the sizes asked for (`max_w`, `max_h`, default 1920×1200), `fps` (30),
 the panel's `pixels_per_yalm` (700), `width` (1600 panel pixels), `opacity`,
-and `auto`: `/term window pull` arguments run once the character is loaded.
+`auto`: `/term window pull` arguments run once the character is loaded,
+`auto_open` (`all`), `never` (`{}`) and `reserved_chords` (`{ 'super+*' }`),
+all described above.
 
 Clicking a window panel focuses it; while focused the mouse and keyboard go
 to the remote window. Esc twice within half a second (or clicking outside)
@@ -806,6 +872,35 @@ pixman 0.46.2; agent built with zig cc), with `yad` 9.3 (GTK 3.24.52) as the cli
   after each END, a click and TEXT "typed from FFXIV\n" showing in the
   rebuilt picture (631 pixels changed); SIGTERM to the agent logged
   "stopping" and ended the app it had launched.
+
+* `test_remotewin`, 2026-09-19, the plugin side of WGEOM, keys, watch and
+  never (fake agent, fake ImGui): WGEOM held until its seq's frame; box 0
+  sizing the panel and filling it with box 0's UVs; a popup's quads at the
+  window scale past the panel's right and bottom edges; a MOVE and a click
+  on the part of the menu off the panel reaching the stream in picture
+  pixels, the click not counting as one on the bare world; box 0's origin
+  added for a window inside a larger picture. Keys learnt from the list
+  after WOPENED (`key:<launch>`, `key:\tAPP\tTITLE`), saved in
+  `window-state.lua` with match text and anchor; `/term reload` sending no
+  WCLOSE and both panels asked for again by key at their saved place and
+  size; a refused key relaunching by match text and learning the new key;
+  a lost connection keeping the panels and asking again by key; the × sending
+  WCLOSE and dropping the panel from the saved state. `super+*` keys not
+  sent, ctrl+c still sent, `alt+shift+*` dropping the key and its text.
+  WLIST `watch` on connect; the baseline opening nothing; a new wid opened;
+  `sid:` lines and 5-column lines left alone; a `parent:` dialog pinned to
+  the right of its window's panel, same yaw, 0.15 yalm in front, and closed
+  with it; a refused wid not asked again; `none` and `related`. `never`
+  entries (app id, `org.gnome.*`, a title part) refusing pulls, runs and
+  `app:` opens with the chat line, skipped by auto-open, and closing a panel
+  whose title came to match. An icon file created after the first look found
+  on the retry 3 s later. `test_ipc`: `keys.reserve` (named and `*` chords,
+  a bad chord changing nothing, shape refusals, `[]` releasing), and
+  `agent.apps` / `agent.windows` without the `never` entries.
+  **None of this has been seen in game**: popups on a real panel, the
+  persistence across a real reload or game restart, XivDesktop's chords,
+  the watch pushes from a real compositor, and Dalamud loading an icon
+  through `texture_file` are all unobserved.
 
 Not observed: any other client (GTK4, Qt, Electron, terminals), popups and
 menus, resizes, wheel scrolling having a visible effect, the game side.
