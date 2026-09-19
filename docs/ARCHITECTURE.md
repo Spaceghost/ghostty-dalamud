@@ -293,6 +293,20 @@ it, and `lua/rain.lua` decides whether it rains and holds the tunables.
   the arm and blade are drawn as a dark silhouette after the panel's
   background and before the content. `'front'` draws them on the glass, and
   `'none'` leaves the wiper out.
+* **Falling off the glass.** A drop that runs off a panel's bottom or side
+  edge before the wiper reaches it, and the water the blade has collected,
+  leave the panel as emits. Collected water is flung off the blade tip at each
+  turn of the sweep, along the direction of travel. `rain_panel_shed` turns
+  each emit into a world droplet: `world_point` on the panel basis gives the
+  position, run-off keeps its trickle speed, and flung water leaves at
+  `fling_speed`, a little off the glass. Droplets live in one fixed
+  `RainPool` of 256 (`max_particles` caps it lower). They fall under
+  `gravity` to the ground under their start point, found with one downward
+  `raycast` (the player's feet when that misses), and then show a small
+  splash ring. Flung droplets fade as they fly. `draw_rain_world` draws them
+  just before `draw_world`, as projected streaks on the background list, so
+  panels cover them. They are not depth-tested against the scene. Nothing is
+  shed from HUD panels, indoors, or during the full-screen flight.
 * `worldview` calls `rain_panel_back` after the background grid and
   `rain_panel_front` before `bell_panel_border`. Both run in panel pixels, so
   `world_transform_vertices` bends the geometry and applies the panel's light

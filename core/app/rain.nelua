@@ -7,6 +7,8 @@ require 'core.app.state'
 require 'core.rain'
 
 local rain_panels: vector(RainPanel)
+global rain_pool: RainPool                  -- drops fallen or flung off the glass, in the world
+local rain_pool_last: float64 = -1
 local rain_prm: RainParams
 local rain_prm_at: float64 = -1
 local rain_prm_ok = false
@@ -131,6 +133,9 @@ global function policy_rain_frame(): (boolean, RainParams)
     prm.continuous_at = (@float32)(lua_field_number(L, t, 'continuous_at', 0.85))
     prm.opacity = (@float32)(lua_field_number(L, t, 'opacity', 0.85))
     prm.fade = (@float32)(lua_field_number(L, t, 'fade', 3))
+    prm.gravity = (@float32)(lua_field_number(L, t, 'gravity', 12))
+    prm.fling_speed = (@float32)(lua_field_number(L, t, 'fling_speed', 2.5))
+    prm.max_particles = (@integer)(math.floor(lua_field_number(L, t, 'max_particles', 256)))
     local w = lua_field_string(L, t, 'wiper', 'back')
     prm.wiper = RainWiper.Back
     if w == 'front' then prm.wiper = RainWiper.Front elseif w == 'none' then prm.wiper = RainWiper.None end
@@ -222,6 +227,42 @@ local function draw_wiper(o: ImVec2, w: float32, h: float32, angle: float32, a: 
   disc(px, py, 7 * s, body, body, 8)
 end
 
+-- Ground under a world point: the game's collision straight down, else the
+-- player's feet, else a character's height below.
+local function rain_ground(x: float32, y: float32, z: float32): float32
+  if host.api.raycast ~= nilptr then
+    local hx: float32, hy: float32, hz: float32 = 0, 0, 0
+    if host.api.raycast(x, y, z, 0, -1, 0, 40, &hx, &hy, &hz) ~= 0 then return hy end
+  end
+  local pc: GuObject
+  if host.api.get_object ~= nilptr and host.api.get_object(WORLD_PLAYER, 0, &pc) ~= 0 and pc.found ~= 0 and pc.y < y then return pc.y end
+  return y - 1.7
+end
+
+-- The drops that left panel `p`'s glass this step become world droplets.
+local function rain_panel_shed(p: *RainPanel, pl: *WorldPlacement, prm: *RainParams): void
+  local b = world_basis($pl)
+  for i = 0, < p.nemit do
+    local e = &p.emit[i]
+    local x, y, z = world_point(&b, e.u, e.v)
+    -- panel direction (pixels) in the world: right is +u, up is -v
+    local vx = b.rx * e.du * b.ypp - b.ux * e.dv
+    local vy = b.ry * e.du * b.ypp - b.uy * e.dv
+    local vz = b.rz * e.du * b.ypp - b.uz * e.dv
+    if e.fling then
+      local l = math.max(math.sqrt(vx * vx + vy * vy + vz * vz), 1e-6)
+      local sp = prm.fling_speed * e.speed
+      -- off the glass a little: toward the viewer in front, away from it behind
+      local off: float32 = prm.wiper == RainWiper.Front and 0.3 or -0.3
+      vx, vy, vz = vx / l * sp + b.fx * sp * off, vy / l * sp, vz / l * sp + b.fz * sp * off
+    else
+      vx, vy, vz = vx * e.speed, vy * e.speed, vz * e.speed
+    end
+    rain_pool:emit(prm.max_particles, x, y, z, vx, vy, vz, rain_ground(x, y, z), e.fling)
+  end
+  p.nemit = 0
+end
+
 -- Behind the content, after the panel's background: step the panel's rain and
 -- draw the wiper at the back of the glass. `fade` hides it (full-screen flight).
 global function rain_panel_back(dl: *ImDrawList, o: ImVec2, pl: *WorldPlacement, id: integer, now: float64, fade: float32): void
@@ -229,11 +270,12 @@ global function rain_panel_back(dl: *ImDrawList, o: ImVec2, pl: *WorldPlacement,
   if not rain_prm_ok then return end
   local p = rain_panel(id, now)
   local prm = rain_prm
-  if not policy_rain_panel(id) then prm.intensity = 0 end
+  if pl.hud or not policy_rain_panel(id) then prm.intensity = 0 end
   if p.level <= 0 and prm.intensity <= 0 then p.last = now p.vis = 0 return end
   p:step(&prm, pl.width, pl.height, (@float32)(now - p.last))
   p.last = now
   p.vis = math.clamp(fade, 0, 1) * math.clamp(prm.opacity, 0, 1)
+  if p.nemit > 0 and fade >= 0.999 and prm.intensity > 0 then rain_panel_shed(p, pl, &prm) end
   if prm.wiper == RainWiper.Back and p.wiping then
     local a = p.vis * math.min(p.level * 3, 1) * math.clamp(pl.opacity + 0.3, 0, 1)
     draw_wiper(o, pl.width, pl.height, p.angle, a, false)
@@ -288,6 +330,52 @@ end
 
 global function rain_reset(): void
   rain_panels:destroy()
+  rain_pool:clear()
+  rain_pool_last = -1
   rain_prm_at = -1
   rain_prm_ok = false
+end
+
+-- Once per frame, before the world panels: the droplets that fell or were
+-- flung off the glass, as short streaks and then small splash rings on the
+-- ground, on the background list behind the panels (not depth-tested).
+global function draw_rain_world(now: float64): void
+  local dt = rain_pool_last < 0 and 0 or (@float32)(now - rain_pool_last)
+  rain_pool_last = now
+  if rain_pool.live == 0 then return end
+  local g: float32 = rain_prm_ok and rain_prm.gravity or 12
+  rain_pool:step(dt, g)
+  if rain_pool.live == 0 or host.api.get_camera == nilptr or imgui.GetBackgroundDrawList == nilptr then return end
+  local cam: GuCamera
+  if host.api.get_camera(&cam) == 0 or cam.width < 1 or cam.height < 1 then return end
+  local vp = imgui.GetMainViewport().Pos
+  local col_r, col_g, col_b: float32 = 0.8, 0.86, 0.95
+  for i = 0, < RAIN_MAX_FALL do
+    local f = &rain_pool.p[i]
+    if f.live and world_depth(&cam, f.x, f.y, f.z) > 0.2 then
+      if not f.landed then
+        local a: float32 = 0.55
+        if f.fling then a = a * math.max(1 - f.t / 1.2, 0.2) end
+        local ok0, x0, y0 = world_project(&cam, f.x, f.y, f.z)
+        local ok1, x1, y1 = world_project(&cam, f.x - f.vx * 0.03, f.y - f.vy * 0.03, f.z - f.vz * 0.03)
+        if ok0 and ok1 then
+          if (x1 - x0) ^ 2 + (y1 - y0) ^ 2 < 1 then y1 = y0 - 1 end
+          strip(x1 + vp.x, y1 + vp.y, x0 + vp.x, y0 + vp.y, 1.5, rcol(col_r, col_g, col_b, a * 0.2), rcol(col_r, col_g, col_b, a), 1)
+        end
+      else
+        local k = f.t / RAIN_FALL_SPLASH
+        local rr = 0.04 + 0.18 * k
+        local col = rcol(col_r, col_g, col_b, 0.5 * (1 - k))
+        local SEG <comptime> = 8
+        local okp, px, py = world_project(&cam, f.x + rr, f.y, f.z)
+        for s = 1, SEG do
+          local ang = s * 6.2832 / SEG
+          local okq, qx, qy = world_project(&cam, f.x + rr * math.cos(ang), f.y, f.z + rr * math.sin(ang))
+          if okp and okq then strip(px + vp.x, py + vp.y, qx + vp.x, qy + vp.y, 1.2, col, col, 1) end
+          okp, px, py = okq, qx, qy
+        end
+      end
+    end
+  end
+  flush(imgui.GetBackgroundDrawList())
 end

@@ -169,6 +169,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     desk_props_sync() -- the desk scene's furniture, as lua/desk.lua asked for it
     apply_world_pins(now)
     local under = world_under_ui_begin() -- beneath other plugins' overlays (Umbra's toolbar)
+    draw_rain_world(now) -- drops fallen off world screens, behind them (core/app/rain.nelua)
     draw_world(now)
     panels_after_world(now) -- the "pull into world" grip over flat windows
     draw_bell(now) -- after the world screens: light behind one is cut out, not painted over it

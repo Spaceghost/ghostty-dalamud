@@ -22,6 +22,11 @@ local M = {
   wiper_continuous_at = 0.85, -- intensity from which it sweeps without resting
   opacity = 0.85,
   fade = 3,                 -- seconds the rain takes to come and go on the glass
+  -- drops that run off a panel's edge, or that the wiper flings off its tip,
+  -- fall into the world and splash on the ground
+  gravity = 12,             -- yalms/s^2
+  fling_speed = 2.5,        -- yalms/s off the blade tip
+  max_particles = 256,      -- falling at once, all panels together (the core holds at most 256)
 }
 
 -- Weather id (the game's Weather sheet) -> rain intensity 0..1. Anything not
@@ -65,6 +70,9 @@ function M.frame()
   frame.continuous_at = M.wiper_continuous_at
   frame.opacity = M.opacity
   frame.fade = M.fade
+  frame.gravity = M.gravity
+  frame.fling_speed = M.fling_speed
+  frame.max_particles = M.max_particles
   return frame
 end
 
