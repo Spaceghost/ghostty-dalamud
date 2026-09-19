@@ -393,6 +393,23 @@ password manager sessions), not just the two folders and the network.
    a `-` (`v0.5.0-rc1`) becomes a pre-release. Re-running the workflow for an
    existing release replaces its files.
 
+### The two channels, and the plugin repository
+
+`tools/package.sh` writes `latest.zip` (always that name) and the plugin's entry
+for a Dalamud plugin repository, `pluginmaster.json`. The site at
+<https://spacegho.st/mods/ffxiv/plugins.json> assembles its listing from those
+two release assets, so a release reaches players without deploying anything and
+without a token in this repository:
+
+| tag | release | what the listing shows |
+| --- | --- | --- |
+| `v0.5.0` | the release for that tag, and `releases/latest/download/…` follows it | the stable version everyone gets |
+| `v0.5.1-test.1` | a prerelease for that tag, **and** the floating `testing` release is moved onto it (`releases/download/testing/…`) | the testing version, only for players who tick testing on Ghostty's entry |
+
+A test build sets `TESTING=1` for `tools/package.sh` (the workflow does this for
+any tag with a `-`), which writes `pluginmaster-testing.json` instead. Nothing
+about the stable channel changes when a test build is cut.
+
 ## What is and is not verified
 
 `tools/ci/run.sh deps`, `test` and `build` have been run locally. The workflows

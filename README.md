@@ -196,6 +196,24 @@ fails if one lands in the output.
 
 ## Installing
 
+**From the plugin repository (one click).** Ghostty is listed in the author's own
+third-party Dalamud repository, together with the other FFXIV mods here:
+
+```
+https://spacegho.st/mods/ffxiv/plugins.json
+```
+
+`/xlsettings` → **Experimental** → **Custom Plugin Repositories** → paste → **+** →
+**Save and Close**; then `/xlplugins` → **All Plugins** → **Ghostty** → **Install**.
+Updates arrive like any other plugin's, and ticking **testing** on its entry opts you
+into test builds (and nothing else) ahead of a release. The page at
+<https://spacegho.st/mods/ffxiv/plugins/> explains it with a section per mod. It is a
+third-party repository: Dalamud will say nobody but the author reviewed these plugins,
+which is true. You still run the agent yourself (step 1 below).
+
+**Or build it yourself** — the path the rest of this section describes, and the one the
+author develops on. Nothing here depends on the repository above.
+
 1. **Start the agent** on your Linux/macOS machine. It writes a token to
    `~/.config/ghostty-agent/token` on first run:
 
@@ -241,11 +259,11 @@ Nothing a Windows player needs involves bash, Wine or a Linux machine.
 
 Either way needs Dalamud (XIVLauncher on Windows).
 
-* **From a custom repository** (once someone hosts the files that
-  `tools/package.sh` makes): `/xlsettings` → Experimental → Custom Plugin
-  Repositories, add the URL of the hosted `pluginmaster.json`, save; then
-  `/xlplugins` → All Plugins → install **Ghostty**. The listing's download
-  links must point at the hosted `GhosttyDalamud-<version>.zip`.
+* **From the plugin repository:** `/xlsettings` → Experimental → Custom Plugin
+  Repositories, add `https://spacegho.st/mods/ffxiv/plugins.json`, save; then
+  `/xlplugins` → All Plugins → install **Ghostty**. That listing is assembled
+  from this repository's own releases, so it always points at the
+  `latest.zip` the release workflow built and attached to the newest tag.
 * **As a dev plugin:** unzip `GhosttyDalamud-<version>.zip` (or copy
   `build/dist/GhosttyDalamud/`) to a folder of your own, e.g.
   `%APPDATA%\GhosttyDalamud\dev\GhosttyDalamud`. `/xlsettings` →

@@ -6,18 +6,20 @@
 #
 # Output, all under build/dist/ (<version> is AssemblyVersion from
 # shim/GhosttyDalamud/GhosttyDalamud.json):
-#   GhosttyDalamud-<version>.zip              the plugin folder (manifest, GhosttyDalamud.dll,
-#                                             ghostty_loader.dll, ghostty_core.dll, lua/), as
-#                                             Dalamud installs it from a custom repository
+#   latest.zip                                the plugin folder (manifest, GhosttyDalamud.dll,
+#                                             ghostty_loader.dll, ghostty_core.dll, lua/, themes/), as
+#                                             Dalamud installs it from a plugin repository. The name
+#                                             never changes, so the listing's download URL
+#                                             (.../releases/latest/download/latest.zip) never does either.
+#   GhosttyDalamud-<version>.zip              the same bytes under a self-describing name
 #   ghostty-agent-<version>-windows-x64.zip   ghostty-agent.exe
-#   pluginmaster.json                         a Dalamud custom-repository listing for the plugin zip
+#   pluginmaster.json                         this plugin's entry for a Dalamud plugin repository;
+#                                             spacegho.st/mods/ffxiv/plugins.json is assembled from it
+#   pluginmaster-testing.json                 the same for a test build, with TESTING=1
 #
 # Environment:
-#   DOWNLOAD_BASE_URL  where the zip will be downloadable from, without the file
-#                      name (default: https://github.com/$GITHUB_REPOSITORY/releases/download/v<version>
-#                      when GITHUB_REPOSITORY is set; otherwise a placeholder, with a warning)
-#   REPO_URL           the project page for the listing (default: https://github.com/$GITHUB_REPOSITORY
-#                      when set, else empty)
+#   REPO               owner/name on GitHub (default: $GITHUB_REPOSITORY, else Spaceghost/ghostty-dalamud)
+#   TESTING            1 to write pluginmaster-testing.json instead of pluginmaster.json
 #   SOURCE_DATE_EPOCH  timestamp for the zip entries and LastUpdate (default: the last
 #                      commit's time, else 0), so the same build packs to the same bytes
 #
@@ -30,6 +32,7 @@ PLUGIN="$DIST/GhosttyDalamud"
 MANIFEST="$PLUGIN/GhosttyDalamud.json"
 
 command -v zip >/dev/null || { echo "error: zip is required" >&2; exit 127; }
+command -v python3 >/dev/null || { echo "error: python3 is required" >&2; exit 127; }
 for f in GhosttyDalamud.dll GhosttyDalamud.json ghostty_loader.dll ghostty_core.dll lua/init.lua lua/platform.lua; do
   [[ -f "$PLUGIN/$f" ]] || { echo "error: $PLUGIN/$f missing; run tools/build.sh first" >&2; exit 1; }
 done
@@ -40,16 +43,7 @@ VERSION="$(sed -n 's/^[[:space:]]*"AssemblyVersion"[[:space:]]*:[[:space:]]*"\([
 if [[ -z "${SOURCE_DATE_EPOCH:-}" ]]; then
   SOURCE_DATE_EPOCH="$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 0)"
 fi
-REPO_URL="${REPO_URL:-${GITHUB_REPOSITORY:+https://github.com/$GITHUB_REPOSITORY}}"
-if [[ -z "${DOWNLOAD_BASE_URL:-}" ]]; then
-  if [[ -n "${GITHUB_REPOSITORY:-}" ]]; then
-    DOWNLOAD_BASE_URL="https://github.com/$GITHUB_REPOSITORY/releases/download/v$VERSION"
-  else
-    DOWNLOAD_BASE_URL="https://example.invalid/set-DOWNLOAD_BASE_URL"
-    echo "warning: DOWNLOAD_BASE_URL is not set; pluginmaster.json points at a placeholder" >&2
-  fi
-fi
-DOWNLOAD_BASE_URL="${DOWNLOAD_BASE_URL%/}"
+REPO="${REPO:-${GITHUB_REPOSITORY:-Spaceghost/ghostty-dalamud}}"
 
 PLUGIN_ZIP="GhosttyDalamud-$VERSION.zip"
 AGENT_ZIP="ghostty-agent-$VERSION-windows-x64.zip"
@@ -69,32 +63,24 @@ cp "$PLUGIN/GhosttyDalamud.dll" "$PLUGIN/GhosttyDalamud.json" "$PLUGIN/ghostty_l
 cp "$PLUGIN"/lua/*.lua "$STAGE/plugin/lua/"
 cp "$PLUGIN"/themes/*.theme "$STAGE/plugin/themes/"
 pack "$STAGE/plugin" "$DIST/$PLUGIN_ZIP"
+# The stable name the plugin repository points at; same bytes.
+cp "$DIST/$PLUGIN_ZIP" "$DIST/latest.zip"
 
 echo "== $AGENT_ZIP"
 cp "$DIST/ghostty-agent.exe" "$STAGE/agent/"
 pack "$STAGE/agent" "$DIST/$AGENT_ZIP"
 
-echo "== pluginmaster.json"
-# the manifest as it ships, plus the fields a repository listing adds
-json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
-body="$(sed -e '$!b' -e '/^[[:space:]]*}[[:space:]]*$/d' "$MANIFEST" | sed -e 's/^/  /')"
-[[ "$(tail -n1 "$MANIFEST" | tr -d '[:space:]')" == "}" ]] || { echo "error: $MANIFEST must end with a closing brace line" >&2; exit 1; }
-url="$(json_escape "$DOWNLOAD_BASE_URL/$PLUGIN_ZIP")"
-{
-  echo "["
-  printf '%s,\n' "$body"
-  printf '    "RepoUrl": "%s",\n' "$(json_escape "$REPO_URL")"
-  printf '    "DownloadLinkInstall": "%s",\n' "$url"
-  printf '    "DownloadLinkUpdate": "%s",\n' "$url"
-  printf '    "DownloadLinkTesting": "%s",\n' "$url"
-  printf '    "IsHide": false,\n'
-  printf '    "IsTestingExclusive": false,\n'
-  printf '    "DownloadCount": 0,\n'
-  printf '    "LastUpdate": %s\n' "$SOURCE_DATE_EPOCH"
-  echo "  }"
-  echo "]"
-} > "$DIST/pluginmaster.json"
+CHANNEL=stable
+LISTING="$DIST/pluginmaster.json"
+if [[ "${TESTING:-0}" == 1 ]]; then CHANNEL=testing; LISTING="$DIST/pluginmaster-testing.json"; fi
+echo "== $(basename "$LISTING")"
+# The manifest as it ships, plus the fields a repository listing adds (download links for
+# both channels, LastUpdate). tools/pluginmaster.py is shared with the other plugins here.
+python3 "$ROOT/tools/pluginmaster.py" \
+  --manifest "$MANIFEST" --repo "$REPO" --channel "$CHANNEL" \
+  --last-update "$SOURCE_DATE_EPOCH" --out "$LISTING"
+cat "$LISTING"
 rm -rf "$STAGE"
 
 echo "== done"
-ls -la "$DIST/$PLUGIN_ZIP" "$DIST/$AGENT_ZIP" "$DIST/pluginmaster.json"
+ls -la "$DIST/latest.zip" "$DIST/$PLUGIN_ZIP" "$DIST/$AGENT_ZIP" "$LISTING"
