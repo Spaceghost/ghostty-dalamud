@@ -13,7 +13,8 @@
 -- again (AFTER.ppm), reads back an Edit control's text if it has one, prints
 -- the title and closes. Each step prints PASS or FAIL; the exit code is the
 -- number of failures.
-require 'agent.capture_win32'
+require 'core.protocol'
+require 'agent.capture' -- pulls in agent/capture_win32.nelua (requiring that first would cycle)
 require 'string'
 require 'io'
 require 'arg'

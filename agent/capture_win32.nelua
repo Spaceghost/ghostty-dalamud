@@ -267,13 +267,14 @@ local function cw32_list(): string
   return sb:promote()
 end
 
+-- why, on failure, is a copy the caller frees
 local function cw32_open(wid: uint32, match: string): (pointer, string)
   local hwnd: pointer = nilptr
   if wid ~= 0 then
     hwnd = hwnd_of(wid)
-    if IsWindow(hwnd) == 0 then return nilptr, 'no such window' end
+    if IsWindow(hwnd) == 0 then return nilptr, string.copy('no such window') end
   else
-    if #match == 0 then return nilptr, 'pick a window by id or name (/term window list)' end
+    if #match == 0 then return nilptr, string.copy('pick a window by id or name (/term window list)') end
     local wins = listable_windows()
     for i = 0, < #wins do
       local title = window_title(wins[i])
@@ -284,7 +285,7 @@ local function cw32_open(wid: uint32, match: string): (pointer, string)
       if hit then hwnd = wins[i] break end
     end
     wins:destroy()
-    if hwnd == nilptr then return nilptr, 'no window matches' end
+    if hwnd == nilptr then return nilptr, string.copy('no window matches') end
   end
   local win = new(@CW32Win)
   win.hwnd = hwnd
