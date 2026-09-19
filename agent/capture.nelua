@@ -63,7 +63,8 @@ global CaptureBackend = @record{
 require 'agent.capture_test'
 
 -- Platform backends compiled into this agent. Flip one to true when its file lands.
-## CAPTURE_BUILT = { wayland = false, win32 = false, mac = false }
+## CAPTURE_BUILT = { wayland = WAYLAND and true or false, -- -D WAYLAND: tools/wayland-flags.sh
+##    win32 = false, mac = false }
 ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
 require 'agent.capture_wayland'
 ## end
@@ -95,7 +96,7 @@ global function capture_select(name: string): (boolean, CaptureBackend, string)
     ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
     return capture_wayland_backend()
     ## else
-    return false, (@CaptureBackend){}, 'wayland backend not built'
+    return false, (@CaptureBackend){}, 'wayland backend not built (no vendor/wayland-sdk or libwlroots-0.20 at build time)'
     ## end
   elseif name == 'win32' then
     ## if CAPTURE_BUILT.win32 and ccinfo.is_windows then

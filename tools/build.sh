@@ -18,7 +18,7 @@
 # DALAMUD_LIB_PATH (Dalamud dev assemblies, default ~/.cache/dalamud-dev),
 # UMBRA_LIB_PATH (Umbra assemblies, default vendor/umbra-dist/dist),
 # ZIG_GLOBAL_CACHE_DIR (default ~/.cache/zig-global),
-# SKIP_SHIM=1 (no C#; refreshes only the native files and lua/ of an existing
+# SKIP_WAYLAND=1 (agent without the Wayland compositor), SKIP_SHIM=1 (no C#; refreshes only the native files and lua/ of an existing
 # build/dist/GhosttyDalamud), SKIP_UMBRA=1 (no widget), SKIP_WIN=1 (no
 # Windows core, loader or agent), SKIP_DEPS=1 (reuse the Nelua,
 # libghostty-vt and Lua builds already in build/).
@@ -67,7 +67,10 @@ fi
 INC="-I$ROOT/vendor/ghostty/include -I$ROOT/vendor/gc-cimgui -I$ROOT/vendor/lua/src"
 
 echo "== ghostty-agent (host)"
-"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
+# shellcheck source=tools/wayland-flags.sh
+source "$ROOT/tools/wayland-flags.sh" # the Wayland compositor backend when its SDK is there
+[[ ${#WAYLAND_NELUA[@]} -gt 0 ]] && echo "with the Wayland compositor (wlroots 0.20)"
+"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${WAYLAND_NELUA[@]}" --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
 mkdir -p build/dist/lua && cp lua/*.lua build/dist/lua/
 
 if [[ "${SKIP_WIN:-0}" != 1 ]]; then
