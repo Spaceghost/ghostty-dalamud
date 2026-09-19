@@ -1,0 +1,134 @@
+-- ghostty-agent's pure parts (agent/logic.nelua), shared by the POSIX and
+-- Windows builds, and the Windows command line quoting both ConPTY users
+-- share (core/sys/wincmdline.nelua).
+require 'agent.logic'
+require 'core.sys.wincmdline'
+require 'string'
+require 'vector'
+
+-- OPEN payload: argv, an empty entry, env
+do
+  local raw: string = 'cmd.exe\0/k\0echo hi\0\0FOO=bar\0PWD=C:\\x'
+  local argv, env = agent_split_nul((@*[0]uint8)(raw.data), raw.size)
+  assert(#argv == 3 and argv[0] == 'cmd.exe' and argv[1] == '/k' and argv[2] == 'echo hi')
+  assert(#env == 2 and env[0] == 'FOO=bar' and env[1] == 'PWD=C:\\x')
+  for i = 0, < #argv do argv[i]:destroy() end
+  for i = 0, < #env do env[i]:destroy() end
+  argv:destroy() env:destroy()
+  local none, none_env = agent_split_nul(nilptr, 0)
+  assert(#none == 0 and #none_env == 0)
+end
+
+do
+  local h, p = agent_parse_hostport('127.0.0.1:7788')
+  assert(h == '127.0.0.1' and p == 7788)
+  h:destroy()
+  h, p = agent_parse_hostport('0.0.0.0')
+  assert(h == '0.0.0.0' and p == 7777)
+  h:destroy()
+end
+
+do
+  local t = agent_trim('abc123\r\n \n')
+  assert(t == 'abc123')
+  t:destroy()
+  t = agent_trim('\n')
+  assert(t == '')
+  local hex = agent_hex('\x00\x0f\xa5\xff')
+  assert(hex == '000fa5ff')
+  hex:destroy()
+end
+
+-- the Windows clipboard wants CRLF; existing CRLF stays single
+do
+  local c = agent_crlf('a\nb\r\nc\n\n')
+  assert(c == 'a\r\nb\r\nc\r\n\r\n', c)
+  c:destroy()
+  c = agent_crlf('\nx')
+  assert(c == '\r\nx')
+  c:destroy()
+end
+
+do
+  local ok, k, v = agent_env_split('PWD=C:\\Users\\x')
+  assert(ok and k == 'PWD' and v == 'C:\\Users\\x')
+  k:destroy() v:destroy()
+  ok, k, v = agent_env_split('EMPTY=')
+  assert(ok and k == 'EMPTY' and v == '')
+  k:destroy()
+  ok = agent_env_split('=C:=C:\\')
+  assert(not ok, 'drive entries have no key')
+  ok = agent_env_split('novalue')
+  assert(not ok)
+end
+
+do
+  local w = agent_default_argv(true, 'C:\\Windows\\system32\\cmd.exe')
+  assert(#w == 1 and w[0] == 'C:\\Windows\\system32\\cmd.exe')
+  w[0]:destroy() w:destroy()
+  w = agent_default_argv(true, '')
+  assert(#w == 1 and w[0] == 'cmd.exe')
+  w[0]:destroy() w:destroy()
+  local p = agent_default_argv(false, 'ignored')
+  assert(#p == 2 and p[0] == '/bin/sh' and p[1] == '-l')
+  p[0]:destroy() p[1]:destroy() p:destroy()
+end
+
+-- ATTACH replay plans: the ring holds the last `size` of `total` bytes
+do
+  local r = agent_replay_plan(100, 100, true, 100)
+  assert(not r.reset and r.count == 0, 'has everything')
+  r = agent_replay_plan(100, 500, true, 460)
+  assert(not r.reset and r.start == 60 and r.count == 40, 'the 40 it missed, from 60 bytes after the oldest')
+  r = agent_replay_plan(100, 500, true, 399)
+  assert(r.reset and r.start == 0 and r.count == 100, 'missed more than the ring holds')
+  r = agent_replay_plan(100, 500, true, 501)
+  assert(r.reset and r.count == 100, 'claims more than exists')
+  r = agent_replay_plan(100, 500, false, 0)
+  assert(r.reset and r.count == 100, 'no fed: everything')
+  r = agent_replay_plan(0, 0, false, 0)
+  assert(not r.reset and r.count == 0, 'nothing yet: no reset')
+  r = agent_replay_plan(50, 50, true, 0)
+  assert(not r.reset and r.start == 0 and r.count == 50, 'a fresh terminal on a short history')
+end
+
+do
+  assert(agent_ring_index(0, 8, 0, 0) == 0)
+  assert(agent_ring_index(5, 8, 0, 3) == 3, 'filling: oldest at 0')
+  assert(agent_ring_index(8, 8, 3, 0) == 3, 'full: oldest at head')
+  assert(agent_ring_index(8, 8, 3, 6) == 1, 'wraps')
+end
+
+do
+  assert(agent_wait_ms(3, 64, false) == 1000, 'idle: sleep on the handles')
+  assert(agent_wait_ms(3, 64, true) == 50, 'a shell in its exit grace')
+  assert(agent_wait_ms(65, 64, false) == 50, 'more handles than one wait takes')
+end
+
+-- CommandLineToArgvW quoting
+do
+  local function cmdline(a: string, b: string, c: string): string
+    local v: vector(string)
+    v:push(a) v:push(b)
+    if #c > 0 then v:push(c) end
+    local s = win_cmdline(&v)
+    v:destroy()
+    return s
+  end
+  local s = cmdline('cmd.exe', '/k', '')
+  assert(s == 'cmd.exe /k', s)
+  s:destroy()
+  s = cmdline('C:\\Program Files\\x.exe', 'a b', '')
+  assert(s == '"C:\\Program Files\\x.exe" "a b"', s)
+  s:destroy()
+  s = cmdline('x', 'say "hi"', '')
+  assert(s == 'x "say \\"hi\\""', s)
+  s:destroy()
+  s = cmdline('x', 'dir\\ with\\', '')
+  assert(s == 'x "dir\\ with\\\\"', s)
+  s:destroy()
+  s = cmdline('x', '', 'tab\there')
+  assert(s == 'x "" "tab\there"', s)
+  s:destroy()
+end
+print('OK')

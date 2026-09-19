@@ -39,7 +39,7 @@ them with your own terminals hidden.
 | `ghostty_core.dll` | inside the game (native, Nelua) | libghostty-vt terminal, ImGui renderer, input encoding, transports, embedded Lua VM; registers `/term`, the info bar entry and IPC |
 | `lua/*.lua` | inside the game (Lua) | profiles, keys, layout, transport choice, what gets registered |
 | `Umbra.Ghostty.dll` | inside Umbra (.NET, optional) | toolbar widget + popup, calling the plugin over IPC |
-| `ghostty-agent` | on your Linux/macOS box (Nelua) | PTY server: shells, ssh, tmux, anything, as persistent sessions |
+| `ghostty-agent` / `ghostty-agent.exe` | on your Linux/macOS box, or on Windows beside the game (Nelua) | PTY server: shells, ssh, tmux, anything, as persistent sessions |
 
 ### Transports
 
@@ -49,10 +49,12 @@ them with your own terminals hidden.
   stream is not encrypted. Sessions survive the plugin reloading or the game
   closing; reattaching replays the recent raw output and libghostty rebuilds
   the screen, which is the same model Superlogical uses. This is the transport
-  to use when the game runs under Wine/Proton on Linux.
-* **conpty** – a Windows pseudo console on the machine running the game
-  (PowerShell, cmd, `ssh.exe`, …). Native Windows only; under Wine it is
-  untested.
+  to use when the game runs under Wine/Proton on Linux, and on native Windows
+  with `ghostty-agent.exe` (see [Windows](#windows)).
+* **conpty** – a Windows pseudo console inside the game process (PowerShell,
+  cmd, `ssh.exe`, …). Needs no agent, but its shells end when the game
+  closes. On native Windows the default profiles fall back to it while no
+  agent answers. Under Wine it is untested in game.
 * **ssh** – not a transport of its own: run `ssh host` through either of the
   above (see the commented examples in `lua/init.lua`).
 * **superlogical** – placeholder. Mitchell Hashimoto's
@@ -70,8 +72,9 @@ them with your own terminals hidden.
 * **Game:** FFXIV with Dalamud (XIVLauncher on Windows, or XIVLauncher.Core
   under Wine/Proton on Linux) and dev plugins enabled. The manifest targets
   Dalamud API level 15.
-* **Agent host:** Linux or macOS for the `agent` transport. The `conpty`
-  transport needs the game on Windows.
+* **Agent host:** Linux or macOS (`ghostty-agent`), or Windows 10 1809 or
+  later (`ghostty-agent.exe`, ConPTY). The `conpty` transport needs the game
+  on Windows.
 * **Umbra** is optional.
 
 ## Building
@@ -102,6 +105,25 @@ Output:
 | `build/dist/GhosttyDalamud/` | the loadable plugin folder: `GhosttyDalamud.dll`, `GhosttyDalamud.json`, `ghostty_loader.dll`, `ghostty_core.dll`, `lua/` |
 | `build/dist/Umbra.Ghostty.dll` | the optional Umbra widget |
 | `build/dist/ghostty-agent` | the PTY server for the build host |
+| `build/dist/ghostty-agent.exe` | the PTY server for Windows |
+
+`tools/package.sh` (after `tools/build.sh`) packs what a Windows player
+installs, all in `build/dist/` and named after `AssemblyVersion` in
+`shim/GhosttyDalamud/GhosttyDalamud.json`; it publishes nothing:
+
+| Path | What |
+|---|---|
+| `GhosttyDalamud-<version>.zip` | the plugin folder as Dalamud installs it from a custom repository |
+| `ghostty-agent-<version>-windows-x64.zip` | `ghostty-agent.exe` |
+| `pluginmaster.json` | a Dalamud custom-repository listing pointing at the plugin zip |
+
+It reads `DOWNLOAD_BASE_URL` (where the zip will be downloadable, without the
+file name; with `GITHUB_REPOSITORY` set it defaults to that repository's
+release `v<version>`, otherwise a placeholder and a warning), `REPO_URL` and
+`SOURCE_DATE_EPOCH` (entry times, default the last commit's, so the same build
+packs to the same bytes). All build, package and test scripts are
+non-interactive, configured by environment variables, and exit non-zero on
+failure.
 
 Dalamud, Umbra and game assemblies are referenced but never shipped; the build
 fails if one lands in the output.
@@ -138,6 +160,78 @@ fails if one lands in the output.
    **Ghostty** and tick load on boot. If Dalamud says the location does not
    exist and your home directory is reached through a symlink, try the path
    with the symlink resolved (`readlink -f`), or the other way round.
+
+## Windows
+
+Everything here is built on Linux and **has not been run on a real Windows
+machine yet**. What was observed: `ghostty-agent.exe` under Wine (Proton 11)
+served a `cmd.exe` session end to end (see Limitations). The plugin itself,
+its Windows defaults, the fallback to local shells and the packages below
+have not been seen working in game on Windows.
+
+Nothing a Windows player needs involves bash, Wine or a Linux machine.
+
+### Install the plugin
+
+Either way needs Dalamud (XIVLauncher on Windows).
+
+* **From a custom repository** (once someone hosts the files that
+  `tools/package.sh` makes): `/xlsettings` → Experimental → Custom Plugin
+  Repositories, add the URL of the hosted `pluginmaster.json`, save; then
+  `/xlplugins` → All Plugins → install **Ghostty**. The listing's download
+  links must point at the hosted `GhosttyDalamud-<version>.zip`.
+* **As a dev plugin:** unzip `GhosttyDalamud-<version>.zip` (or copy
+  `build/dist/GhosttyDalamud/`) to a folder of your own, e.g.
+  `%APPDATA%\GhosttyDalamud\dev\GhosttyDalamud`. `/xlsettings` →
+  Experimental → Dev Plugin Locations, add the full path of
+  `GhosttyDalamud.dll` in it, save; `/xlplugins` → Dev Tools → enable
+  **Ghostty** and tick load on boot. To update, replace the files; a new
+  `ghostty_core.dll` is picked up within about two seconds.
+
+### Run the agent
+
+Without an agent the plugin still works: its default profiles open local
+PowerShell and cmd terminals (ConPTY) inside the game, which close with the
+game. For shells that survive the game closing or crashing:
+
+1. Unzip `ghostty-agent-<version>-windows-x64.zip` somewhere permanent, e.g.
+   `%LOCALAPPDATA%\ghostty-agent\ghostty-agent.exe`.
+2. Run it. On first start it writes a random token to
+   `%APPDATA%\ghostty-agent\token`, readable only by your user, and listens
+   on `127.0.0.1:7777`. Options as on Linux: `--listen HOST:PORT`,
+   `--token-file PATH`, `--replay-bytes N`, `--term NAME`. It is a console
+   program; closing its window ends it and every shell it runs.
+3. In game the default profiles (`powershell`, `cmd`) now open through the
+   agent: the plugin reads the same token file, so there is nothing to
+   configure. A terminal opened while no agent answered stays local.
+
+Start on login, pick one:
+
+* **Startup folder:** `Win+R` → `shell:startup`, create a shortcut to
+  `ghostty-agent.exe` there, and in its Properties set Run: Minimized.
+* **Task Scheduler:** Create Task → General: "Run only when user is logged
+  on" (the agent needs your desktop for the clipboard); Triggers: At log on,
+  your user; Actions: Start a program, `ghostty-agent.exe`; Settings: untick
+  "Stop the task if it runs longer than".
+
+Neither needs administrator rights; the agent is a normal user process.
+
+### Windows defaults and clipboard
+
+`lua/platform.lua` picks the defaults from `ghostty.platform()`: `'windows'`
+on native Windows, `'wine'` for the same DLL under Wine or Proton (ntdll
+exports `wine_get_version`). On `'windows'` the agent token file is
+`%APPDATA%\ghostty-agent\token` and the profiles are `powershell` and
+`cmd` through the agent, each with a `fallback` naming its local ConPTY twin
+(`powershell (local)`, `cmd (local)`). Under Wine nothing changed: the Linux
+agent's `~/.config/ghostty-agent/token`, bash and tmux through the agent,
+pwsh and cmd over ConPTY. A copied `init.lua` that sets `agent` and
+`profiles` itself is used as it is.
+
+Copy and paste use the Windows clipboard through Dalamud's ImGui when no
+agent is connected; with the Windows agent they also go through the agent's
+Win32 clipboard (the same clipboard when the agent runs on the game's
+machine). Neither has been tried on Windows.
 
 ### Optional: Umbra widget
 
@@ -178,7 +272,8 @@ with XIVLauncher.Core. Set `GHOSTTY_HOME` to use a directory of your own.
 * Most options are in the settings window (`/term config`, or Settings in
   `/xlplugins`), saved to `settings.lua` there.
 * For the rest, copy `lua/init.lua` (profiles, agent address and token,
-  commands, info bar behaviour) or `lua/keymap.lua` (which chords the plugin
+  commands, info bar behaviour; the per-platform defaults it starts from are
+  in `lua/platform.lua`) or `lua/keymap.lua` (which chords the plugin
   handles; everything else goes to the terminal exactly as Ghostty would
   encode it) into the config directory's `lua/`. That directory comes first on
   `package.path`, so files there win over the shipped ones. Settings made in
@@ -305,7 +400,8 @@ handles overlapped reads, not observed.
 Everything runs on your machines. From the code: the plugin connects only to
 the agent address you configure, sends no telemetry, and logs only to
 Dalamud's local log. The agent listens only on the address you pass (default
-`127.0.0.1:7777`) and requires the token; the stream is not encrypted, so
+`127.0.0.1:7777`) and requires the token (on Windows kept in
+`%APPDATA%\ghostty-agent\token` with an owner-only DACL); the stream is not encrypted, so
 tunnel it for remote use. Migrated config copies are written owner-only.
 `/term showcase` hides your own terminals while it runs.
 
@@ -318,8 +414,10 @@ At build time only, `tools/fetch-vendor.sh` downloads the pinned sources
 Tested on the host (`tests/run.sh`): the libghostty-vt binding, cell renderer,
 key encoding, DualSense report parsing, Lua policy, agent protocol and server,
 the plugin's activation state machine, its command / info bar / IPC registration and the config
-migration (`tests/test_hostsurface.nelua`, `tests/test_migrate.*`). Both C#
-projects and the Windows DLL compile.
+migration (`tests/test_hostsurface.nelua`, `tests/test_migrate.*`), the
+per-platform defaults and local fallbacks (`tests/test_platform.*`) and the
+agent's shared pure logic (`tests/test_agent_logic.nelua`). Both C#
+projects, the Windows DLLs and `ghostty-agent.exe` compile.
 
 **The standalone plugin, its info bar entry and the IPC-only Umbra widget have
 not been observed in game.** What they assume:
@@ -341,6 +439,24 @@ not been observed in game.** What they assume:
 | Toolbar placement survives the widget becoming IPC-only (same file, assembly name and widget id) | re-add the Ghostty widget in Umbra |
 | Per-frame IPC (status and popup draw every frame, exceptions while offline) is cheap enough | frame time rises with the widget; a cheaper status channel is needed |
 | The info bar popup has no Esc-to-close, so Esc reaches the terminal | see `popup.close_on_blur` |
+
+**Windows (native):** nothing has been run on real Windows. Observed only
+under Wine on Linux, with `tests/smoke_agent_windows.nelua` against
+`ghostty-agent.exe` in a throwaway prefix:
+
+| Check | Proton 11 (Wine 11) | Wine XIV staging 10.8 |
+|---|---|---|
+| token handshake, OPEN `cmd.exe` | yes | yes |
+| typed `echo hi` comes back, env override, `PWD` as working directory | yes | no: this Wine gives a pseudo console's child no console handles when they are passed as null (newer Wine and Windows do), so `cmd.exe` exits at once |
+| ATTACH replay from a second connection, session kept after the client disconnects, LIST | yes | no (the session had exited) |
+| exit status, a command that cannot start refused | yes | refused: yes |
+| Win32 clipboard round trip | no: headless, `OpenClipboard` never returned; the agent gave up after 1 s and answered "clipboard unavailable" | yes |
+| resize | not checked (Wine has no `mode con`) | not checked |
+
+Not observed anywhere: the agent on Windows itself (console window, start on
+login, Windows Defender or SmartScreen reactions to an unsigned exe), the
+plugin's Windows defaults and local fallbacks in game, clipboard on Windows,
+the custom-repository install and the dev-plugin path on Windows.
 
 Also: the DualSense Create button (`toggle_gamepad_button = 'create'`) is
 tested only against fake HID devices, not with a controller, on Windows or
@@ -373,9 +489,10 @@ like this (expected from the code, not yet seen in game):
 * `suspended:` – the old core appeared while the plugin was active. The
   plugin stops drawing and keeps its sessions until the old core unloads.
 
-## Extras: crash-dialog helper
+## Extras: crash-dialog helper (Linux/Wine only)
 
-Linux with XIVLauncher.Core as a flatpak only. `tools/crash-restart.nelua`
+Linux with XIVLauncher.Core as a flatpak only; not needed, and not usable, on
+Windows. `tools/crash-restart.nelua`
 builds `crash-restart.exe`, which finds the "Dalamud Crash Handler" dialog and
 chooses "Restart normally" then "Restart". `tools/build.sh` does not build it:
 

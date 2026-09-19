@@ -1,11 +1,11 @@
 # Architecture
 
 ```
- FFXIV process (Windows / Wine)                     Linux or macOS host
+ FFXIV process (Windows / Wine)                     Linux/macOS host, or Windows
  ┌───────────────────────────────────────────┐      ┌────────────────────────┐
  │ Dalamud ── GhosttyDalamud.dll (C#)        │      │ ghostty-agent (Nelua)  │
- │   │ Draw / OpenMainUi / commands / DTR    │      │  poll() loop            │
- │   ▼ ghostty_loader.dll (swaps the core)   │ TCP  │  forkpty per session    │
+ │   │ Draw / OpenMainUi / commands / DTR    │      │  poll() / event wait    │
+ │   ▼ ghostty_loader.dll (swaps the core)   │ TCP  │  forkpty or ConPTY      │
  │ ghostty_core.dll (Nelua)  ◄───────────────┼──────┤  256 KiB replay ring    │
  │  app/hostsurface activation, events, IPC  │      │  token handshake        │
  │  session.nelua   terminal ⇄ transport     │      └────────────────────────┘
@@ -65,6 +65,32 @@
   multiplexing many sessions on one socket. Terminal replies (DA, DSR, kitty
   responses) flow back through libghostty's `WRITE_PTY` callback into the same
   transport.
+* **One agent, two platforms.** `agent/agent.nelua` holds the protocol,
+  sessions, replay ring and detach marks once; the platform code sits beside
+  it. POSIX: `pty_posix.nelua` (forkpty, non-blocking master) and
+  `sys_posix.nelua` (wl-copy / xclip, `/dev/urandom`, token under
+  `~/.config`), driven by `poll()`. Windows: `pty_windows.nelua` gives each
+  session a pseudo console fed through two named pipes whose agent ends are
+  overlapped (anonymous pipes cannot be), with its OVERLAPPED records and
+  buffers in a heap block that never moves; `winloop.nelua` waits on one
+  event per socket (`WSAEventSelect`), each shell's process handle and its
+  pending pipe reads and writes with `WaitForMultipleObjects`, so an idle
+  agent sleeps (at most 64 handles per wait; beyond that, and during the
+  150 ms after a shell exits while the console may still hand over output,
+  it polls every 50 ms). `sys_windows.nelua` has the Win32 clipboard (on a
+  thread given one second, so a stuck clipboard never stalls the shells),
+  `BCryptGenRandom` and the token under `%APPDATA%` with an owner-only DACL
+  (`core/sys/fsbase.nelua`, shared with the core). Children get null standard
+  handles with `STARTF_USESTDHANDLES`, as Windows Terminal does, so they talk
+  to their pseudo console and not to the agent's own stdio.
+  `agent/logic.nelua` holds the pure parts both builds use.
+* **Platform defaults are Lua.** `ghostty.platform()` (`core/sys/platform.nelua`)
+  says `'windows'`, or `'wine'` when ntdll exports `wine_get_version`;
+  `lua/platform.lua` turns that into the agent's token file and the
+  profiles. An agent profile's `fallback` names a conpty profile: while the
+  last connection attempt failed (`host.agent_down`), new terminals open the
+  fallback (`policy_open_profile`) and terminals still waiting for their
+  shell switch to it (`Session:use_fallback`).
 * **Lua decides, Nelua executes.** `policy.nelua` embeds Lua 5.4, loads
   `lua/init.lua`, and exposes typed config records; `keymap.lua`'s `on_key`
   is consulted for every named key press before the terminal sees it.
@@ -193,13 +219,13 @@ on.
 ```
 core/         Nelua plugin core (compiled to ghostty_core.dll)
 core/app/     the app modules; hostsurface.nelua is the plugin's side of the host
-core/sys/     net (POSIX + Winsock), conpty (Windows), procguard, fs, hid and dualsense_reader (Windows HID)
+core/sys/     net (POSIX + Winsock), conpty (Windows), procguard, fs / fsbase, platform, wincmdline, hid and dualsense_reader (Windows HID)
 core/shaders/ HLSL sources and the committed DXBC the core embeds
-agent/        ghostty-agent PTY server (Nelua, POSIX)
+agent/        ghostty-agent PTY server (Nelua): agent.nelua, logic, pty_posix / sys_posix, pty_windows / sys_windows / winloop
 lua/          shipped policy: init.lua, keymap.lua, migrate.lua, ...
 shim/         GhosttyDalamud (plugin) and Umbra.Ghostty (widget) C# projects
 tests/        host tests + run.sh
-tools/        fetch-vendor.sh, build.sh, install-dev.sh, zig-cc-win.sh, build-shaders.lua, crash-restart.{nelua,sh}
+tools/        fetch-vendor.sh, build.sh, package.sh, install-dev.sh, zig-cc-win.sh, build-shaders.lua, crash-restart.{nelua,sh} (Linux/Wine only)
 vendor/       pinned third-party checkouts (git-ignored, see toolchain.env)
 ```
 
@@ -236,6 +262,13 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_migrate` (`.nelua` + `.lua`) | the one-time migration from the Umbra-hosted home |
 | `test_hostsurface` | the plugin side against a recording fake host: activation and refusals, registration and shutdown order, suspension, events, info bar, `ghostty.open_url` (https only) and an older shim's smaller `GuHostApi` |
 | `test_vote` (`.nelua` + `.lua`) | the feature vote link: the shipped catalogue, new-idea count, the settings window's section and badge, the seen marker through `settings.lua` |
+| `test_platform` (`.nelua` + `.lua`) | `ghostty.platform()` on the host, `lua/platform.lua` per platform, the shipped `init.lua` as Windows and as Wine, the fallback choice and an agent terminal switching to its fallback |
+| `test_agent_logic` | the agent's pure parts: OPEN parsing, replay plans, ring indexes, CRLF for the Windows clipboard, env entries, default shells, the Windows wait timeout, command line quoting |
 | `test_agent` | `ghostty-agent` end to end over TCP |
 
 The last step checks that the core also compiles as a native host module.
+
+`tests/smoke_agent_windows.nelua` is manual: a host client for a running
+`ghostty-agent.exe` (on Windows, or under Wine in a throwaway prefix) that
+opens `cmd.exe`, types into it and checks replay, LIST, clipboard and exit
+status, printing PASS / FAIL per step (see the README for what it showed).

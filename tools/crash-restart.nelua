@@ -1,4 +1,7 @@
 --[[
+LINUX / WINE ONLY. Not part of the plugin and not needed on Windows: a helper
+for XIVLauncher.Core (flatpak) on Linux, run by tools/crash-restart.sh.
+
 crash-restart.exe: answer the Dalamud Crash Handler dialog with
 "Restart normally" + "Restart".
 

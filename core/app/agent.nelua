@@ -212,6 +212,29 @@ global function agent_on_ready(): void
   host.agent_error_shown:destroy() -- the next failure is news again
 end
 
+-- The agent is down: terminals still waiting for their shell whose profile
+-- has a local fallback (lua/platform.lua gives native Windows one) open it.
+local function agent_use_fallbacks(): void
+  local j = 0
+  for i = 0, < #host.pending_open do
+    local s = host.pending_open[i]
+    local f: *Profile = nilptr
+    if s ~= nilptr then
+      local asked: Profile = { transport = 'agent', fallback = s.fallback }
+      f = policy_open_profile(&asked, true)
+      if f == &asked then f = nilptr end
+    end
+    if f ~= nilptr then
+      logf(LOG_INFO, 'session %d: no agent, opening fallback profile %s', s.id, f.name)
+      s:use_fallback(f)
+    else
+      host.pending_open[j] = s
+      j = j + 1
+    end
+  end
+  host.pending_open:resize(j)
+end
+
 global function agent_pump(now: float64): void
   if not host.agent_enabled then return end
   local st = host.agent.state
@@ -223,6 +246,11 @@ global function agent_pump(now: float64): void
   end
   host.agent:pump(now)
   st = host.agent.state
+  if st == AgentState.Ready then host.agent_down = false end
+  if st == AgentState.Failed and not host.agent_down then
+    host.agent_down = true
+    agent_use_fallbacks()
+  end
   if st == AgentState.Ready and host.agent_prev_state ~= AgentState.Ready then agent_on_ready() end
   host.agent_prev_state = st
   if st == AgentState.Ready and not host.agent_listed then
@@ -288,6 +316,8 @@ global function session_new(profile_index: integer, cols: uint16, rows: uint16):
     if #policy.profiles == 0 then return nilptr end
     p = policy_profile(0)
   end
+  -- no agent answered the last attempt: a profile with a local fallback opens that
+  p = policy_open_profile(p, not host.agent_enabled or host.agent_down)
   local s = new(@Session)
   local agent: *AgentClient = nilptr
   if host.agent_enabled then agent = &host.agent end

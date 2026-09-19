@@ -1,0 +1,39 @@
+-- argv to a Windows command line, quoted by CommandLineToArgvW's rules. Pure
+-- (no Windows API), so the host tests check it; the core's ConPTY transport
+-- and ghostty-agent's Windows PTYs both use it.
+require 'string'
+require 'vector'
+require 'stringbuilder'
+
+-- Quote argv into a Windows command line (CommandLineToArgvW rules).
+global function win_cmdline(argv: *vector(string)): string
+  local sb: stringbuilder
+  for i = 0, < #argv do
+    if i > 0 then sb:write(' ') end
+    local a = argv[i]
+    local needs = #a == 0 or a:find(' ', 1, true) > 0 or a:find('\t', 1, true) > 0 or a:find('"', 1, true) > 0
+    if not needs then
+      sb:write(a)
+    else
+      sb:write('"')
+      local bs = 0
+      for k = 1, #a do
+        local c = a:byte(k)
+        if c == 92 then
+          bs = bs + 1
+        elseif c == 34 then
+          for _ = 1, bs * 2 + 1 do sb:write('\\') end
+          bs = 0
+          sb:write('"')
+        else
+          for _ = 1, bs do sb:write('\\') end
+          bs = 0
+          sb:writebyte(c) -- no string.char: its string would leak without a GC
+        end
+      end
+      for _ = 1, bs * 2 do sb:write('\\') end
+      sb:write('"')
+    end
+  end
+  return sb:promote()
+end

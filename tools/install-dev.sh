@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Stage the dev build of the GhosttyDalamud plugin where Dalamud loads it.
+# A convenience for building on Linux (it prints the Wine Z:\ path); on
+# Windows, copy build/dist/GhosttyDalamud/ yourself (README, "Windows").
 #
 #   tools/build.sh && tools/install-dev.sh [--widget]
 #
@@ -36,7 +38,7 @@ widget=0
 for a in "$@"; do
   case "$a" in
     --widget) widget=1 ;;
-    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
     *) echo "unknown argument: $a" >&2; exit 2 ;;
   esac
 done

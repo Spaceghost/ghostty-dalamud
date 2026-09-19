@@ -5,17 +5,23 @@
 #   3. Lua 5.4 static libs for host and Windows
 #   4. ghostty_core.dll   (Nelua core, Windows x64) and ghostty_loader.dll
 #      (Nelua, loads a copy of the core and swaps it when the file changes)
-#   5. ghostty-agent      (Nelua, host Linux/macOS PTY server)
+#   5. ghostty-agent      (Nelua, host Linux/macOS PTY server) and
+#      ghostty-agent.exe  (the same agent for Windows: ConPTY, Winsock)
 #   6. GhosttyDalamud.dll (Dalamud plugin shim) and Umbra.Ghostty.dll (Umbra
 #      toolbar widget), both C#, need dotnet 10
-# Output lands in build/dist/; build/dist/GhosttyDalamud/ is the loadable
-# plugin folder (tools/install-dev.sh stages it).
+# Output lands in build/dist/ (fixed paths); build/dist/GhosttyDalamud/ is the
+# loadable plugin folder (tools/install-dev.sh stages it, tools/package.sh
+# zips it). Non-interactive; exits non-zero when any step fails. Needs
+# vendor/ (tools/fetch-vendor.sh) and nothing else outside this checkout.
 #
 # Environment overrides: ZIG (zig binary), DOTNET (dotnet binary),
-# DALAMUD_LIB_PATH (Dalamud dev assemblies), UMBRA_LIB_PATH (Umbra assemblies),
+# DALAMUD_LIB_PATH (Dalamud dev assemblies, default ~/.cache/dalamud-dev),
+# UMBRA_LIB_PATH (Umbra assemblies, default vendor/umbra-dist/dist),
+# ZIG_GLOBAL_CACHE_DIR (default ~/.cache/zig-global),
 # SKIP_SHIM=1 (no C#; refreshes only the native files and lua/ of an existing
-# build/dist/GhosttyDalamud), SKIP_UMBRA=1 (no widget), SKIP_WIN=1,
-# SKIP_DEPS=1 (reuse the Nelua, libghostty-vt and Lua builds already in build/).
+# build/dist/GhosttyDalamud), SKIP_UMBRA=1 (no widget), SKIP_WIN=1 (no
+# Windows core, loader or agent), SKIP_DEPS=1 (reuse the Nelua,
+# libghostty-vt and Lua builds already in build/).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
@@ -74,6 +80,9 @@ if [[ "${SKIP_WIN:-0}" != 1 ]]; then
   ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc -P noentrypoint -P "writestderr='hooked'" -P "abort='hooked'" \
     --cflags="-O2 $INC -L$ROOT/build/win/lib -L$ROOT/build/lua-win" \
     --cache-dir build/win/cache -L . -H -o build/dist/ghostty_loader.dll core/loader.nelua
+  echo "== ghostty-agent.exe (windows x64)"
+  ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc --cflags="-O2" \
+    --cache-dir build/win/cache-agent -L . -o build/dist/ghostty-agent.exe agent/agent.nelua
 fi
 
 # Game and Dalamud assemblies are referenced, never shipped: a copy beside the

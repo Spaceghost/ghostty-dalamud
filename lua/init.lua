@@ -12,8 +12,11 @@ local animation = require('animation')
 local settings = require('settings')
 local bell = require('bell')
 local showcase = require('showcase')
+local platform = require('platform')
 
-local home = os.getenv('HOME') or os.getenv('USERPROFILE') or ''
+-- The agent connection and profiles for where the game runs (native Windows,
+-- or Wine/Proton on Linux): see lua/platform.lua.
+local defaults = platform.defaults(platform.name())
 
 local config = {
   -- Key that toggles the Quake-style drop-down terminal. Names are ImGui
@@ -97,31 +100,31 @@ local config = {
     keep_visible = { user_hidden = true, cutscene = true, gpose = true, always = false },
   },
 
-  -- ghostty-agent connection (Linux/macOS host). Keep it on loopback, or reach
-  -- it through `ssh -L` or a private network: every connection must present
-  -- the token, but the stream itself is not encrypted.
-  agent = {
-    host = '127.0.0.1',
-    port = 7777,
-    -- Either inline the token or point at the agent's token file. When the
-    -- game runs on another machine, copy the file over (or use ssh -L).
-    token = '',
-    token_file = home .. '/.config/ghostty-agent/token',
-  },
+  -- ghostty-agent connection. Keep it on loopback, or reach it through
+  -- `ssh -L` or a private network: every connection must present the token,
+  -- but the stream itself is not encrypted. The default (lua/platform.lua) is
+  -- 127.0.0.1:7777 with the token read from the agent's token file:
+  -- %APPDATA%\ghostty-agent\token on native Windows,
+  -- ~/.config/ghostty-agent/token otherwise. To set your own:
+  --   agent = { host = '127.0.0.1', port = 7777, token = '', token_file = '/path/to/token' },
+  agent = defaults.agent,
 
   -- Profiles appear in the new-tab menu. `transport` is one of:
-  --   "agent"        run `command` on the ghostty-agent host (Linux/macOS)
-  --   "conpty"       run `command` on the Windows host running the game (ConPTY)
+  --   "agent"        run `command` on the ghostty-agent host (Linux/macOS or Windows)
+  --   "conpty"       run `command` on the Windows host running the game (ConPTY);
+  --                  these shells end when the game closes
   --   "superlogical" placeholder until Superlogical publishes its client protocol
-  profiles = {
-    { name = 'shell',      transport = 'agent',  command = { '/bin/bash', '-l' } },
-    { name = 'tmux',       transport = 'agent',  command = { 'tmux', 'new-session', '-A', '-s', 'ghostty' } },
-    { name = 'powershell', transport = 'conpty', command = { 'pwsh.exe', '-NoLogo' } },
-    { name = 'cmd',        transport = 'conpty', command = { 'cmd.exe' } },
-    -- ssh is a command like any other, through either transport:
-    -- { name = 'ssh',       transport = 'agent',  command = { 'ssh', '-t', 'user@example-host' } },
-    -- { name = 'ssh (win)', transport = 'conpty', command = { 'ssh.exe', 'user@example-host' } },
-  },
+  -- An agent profile may name a `fallback` profile (a conpty one) that opens
+  -- instead while no agent answers. The defaults (lua/platform.lua): on native
+  -- Windows, powershell and cmd through the agent with local fallbacks; under
+  -- Wine, bash and tmux through the agent plus pwsh and cmd over ConPTY. E.g.:
+  --   profiles = {
+  --     { name = 'shell', transport = 'agent', command = { '/bin/bash', '-l' } },
+  --     { name = 'ssh',   transport = 'agent', command = { 'ssh', '-t', 'user@example-host' } },
+  --     { name = 'cmd',   transport = 'agent', command = { 'cmd.exe' }, fallback = 'cmd (local)' },
+  --     { name = 'cmd (local)', transport = 'conpty', command = { 'cmd.exe' } },
+  --   },
+  profiles = defaults.profiles,
   default_profile = 1,
 
   on_key = keymap.on_key,

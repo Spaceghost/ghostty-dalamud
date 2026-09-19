@@ -1,0 +1,135 @@
+-- ghostty-agent's host facilities on Linux/macOS: the desktop clipboard
+-- (wl-copy / wl-paste on Wayland, xclip on X11), random bytes, the process
+-- id, the token file's home. The Windows build uses agent/sys_windows.nelua.
+require 'string'
+require 'stringbuilder'
+require 'io'
+require 'os'
+
+## cinclude '<sys/types.h>'
+## cinclude '<sys/wait.h>'
+## cinclude '<sys/stat.h>'
+## cinclude '<signal.h>'
+## cinclude '<unistd.h>'
+## cinclude '<poll.h>'
+
+local pollfd <cimport, nodecl, ctypedef> = @record{ fd: cint, events: cshort, revents: cshort }
+local function execvp(file: cstring, argv: *[0]cstring): cint <cimport, nodecl> end
+local function _exit(status: cint): void <cimport, nodecl> end
+local function read(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function write(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function close(fd: cint): cint <cimport, nodecl> end
+local function poll(fds: *[0]pollfd, n: culong, timeout: cint): cint <cimport, nodecl> end
+local function waitpid(pid: cint, status: *cint, options: cint): cint <cimport, nodecl> end
+local function kill(pid: cint, sig: cint): cint <cimport, nodecl> end
+local function signal(sig: cint, handler: pointer): pointer <cimport, nodecl> end
+local function umask(mask: cuint): cuint <cimport, nodecl> end
+local function getpid(): cint <cimport, nodecl> end
+local function fork(): cint <cimport, nodecl> end
+local function pipe(fds: *[2]cint): cint <cimport, nodecl> end
+local function dup2(oldfd: cint, newfd: cint): cint <cimport, nodecl> end
+local POLLIN: cshort <cimport, nodecl, const>
+local WNOHANG: cint <cimport, nodecl, const>
+local SIGKILL: cint <cimport, nodecl, const>
+local SIGPIPE: cint <cimport, nodecl, const>
+local SIG_IGN: pointer <cimport, nodecl, const>
+
+local function WIFEXITED(s: cint): boolean <cimport, nodecl> end
+local function WEXITSTATUS(s: cint): cint <cimport, nodecl> end
+
+global AGENT_CLIP_MAX: usize <comptime> = 1024 * 1024
+
+global function agent_sys_init(): void
+  signal(SIGPIPE, SIG_IGN)
+end
+
+global function agent_pid(): int64
+  return getpid()
+end
+
+-- `n` random bytes (fewer when /dev/urandom is unreadable).
+global function agent_random(n: usize): string
+  local rf = io.open('/dev/urandom', 'rb')
+  local raw: string
+  if rf:isopen() then raw = rf:read(n) rf:close() end
+  return raw
+end
+
+-- ~/.config/ghostty-agent/token, its directory made on the way.
+global function agent_default_token_path(): string
+  local home = os.getenv('HOME')
+  local dir = home .. '/.config/ghostty-agent'
+  os.execute('mkdir -p "' .. dir .. '"')
+  return dir .. '/token'
+end
+
+-- Write a new token file readable only by its owner (umask 077 while it is created).
+global function agent_write_private(path: string, content: string): boolean
+  local old = umask(0x3f)
+  local wf = io.open(path, 'wb')
+  umask(old)
+  if not wf:isopen() then return false end
+  wf:write(content)
+  wf:close()
+  return true
+end
+
+-- Each clipboard tool runs as a short child process with a pipe; the agent
+-- waits for it (a clipboard tool exits at once, wl-copy forks its own server).
+local function exec_first(argvs: *[2][4]cstring): void
+  for i = 0, < 2 do
+    if argvs[i][0] ~= nilptr then execvp(argvs[i][0], &argvs[i]) end
+  end
+  _exit(127)
+end
+
+global function agent_clipboard_set(data: *[0]uint8, len: usize): boolean
+  local fds: [2]cint
+  if pipe(&fds) ~= 0 then return false end
+  local pid = fork()
+  if pid < 0 then close(fds[0]) close(fds[1]) return false end
+  if pid == 0 then
+    dup2(fds[0], 0)
+    close(fds[0]) close(fds[1])
+    local argvs: [2][4]cstring = { { 'wl-copy', nilptr, nilptr, nilptr }, { 'xclip', '-selection', 'clipboard', nilptr } }
+    exec_first(&argvs)
+  end
+  close(fds[0])
+  local off: usize = 0
+  while off < len do
+    local n = write(fds[1], &data[off], len - off)
+    if n <= 0 then break end
+    off = off + (@usize)(n)
+  end
+  close(fds[1])
+  local status: cint = 0
+  waitpid(pid, &status, 0)
+  return off == len and WIFEXITED(status) and WEXITSTATUS(status) == 0
+end
+
+global function agent_clipboard_get(): (boolean, string)
+  local fds: [2]cint
+  if pipe(&fds) ~= 0 then return false, '' end
+  local pid = fork()
+  if pid < 0 then close(fds[0]) close(fds[1]) return false, '' end
+  if pid == 0 then
+    dup2(fds[1], 1)
+    close(fds[0]) close(fds[1])
+    local argvs: [2][4]cstring = { { 'wl-paste', '--no-newline', nilptr, nilptr }, { 'xclip', '-o', '-selection', 'clipboard' } }
+    exec_first(&argvs)
+  end
+  close(fds[1])
+  local sb: stringbuilder
+  local buf: [8192]uint8
+  local pf: [1]pollfd = { { fd = fds[0], events = POLLIN } }
+  while #sb < AGENT_CLIP_MAX do
+    if poll(&pf, 1, 1000) <= 0 then break end -- a stuck clipboard owner must not stall the agent
+    local n = read(fds[0], &buf, 8192)
+    if n <= 0 then break end
+    sb:write(string{data=(@*[0]byte)(&buf), size=(@usize)(n)})
+  end
+  close(fds[0])
+  local status: cint = 0
+  if waitpid(pid, &status, WNOHANG) == 0 then kill(pid, SIGKILL) waitpid(pid, &status, 0) end
+  return true, sb:promote()
+end

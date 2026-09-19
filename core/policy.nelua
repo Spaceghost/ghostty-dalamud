@@ -16,6 +16,7 @@ global Profile = @record{
   host: string,             -- transport-specific target (agent host, superlogical url)
   port: integer,
   cwd: string,
+  fallback: string,         -- agent profiles: the profile (by name) to open instead while no agent answers
 }
 
 global DropdownCfg = @record{
@@ -149,6 +150,7 @@ local function read_profile(L: *lua_State, idx: cint): Profile
   p.host = lua_field_string(L, idx, 'host', '')
   p.port = lua_field_integer(L, idx, 'port', 0)
   p.cwd = lua_field_string(L, idx, 'cwd', '')
+  p.fallback = lua_field_string(L, idx, 'fallback', '')
   lua_getfield(L, idx, 'command')
   if lua_type(L, -1) == LUA_TTABLE then
     read_string_list(L, -1, &p.argv)
@@ -167,7 +169,7 @@ end
 local function clear_profiles(): void
   for i = 0, < #policy.profiles do
     local p = &policy.profiles[i]
-    p.name:destroy() p.transport:destroy() p.host:destroy() p.cwd:destroy()
+    p.name:destroy() p.transport:destroy() p.host:destroy() p.cwd:destroy() p.fallback:destroy()
     for k = 0, < #p.argv do p.argv[k]:destroy() end
     p.argv:destroy()
     for k = 0, < #p.env do p.env[k]:destroy() end
@@ -447,6 +449,25 @@ end
 global function policy_profile(i: integer): *Profile
   if i < 0 or i >= #policy.profiles then return nilptr end
   return &policy.profiles[i]
+end
+
+-- The profile called `name`, if any.
+global function policy_profile_named(name: string): *Profile
+  if #name == 0 then return nilptr end
+  for i = 0, < #policy.profiles do
+    if policy.profiles[i].name == name then return &policy.profiles[i] end
+  end
+  return nilptr
+end
+
+-- The profile a new terminal opens for profile `p`: its `fallback` instead
+-- while the agent is down (no agent answered the last attempt), when the
+-- fallback names a local (conpty) profile. Otherwise `p`.
+global function policy_open_profile(p: *Profile, agent_down: boolean): *Profile
+  if p == nilptr or not agent_down or p.transport ~= 'agent' then return p end
+  local f = policy_profile_named(p.fallback)
+  if f == nilptr or f.transport ~= 'conpty' then return p end
+  return f
 end
 
 -- World panels ------------------------------------------------------------------
