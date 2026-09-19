@@ -28,7 +28,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/toolchain.env"
 cd "$ROOT"
 
-ZIG="${ZIG:-zig}"
+export ZIG="${ZIG:-zig}"
 DOTNET="${DOTNET:-dotnet}"
 NELUA="$ROOT/vendor/nelua-lang/nelua"
 export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig-global}"
