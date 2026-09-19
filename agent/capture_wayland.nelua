@@ -508,6 +508,7 @@ local Cap = @record{
   first_new: uint32,       -- run: windows with this id or later appeared after the launch
   name: string,            -- owned, lower case: the launched program's base name
   handed_off: boolean,     -- the launched process exited 0 without a window of its own
+  flatpak: string,         -- owned: the Flatpak app id a `flatpak run` launch starts, else ''
   launch: string,          -- owned: the launch id of the app started for this open
   key: string,             -- owned: "key:..." match text, re-attaching a saved window
 }
@@ -777,6 +778,49 @@ global function wayland_launch_name(cmd: string): string
     i = j
   end
   return (@string){}
+end
+
+-- The app id of a `flatpak run [options] APP.ID [args]` command line, else
+-- '' (for telling "already running on the desktop" apart).
+global function wayland_flatpak_id(cmd: string): string
+  local at = cmd:find('flatpak run ', 1, true)
+  if at == 0 then return (@string){} end
+  local i, n = at + 12, #cmd
+  while i <= n do
+    while i <= n and cmd:byte(i) == 32 do i = i + 1 end
+    local j = i
+    while j <= n and cmd:byte(j) ~= 32 do j = j + 1 end
+    if j > i and cmd:byte(i) ~= 45 then -- the first word that is not an --option
+      local word = cmd:sub(i, j - 1)
+      local dots = 0
+      for k = 1, #word do if word:byte(k) == 46 then dots = dots + 1 end end
+      if dots >= 2 then return word end
+      word:destroy()
+      return (@string){}
+    end
+    i = j
+  end
+  return (@string){}
+end
+
+-- A Flatpak app with an instance running outside this compositor, from
+-- `flatpak ps` (its single-instance copy on the desktop took the launch).
+local function flatpak_running(id: string): boolean
+  if #id == 0 then return false end
+  local f = io.popen('flatpak ps --columns=application 2>/dev/null', 'r')
+  if not f:isopen() then return false end
+  local out = f:read('a')
+  f:close()
+  local found = false
+  local start = 1
+  for pos = 1, #out + 1 do
+    if pos > #out or out:byte(pos) == 10 then
+      if pos - start == #id and out:subview(start, pos - 1) == id then found = true end
+      start = pos + 1
+    end
+  end
+  out:destroy()
+  return found
 end
 
 -- A WLIST field: tabs and newlines would break the line format.
@@ -1977,7 +2021,9 @@ local function settle(c: *Cap, now: float64): void
         return
       elseif ch.status ~= 0 or now >= c.deadline then
         local sb: stringbuilder
-        if ch.status == 0 then
+        if ch.status == 0 and flatpak_running(c.flatpak) then
+          sb:writef('%s is already running on your desktop and took the launch; quit it there to open it in the game', c.flatpak)
+        elseif ch.status == 0 then
           sb:writef('the app exited without opening a window here (a copy already running on the desktop may have taken it)')
         else
           sb:writef('the app exited (status %d) without opening a window here', ch.status)
@@ -2061,6 +2107,7 @@ local function wl_open(wid: uint32, match: string): (pointer, string)
     c.launch = string.format('%s.%d', wc.instance, wc.launches)
     c.first_new = wc.next_id
     c.name = wayland_launch_name(cmd)
+    c.flatpak = wayland_flatpak_id(cmd)
     log('started "' .. cmd .. '" (pid ' .. tostring(c.pid) .. ') on ' .. wc.socket)
     cmd:destroy()
   elseif #match >= 4 and match:subview(1, 4) == 'key:' then
@@ -2220,7 +2267,7 @@ local function forget_cap(c: *Cap): void
   for i = 0, < #wc.caps do
     if wc.caps[i] == c then wc.caps:remove(i) break end
   end
-  c.why:destroy() c.title:destroy() c.match:destroy() c.name:destroy() c.launch:destroy() c.key:destroy()
+  c.why:destroy() c.title:destroy() c.match:destroy() c.name:destroy() c.flatpak:destroy() c.launch:destroy() c.key:destroy()
   delete(c)
 end
 
