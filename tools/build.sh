@@ -84,7 +84,7 @@ done
 STAMP=(-P "build_commit='$BUILD_COMMIT'" -P "build_id='$BUILD_ID'")
 echo "== build stamp: commit $BUILD_COMMIT, build $BUILD_ID"
 
-INC="-I$ROOT/vendor/ghostty/include -I$ROOT/vendor/gc-cimgui -I$ROOT/vendor/lua/src"
+INC="-I$ROOT/vendor/ghostty/include -I$ROOT/vendor/gc-cimgui -I$ROOT/vendor/lua/src -I$ROOT/vendor/stb"
 
 echo "== ghostty-agent (host)"
 # shellcheck source=tools/wayland-flags.sh

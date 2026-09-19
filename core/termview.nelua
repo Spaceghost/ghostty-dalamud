@@ -16,7 +16,9 @@ global GlyphDraw = @record{
   bold: boolean,
   underline: boolean,
   strike: boolean,
-  cp: uint32, -- non-zero: drawn by core/boxdraw.nelua, not the font
+  cp: uint32, -- non-zero: drawn by core/boxdraw.nelua (or core/glyphfb.nelua with `fb`), not the font
+  fb: boolean, -- a fallback glyph: `cp` from core/glyphfb.nelua, the bytes kept for the ImGui font if it cannot draw
+  span: uint8, -- cells a fallback glyph covers (2: a wide character)
 }
 
 global TermView = @record{

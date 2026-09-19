@@ -65,6 +65,11 @@ global function load_policy(): boolean
     logf(LOG_ERROR, 'lua config failed: %s', policy.error)
     return false
   end
+  do -- fallback glyphs come from the shipped fonts/ (core/glyphfb.nelua)
+    local fonts = string.format('%s/fonts', install)
+    glyphfb_set_dir(fonts)
+    fonts:destroy()
+  end
   boot_lua_register(policy.L)
   gallery_lua_register(policy.L) -- ghostty.http_upload / game_string for lua/gallery.lua
   ipc_lua_register(policy.L) -- ghostty.window_* for lua/ipc.lua

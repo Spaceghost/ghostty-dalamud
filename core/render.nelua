@@ -2,6 +2,7 @@
 require 'core.ghostty'
 require 'core.imgui'
 require 'core.boxdraw'
+require 'core.glyphfb'
 require 'core.termview'
 require 'core.theme'
 require 'memory'
@@ -164,9 +165,31 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
               local mergeable = merge_text and plain and buf.len == 1 and text[0] > 32 and text[0] < 127
               local cp = boxdraw_codepoint(&text, buf.len)
               if not boxdraw_handles(cp) then cp = 0 end
+              -- a glyph the ImGui font cannot draw (above U+FFFF, or missing): core/glyphfb.nelua
+              local fbcp: uint32 = 0
+              local span: integer = 1
+              if cp == 0 and text[0] >= 0x80 then
+                fbcp = glyphfb_codepoint(&text, buf.len)
+                if glyphfb_wants(m.font, fbcp) then
+                  local raw: GhosttyCell = 0
+                  local wide: cint = 0
+                  if ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw) == GHOSTTY_SUCCESS and
+                     ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide) == GHOSTTY_SUCCESS and wide == GHOSTTY_CELL_WIDE_WIDE then
+                    span = 2
+                  end
+                  if not glyphfb_has(fbcp, m.cell_w, m.cell_h, span) then fbcp = 0 end
+                else
+                  fbcp = 0
+                end
+              end
               local n = #v.glyphs
               if cp ~= 0 then
                 v.glyphs:push(GlyphDraw{ x = x, col = fgcol, off = #v.glyph_bytes, len = 0, underline = underline, strike = strike, cp = cp })
+              elseif fbcp ~= 0 then
+                local off = #v.glyph_bytes
+                v.glyph_bytes:resize(off + buf.len)
+                memory.copy(&v.glyph_bytes[off], &text, buf.len)
+                v.glyphs:push(GlyphDraw{ x = x, col = fgcol, off = off, len = buf.len, underline = underline, strike = strike, cp = fbcp, fb = true, span = (@uint8)(span) })
               elseif mergeable and text_next_col == col and n > 0 and v.glyphs[n - 1].col == fgcol and v.glyphs[n - 1].bold == bold then
                 -- the run's bytes are the last ones queued
                 v.glyph_bytes:push(text[0])
@@ -194,7 +217,11 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
           local g = v.glyphs[gi]
           local b = (@cstring)(&bytes[g.off])
           local e = (@cstring)(&bytes[g.off + g.len])
-          if g.cp ~= 0 then
+          if g.fb then
+            if not glyphfb_draw(dl, g.cp, g.x, y, m.cell_w, m.cell_h, g.span, g.col, not render_world) then
+              imgui.DrawListAddText(dl, m.font, m.font_size, vec2(g.x, y), g.col, b, e, 0.0, nilptr)
+            end
+          elseif g.cp ~= 0 then
             boxdraw_draw(dl, g.cp, g.x, y, m.cell_w, m.cell_h, g.col, not render_world)
           else
             imgui.DrawListAddText(dl, m.font, m.font_size, vec2(g.x, y), g.col, b, e, 0.0, nilptr)
@@ -238,8 +265,11 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
         imgui.DrawListAddRectFilled(dl, vec2(cx, cy), vec2(cx + m.cell_w, cy + m.cell_h), ccol, 0.0, 0)
         -- a theme with cursor-text redraws the glyph under the block in that colour
         local ccp = cur_glyph_len > 0 and boxdraw_codepoint(&cur_glyph, cur_glyph_len) or 0
+        local fcp = cur_glyph_len > 0 and glyphfb_codepoint(&cur_glyph, cur_glyph_len) or 0
         if boxdraw_handles(ccp) then
           boxdraw_draw(dl, ccp, cx, cy, m.cell_w, m.cell_h, rgb(theme_term.cursor_text, 255), not render_world)
+        elseif glyphfb_wants(m.font, fcp) and glyphfb_draw(dl, fcp, cx, cy, m.cell_w, m.cell_h, 1, rgb(theme_term.cursor_text, 255), not render_world) then
+          -- a fallback glyph
         elseif cur_glyph_len > 0 then
           local b = (@cstring)(&cur_glyph[0])
           local e = (@cstring)(&cur_glyph[cur_glyph_len])
