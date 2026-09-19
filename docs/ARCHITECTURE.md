@@ -287,6 +287,7 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_agent_windows` | remote windows end to end over TCP against `--windows test`: list, open by id and match, KEY and delta frames rebuilt, scaling, flow control, every input kind, close, WEND, failures, streams per connection, `--windows off` |
 | `test_capture_wayland` | the Wayland backend's pure parts: USB HID to evdev, codepoint to key and Shift in real xkb keymaps (us, de), `run:` parsing, WLIST lines, matching (only with `vendor/wayland-sdk`) |
 | `test_wayland_compositor` | the agent's Wayland compositor with a real client (`yad`, GTK3): launch through `run:`, map, frame size and content, click and TEXT/KEY/WHEEL input changing the pixels, WLIST, close, a launch that exits without a window; writes `first.png` and `typed.png` to `build/test-scratch/wayland` (only with `vendor/wayland-sdk`; skipped without yad) |
+| `test_e2e_wayland` | the plugin's agent client against a real `ghostty-agent --windows wayland`: `run:yad`, KEY and delta frames with WACK pacing, click and TEXT reaching the app, SIGTERM ending the apps the agent launched (only with `vendor/wayland-sdk` and yad) |
 
 The last step checks that the core also compiles as a native host module.
 

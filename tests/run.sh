@@ -91,6 +91,23 @@ if [[ ${#WAYLAND_DEFINE[@]} -gt 0 ]]; then
   # a real Wayland client (yad, GTK3) in the agent's compositor; frames land in build/test-scratch/wayland
   mkdir -p build/test-scratch/wayland
   wlrun test_wayland_compositor "$ROOT/build/test-scratch/wayland"
+  echo "--- test_e2e_wayland"
+  # the plugin's agent client against a real agent that is the compositor
+  "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${WAYLAND_DEFINE[@]}" --cflags="$WAYLAND_CFLAGS" --cache-dir build/nelua-cache -L . -o build/ghostty-agent-wayland -b agent/agent.nelua
+  "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -b tests/test_e2e_wayland.nelua
+  LPORT=$((PORT + 2)); LSOCK="ghostty-test-$$"; LTITLE="ghostty-e2e-$$"
+  env -u DISPLAY build/ghostty-agent-wayland --listen "127.0.0.1:$LPORT" --token-file build/agent-token --windows wayland \
+    --wayland-socket "$LSOCK" >build/agent-wayland.log 2>&1 &
+  LAGENT=$!
+  sleep 0.5
+  kill -0 "$LAGENT" || { cat build/agent-wayland.log; exit 1; }
+  build/nelua-cache/test_e2e_wayland "$LPORT" testtoken123 "$ROOT/build/test-scratch/wayland" "$LTITLE" || { cat build/agent-wayland.log; kill "$LAGENT"; exit 1; }
+  # stopping the agent ends the app it launched (SIGTERM -> capture_wayland_shutdown)
+  kill -TERM "$LAGENT"; wait "$LAGENT" || true
+  sleep 0.3
+  if pgrep -f -- "--title=$LTITLE" >/dev/null; then echo "an app outlived the agent"; pkill -f -- "--title=$LTITLE"; exit 1; fi
+  grep -q stopping build/agent-wayland.log || { echo "the agent did not stop cleanly"; exit 1; }
+  echo "agent stop ended the app OK"
 else
   echo "--- test_wayland_compositor skipped (no vendor/wayland-sdk or libwlroots-0.20)"
 fi

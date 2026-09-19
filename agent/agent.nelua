@@ -558,6 +558,8 @@ local function main(): integer
   local listen_spec: string = '127.0.0.1:7777'
   local token_path: string = ''
   local windows_name: string = 'auto'
+  local wayland_socket: string = '' -- empty: GHOSTTY_WAYLAND_SOCKET, else ghostty-0, ghostty-1, ...
+  local xkb_layout: string = ''     -- empty: GHOSTTY_XKB_LAYOUT, else us
   agent.replay_bytes = 256 * 1024
   agent.term = 'xterm-256color'
   agent.next_id = 1
@@ -570,8 +572,10 @@ local function main(): integer
     elseif a == '--replay-bytes' and i < #arg then agent.replay_bytes = (@usize)(tointeger(arg[i+1])) i = i + 1
     elseif a == '--term' and i < #arg then agent.term = arg[i+1] i = i + 1
     elseif a == '--windows' and i < #arg then windows_name = arg[i+1] i = i + 1
+    elseif a == '--wayland-socket' and i < #arg then wayland_socket = arg[i+1] i = i + 1 -- Linux compositor only
+    elseif a == '--xkb-layout' and i < #arg then xkb_layout = arg[i+1] i = i + 1
     elseif a == '--help' or a == '-h' then
-      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME]\n')
+      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME] [--wayland-socket NAME] [--xkb-layout LAYOUT]\n')
       return 0
     else
       io.stderr:write('unknown argument: ', a, '\n')
@@ -598,6 +602,9 @@ local function main(): integer
     sb:writef('ghostty-agent %d %d', PROTO_VERSION, nonce)
     agent.hello = sb:promote()
   end
+  ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
+  capture_wayland_configure(wayland_socket, xkb_layout)
+  ## end
   do
     local ok, why = windows:init(windows_name, client_queue)
     if ok then log('windows: ' .. windows.backend.name) else log('windows unavailable: ' .. why) end
@@ -657,7 +664,7 @@ local function main(): integer
   end
   ## else
   local fds: [512]pollfd
-  while true do
+  while not agent_stop_requested() do
     local n: usize = 0
     fds[n] = { fd = net.socket_fd(agent.listen_sock), events = POLLIN }
     n = n + 1
@@ -695,6 +702,10 @@ local function main(): integer
     for ci = 0, < #agent.clients do flush_client(ci) end
     reap()
   end
+  log('stopping')
+  ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
+  capture_wayland_shutdown() -- apps launched into the compositor are ended, not orphaned
+  ## end
   ## end
   return 0
 end

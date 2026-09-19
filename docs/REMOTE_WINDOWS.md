@@ -516,6 +516,14 @@ pixman 0.46.2; agent built with zig cc), with `yad` 9.3 (GTK 3.24.52) as the cli
   WOPEN `run:yad …` answered WOPENED sid 1, a 500×337 KEY frame followed,
   a click and TEXT produced 4 delta frames, WCLOSE closed the app.
 
+* `test_e2e_wayland` (in `tests/run.sh`): the plugin's own agent client
+  (`core/agent_client.nelua`, decoding as `core/app/remotewin.nelua` does)
+  against a real agent run with `--windows wayland --wayland-socket …` and no
+  `DISPLAY`: WOPEN `run:yad …`, a 560×397 KEY frame and deltas with WACK
+  after each END, a click and TEXT "typed from FFXIV\n" showing in the
+  rebuilt picture (631 pixels changed); SIGTERM to the agent logged
+  "stopping" and ended the app it had launched.
+
 Not observed: any other client (GTK4, Qt, Electron, terminals), popups and
 menus, resizes, wheel scrolling having a visible effect, the game side.
 
