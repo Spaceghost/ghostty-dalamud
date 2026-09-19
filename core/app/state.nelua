@@ -84,6 +84,11 @@ global GuHostApi = @record{
   -- a chat command of its own (CONFIG.host.verb_commands): its handler posts
   -- GuEventKind.Chat with `a` = tag and the arguments as text; 1 = ok
   command_add_tagged: function(name: cstring, help: cstring, tag: cint): cint,
+  -- flat windows pulled into the world (core/app/chatpanel.nelua, docs/ADOPT.md)
+  addon_rect: function(name: cstring, x: *float32, y: *float32, w: *float32, h: *float32): cint, -- 1 shown, 2 loaded but hidden, 0 none
+  addon_show: function(name: cstring, shown: cint): cint, -- a game addon (AtkUnitBase) shown or hidden; 1 = ok
+  chat_send: function(text: cstring): cint,              -- a line through the game's chat box; 1 = queued
+  config_uint: function(name: cstring, out: *uint32): cint, -- a UiConfig option (log colours); 1 = found
 }
 
 global LOG_INFO: cint <comptime> = 1

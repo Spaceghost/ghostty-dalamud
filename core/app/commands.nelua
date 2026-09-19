@@ -195,6 +195,7 @@ global function run_command(cmd: string): cint
     -- the same teardown as gu_shutdown: nothing may keep steering the game
     showcase_stop()
     teardown_effects()
+    panels_shutdown() -- pulled windows back to the flat UI; the new policy pulls them in again
     -- DETACH, never CLOSE: the shells survive, and a reload that fails before
     -- agent_setup must not leave CLOSE frames queued for every one of them
     for i = 0, < #host.sessions do host.sessions[i].keep_on_agent = true end
@@ -230,6 +231,8 @@ global function run_command(cmd: string): cint
     -- a focused window panel moves (core/app/remotewin.nelua)
     local on_window, wrc = remotewin_pin(arg)
     if on_window then return wrc end
+    local on_panel, prc = panels_pin(arg) -- a focused pulled window moves the same way (core/app/panels.nelua)
+    if on_panel then return prc end
     -- pin the active dropdown tab (or a new session) into the world
     local s: *Session = nilptr
     local from_tab = host.dropdown_active >= 0 and host.dropdown_active < #host.dropdown_tabs
@@ -384,6 +387,8 @@ global function run_command(cmd: string): cint
       set_visible(true)
     end
     return 0
+  elseif verb == 'adopt' or verb == 'release' or verb == 'adopted' then
+    return panels_command(verb, arg) -- flat windows into the world and back (docs/ADOPT.md)
   elseif verb == 'new' then
     local n = policy.default_profile
     if #arg > 0 then
@@ -410,6 +415,13 @@ global function run_verb_command(verb: string, args: string): cint
   local a: string = args
   while #a > 0 and a.data[0] == ' '_b do a = a:subview(2) end
   if verb == 'window' then
+    -- /window adopt NAME | release [NAME] | adopted: flat windows (core/app/panels.nelua)
+    local sub: string = a
+    local rest: string
+    local sp = a:find(' ', 1, true)
+    if sp > 0 then sub, rest = a:subview(1, sp - 1), a:subview(sp + 1) end
+    local prc = panels_command(sub, rest)
+    if prc ~= 3 then return prc end
     return window_command(a)
   elseif verb == 'ask' then
     return assistant_command(a)

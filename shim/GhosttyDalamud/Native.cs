@@ -50,6 +50,10 @@ internal unsafe struct GuHostApi
     public delegate* unmanaged[Cdecl]<nint, float, int> BgSetTransparency;
     public delegate* unmanaged[Cdecl]<nint, int> BgDestroy;
     public delegate* unmanaged[Cdecl]<byte*, byte*, int, int> CommandAddTagged;
+    public delegate* unmanaged[Cdecl]<byte*, float*, float*, float*, float*, int> AddonRect;
+    public delegate* unmanaged[Cdecl]<byte*, int, int> AddonShow;
+    public delegate* unmanaged[Cdecl]<byte*, int> ChatSend;
+    public delegate* unmanaged[Cdecl]<byte*, uint*, int> ConfigUInt;
 }
 
 // Mirrors GuInitInfo in core/app/boot.nelua.
@@ -123,6 +127,8 @@ internal static unsafe class Native
     public static delegate* unmanaged[Cdecl]<float*, float*, int, int, void> WalkInput;
     // optional: a core (or loader) from before GhosttyDalamud.v1.Call has none
     public static delegate* unmanaged[Cdecl]<byte*, byte*, nuint, nuint> Call;
+    // optional: a core (or loader) from before the chat pet has none
+    public static delegate* unmanaged[Cdecl]<int, byte*, byte*, void> Chat;
 
     public static void Load(string dllPath)
     {
@@ -144,6 +150,7 @@ internal static unsafe class Native
             nint version    = NativeLibrary.GetExport(lib, "gu_version");
             nint walkInput  = NativeLibrary.GetExport(lib, "gu_walk_input");
             NativeLibrary.TryGetExport(lib, "gu_call", out nint call);
+            NativeLibrary.TryGetExport(lib, "gu_chat", out nint chat);
             InitEx     = (delegate* unmanaged[Cdecl]<GuHostApi*, GuInitInfo*, int>)initEx;
             Frame      = (delegate* unmanaged[Cdecl]<void>)frame;
             Event      = (delegate* unmanaged[Cdecl]<int, int, int, float, float, byte*, void>)evt;
@@ -155,6 +162,7 @@ internal static unsafe class Native
             Version    = (delegate* unmanaged[Cdecl]<byte*>)version;
             WalkInput  = (delegate* unmanaged[Cdecl]<float*, float*, int, int, void>)walkInput;
             Call       = (delegate* unmanaged[Cdecl]<byte*, byte*, nuint, nuint>)call;
+            Chat       = (delegate* unmanaged[Cdecl]<int, byte*, byte*, void>)chat;
             _lib       = lib;
         }
         catch
@@ -175,6 +183,15 @@ internal static unsafe class Native
     {
         byte[] bytes = Encoding.UTF8.GetBytes(text + "\0");
         fixed (byte* p = bytes) Event((int)kind, a, b, x, y, p);
+    }
+
+    // gu_chat: one chat message, sender and text as NUL-terminated UTF-8.
+    public static void PostChat(int kind, string sender, string text)
+    {
+        if (Chat == null) return;
+        byte[] s = Encoding.UTF8.GetBytes(sender + "\0");
+        byte[] t = Encoding.UTF8.GetBytes(text + "\0");
+        fixed (byte* ps = s) fixed (byte* pt = t) Chat(kind, ps, pt);
     }
 
     // gu_call: JSON in, JSON out (docs/IPC.md). The core answers in at most

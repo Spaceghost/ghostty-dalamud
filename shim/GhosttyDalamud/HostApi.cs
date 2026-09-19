@@ -74,6 +74,10 @@ internal static unsafe class HostApi
         Api->BgSetTransparency = &BgSetTransparency;
         Api->BgDestroy      = &BgDestroy;
         Api->CommandAddTagged = &CommandAddTagged;
+        Api->AddonRect      = &AddonRect;
+        Api->AddonShow      = &AddonShow;
+        Api->ChatSend       = &ChatSend;
+        Api->ConfigUInt     = &ConfigUInt;
     }
 
     public static void Free()
@@ -185,6 +189,78 @@ internal static unsafe class HostApi
     {
         if (url == null) return 0;
         try { Dalamud.Utility.Util.OpenLink(Str(url)); return 1; } catch { return 0; }
+    }
+
+    // Flat windows pulled into the world (docs/ADOPT.md) ------------------------------------------
+
+    // A game addon's rectangle on the screen: 1 shown, 2 loaded but hidden, 0 not loaded.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int AddonRect(byte* name, float* x, float* y, float* w, float* h)
+    {
+        try {
+            var a = Plugin.GameGui.GetAddonByName(Str(name), 1);
+            if (a.IsNull) return 0;
+            *x = a.X; *y = a.Y; *w = a.ScaledWidth; *h = a.ScaledHeight;
+            return a.IsVisible ? 1 : 2;
+        } catch { return 0; }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int AddonShow(byte* name, int shown)
+    {
+        try {
+            var a = Plugin.GameGui.GetAddonByName(Str(name), 1);
+            if (a.IsNull) return 0;
+            ((FFXIVClientStructs.FFXIV.Component.GUI.AtkUnitBase*)a.Address)->IsVisible = shown != 0;
+            return 1;
+        } catch { return 0; }
+    }
+
+    // What the chat input itself allows (xiv-mcp's ChatInput): anything the game
+    // would strip makes the line differ after sanitising, and it is refused.
+    private const FFXIVClientStructs.FFXIV.Client.System.String.AllowedEntities ChatAllowed =
+        (FFXIVClientStructs.FFXIV.Client.System.String.AllowedEntities)0x27F;
+
+    // A line through the game's chat box, as if typed and sent with Enter; on
+    // the framework thread. 1 = queued (a refusal is logged there).
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int ChatSend(byte* text)
+    {
+        try {
+            string line = Str(text);
+            if (line.Length == 0 || System.Text.Encoding.UTF8.GetByteCount(line) > 500) return 0;
+            Plugin.GameFramework.RunOnFrameworkThread(() => SubmitChat(line));
+            return 1;
+        } catch { return 0; }
+    }
+
+    private static void SubmitChat(string line)
+    {
+        var ui = FFXIVClientStructs.FFXIV.Client.UI.UIModule.Instance();
+        if (ui == null) { Plugin.Log.Warning("[Ghostty] chat: the game UI is not ready"); return; }
+        var str = FFXIVClientStructs.FFXIV.Client.System.String.Utf8String.FromString(line);
+        if (str == null) return;
+        try {
+            str->SanitizeString(ChatAllowed, null);
+            if (!string.Equals(str->ToString(), line, StringComparison.Ordinal)) {
+                Plugin.Log.Warning("[Ghostty] chat: the line has characters the game's chat box does not accept; not sent");
+                return;
+            }
+            ui->ProcessChatBoxEntry(str, 0, false);
+        } finally {
+            str->Dtor(true);
+        }
+    }
+
+    // A UiConfig option as a number (the chat log colours: ColorSay, ...).
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int ConfigUInt(byte* name, uint* value)
+    {
+        try {
+            if (!Plugin.GameConfig.UiConfig.TryGetUInt(Str(name), out uint v)) return 0;
+            *value = v;
+            return 1;
+        } catch { return 0; }
     }
 
     // Fonts and keys -----------------------------------------------------------------------------

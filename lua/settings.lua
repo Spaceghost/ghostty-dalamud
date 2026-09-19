@@ -128,6 +128,9 @@ S.schema = {
     { 'assistant.chat', 'argv', '/term ask runs' },
     { 'assistant.ask', 'argv', '/term ask <question> runs, plus the question' },
   } },
+  { 'Flat windows in the world', {
+    { 'adopt.auto.mappy', 'checkbox', 'Mappy\'s map is a world panel whenever it is open' },
+  } },
   { 'Info bar & hidden UI', {
     { 'host.dtr.mode', 'combo', DTR_MODES, 'Server info bar entry (auto: only without the Umbra widget)' },
     { 'popup.close_on_blur', 'checkbox', 'Info bar popup closes when you click elsewhere' },
