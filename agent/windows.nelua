@@ -41,6 +41,7 @@ local WinStream = @record{
   prev: vector(uint8),   -- what the client has, pw x ph, stride pw * 4
   scaled: vector(uint8),
   rects: vector(WinRect),
+  geom: vector(CaptureBox), -- the WGEOM last sent, in frame pixels as sent
   scratch: vector(uint8),
   body: vector(uint8),
 }
@@ -93,9 +94,39 @@ local function drop(self: *AgentWindows, i: usize): void
   s.prev:destroy()
   s.scaled:destroy()
   s.rects:destroy()
+  s.geom:destroy()
   s.scratch:destroy()
   s.body:destroy()
   self.streams:remove(i)
+end
+
+-- WGEOM before the first WFRAME of a seq whose boxes differ from the last
+-- ones sent: the window's and its popups' rectangles in the picture, scaled
+-- as the frame is (factor f).
+local function send_geom(s: *WinStream, q: *ByteQueue, fr: *CaptureFrame, f: integer): void
+  local n = math.min(fr.nbox, 64)
+  local same = n == #s.geom
+  local b: [64]CaptureBox
+  for i = 0, < n do
+    local r = fr.boxes[i]
+    b[i] = { x = r.x // f, y = r.y // f, w = (r.w + f - 1) // f, h = (r.h + f - 1) // f }
+    if same and (b[i].x ~= s.geom[i].x or b[i].y ~= s.geom[i].y or b[i].w ~= s.geom[i].w or b[i].h ~= s.geom[i].h) then same = false end
+  end
+  if same then return end
+  s.geom:clear()
+  local body: [4 + 4 + 2 + 64 * 8]uint8
+  proto.put_u32(&body, s.sid)
+  proto.put_u32((@*[0]uint8)(&body[4]), s.seq)
+  proto.put_u16((@*[0]uint8)(&body[8]), (@uint16)(n))
+  for i = 0, < n do
+    s.geom:push(b[i])
+    local o = 10 + i * 8
+    proto.put_u16((@*[0]uint8)(&body[o]), (@uint16)(math.max(0, b[i].x)))
+    proto.put_u16((@*[0]uint8)(&body[o + 2]), (@uint16)(math.max(0, b[i].y)))
+    proto.put_u16((@*[0]uint8)(&body[o + 4]), (@uint16)(math.max(0, b[i].w)))
+    proto.put_u16((@*[0]uint8)(&body[o + 6]), (@uint16)(math.max(0, b[i].h)))
+  end
+  proto.write_frame(q, PROTO_WGEOM, &body, (@usize)(10 + n * 8))
 end
 
 -- One frame: scale, announce the stream if this is its first, diff against
@@ -119,6 +150,7 @@ local function stream_send(self: *AgentWindows, s: *WinStream, q: *ByteQueue, fr
   end
   if #s.rects == 0 then return end
   s.seq = s.seq + 1
+  send_geom(s, q, fr, f)
   wincodec_write_frames(q, s.sid, s.seq, src, stride, w, h, key, &s.rects, &s.scratch, &s.body)
   -- keep what the client now shows: all of it, or the rectangles just sent
   local row = (@usize)(w * 4)

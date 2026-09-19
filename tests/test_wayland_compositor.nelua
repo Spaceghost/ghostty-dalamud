@@ -163,6 +163,47 @@ local function differing(a: *[0]uint8, b: *[0]uint8, n: usize): integer
   return d
 end
 
+
+-- Right-click near the window's bottom-right corner: the context menu opens
+-- beyond the window, so the picture grows to hold it and the boxes say where
+-- the window and the menu are; Escape closes it and the picture shrinks back.
+local function popup_check(h: pointer, w0: integer, h0: integer, name: string): void
+  local e: CaptureInput = { kind = WIN_INPUT_BUTTON, x = w0 - 30, y = h0 // 2, button = 1, down = true }
+  be.input(h, &e)
+  e.down = false
+  be.input(h, &e)
+  local t1 = os.now()
+  local f: CaptureFrame
+  while os.now() - t1 < 5 do
+    turn(20)
+    if be.frame(h, &f) and f.nbox >= 2 and (f.w > w0 or f.h > h0) then break end
+  end
+  f = frame_of(h)
+  print(string.format('%s menu open: picture %dx%d, %d boxes, window at %d,%d %dx%d, menu at %d,%d %dx%d', name, f.w, f.h, f.nbox,
+    f.nbox > 0 and f.boxes[0].x or -1, f.nbox > 0 and f.boxes[0].y or -1, f.nbox > 0 and f.boxes[0].w or -1, f.nbox > 0 and f.boxes[0].h or -1,
+    f.nbox > 1 and f.boxes[1].x or -1, f.nbox > 1 and f.boxes[1].y or -1, f.nbox > 1 and f.boxes[1].w or -1, f.nbox > 1 and f.boxes[1].h or -1))
+  check(f.nbox >= 2, name .. ': the menu is a box of the picture')
+  check(f.w > w0 or f.h > h0, name .. ': the picture grew beyond the window')
+  check(f.boxes[0].w == w0 and f.boxes[0].h == h0, name .. ': box 0 is the window')
+  check(f.boxes[1].x + f.boxes[1].w > f.boxes[0].x + f.boxes[0].w, name .. ': the menu reaches past the window\'s right edge')
+  -- the menu has pixels of its own out there (not black)
+  local mx, my = f.boxes[1].x + f.boxes[1].w - 8, f.boxes[1].y + f.boxes[1].h // 2
+  local o = (@usize)(my) * f.stride + (@usize)(mx) * 4
+  check(f.pixels[o] ~= 0 or f.pixels[o + 1] ~= 0 or f.pixels[o + 2] ~= 0, name .. ': menu pixels outside the window')
+  save_png(f, name .. '-menu.png')
+  e = { kind = WIN_INPUT_KEY, hid = 0x29, down = true } -- Escape
+  be.input(h, &e)
+  e.down = false
+  be.input(h, &e)
+  t1 = os.now()
+  while os.now() - t1 < 5 do
+    turn(20)
+    if be.frame(h, &f) and f.w == w0 and f.h == h0 then break end
+  end
+  f = frame_of(h)
+  check(f.w == w0 and f.h == h0 and f.nbox == 1, name .. ': back to the window alone after Escape')
+end
+
 -- WLIST before anything runs: only the launch line
 do
   local l = be.list()
@@ -261,6 +302,7 @@ local changed = differing(&before[0], fr.pixels, (@usize)(fr.w * fr.h * 4))
 print('pixels changed by typing: ' .. tostring(changed))
 check(changed > 50, 'typing changed the pixels')
 save_png(fr, 'typed.png')
+popup_check(h, w0, h0, 'xdg')
 
 -- close: the launched app is asked to close; its exit is reaped
 be.close(h)
@@ -317,6 +359,7 @@ do
   print('X11 pixels changed by typing: ' .. tostring(cx))
   check(cx > 50, 'typing reached the X11 app')
   save_png(fx, 'x11-typed.png')
+  popup_check(hx, xw, xh, 'x11')
   bx:destroy()
   be.close(hx) -- WM_DELETE_WINDOW: yad exits
   run_for(1.0)

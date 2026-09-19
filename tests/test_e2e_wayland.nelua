@@ -32,6 +32,10 @@ local State = @record{
   deltas: integer,
   pending_ack: boolean, ack_seq: uint32,
   why: string,
+  geoms: integer,      -- WGEOMs seen
+  gn: integer,         -- boxes in the latest
+  gwin: [4]integer,    -- its first box (the window)
+  gpop: [4]integer,    -- its second (a popup), if any
 }
 local st: State
 
@@ -60,6 +64,16 @@ local function on_event(ctx: pointer, ev: *AgentEvent): void
       st.frames = st.frames + 1
       if f.flags & WINCODEC_FLAG_KEY ~= 0 then st.keys = st.keys + 1 else st.deltas = st.deltas + 1 end
       st.pending_ack, st.ack_seq = true, f.seq
+    end
+  elseif ev.typ == PROTO_WGEOM then
+    -- the agent_client hands unknown kinds over whole: sid, seq, n, boxes
+    assert(ev.len >= 10, 'a WGEOM has its header')
+    local n = (@integer)(proto.get_u16((@*[0]uint8)(&ev.data[8])))
+    assert(ev.len == (@usize)(10 + n * 8), 'a WGEOM is its boxes long')
+    st.geoms, st.gn = st.geoms + 1, n
+    for k = 0, < 4 do
+      st.gwin[k] = proto.get_u16((@*[0]uint8)(&ev.data[10 + k * 2]))
+      st.gpop[k] = n > 1 and (@integer)(proto.get_u16((@*[0]uint8)(&ev.data[18 + k * 2]))) or 0
     end
   elseif ev.typ == PROTO_WEND then
     st.ended = true
@@ -140,6 +154,29 @@ if #first == #st.pixels then
 end
 assert(changed > 50, 'the typed text shows in the picture')
 write_ppm(outdir .. '/e2e-typed.ppm')
+
+-- a context menu near the right edge: WGEOM says the picture now holds the
+-- window and a menu reaching past it, and the frame grows to match
+assert(st.geoms >= 1 and st.gn == 1, 'a WGEOM with the window alone came with the first frame')
+local ww, wh = st.gwin[2], st.gwin[3]
+assert(ww == st.w and wh == st.h, 'the window box is the whole picture before a menu')
+proto.put_u16(&b, (@uint16)(st.w - 20))
+proto.put_u16((@*[0]uint8)(&b[2]), (@uint16)(st.h // 2))
+b[4], b[5] = 1, 1
+client:winput(st.sid, WIN_INPUT_BUTTON, &b, 6)
+b[5] = 0
+client:winput(st.sid, WIN_INPUT_BUTTON, &b, 6)
+assert(pump_for(5, function(): boolean return st.gn >= 2 and st.w > ww end), 'a WGEOM with a menu, and a wider picture')
+print(('e2e menu: picture %dx%d, window %d,%d %dx%d, menu %d,%d %dx%d'):format(st.w, st.h,
+  st.gwin[0], st.gwin[1], st.gwin[2], st.gwin[3], st.gpop[0], st.gpop[1], st.gpop[2], st.gpop[3]))
+assert(st.gwin[2] == ww and st.gwin[3] == wh, 'the window keeps its size in the picture')
+assert(st.gpop[0] + st.gpop[2] > st.gwin[0] + st.gwin[2], 'the menu reaches past the window')
+write_ppm(outdir .. '/e2e-menu.ppm')
+local esc: [4]uint8 = { 0x29, 0, 1, 0 }
+client:winput(st.sid, WIN_INPUT_KEY, &esc, 4)
+esc[2] = 0
+client:winput(st.sid, WIN_INPUT_KEY, &esc, 4)
+assert(pump_for(5, function(): boolean return st.gn == 1 and st.w == ww end), 'the menu closed: the window alone again')
 print(('e2e: %dx%d, %d frames (%d key, %d delta), %d pixels changed by typing'):format(st.w, st.h, st.frames, st.keys, st.deltas, changed))
 -- the stream stays open: run.sh stops the agent, which must end the app
 client:flush()

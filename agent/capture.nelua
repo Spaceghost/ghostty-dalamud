@@ -15,12 +15,20 @@
 -- answers 'backend not built', and the agent runs without windows.
 require 'string'
 
+-- A rectangle of a frame: x, y from its top-left corner, in its pixels.
+global CaptureBox = @record{ x: integer, y: integer, w: integer, h: integer }
+
 global CaptureFrame = @record{
   pixels: *[0]uint8,   -- BGRA, top-down, alpha ignored; borrowed until the next call on the handle
   w: integer,
   h: integer,
   stride: usize,       -- bytes a row
   serial: uint64,      -- changes whenever the pixels do (0: no frame yet)
+  -- optional: where things are in the picture when it is more than the
+  -- window: boxes[0] the window, then its popups (menus drawn outside it);
+  -- nbox 0 means the whole frame is the window. Borrowed like `pixels`.
+  boxes: *[0]CaptureBox,
+  nbox: integer,
 }
 
 -- One WINPUT, decoded. Coordinates are pixels of the window as captured (the

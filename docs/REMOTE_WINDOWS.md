@@ -45,6 +45,7 @@ agent → client
 | 25 | WOPENED | req u32, sid, w u16, h u16, title UTF-8 (sid 0: failed, the text says why) |
 | 26 | WFRAME | sid, seq u32, w u16, h u16, flags u8, nrect u16, rects… |
 | 27 | WEND | sid, reason UTF-8 (window closed, capture refused, …) |
+| 28 | WGEOM | sid, seq u32, n u16, n × (x u16, y u16, w u16, h u16) |
 
 WOPENED answers WOPEN by its client-chosen `req`, and may come much later
 (an app being launched has not shown its window yet) and out of order. `wid 0`
@@ -63,6 +64,36 @@ Each rectangle: `x u16, y u16, w u16, h u16, enc u8, len u32, bytes[len]`.
 * enc 0 RAW: `w*h*4` bytes BGRA, rows top to bottom, no padding.
 * enc 1 QOI: the rectangle's pixels as a QOI chunk stream (no header, no end
   marker), alpha ignored and always 255; decoded length is exactly `w*h`.
+
+WGEOM (additive; agents send it only when the picture can be more than the
+window, so far the Linux compositor): where things are in a stream's
+picture, in pixels of the frames as sent (after scaling). Box 0 is the
+window itself; the others are its popups (menus, tooltips, combo lists)
+that reach outside it, so the picture is the rectangle around all of them.
+It comes right before the first WFRAME of `seq` whenever the boxes change,
+and holds from that seq's END on; the first one comes with the first frame.
+A client that ignores it still maps input correctly (WINPUT coordinates
+are picture pixels), but shows the picture shrinking while a menu is open
+and black where neither window nor popup is.
+
+What the plugin has to do with WGEOM (core/app/remotewin.nelua; not done):
+
+1. Keep the latest boxes per stream, parsed as above, applied when the
+   frame with that `seq` is presented.
+2. Size and place the panel from box 0 only: the panel's aspect and
+   letterbox come from the window's w×h, not the picture's, so opening a
+   menu does not resize or shift the window on the panel.
+3. Draw the texture's box-0 region into the panel as today (UVs = box 0 /
+   picture size), then each other box as its own quad at the same scale,
+   offset from the window's placement by (box − box 0), even where that is
+   outside the panel (menus hang over the panel's edge in the world).
+   Nothing outside the boxes is drawn (it is black in the picture).
+4. Input: a panel point maps to picture pixel = box 0's origin + the point
+   in window pixels; points over a popup quad outside the panel go to the
+   stream too (map through that quad), so a menu below the panel can be
+   clicked. A click outside every box still goes to the stream (it closes
+   the menu).
+5. Old agents never send WGEOM: treat "no boxes" as box 0 = the whole picture.
 
 Flow control: the agent keeps at most 2 unacknowledged `seq` per stream. The
 client sends WACK with the `seq` it presented. A stream nobody acknowledges
@@ -375,6 +406,14 @@ no host compositor: the host desktop never sees these windows.
   ARGS`, since ours offers only shared-memory buffers to it). No NAME: the
   first installed of labwc, sway, wayfire, river, weston, Hyprland. `cage
   APP` runs one app (`--` added).
+* Popups are not clipped: an xdg_popup may be placed anywhere within 600
+  logical px around its window (its positioner is unconstrained against that
+  box, not the window), and X11 menus open on an X screen of 3840×2160 (one
+  extra output nothing draws, so GTK/Qt on X11 do not keep menus inside
+  their window). Each window's output is sized to the window plus its shown
+  popups (clamped to the same margin) and placed at their top-left corner;
+  WFRAME pictures are that rectangle and WGEOM says where the window and
+  each popup are in it. WINPUT coordinates are pixels of that picture.
 * Input: the stream that gets input gets the keyboard focus (one toplevel at a
   time). Pointer events go to the surface under the point in that window's
   scene (popups included), with `BTN_LEFT/RIGHT/MIDDLE`. WHEEL `dy` is 1/120
@@ -390,7 +429,6 @@ no host compositor: the host desktop never sees these windows.
 
 Limits, all current:
 
-* Popups are constrained to the window and clipped to it.
 * TEXT reaches only characters the layout types at level 1 or 2; others (for
   "us": accented letters, emoji) are dropped with one log line. text-input-v3
   is the way to more.
@@ -596,6 +634,18 @@ pixman 0.46.2; agent built with zig cc), with `yad` 9.3 (GTK 3.24.52) as the cli
   river, weston or Hyprland, so `desktop:sway|labwc` is not run) as our
   client: one 2560×1440 window showing yad inside cage. An unknown desktop
   name was refused.
+* `test_wayland_compositor`, 2026-09-19, popups: a right click 30 px from
+  yad's right edge opened GTK's context menu; with the xdg window (1280×800
+  at scale 2) the picture grew to 1604×946 with the window at 0,0 and the
+  menu at 1252,402 352×544 (menu pixels outside the window, saved as
+  `xdg-menu.png`); with the X11 window (500×300) to 638×405, menu at 471,151
+  167×254 (an override-redirect window, `x11-menu.png`). Escape closed each
+  and the picture went back to the window alone. Before the big X screen
+  output, GTK on X11 kept its menu inside the 500×300 window.
+* `test_e2e_wayland`, 2026-09-19, WGEOM over TCP: a WGEOM with the window
+  alone came with the first frame; after a right click near the edge a
+  WGEOM with window 0,0 1120×720 and a menu at 1102,362 352×544, and a
+  1454×906 picture; after Escape the window alone again.
 * `test_e2e_wayland` (in `tests/run.sh`): the plugin's own agent client
   (`core/agent_client.nelua`, decoding as `core/app/remotewin.nelua` does)
   against a real agent run with `--windows wayland --wayland-socket …` and no

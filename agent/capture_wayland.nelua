@@ -15,13 +15,17 @@
 -- (always server side: the game panel draws the chrome). Every xdg_toplevel
 -- gets its own wlr_scene and its own headless output sized to the window's
 -- geometry; rendering that output yields the window's pixels. Popups render
--- into their toplevel's scene, constrained to the window and clipped to it.
+-- into their toplevel's scene.
 --
 -- X11 apps come in through wlroots' Xwayland (started with the first X11
 -- client): their toplevels are windows like xdg ones, their override-redirect
 -- windows (menus, tooltips) are drawn into the window they belong to.
 --
--- Limits (docs/REMOTE_WINDOWS.md): popups clipped to the window, TEXT typed
+-- A window's picture is the window and its popups: menus may reach outside
+-- the window (by up to POPUP_MARGIN), the picture grows to hold them and
+-- CaptureFrame.boxes says where the window is in it (WGEOM).
+--
+-- Limits (docs/REMOTE_WINDOWS.md): TEXT typed
 -- through keymap lookup (levels 1 and 2 of the layout; other characters are
 -- dropped), software rendering only.
 --
@@ -282,6 +286,8 @@ local function wlr_keyboard_finish(kb: *wlr_keyboard): void <cimport, nodecl> en
 local function wlr_keyboard_notify_key(kb: *wlr_keyboard, ev: *wlr_keyboard_key_event): void <cimport, nodecl> end
 local function wlr_scene_subsurface_tree_create(parent: *wlr_scene_tree, s: *wlr_surface): *wlr_scene_tree <cimport, nodecl> end
 local function wlr_scene_node_set_position(n: *wlr_scene_node, x: cint, y: cint): void <cimport, nodecl> end
+local function wlr_scene_node_coords(n: *wlr_scene_node, x: *cint, y: *cint): boolean <cimport, nodecl> end
+local function wlr_scene_output_set_position(so: *wlr_scene_output, x: cint, y: cint): void <cimport, nodecl> end
 
 -- Xwayland (wlroots' XWM): X11 windows are wlr_xwayland_surfaces whose
 -- wl_surface Xwayland commits like any client's.
@@ -327,6 +333,9 @@ global WAYLAND_DEFAULT_W: integer <comptime> = 1280
 global WAYLAND_DEFAULT_H: integer <comptime> = 800
 local WAYLAND_OPEN_TIMEOUT: float64 <comptime> = 30.0 -- s, for a launched app or a match to show up
 local WAYLAND_HANDOFF_WAIT: float64 <comptime> = 5.0 -- s, after a launched app exits 0 without a window
+local X11_SCREEN_W: integer <comptime> = 3840 -- the X screen Xwayland sees (see start_xwayland)
+local X11_SCREEN_H: integer <comptime> = 2160
+local POPUP_MARGIN: integer <comptime> = 600 -- logical px popups may reach beyond their window
 local BTN_LEFT: uint32 <comptime> = 0x110 -- then BTN_RIGHT 0x111, BTN_MIDDLE 0x112
 local AXIS_PER_NOTCH: float64 <comptime> = 15.0 -- wl_pointer.axis units per wheel notch (libinput's)
 
@@ -382,6 +391,9 @@ Top = @record{
   w: integer, h: integer,
   serial: uint64,
   popups: vector(*Popup),
+  ox: integer, oy: integer,  -- the picture's corner relative to the window's (logical; <= 0)
+  lay: vector(CaptureBox),   -- the window and its shown popups, logical, window-relative
+  boxes: vector(CaptureBox), -- the same in the latest picture's pixels (CaptureFrame.boxes)
   on_commit: Hook, on_map: Hook, on_unmap: Hook, on_destroy: Hook,
   on_maximize: Hook, on_fullscreen: Hook,
 }
@@ -816,6 +828,7 @@ local function top_free(t: *Top): void
     if pp.p ~= nilptr then pp.p.base.data = nilptr end
   end
   t.popups:destroy()
+  t.lay:destroy() t.boxes:destroy()
   if t.deco ~= nilptr then (@*Deco)(t.deco).top = nilptr end
   if t.output ~= nilptr then wlr_output_destroy(t.output) end -- takes the scene output along
   wlr_scene_node_destroy(&t.scene.tree.node)
@@ -923,7 +936,10 @@ local function on_popup_commit(l: *wl_listener, data: pointer): void
   if not pp.p.base.initial_commit then return end
   local root = popup_root(pp.p)
   if root ~= nilptr then
-    local box = root.base.geometry -- the window, in the toplevel surface's coordinates
+    -- the window and a margin around it, in the toplevel surface's
+    -- coordinates: menus may reach outside the window (the picture grows)
+    local g = root.base.geometry
+    local box: wlr_box = { x = g.x - POPUP_MARGIN, y = g.y - POPUP_MARGIN, width = g.width + 2 * POPUP_MARGIN, height = g.height + 2 * POPUP_MARGIN }
     wlr_xdg_popup_unconstrain_from_box(pp.p, &box)
   end
   wlr_xdg_surface_schedule_configure(pp.p.base)
@@ -1163,17 +1179,65 @@ local function grab(t: *Top, buf: *wlr_buffer, w: integer, h: integer): void
   t.serial = t.serial + 1
 end
 
+-- The window and its shown popups (t.lay, logical, the window's corner at
+-- 0,0; popups kept within POPUP_MARGIN of it) and the rectangle around all
+-- of them: the picture.
+local function top_layout(t: *Top): (integer, integer, integer, integer)
+  local w, h = top_size(t)
+  t.lay:clear()
+  t.lay:push(CaptureBox{ x = 0, y = 0, w = w, h = h })
+  local x0, y0, x1, y1 = 0, 0, w, h
+  for i = 0, < #t.popups do
+    local pp = t.popups[i]
+    if pp.x ~= nilptr then x11_place(pp) end
+    if pp.tree ~= nilptr then
+      local surf: *wlr_surface = nilptr
+      local pw, ph = 0, 0
+      if pp.p ~= nilptr then
+        surf, pw, ph = pp.p.base.surface, (@integer)(pp.p.base.geometry.width), (@integer)(pp.p.base.geometry.height)
+      else
+        surf, pw, ph = pp.x.xs.surface, (@integer)(pp.x.xs.width), (@integer)(pp.x.xs.height)
+      end
+      if surf ~= nilptr and surf.mapped and pw > 0 and ph > 0 then
+        local lx: cint, ly: cint = 0, 0
+        wlr_scene_node_coords(&pp.tree.node, &lx, &ly)
+        local bx0, by0 = math.max((@integer)(lx), -POPUP_MARGIN), math.max((@integer)(ly), -POPUP_MARGIN)
+        local bx1, by1 = math.min((@integer)(lx) + pw, w + POPUP_MARGIN), math.min((@integer)(ly) + ph, h + POPUP_MARGIN)
+        if bx1 > bx0 and by1 > by0 then
+          t.lay:push(CaptureBox{ x = bx0, y = by0, w = bx1 - bx0, h = by1 - by0 })
+          x0, y0 = math.min(x0, bx0), math.min(y0, by0)
+          x1, y1 = math.max(x1, bx1), math.max(y1, by1)
+        end
+      end
+    end
+  end
+  return x0, y0, x1 - x0, y1 - y0
+end
+
 local function render(t: *Top): void
   if not t.mapped or t.sout == nilptr or t.output.frame_pending then return end
-  local lw, lh = top_size(t)
-  local w, h = lw * t.scale, lh * t.scale -- output pixels
+  local ux, uy, uw, uh = top_layout(t)
+  local w, h = uw * t.scale, uh * t.scale -- output pixels
   local resize = w ~= t.output.width or h ~= t.output.height
-  if not resize and not wlr_scene_output_needs_frame(t.sout) then return end
+  local moved = ux ~= t.ox or uy ~= t.oy
+  if moved then
+    -- the output shows the scene from the picture's corner on
+    wlr_scene_output_set_position(t.sout, (@cint)(ux), (@cint)(uy))
+    t.ox, t.oy = ux, uy
+  end
+  if not resize and not moved and not wlr_scene_output_needs_frame(t.sout) then return end
   local st: wlr_output_state
   wlr_output_state_init(&st)
   if resize then wlr_output_state_set_custom_mode(&st, (@int32)(w), (@int32)(h), 0) end
   if wlr_scene_output_build_state(t.sout, &st, nilptr) then
-    if (st.committed & WLR_OUTPUT_STATE_BUFFER) ~= 0 and st.buffer ~= nilptr then grab(t, st.buffer, w, h) end
+    if (st.committed & WLR_OUTPUT_STATE_BUFFER) ~= 0 and st.buffer ~= nilptr then
+      grab(t, st.buffer, w, h)
+      t.boxes:clear()
+      for i = 0, < #t.lay do
+        local b = t.lay[i]
+        t.boxes:push(CaptureBox{ x = (b.x - ux) * t.scale, y = (b.y - uy) * t.scale, w = b.w * t.scale, h = b.h * t.scale })
+      end
+    end
     wlr_output_commit_state(t.output, &st)
   end
   wlr_output_state_finish(&st)
@@ -1209,7 +1273,8 @@ end
 local function pointer_to(t: *Top, x: integer, y: integer, time: uint32): void
   local sx: float64, sy: float64 = 0, 0
   -- frames are output pixels; the scene is in logical coordinates
-  local lx, ly = (x + 0.5) / t.scale, (y + 0.5) / t.scale
+  -- picture pixels -> the scene's logical coordinates (the window's corner at 0,0)
+  local lx, ly = t.ox + (x + 0.5) / t.scale, t.oy + (y + 0.5) / t.scale
   local node = wlr_scene_node_at(&t.scene.tree.node, lx, ly, &sx, &sy)
   local surf: *wlr_surface = nilptr
   if node ~= nilptr and node.type == WLR_SCENE_NODE_BUFFER then
@@ -1512,7 +1577,8 @@ local function wl_frame(h: pointer, out: *CaptureFrame): boolean
   local c = (@*Cap)(h)
   local t = c.top
   if t == nilptr or t.serial == 0 then return false end
-  $out = { pixels = (@*[0]uint8)(&t.pixels[0]), w = t.w, h = t.h, stride = (@usize)(t.w) * 4, serial = t.serial }
+  $out = { pixels = (@*[0]uint8)(&t.pixels[0]), w = t.w, h = t.h, stride = (@usize)(t.w) * 4, serial = t.serial,
+           boxes = #t.boxes > 0 and (@*[0]CaptureBox)(&t.boxes[0]) or nilptr, nbox = #t.boxes }
   return true
 end
 
@@ -1630,6 +1696,22 @@ local function start_xwayland(): void
   wc.xwayland = wlr_xwayland_create(wc.display, wc.compositor, mode ~= 'eager')
   if wc.xwayland == nilptr then log('cannot start Xwayland: X11-only apps will not show') return end
   wlr_xwayland_set_seat(wc.xwayland, wc.seat)
+  -- X11 apps keep their menus on the "monitor" (all our outputs overlap at
+  -- 0,0, one per window, each the window's size); one big output that is
+  -- never drawn gives them a screen to open menus beyond their window in
+  do
+    local o = wlr_headless_add_output(wc.backend, X11_SCREEN_W, X11_SCREEN_H)
+    if o ~= nilptr then
+      wlr_output_init_render(o, wc.allocator, wc.renderer)
+      local st: wlr_output_state
+      wlr_output_state_init(&st)
+      wlr_output_state_set_enabled(&st, true)
+      wlr_output_state_set_custom_mode(&st, X11_SCREEN_W, X11_SCREEN_H, 0)
+      wlr_output_commit_state(o, &st)
+      wlr_output_state_finish(&st)
+      wlr_output_create_global(o, wc.display)
+    end
+  end
   hook(&wc.on_x_surface, &wc.xwayland.events.new_surface, on_x_surface, nilptr)
   hook(&wc.on_x_ready, &wc.xwayland.events.ready, on_x_ready, nilptr)
   if wc.xwayland.server ~= nilptr then hook(&wc.on_x_start, &wc.xwayland.server.events.start, on_x_start, nilptr) end
