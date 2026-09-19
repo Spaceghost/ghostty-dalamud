@@ -53,7 +53,7 @@ function M.banner()
     end
     put(reset, '\n')
   end
-  put('\n  ', rgb(230, 222, 200), 'a real terminal emulator, living in Eorzea', reset, '\n\n')
+  put('\n  ', rgb(230, 222, 200), 'Eorzea is a terminal multiplexer', reset, '\n\n')
   local lines = {
     { 'libghostty-vt', 'terminal state, kitty keyboard, truecolor' },
     { 'nelua core', 'drawn straight into the game world' },

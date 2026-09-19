@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="640" viewBox="0 0 1280 640">
-  <title>Ghostty for FFXIV: a real terminal in Eorzea</title>
+  <title>Ghostty for FFXIV: Eorzea is a terminal multiplexer</title>
   <defs>
     <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="#050a1c"/>
@@ -259,7 +259,7 @@
   </g>
   <path d="M84 352 H500" stroke="url(#goldH)" stroke-width="2"/>
   <path d="M292 344 l8 8 l-8 8 l-8 -8 Z" fill="#d6a854"/>
-  <text x="86" y="398" font-family="'Fira Code','Source Code Pro','DejaVu Sans Mono',monospace" font-size="27" fill="#8ff0ff" filter="url(#glow)">&gt; a real terminal in Eorzea<tspan fill="#8ff0ff">▌</tspan></text>
+  <text x="86" y="398" font-family="'Fira Code','Source Code Pro','DejaVu Sans Mono',monospace" font-size="22" fill="#8ff0ff" filter="url(#glow)">&gt; Eorzea is a terminal multiplexer<tspan fill="#8ff0ff">▌</tspan></text>
 
   <!-- gold frame -->
   <rect x="14" y="14" width="1252" height="612" rx="18" fill="none" stroke="url(#gold)" stroke-width="3" opacity="0.8"/>

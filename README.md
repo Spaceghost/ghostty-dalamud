@@ -1,6 +1,6 @@
 # Ghostty for Dalamud
 
-![Ghostty for FFXIV: a real terminal in Eorzea](images/banner.png)
+![Ghostty for FFXIV: Eorzea is a terminal multiplexer](images/banner.png)
 
 **Vote on what it does next: https://spacegho.st/mods/ffxiv/term/vote/**
 
