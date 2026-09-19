@@ -35,6 +35,12 @@
 -- Version 3 adds remote desktop windows (docs/REMOTE_WINDOWS.md): WLIST,
 -- WOPEN, WACK, WINPUT, WCLOSE from the client; WLISTR, WOPENED, WFRAME, WEND
 -- from the agent. Clients send them only to agents greeting with version 3+.
+--
+-- Version 4 adds raw jobs (docs/JOBS.md): a process on pipes instead of a
+-- PTY, for a program whose output the client parses rather than draws --
+-- a Claude Code session in stream-json mode above all. JOPEN, JDATA, JCLOSE,
+-- JSIG, JATTACH from the client; JOPENED, JOUT, JEXIT from the agent.
+-- Clients send them only to agents greeting with version 4+.
 
 global proto = @record{}
 
@@ -53,6 +59,11 @@ global PROTO_WOPEN: uint8 <comptime> = 12     -- req u32, wid u32, max_w u16, ma
 global PROTO_WACK: uint8 <comptime> = 13      -- sid, seq u32: frame presented
 global PROTO_WINPUT: uint8 <comptime> = 14    -- sid, kind u8, body
 global PROTO_WCLOSE: uint8 <comptime> = 15    -- sid
+global PROTO_JOPEN: uint8 <comptime> = 29     -- version 4: req u32, flags u8, argv... "\0\0" env... (docs/JOBS.md)
+global PROTO_JDATA: uint8 <comptime> = 30     -- jid, bytes for the job's stdin (no bytes: close its stdin)
+global PROTO_JCLOSE: uint8 <comptime> = 31    -- jid: kill the job
+global PROTO_JSIG: uint8 <comptime> = 32      -- jid, sig u8
+global PROTO_JATTACH: uint8 <comptime> = 33   -- jid: take over a kept job, with its replay
 
 global PROTO_OK: uint8 <comptime> = 16
 global PROTO_ERR: uint8 <comptime> = 17
@@ -67,6 +78,18 @@ global PROTO_WOPENED: uint8 <comptime> = 25   -- req u32, sid, w u16, h u16, tit
 global PROTO_WFRAME: uint8 <comptime> = 26    -- sid, seq u32, w u16, h u16, flags u8, nrect u16, rects
 global PROTO_WEND: uint8 <comptime> = 27      -- sid, reason
 global PROTO_WGEOM: uint8 <comptime> = 28     -- sid, seq u32, n u16, n x (x u16, y u16, w u16, h u16): window, then popups
+global PROTO_JOPENED: uint8 <comptime> = 34   -- req u32, jid u32, pid u32 (jid 0: failed, the text says why)
+global PROTO_JOUT: uint8 <comptime> = 35      -- jid, stream u8 (1 stdout, 2 stderr), bytes
+global PROTO_JEXIT: uint8 <comptime> = 36     -- jid, status i32 (128 + signal when killed)
+
+-- JOPEN flags
+global JOB_FLAG_KEEP: uint8 <comptime> = 1    -- bit 0: outlive the connection; JATTACH picks it up again
+
+-- JOUT streams
+global JOB_OUT: uint8 <comptime> = 1
+global JOB_ERR: uint8 <comptime> = 2
+
+global JOB_NO_JOB: uint32 <comptime> = 0xFFFFFFFF -- JEXIT status for an unknown jid
 
 -- WINPUT kinds
 global WIN_INPUT_MOVE: uint8 <comptime> = 1   -- x i16, y i16
@@ -80,7 +103,7 @@ global WIN_MOD_SHIFT: uint8 <comptime> = 2
 global WIN_MOD_ALT: uint8 <comptime> = 4
 global WIN_MOD_SUPER: uint8 <comptime> = 8
 
-global PROTO_VERSION: integer <comptime> = 3
+global PROTO_VERSION: integer <comptime> = 4
 global PROTO_NO_SESSION: uint32 <comptime> = 0xFFFFFFFF -- EXIT status for an unknown id
 
 global PROTO_HEADER: usize <comptime> = 5

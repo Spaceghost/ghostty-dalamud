@@ -23,8 +23,9 @@ recorded under "Verified" at the end of this file; everything else is not.
 
 ## Protocol (version 3, additive)
 
-Agents greet with `ghostty-agent 3 <nonce>`. Clients send window frames only
-to version 3 agents. All integers are little endian. `sid` is a window stream
+Agents greet with `ghostty-agent <version> <nonce>`. Clients send window
+frames only to agents of version 3 or later (version 4 adds jobs,
+docs/JOBS.md). All integers are little endian. `sid` is a window stream
 id (u32), its own number space, never a PTY session id.
 
 client → agent
