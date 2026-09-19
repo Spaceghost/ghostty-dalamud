@@ -25,6 +25,11 @@ local function GlobalLock(h: pointer): pointer <cimport, nodecl> end
 local function GlobalUnlock(h: pointer): cint <cimport, nodecl> end
 local function GlobalSize(h: pointer): usize <cimport, nodecl> end
 local function Sleep(ms: uint32): void <cimport, nodecl> end
+local function CreateThread(sa: pointer, stack: usize, fn: function(pointer): uint32, arg: pointer, flags: uint32, id: *uint32): pointer <cimport, nodecl> end
+local function WaitForSingleObject(h: pointer, ms: uint32): uint32 <cimport, nodecl> end
+local function CloseHandle(h: pointer): cint <cimport, nodecl> end
+local function InterlockedCompareExchange(p: *clong, xchg: clong, cmp: clong): clong <cimport, nodecl> end
+local WAIT_OBJECT_0: uint32 <cimport, nodecl, const>
 local function MultiByteToWideChar(cp: uint32, flags: uint32, src: cstring, srclen: cint, dst: *[0]uint16, dstlen: cint): cint <cimport, nodecl> end
 local function WideCharToMultiByte(cp: uint32, flags: uint32, src: *[0]uint16, srclen: cint, dst: *[0]cchar, dstlen: cint, def: cstring, used: pointer): cint <cimport, nodecl> end
 local CF_UNICODETEXT: uint32 <cimport, nodecl, const>
@@ -91,7 +96,7 @@ local function open_clipboard(): boolean
   return false
 end
 
-global function agent_clipboard_set(data: *[0]uint8, len: usize): boolean
+local function clip_do_set(data: *[0]uint8, len: usize): boolean
   local text = agent_crlf(string{data=(@*[0]byte)(data), size=len})
   local n = MultiByteToWideChar(CP_UTF8, 0, (@cstring)(text.data), (@cint)(text.size), nilptr, 0)
   if n < 0 or (n == 0 and text.size > 0) then text:destroy() return false end
@@ -112,7 +117,7 @@ global function agent_clipboard_set(data: *[0]uint8, len: usize): boolean
 end
 
 -- The clipboard's text as UTF-8; empty when it holds no text.
-global function agent_clipboard_get(): (boolean, string)
+local function clip_do_get(): (boolean, string)
   if not open_clipboard() then return false, (@string){} end
   local h = GetClipboardData(CF_UNICODETEXT)
   if h == nilptr then CloseClipboard() return true, (@string){} end
@@ -135,4 +140,72 @@ global function agent_clipboard_get(): (boolean, string)
   GlobalUnlock(h)
   CloseClipboard()
   return true, out
+end
+
+-- Clipboard calls run on a short-lived thread the loop waits for at most a
+-- second: a hung clipboard owner (or, under Wine, a desktop without a
+-- clipboard server) must not stall every shell. A job the loop gave up on is
+-- freed by its thread when the call finally returns.
+local CLIP_TIMEOUT_MS: uint32 <comptime> = 1000
+local CLIP_PENDING: clong <comptime> = 0
+local CLIP_DONE: clong <comptime> = 1
+local CLIP_ABANDONED: clong <comptime> = 2
+
+local ClipJob = @record{
+  set: boolean,
+  data: string,  -- CLIP_SET: a copy of the text
+  ok: boolean,
+  out: string,   -- CLIP_GET: the text
+  state: clong,
+}
+
+local function free_job(job: *ClipJob): void
+  job.data:destroy()
+  job.out:destroy()
+  delete(job)
+end
+
+local function clip_thread(arg: pointer): uint32
+  local job = (@*ClipJob)(arg)
+  if job.set then
+    job.ok = clip_do_set((@*[0]uint8)(job.data.data), job.data.size)
+  else
+    job.ok, job.out = clip_do_get()
+  end
+  if InterlockedCompareExchange(&job.state, CLIP_DONE, CLIP_PENDING) == CLIP_ABANDONED then free_job(job) end
+  return 0
+end
+
+-- Run the job; true with the job still ours, false when it timed out (the thread owns it then).
+local function clip_run(job: *ClipJob): boolean
+  local th = CreateThread(nilptr, 0, clip_thread, job, 0, nilptr)
+  if th == nilptr then
+    clip_thread(job) -- no thread: do it here
+    return true
+  end
+  local finished = WaitForSingleObject(th, CLIP_TIMEOUT_MS) == WAIT_OBJECT_0
+  CloseHandle(th)
+  if finished then return true end
+  if InterlockedCompareExchange(&job.state, CLIP_ABANDONED, CLIP_PENDING) == CLIP_DONE then return true end
+  io.stderr:write('[ghostty-agent] the clipboard did not answer within a second\n')
+  return false
+end
+
+global function agent_clipboard_set(data: *[0]uint8, len: usize): boolean
+  local job = new(@ClipJob)
+  job.set = true
+  job.data = string{data=(@*[0]byte)(data), size=len}:copy()
+  if not clip_run(job) then return false end
+  local ok = job.ok
+  free_job(job)
+  return ok
+end
+
+global function agent_clipboard_get(): (boolean, string)
+  local job = new(@ClipJob)
+  if not clip_run(job) then return false, (@string){} end
+  local ok, out = job.ok, job.out
+  job.out = (@string){}
+  free_job(job)
+  return ok, out
 end

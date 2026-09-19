@@ -15,7 +15,8 @@ require 'core.sys.wincmdline'
 ## cinclude '<windows.h>'
 
 local COORD <cimport, nodecl> = @record{ X: int16, Y: int16 }
-local STARTUPINFOW <cimport, nodecl> = @record{ cb: uint32 }
+local STARTUPINFOW <cimport, nodecl> = @record{ cb: uint32, dwFlags: uint32, hStdInput: pointer, hStdOutput: pointer, hStdError: pointer }
+local STARTF_USESTDHANDLES: uint32 <cimport, nodecl, const>
 local STARTUPINFOEXW <cimport, nodecl> = @record{ StartupInfo: STARTUPINFOW, lpAttributeList: pointer }
 -- declared with only the fields used: the C compiler knows the real size
 local SIZEOF_STARTUPINFOEXW: uint32 <cimport 'sizeof(STARTUPINFOEXW)', nodecl, const>
@@ -272,6 +273,12 @@ function AgentPty.spawn(term: string, argv: *vector(string), env: *vector(string
     end
     local si: STARTUPINFOEXW
     si.StartupInfo.cb = SIZEOF_STARTUPINFOEXW
+  -- Null standard handles (as Windows Terminal does): otherwise a child can
+  -- take this process's own stdin/stdout instead of its pseudo console's.
+  si.StartupInfo.dwFlags = STARTF_USESTDHANDLES
+  si.StartupInfo.hStdInput = nilptr
+  si.StartupInfo.hStdOutput = nilptr
+  si.StartupInfo.hStdError = nilptr
     si.lpAttributeList = w.attr_list
     local pi: PROCESS_INFORMATION
     local cmdline = win_cmdline(argv)

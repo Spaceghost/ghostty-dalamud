@@ -20,7 +20,8 @@ global ConPty = @record{
 ## cinclude '<windows.h>'
 
 local COORD <cimport, nodecl> = @record{ X: int16, Y: int16 }
-local STARTUPINFOW <cimport, nodecl> = @record{ cb: uint32 }
+local STARTUPINFOW <cimport, nodecl> = @record{ cb: uint32, dwFlags: uint32, hStdInput: pointer, hStdOutput: pointer, hStdError: pointer }
+local STARTF_USESTDHANDLES: uint32 <cimport, nodecl, const>
 local STARTUPINFOEXW <cimport, nodecl> = @record{ StartupInfo: STARTUPINFOW, lpAttributeList: pointer }
 -- These records declare only the fields used, so `#STARTUPINFOEXW` would be
 -- their size (16), not the real 112 CreateProcessW checks: ask the C compiler.
@@ -50,6 +51,7 @@ local EXTENDED_STARTUPINFO_PRESENT: uint32 <cimport, nodecl, const>
 local CREATE_UNICODE_ENVIRONMENT: uint32 <cimport, nodecl, const>
 local PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize <cimport, nodecl, const>
 local WAIT_OBJECT_0: uint32 <cimport, nodecl, const>
+local INVALID_HANDLE_VALUE: pointer <cimport, nodecl, const>
 local CP_UTF8: uint32 <cimport, nodecl, const>
 
 -- ConPTY entry points are resolved at runtime so the DLL still loads on a
@@ -109,6 +111,12 @@ function ConPty:open(argv: *vector(string), cwd: string, cols: uint16, rows: uin
 
   local si: STARTUPINFOEXW
   si.StartupInfo.cb = SIZEOF_STARTUPINFOEXW
+  -- Null standard handles (as Windows Terminal does): otherwise a child can
+  -- take this process's own stdin/stdout instead of its pseudo console's.
+  si.StartupInfo.dwFlags = STARTF_USESTDHANDLES
+  si.StartupInfo.hStdInput = nilptr
+  si.StartupInfo.hStdOutput = nilptr
+  si.StartupInfo.hStdError = nilptr
   si.lpAttributeList = self.attr_list
   local pi: PROCESS_INFORMATION
   local cmdline = win_cmdline(argv)
