@@ -68,6 +68,8 @@ global DepthPass = @record{
   ran: uint64,                -- begin callbacks the renderer has run (total)
   ran_seen: uint64,
   misses: integer,
+  reversed: boolean,          -- this frame's depth grows toward the camera (the comparison's direction)
+  matrix_logged: boolean,     -- the camera's depth mapping, reported once per session
   last_upload: WorldDepthParams, -- host builds: what the last begin callback would upload
   host_bind_fails: boolean,   -- host builds: the tests' stand-in for a callback that binds nothing
 }
@@ -138,19 +140,22 @@ local D3D11_CPU_ACCESS_WRITE <comptime> = 0x10000
 local D3D11_MAP_WRITE_DISCARD <comptime> = 4
 local D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR <comptime> = 0x95
 local D3D11_TEXTURE_ADDRESS_CLAMP <comptime> = 3
+local D3D11_COMPARISON_LESS_EQUAL <comptime> = 4
 local D3D11_COMPARISON_GREATER_EQUAL <comptime> = 7
 
 local gpu_device: *ID3D11Device        -- Dalamud's device the objects below belong to (borrowed)
 local gpu_ctx: *ID3D11DeviceContext    -- its immediate context (our reference)
 local gpu_ps: *ID3D11PixelShader
 local gpu_cb: *ID3D11Buffer
-local gpu_sampler: *ID3D11SamplerState
+local gpu_sampler: *ID3D11SamplerState      -- GREATER_EQUAL: reversed Z, the panel is nearer where its value is greater
+local gpu_sampler_fwd: *ID3D11SamplerState  -- LESS_EQUAL, for a depth buffer that grows away from the camera
 local gpu_checked_srv: pointer         -- depth view already known to belong to gpu_device
 
 local function gpu_release(): void
   if gpu_ps ~= nilptr then ID3D11PixelShader_Release(gpu_ps) gpu_ps = nilptr end
   if gpu_cb ~= nilptr then ID3D11Buffer_Release(gpu_cb) gpu_cb = nilptr end
   if gpu_sampler ~= nilptr then ID3D11SamplerState_Release(gpu_sampler) gpu_sampler = nilptr end
+  if gpu_sampler_fwd ~= nilptr then ID3D11SamplerState_Release(gpu_sampler_fwd) gpu_sampler_fwd = nilptr end
   if gpu_ctx ~= nilptr then ID3D11DeviceContext_Release(gpu_ctx) gpu_ctx = nilptr end
   gpu_device = nilptr
   gpu_checked_srv = nilptr
@@ -221,17 +226,30 @@ local function gpu_prepare(sd: *GuSceneDepth): boolean
       return latch('CreateBuffer failed for the panel depth constants')
     end
   end
-  if gpu_sampler == nilptr then
+  if gpu_sampler == nilptr or gpu_sampler_fwd == nilptr then
+    -- both comparisons: which one a frame uses follows the camera's depth
+    -- mapping (world_depth_reversed), and the camera may change under us
     local sdesc: D3D11_SAMPLER_DESC = {
       Filter = D3D11_FILTER_COMPARISON_MIN_MAG_MIP_LINEAR, AddressU = D3D11_TEXTURE_ADDRESS_CLAMP,
       AddressV = D3D11_TEXTURE_ADDRESS_CLAMP, AddressW = D3D11_TEXTURE_ADDRESS_CLAMP,
       ComparisonFunc = D3D11_COMPARISON_GREATER_EQUAL, MaxLOD = 3.402823466e38,
     }
-    local hr = ID3D11Device_CreateSamplerState(dev, &sdesc, &gpu_sampler)
-    if hr < 0 then
-      gpu_sampler = nilptr
-      depthpass.hresult = hr
-      return latch('CreateSamplerState failed for the depth comparison')
+    if gpu_sampler == nilptr then
+      local hr = ID3D11Device_CreateSamplerState(dev, &sdesc, &gpu_sampler)
+      if hr < 0 then
+        gpu_sampler = nilptr
+        depthpass.hresult = hr
+        return latch('CreateSamplerState failed for the depth comparison')
+      end
+    end
+    if gpu_sampler_fwd == nilptr then
+      sdesc.ComparisonFunc = D3D11_COMPARISON_LESS_EQUAL
+      local hr = ID3D11Device_CreateSamplerState(dev, &sdesc, &gpu_sampler_fwd)
+      if hr < 0 then
+        gpu_sampler_fwd = nilptr
+        depthpass.hresult = hr
+        return latch('CreateSamplerState failed for the depth comparison')
+      end
     end
   end
   if gpu_ctx == nilptr then
@@ -256,7 +274,8 @@ end
 -- on ImGui's own shader.
 local function bind(p: *WorldDepthParams): boolean
   ## if ccinfo.is_windows then
-    if gpu_ctx == nilptr or gpu_ps == nilptr or gpu_cb == nilptr or gpu_sampler == nilptr or depthpass.scene.srv == nilptr then
+    if gpu_ctx == nilptr or gpu_ps == nilptr or gpu_cb == nilptr or gpu_sampler == nilptr
+       or gpu_sampler_fwd == nilptr or depthpass.scene.srv == nilptr then
       return false
     end
     local mapped: D3D11_MAPPED_SUBRESOURCE
@@ -265,7 +284,7 @@ local function bind(p: *WorldDepthParams): boolean
     ID3D11DeviceContext_Unmap(gpu_ctx, (@*ID3D11Resource)(gpu_cb), 0)
     local cb = gpu_cb
     local srv = (@*ID3D11ShaderResourceView)(depthpass.scene.srv)
-    local sampler = gpu_sampler
+    local sampler = depthpass.reversed and gpu_sampler or gpu_sampler_fwd
     ID3D11DeviceContext_PSSetConstantBuffers(gpu_ctx, 0, 1, &cb)
     ID3D11DeviceContext_PSSetShaderResources(gpu_ctx, 1, 1, &srv)
     ID3D11DeviceContext_PSSetSamplers(gpu_ctx, 1, 1, &sampler)
@@ -323,7 +342,11 @@ global function depthpass_frame_begin(get_scene_depth: function(out: *GuSceneDep
   if sd.srv == nilptr then return fail('the scene depth has no shader resource view') end
   if sd.actual_width == 0 or sd.actual_height == 0 or cam.width < 1 or cam.height < 1 then return fail('the scene depth has no size') end
   local okf, frame = world_depth_frame(cam)
-  if not okf then return fail('the camera is not reversed-Z with an infinite far plane') end
+  -- any perspective projection is read back as distance (world_depth_mapping);
+  -- only one with no perspective divide at all, or whose depth carries no
+  -- distance, is refused
+  if not okf then return fail('the camera\'s depth cannot be read back as distance (no perspective divide, or a depth column that is not one)') end
+  depthpass.reversed = world_depth_reversed(frame.depth_b)
   if not gpu_prepare(&sd) then return false end
   depthpass.frame = frame
   depthpass.cam = $cam
@@ -351,6 +374,22 @@ global function depthpass_select(requested: uint8, get_scene_depth: function(out
       log(LOG_WARN, msg)
       msg:destroy()
     end
+  end
+  -- The mapping itself, once per session: which projection the game really
+  -- uses can only be confirmed in game, so the numbers behind it go to the log
+  -- (ndc z = b / depth + a; reversed Z has b > 0, an infinite far plane a = 0).
+  if ok and not depthpass.matrix_logged then
+    depthpass.matrix_logged = true
+    local m = &cam.m
+    local sb: stringbuilder
+    sb:writef('world: depth mapping ndc z = %.6f / depth + %.6f (%s Z, %s far plane); view-projection z column (%.6f, %.6f, %.6f, %.6f), w column (%.6f, %.6f, %.6f, %.6f)',
+      depthpass.frame.depth_b, depthpass.frame.depth_a,
+      depthpass.reversed and 'reversed' or 'forward',
+      math.abs(depthpass.frame.depth_a) < 1e-9 and 'infinite' or 'finite',
+      m[2], m[6], m[10], m[14], m[3], m[7], m[11], m[15])
+    local msg = sb:promote()
+    log(LOG_INFO, msg)
+    msg:destroy()
   end
   return ok and WORLD_OCCLUSION_DEPTH or WORLD_OCCLUSION_CAPSULE
 end

@@ -1,0 +1,528 @@
+-- Another plugin's ImGui window shown on a world panel: the pure parts
+-- (docs/ADOPT.md; the app side is core/app/adopt.nelua).
+--
+-- A window is laid out and drawn by its own plugin at its real place on the
+-- screen, in screen pixels. When ImGui is about to render (a RenderPre
+-- context hook) its draw lists are copied into a snapshot here and emptied,
+-- so nothing of it reaches the screen. On the next frame the snapshot is
+-- emitted into the world panel's draw list in panel pixels, where worldview
+-- bends it onto the panel like a terminal (world_transform_vertices). The
+-- pointer goes the other way: a cursor over the panel becomes a point inside
+-- the real window.
+--
+-- ImGui clips with scissor rectangles, which mean nothing once the vertices
+-- are projected into the world, so every triangle is clipped here on the CPU
+-- against its command's clip rectangle and cut into vertical strips narrow
+-- enough to follow the panel's curve.
+require 'math'
+require 'vector'
+require 'string'
+require 'core.imgui'
+require 'core.imgui_internal'
+
+-- Window pixels to panel pixels: a uniform scale, centred in the content box.
+global AdoptMap = @record{
+  win_x: float32, win_y: float32,   -- window top-left on the screen
+  win_w: float32, win_h: float32,
+  ox: float32, oy: float32,         -- panel pixel of the window's top-left
+  scale: float32,                   -- panel pixels per window pixel
+}
+
+-- Fit a window `win_w` x `win_h` at (win_x, win_y) into the panel box
+-- (cx, cy, cw, ch) without distorting it.
+global function adopt_fit(win_x: float32, win_y: float32, win_w: float32, win_h: float32,
+                          cx: float32, cy: float32, cw: float32, ch: float32): AdoptMap
+  local m: AdoptMap = { win_x = win_x, win_y = win_y, win_w = win_w, win_h = win_h, scale = 1 }
+  if win_w >= 1 and win_h >= 1 and cw > 0 and ch > 0 then m.scale = math.min(cw / win_w, ch / win_h) end
+  m.ox = cx + (cw - win_w * m.scale) * 0.5
+  m.oy = cy + (ch - win_h * m.scale) * 0.5
+  return m
+end
+
+-- Cover the panel box (cx, cy, cw, ch) with the window area `ix, iy, iw, ih`
+-- (screen pixels) without distorting it: the larger of the two scales, centred,
+-- so the box has no empty band and whatever sticks out is cut by the box.
+global function adopt_cover(ix: float32, iy: float32, iw: float32, ih: float32,
+                            cx: float32, cy: float32, cw: float32, ch: float32): AdoptMap
+  local m: AdoptMap = { win_x = ix, win_y = iy, win_w = iw, win_h = ih, scale = 1 }
+  if iw >= 1 and ih >= 1 and cw > 0 and ch > 0 then m.scale = math.max(cw / iw, ch / ih) end
+  m.ox = cx + (cw - iw * m.scale) * 0.5
+  m.oy = cy + (ch - ih * m.scale) * 0.5
+  return m
+end
+
+-- The window size that gives its inner area (inside the title bar and
+-- borders: `chrome_w` x `chrome_h` window pixels around it) the panel box's
+-- shape, bw x bh panel pixels at `scale` panel pixels per window pixel. The
+-- window must stay on the display (dw x dh; ImGui culls what lies outside),
+-- so a box too large for it is rendered at a larger scale (a smaller window,
+-- scaled up on the panel). -> the window's width, height and the scale used.
+global function adopt_window_for_panel(bw: float32, bh: float32, scale: float32, chrome_w: float32, chrome_h: float32,
+                                       dw: float32, dh: float32): (float32, float32, float32)
+  local s = math.max(scale, 0.05)
+  s = math.max(s, bw / math.max(dw - chrome_w, 1), bh / math.max(dh - chrome_h, 1))
+  local iw, ih = math.max(bw / s, 1), math.max(bh / s, 1)
+  return iw + chrome_w, ih + chrome_h, s
+end
+
+global function adopt_to_panel(m: *AdoptMap, x: float32, y: float32): (float32, float32)
+  return m.ox + (x - m.win_x) * m.scale, m.oy + (y - m.win_y) * m.scale
+end
+
+global function adopt_to_window(m: *AdoptMap, u: float32, v: float32): (float32, float32)
+  local s = m.scale > 1e-6 and m.scale or 1
+  return m.win_x + (u - m.ox) / s, m.win_y + (v - m.oy) / s
+end
+
+-- Polygons while clipping: a triangle gains at most one vertex per clip edge.
+global ADOPT_POLY_MAX <comptime> = 12
+global AdoptVert = @record{ x: float32, y: float32, u: float32, v: float32, col: uint32 }
+global AdoptPoly = @record{ n: integer, v: [ADOPT_POLY_MAX]AdoptVert }
+
+local function lerp_col(a: uint32, b: uint32, t: float32): uint32
+  local out: uint32 = 0
+  for sh = 0, 24, 8 do
+    local ca = (@float32)((a >> sh) & 0xFF)
+    local cb = (@float32)((b >> sh) & 0xFF)
+    out = out | ((@uint32)(math.clamp(ca + (cb - ca) * t + 0.5, 0, 255)) << sh)
+  end
+  return out
+end
+
+local function lerp_vert(a: AdoptVert, b: AdoptVert, t: float32): AdoptVert
+  return AdoptVert{
+    x = a.x + (b.x - a.x) * t, y = a.y + (b.y - a.y) * t,
+    u = a.u + (b.u - a.u) * t, v = a.v + (b.v - a.v) * t,
+    col = lerp_col(a.col, b.col, t),
+  }
+end
+
+-- One Sutherland-Hodgman pass: keep the side where sign * (coord - edge) >= 0
+-- (axis 0 = x, 1 = y).
+local function clip_edge(p: *AdoptPoly, axis: integer, edge: float32, sign: float32): void
+  if p.n == 0 then return end
+  local out: AdoptPoly
+  out.n = 0
+  for i = 0, < p.n do
+    local a = p.v[i]
+    local b = p.v[(i + 1) % p.n]
+    local da = sign * ((axis == 0 and a.x or a.y) - edge)
+    local db = sign * ((axis == 0 and b.x or b.y) - edge)
+    if da >= 0 and out.n < ADOPT_POLY_MAX then out.v[out.n] = a out.n = out.n + 1 end
+    if (da >= 0) ~= (db >= 0) and out.n < ADOPT_POLY_MAX then
+      out.v[out.n] = lerp_vert(a, b, da / (da - db))
+      out.n = out.n + 1
+    end
+  end
+  $p = out
+end
+
+-- One half-plane for other modules (core/hudmask.nelua): keep where
+-- sign * (coord - edge) >= 0, axis 0 = x, 1 = y.
+global function adopt_clip_half(p: *AdoptPoly, axis: integer, edge: float32, sign: float32): void
+  clip_edge(p, axis, edge, sign)
+end
+
+-- Clip `p` in place to the rectangle [x0, x1] x [y0, y1]; n = 0 when nothing is left.
+global function adopt_clip(p: *AdoptPoly, x0: float32, y0: float32, x1: float32, y1: float32): void
+  clip_edge(p, 0, x0, 1)
+  clip_edge(p, 0, x1, -1)
+  clip_edge(p, 1, y0, 1)
+  clip_edge(p, 1, y1, -1)
+  if p.n < 3 then p.n = 0 end
+end
+
+-- Triangles out of a convex polygon, as a fan, `origin` added to positions.
+local function emit_fan(dst: *ImDrawList, p: *AdoptPoly, origin: ImVec2): integer
+  if p.n < 3 then return 0 end
+  local tris = p.n - 2
+  imgui.DrawListPrimReserve(dst, (@cint)(tris * 3), (@cint)(tris * 3))
+  for t = 1, tris do
+    local a, b, c = p.v[0], p.v[t], p.v[t + 1]
+    imgui.DrawListPrimVtx(dst, vec2(origin.x + a.x, origin.y + a.y), vec2(a.u, a.v), a.col)
+    imgui.DrawListPrimVtx(dst, vec2(origin.x + b.x, origin.y + b.y), vec2(b.u, b.v), b.col)
+    imgui.DrawListPrimVtx(dst, vec2(origin.x + c.x, origin.y + c.y), vec2(c.u, c.v), c.col)
+  end
+  return tris * 3
+end
+
+-- A clipped polygon, cut into vertical strips `strip` panel pixels wide
+-- (0 = uncut) so a curved panel bends it. Returns the vertices written.
+global function adopt_emit_poly(dst: *ImDrawList, p: *AdoptPoly, origin: ImVec2, strip: float32): integer
+  if p.n < 3 then return 0 end
+  local minx, maxx = p.v[0].x, p.v[0].x
+  for i = 1, < p.n do minx, maxx = math.min(minx, p.v[i].x), math.max(maxx, p.v[i].x) end
+  if strip <= 0 or maxx - minx <= strip then return emit_fan(dst, p, origin) end
+  local written = 0
+  local x = math.floor(minx / strip) * strip
+  while x < maxx do
+    local piece = $p
+    clip_edge(&piece, 0, x, 1)
+    clip_edge(&piece, 0, x + strip, -1)
+    if piece.n >= 3 then written = written + emit_fan(dst, &piece, origin) end
+    x = x + strip
+  end
+  return written
+end
+
+-- Copy every draw command of `src` (screen pixels) into `dst` as panel pixels
+-- drawn at `origin`, clipped to each command's own clip rectangle and to
+-- `box` (panel pixels; popups get a larger one). Callbacks are skipped: they
+-- would run against the screen's state. Returns the vertices written.
+global function adopt_copy(dst: *ImDrawList, src: *ImDrawList, m: *AdoptMap, origin: ImVec2, box: ImVec4, strip: float32): integer
+  if src == nilptr or dst == nilptr then return 0 end
+  local written = 0
+  local nv = src.VtxBuffer.Size
+  local ni = src.IdxBuffer.Size
+  local push = imgui_int.DrawListPushTextureID
+  local pop = imgui_int.DrawListPopTextureID
+  for ci = 0, < src.CmdBuffer.Size do
+    local cmd = &src.CmdBuffer.Data[ci]
+    if cmd.UserCallback ~= nilptr or cmd.ElemCount == 0 then continue end
+    local cx0, cy0 = adopt_to_panel(m, cmd.ClipRect.x, cmd.ClipRect.y)
+    local cx1, cy1 = adopt_to_panel(m, cmd.ClipRect.z, cmd.ClipRect.w)
+    cx0, cy0 = math.max(cx0, box.x), math.max(cy0, box.y)
+    cx1, cy1 = math.min(cx1, box.z), math.min(cy1, box.w)
+    if cx1 <= cx0 or cy1 <= cy0 then continue end
+    local pushed = false -- the texture goes on only once something is drawn with it
+    local e = 0
+    while e + 2 < (@integer)(cmd.ElemCount) do
+      local poly: AdoptPoly
+      poly.n = 3
+      local ok = true
+      for k = 0, 2 do
+        local ii = (@integer)(cmd.IdxOffset) + e + k
+        if ii >= ni then ok = false break end
+        local vi = (@integer)(src.IdxBuffer.Data[ii]) + (@integer)(cmd.VtxOffset)
+        if vi >= nv then ok = false break end
+        local sv = &src.VtxBuffer.Data[vi]
+        local px, py = adopt_to_panel(m, sv.pos.x, sv.pos.y)
+        poly.v[k] = { x = px, y = py, u = sv.uv.x, v = sv.uv.y, col = sv.col }
+      end
+      e = e + 3
+      if not ok then break end
+      -- wholly inside (text, most widgets): no clipping needed
+      local minx = math.min(poly.v[0].x, math.min(poly.v[1].x, poly.v[2].x))
+      local maxx = math.max(poly.v[0].x, math.max(poly.v[1].x, poly.v[2].x))
+      local miny = math.min(poly.v[0].y, math.min(poly.v[1].y, poly.v[2].y))
+      local maxy = math.max(poly.v[0].y, math.max(poly.v[1].y, poly.v[2].y))
+      if maxx <= cx0 or minx >= cx1 or maxy <= cy0 or miny >= cy1 then continue end
+      if minx < cx0 or maxx > cx1 or miny < cy0 or maxy > cy1 then adopt_clip(&poly, cx0, cy0, cx1, cy1) end
+      if poly.n < 3 then continue end
+      if not pushed and push ~= nilptr and pop ~= nilptr then
+        push(dst, cmd.TextureId)
+        pushed = true
+      end
+      written = written + adopt_emit_poly(dst, &poly, origin, strip)
+    end
+    if pushed then pop(dst) end
+  end
+  return written
+end
+
+-- Snapshots ---------------------------------------------------------------------
+-- What an adopted window drew in one frame: the draw lists of the window, its
+-- child windows and its popups, back to front, each with the screen
+-- rectangle of the window that drew it.
+
+global AdoptSnapList = @record{
+  cmd0: integer, ncmd: integer,
+  idx0: integer, nidx: integer,
+  vtx0: integer, nvtx: integer,
+  x0: float32, y0: float32, x1: float32, y1: float32, -- the window's rectangle (screen pixels)
+  popup: boolean,           -- a popup or tooltip: may spill over the window
+}
+
+global AdoptSnap = @record{
+  lists: vector(AdoptSnapList),
+  cmds: vector(ImDrawCmd),
+  idx: vector(uint16),
+  vtx: vector(ImDrawVert),
+  frame: integer,           -- ImGui frame taken (0: never)
+}
+
+global function adopt_snap_clear(snap: *AdoptSnap): void
+  snap.lists:clear()
+  snap.cmds:clear()
+  snap.idx:clear()
+  snap.vtx:clear()
+end
+
+global function adopt_snap_destroy(snap: *AdoptSnap): void
+  snap.lists:destroy()
+  snap.cmds:destroy()
+  snap.idx:destroy()
+  snap.vtx:destroy()
+  snap.frame = 0
+end
+
+-- Append the contents of `src` drawn by a window at (x0, y0)-(x1, y1).
+global function adopt_snap_take(snap: *AdoptSnap, src: *ImDrawList, x0: float32, y0: float32, x1: float32, y1: float32, popup: boolean): void
+  if src == nilptr or src.CmdBuffer.Size == 0 then return end
+  local l: AdoptSnapList = {
+    cmd0 = #snap.cmds, ncmd = src.CmdBuffer.Size, idx0 = #snap.idx, nidx = src.IdxBuffer.Size,
+    vtx0 = #snap.vtx, nvtx = src.VtxBuffer.Size, x0 = x0, y0 = y0, x1 = x1, y1 = y1, popup = popup,
+  }
+  for i = 0, < src.CmdBuffer.Size do snap.cmds:push(src.CmdBuffer.Data[i]) end
+  for i = 0, < src.IdxBuffer.Size do snap.idx:push(src.IdxBuffer.Data[i]) end
+  for i = 0, < src.VtxBuffer.Size do snap.vtx:push(src.VtxBuffer.Data[i]) end
+  snap.lists:push(l)
+end
+
+-- Emit a snapshot into `dst`: lists of the window itself clipped to `box`,
+-- popups to `popup_box`. Returns the vertices written.
+global function adopt_snap_emit(dst: *ImDrawList, snap: *AdoptSnap, m: *AdoptMap, origin: ImVec2,
+                                box: ImVec4, popup_box: ImVec4, strip: float32): integer
+  local written = 0
+  for i = 0, < #snap.lists do
+    local l = snap.lists[i]
+    if l.ncmd == 0 or l.nidx == 0 or l.nvtx == 0 then continue end
+    local view: ImDrawList
+    view.CmdBuffer = { Size = (@cint)(l.ncmd), Capacity = (@cint)(l.ncmd), Data = (@*[0]ImDrawCmd)(&snap.cmds[l.cmd0]) }
+    view.IdxBuffer = { Size = (@cint)(l.nidx), Capacity = (@cint)(l.nidx), Data = (@*[0]uint16)(&snap.idx[l.idx0]) }
+    view.VtxBuffer = { Size = (@cint)(l.nvtx), Capacity = (@cint)(l.nvtx), Data = (@*[0]ImDrawVert)(&snap.vtx[l.vtx0]) }
+    written = written + adopt_copy(dst, &view, m, origin, l.popup and popup_box or box, strip)
+  end
+  return written
+end
+
+-- What the window shows of its own content, for cropping away the margins a
+-- plugin leaves around it (Mappy's map zoomed out): the bounds of the
+-- triangles of the window and its children (not popups) drawn with a texture
+-- other than `atlas` (the font atlas the window's frame is drawn with), each
+-- cut to its clip rectangle and to (x0, y0)-(x1, y1). False when there are none.
+global function adopt_snap_content(snap: *AdoptSnap, atlas: pointer, x0: float32, y0: float32, x1: float32, y1: float32): (boolean, ImVec4)
+  local found = false
+  local b: ImVec4 = { 1e30, 1e30, -1e30, -1e30 }
+  for i = 0, < #snap.lists do
+    local l = snap.lists[i]
+    if l.popup then continue end
+    for ci = l.cmd0, < l.cmd0 + l.ncmd do
+      local cmd = &snap.cmds[ci]
+      if cmd.UserCallback ~= nilptr or cmd.ElemCount == 0 or cmd.TextureId == atlas then continue end
+      local cx0, cy0 = math.max(cmd.ClipRect.x, x0), math.max(cmd.ClipRect.y, y0)
+      local cx1, cy1 = math.min(cmd.ClipRect.z, x1), math.min(cmd.ClipRect.w, y1)
+      if cx1 <= cx0 or cy1 <= cy0 then continue end
+      for e = 0, < (@integer)(cmd.ElemCount) do
+        local ii = l.idx0 + (@integer)(cmd.IdxOffset) + e
+        if ii >= l.idx0 + l.nidx then break end
+        local vi = l.vtx0 + (@integer)(snap.idx[ii]) + (@integer)(cmd.VtxOffset)
+        if vi >= l.vtx0 + l.nvtx then continue end
+        local p = snap.vtx[vi].pos
+        local px, py = math.clamp(p.x, cx0, cx1), math.clamp(p.y, cy0, cy1)
+        b.x, b.y = math.min(b.x, px), math.min(b.y, py)
+        b.z, b.w = math.max(b.z, px), math.max(b.w, py)
+        found = true
+      end
+    end
+  end
+  if not found or b.z - b.x < 1 or b.w - b.y < 1 then return false, ImVec4{} end
+  return true, b
+end
+
+-- The texture a snapshot's window frame is drawn with (its first command's):
+-- the font atlas, as far as adopt_snap_content is concerned.
+global function adopt_snap_atlas(snap: *AdoptSnap): pointer
+  for i = 0, < #snap.lists do
+    local l = snap.lists[i]
+    if not l.popup and l.ncmd > 0 then return snap.cmds[l.cmd0].TextureId end
+  end
+  return nilptr
+end
+
+-- Whether screen point (x, y) lands on a window of the snapshot.
+global function adopt_snap_inside(snap: *AdoptSnap, x: float32, y: float32): boolean
+  for i = 0, < #snap.lists do
+    local l = snap.lists[i]
+    if x >= l.x0 and x < l.x1 and y >= l.y0 and y < l.y1 then return true end
+  end
+  return false
+end
+
+-- Pointer ---------------------------------------------------------------------------
+
+-- Where the pointer goes this frame (core/app/adopt.nelua decides the inputs).
+global AdoptPointer = @record{
+  remap: boolean,           -- into the adopted window
+  x: float32, y: float32,   -- the position ImGui gets
+}
+
+-- `hit`: the cursor maps onto the panel at panel pixel (u, v); `over_screen`:
+-- another window of the screen lies under the real cursor; `focused`: the
+-- panel has focus; `captured`: a button went down while remapped and is
+-- still held; `inside`: (u, v) lands on the adopted window or one of its popups.
+global function adopt_pointer(real_x: float32, real_y: float32, m: *AdoptMap, hit: boolean, u: float32, v: float32,
+                              over_screen: boolean, focused: boolean, captured: boolean, inside: boolean): AdoptPointer
+  local p: AdoptPointer = { remap = false, x = real_x, y = real_y }
+  if real_x < -1e30 or real_y < -1e30 then return p end -- no mouse (ImGui's -FLT_MAX)
+  if not focused then return p end
+  if captured and hit then
+    p.remap = true
+  elseif not over_screen and hit and inside then
+    p.remap = true
+  end
+  if p.remap then p.x, p.y = adopt_to_window(m, u, v) end
+  return p
+end
+
+-- Rewrite the mouse position events ImGui has queued for the coming frame
+-- (`q`, g.InputEventsQueue) to (x, y), saving the last real position into
+-- `real`. Returns how many were rewritten; 0 means the caller must queue
+-- one itself.
+global function adopt_rewrite_mouse(q: *ImVector_ImGuiInputEvent, x: float32, y: float32, real: *ImVec2): integer
+  local n = 0
+  for i = 0, < q.Size do
+    local e = &q.Data[i]
+    if e.Type == ImGuiInputEventType_MousePos then
+      real.x, real.y = e.MousePos.PosX, e.MousePos.PosY
+      e.MousePos.PosX, e.MousePos.PosY = x, y
+      n = n + 1
+    end
+  end
+  return n
+end
+
+-- The last queued real mouse position, if any (not rewriting).
+global function adopt_peek_mouse(q: *ImVector_ImGuiInputEvent, real: *ImVec2): boolean
+  local found = false
+  for i = 0, < q.Size do
+    local e = &q.Data[i]
+    if e.Type == ImGuiInputEventType_MousePos then
+      real.x, real.y = e.MousePos.PosX, e.MousePos.PosY
+      found = true
+    end
+  end
+  return found
+end
+
+-- Placement and flags -------------------------------------------------------------------
+
+-- A window whose rectangle leaves the display loses what ImGui culls: move it
+-- (x, y) back inside the display (dw x dh from dx, dy). Returns whether it
+-- had to move and where to.
+global function adopt_on_screen(x: float32, y: float32, w: float32, h: float32,
+                                dx: float32, dy: float32, dw: float32, dh: float32): (boolean, float32, float32)
+  local nx, ny = x, y
+  if nx + w > dx + dw then nx = dx + dw - w end
+  if ny + h > dy + dh then ny = dy + dh - h end
+  if nx < dx then nx = dx end
+  if ny < dy then ny = dy end
+  return nx ~= x or ny ~= y, nx, ny
+end
+
+-- The flags an adopted window runs with this frame: it lets clicks through
+-- (NoMouseInputs) unless the pointer is remapped into it.
+global function adopt_frame_flags(flags: cint, remap: boolean): cint
+  if remap then return flags end
+  return flags | ImGuiWindowFlags_NoMouseInputs
+end
+
+-- The flags given back on release: the plugin's own NoMouseInputs bit.
+global function adopt_restore_flags(flags: cint, orig: cint): cint
+  return (flags & ~ImGuiWindowFlags_NoMouseInputs) | (orig & ImGuiWindowFlags_NoMouseInputs)
+end
+
+-- The registry's life cycle ---------------------------------------------------------------
+
+global AdoptState = @enum(cint){
+  Waiting = 0,  -- asked for; its window has not been seen yet
+  Adopted,      -- drawn on its panel
+  Lost,         -- adopted, but the window has not been drawn for a while
+  Released,     -- given back (the panel closes)
+}
+
+global AdoptAction = @enum(cint){
+  None = 0,
+  Take,         -- first sight: remember where it was, keep it on screen
+  Lose,         -- not drawn any more: say so on the panel
+  Regain,       -- drawn again after being lost
+  GiveUp,       -- never seen, or lost for too long: close the panel
+}
+
+global AdoptEntry = @record{
+  state: AdoptState,
+  since: float64,           -- time of the last state change
+  seen_at: float64,         -- the window was last drawn
+}
+
+-- Seconds before a window that never showed up, or stopped, is given up on.
+global ADOPT_WAIT_LIMIT: float64 <comptime> = 30
+global ADOPT_LOST_LIMIT: float64 <comptime> = 600
+global ADOPT_LOST_AFTER: float64 <comptime> = 0.5
+
+-- One step per frame: `drawn` whether the window was drawn this frame.
+global function adopt_step(e: *AdoptEntry, drawn: boolean, now: float64): AdoptAction
+  if e.state == AdoptState.Released then return AdoptAction.None end
+  if drawn then e.seen_at = now end
+  if e.state == AdoptState.Waiting then
+    if drawn then
+      e.state, e.since = AdoptState.Adopted, now
+      return AdoptAction.Take
+    end
+    if now - e.since > ADOPT_WAIT_LIMIT then
+      e.state, e.since = AdoptState.Released, now
+      return AdoptAction.GiveUp
+    end
+  elseif e.state == AdoptState.Adopted then
+    if not drawn and now - e.seen_at > ADOPT_LOST_AFTER then
+      e.state, e.since = AdoptState.Lost, now
+      return AdoptAction.Lose
+    end
+  elseif e.state == AdoptState.Lost then
+    if drawn then
+      e.state, e.since = AdoptState.Adopted, now
+      return AdoptAction.Regain
+    end
+    if now - e.since > ADOPT_LOST_LIMIT then
+      e.state, e.since = AdoptState.Released, now
+      return AdoptAction.GiveUp
+    end
+  end
+  return AdoptAction.None
+end
+
+-- The "pull into world" grip --------------------------------------------------------------
+
+global ADOPT_GRIP_W: float32 <comptime> = 150
+global ADOPT_GRIP_H: float32 <comptime> = 24
+
+-- The grip of a flat window at (x, y) w x h: centred above its top edge, or
+-- just inside it when there is no room above (the display starts at `top`).
+global function adopt_grip_rect(x: float32, y: float32, w: float32, h: float32, top: float32): ImVec4
+  local gw = math.min(ADOPT_GRIP_W, math.max(w, 40))
+  local gx = x + (w - gw) * 0.5
+  local gy = y - ADOPT_GRIP_H - 2
+  if gy < top then gy = y + 2 end
+  return ImVec4{ x = gx, y = gy, z = gx + gw, w = gy + ADOPT_GRIP_H }
+end
+
+global function adopt_in_rect(r: ImVec4, x: float32, y: float32): boolean
+  return x >= r.x and x < r.z and y >= r.y and y < r.w
+end
+
+-- Whether the grip of a window shows: the modifier is held and the pointer is
+-- over the window or already on its grip.
+global function adopt_grip_shown(modifier: boolean, win: ImVec4, grip: ImVec4, x: float32, y: float32): boolean
+  return modifier and (adopt_in_rect(win, x, y) or adopt_in_rect(grip, x, y))
+end
+
+-- Names -------------------------------------------------------------------------------------
+
+-- The ImGui id part of a window name: what follows the last '###', else the
+-- whole name. Two names with the same id are the same window.
+global function adopt_window_id_part(name: string): string
+  local cut = 0
+  for i = 1, #name - 2 do
+    if name.data[i - 1] == '#'_b and name.data[i] == '#'_b and name.data[i + 1] == '#'_b then cut = i + 2 end
+  end
+  if cut > 0 then return name:subview(cut + 1) end
+  return name
+end
+
+-- The visible title of a window name: up to the first '##'.
+global function adopt_window_label(name: string): string
+  for i = 1, #name - 1 do
+    if name.data[i - 1] == '#'_b and name.data[i] == '#'_b then return name:subview(1, i - 1) end
+  end
+  return name
+end

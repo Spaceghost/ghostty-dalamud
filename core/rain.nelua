@@ -1,0 +1,406 @@
+-- Rain on world panels as plain functions of time: drops landing on the glass,
+-- growing, merging and trickling down, and the wiper sweeping them off. One
+-- RainPanel per panel, fixed size, stepped with a seeded generator so the same
+-- seed and steps give the same drops. Drawing lives in core/app/rain.nelua and
+-- the weather and tunables in lua/rain.lua; this module needs no ImGui.
+require 'math'
+
+global RAIN_MAX_DROPS <comptime> = 120
+global RAIN_SWEEP: float32 <comptime> = 1.4          -- seconds for one sweep, out and back
+global RAIN_WIPER_REST: float32 <comptime> = 0.06    -- radians above the bottom edge, pointing right
+global RAIN_WIPER_OUT: float32 <comptime> = 3.08     -- the far end of the arc, pointing left
+global RAIN_SPLASH: float32 <comptime> = 0.3         -- seconds a landing ring lasts
+global RAIN_SMEAR: float32 <comptime> = 0.6          -- seconds a wiped drop's smear lasts
+global RAIN_BLADE_FROM: float32 <comptime> = 0.2     -- the blade covers the arm from here (share of its length) to the tip
+
+global RAIN_MAX_EMIT <comptime> = 24              -- drops leaving one panel in one step
+global RAIN_MAX_FLING <comptime> = 10             -- drops flung off the blade tip at one turn
+global RAIN_MAX_FALL <comptime> = 256             -- world droplets, all panels together
+global RAIN_FALL_SPLASH: float32 <comptime> = 0.35 -- seconds a splash on the ground lasts
+global RAIN_FALL_MAX_T: float32 <comptime> = 6     -- a droplet that never lands is dropped
+
+global RainWiper = @enum{ Back = 0, Front, None }
+
+-- A drop leaving the glass, in panel pixels: where, and which way (unit).
+-- Run-off moves `speed` panel pixels per second; flung drops leave at the
+-- configured fling speed.
+global RainEmit = @record{
+  u: float32, v: float32,
+  du: float32, dv: float32,
+  speed: float32,
+  fling: boolean,
+}
+
+-- What lua/rain.lua decides for one frame (CONFIG.rain.frame()), with the
+-- intensity already made per panel (0 for HUD panels).
+global RainParams = @record{
+  intensity: float32,      -- target 0..1; the panel fades toward it
+  max_drops: integer,      -- at full intensity, up to RAIN_MAX_DROPS
+  size_min: float32,       -- drop radius in panel pixels
+  size_max: float32,
+  trickle_speed: float32,  -- pixels per second of a large drop
+  period_light: float32,   -- seconds between sweeps in light rain
+  period_heavy: float32,   -- ... in heavier rain
+  continuous_at: float32,  -- intensity from which the wiper never rests
+  wiper: RainWiper,
+  opacity: float32,
+  fade: float32,           -- seconds to fade in or out
+  gravity: float32,        -- yalms/s^2 for drops falling off the glass
+  fling_speed: float32,    -- yalms/s off the blade tip
+  max_particles: integer,  -- world droplets at once, up to RAIN_MAX_FALL
+}
+
+global RainDrop = @record{
+  kind: uint8,             -- 0 free, 1 drop, 2 smear left by the wiper
+  moving: boolean,         -- trickling down
+  x: float32, y: float32, r: float32,
+  rmax: float32,           -- it grows up to this
+  age: float32,            -- seconds since it landed (or was smeared)
+  trail_y: float32,        -- where its trickle started
+  phase: float32,          -- wobble
+  smear_ang: float32,      -- the blade's angle when it was wiped
+}
+
+global RainPanel = @record{
+  id: integer,
+  rng: uint32,
+  t: float64,              -- simulated seconds
+  level: float32,          -- faded intensity 0..1
+  spawn_acc: float32,
+  evap_acc: float32,
+  live: integer,           -- drops (not smears)
+  wiping: boolean,         -- the wiper is in service (it is raining)
+  wiper_start: float64,    -- start of the current sweep, < 0 at rest
+  wiper_next: float64,
+  angle: float32,          -- blade angle, radians from the right along the bottom edge, counter-clockwise
+  last: float64,           -- frame time of the last step (core/app/rain.nelua)
+  vis: float32,            -- frame visibility, for the front pass
+  turned: boolean,         -- the current sweep has passed its far end
+  carried: integer,        -- drops the blade has collected since it last flung
+  nemit: integer,
+  emit: [RAIN_MAX_EMIT]RainEmit, -- drops that left the glass this step (core/app/rain.nelua takes them)
+  drops: [RAIN_MAX_DROPS]RainDrop,
+}
+
+function RainPanel:init(id: integer, seed: uint32): void
+  $self = {}
+  self.id = id
+  self.rng = seed ~ ((@uint32)(id) * 2654435761_u32)
+  if self.rng == 0 then self.rng = 0x9E3779B9 end
+  self.wiper_start = -1
+  self.angle = RAIN_WIPER_REST
+end
+
+-- xorshift32: 0 <= x < 1
+function RainPanel:rand(): float32
+  local x = self.rng
+  x = x ~ (x << 13)
+  x = x ~ (x >> 17)
+  x = x ~ (x << 5)
+  self.rng = x
+  return (@float32)((x >> 8) & 0xFFFFFF) / 16777216.0_f32
+end
+
+-- Where the wiper pivots (panel pixels) and how long its arm is: centred on
+-- the bottom edge, reaching nearly to the top and sides.
+global function rain_wiper_geom(w: float32, h: float32): (float32, float32, float32)
+  local len = math.max(math.min(h - 14, w * 0.5 - 10), 10)
+  return w * 0.5, h - 6, len
+end
+
+-- Blade angle `u` (0..1) through a sweep: out and back, eased at both ends.
+global function rain_wiper_angle(u: float32): float32
+  if u <= 0 or u >= 1 then return RAIN_WIPER_REST end
+  local x = u < 0.5 and u * 2 or (1 - u) * 2
+  local s = x * x * (3 - 2 * x)
+  return RAIN_WIPER_REST + (RAIN_WIPER_OUT - RAIN_WIPER_REST) * s
+end
+
+-- Seconds from one sweep's start to the next: from period_light in a drizzle
+-- to period_heavy, then back to back from continuous_at.
+global function rain_wiper_period(level: float32, prm: *RainParams): float32
+  if level >= prm.continuous_at then return RAIN_SWEEP end
+  local k = math.clamp(level / math.max(prm.continuous_at, 0.01), 0, 1)
+  return math.max(prm.period_light + (prm.period_heavy - prm.period_light) * k, RAIN_SWEEP)
+end
+
+function RainPanel:clear(): void
+  for i = 0, < RAIN_MAX_DROPS do self.drops[i].kind = 0 end
+  self.live = 0
+end
+
+local function trickle_r(prm: *RainParams): float32 return prm.size_max * 0.8 end
+
+-- `d` runs into another drop: the smaller joins the larger. True when `d` was absorbed.
+function RainPanel:merge(i: integer, prm: *RainParams): boolean
+  local d = &self.drops[i]
+  for k = 0, < RAIN_MAX_DROPS do
+    local o = &self.drops[k]
+    if k ~= i and o.kind == 1 then
+      local dx, dy = o.x - d.x, o.y - d.y
+      local rr = (d.r + o.r) * 0.85
+      if dx * dx + dy * dy < rr * rr then
+        local big, small = o, d
+        if d.r > o.r then big, small = d, o end
+        big.r = math.min(math.sqrt(big.r * big.r + small.r * small.r), prm.size_max * 1.3)
+        big.rmax = math.max(big.rmax, big.r)
+        small.kind = 0
+        self.live = self.live - 1
+        return small == d
+      end
+    end
+  end
+  return false
+end
+
+function RainPanel:spawn(w: float32, h: float32, prm: *RainParams): void
+  local slot = -1
+  for i = 0, < RAIN_MAX_DROPS do
+    if self.drops[i].kind == 0 then slot = i break end
+  end
+  if slot < 0 then return end
+  local d = &self.drops[slot]
+  local lo = math.max(prm.size_min, 0.5)
+  local hi = math.max(prm.size_max * 0.6, lo)
+  $d = {
+    kind = 1, x = self:rand() * w, y = self:rand() * h,
+    r = lo + (hi - lo) * self:rand(),
+    rmax = prm.size_max * (0.55 + 0.5 * self:rand()),
+    phase = self:rand() * 6.2832,
+  }
+  self.live = self.live + 1
+  -- landing on a drop: it takes the water and splashes again
+  local ox, oy = d.x, d.y
+  if self:merge(slot, prm) then
+    for k = 0, < RAIN_MAX_DROPS do
+      local o = &self.drops[k]
+      if o.kind == 1 and (o.x - ox) ^ 2 + (o.y - oy) ^ 2 < (o.r * 2) ^ 2 then o.age = 0 break end
+    end
+  end
+end
+
+function RainPanel:push_emit(e: RainEmit): void
+  if self.nemit >= RAIN_MAX_EMIT then return end
+  self.emit[self.nemit] = e
+  self.nemit = self.nemit + 1
+end
+
+-- The water the blade collected leaves its tip at a turn, along the way it was
+-- moving (`dir` +1 outward, -1 coming back) and a little outward along the arm.
+function RainPanel:fling(angle: float32, dir: float32, w: float32, h: float32): void
+  local n = math.min(self.carried, RAIN_MAX_FLING)
+  self.carried = 0
+  if n <= 0 then return end
+  local px, py, len = rain_wiper_geom(w, h)
+  local ax, ay = math.cos(angle), -math.sin(angle)
+  local tx, ty = -math.sin(angle) * dir, -math.cos(angle) * dir
+  for i = 0, < n do
+    local j = (self:rand() - 0.5) * 0.6
+    local ex, ey = tx + ax * (0.4 + j), ty + ay * (0.4 + j)
+    local l = math.max(math.sqrt(ex * ex + ey * ey), 1e-4)
+    local k = len * (0.9 + 0.1 * self:rand())
+    self:push_emit({ u = px + ax * k, v = py + ay * k, du = ex / l, dv = ey / l, speed = 0.6 + 0.6 * self:rand(), fling = true })
+  end
+end
+
+-- Clear the drops the blade crossed going from angle a to b, leaving smears.
+function RainPanel:wipe(a: float32, b: float32, w: float32, h: float32): void
+  local a0, a1 = math.min(a, b), math.max(a, b)
+  if a1 - a0 < 1e-6 then return end
+  local px, py, len = rain_wiper_geom(w, h)
+  for i = 0, < RAIN_MAX_DROPS do
+    local d = &self.drops[i]
+    if d.kind == 1 then
+      local dx, dy = d.x - px, py - d.y
+      local dist = math.sqrt(dx * dx + dy * dy)
+      if dist >= len * RAIN_BLADE_FROM - d.r and dist <= len + d.r and dist > 1 then
+        local phi = math.atan(dy, dx)
+        local margin = (d.r + 4) / dist
+        if phi >= a0 - margin and phi <= a1 + margin then
+          d.kind, d.age, d.moving, d.smear_ang = 2, 0, false, b
+          self.live = self.live - 1
+          self.carried = self.carried + 1
+        end
+      end
+    end
+  end
+end
+
+-- Advance `dt` seconds on a w x h panel.
+function RainPanel:step(prm: *RainParams, w: float32, h: float32, dt: float32): void
+  dt = math.clamp(dt, 0, 0.1)
+  self.t = self.t + dt
+  self.nemit = 0
+  local target = math.clamp(prm.intensity, 0, 1)
+  local rate = dt / math.max(prm.fade, 0.05)
+  if self.level < target then self.level = math.min(target, self.level + rate)
+  else self.level = math.max(target, self.level - rate) end
+  if self.level <= 0.001 then
+    self.level = 0
+    self:clear()
+    self.wiping, self.wiper_start, self.angle, self.carried = false, -1, RAIN_WIPER_REST, 0
+    return
+  end
+  local level = self.level
+
+  -- land new drops up to the count for this intensity; evaporate past it
+  local cap = math.clamp(prm.max_drops, 0, RAIN_MAX_DROPS)
+  local want = (@integer)(math.floor(cap * level + 0.5))
+  if self.live < want then
+    self.spawn_acc = self.spawn_acc + dt * (3 + 50 * level)
+    while self.spawn_acc >= 1 and self.live < want do
+      self:spawn(w, h, prm)
+      self.spawn_acc = self.spawn_acc - 1
+    end
+  else
+    self.spawn_acc = 0
+  end
+  if self.live > want then
+    self.evap_acc = self.evap_acc + dt * (self.live - want) * 2 + dt * 4
+    while self.evap_acc >= 1 and self.live > want do
+      local start = (@integer)(self:rand() * RAIN_MAX_DROPS) % RAIN_MAX_DROPS
+      for k = 0, < RAIN_MAX_DROPS do
+        local d = &self.drops[(start + k) % RAIN_MAX_DROPS]
+        if d.kind == 1 then d.kind = 0 self.live = self.live - 1 break end
+      end
+      self.evap_acc = self.evap_acc - 1
+    end
+  else
+    self.evap_acc = 0
+  end
+
+  -- grow, trickle, fade smears
+  local tr = trickle_r(prm)
+  for i = 0, < RAIN_MAX_DROPS do
+    local d = &self.drops[i]
+    if d.kind == 2 then
+      d.age = d.age + dt
+      if d.age >= RAIN_SMEAR then d.kind = 0 end
+    elseif d.kind == 1 then
+      d.age = d.age + dt
+      if not d.moving then
+        d.r = math.min(d.rmax, d.r + dt * 0.3)
+        if d.r >= tr then d.moving, d.trail_y = true, d.y end
+      else
+        local v = prm.trickle_speed * math.clamp(0.4 + (d.r - tr) / math.max(prm.size_max * 0.5, 0.5), 0.4, 1.6)
+        d.y = d.y + v * dt
+        d.x = d.x + math.sin(self.t * 2.3 + d.phase) * 7 * dt
+        if d.y - d.r > h or d.x < 0 or d.x > w then
+          -- off the glass before the wiper got it: it falls on (core/app/rain.nelua)
+          local du, dv: float32 = 0, 1
+          local u, vv = math.clamp(d.x, 0, w), h
+          if d.x < 0 or d.x > w then du, dv, vv = d.x < 0 and -0.3 or 0.3, 0.95, math.clamp(d.y, 0, h) end
+          self:push_emit({ u = u, v = vv, du = du, dv = dv, speed = v })
+          d.kind = 0
+          self.live = self.live - 1
+        else
+          self:merge(i, prm)
+        end
+      end
+    end
+  end
+
+  -- the wiper: in service while it rains, each sweep one arc out and back
+  if prm.wiper == RainWiper.None or level < 0.02 then
+    self.wiping, self.wiper_start, self.angle, self.carried = false, -1, RAIN_WIPER_REST, 0
+    return
+  end
+  local period = rain_wiper_period(level, prm)
+  if not self.wiping then
+    self.wiping = true
+    self.wiper_next = self.t + period * 0.5
+  end
+  if self.wiper_start < 0 and self.t >= self.wiper_next then self.wiper_start, self.turned = self.t, false end
+  local prev = self.angle
+  if self.wiper_start >= 0 then
+    local u = (@float32)((self.t - self.wiper_start) / RAIN_SWEEP)
+    if u >= 0.5 and not self.turned then
+      self.turned = true
+      if prev < RAIN_WIPER_OUT then self:wipe(prev, RAIN_WIPER_OUT, w, h) end
+      prev = RAIN_WIPER_OUT
+      self:fling(RAIN_WIPER_OUT, 1, w, h)
+    end
+    if u >= 1 then
+      self:wipe(prev, RAIN_WIPER_REST, w, h)
+      prev = RAIN_WIPER_REST
+      self:fling(RAIN_WIPER_REST, -1, w, h)
+      self.wiper_start = -1
+      self.wiper_next = self.t + math.max(period - RAIN_SWEEP, 0)
+      self.angle = RAIN_WIPER_REST
+    else
+      self.angle = rain_wiper_angle(u)
+    end
+    self:wipe(prev, self.angle, w, h)
+  end
+end
+
+-- Drops (not smears) on the panel.
+function RainPanel:count(): integer
+  local n = 0
+  for i = 0, < RAIN_MAX_DROPS do
+    if self.drops[i].kind == 1 then n = n + 1 end
+  end
+  return n
+end
+
+-- World droplets ------------------------------------------------------------------
+-- Drops that left the glass, falling in world space (yalms, y up) until they
+-- reach `ground`, then a short splash. One pool for every panel.
+
+global RainFall = @record{
+  live: boolean,
+  landed: boolean,
+  fling: boolean,          -- off the wiper: fades as it flies
+  x: float32, y: float32, z: float32,
+  vx: float32, vy: float32, vz: float32,
+  ground: float32,
+  t: float32,              -- seconds in the air, then seconds of splash
+}
+
+global RainPool = @record{
+  live: integer,
+  p: [RAIN_MAX_FALL]RainFall,
+}
+
+-- A new droplet, unless `cap` (at most RAIN_MAX_FALL) are already falling.
+function RainPool:emit(cap: integer, x: float32, y: float32, z: float32, vx: float32, vy: float32, vz: float32,
+                       ground: float32, fling: boolean): boolean
+  if self.live >= math.clamp(cap, 0, RAIN_MAX_FALL) then return false end
+  for i = 0, < RAIN_MAX_FALL do
+    local f = &self.p[i]
+    if not f.live then
+      $f = { live = true, fling = fling, x = x, y = y, z = z, vx = vx, vy = vy, vz = vz, ground = ground }
+      self.live = self.live + 1
+      return true
+    end
+  end
+  return false
+end
+
+function RainPool:step(dt: float32, gravity: float32): void
+  if self.live == 0 then return end
+  dt = math.clamp(dt, 0, 0.1)
+  for i = 0, < RAIN_MAX_FALL do
+    local f = &self.p[i]
+    if f.live then
+      f.t = f.t + dt
+      if f.landed then
+        if f.t >= RAIN_FALL_SPLASH then f.live = false self.live = self.live - 1 end
+      else
+        f.vy = f.vy - gravity * dt
+        f.x, f.y, f.z = f.x + f.vx * dt, f.y + f.vy * dt, f.z + f.vz * dt
+        if f.y <= f.ground then
+          f.y, f.landed, f.t = f.ground, true, 0
+        elseif f.t >= RAIN_FALL_MAX_T then
+          f.live = false
+          self.live = self.live - 1
+        end
+      end
+    end
+  end
+end
+
+function RainPool:clear(): void
+  for i = 0, < RAIN_MAX_FALL do self.p[i].live = false end
+  self.live = 0
+end

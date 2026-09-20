@@ -1,6 +1,7 @@
 -- A TermView owns one libghostty-vt terminal plus the render-state objects
 -- needed to read it back for drawing. Sessions embed one of these.
 require 'core.ghostty'
+require 'core.theme'
 require 'vector'
 require 'string'
 require 'math'
@@ -15,6 +16,9 @@ global GlyphDraw = @record{
   bold: boolean,
   underline: boolean,
   strike: boolean,
+  cp: uint32, -- non-zero: drawn by core/boxdraw.nelua (or core/glyphfb.nelua with `fb`), not the font
+  fb: boolean, -- a fallback glyph: `cp` from core/glyphfb.nelua (its tofu box when no font has it)
+  span: uint8, -- cells a fallback glyph covers (2: a wide character)
 }
 
 global TermView = @record{
@@ -27,6 +31,7 @@ global TermView = @record{
   ok: boolean,
   glyphs: vector(GlyphDraw),
   glyph_bytes: vector(byte),
+  theme_gen: integer,       -- theme_generation last applied (0: none yet, libghostty's defaults)
 }
 
 function TermView:init(cols: uint16, rows: uint16): boolean
@@ -67,9 +72,37 @@ function TermView:resize(cols: uint16, rows: uint16, cell_w_px: uint32, cell_h_p
   return true
 end
 
+-- Give the terminal the theme's default colours and palette. What the theme
+-- leaves out goes back to libghostty's own default; colours a program set
+-- itself (OSC 4/10/11/12) stay on top, as in Ghostty.
+function TermView:apply_theme(t: *TermTheme): void
+  local term = self.term
+  ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND, t.has_background and &t.background or nilptr)
+  ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND, t.has_foreground and &t.foreground or nilptr)
+  ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_COLOR_CURSOR, t.has_cursor and &t.cursor or nilptr)
+  ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, nilptr)
+  local any = false
+  for i = 0, 255 do if t.palette_set[i] then any = true break end end
+  if any then
+    local pal: [256]GhosttyColorRgb
+    if ghostty_terminal_get(term, GHOSTTY_TERMINAL_DATA_COLOR_PALETTE_DEFAULT, &pal) == GHOSTTY_SUCCESS then
+      for i = 0, 255 do if t.palette_set[i] then pal[i] = t.palette[i] end end
+      ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_COLOR_PALETTE, &pal)
+    end
+  end
+end
+
+-- Apply the current theme if it changed since this terminal last took it.
+function TermView:sync_theme(): void
+  if self.theme_gen == theme_generation or not self.ok then return end
+  self:apply_theme(&theme_term)
+  self.theme_gen = theme_generation
+end
+
 -- Refresh the render-state snapshot from the terminal. Call once per frame
--- before drawing.
+-- before drawing; a theme change reaches the terminal here.
 function TermView:update(): boolean
+  self:sync_theme()
   return ghostty_render_state_update(self.state, self.term) == GHOSTTY_SUCCESS
 end
 

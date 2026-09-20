@@ -34,6 +34,8 @@ local function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl>
 local F_GETFL: cint <cimport, nodecl, const>
 local F_SETFL: cint <cimport, nodecl, const>
 local O_NONBLOCK: cint <cimport, nodecl, const>
+local F_SETFD: cint <cimport, nodecl, const>
+local FD_CLOEXEC: cint <cimport, nodecl, const>
 local errno: cint <cimport, nodecl>
 local EAGAIN: cint <cimport, nodecl, const>
 local EWOULDBLOCK: cint <cimport, nodecl, const>
@@ -136,6 +138,10 @@ local function set_nonblocking(s: NetSocket): boolean
     local one: culong = 1
     return ioctlsocket(s, FIONBIO, &one) == 0
   ## else
+    -- close-on-exec as well: a process the agent starts (a shell, a
+    -- clipboard tool, an app) must not inherit connections, or a closed one
+    -- stays half-open for as long as that process lives
+    fcntl(s, F_SETFD, FD_CLOEXEC)
     local flags = fcntl(s, F_GETFL, 0)
     if flags < 0 then return false end
     return fcntl(s, F_SETFL, flags | O_NONBLOCK) >= 0

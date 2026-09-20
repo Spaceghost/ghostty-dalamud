@@ -1,0 +1,876 @@
+-- /term selftest [list | all | suite...]: deterministic checks inside the
+-- live game, one suite per frame, written as JSON to selftest/latest.json in
+-- the config directory (plus selftest/report-<time>-<build>.json) with a
+-- one-line summary in the log. The pure parts live in core/selftest_logic.nelua,
+-- the Lua checks in lua/selftest.lua.
+--
+-- Nothing here moves the character, acts in combat or sends chat. The
+-- terminals it opens are its own (never shown) and closed again; the loader
+-- suite swaps the core for a fresh copy of the same file twice and hands its
+-- results to the next core through selftest/state.tsv.
+--
+-- Every core also writes selftest/core-loaded.json on its first frame, so a
+-- CI run can wait for its build (docs/CI.md, "In-game tests").
+require 'core.app.popup'
+require 'core.selftest_logic'
+require 'core.buildinfo'
+require 'core.sys.platform'
+require 'core.sys.procstat'
+require 'io'
+require 'os'
+
+local SUITE_CORE <comptime> = 0
+local SUITE_TERMINAL <comptime> = 1
+local SUITE_RENDER <comptime> = 2
+local SUITE_WORLD <comptime> = 3
+local SUITE_SETTINGS <comptime> = 4
+local SUITE_THEMES <comptime> = 5
+local SUITE_BELL <comptime> = 6
+local SUITE_AGENT <comptime> = 7
+local SUITE_LOADER <comptime> = 8
+
+local AGENT_OUTPUT_MS: uint64 <comptime> = 10000   -- the marker must show up within this
+local AGENT_EXIT_MS: uint64 <comptime> = 5000
+local SWAP_WAIT_MS: uint64 <comptime> = 15000      -- the loader polls every 1 s and waits 0.5 s for the file to settle
+local REATTACH_WAIT_MS: uint64 <comptime> = 20000  -- after a swap: the agent's LISTR puts the layout back
+local STATE_MAX_AGE_MS: uint64 <comptime> = 120000 -- an older state file is a leftover, not a run
+local MARKER: string <comptime> = 'ghostty-selftest'
+local MARKER_QUOTED: string <comptime> = '"ghostty-selftest"' -- as a recorded text call shows it
+
+local Runner = @record{
+  booted: boolean,        -- first frame of this core seen (core-loaded.json written)
+  active: boolean,
+  st: SelftestState,
+  phase: integer,         -- inside an asynchronous suite
+  phase_ms: uint64,       -- when the phase began
+  suite_ms: uint64,       -- when the current suite began
+  session_id: integer,    -- the agent suite's terminal
+}
+local R: Runner
+
+-- Paths and files -------------------------------------------------------------------
+local function join(dir: string, name: string): string
+  if #dir == 0 then return string.copy(name) end
+  local last = dir.data[dir.size - 1]
+  if last == '/'_b or last == '\\'_b then return dir .. name end
+  return dir .. '/' .. name
+end
+
+-- <config>/selftest, created when missing
+local function selftest_dir(): string
+  local d = join(host.dir, 'selftest')
+  fs_mkdir((@cstring)(d.data))
+  return d
+end
+
+local function read_file(path: string): (boolean, string)
+  local f = io.open(path, 'rb')
+  if not f:isopen() then f:destroy() return false, (@string){} end
+  local content = f:read('a')
+  f:destroy()
+  return true, content
+end
+
+-- write beside the target, then rename over it: a reader never sees half a file
+local function write_file(path: string, content: string): boolean
+  local tmp = path .. '.tmp'
+  defer tmp:destroy() end
+  local f = io.open(tmp, 'wb')
+  local ok = f:isopen() and f:write(content)
+  f:destroy()
+  if not ok then os.remove(tmp) return false end
+  os.remove(path)
+  local renamed = os.rename(tmp, path)
+  return renamed
+end
+
+## if ccinfo.is_windows then
+local SelftestFileTime <cimport 'FILETIME', nodecl> = @record{ dwLowDateTime: uint32, dwHighDateTime: uint32 }
+local function CreateFileA(name: cstring, access: uint32, share: uint32, sa: pointer, disp: uint32, flags: uint32, tmpl: pointer): pointer <cimport, nodecl> end
+local function SetFileTime(h: pointer, c: pointer, a: pointer, w: *SelftestFileTime): cint <cimport, nodecl> end
+local function GetSystemTimeAsFileTime(ft: *SelftestFileTime): void <cimport, nodecl> end
+local function CloseHandle(h: pointer): cint <cimport, nodecl> end
+local function GetModuleFileNameA(mod: pointer, buf: pointer, cap: uint32): uint32 <cimport, nodecl> end
+## else
+local function utime(path: cstring, times: pointer): cint <cimport, cinclude '<utime.h>', nodecl> end
+## end
+local time_t <cimport, cinclude '<time.h>', nodecl> = @int64
+local function c_time(t: *time_t): time_t <cimport 'time', cinclude '<time.h>', nodecl> end
+local function gmtime(t: *time_t): pointer <cimport, cinclude '<time.h>', nodecl> end
+local function strftime(buf: *[0]cchar, cap: usize, fmt: cstring, tm: pointer): usize <cimport, cinclude '<time.h>', nodecl> end
+
+-- Give `path` the current time as its write time, content untouched: the
+-- loader then swaps in a fresh copy of the same core.
+local function touch(path: string): boolean
+  ## if ccinfo.is_windows then
+    -- FILE_WRITE_ATTRIBUTES, share read/write/delete, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL
+    local h = CreateFileA((@cstring)(path.data), 0x100, 7, nilptr, 3, 0x80, nilptr)
+    if (@isize)(h) == -1 or h == nilptr then return false end
+    local ft: SelftestFileTime
+    GetSystemTimeAsFileTime(&ft)
+    local ok = SetFileTime(h, nilptr, nilptr, &ft) ~= 0
+    CloseHandle(h)
+    return ok
+  ## else
+    return utime((@cstring)(path.data), nilptr) == 0
+  ## end
+end
+
+-- 'YYYYmmddTHHMMSSZ' (file names) or 'YYYY-mm-ddTHH:MM:SSZ'
+local function utc_now(compact: boolean): string
+  local t = c_time(nilptr)
+  local tm = gmtime(&t)
+  if tm == nilptr then return string.copy('unknown') end
+  local buf: [32]cchar
+  local n = strftime(&buf, 32, compact and '%Y%m%dT%H%M%SZ' or '%Y-%m-%dT%H:%M:%SZ', tm)
+  return string.copy(string{data=(@*[0]byte)(&buf), size=n})
+end
+
+-- first line of <game dir>/ffxivgame.ver ('unknown' outside the game)
+local function game_version(): string
+  ## if ccinfo.is_windows then
+    local buf: [1024]byte
+    local n = GetModuleFileNameA(nilptr, &buf, 1024)
+    if n > 0 and n < 1024 then
+      local cut: usize = 0
+      for i: usize = 0, < n do
+        if buf[i] == '\\'_b or buf[i] == '/'_b then cut = i + 1 end
+      end
+      local dir = string{data=(@*[0]byte)(&buf), size=cut}
+      local path = dir .. 'ffxivgame.ver'
+      local ok, text = read_file(path)
+      path:destroy()
+      if ok then
+        local e: usize = 0
+        while e < text.size and text.data[e] ~= '\r'_b and text.data[e] ~= '\n'_b do e = e + 1 end
+        local v = selftest_field(string{data=text.data, size=e})
+        text:destroy()
+        if #v > 0 then return v end
+        v:destroy()
+      end
+    end
+  ## end
+  return string.copy('unknown')
+end
+
+-- AssemblyVersion of GhosttyDalamud.json beside the core
+local function plugin_version(): string
+  local path = join(boot.install_dir, 'GhosttyDalamud.json')
+  local ok, text = read_file(path)
+  path:destroy()
+  if ok then
+    local fok, v = selftest_json_string_field(text, 'AssemblyVersion')
+    text:destroy()
+    if fok then
+      local clean = selftest_field(v)
+      v:destroy()
+      return clean
+    end
+  end
+  return string.copy('unknown')
+end
+
+local function under_loader(): boolean
+  ## if ccinfo.is_windows then
+    return GetModuleHandleA('ghostty_loader.dll') ~= nilptr
+  ## else
+    return false
+  ## end
+end
+
+local function now_ms(): uint64 return procguard_now_ms() end
+
+local function add(suite: integer, name: string, status: SelftestStatus, ms: uint64, message: string): void
+  selftest_add(&R.st.cases, SELFTEST_SUITES[suite], name, status, ms, message)
+end
+
+-- Report --------------------------------------------------------------------------
+local function fill_meta(meta: *SelftestMeta, state: string): void
+  meta.run_id = string.copy(R.st.run_id)
+  meta.selection = selftest_selection_text(R.st.selection)
+  meta.state = string.copy(state)
+  meta.build_id = string.copy(BUILD_ID)
+  meta.commit = string.copy(BUILD_COMMIT)
+  meta.core_version = string.copy(build_version_cstr())
+  meta.plugin_version = plugin_version()
+  meta.game_version = game_version()
+  meta.platform = string.copy(platform_name())
+  meta.host_kind = string.copy(boot.host_kind == HOST_KIND_DALAMUD and 'dalamud' or 'embedded')
+  meta.started_utc = string.copy(R.st.started_utc)
+  meta.finished_utc = utc_now(false)
+  meta.duration_ms = now_ms() - R.st.started_ms
+end
+
+local function meta_destroy(meta: *SelftestMeta): void
+  meta.run_id:destroy() meta.selection:destroy() meta.state:destroy() meta.build_id:destroy()
+  meta.commit:destroy() meta.core_version:destroy() meta.plugin_version:destroy() meta.game_version:destroy()
+  meta.platform:destroy() meta.host_kind:destroy() meta.started_utc:destroy() meta.finished_utc:destroy()
+end
+
+local function write_report(state: string, complete: boolean): void
+  local meta: SelftestMeta
+  fill_meta(&meta, state)
+  local json = selftest_report_json(&meta, &R.st.cases, complete)
+  local dir = selftest_dir()
+  local latest = join(dir, 'latest.json')
+  if not write_file(latest, json) then logf(LOG_WARN, 'selftest: could not write %s', latest) end
+  if complete then
+    local stamp = utc_now(true)
+    local name = string.format('report-%s-%s.json', stamp, BUILD_ID)
+    local copy = join(dir, name)
+    write_file(copy, json)
+    copy:destroy() name:destroy() stamp:destroy()
+    local summary = selftest_summary(&meta, &R.st.cases)
+    local pass, fail, skip = selftest_count(&R.st.cases)
+    log(fail == 0 and LOG_INFO or LOG_WARN, summary)
+    summary:destroy()
+  end
+  latest:destroy() dir:destroy() json:destroy()
+  meta_destroy(&meta)
+end
+
+local function finish(): void
+  write_report('complete', true)
+  selftest_state_destroy(&R.st)
+  local booted = R.booted
+  R = {}
+  R.booted = booted
+end
+
+-- Suites ----------------------------------------------------------------------------
+local function suite_core(): void
+  local t = now_ms()
+  add(SUITE_CORE, 'active', boot.state == HostState.Active and SelftestStatus.Pass or SelftestStatus.Fail, 0,
+    boot.state == HostState.Active and 'activation ACTIVE' or 'the core is not active')
+  if boot.host_kind ~= HOST_KIND_DALAMUD then
+    add(SUITE_CORE, 'imgui', SelftestStatus.Skip, 0, 'embedded host (tests): no ImGui')
+  elseif host.imgui_ok then
+    add(SUITE_CORE, 'imgui', SelftestStatus.Pass, 0, 'every cimgui export bound')
+  else
+    local m = string.format('%d cimgui exports missing', host.imgui_missing)
+    add(SUITE_CORE, 'imgui', SelftestStatus.Fail, 0, m)
+    m:destroy()
+  end
+  if policy.loaded then
+    add(SUITE_CORE, 'policy', SelftestStatus.Pass, 0, 'lua/init.lua loaded')
+  else
+    add(SUITE_CORE, 'policy', SelftestStatus.Fail, 0, policy.error)
+  end
+  local stamped = BUILD_COMMIT ~= 'unknown' and BUILD_ID ~= 'unstamped'
+  local m = string.format('commit %s, build %s', BUILD_COMMIT, BUILD_ID)
+  if stamped then add(SUITE_CORE, 'build stamp', SelftestStatus.Pass, 0, m)
+  elseif boot.host_kind ~= HOST_KIND_DALAMUD then add(SUITE_CORE, 'build stamp', SelftestStatus.Skip, 0, m)
+  else add(SUITE_CORE, 'build stamp', SelftestStatus.Fail, 0, 'this core has no build stamp (tools/build.sh adds it)') end
+  m:destroy()
+  if under_loader() then
+    add(SUITE_CORE, 'loader', SelftestStatus.Pass, now_ms() - t, 'running under ghostty_loader.dll')
+  else
+    add(SUITE_CORE, 'loader', SelftestStatus.Skip, now_ms() - t, 'not loaded through ghostty_loader.dll')
+  end
+end
+
+local function suite_terminal(): void
+  local t = now_ms()
+  local before = #host.sessions
+  local s = session_new_local('selftest', SELFTEST_VT_COLS, SELFTEST_VT_ROWS)
+  if s == nilptr then
+    add(SUITE_TERMINAL, 'local session', SelftestStatus.Fail, now_ms() - t, 'session_new_local failed')
+    return
+  end
+  local shown = false
+  for i = 0, < #host.dropdown_tabs do if host.dropdown_tabs[i] == s then shown = true end end
+  for i = 0, < #host.windows do if host.windows[i] == s then shown = true end end
+  local ok, err = selftest_vt_check(&s.view)
+  add(SUITE_TERMINAL, 'vt read back', ok and SelftestStatus.Pass or SelftestStatus.Fail, now_ms() - t,
+    ok and 'text, truecolour, background run, bold and underline as fed' or err)
+  err:destroy()
+  session_remove(s)
+  local gone = #host.sessions == before
+  add(SUITE_TERMINAL, 'local session', (gone and not shown) and SelftestStatus.Pass or SelftestStatus.Fail, now_ms() - t,
+    shown and 'the self-test terminal was put on screen' or (gone and 'opened without a shell, never shown, closed' or 'still listed after closing'))
+end
+
+-- Optional cimgui exports for an offscreen draw list, resolved once.
+local Offscreen = @record{
+  tried: boolean,
+  shared: function(): pointer,
+  create: function(shared: pointer): *ImDrawList,
+  destroy: function(dl: *ImDrawList): void,
+  reset: function(dl: *ImDrawList): void,
+  clip_full: function(dl: *ImDrawList): void,
+  push_tex: function(dl: *ImDrawList, tex: pointer): void,
+}
+local offscreen: Offscreen
+
+local function offscreen_bind(): boolean
+  if not offscreen.tried then
+    offscreen.tried = true
+    offscreen.shared = (@function(): pointer)(resolve_imgui('igGetDrawListSharedData'))
+    offscreen.create = (@function(shared: pointer): *ImDrawList)(resolve_imgui('ImDrawList_ImDrawList'))
+    offscreen.destroy = (@function(dl: *ImDrawList): void)(resolve_imgui('ImDrawList_destroy'))
+    offscreen.reset = (@function(dl: *ImDrawList): void)(resolve_imgui('ImDrawList__ResetForNewFrame'))
+    offscreen.clip_full = (@function(dl: *ImDrawList): void)(resolve_imgui('ImDrawList_PushClipRectFullScreen'))
+    offscreen.push_tex = (@function(dl: *ImDrawList, tex: pointer): void)(resolve_imgui('ImDrawList_PushTextureID'))
+  end
+  return offscreen.shared ~= nilptr and offscreen.create ~= nilptr and offscreen.destroy ~= nilptr
+    and offscreen.reset ~= nilptr and offscreen.clip_full ~= nilptr and offscreen.push_tex ~= nilptr
+end
+
+-- The fixed terminal drawn with the real font into a draw list nobody renders;
+-- returns vertex, index and command counts.
+local function offscreen_pass(v: *TermView, m: RenderMetrics): (boolean, integer, integer, integer)
+  local shared = offscreen.shared()
+  if shared == nilptr then return false, 0, 0, 0 end
+  local dl = offscreen.create(shared)
+  if dl == nilptr then return false, 0, 0, 0 end
+  offscreen.reset(dl)
+  offscreen.clip_full(dl)
+  offscreen.push_tex(dl, imgui.GetForegroundDrawList()._CmdHeader.TextureId)
+  v:update()
+  local saved_world, saved_run = render_world, render_max_run_px
+  render_world, render_max_run_px = false, 0
+  render_termview(dl, v, vec2(0, 0), m, true, true, 255, 0)
+  render_world, render_max_run_px = saved_world, saved_run
+  local vtx, idx, cmd = dl.VtxBuffer.Size, dl.IdxBuffer.Size, dl.CmdBuffer.Size
+  offscreen.destroy(dl)
+  return true, vtx, idx, cmd
+end
+
+local function suite_render(): void
+  local t = now_ms()
+  local ok, h, calls, out = selftest_render_ops()
+  out:destroy()
+  local hx = selftest_hex64(h)
+  if not ok then
+    add(SUITE_RENDER, 'recorded calls', SelftestStatus.Fail, now_ms() - t, 'could not create a terminal')
+  elseif hx == SELFTEST_RENDER_HASH then
+    local m = string.format('%d draw calls, hash %s as on the host build', calls, hx)
+    add(SUITE_RENDER, 'recorded calls', SelftestStatus.Pass, now_ms() - t, m)
+    m:destroy()
+  else
+    local m = string.format('%d draw calls, hash %s, expected %s (this build renders the fixed terminal differently)', calls, hx, SELFTEST_RENDER_HASH)
+    add(SUITE_RENDER, 'recorded calls', SelftestStatus.Fail, now_ms() - t, m)
+    m:destroy()
+  end
+  hx:destroy()
+
+  t = now_ms()
+  if not host.imgui_ok then
+    add(SUITE_RENDER, 'offscreen draw list', SelftestStatus.Skip, 0, 'no ImGui in this host')
+    return
+  end
+  if not offscreen_bind() then
+    add(SUITE_RENDER, 'offscreen draw list', SelftestStatus.Skip, 0, 'cimgui lacks the draw list constructor exports')
+    return
+  end
+  local v: TermView
+  if not v:init(SELFTEST_RENDER_COLS, SELFTEST_RENDER_ROWS) then
+    add(SUITE_RENDER, 'offscreen draw list', SelftestStatus.Fail, 0, 'could not create a terminal')
+    return
+  end
+  v:feed((@*[0]uint8)(SELFTEST_RENDER_INPUT.data), SELFTEST_RENDER_INPUT.size)
+  local m = render_measure(imgui.GetFont(), 16)
+  local ok1, v1, i1, c1 = offscreen_pass(&v, m)
+  local ok2, v2, i2, c2 = offscreen_pass(&v, m)
+  v:destroy()
+  if not ok1 or not ok2 then
+    add(SUITE_RENDER, 'offscreen draw list', SelftestStatus.Fail, now_ms() - t, 'could not create an offscreen draw list')
+  elseif v1 ~= v2 or i1 ~= i2 or c1 ~= c2 or v1 == 0 then
+    local msg = string.format('two passes differ or are empty: vtx %d/%d idx %d/%d cmds %d/%d', v1, v2, i1, i2, c1, c2)
+    add(SUITE_RENDER, 'offscreen draw list', SelftestStatus.Fail, now_ms() - t, msg)
+    msg:destroy()
+  else
+    local counts = string.format('%d/%d/%d', v1, i1, c1)
+    local hc = selftest_hex64(selftest_fnv(SELFTEST_FNV_START, counts))
+    local msg = string.format('vtx %d, idx %d, cmds %d in both passes (hash %s; depends on the font)', v1, i1, c1, hc)
+    add(SUITE_RENDER, 'offscreen draw list', SelftestStatus.Pass, now_ms() - t, msg)
+    msg:destroy() hc:destroy() counts:destroy()
+  end
+end
+
+local function suite_world(in_world: boolean): void
+  local t = now_ms()
+  if not in_world then
+    add(SUITE_WORLD, 'projection round trip', SelftestStatus.Skip, 0, 'no character loaded (log in to run it)')
+    return
+  end
+  if host.api.get_camera == nilptr then
+    add(SUITE_WORLD, 'projection round trip', SelftestStatus.Skip, 0, 'this shim has no get_camera')
+    return
+  end
+  local cam: GuCamera
+  if host.api.get_camera(&cam) == 0 then
+    add(SUITE_WORLD, 'projection round trip', SelftestStatus.Fail, now_ms() - t, 'get_camera returned nothing with a character loaded')
+    return
+  end
+  local st, worst, msg = selftest_world_roundtrip(&cam)
+  add(SUITE_WORLD, 'projection round trip', st, now_ms() - t, msg)
+  msg:destroy()
+end
+
+-- lua/selftest.lua: one line per case, "name\tstatus\tmessage"
+local function suite_lua(suite: integer): void
+  local t = now_ms()
+  local dir = selftest_dir()
+  local scratch = join(dir, 'scratch')
+  fs_mkdir((@cstring)(scratch.data))
+  local ok, out = policy_selftest(SELFTEST_SUITES[suite], scratch)
+  local ms = now_ms() - t
+  if not ok then
+    add(suite, 'lua', SelftestStatus.Fail, ms, out)
+  else
+    local start: usize = 0
+    local n = 0
+    for i: usize = 0, <= out.size do
+      if i == out.size or out.data[i] == '\n'_b then
+        if i > start then
+          local line = string{data=(@*[0]byte)(&out.data[start]), size=i - start}
+          local t1 = line:find('\t', 1, true)
+          local t2 = t1 > 0 and line:find('\t', t1 + 1, true) or 0
+          if t1 > 0 and t2 > 0 then
+            local sok, status = selftest_status_parse(line:subview(t1 + 1, t2 - 1))
+            if not sok then status = SelftestStatus.Fail end
+            add(suite, line:subview(1, t1 - 1), status, ms, line:subview(t2 + 1))
+          else
+            add(suite, 'lua', SelftestStatus.Fail, ms, line)
+          end
+          n = n + 1
+        end
+        start = i + 1
+      end
+    end
+    if n == 0 then add(suite, 'lua', SelftestStatus.Fail, ms, 'no cases') end
+  end
+  out:destroy() scratch:destroy() dir:destroy()
+end
+
+-- agent: true when the suite is done
+local function suite_agent(): boolean
+  local now = now_ms()
+  if R.phase == 0 then
+    if not host.agent_enabled then
+      add(SUITE_AGENT, 'echo', SelftestStatus.Skip, 0, 'the agent is off in lua/init.lua')
+      return true
+    end
+    if host.agent.state ~= AgentState.Ready then
+      add(SUITE_AGENT, 'echo', SelftestStatus.Skip, 0, 'no agent answered (start ghostty-agent to run this suite)')
+      return true
+    end
+    local p: Profile = { name = 'selftest', transport = 'agent' }
+    if platform_name() == 'windows' then
+      p.argv:push('cmd.exe') p.argv:push('/c') p.argv:push('echo ' .. MARKER)
+    else
+      p.argv:push('sh') p.argv:push('-c') p.argv:push('echo ' .. MARKER)
+    end
+    local s = session_open(&p, 40, 4)
+    p.argv[2]:destroy()
+    p.argv:destroy()
+    if s == nilptr then
+      add(SUITE_AGENT, 'open', SelftestStatus.Fail, 0, 'session_open failed')
+      return true
+    end
+    R.session_id = s.id
+    R.phase, R.phase_ms, R.suite_ms = 1, now, now
+    return false
+  end
+  local s = find_session(R.session_id)
+  if R.phase == 1 then
+    if s == nilptr then
+      add(SUITE_AGENT, 'echo', SelftestStatus.Fail, now - R.phase_ms, 'the terminal went away before its output arrived')
+      return true
+    end
+    local out = selftest_record_termview(&s.view)
+    local seen = out:find(MARKER_QUOTED, 1, true) > 0
+    out:destroy()
+    if seen then
+      add(SUITE_AGENT, 'echo', SelftestStatus.Pass, now - R.phase_ms, 'sh -c \'echo ghostty-selftest\' read back from the grid')
+      R.phase, R.phase_ms = 2, now
+    elseif s.exited then
+      local m = string.format('the shell ended (status %d) without printing %s', s.exit_status, MARKER)
+      add(SUITE_AGENT, 'echo', SelftestStatus.Fail, now - R.phase_ms, m)
+      m:destroy()
+      session_remove(s)
+      return true
+    elseif now - R.phase_ms > AGENT_OUTPUT_MS then
+      add(SUITE_AGENT, 'echo', SelftestStatus.Fail, now - R.phase_ms, 'timed out after 10 s waiting for the marker')
+      session_remove(s)
+      return true
+    end
+    return false
+  end
+  -- phase 2: the shell exits by itself, then the terminal is closed
+  if s == nilptr then
+    add(SUITE_AGENT, 'exit', SelftestStatus.Pass, now - R.phase_ms, 'exited and closed by close_on_exit')
+    return true
+  end
+  if s.process_exited then
+    add(SUITE_AGENT, 'exit', s.exit_status == 0 and SelftestStatus.Pass or SelftestStatus.Fail, now - R.phase_ms,
+      s.exit_status == 0 and 'exit status 0' or 'non-zero exit status')
+    session_remove(s)
+    add(SUITE_AGENT, 'close', find_session(R.session_id) == nilptr and SelftestStatus.Pass or SelftestStatus.Fail, 0, 'terminal closed')
+    return true
+  end
+  if now - R.phase_ms > AGENT_EXIT_MS then
+    add(SUITE_AGENT, 'exit', SelftestStatus.Fail, now - R.phase_ms, 'timed out after 5 s waiting for the shell to exit')
+    session_remove(s)
+    return true
+  end
+  return false
+end
+
+-- loader --------------------------------------------------------------------------
+local function push_agent_ids(out: *vector(uint32), list: *vector(*Session)): integer
+  local other = 0
+  for i = 0, < #$list do
+    local s = (@*vector(*Session))(list)[i]
+    if s.kind == TransportKind.Agent and not s.awaiting_open then out:push(s.agent_id) else other = other + 1 end
+  end
+  return other
+end
+
+-- The fingerprint of what must survive a swap; `other` counts terminals that
+-- cannot (local ones), which keep the suite from running.
+local function fingerprint(): (string, integer)
+  local views: SelftestViews
+  local other = push_agent_ids(&views.tabs, &host.dropdown_tabs) + push_agent_ids(&views.windows, &host.windows)
+    + push_agent_ids(&views.minimized, &host.minimized) + push_agent_ids(&views.world, &host.world)
+  for i = 0, < #host.sessions do
+    if host.sessions[i].kind ~= TransportKind.Agent then other = other + 1 end
+  end
+  local path = join(host.dir, 'settings.lua')
+  local ok, text = read_file(path)
+  path:destroy()
+  local h: uint64 = 0
+  if ok then h = selftest_fnv(SELFTEST_FNV_START, text) text:destroy() end
+  local fp = selftest_fingerprint(&views, h, BUILD_ID)
+  selftest_views_destroy(&views)
+  return fp, other
+end
+
+local function state_path(): string
+  local dir = selftest_dir()
+  local p = join(dir, 'state.tsv')
+  dir:destroy()
+  return p
+end
+
+-- Hand the run to the next core and make the loader swap.
+local function request_swap(): boolean
+  R.st.step = R.st.step + 1
+  R.st.swap_ms = now_ms()
+  local enc = selftest_state_encode(&R.st)
+  local path = state_path()
+  local ok = write_file(path, enc)
+  enc:destroy()
+  if ok then
+    write_report('swapping', false)
+    local core = join(boot.install_dir, 'ghostty_core.dll')
+    ok = touch(core)
+    if not ok then
+      logf(LOG_WARN, 'selftest: could not update the write time of %s', core)
+      os.remove(path)
+    else
+      logf(LOG_INFO, 'selftest: asking the loader for swap %d of 2', R.st.step)
+    end
+    core:destroy()
+  end
+  path:destroy()
+  R.phase, R.phase_ms = 1, now_ms()
+  return ok
+end
+
+local function suite_loader(): boolean
+  local now = now_ms()
+  if R.phase == 0 then
+    if not under_loader() then
+      add(SUITE_LOADER, 'swap', SelftestStatus.Skip, 0, 'not loaded through ghostty_loader.dll')
+      return true
+    end
+    if host.agent_enabled and not host.reattach_done and now - R.suite_ms < REATTACH_WAIT_MS then
+      return false -- the layout is still coming back from the agent: compare once it is
+    end
+    local fp, other = fingerprint()
+    if other > 0 then
+      local m = string.format('%d local terminals (ConPTY or no shell) would not survive a swap; close them to run this suite', other)
+      add(SUITE_LOADER, 'swap', SelftestStatus.Skip, 0, m)
+      m:destroy() fp:destroy()
+      return true
+    end
+    R.st.fp:destroy()
+    R.st.fp = fp
+    R.st.step = 0
+    if not request_swap() then
+      add(SUITE_LOADER, 'swap', SelftestStatus.Fail, 0, 'could not write the state file or touch ghostty_core.dll')
+      return true
+    end
+    return false
+  end
+  if R.phase == 1 then
+    -- still here: the loader has not swapped
+    if now - R.phase_ms > SWAP_WAIT_MS then
+      local path = state_path()
+      os.remove(path)
+      path:destroy()
+      add(SUITE_LOADER, R.st.step == 1 and 'swap' or 'swap back', SelftestStatus.Fail, now - R.phase_ms,
+        'the loader did not swap the core within 15 s')
+      return true
+    end
+    return false
+  end
+  -- phase 2: a fresh core carrying on; wait for the layout, then compare
+  if host.agent_enabled and not host.reattach_done and now - R.phase_ms < REATTACH_WAIT_MS then return false end
+  local fp, other = fingerprint()
+  local same = fp == R.st.fp
+  local name: string = R.st.step == 1 and 'swap' or 'swap back'
+  if same then
+    local m = string.format('swapped in %d ms; terminals, layout and settings unchanged', now - R.st.swap_ms)
+    add(SUITE_LOADER, name, SelftestStatus.Pass, now - R.st.swap_ms, m)
+    m:destroy()
+  else
+    local m = string.format('before: %s; after: %s', R.st.fp, fp)
+    add(SUITE_LOADER, name, SelftestStatus.Fail, now - R.st.swap_ms, m)
+    m:destroy()
+  end
+  fp:destroy()
+  if same and R.st.step < 2 then
+    if not request_swap() then
+      add(SUITE_LOADER, 'swap back', SelftestStatus.Fail, 0, 'could not write the state file or touch ghostty_core.dll')
+      return true
+    end
+    return false
+  end
+  return true
+end
+
+-- A state file left by the previous core: carry on with its run.
+local function resume(): void
+  local path = state_path()
+  defer path:destroy() end
+  local ok, text = read_file(path)
+  if not ok then return end
+  os.remove(path)
+  local st: SelftestState
+  local decoded = selftest_state_decode(text, &st)
+  text:destroy()
+  if not decoded then
+    log(LOG_WARN, 'selftest: ignored an unreadable state file')
+    return
+  end
+  local now = now_ms()
+  if st.step < 1 or st.step > 2 or now < st.swap_ms or now - st.swap_ms > STATE_MAX_AGE_MS then
+    logf(LOG_WARN, 'selftest: ignored a stale state file (run %s)', st.run_id)
+    selftest_state_destroy(&st)
+    return
+  end
+  R.st = st
+  R.active = true
+  R.phase, R.phase_ms, R.suite_ms = 2, now, now
+  logf(LOG_INFO, 'selftest: run %s continues after swap %d', R.st.run_id, R.st.step)
+end
+
+local function write_loaded(): void
+  local dir = selftest_dir()
+  local path = join(dir, 'core-loaded.json')
+  local utc = utc_now(false)
+  local sb: stringbuilder
+  sb:write('{ "build_id": ')
+  selftest_json_string(&sb, BUILD_ID)
+  sb:write(', "commit": ')
+  selftest_json_string(&sb, BUILD_COMMIT)
+  sb:write(', "core_version": ')
+  selftest_json_string(&sb, build_version_cstr())
+  sb:write(', "loaded_utc": ')
+  selftest_json_string(&sb, utc)
+  -- the process at this core's first frame: compare across reloads (leak watch below)
+  local ps = procstat_sample()
+  sb:writef(', "private_bytes": %d, "working_set": %d, "handles": %d, "gdi": %d, "user": %d',
+    (@int64)(ps.private_bytes), (@int64)(ps.working_set), (@int64)(ps.handles), (@int64)(ps.gdi), (@int64)(ps.user))
+  sb:write(' }\n')
+  local json = sb:promote()
+  write_file(path, json)
+  json:destroy() utc:destroy() path:destroy() dir:destroy()
+end
+
+-- Leak watch ------------------------------------------------------------------------------
+-- Opt-in (`/term selftest leakwatch on`, a marker file selftest/leakwatch.on):
+-- every core load appends one line to selftest/leakwatch.tsv, so after a
+-- session of reloads the file shows whether memory or handles climb with each
+-- one. `/term selftest leakwatch` logs the first and last sample and the growth
+-- per reload. One sample per load, a few system calls: nothing per frame.
+local function leakwatch_paths(): (string, string)
+  local dir = selftest_dir()
+  local on, tsv = join(dir, 'leakwatch.on'), join(dir, 'leakwatch.tsv')
+  dir:destroy()
+  return on, tsv
+end
+
+local function leakwatch_sample(event: string): void
+  local on, tsv = leakwatch_paths()
+  defer on:destroy() tsv:destroy() end
+  local enabled, marker = read_file(on)
+  marker:destroy()
+  if not enabled then return end
+  local had, old = read_file(tsv)
+  local sb: stringbuilder
+  if had then sb:write(old) else sb:write('utc\tbuild\tevent\tprivate_bytes\tworking_set\thandles\tgdi\tuser\n') end
+  old:destroy()
+  local utc = utc_now(false)
+  local ps = procstat_sample()
+  sb:writef('%s\t%s\t%s\t%d\t%d\t%d\t%d\t%d\n', utc, BUILD_ID, event,
+    (@int64)(ps.private_bytes), (@int64)(ps.working_set), (@int64)(ps.handles), (@int64)(ps.gdi), (@int64)(ps.user))
+  utc:destroy()
+  local text = sb:promote()
+  write_file(tsv, text)
+  text:destroy()
+end
+
+-- /term selftest leakwatch [on | off]
+local function leakwatch_command(arg: string): cint
+  local on, tsv = leakwatch_paths()
+  defer on:destroy() tsv:destroy() end
+  if arg == 'on' then
+    write_file(on, 'on\n')
+    leakwatch_sample('enabled')
+    logf(LOG_INFO, 'leak watch on: every core load is sampled into %s', tsv)
+    return 0
+  elseif arg == 'off' then
+    os.remove(on)
+    logf(LOG_INFO, 'leak watch off (%s is kept)', tsv)
+    return 0
+  end
+  local had, text = read_file(tsv)
+  defer text:destroy() end
+  if not had then
+    logf(LOG_INFO, 'leak watch: no samples yet; turn it on with /term selftest leakwatch on')
+    return 0
+  end
+  -- first and last data line: private bytes and handles
+  local first_priv: uint64, last_priv: uint64, first_h: uint64, last_h: uint64 = 0, 0, 0, 0
+  local rows = 0
+  local at: usize = 0
+  while at < text.size do
+    local stop = at
+    while stop < text.size and text.data[stop] ~= '\n'_b do stop = stop + 1 end
+    local col: integer, v: uint64 = 0, 0
+    local priv: uint64, h: uint64 = 0, 0
+    for i = at, < stop do
+      local c = text.data[i]
+      if c == '\t'_b then
+        if col == 3 then priv = v elseif col == 5 then h = v end
+        col = col + 1 v = 0
+      elseif c >= '0'_b and c <= '9'_b then v = v * 10 + (c - '0'_b)
+      end
+    end
+    if at > 0 and stop > at then -- the header is the line at 0
+      rows = rows + 1
+      if rows == 1 then first_priv, first_h = priv, h end
+      last_priv, last_h = priv, h
+    end
+    at = stop + 1
+  end
+  if rows < 2 then
+    logf(LOG_INFO, 'leak watch: %d sample(s); reload the core a few times first', rows)
+    return 0
+  end
+  local dpriv = (@int64)(last_priv) - (@int64)(first_priv)
+  local dh = (@int64)(last_h) - (@int64)(first_h)
+  logf(LOG_INFO, 'leak watch: %d samples; private memory %+d KiB (%+d KiB per load), handles %+d (%+d per load)',
+    rows, dpriv // 1024, dpriv // 1024 // (rows - 1), dh, dh // (rows - 1))
+  return 0
+end
+
+-- Entry points --------------------------------------------------------------------------
+
+-- /term selftest [list | all | suite...]; 0 started (or listed), 4 refused.
+global function selftest_command(args: string): cint
+  if args == 'leakwatch' then return leakwatch_command('') end
+  if args == 'leakwatch on' then return leakwatch_command('on') end
+  if args == 'leakwatch off' then return leakwatch_command('off') end
+  local ok, mask, list_only, err = selftest_parse(args)
+  if not ok then
+    logf(LOG_WARN, '%s', err)
+    err:destroy()
+    return 4
+  end
+  if list_only then
+    for i = 0, < SELFTEST_SUITE_COUNT do logf(LOG_INFO, 'selftest %s: %s', SELFTEST_SUITES[i], SELFTEST_SUITE_HELP[i]) end
+    log(LOG_INFO, 'selftest: /term selftest [all | suite...] writes selftest/latest.json in the config directory')
+    return 0
+  end
+  if R.active then
+    logf(LOG_WARN, 'selftest: run %s is still going', R.st.run_id)
+    return 4
+  end
+  if #host.dir == 0 then
+    log(LOG_WARN, 'selftest: no config directory to write the report to')
+    return 4
+  end
+  selftest_state_destroy(&R.st)
+  local utc = utc_now(true)
+  R.st.run_id = string.format('%s-%s', utc, BUILD_ID)
+  utc:destroy()
+  R.st.selection = mask
+  R.st.next = 0
+  R.st.started_ms = now_ms()
+  R.st.started_utc = utc_now(false)
+  R.phase, R.phase_ms, R.suite_ms = 0, R.st.started_ms, R.st.started_ms
+  R.active = true
+  local sel = selftest_selection_text(mask)
+  logf(LOG_INFO, 'selftest: running %s (run %s)', sel, R.st.run_id)
+  sel:destroy()
+  write_report('running', false)
+  return 0
+end
+
+-- Per frame while the core is active: one step of the run. `in_world` is
+-- true while a character is loaded.
+global function selftest_tick(in_world: boolean): void
+  if not R.booted then
+    R.booted = true
+    if #host.dir > 0 then
+      write_loaded()
+      leakwatch_sample('load')
+      resume()
+    end
+  end
+  if not R.active then return end
+  local i = R.st.next
+  while i < SELFTEST_SUITE_COUNT and (R.st.selection & ((@uint32)(1) << i)) == 0 do i = i + 1 end
+  if i ~= R.st.next then
+    R.st.next = i
+    R.phase, R.suite_ms = 0, now_ms()
+  end
+  if i >= SELFTEST_SUITE_COUNT then
+    finish()
+    return
+  end
+  local done = true
+  if i == SUITE_CORE then suite_core()
+  elseif i == SUITE_TERMINAL then suite_terminal()
+  elseif i == SUITE_RENDER then suite_render()
+  elseif i == SUITE_WORLD then suite_world(in_world)
+  elseif i == SUITE_SETTINGS or i == SUITE_THEMES or i == SUITE_BELL then suite_lua(i)
+  elseif i == SUITE_AGENT then done = suite_agent()
+  elseif i == SUITE_LOADER then done = suite_loader()
+  end
+  if done then
+    R.st.next = i + 1
+    R.phase, R.suite_ms = 0, now_ms()
+  end
+end
+
+-- True while a run is going (tests).
+global function selftest_running(): boolean
+  return R.active
+end
+
+-- The core is shutting down: a run that is not handing over to the next
+-- core ends here, its report says so.
+global function selftest_shutdown(): void
+  if R.active and not (R.st.next == SUITE_LOADER and R.phase == 1) then
+    add(R.st.next < SELFTEST_SUITE_COUNT and R.st.next or SUITE_LOADER, 'interrupted', SelftestStatus.Fail, 0, 'the core shut down during the run')
+    write_report('complete', true)
+  end
+  selftest_state_destroy(&R.st)
+  R = {}
+end

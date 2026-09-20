@@ -2,6 +2,7 @@
 -- the host-side test build still links.
 require 'string'
 require 'vector'
+require 'core.sys.wincmdline'
 
 global ConPty = @record{
   hpc: pointer,
@@ -19,7 +20,8 @@ global ConPty = @record{
 ## cinclude '<windows.h>'
 
 local COORD <cimport, nodecl> = @record{ X: int16, Y: int16 }
-local STARTUPINFOW <cimport, nodecl> = @record{ cb: uint32 }
+local STARTUPINFOW <cimport, nodecl> = @record{ cb: uint32, dwFlags: uint32, hStdInput: pointer, hStdOutput: pointer, hStdError: pointer }
+local STARTF_USESTDHANDLES: uint32 <cimport, nodecl, const>
 local STARTUPINFOEXW <cimport, nodecl> = @record{ StartupInfo: STARTUPINFOW, lpAttributeList: pointer }
 -- These records declare only the fields used, so `#STARTUPINFOEXW` would be
 -- their size (16), not the real 112 CreateProcessW checks: ask the C compiler.
@@ -49,6 +51,7 @@ local EXTENDED_STARTUPINFO_PRESENT: uint32 <cimport, nodecl, const>
 local CREATE_UNICODE_ENVIRONMENT: uint32 <cimport, nodecl, const>
 local PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE: usize <cimport, nodecl, const>
 local WAIT_OBJECT_0: uint32 <cimport, nodecl, const>
+local INVALID_HANDLE_VALUE: pointer <cimport, nodecl, const>
 local CP_UTF8: uint32 <cimport, nodecl, const>
 
 -- ConPTY entry points are resolved at runtime so the DLL still loads on a
@@ -83,39 +86,6 @@ local function to_wide(s: string): *[0]uint16
   return w
 end
 
--- Quote argv into a Windows command line (CommandLineToArgvW rules).
-local function build_cmdline(argv: *vector(string)): string
-  local sb: stringbuilder
-  for i = 0, < #argv do
-    if i > 0 then sb:write(' ') end
-    local a = argv[i]
-    local needs = #a == 0 or a:find(' ', 1, true) > 0 or a:find('\t', 1, true) > 0 or a:find('"', 1, true) > 0
-    if not needs then
-      sb:write(a)
-    else
-      sb:write('"')
-      local bs = 0
-      for k = 1, #a do
-        local c = a:byte(k)
-        if c == 92 then
-          bs = bs + 1
-        elseif c == 34 then
-          for _ = 1, bs * 2 + 1 do sb:write('\\') end
-          bs = 0
-          sb:write('"')
-        else
-          for _ = 1, bs do sb:write('\\') end
-          bs = 0
-          sb:write(string.char(c))
-        end
-      end
-      for _ = 1, bs * 2 do sb:write('\\') end
-      sb:write('"')
-    end
-  end
-  return sb:promote()
-end
-
 require 'stringbuilder'
 
 function ConPty:open(argv: *vector(string), cwd: string, cols: uint16, rows: uint16): boolean
@@ -141,9 +111,15 @@ function ConPty:open(argv: *vector(string), cwd: string, cols: uint16, rows: uin
 
   local si: STARTUPINFOEXW
   si.StartupInfo.cb = SIZEOF_STARTUPINFOEXW
+  -- Null standard handles (as Windows Terminal does): otherwise a child can
+  -- take this process's own stdin/stdout instead of its pseudo console's.
+  si.StartupInfo.dwFlags = STARTF_USESTDHANDLES
+  si.StartupInfo.hStdInput = nilptr
+  si.StartupInfo.hStdOutput = nilptr
+  si.StartupInfo.hStdError = nilptr
   si.lpAttributeList = self.attr_list
   local pi: PROCESS_INFORMATION
-  local cmdline = build_cmdline(argv)
+  local cmdline = win_cmdline(argv)
   local wcmd = to_wide(cmdline)
   cmdline:destroy()
   local wcwd: *[0]uint16 = nilptr

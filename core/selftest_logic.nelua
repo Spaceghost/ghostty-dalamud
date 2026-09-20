@@ -1,0 +1,637 @@
+-- The pure parts of `/term selftest` (core/app/selftest.nelua runs them in the
+-- game): which suites a command line picks, the case records, the JSON report
+-- and its one-line summary, the state a run hands across a core swap, and the
+-- checks that need no game: a terminal read back through libghostty, the
+-- draw calls of a fixed terminal, and the world projection round trip.
+-- Nothing here reads the clock or a file; the host tests run all of it.
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'math'
+require 'core.ghostty'
+require 'core.imgui'
+require 'core.termview'
+require 'core.render'
+require 'core.world'
+local strconv: type = require 'detail.strconv'
+
+-- Suites ------------------------------------------------------------------------
+-- In running order: `loader` swaps the core, so it goes last.
+global SELFTEST_SUITE_COUNT: integer <comptime> = 9
+global SELFTEST_SUITES: [9]string = {
+  'core', 'terminal', 'render', 'world', 'settings', 'themes', 'bell', 'agent', 'loader',
+}
+global SELFTEST_SUITE_HELP: [9]string = {
+  'the core is loaded and active, ImGui is bound, the build stamp is present',
+  'a local terminal (no shell) fed known VT bytes, its grid and colours read back through libghostty',
+  'a fixed terminal drawn through recorded draw calls (hash against the host build) and into an offscreen draw list twice',
+  'the live camera: camera position, projection and panel hit testing round trip within 0.5 px (needs a character)',
+  'settings.lua saved and read back in a scratch directory, sliders clamped (lua/selftest.lua)',
+  'every theme resolves, and switching and restoring gives the same colours (when lua/themes.lua exists)',
+  '/term bell and /term showcase arguments parse; the bell style is restored',
+  'a shell on ghostty-agent echoes a marker, exits and is closed (skipped when no agent answers)',
+  'the loader swaps in the same ghostty_core.dll and back; terminals, layout and settings survive',
+}
+global SELFTEST_ALL: uint32 <comptime> = (1 << 9) - 1
+
+global function selftest_suite_index(name: string): integer
+  for i = 0, < SELFTEST_SUITE_COUNT do
+    if SELFTEST_SUITES[i] == name then return i end
+  end
+  return -1
+end
+
+local function is_space(b: byte): boolean
+  return b == ' '_b or b == '\t'_b or b == ','_b
+end
+
+-- `/term selftest [list | all | suite...]` (suites separated by spaces or
+-- commas). Returns ok, the suites as bits (1 << index), list_only, and an
+-- error message when not ok.
+global function selftest_parse(args: string): (boolean, uint32, boolean, string)
+  local mask: uint32 = 0
+  local words = 0
+  local i: usize = 0
+  while i < args.size do
+    while i < args.size and is_space(args.data[i]) do i = i + 1 end
+    if i >= args.size then break end
+    local j = i
+    while j < args.size and not is_space(args.data[j]) do j = j + 1 end
+    local w = string{data=(@*[0]byte)(&args.data[i]), size=j - i}
+    words = words + 1
+    if w == 'list' then
+      if words == 1 then
+        local k = j
+        while k < args.size and is_space(args.data[k]) do k = k + 1 end
+        if k >= args.size then return true, 0, true, (@string){} end
+      end
+      return false, 0, false, string.copy('selftest: "list" takes no suites')
+    elseif w == 'all' then
+      mask = mask | SELFTEST_ALL
+    else
+      local n = selftest_suite_index(w)
+      if n < 0 then
+        return false, 0, false, string.format('selftest: unknown suite "%s" (see /term selftest list)', w)
+      end
+      mask = mask | ((@uint32)(1) << n)
+    end
+    i = j
+  end
+  if mask == 0 then mask = SELFTEST_ALL end
+  return true, mask, false, (@string){}
+end
+
+-- Cases -------------------------------------------------------------------------
+global SelftestStatus = @enum(integer){ Pass = 0, Fail, Skip }
+
+global SelftestCase = @record{
+  suite: string,
+  name: string,
+  status: SelftestStatus,
+  ms: uint64,
+  message: string,
+}
+
+global function selftest_status_name(s: SelftestStatus): string
+  if s == SelftestStatus.Pass then return 'pass' end
+  if s == SelftestStatus.Fail then return 'fail' end
+  return 'skip'
+end
+
+global function selftest_status_parse(s: string): (boolean, SelftestStatus)
+  if s == 'pass' then return true, SelftestStatus.Pass end
+  if s == 'fail' then return true, SelftestStatus.Fail end
+  if s == 'skip' then return true, SelftestStatus.Skip end
+  return false, SelftestStatus.Fail
+end
+
+-- A copy of `s` fit for one field of the state file: tabs, newlines and
+-- other control bytes become spaces, at most 400 bytes.
+global function selftest_field(s: string): string
+  local n = s.size
+  if n > 400 then n = 400 end
+  local out = string.create(n)
+  for i: usize = 0, < n do
+    local b = s.data[i]
+    if b < 32 or b == 127 then b = ' '_b end
+    out.data[i] = b
+  end
+  return out
+end
+
+global function selftest_case_destroy(c: *SelftestCase): void
+  c.suite:destroy()
+  c.name:destroy()
+  c.message:destroy()
+end
+
+global function selftest_cases_clear(cases: *vector(SelftestCase)): void
+  for i = 0, < #$cases do selftest_case_destroy(&(@*vector(SelftestCase))(cases)[i]) end
+  cases:clear()
+end
+
+global function selftest_add(cases: *vector(SelftestCase), suite: string, name: string, status: SelftestStatus, ms: uint64, message: string): void
+  cases:push(SelftestCase{
+    suite = selftest_field(suite), name = selftest_field(name), status = status, ms = ms, message = selftest_field(message),
+  })
+end
+
+global function selftest_count(cases: *vector(SelftestCase)): (integer, integer, integer)
+  local pass, fail, skip = 0, 0, 0
+  for i = 0, < #$cases do
+    local st = (@*vector(SelftestCase))(cases)[i].status
+    if st == SelftestStatus.Pass then pass = pass + 1
+    elseif st == SelftestStatus.Fail then fail = fail + 1
+    else skip = skip + 1 end
+  end
+  return pass, fail, skip
+end
+
+-- FNV-1a, 64 bit --------------------------------------------------------------------
+global SELFTEST_FNV_START: uint64 <comptime> = 0xcbf29ce484222325_u64
+
+global function selftest_fnv(h: uint64, s: string): uint64
+  for i: usize = 0, < s.size do
+    h = (h ~ s.data[i]) * 0x100000001b3_u64
+  end
+  return h
+end
+
+global function selftest_hex64(h: uint64): string
+  local digits: string = '0123456789abcdef'
+  local out = string.create(16)
+  for i = 0, < 16 do
+    out.data[15 - i] = digits.data[(h >> (i * 4)) & 15]
+  end
+  return out
+end
+
+-- Report --------------------------------------------------------------------------
+global SelftestMeta = @record{
+  run_id: string,
+  selection: string,        -- the suites asked for, in order, space separated
+  state: string,            -- 'running' | 'swapping' | 'complete'
+  build_id: string,
+  commit: string,
+  core_version: string,
+  plugin_version: string,   -- AssemblyVersion of GhosttyDalamud.json beside the core
+  game_version: string,     -- ffxivgame.ver beside the game executable
+  platform: string,         -- 'windows' | 'wine' | the host's
+  host_kind: string,        -- 'dalamud' | 'embedded'
+  started_utc: string,
+  finished_utc: string,
+  duration_ms: uint64,
+}
+
+global function selftest_json_string(sb: *stringbuilder, s: string): void
+  sb:write('"')
+  for i: usize = 0, < s.size do
+    local b = s.data[i]
+    if b == '"'_b then sb:write('\\"')
+    elseif b == '\\'_b then sb:write('\\\\')
+    elseif b == '\n'_b then sb:write('\\n')
+    elseif b == '\r'_b then sb:write('\\r')
+    elseif b == '\t'_b then sb:write('\\t')
+    elseif b < 32 or b == 127 then sb:writef('\\u%04x', b)
+    else sb:writebyte(b) end
+  end
+  sb:write('"')
+end
+
+local function json_field(sb: *stringbuilder, indent: string, key: string, value: string, comma: boolean): void
+  sb:write(indent)
+  selftest_json_string(sb, key)
+  sb:write(': ')
+  selftest_json_string(sb, value)
+  if comma then sb:write(',') end
+  sb:write('\n')
+end
+
+global function selftest_selection_text(mask: uint32): string
+  local sb: stringbuilder
+  for i = 0, < SELFTEST_SUITE_COUNT do
+    if (mask & ((@uint32)(1) << i)) ~= 0 then
+      if sb:view().size > 0 then sb:write(' ') end
+      sb:write(SELFTEST_SUITES[i])
+    end
+  end
+  return sb:promote()
+end
+
+-- The report written to selftest/latest.json. `complete` is false while a
+-- run is still going (the loader suite writes one before each swap).
+global function selftest_report_json(meta: *SelftestMeta, cases: *vector(SelftestCase), complete: boolean): string
+  local pass, fail, skip = selftest_count(cases)
+  local sb: stringbuilder
+  sb:write('{\n')
+  sb:write('  "schema": 1,\n')
+  sb:writef('  "complete": %s,\n', complete and 'true' or 'false')
+  sb:writef('  "ok": %s,\n', (complete and fail == 0) and 'true' or 'false')
+  json_field(&sb, '  ', 'state', meta.state, true)
+  json_field(&sb, '  ', 'run_id', meta.run_id, true)
+  json_field(&sb, '  ', 'selection', meta.selection, true)
+  sb:write('  "build": {\n')
+  json_field(&sb, '    ', 'id', meta.build_id, true)
+  json_field(&sb, '    ', 'commit', meta.commit, true)
+  json_field(&sb, '    ', 'core_version', meta.core_version, false)
+  sb:write('  },\n')
+  json_field(&sb, '  ', 'plugin_version', meta.plugin_version, true)
+  json_field(&sb, '  ', 'game_version', meta.game_version, true)
+  json_field(&sb, '  ', 'platform', meta.platform, true)
+  json_field(&sb, '  ', 'host', meta.host_kind, true)
+  json_field(&sb, '  ', 'started_utc', meta.started_utc, true)
+  json_field(&sb, '  ', 'finished_utc', meta.finished_utc, true)
+  sb:writef('  "duration_ms": %d,\n', (@int64)(meta.duration_ms))
+  sb:writef('  "summary": { "passed": %d, "failed": %d, "skipped": %d, "total": %d },\n', pass, fail, skip, #$cases)
+  sb:write('  "cases": [')
+  for i = 0, < #$cases do
+    local c = &(@*vector(SelftestCase))(cases)[i]
+    sb:write(i == 0 and '\n' or ',\n')
+    sb:write('    { "suite": ')
+    selftest_json_string(&sb, c.suite)
+    sb:write(', "case": ')
+    selftest_json_string(&sb, c.name)
+    sb:write(', "status": ')
+    selftest_json_string(&sb, selftest_status_name(c.status))
+    sb:writef(', "ms": %d, "message": ', (@int64)(c.ms))
+    selftest_json_string(&sb, c.message)
+    sb:write(' }')
+  end
+  sb:write(#$cases > 0 and '\n  ]\n' or ']\n')
+  sb:write('}\n')
+  return sb:promote()
+end
+
+-- One line for the log: PASS/FAIL, counts, and the first failure.
+global function selftest_summary(meta: *SelftestMeta, cases: *vector(SelftestCase)): string
+  local pass, fail, skip = selftest_count(cases)
+  local sb: stringbuilder
+  sb:writef('selftest %s: %s, %d passed, %d failed, %d skipped in %d ms (build %s)',
+    meta.selection, fail == 0 and 'PASS' or 'FAIL', pass, fail, skip, (@int64)(meta.duration_ms), meta.build_id)
+  for i = 0, < #$cases do
+    local c = &(@*vector(SelftestCase))(cases)[i]
+    if c.status == SelftestStatus.Fail then
+      sb:writef('; first failure %s/%s: %s', c.suite, c.name, c.message)
+      break
+    end
+  end
+  return sb:promote()
+end
+
+-- The string value of "key" in a flat JSON text (GhosttyDalamud.json's
+-- AssemblyVersion); escapes are kept as written. False when there is none.
+global function selftest_json_string_field(text: string, key: string): (boolean, string)
+  local quoted = string.format('"%s"', key)
+  defer quoted:destroy() end
+  local at = text:find(quoted, 1, true)
+  if at <= 0 then return false, (@string){} end
+  local i: usize = (@usize)(at - 1) + quoted.size
+  while i < text.size and (text.data[i] == ' '_b or text.data[i] == '\t'_b or text.data[i] == '\r'_b or text.data[i] == '\n'_b) do i = i + 1 end
+  if i >= text.size or text.data[i] ~= ':'_b then return false, (@string){} end
+  i = i + 1
+  while i < text.size and (text.data[i] == ' '_b or text.data[i] == '\t'_b or text.data[i] == '\r'_b or text.data[i] == '\n'_b) do i = i + 1 end
+  if i >= text.size or text.data[i] ~= '"'_b then return false, (@string){} end
+  i = i + 1
+  local j = i
+  while j < text.size and text.data[j] ~= '"'_b do
+    if text.data[j] == '\\'_b then j = j + 1 end
+    j = j + 1
+  end
+  if j > text.size then return false, (@string){} end
+  return true, string.copy(string{data=(@*[0]byte)(&text.data[i]), size=j - i})
+end
+
+-- State across a core swap ------------------------------------------------------
+-- The loader suite writes this before the loader unloads the core; the next
+-- core reads it once, deletes it, and carries on. Tab separated lines.
+global SELFTEST_STATE_MAGIC: string <comptime> = 'ghostty-selftest-state 1'
+
+global SelftestState = @record{
+  run_id: string,
+  selection: uint32,
+  next: integer,            -- suite index to run next
+  step: integer,            -- loader suite: swaps done so far
+  started_ms: uint64,
+  started_utc: string,
+  swap_ms: uint64,          -- when the last swap was asked for
+  fp: string,               -- what must survive the swap (selftest_fingerprint)
+  cases: vector(SelftestCase),
+}
+
+global function selftest_state_destroy(st: *SelftestState): void
+  st.run_id:destroy()
+  st.started_utc:destroy()
+  st.fp:destroy()
+  selftest_cases_clear(&st.cases)
+  st.cases:destroy()
+  $st = {}
+end
+
+global function selftest_state_encode(st: *SelftestState): string
+  local sb: stringbuilder
+  sb:write(SELFTEST_STATE_MAGIC, '\n')
+  local run = selftest_field(st.run_id)
+  local utc = selftest_field(st.started_utc)
+  local fp = selftest_field(st.fp)
+  sb:writef('run\t%s\nselection\t%d\nnext\t%d\nstep\t%d\nstarted_ms\t%d\nstarted_utc\t%s\nswap_ms\t%d\nfp\t%s\n',
+    run, st.selection, st.next, st.step, (@int64)(st.started_ms), utc, (@int64)(st.swap_ms), fp)
+  run:destroy() utc:destroy() fp:destroy()
+  for i = 0, < #st.cases do
+    local c = &st.cases[i]
+    sb:writef('case\t%s\t%s\t%s\t%d\t%s\n', c.suite, c.name, selftest_status_name(c.status), (@int64)(c.ms), c.message)
+  end
+  return sb:promote()
+end
+
+local function parse_int(s: string): (boolean, integer)
+  if #s == 0 or s.data[0] < '0'_b or s.data[0] > '9'_b then return false, 0 end
+  return strconv.str2int(s, 10)
+end
+
+-- Split one line on tabs into at most 6 fields.
+local function split_tabs(line: string, out: *[6]string): integer
+  local n = 0
+  local start: usize = 0
+  for i: usize = 0, <= line.size do
+    if i == line.size or line.data[i] == '\t'_b then
+      if n < 6 then
+        if i > start then out[n] = string{data=(@*[0]byte)(&line.data[start]), size=i - start} else out[n] = (@string){} end
+        n = n + 1
+      end
+      start = i + 1
+    end
+  end
+  return n
+end
+
+-- False (and nothing kept) for anything that is not a whole state file.
+global function selftest_state_decode(text: string, st: *SelftestState): boolean
+  $st = {}
+  local ok_magic = false
+  local seen_run, seen_next = false, false
+  local start: usize = 0
+  local fields: [6]string
+  for i: usize = 0, <= text.size do
+    if i == text.size or text.data[i] == '\n'_b then
+      local line: string
+      if i > start then line = string{data=(@*[0]byte)(&text.data[start]), size=i - start} end
+      if line.size > 0 and line.data[line.size - 1] == '\r'_b then line.size = line.size - 1 end
+      start = i + 1
+      if not ok_magic then
+        if line ~= SELFTEST_STATE_MAGIC then return false end
+        ok_magic = true
+      elseif line.size > 0 then
+        local n = split_tabs(line, &fields)
+        local key = fields[0]
+        if key == 'case' and n == 6 then
+          local sok, status = selftest_status_parse(fields[3])
+          local mok, ms = parse_int(fields[4])
+          if not sok or not mok then selftest_state_destroy(st) return false end
+          selftest_add(&st.cases, fields[1], fields[2], status, (@uint64)(ms), fields[5])
+        elseif n == 2 and (key == 'run' or key == 'started_utc' or key == 'fp') then
+          if key == 'run' then st.run_id:destroy() st.run_id = string.copy(fields[1]) seen_run = true
+          elseif key == 'started_utc' then st.started_utc:destroy() st.started_utc = string.copy(fields[1])
+          else st.fp:destroy() st.fp = string.copy(fields[1]) end
+        elseif n == 2 then
+          local iok, v = parse_int(fields[1])
+          if not iok then selftest_state_destroy(st) return false end
+          if key == 'selection' then st.selection = (@uint32)(v)
+          elseif key == 'next' then st.next = v seen_next = true
+          elseif key == 'step' then st.step = v
+          elseif key == 'started_ms' then st.started_ms = (@uint64)(v)
+          elseif key == 'swap_ms' then st.swap_ms = (@uint64)(v)
+          end -- unknown keys are ignored
+        elseif n == 1 and (key == 'fp' or key == 'started_utc' or key == 'run') then
+          -- an empty value
+        else
+          selftest_state_destroy(st)
+          return false
+        end
+      end
+    end
+  end
+  if not ok_magic or not seen_run or not seen_next or st.next < 0 or st.next > SELFTEST_SUITE_COUNT then
+    selftest_state_destroy(st)
+    return false
+  end
+  return true
+end
+
+-- What must be the same after a core swap: the terminals in each view (by
+-- the agent's session id, so a detached shell that came back counts), the
+-- settings file and the build. Views: tab, window, minimized, world.
+global SelftestViews = @record{
+  tabs: vector(uint32), windows: vector(uint32), minimized: vector(uint32), world: vector(uint32),
+}
+
+local function sort_ids(v: *vector(uint32)): void
+  for i = 1, < #$v do
+    local x = (@*vector(uint32))(v)[i]
+    local j = i - 1
+    while j >= 0 and (@*vector(uint32))(v)[j] > x do
+      (@*vector(uint32))(v)[j + 1] = (@*vector(uint32))(v)[j]
+      j = j - 1
+    end
+    (@*vector(uint32))(v)[j + 1] = x
+  end
+end
+
+local function write_ids(sb: *stringbuilder, name: string, v: *vector(uint32)): void
+  sort_ids(v)
+  sb:write(name, '=')
+  for i = 0, < #$v do
+    if i > 0 then sb:write(',') end
+    sb:writef('%d', (@*vector(uint32))(v)[i])
+  end
+  sb:write(';')
+end
+
+global function selftest_fingerprint(views: *SelftestViews, settings_hash: uint64, build_id: string): string
+  local sb: stringbuilder
+  write_ids(&sb, 'tab', &views.tabs)
+  write_ids(&sb, 'window', &views.windows)
+  write_ids(&sb, 'min', &views.minimized)
+  write_ids(&sb, 'world', &views.world)
+  local h = selftest_hex64(settings_hash)
+  sb:write('settings=', h, ';build=', build_id)
+  h:destroy()
+  return sb:promote()
+end
+
+global function selftest_views_destroy(v: *SelftestViews): void
+  v.tabs:destroy() v.windows:destroy() v.minimized:destroy() v.world:destroy()
+end
+
+-- Draw calls of a terminal ---------------------------------------------------------
+-- The render path is swapped for recorders that write one line per call, so
+-- what libghostty's render state says (text, colours, runs, cursor) can be
+-- read back and compared, in the game as on the host.
+local rec: stringbuilder
+local rec_calls: integer = 0
+
+local function rec_rect(dl: *ImDrawList, p_min: ImVec2, p_max: ImVec2, col: uint32, rounding: float32, flags: cint): void
+  rec_calls = rec_calls + 1
+  rec:writef('rect %.1f,%.1f-%.1f,%.1f col=%08x\n', p_min.x, p_min.y, p_max.x, p_max.y, col)
+end
+local function rec_rect_outline(dl: *ImDrawList, p_min: ImVec2, p_max: ImVec2, col: uint32, rounding: float32, flags: cint, thickness: float32): void
+  rec_calls = rec_calls + 1
+  rec:writef('rectline %.1f,%.1f-%.1f,%.1f col=%08x\n', p_min.x, p_min.y, p_max.x, p_max.y, col)
+end
+local function rec_line(dl: *ImDrawList, p1: ImVec2, p2: ImVec2, col: uint32, thickness: float32): void
+  rec_calls = rec_calls + 1
+  rec:writef('line %.1f,%.1f-%.1f,%.1f col=%08x\n', p1.x, p1.y, p2.x, p2.y, col)
+end
+local function rec_text(dl: *ImDrawList, font: *ImFont, font_size: float32, pos: ImVec2, col: uint32, text_begin: cstring, text_end: cstring, wrap_width: float32, clip: *ImVec4): void
+  rec_calls = rec_calls + 1
+  local s = string{data=(@*[0]byte)(text_begin), size=(@usize)((@isize)(text_end) - (@isize)(text_begin))}
+  rec:writef('text %.1f,%.1f "%s" col=%08x\n', pos.x, pos.y, s, col)
+end
+
+-- The fixed cell size of every recorded pass: no font is involved.
+global SELFTEST_CELL_W: float32 <comptime> = 8
+global SELFTEST_CELL_H: float32 <comptime> = 16
+
+-- Draw `v` through the recorders; returns the log (one line per call). The
+-- real draw functions and the world-panel switches are put back afterwards.
+global function selftest_record_termview(v: *TermView): string
+  local saved = imgui
+  local saved_world, saved_run = render_world, render_max_run_px
+  imgui.DrawListAddRectFilled = rec_rect
+  imgui.DrawListAddRect = rec_rect_outline
+  imgui.DrawListAddLine = rec_line
+  imgui.DrawListAddText = rec_text
+  render_world, render_max_run_px = false, 0
+  rec_calls = 0
+  local m: RenderMetrics = { font = nilptr, font_size = SELFTEST_CELL_H, cell_w = SELFTEST_CELL_W, cell_h = SELFTEST_CELL_H }
+  v:update()
+  render_termview(nilptr, v, vec2(0, 0), m, true, true, 255, 0)
+  imgui = saved
+  render_world, render_max_run_px = saved_world, saved_run
+  return rec:promote()
+end
+
+-- VT bytes the terminal suite feeds, and what must come back.
+global SELFTEST_VT_COLS: uint16 <comptime> = 24
+global SELFTEST_VT_ROWS: uint16 <comptime> = 4
+global SELFTEST_VT_INPUT: string <comptime> = #[
+  '\27[2J\27[H' ..
+  'ghostty selftest\r\n' ..
+  '\27[38;2;10;20;30mRGB\27[0m \27[48;2;200;100;50mBG\27[0m\r\n' ..
+  '\27[1mB\27[0m\27[4mu\27[0m']#
+
+-- Lines that must be in the recorded draw calls of SELFTEST_VT_INPUT, each
+-- with what it proves. Colours are ImGui's packed ABGR.
+local VT_EXPECT_COUNT <comptime> = 7
+local VT_EXPECT: [7]string = {
+  'text 0.0,0.0 "ghostty"', 'text 64.0,0.0 "selftest"',
+  'text 0.0,16.0 "RGB" col=ff1e140a',
+  'rect 32.0,16.0-48.0,32.0 col=ff3264c8', 'text 32.0,16.0 "BG"',
+  'text 0.7,32.0 "B"', 'line 8.0,46.0-16.0,46.0',
+}
+local VT_WHY: [7]string = {
+  'first word of row 0', 'second word of row 0 at column 8',
+  'truecolor foreground 10,20,30', 'truecolor background 200,100,50 over columns 4-5',
+  'text over the background run', 'bold drawn twice (offset copy)', 'underline under column 1 of row 2',
+}
+
+-- Feed SELFTEST_VT_INPUT into `v` (fresh, SELFTEST_VT_COLS x ROWS) and read
+-- it back. Returns ok and, when not ok, what differed.
+global function selftest_vt_check(v: *TermView): (boolean, string)
+  v:feed((@*[0]uint8)(SELFTEST_VT_INPUT.data), SELFTEST_VT_INPUT.size)
+  local out = selftest_record_termview(v)
+  defer out:destroy() end
+  for i = 0, < VT_EXPECT_COUNT do
+    if out:find(VT_EXPECT[i], 1, true) <= 0 then
+      local first = out:subview(1, math.min(#out, 400))
+      return false, string.format('missing "%s" (%s); got: %s', VT_EXPECT[i], VT_WHY[i], first)
+    end
+  end
+  -- the run is drawn before its glyphs, or it would cover them
+  if out:find('rect 32.0,16.0-48.0,32.0', 1, true) > out:find('text 32.0,16.0 "BG"', 1, true) then
+    return false, string.copy('background run drawn after its glyphs')
+  end
+  return true, (@string){}
+end
+
+-- The fixed terminal of the render suite: everything the renderer
+-- distinguishes (runs, bold, underline, strike, inverse, 256 colours, wide
+-- glyphs, the cursor). Its recorded calls hash to SELFTEST_RENDER_HASH on
+-- every build; tests/test_selftest.nelua checks the constant.
+global SELFTEST_RENDER_COLS: uint16 <comptime> = 32
+global SELFTEST_RENDER_ROWS: uint16 <comptime> = 6
+global SELFTEST_RENDER_INPUT: string <comptime> = #[
+  '\27[2J\27[H' ..
+  '\27[1mbold\27[0m \27[4munder\27[0m \27[9mstrike\27[0m \27[7minverse\27[0m\r\n' ..
+  '\27[31mred\27[32mgreen\27[34mblue\27[0m \27[38;5;208m208\27[48;5;19m bg19 \27[0m\r\n' ..
+  '\27[38;2;255;128;0mtrue\27[48;2;0;64;128mcolour\27[0m\r\n' ..
+  '\xe6\x97\xa5\xe6\x9c\xac wide \xe2\x94\x80\xe2\x94\x80 box\r\n' ..
+  '\27[42m          \27[0m end']#
+global SELFTEST_RENDER_HASH: string <comptime> = '7cd4943e6e6e1e25'
+
+global function selftest_render_ops(): (boolean, uint64, integer, string)
+  local v: TermView
+  if not v:init(SELFTEST_RENDER_COLS, SELFTEST_RENDER_ROWS) then return false, 0, 0, (@string){} end
+  v:feed((@*[0]uint8)(SELFTEST_RENDER_INPUT.data), SELFTEST_RENDER_INPUT.size)
+  local out = selftest_record_termview(&v)
+  local calls = rec_calls
+  v:destroy()
+  local h = selftest_fnv(SELFTEST_FNV_START, out)
+  return true, h, calls, out
+end
+
+-- World projection round trip ------------------------------------------------------
+-- A panel six yalms in front of the camera, facing it: sixteen fixed panel
+-- points (a seeded generator, so every run picks the same ones) are projected
+-- to the screen and hit-tested back. Returns the status, the largest error in
+-- panel pixels and a message.
+global SELFTEST_WORLD_TOLERANCE: float32 <comptime> = 0.5
+
+global function selftest_world_roundtrip(cam: *GuCamera): (SelftestStatus, float32, string)
+  if cam.width < 1 or cam.height < 1 then
+    return SelftestStatus.Fail, 0, string.format('camera viewport is %.0f x %.0f', cam.width, cam.height)
+  end
+  local ok, px, py, pz = world_camera_position(cam)
+  if not ok then return SelftestStatus.Fail, 0, string.copy('the view-projection matrix has no camera position (not a perspective projection)') end
+  local d0 = world_depth(cam, px, py, pz)
+  local fx, fy, fz = world_camera_forward(cam)
+  local d1 = world_depth(cam, px + fx, py + fy, pz + fz)
+  if math.abs(d0) > 0.01 * math.max(math.abs(d1), 1.0) then
+    return SelftestStatus.Fail, 0, string.format('clip depth at the recovered camera position is %.4f, expected 0', d0)
+  end
+  if d1 <= d0 then return SelftestStatus.Fail, 0, string.copy('depth does not grow along the camera forward axis') end
+  local hx: float32, hz: float32 = fx, fz
+  local hl: float32 = math.sqrt(hx * hx + hz * hz)
+  if hl < 1e-3 then hx, hz, hl = 0, 1, 1 end
+  hx, hz = hx / hl, hz / hl
+  local dist: float32 = 6
+  local pl: WorldPlacement = {
+    x = px + fx * dist, y = py + fy * dist, z = pz + fz * dist,
+    yaw = (@float32)(math.atan(-hx, -hz)), pitch = 0,
+    width = 320, height = 180, ppm = 100, opacity = 1,
+  }
+  local b = world_basis(pl)
+  local q: [4]ImVec2
+  if not world_corners(cam, &b, &q) then return SelftestStatus.Fail, 0, string.copy('a panel in front of the camera projects behind it') end
+  if world_backfacing(&q) then return SelftestStatus.Fail, 0, string.copy('a panel facing the camera projects back to front') end
+  local seed: uint32 = 0x5e1f7e57
+  local worst: float32 = 0
+  for i = 1, 16 do
+    seed = seed * 1664525 + 1013904223
+    local u = 8 + (@float32)((seed >> 8) % 304)
+    seed = seed * 1664525 + 1013904223
+    local vv = 8 + (@float32)((seed >> 8) % 164)
+    local x, y, z = world_point(&b, u, vv)
+    local pok, sx, sy = world_project(cam, x, y, z)
+    if not pok then return SelftestStatus.Fail, worst, string.format('point %d (%.0f,%.0f) projects behind the camera', i, u, vv) end
+    local found, on, hu, hv = world_hit(cam, &b, vec2(sx, sy))
+    if not found or not on then
+      return SelftestStatus.Fail, worst, string.format('point %d (%.0f,%.0f) at screen %.1f,%.1f does not hit the panel', i, u, vv, sx, sy)
+    end
+    local e = math.max(math.abs(hu - u), math.abs(hv - vv))
+    if e > worst then worst = e end
+  end
+  if worst > SELFTEST_WORLD_TOLERANCE then
+    return SelftestStatus.Fail, worst, string.format('hit test is %.3f panel px off (tolerance %.1f)', worst, SELFTEST_WORLD_TOLERANCE)
+  end
+  return SelftestStatus.Pass, worst, string.format('16 points, worst %.4f panel px', worst)
+end

@@ -1,0 +1,361 @@
+-- A local child process on pipes, for output the plugin parses instead of
+-- drawing: the /ask panel's hidden assistant session (core/app/ask.nelua).
+--
+-- Why not the ConPTY transport (core/sys/conpty.nelua): a pseudo console is a
+-- screen. Everything written to it goes through a console screen buffer that
+-- is re-emitted as VT, so a line longer than the console is wrapped into rows
+-- and comes back with CR/LF (and cursor moves) inserted in the middle of it.
+-- That is right for a terminal and wrong for `almanac ask --stream-json`,
+-- whose protocol is one JSON object per line: a long line would arrive cut
+-- into pieces and fail to parse. A pipe has no width and no screen, so the
+-- bytes the program writes are the bytes we read.
+--
+-- stderr is merged into the same pipe as stdout, as a pseudo console merges
+-- them: the panel shows a stray line ("command not found", a traceback) as
+-- the reason an answer failed. A program that interleaves stderr inside a
+-- JSON line can still confuse the reader; nothing can fix that from here.
+--
+-- On Windows the child also goes into a job object with
+-- JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, so it cannot outlive the game even if
+-- the game never gets to close it (a crash closes the handle for us).
+--
+-- The POSIX half exists for the host test build (tests/test_ask.nelua): the
+-- plugin itself is a Windows DLL, but the same code path is then exercised on
+-- Linux, where fork/exec pipes behave the same way.
+require 'string'
+require 'vector'
+require 'core.sys.wincmdline'
+
+global ProcPipe = @record{
+  -- windows
+  hjob: pointer,
+  in_write: pointer,
+  out_read: pointer,
+  process: pointer,
+  thread: pointer,
+  -- posix
+  in_fd: cint,
+  out_fd: cint,
+  pid: cint,
+  -- both
+  alive: boolean,
+  exit_code: uint32,
+  exited: boolean,
+}
+
+global PROCPIPE_MAX_ARGV: usize <comptime> = 256
+
+## if ccinfo.is_windows then
+## cinclude '<windows.h>'
+
+local STARTUPINFOW <cimport, nodecl> = @record{ cb: uint32, dwFlags: uint32, hStdInput: pointer, hStdOutput: pointer, hStdError: pointer }
+local SIZEOF_STARTUPINFOW: uint32 <cimport 'sizeof(STARTUPINFOW)', nodecl, const>
+local PROCESS_INFORMATION <cimport, nodecl> = @record{ hProcess: pointer, hThread: pointer, dwProcessId: uint32, dwThreadId: uint32 }
+local SECURITY_ATTRIBUTES <cimport, nodecl> = @record{ nLength: uint32, lpSecurityDescriptor: pointer, bInheritHandle: cint }
+
+local function CreatePipe(hRead: *pointer, hWrite: *pointer, sa: *SECURITY_ATTRIBUTES, size: uint32): cint <cimport, nodecl> end
+local function CloseHandle(h: pointer): cint <cimport, nodecl> end
+local function ReadFile(h: pointer, buf: pointer, n: uint32, read: *uint32, ov: pointer): cint <cimport, nodecl> end
+local function WriteFile(h: pointer, buf: pointer, n: uint32, written: *uint32, ov: pointer): cint <cimport, nodecl> end
+local function PeekNamedPipe(h: pointer, buf: pointer, n: uint32, read: *uint32, avail: *uint32, left: *uint32): cint <cimport, nodecl> end
+local function SetHandleInformation(h: pointer, mask: uint32, flags: uint32): cint <cimport, nodecl> end
+local function CreateProcessW(app: pointer, cmd: pointer, pa: pointer, ta: pointer, inherit: cint, flags: uint32, env: pointer, cwd: pointer, si: pointer, pi: *PROCESS_INFORMATION): cint <cimport, nodecl> end
+local function WaitForSingleObject(h: pointer, ms: uint32): uint32 <cimport, nodecl> end
+local function GetExitCodeProcess(h: pointer, code: *uint32): cint <cimport, nodecl> end
+local function TerminateProcess(h: pointer, code: uint32): cint <cimport, nodecl> end
+local function GetProcessHeap(): pointer <cimport, nodecl> end
+local function HeapAlloc(heap: pointer, flags: uint32, size: usize): pointer <cimport, nodecl> end
+local function HeapFree(heap: pointer, flags: uint32, p: pointer): cint <cimport, nodecl> end
+local function MultiByteToWideChar(cp: uint32, flags: uint32, src: cstring, srclen: cint, dst: *[0]uint16, dstlen: cint): cint <cimport, nodecl> end
+local function CreateJobObjectW(sa: pointer, name: pointer): pointer <cimport, nodecl> end
+local function SetInformationJobObject(job: pointer, class: cint, info: pointer, len: uint32): cint <cimport, nodecl> end
+local function AssignProcessToJobObject(job: pointer, process: pointer): cint <cimport, nodecl> end
+local function ResumeThread(thread: pointer): uint32 <cimport, nodecl> end
+local HANDLE_FLAG_INHERIT: uint32 <cimport, nodecl, const>
+local CREATE_UNICODE_ENVIRONMENT: uint32 <cimport, nodecl, const>
+local CREATE_NO_WINDOW: uint32 <cimport, nodecl, const>
+local CREATE_SUSPENDED: uint32 <cimport, nodecl, const>
+local STARTF_USESTDHANDLES: uint32 <cimport, nodecl, const>
+local WAIT_OBJECT_0: uint32 <cimport, nodecl, const>
+local CP_UTF8: uint32 <cimport, nodecl, const>
+-- Only the fields this file sets are named: with <cimport, nodecl> the C
+-- compiler still sees the real declarations from windows.h, so the size and
+-- layout are Windows's own (the ConPTY transport declares STARTUPINFOEXW the
+-- same way). `#T` would be Nelua's idea of the size, so the length argument
+-- comes from C's sizeof.
+local JOBOBJECT_BASIC_LIMIT_INFORMATION <cimport, nodecl> = @record{ LimitFlags: uint32 }
+local JOBOBJECT_EXTENDED_LIMIT_INFORMATION <cimport, nodecl> = @record{ BasicLimitInformation: JOBOBJECT_BASIC_LIMIT_INFORMATION }
+local JobObjectExtendedLimitInformation: cint <cimport, nodecl, const>
+local SIZEOF_JOBEXT: uint32 <cimport 'sizeof(JOBOBJECT_EXTENDED_LIMIT_INFORMATION)', nodecl, const>
+local JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE: uint32 <cimport, nodecl, const>
+
+local function to_wide(s: string): *[0]uint16
+  local n = MultiByteToWideChar(CP_UTF8, 0, (@cstring)(s.data), (@cint)(s.size), nilptr, 0)
+  local w = (@*[0]uint16)(HeapAlloc(GetProcessHeap(), 0, (@usize)(n + 1) * 2))
+  if w == nilptr then return nilptr end
+  MultiByteToWideChar(CP_UTF8, 0, (@cstring)(s.data), (@cint)(s.size), w, n)
+  w[n] = 0
+  return w
+end
+
+-- A job object that kills what is in it when its last handle goes away, so a
+-- crash of the game takes the assistant with it (jobs nest since Windows 8,
+-- so being inside the game's own job is fine). nilptr when it cannot be made:
+-- the child then simply lives until close() kills it.
+local function make_job(): pointer
+  local job = CreateJobObjectW(nilptr, nilptr)
+  if job == nilptr then return nilptr end
+  local info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+  info.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+  if SetInformationJobObject(job, JobObjectExtendedLimitInformation, &info, SIZEOF_JOBEXT) == 0 then
+    CloseHandle(job)
+    return nilptr
+  end
+  return job
+end
+
+function ProcPipe:open(argv: *vector(string), cwd: string): boolean
+  $self = {}
+  if #$argv == 0 then return false end
+  local sa: SECURITY_ATTRIBUTES = { nLength = #SECURITY_ATTRIBUTES, lpSecurityDescriptor = nilptr, bInheritHandle = 1 }
+  local in_read: pointer
+  local out_write: pointer
+  if CreatePipe(&in_read, &self.in_write, &sa, 0) == 0 then return false end
+  if CreatePipe(&self.out_read, &out_write, &sa, 0) == 0 then
+    CloseHandle(in_read) CloseHandle(self.in_write)
+    $self = {}
+    return false
+  end
+  -- our ends stay in this process only: otherwise the child holds a copy and
+  -- the read end never sees EOF when the child exits
+  SetHandleInformation(self.in_write, HANDLE_FLAG_INHERIT, 0)
+  SetHandleInformation(self.out_read, HANDLE_FLAG_INHERIT, 0)
+
+  local si: STARTUPINFOW
+  si.cb = SIZEOF_STARTUPINFOW
+  si.dwFlags = STARTF_USESTDHANDLES
+  si.hStdInput = in_read
+  si.hStdOutput = out_write
+  si.hStdError = out_write -- merged, as a pseudo console merges them
+  local pi: PROCESS_INFORMATION
+  local cmdline = win_cmdline(argv)
+  local wcmd = to_wide(cmdline)
+  cmdline:destroy()
+  local wcwd: *[0]uint16 = nilptr
+  if #cwd > 0 then wcwd = to_wide(cwd) end
+  self.hjob = make_job()
+  -- CREATE_NO_WINDOW: no console window may flash over the game.
+  -- CREATE_SUSPENDED while there is a job: the child must be in the job
+  -- before it can run, or it could spawn children that escape it.
+  local flags = CREATE_UNICODE_ENVIRONMENT | CREATE_NO_WINDOW
+  if self.hjob ~= nilptr then flags = flags | CREATE_SUSPENDED end
+  local ok = CreateProcessW(nilptr, wcmd, nilptr, nilptr, 1, flags, nilptr, wcwd, &si, &pi)
+  if wcmd ~= nilptr then HeapFree(GetProcessHeap(), 0, wcmd) end
+  if wcwd ~= nilptr then HeapFree(GetProcessHeap(), 0, wcwd) end
+  CloseHandle(in_read)
+  CloseHandle(out_write)
+  if ok == 0 then
+    if self.hjob ~= nilptr then CloseHandle(self.hjob) end
+    CloseHandle(self.in_write)
+    CloseHandle(self.out_read)
+    $self = {}
+    return false
+  end
+  self.process = pi.hProcess
+  self.thread = pi.hThread
+  if self.hjob ~= nilptr then
+    AssignProcessToJobObject(self.hjob, self.process)
+    ResumeThread(self.thread) -- it was created suspended for the job
+  end
+  self.alive = true
+  return true
+end
+
+-- Non-blocking read; bytes read, or 0 when none are waiting.
+function ProcPipe:read(buf: pointer, cap: usize): usize
+  if not self.alive then return 0 end
+  local avail: uint32 = 0
+  if PeekNamedPipe(self.out_read, nilptr, 0, nilptr, &avail, nilptr) == 0 then return 0 end
+  if avail == 0 then return 0 end
+  local want: uint32 = avail
+  if (@usize)(want) > cap then want = (@uint32)(cap) end
+  local got: uint32 = 0
+  if ReadFile(self.out_read, buf, want, &got, nilptr) == 0 then return 0 end
+  return got
+end
+
+function ProcPipe:write(buf: pointer, len: usize): void
+  if not self.alive or len == 0 then return end
+  local written: uint32 = 0
+  WriteFile(self.in_write, buf, (@uint32)(len), &written, nilptr)
+end
+
+-- Let the child see EOF on its stdin without killing it.
+function ProcPipe:close_stdin(): void
+  if self.in_write == nilptr then return end
+  CloseHandle(self.in_write)
+  self.in_write = nilptr
+end
+
+function ProcPipe:poll_exit(): boolean
+  if not self.alive or self.exited then return self.exited end
+  if WaitForSingleObject(self.process, 0) == WAIT_OBJECT_0 then
+    local code: uint32 = 0
+    GetExitCodeProcess(self.process, &code)
+    self.exit_code = code
+    self.exited = true
+  end
+  return self.exited
+end
+
+function ProcPipe:close(): void
+  if not self.alive then return end
+  if not self.exited then TerminateProcess(self.process, 1) end
+  if self.in_write ~= nilptr then CloseHandle(self.in_write) end
+  if self.out_read ~= nilptr then CloseHandle(self.out_read) end
+  if self.thread ~= nilptr then CloseHandle(self.thread) end
+  if self.process ~= nilptr then CloseHandle(self.process) end
+  if self.hjob ~= nilptr then CloseHandle(self.hjob) end -- kills whatever is left in it
+  $self = {}
+end
+
+## else
+
+## cinclude '<unistd.h>'
+## cinclude '<fcntl.h>'
+## cinclude '<errno.h>'
+## cinclude '<signal.h>'
+## cinclude '<sys/wait.h>'
+
+local function fork(): cint <cimport, nodecl> end
+local function pipe(fds: *[2]cint): cint <cimport, nodecl> end
+local function dup2(oldfd: cint, newfd: cint): cint <cimport, nodecl> end
+local function execvp(file: cstring, argv: *[0]cstring): cint <cimport, nodecl> end
+local function chdir(path: cstring): cint <cimport, nodecl> end
+local function setsid(): cint <cimport, nodecl> end
+local function _exit(status: cint): void <cimport, nodecl> end
+local function c_read(fd: cint, buf: pointer, n: csize): isize <cimport 'read', nodecl> end
+local function c_write(fd: cint, buf: pointer, n: csize): isize <cimport 'write', nodecl> end
+local function c_close(fd: cint): cint <cimport 'close', nodecl> end
+local function waitpid(pid: cint, status: *cint, options: cint): cint <cimport, nodecl> end
+local function kill(pid: cint, sig: cint): cint <cimport, nodecl> end
+local function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
+local function signal(sig: cint, handler: pointer): pointer <cimport, nodecl> end
+local WNOHANG: cint <cimport, nodecl, const>
+local SIGKILL: cint <cimport, nodecl, const>
+local SIGPIPE: cint <cimport, nodecl, const>
+local SIG_DFL: pointer <cimport, nodecl, const>
+local F_GETFL: cint <cimport, nodecl, const>
+local F_SETFL: cint <cimport, nodecl, const>
+local O_NONBLOCK: cint <cimport, nodecl, const>
+local F_SETFD: cint <cimport, nodecl, const>
+local FD_CLOEXEC: cint <cimport, nodecl, const>
+local errno: cint <cimport, nodecl>
+local EAGAIN: cint <cimport, nodecl, const>
+local EINTR: cint <cimport, nodecl, const>
+local function WIFEXITED(s: cint): boolean <cimport, nodecl> end
+local function WEXITSTATUS(s: cint): cint <cimport, nodecl> end
+local function WIFSIGNALED(s: cint): boolean <cimport, nodecl> end
+local function WTERMSIG(s: cint): cint <cimport, nodecl> end
+
+local function nonblock_cloexec(fd: cint): void
+  local fl = fcntl(fd, F_GETFL, 0)
+  fcntl(fd, F_SETFL, fl | O_NONBLOCK)
+  fcntl(fd, F_SETFD, FD_CLOEXEC) -- the next child must not hold this pipe open
+end
+
+function ProcPipe:open(argv: *vector(string), cwd: string): boolean
+  $self = {}
+  self.in_fd, self.out_fd, self.pid = -1, -1, -1
+  if #$argv == 0 then return false end
+  local ip: [2]cint, op: [2]cint
+  if pipe(&ip) ~= 0 then return false end
+  if pipe(&op) ~= 0 then c_close(ip[0]) c_close(ip[1]) return false end
+  local pid = fork()
+  if pid < 0 then
+    c_close(ip[0]) c_close(ip[1]) c_close(op[0]) c_close(op[1])
+    return false
+  end
+  if pid == 0 then
+    setsid() -- its own process group: a signal for it does not hit the game
+    signal(SIGPIPE, SIG_DFL)
+    dup2(ip[0], 0)
+    dup2(op[1], 1)
+    dup2(op[1], 2) -- merged, as on Windows
+    c_close(ip[0]) c_close(ip[1])
+    c_close(op[0]) c_close(op[1])
+    if #cwd > 0 then chdir((@cstring)(cwd.data)) end
+    local cargv: [PROCPIPE_MAX_ARGV]cstring
+    local n = (@usize)(#$argv)
+    if n > PROCPIPE_MAX_ARGV - 1 then n = PROCPIPE_MAX_ARGV - 1 end
+    for i = 0, < n do cargv[i] = (@cstring)((($argv)[i]).data) end
+    cargv[n] = nilptr
+    execvp(cargv[0], &cargv)
+    _exit(127) -- the command was not found: the panel says so
+  end
+  c_close(ip[0])
+  c_close(op[1])
+  nonblock_cloexec(ip[1])
+  nonblock_cloexec(op[0])
+  self.in_fd, self.out_fd, self.pid = ip[1], op[0], pid
+  self.alive = true
+  return true
+end
+
+function ProcPipe:read(buf: pointer, cap: usize): usize
+  if not self.alive or self.out_fd < 0 or cap == 0 then return 0 end
+  local n = c_read(self.out_fd, buf, (@csize)(cap))
+  if n > 0 then return (@usize)(n) end
+  if n == 0 then -- EOF: the child closed its end (it may not have exited yet)
+    c_close(self.out_fd)
+    self.out_fd = -1
+  end
+  return 0
+end
+
+function ProcPipe:write(buf: pointer, len: usize): void
+  if not self.alive or self.in_fd < 0 or len == 0 then return end
+  c_write(self.in_fd, buf, (@csize)(len))
+end
+
+function ProcPipe:close_stdin(): void
+  if self.in_fd < 0 then return end
+  c_close(self.in_fd)
+  self.in_fd = -1
+end
+
+function ProcPipe:poll_exit(): boolean
+  if not self.alive or self.exited then return self.exited end
+  local st: cint = 0
+  local r = waitpid(self.pid, &st, WNOHANG)
+  if r == self.pid then
+    self.exited = true
+    if WIFEXITED(st) then
+      self.exit_code = (@uint32)(WEXITSTATUS(st))
+    elseif WIFSIGNALED(st) then
+      self.exit_code = (@uint32)(128 + WTERMSIG(st))
+    else
+      self.exit_code = 1
+    end
+  elseif r < 0 and errno ~= EINTR then
+    self.exited = true -- no such child (already reaped): nothing more to wait for
+    self.exit_code = 1
+  end
+  return self.exited
+end
+
+function ProcPipe:close(): void
+  if not self.alive then return end
+  if not self.exited and self.pid > 0 then
+    kill(-self.pid, SIGKILL) -- the process group setsid() gave it
+    kill(self.pid, SIGKILL)
+    local st: cint = 0
+    waitpid(self.pid, &st, 0) -- reap it here: nothing else will
+  end
+  if self.in_fd >= 0 then c_close(self.in_fd) end
+  if self.out_fd >= 0 then c_close(self.out_fd) end
+  $self = {}
+  self.in_fd, self.out_fd, self.pid = -1, -1, -1
+end
+
+## end

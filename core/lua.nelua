@@ -24,10 +24,15 @@ local function lua_open_standard_libraries(L: *lua_State): void <cimport 'luaL_o
 global function lua_close(L: *lua_State): void <cimport, nodecl> end
 global function luaL_loadfilex(L: *lua_State, filename: cstring, mode: cstring): cint <cimport, nodecl> end
 global function luaL_loadstring(L: *lua_State, s: cstring): cint <cimport, nodecl> end
+-- a chunk from memory, for a file the core read itself (on Windows the CRT's
+-- own open is ANSI, so a path the active code page cannot spell has to be read
+-- through the wide API first: core/sys/winpath.nelua)
+global function luaL_loadbufferx(L: *lua_State, buf: cstring, size: usize, name: cstring, mode: cstring): cint <cimport, nodecl> end
 global function lua_pcallk(L: *lua_State, nargs: cint, nresults: cint, errfunc: cint, ctx: isize, k: pointer): cint <cimport, nodecl> end
 global function lua_gettop(L: *lua_State): cint <cimport, nodecl> end
 global function lua_settop(L: *lua_State, idx: cint): void <cimport, nodecl> end
 global function lua_type(L: *lua_State, idx: cint): cint <cimport, nodecl> end
+global function lua_gettable(L: *lua_State, idx: cint): cint <cimport, nodecl> end
 global function lua_getfield(L: *lua_State, idx: cint, k: cstring): cint <cimport, nodecl> end
 global function lua_setfield(L: *lua_State, idx: cint, k: cstring): void <cimport, nodecl> end
 global function lua_getglobal(L: *lua_State, name: cstring): cint <cimport, nodecl> end

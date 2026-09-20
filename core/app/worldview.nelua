@@ -5,9 +5,17 @@
 -- double-click camera, occlusion by the scene (the depth test, or the
 -- character cut-out when that is unavailable) and derez in combat.
 require 'core.app.dropdown'
+require 'core.app.remotewin'
+require 'core.app.panels'
 require 'core.app.lights'
 require 'core.app.occluders'
+require 'core.app.rain'
+require 'core.app.deskprops'
+require 'core.app.reactions'
+require 'core.app.resize'
+require 'core.app.cursor'
 require 'core.depthpass'
+require 'core.tooltip'
 
 -- World panels ------------------------------------------------------------------
 -- The camera DirH that looks along (dx, dz): DirH is calibrated against the
@@ -114,7 +122,7 @@ global function reap_exited(now: float64): void
   local i: integer = #host.sessions - 1
   while i >= 0 do
     local s = host.sessions[i]
-    if s.process_exited then
+    if s.process_exited and not s.assistant and not s.capture then -- /term ask keeps its answer on screen; /ask reads its own
       if s.exited_at == 0 then
         s.exited_at = now
       elseif now - s.exited_at > 0.4 and s ~= host.popup_session and not s.leaving then
@@ -144,6 +152,7 @@ global function save_world_state(): void
   layout_push(&entries, &host.world, 'world')
   policy_world_save(&entries)
   entries:destroy()
+  remotewin_save_state() -- window panels, by their window keys
 end
 
 -- World screens nobody can see stop streaming after a moment (unless marked
@@ -244,6 +253,23 @@ local function walk_tick(now: float64): void
   if host.walk.id == 0 then logf(LOG_INFO, 'walk: %s', WALK_ENDS[host.walk.ended]) end
 end
 
+-- A panel focused from the keyboard (IPC panel.focus) that should get the
+-- single click's camera turn and walk-up too: done when draw_world next
+-- places it, and only while it still has the keyboard. 0 = none.
+global world_fly_id: integer = 0
+
+-- The camera turn toward a panel placed at (px, pz), as a single click turns it.
+local function turn_camera_to(cam: *GuCamera, pc: *GuObject, px: float32, pz: float32): void
+  local ch: float32, cv: float32, cd: float32, cmin: float32 = 0, 0, 0, 0
+  if host.world_full_id == 0 and host.api.get_camera_state ~= nilptr and host.api.set_camera_state ~= nilptr
+     and host.api.get_camera_state(&ch, &cv, &cd, &cmin) ~= 0 then
+    host.cam_target_h = camera_heading_to(cam, ch, px - pc.x, pz - pc.z)
+    host.cam_target_v = cv
+    host.cam_target_d = cd
+    host.cam_active = true
+  end
+end
+
 -- Presenting the focused panel ----------------------------------------------------
 -- Eases toward the presented pose while the panel has focus and back after;
 -- walkable panels float toward where the character will stand, others toward
@@ -251,7 +277,10 @@ end
 local function present_panel(s: *Session, pl: *WorldPlacement, cam: *GuCamera, occ: *WorldOccluder, pc: *GuObject, wdt: float32, full_this: boolean): void
   local tn = &host.world_tuning
   local target: float32 = (tn.present and host.world_focus == s.id and not full_this) and 1 or 0
-  s.present_t, s.present_v = world_ease(s.present_t, s.present_v, target, wdt, tn.present_ease)
+  -- held still while its edges are dragged: the grabbed edge must stay under the cursor
+  if host.world_drag_id ~= s.id then
+    s.present_t, s.present_v = world_ease(s.present_t, s.present_v, target, wdt, tn.present_ease)
+  end
   if s.present_t <= 0.0001 then return end
   local cok, cx, cy, cz = world_camera_position(cam)
   if not cok then return end
@@ -291,7 +320,7 @@ global function release_look_at(): void
 end
 
 -- Let go of what the core makes the game show or do: panel lights, shadow
--- boards, the character animation, the walk and the head aim. gu_shutdown,
+-- boards, the desk scene's furniture, the character animation, the walk and the head aim. gu_shutdown,
 -- /term reload and the kill switch all do this.
 global function teardown_effects(): void
   lights_destroy_all()
@@ -299,6 +328,8 @@ global function teardown_effects(): void
   local anim_err = policy_anim_toggle(false)
   anim_err:destroy()
   host.anim_out = false
+  desk_props_teardown() -- after the toggle: Lua has let the desk scene go
+  reactions_reset()
   release_walk() -- stop steering before the hook can call a core that is gone
   release_look_at()
 end
@@ -324,7 +355,27 @@ end
 -- Alt + left-drag carries a panel along the cursor ray; world_drag_step (in
 -- core/world.nelua) runs the gesture, lua/world.lua drop() pins it on release.
 
+-- Screen pixels a press on a pet's title strip must travel before it counts as
+-- a drag onto another pet instead of a click that focuses the panel.
+local ORDER_DRAG_THRESHOLD: float32 <comptime> = 6
+
 -- Alt, Shift, Ctrl as held (raw on Windows: the game may have the keyboard).
+-- The pin <-> pet button's icon in its 26 px square at (x, y): on a pet a
+-- push pin (click: pin it where it floats), on a pin a paw (click: a pet).
+local function draw_pet_icon(dl: *ImDrawList, x: float32, y: float32, pet: boolean, ink: uint32): void
+  if pet then
+    imgui.DrawListAddRectFilled(dl, vec2(x + 9, y + 5), vec2(x + 17, y + 12), ink, 3.5, 0)   -- head
+    imgui.DrawListAddLine(dl, vec2(x + 7, y + 13), vec2(x + 19, y + 13), ink, 2.0)           -- collar
+    imgui.DrawListAddLine(dl, vec2(x + 13, y + 13), vec2(x + 13, y + 22), ink, 1.6)          -- needle
+  else
+    imgui.DrawListAddRectFilled(dl, vec2(x + 8, y + 13), vec2(x + 18, y + 21), ink, 4, 0)    -- pad
+    imgui.DrawListAddRectFilled(dl, vec2(x + 4.5, y + 9), vec2(x + 8, y + 12.5), ink, 1.8, 0) -- toes
+    imgui.DrawListAddRectFilled(dl, vec2(x + 9, y + 5.5), vec2(x + 12.5, y + 9.5), ink, 1.8, 0)
+    imgui.DrawListAddRectFilled(dl, vec2(x + 13.5, y + 5.5), vec2(x + 17, y + 9.5), ink, 1.8, 0)
+    imgui.DrawListAddRectFilled(dl, vec2(x + 18, y + 9), vec2(x + 21.5, y + 12.5), ink, 1.8, 0)
+  end
+end
+
 local function drag_mods(): (boolean, boolean, boolean)
   ## if ccinfo.is_windows then
     return (GetAsyncKeyState(0x12) & 0x8000) ~= 0, (GetAsyncKeyState(0x10) & 0x8000) ~= 0, (GetAsyncKeyState(0x11) & 0x8000) ~= 0
@@ -345,7 +396,7 @@ end
 -- The grip on a panel under Alt (or being carried), in panel pixels: an outline
 -- in short segments so it bends with a curved panel, and a crosshair where it is held.
 local function draw_drag_grip(dl: *ImDrawList, o: ImVec2, w: float32, h: float32, u: float32, v: float32): void
-  local col, shade = im_col32(120, 220, 255, 240), im_col32(0, 20, 30, 160)
+  local col, shade = chrome_col(ChromeColor.Accent2, 240), im_col32(0, 20, 30, 160)
   local SEG <comptime> = 24
   for pass = 0, 1 do
     local c, t = pass == 0 and shade or col, (@float32)(pass == 0 and 12 or 6)
@@ -366,14 +417,48 @@ local function draw_drop_ghost(dl: *ImDrawList, cam: *GuCamera, vp: ImVec2, pl: 
   local b = world_basis(pl)
   local q: [4]ImVec2
   if not world_corners(cam, &b, &q) then return end
-  local col = fitted and im_col32(140, 240, 150, 240) or im_col32(120, 220, 255, 240)
-  local fill = fitted and im_col32(140, 240, 150, 40) or im_col32(120, 220, 255, 32)
+  local col = fitted and chrome_col(ChromeColor.Ok, 240) or chrome_col(ChromeColor.Accent2, 240)
+  local fill = fitted and chrome_col(ChromeColor.Ok, 40) or chrome_col(ChromeColor.Accent2, 32)
   for i = 0, < 4 do q[i] = vec2(q[i].x + vp.x, q[i].y + vp.y) end
   imgui.DrawListAddTriangleFilled(dl, q[0], q[1], q[2], fill)
   imgui.DrawListAddTriangleFilled(dl, q[0], q[2], q[3], fill)
   for i = 0, < 4 do imgui.DrawListAddLine(dl, q[i], q[(i + 1) % 4], col, 2.5) end
   local ok, sx, sy = world_project(cam, s.x, s.y, s.z)
   if ok then draw_crosshair(dl, sx + vp.x, sy + vp.y, 12, col, 2) end
+end
+
+-- Docking a carried panel to the screen (lua/world.lua `hud`): where it would
+-- dock if let go now, and the screen pixels per panel pixel it keeps.
+local function hud_dock_at(cam: *GuCamera, pose: WorldPlacement, ctrl: boolean): (WorldDock, float32)
+  local tn = &host.world_tuning
+  local none: WorldDock
+  if not tn.hud_dock then return none, 1 end
+  local vok, v = world_view(cam)
+  if not vok then return none, 1 end
+  local ok, fx, fy, scale = world_hud_spot(&v, pose.x, pose.y, pose.z, pose.ppm)
+  if not ok then return none, 1 end
+  local vp = imgui.GetMainViewport().Pos
+  local mouse: ImVec2
+  imgui.GetMousePos(&mouse)
+  local px, py = mouse.x - vp.x, mouse.y - vp.y
+  return world_hud_dock(cam.width, cam.height, px, py, px - fx * cam.width, py - fy * cam.height,
+    pose.width * scale * 0.5, pose.height * scale * 0.5, tn.hud_edge, tn.hud_margin, ctrl), scale
+end
+
+-- The dock preview: a soft glow along the sides it docks to, and its outline there.
+local function draw_dock_preview(dl: *ImDrawList, cam: *GuCamera, vp: ImVec2, dock: *WorldDock, hw: float32, hh: float32): void
+  local col = chrome_col(ChromeColor.Accent2, 200)
+  for gi = 0, < 4 do
+    local g = (@float32)(6 + gi * 7)
+    local glow = chrome_col(ChromeColor.Accent2, (@uint8)(46 - gi * 10))
+    if dock.left then imgui.DrawListAddRectFilled(dl, vp, vec2(vp.x + g, vp.y + cam.height), glow, 0, 0) end
+    if dock.right then imgui.DrawListAddRectFilled(dl, vec2(vp.x + cam.width - g, vp.y), vec2(vp.x + cam.width, vp.y + cam.height), glow, 0, 0) end
+    if dock.top then imgui.DrawListAddRectFilled(dl, vp, vec2(vp.x + cam.width, vp.y + g), glow, 0, 0) end
+    if dock.bottom then imgui.DrawListAddRectFilled(dl, vec2(vp.x, vp.y + cam.height - g), vec2(vp.x + cam.width, vp.y + cam.height), glow, 0, 0) end
+  end
+  local cx, cy = vp.x + dock.x * cam.width, vp.y + dock.y * cam.height
+  imgui.DrawListAddRectFilled(dl, vec2(cx - hw, cy - hh), vec2(cx + hw, cy + hh), chrome_col(ChromeColor.Accent2, 24), 6, 0)
+  imgui.DrawListAddRect(dl, vec2(cx - hw, cy - hh), vec2(cx + hw, cy + hh), col, 6, 0, 2.0)
 end
 
 -- After the panels: advance the gesture, show where a snap lands, pin on release.
@@ -391,6 +476,24 @@ local function drag_tick(dl: *ImDrawList, cam: *GuCamera, vp: ImVec2, inp: World
   if not st.dragging and not st.dropped then return end
   local pose = carried
   local fit_w: float32, fit_h: float32 = 0, 0
+  -- at a side of the screen (or with Ctrl, no Shift): docks to the screen instead
+  if not st.snap then
+    local dock, scale = hud_dock_at(cam, carried, inp.ctrl)
+    if dock.ok and st.dragging then
+      draw_dock_preview(dl, cam, vp, &dock, math.min(carried.width * scale * 0.5, cam.width * 0.5 - tn.hud_margin),
+        math.min(carried.height * scale * 0.5, cam.height * 0.5 - tn.hud_margin))
+    elseif dock.ok then
+      local err = policy_world_dock(st.id, dock.x, dock.y, scale)
+      if #err > 0 then
+        logf(LOG_WARN, 'session %d: dock failed: %s', st.id, err)
+      else
+        logf(LOG_INFO, 'session %d: docked to the screen at (%.3f, %.3f), %.2f px per px', st.id, dock.x, dock.y, scale)
+        save_world_state()
+      end
+      err:destroy()
+      return
+    end
+  end
   if st.snap and ray_ok and host.api.raycast ~= nilptr then
     local snap = world_snap(host.api.raycast, ox, oy, oz, dx, dy, dz, tn.drag_reach, tn.drag_probe)
     if snap.ok then
@@ -468,6 +571,186 @@ local function camera_tick(wdt: float32): void
   end
 end
 
+-- World panel operations: the title buttons, /term pin and IPC (lua/ipc.lua) --------------
+
+-- A world panel (terminal or window) by id, or nilptr.
+global function world_panel(id: integer): *Session
+  if id == 0 then return nilptr end
+  for i = 0, < #host.world do
+    if host.world[i].id == id then return host.world[i] end
+  end
+  return nilptr
+end
+
+-- Pin <-> pet (lua/world.lua `toggle`): a pet becomes a pin at the pose it
+-- was last shown at (presented included), anything else a pet. '' or why
+-- not (owned either way).
+global function world_toggle_pet(s: *Session): string
+  local sb: stringbuilder
+  sb:write('toggle')
+  if s.posed then sb:writef(' %.5f %.5f %.5f %.6f %.6f', s.pose_x, s.pose_y, s.pose_z, s.pose_yaw, s.pose_pitch) end
+  local args = sb:promote()
+  local err = policy_world_command(s.id, args)
+  args:destroy()
+  if #err == 0 and host.walk.id == s.id then end_walk(WORLD_WALK_CANCELLED) end -- it moves or stays: walking there means nothing now
+  return err
+end
+
+-- Hide or show world panel `s` (lua/world.lua's `hidden`). Hidden it is not
+-- drawn, loses the keyboard and full screen, and sleeps at once as an unseen
+-- panel does after a while: a window stops acknowledging frames (the agent
+-- stops sending), a terminal detaches (not while a full-screen program runs
+-- in it: a replay would lose its modes). Shown again, it wakes when next drawn.
+-- '' or why not (owned).
+global function world_panel_hide(s: *Session, hidden: boolean): string
+  local err = policy_world_command(s.id, hidden and 'hide' or 'hide off')
+  if #err > 0 or not hidden then return err end
+  if host.world_focus == s.id then host.world_focus = 0 end
+  if host.world_full_id == s.id then host.world_full_id = 0 end
+  if host.world_drag_id == s.id then host.world_drag_id = 0 end
+  if host.drag.id == s.id then host.drag.id = 0 end
+  if host.order_drag.id == s.id then host.order_drag = {} end
+  if host.walk.id == s.id then end_walk(WORLD_WALK_CANCELLED) end
+  s.posed = false
+  if s.kind == TransportKind.Window or s.view.term == nilptr or not ghostty_terminal_mode_enabled(s.view.term, 1049, false) then
+    s:sleep()
+  end
+  return err
+end
+
+-- Give world panel `s` the keyboard as a click on it would (focused, and no
+-- ImGui window keeps focus beside it), without the click's walk-up or camera
+-- turn. A pet still turns your character to face it once, as on a click.
+-- '' or why not (owned).
+global function world_panel_focus(s: *Session): string
+  if s.leaving then return string.copy('the panel is closing') end
+  set_world_visible(true)
+  host.world_focus = s.id
+  host.last_click_id = 0
+  if imgui.SetWindowFocusNil ~= nilptr then imgui.SetWindowFocusNil() end
+  return string{}
+end
+
+-- A new world terminal of `profile` ('' the default; a number: its place in
+-- CONFIG.profiles counting from 1; else its name), a pet or at `pin`'s place
+-- (as /term pin takes it), as /term pet opens one. Its id, or 0 and why (owned).
+global function world_terminal_new(profile: string, pin: string): (integer, string)
+  if not player_loaded() then return 0, string.copy('no player (log in first)') end
+  local idx: integer = policy.default_profile - 1
+  if #profile > 0 then
+    local n: integer = 0
+    local digits = #profile <= 6
+    for i = 0, < #profile do
+      local c = profile.data[i]
+      if c < '0'_b or c > '9'_b then digits = false break end
+      n = n * 10 + (c - '0'_b)
+    end
+    idx = -1
+    if digits then
+      if n >= 1 and n <= #policy.profiles then idx = n - 1 end
+    else
+      for i = 0, < #policy.profiles do
+        if policy.profiles[i].name == profile then idx = i break end
+      end
+    end
+    if idx < 0 then
+      local sb: stringbuilder
+      sb:write('no such profile: ', profile)
+      return 0, sb:promote()
+    end
+  end
+  local s = session_new(idx, 80, 24)
+  if s == nilptr then return 0, string.copy('no terminal could be opened') end
+  if #pin == 0 then
+    if not make_pet(s) then
+      session_remove(s)
+      return 0, string.copy('the pet could not be placed')
+    end
+  else
+    local err = policy_world_command(s.id, pin)
+    if #err > 0 then
+      session_remove(s)
+      local sb: stringbuilder
+      sb:write('pin: ', err)
+      err:destroy()
+      return 0, sb:promote()
+    end
+    host.world:push(s)
+    set_world_visible(true)
+    logf(LOG_INFO, 'session %d: pinned in world (%s)', s.id, pin)
+  end
+  return s.id, string{}
+end
+
+-- Other plugins' overlays stay above the world panels. Umbra draws its
+-- toolbar into the background layer, the one layer below every window, which
+-- is where the panels go too; a plugin that draws there earlier in the frame
+-- would be painted over. So everything Ghostty draws into that layer (panels,
+-- the bell) is moved in front of what was already there: the world first,
+-- the toolbars and markers of the others on top. Windows (our dropdown and
+-- popups among them) are unaffected. CONFIG.world.under_ui = false turns it
+-- off. -> the first command of ours, or -1 when there is nothing to go under.
+global function world_under_ui_begin(): integer
+  if not host.world_tuning.under_ui or imgui.DrawListAddCallback == nilptr or imgui.GetBackgroundDrawList == nilptr then return -1 end
+  local dl = imgui.GetBackgroundDrawList()
+  if dl == nilptr then return -1 end
+  local drawn = false
+  for i = 0, < dl.CmdBuffer.Size do
+    if dl.CmdBuffer.Data[i].ElemCount > 0 then drawn = true break end
+  end
+  if not drawn then return -1 end
+  -- a render-state reset is a command of its own that ImGui never merges
+  -- into, so what we draw next starts a command of its own too
+  imgui.DrawListAddCallback(dl, (@pointer)(IMDRAW_CALLBACK_RESET), nilptr)
+  return dl.CmdBuffer.Size - 2
+end
+
+global function world_under_ui_end(base: integer): void
+  if base < 0 then return end
+  local dl = imgui.GetBackgroundDrawList()
+  if dl == nilptr or base >= dl.CmdBuffer.Size then return end
+  world_cmds_to_front(&dl.CmdBuffer, base)
+  -- whoever draws next must not extend the command now last: its indices
+  -- are no longer the last ones in the buffer
+  imgui.DrawListAddCallback(dl, (@pointer)(IMDRAW_CALLBACK_RESET), nilptr)
+end
+
+-- The game's HUD this frame (CONFIG.world.under_hud, core/hudmask.nelua):
+-- panels are cut where it is shown. Empty with an older shim or when off.
+local hud_rects: [HUDMASK_MAX]GuHudRect
+
+local function read_hud_mask(vp: ImVec2, cam: *GuCamera): void
+  host.hud_mask.n = 0
+  if not host.world_tuning.under_hud or host.api.hud_rects == nilptr then return end
+  local n = host.api.hud_rects((@*[0]GuHudRect)(&hud_rects), HUDMASK_MAX)
+  if n <= 0 then return end
+  local ignore: string = (@cstring)(&host.world_tuning.under_hud_ignore[0])
+  hudmask_set(&host.hud_mask, (@*[0]GuHudRect)(&hud_rects), math.min(n, HUDMASK_MAX), ignore, vp.x, vp.y, cam.width, cam.height)
+end
+
+-- Resizing by the edges (core/app/resize.nelua): host.world_drag_id is the
+-- panel, `resizing` the gesture.
+local resizing: WorldResize
+
+local function end_resize(): void
+  if host.world_drag_id == 0 then return end
+  logf(LOG_INFO, 'session %d: resized', host.world_drag_id)
+  host.world_drag_id = 0
+  resizing.id = 0
+  save_world_state()
+end
+
+-- A window panel keeps its window's shape.
+local function panel_aspect(s: *Session, w: float32, h: float32): float32
+  if s.kind ~= TransportKind.Window then return 0 end
+  local rw = remotewin_of(s)
+  if rw ~= nilptr then
+    local _, _, ww, wh = remotewin_window_box(rw)
+    if ww > 0 and wh > 0 then return (@float32)(ww) / (@float32)(wh) end
+  end
+  return h > 0 and w / h or 0
+end
+
 global function draw_world(now: float64): void
   defer lights_sync() end -- panel lights: however this frame ends
   defer occluders_sync(&host.world_tuning) end -- and shadow boards
@@ -479,12 +762,20 @@ global function draw_world(now: float64): void
   local wdt = (@float32)(math.clamp(now - host.world_last_time, 0, 0.1))
   host.world_last_time = now
   camera_tick(wdt)
+  -- a resize ends when the button comes up, wherever that is (off the panel,
+  -- over a window) or when its panel is gone; until then the mouse is ours,
+  -- so neither the camera nor the character reacts to the drag
+  if host.world_drag_id ~= 0 and (not host.lmb_down or world_panel(host.world_drag_id) == nilptr or host.world_rez <= 0.001) then
+    end_resize()
+  end
+  if host.world_drag_id ~= 0 then imgui.SetNextFrameWantCaptureMouse(true) end
   if #host.world == 0 then return end
   if host.api.get_camera == nilptr then world_diag('shim has no camera callback') return end
   local cam: GuCamera
   if host.api.get_camera(&cam) == 0 or cam.width < 1 or cam.height < 1 then world_diag('no camera') return end
   local vp = imgui.GetMainViewport().Pos
   local dl = imgui.GetBackgroundDrawList()
+  read_hud_mask(vp, &cam)
   local mouse: ImVec2
   imgui.GetMousePos(&mouse)
   local rel = vec2(mouse.x - vp.x, mouse.y - vp.y)
@@ -500,6 +791,7 @@ global function draw_world(now: float64): void
   if host.world_rez <= 0.001 then
     host.world_focus = 0
     host.drag.id = 0
+    host.order_drag = {}
     return
   end
 
@@ -538,6 +830,18 @@ global function draw_world(now: float64): void
     over_window = over_window, wheel = imgui.GetIO().MouseWheel,
     wheel_step = tuning.drag_wheel_step, min_distance = tuning.drag_min_distance, max_distance = tuning.drag_max_distance,
   }
+  -- dragging a pet by its title onto another swaps their places in the pet
+  -- order; a press that goes nowhere stays a click (core/world.nelua). How
+  -- many pets are on screen is last frame's count: placements are asked for
+  -- once a frame, inside the loop below.
+  local order_in: WorldOrderDragInput = {
+    enabled = host.world_pets > 1, alt = alt,
+    lmb_down = host.lmb_down, lmb_pressed = host.lmb_pressed, rmb_down = host.rmb_down,
+    over_window = over_window, mx = rel.x, my = rel.y, threshold = ORDER_DRAG_THRESHOLD,
+  }
+  local pets_now = 0
+  -- while a pet is held by its title the press is the gesture's, not the panels'
+  if host.order_drag.id ~= 0 then click = false end
   local carried_pl: WorldPlacement
   local clicked = click and not over_window
   local clicked_any = false
@@ -567,30 +871,32 @@ global function draw_world(now: float64): void
       carried_pl = pl
     end
     light_panel(s.id, ok and not s.sleeping, &pl, prez * (1 - ft))
-    -- a double-clicked panel flies to a centred rectangle covering full_screen of the view
-    local fsz = host.world_tuning.full_screen
-    local fw = math.max(cam.width * fsz, 320)
-    local fh = math.max(cam.height * fsz, 200)
-    if fsz >= 0.999 then fw, fh = cam.width - 2 * FULL_MARGIN, cam.height - 2 * FULL_MARGIN end
-    local full_at = vec2(vp.x + (cam.width - fw) * 0.5, vp.y + (cam.height - fh) * 0.5)
+    -- a double-clicked panel flies to a centred rectangle of full_screen of the
+    -- view, keeping its shape: its pixels (and the terminal grid laid out in
+    -- them) stay as they are all the way, only shown at another size (core/world.nelua)
+    local flat = world_full_rect(vp, cam.width, cam.height, host.world_tuning.full_screen, FULL_MARGIN, pl.width, pl.height)
+    -- pulled off the flat UI: flies out of the flat window's rectangle (core/app/panelkit.nelua)
+    if s.kind == TransportKind.Panel then ft, flat, full_this = panel_flight(s.id, ft, flat, full_this, pl.width, pl.height) end
     -- where it was placed (walk target), then the presented pose on top
     local placed_x, placed_z = pl.x, pl.z
+    if world_fly_id == s.id then
+      world_fly_id = 0
+      if ok and host.world_focus == s.id and not pl.hud then
+        turn_camera_to(&cam, &pc, placed_x, placed_z)
+        start_walk(s.id, placed_x, placed_z, &pc, now)
+      end
+    end
     if ok then
       if host.walk.id == s.id then host.walk.tx, host.walk.tz = placed_x, placed_z end
-      if not carried then present_panel(s, &pl, &cam, &occ, &pc, wdt, full_this) end
+      if not carried and not pl.hud then present_panel(s, &pl, &cam, &occ, &pc, wdt, full_this) end
     end
+    -- the pose it is shown at: pin <-> pet turns it into a pin right there
+    s.posed = ok and not carried
+    if s.posed then s.pose_x, s.pose_y, s.pose_z, s.pose_yaw, s.pose_pitch = pl.x, pl.y, pl.z, pl.yaw, pl.pitch end
     -- the shadow board follows the pose the panel is drawn at (carried or
     -- presented); full screen leaves the world, so the board goes
-    occluder_panel(s.id, ok and not s.sleeping and prez * (1 - ft) > 0, &pl, &host.world_tuning)
-    -- mid-flight the terminal keeps the grid of its world size, so the shell is
-    -- resized once when the flight ends instead of on every frame of it
-    local grid_w, grid_h = pl.width, pl.height
-    if ok and full_this and ft > 0 then
-      local nw, nh = pl.width + (fw - pl.width) * ft, pl.height + (fh - pl.height) * ft
-      pl.ppm = pl.ppm * nw / pl.width -- keep the world-space size while the pixels grow
-      pl.width, pl.height = nw, nh
-      pl.curve = pl.curve * (1 - ft)
-    end
+    occluder_panel(s.id, ok and not pl.hud and not s.sleeping and prez * (1 - ft) > 0, &pl, &host.world_tuning)
+    if ok and full_this then pl = world_flight_pose(pl, ft) end
     if ok then
       local b = world_basis(pl)
       local q: [4]ImVec2
@@ -629,30 +935,66 @@ global function draw_world(now: float64): void
         local uok, hovered, mu, mv = world_hit(&cam, &b, rel)
         if ft >= 0.5 then
           uok = true
-          mu, mv = mouse.x - full_at.x, mouse.y - full_at.y
+          mu, mv = world_flat_uv(flat, mouse)
           hovered = mu >= 0 and mv >= 0 and mu < pl.width and mv < pl.height
         end
-        -- the panel an Alt press would pick up, and how far out along the ray it is held
-        if hovered and ft <= 0 and prez > 0.9 and host.world_visible and not over_window and ray_ok then
+        -- resize grips on all four edges and the corners, sized in screen pixels
+        local grip = 0
+        if uok and ft <= 0 then grip = world_grip_at(&cam, &b, pl.width, pl.height, mu, mv) end
+        -- the panel an Alt press would pick up (its grips too), and how far out along the ray it is held
+        if (hovered or grip ~= 0) and ft <= 0 and prez > 0.9 and host.world_visible and not over_window and ray_ok then
           local gx, gy, gz = world_point(&b, mu, mv)
           drag_in.hover_id, drag_in.hover_u, drag_in.hover_v = s.id, mu, mv
           drag_in.hover_dist = math.sqrt((gx - ray_ox) ^ 2 + (gy - ray_oy) ^ 2 + (gz - ray_oz) ^ 2)
         end
-        -- resize grips: right edge, bottom edge, bottom-right corner (panel pixels)
-        local GRIP: float32 <comptime> = 28
-        local grip = 0
-        if uok and mu > -GRIP and mv > -GRIP and mu < pl.width + GRIP and mv < pl.height + GRIP then
-          if mu > pl.width - GRIP then grip = grip | 1 end
-          if mv > pl.height - GRIP then grip = grip | 2 end
-        end
+        -- and the pet a title drag would pick up or drop on
+        if pl.pet and not pl.hud then pets_now = pets_now + 1 end
         -- title buttons along the top-right edge
         local button = uok and world_title_button(pl.width, mu, mv) or WORLD_BUTTON_NONE
+        -- a pet's arrows on its edges (under the pointer only, not full screen)
+        if button == WORLD_BUTTON_NONE and uok and hovered and ft <= 0 and pl.pet then
+          button = world_order_button(pl.width, pl.height, mu, mv, pl.order_prev, pl.order_next)
+        end
+        if hovered and uok and pl.pet and not pl.hud and ft <= 0 and prez > 0.9 and host.world_visible and not over_window then
+          order_in.hover_id = s.id
+          if button == WORLD_BUTTON_NONE and grip == 0 and world_title_strip(pl.width, mu, mv) then order_in.on_title = true end
+        end
+        if host.order_drag.id == s.id then order_in.shown = ok and pl.pet and ft <= 0 end
+        local on_order = button == WORLD_BUTTON_ORDER_PREV or button == WORLD_BUTTON_ORDER_NEXT
         local on_close = button == WORLD_BUTTON_CLOSE
         local on_full = button == WORLD_BUTTON_FULL
         local on_popin = button == WORLD_BUTTON_POPIN
+        local on_pet = button == WORLD_BUTTON_PET
         local on_occluded = button == WORLD_BUTTON_OCCLUDED
         if button ~= WORLD_BUTTON_NONE then grip = 0 end
-        if ft > 0 then grip = 0 end -- no resizing while full screen
+        if host.world_drag_id ~= 0 and host.world_drag_id ~= s.id then grip = 0 end -- one resize at a time
+        local resizing_this = host.world_drag_id == s.id
+        if resizing_this then grip = resizing.mode end
+        local grip_live = grip ~= 0 and not over_window and prez > 0.9 and host.world_visible and host.drag.id == 0
+        -- tooltips: hovered in world space, shown at the pointer like any other
+        do
+          -- the title strip of a pet that has somewhere to go: the drag gesture
+          local on_title_tip = order_in.on_title and order_in.hover_id == s.id and host.world_pets > 1
+            and host.order_drag.id == 0
+          local tip_on = not over_window and prez > 0.9 and host.world_visible
+            and (button ~= WORLD_BUTTON_NONE or (grip ~= 0 and not resizing_this) or on_title_tip)
+          local tip_id = (@uint64)(s.id) * 16 + (@uint64)(button == WORLD_BUTTON_NONE and (on_title_tip and 14 or 15) or button) + 0x3a000000_u64
+          if tooltip_due(tip_id, tip_on, now) then
+            local key: string = 'world.resize'
+            -- on_title is only set where there is no grip, so this is the plain strip
+            if on_title_tip and button == WORLD_BUTTON_NONE then key = 'world.order.drag' end
+            if on_close then key = 'world.close'
+            elseif on_full then key = ft > 0.5 and 'world.full.off' or 'world.full'
+            elseif on_popin then key = 'world.popin'
+            elseif on_pet then key = pl.pet and 'world.pin' or 'world.pet'
+            elseif on_occluded then key = s.run_occluded and 'world.sleep.off' or 'world.sleep.on'
+            elseif button == WORLD_BUTTON_ORDER_PREV then key = 'world.order.prev'
+            elseif button == WORLD_BUTTON_ORDER_NEXT then key = 'world.order.next' end
+            local text = policy_tooltip(key, '')
+            tooltip_show(text, nilptr, 0)
+            text:destroy()
+          end
+        end
         -- text selection on the grid (drawn 16 px in); grips and buttons win
         local tx, ty = mu - 16, mv - 16
         local on_grid = hovered and grip == 0 and button == WORLD_BUTTON_NONE and not over_window
@@ -671,7 +1013,14 @@ global function draw_world(now: float64): void
            and host.world_visible and not host.lmb_down and not host.rmb_down then
           imgui.SetNextFrameWantCaptureMouse(true)
         end
+        -- a grip claims the mouse on any panel, so the press resizes instead of
+        -- turning the camera (the game's cursor stays: the edge glow is the feedback)
+        if grip_live and (resizing_this or (not host.lmb_down and not host.rmb_down)) then
+          imgui.SetNextFrameWantCaptureMouse(true)
+        end
+        if resizing_this then cursor_over_world = true end
         if (hovered or grip ~= 0) and not over_window and prez > 0.9 and host.world_visible then
+          cursor_over_world = true -- the game keeps its own cursor over a panel (core/app/cursor.nelua)
           if click then host.click_used = true end
           if click and on_close then
             host.world_close_id = s.id
@@ -679,14 +1028,21 @@ global function draw_world(now: float64): void
             host.world_full_toggle_id = s.id
           elseif click and on_popin then
             host.world_popin_id = s.id
+          elseif click and on_pet then
+            host.world_pet_toggle_id = s.id
           elseif click and on_occluded then
             host.world_occluded_toggle_id = s.id
+          elseif click and on_order then
+            host.world_order_id = s.id
+            host.world_order_next = button == WORLD_BUTTON_ORDER_NEXT
           end
-          if click and grip ~= 0 and host.world_focus == s.id then
+          -- a press on a grip resizes at once (and focuses); Alt + press stays the move gesture
+          if click and grip ~= 0 and host.world_drag_id == 0 then
             host.world_drag_id = s.id
             host.world_drag_mode = grip
-            host.world_drag_u0, host.world_drag_v0 = mu, mv
-            host.world_drag_w0, host.world_drag_h0 = pl.width, pl.height
+            world_resize_begin(&resizing, s.id, grip, pl.width, pl.height, mu, mv,
+              panel_aspect(s, pl.width, pl.height), not pl.pet and world_resize_anchored(s.id))
+            logf(LOG_INFO, 'session %d: resizing', s.id)
           end
           if clicked then
             host.world_focus = s.id
@@ -702,7 +1058,7 @@ global function draw_world(now: float64): void
                 end_walk(WORLD_WALK_CANCELLED)
                 host.world_full_toggle_id = s.id
                 local ch: float32, cv: float32, cd: float32, cmin: float32 = 0, 0, 0, 0
-                if host.api.get_camera_state ~= nilptr and host.api.set_camera_state ~= nilptr and host.world_full_id ~= s.id
+                if not pl.hud and host.api.get_camera_state ~= nilptr and host.api.set_camera_state ~= nilptr and host.world_full_id ~= s.id
                    and host.api.get_camera_state(&ch, &cv, &cd, &cmin) ~= 0 then
                   host.cam_target_h = camera_heading_to(&cam, ch, pl.x - pc.x, pl.z - pc.z)
                   host.cam_target_v = 0
@@ -716,7 +1072,7 @@ global function draw_world(now: float64): void
                 host.last_click_id = s.id
                 host.last_click_time = now
                 local ch: float32, cv: float32, cd: float32, cmin: float32 = 0, 0, 0, 0
-                if host.world_full_id == 0 and host.api.get_camera_state ~= nilptr and host.api.set_camera_state ~= nilptr
+                if host.world_full_id == 0 and not pl.hud and host.api.get_camera_state ~= nilptr and host.api.set_camera_state ~= nilptr
                    and host.api.get_camera_state(&ch, &cv, &cd, &cmin) ~= 0 then
                   host.cam_target_h = camera_heading_to(&cam, ch, pl.x - pc.x, pl.z - pc.z)
                   host.cam_target_v = cv
@@ -728,27 +1084,25 @@ global function draw_world(now: float64): void
             end
           end
         end
-        if host.world_drag_id == s.id then
-          imgui.SetNextFrameWantCaptureMouse(true) -- our own drag
-          if not host.lmb_down then
-            host.world_drag_id = 0
-          elseif uok then
-            -- panels are placed by their centre, so an edge moves half the size change
-            local nw, nh = host.world_drag_w0, host.world_drag_h0
-            if host.world_drag_mode & 1 ~= 0 then nw = host.world_drag_w0 + (mu - host.world_drag_u0) * 2 end
-            if host.world_drag_mode & 2 ~= 0 then nh = host.world_drag_h0 + (mv - host.world_drag_v0) * 2 end
-            policy_world_resize(s.id, nw, nh)
+        -- the grabbed edge goes back under the cursor, measured on the panel as
+        -- it is now (so a pet that drifts, or a clamp, corrects itself next frame)
+        if host.world_drag_id == s.id and host.lmb_down and uok and ft <= 0 then
+          local nw, nh, su, sv = world_resize_size(&resizing, pl.width, pl.height, mu, mv, shift)
+          if math.abs(nw - pl.width) > 0.01 or math.abs(nh - pl.height) > 0.01 then
+            world_resize_apply(s.id, nw, nh, resizing.aspect > 0 and not shift, su, sv, &b)
           end
         end
         local focused = host.world_focus == s.id
         -- the depth test goes in before the panel's first draw command (the glow
         -- included); off once the full-screen flight starts moving the vertices
         -- away from the surface the shader intersects
-        local depth_on = occlusion == WORLD_OCCLUSION_DEPTH and depthpass_panel_begin(dl, &b, ft > 0 and 0 or 1)
+        -- a HUD panel is always in front
+        local depth_on = not pl.hud and occlusion == WORLD_OCCLUSION_DEPTH and depthpass_panel_begin(dl, &b, ft > 0 and 0 or 1)
         local panel_occ: *WorldOccluder = nilptr
-        if occlusion ~= WORLD_OCCLUSION_OFF and not depth_on then panel_occ = &occ end
+        if occlusion ~= WORLD_OCCLUSION_OFF and not depth_on and not pl.hud then panel_occ = &occ end
         local first = dl.VtxBuffer.Size
         local first_cmd = dl.CmdBuffer.Size
+        local first_idx = dl.IdxBuffer.Size
         bell_panel_glow(dl, vp, &pl, s.id) -- the visual bell lifts the backlight below
         -- backlight: a soft glow around the panel when the world is dim
         if pl.backlight > 0.02 then
@@ -756,16 +1110,22 @@ global function draw_world(now: float64): void
             local pad = (@float32)(gi * 10)
             local ga = (@uint8)(math.clamp(pl.backlight * 34 / gi, 0, 255))
             imgui.DrawListAddRectFilled(dl, vec2(vp.x - pad, vp.y - pad), vec2(vp.x + pl.width + pad, vp.y + pl.height + pad),
-              im_col32(90, 150, 220, ga), pad + 8, 0)
+              chrome_col(ChromeColor.Glow, ga), pad + 8, 0)
           end
         end
         -- background as a grid: follows the curve, and gives the character
         -- cut-out enough vertices to follow its silhouette; backlight lifts it
-        local bgl = (@uint8)(10 + 26 * math.clamp(pl.backlight, 0, 1))
-        local bg_col = im_col32(bgl, (@uint8)(bgl + 3), (@uint8)(bgl + 8), (@uint8)(math.clamp(pl.opacity, 0, 1) * 255))
+        -- (the lift is taken as spaceghost's 10 + 26 * backlight always was, so it stays pixel for pixel)
+        local lift = (@integer)((@uint8)(10 + 26 * math.clamp(pl.backlight, 0, 1))) - 10
+        local panel = chrome_colors[(@integer)(ChromeColor.Panel)]
+        local bg_col = im_col32((@uint8)(math.min(((panel >> 16) & 0xFF) + lift, 255)),
+          (@uint8)(math.min(((panel >> 8) & 0xFF) + lift, 255)),
+          (@uint8)(math.min((panel & 0xFF) + lift, 255)), (@uint8)(math.clamp(pl.opacity, 0, 1) * 255))
         local STRIPS <comptime> = 24
         local ROWS <comptime> = 32
-        for k = 0, < STRIPS do
+        -- a remote window showing its picture is the panel itself: no slab behind it
+        local bare = s.kind == TransportKind.Window and remotewin_bare(s)
+        for k = 0, < (bare and 0 or STRIPS) do
           local x0 = vp.x + pl.width * k / STRIPS
           local x1 = vp.x + pl.width * (k + 1) / STRIPS
           for rr = 0, < ROWS do
@@ -774,18 +1134,24 @@ global function draw_world(now: float64): void
             imgui.DrawListAddRectFilled(dl, vec2(x0, y0), vec2(x1, y1), bg_col, 0, 0)
           end
         end
+        rain_panel_back(dl, vp, &pl, s.id, now, 1 - ft) -- the wiper at the back of the glass (core/app/rain.nelua)
         -- draw in panel pixels at the viewport origin, then bend onto the panel;
         -- font size 0 = the font's native size, the crispest after projection
         render_max_run_px = pl.width / STRIPS
         render_world = true
         host.drawing_world = true
         local content_first = dl.VtxBuffer.Size
-        if ft <= 0 or ft >= 1 then grid_w, grid_h = pl.width, pl.height end
         -- level of detail: text under 3 screen pixels a line is not drawn (the
         -- background, title and border still are)
         local cell_px = s.cell_h * (maxy - miny) / math.max(pl.height, 1)
-        if focused or ft > 0 or s.cell_h <= 0 or cell_px >= 3 then
-          draw_terminal(s, dl, vec2(vp.x + 16, vp.y + 16), grid_w - 32, grid_h - 32, policy.world_font_size, focused, false, 0, 0)
+        if s.kind == TransportKind.Window then -- a remote window's picture (core/app/remotewin.nelua)
+          local fu, fv = world_flat_uv(flat, mouse)
+          remotewin_projection(&cam, &b, rel, ft >= 0.5, vec2(fu, fv)) -- for its popups
+          remotewin_panel(s, dl, vp, pl.width, pl.height, focused, on_grid, mu, mv, click)
+        elseif s.kind == TransportKind.Panel then -- a flat window pulled into the world (core/app/panels.nelua)
+          panel_content(s, dl, vp, pl.width, pl.height, focused, on_grid, mu, mv, click)
+        elseif focused or ft > 0 or s.cell_h <= 0 or cell_px >= 3 then
+          draw_terminal(s, dl, vec2(vp.x + 16, vp.y + 16), pl.width - 32, pl.height - 32, policy.world_font_size, focused, false, 0, 0)
         else
           s:pump()
         end
@@ -793,36 +1159,76 @@ global function draw_world(now: float64): void
         host.drawing_world = false
         render_max_run_px = 0
         render_world = false
-        do -- title buttons: sleep unseen, pop-in, full screen, close (brighter when hovered)
-          local ink = im_col32(240, 230, 220, 255)
+        -- a bare window panel shows its buttons and grip only under the pointer
+        if not bare or hovered or grip ~= 0 or host.world_drag_id == s.id then -- title buttons: sleep unseen, pop-in, full screen, close (brighter when hovered)
+          local ink = chrome_col(ChromeColor.Ink, 255)
           local cy0 = vp.y + 4
           -- close ×
           local cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_CLOSE)
-          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_close and not over_window) and im_col32(190, 60, 50, 235) or im_col32(90, 40, 36, 180), 5, 0)
+          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_close and not over_window) and chrome_col(ChromeColor.Close, 235) or chrome_col(ChromeColor.CloseIdle, 180), 5, 0)
           imgui.DrawListAddLine(dl, vec2(cx0 + 7, cy0 + 7), vec2(cx0 + 19, cy0 + 19), ink, 2.5)
           imgui.DrawListAddLine(dl, vec2(cx0 + 19, cy0 + 7), vec2(cx0 + 7, cy0 + 19), ink, 2.5)
           -- full screen: a frame (filled corners when already full screen)
           cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_FULL)
-          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_full and not over_window) and im_col32(70, 110, 160, 235) or im_col32(40, 50, 70, 180), 5, 0)
+          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_full and not over_window) and chrome_col(ChromeColor.Full, 235) or chrome_col(ChromeColor.FullIdle, 180), 5, 0)
           imgui.DrawListAddRect(dl, vec2(cx0 + 6, cy0 + 7), vec2(cx0 + 20, cy0 + 19), ink, 2, 0, 2.0)
           if ft > 0.5 then imgui.DrawListAddRectFilled(dl, vec2(cx0 + 10, cy0 + 11), vec2(cx0 + 16, cy0 + 15), ink, 0, 0) end
           -- pop-in: arrow into a tab
           cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_POPIN)
-          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_popin and not over_window) and im_col32(120, 100, 60, 235) or im_col32(60, 52, 40, 180), 5, 0)
+          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_popin and not over_window) and chrome_col(ChromeColor.Popin, 235) or chrome_col(ChromeColor.PopinIdle, 180), 5, 0)
           imgui.DrawListAddLine(dl, vec2(cx0 + 6, cy0 + 8), vec2(cx0 + 20, cy0 + 8), ink, 2.0)
           imgui.DrawListAddLine(dl, vec2(cx0 + 13, cy0 + 12), vec2(cx0 + 13, cy0 + 21), ink, 2.0)
           imgui.DrawListAddTriangleFilled(dl, vec2(cx0 + 8, cy0 + 12), vec2(cx0 + 18, cy0 + 12), vec2(cx0 + 13, cy0 + 7), ink)
+          -- pin <-> pet: a pin on a pet (pin it here), a paw on a pin (make it a pet)
+          cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_PET)
+          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_pet and not over_window) and chrome_col(ChromeColor.Popin, 235) or chrome_col(ChromeColor.PopinIdle, 180), 5, 0)
+          draw_pet_icon(dl, cx0, cy0, pl.pet, ink)
           -- keep running when unseen: moon (sleeps) or play (keeps running)
           cx0 = vp.x + world_title_button_x(pl.width, WORLD_BUTTON_OCCLUDED)
-          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_occluded and not over_window) and im_col32(80, 90, 130, 235) or im_col32(44, 46, 66, 180), 5, 0)
+          imgui.DrawListAddRectFilled(dl, vec2(cx0, cy0), vec2(cx0 + 26, cy0 + 26), (on_occluded and not over_window) and chrome_col(ChromeColor.Sleep, 235) or chrome_col(ChromeColor.SleepIdle, 180), 5, 0)
           draw_occluded_icon(dl, cx0, cy0, s.run_occluded, ink)
+          imgui.DrawListAddTriangleFilled(dl, vec2(vp.x + pl.width - 22, vp.y + pl.height - 4),
+            vec2(vp.x + pl.width - 4, vp.y + pl.height - 22), vec2(vp.x + pl.width - 4, vp.y + pl.height - 4),
+            chrome_col(ChromeColor.Accent, (host.world_drag_id == s.id) and 255 or 150))
         end
-        imgui.DrawListAddTriangleFilled(dl, vec2(vp.x + pl.width - 22, vp.y + pl.height - 4),
-          vec2(vp.x + pl.width - 4, vp.y + pl.height - 22), vec2(vp.x + pl.width - 4, vp.y + pl.height - 4),
-          im_col32(200, 160, 90, (host.world_drag_id == s.id) and 255 or 150))
+        -- dragging a pet by its title: the one held gets an accent title band,
+        -- the one under the pointer a frame around it (drop here to swap)
+        if host.order_drag.id ~= 0 and host.order_drag.moved and pl.pet and ft <= 0 then
+          if host.order_drag.id == s.id then
+            imgui.SetNextFrameWantCaptureMouse(true) -- our own drag: the game keeps its camera
+            imgui.DrawListAddRectFilled(dl, vec2(vp.x, vp.y), vec2(vp.x + pl.width, vp.y + WORLD_BUTTON_PITCH),
+              chrome_col(ChromeColor.Accent, 90), 0, 0)
+          elseif host.order_drag.over == s.id then
+            imgui.DrawListAddRectFilled(dl, vec2(vp.x, vp.y), vec2(vp.x + pl.width, vp.y + pl.height),
+              chrome_col(ChromeColor.Accent, 40), 0, 0)
+            imgui.DrawListAddRect(dl, vec2(vp.x + 1, vp.y + 1), vec2(vp.x + pl.width - 1, vp.y + pl.height - 1),
+              chrome_col(ChromeColor.Accent, 235), 0, 0, 3)
+          end
+        end
+        -- a pet's arrows: swap places with the neighbour on that side
+        if hovered and pl.pet and ft <= 0 and not over_window and (pl.order_prev or pl.order_next) then
+          local ink = chrome_col(ChromeColor.Ink, 255)
+          local ay0 = vp.y + (pl.height - WORLD_ORDER_H) * 0.5
+          local ay1 = ay0 + WORLD_ORDER_H
+          local aym = ay0 + WORLD_ORDER_H * 0.5
+          if pl.order_prev then
+            local ax0 = vp.x + 2
+            local hot = button == WORLD_BUTTON_ORDER_PREV
+            imgui.DrawListAddRectFilled(dl, vec2(ax0, ay0), vec2(ax0 + WORLD_ORDER_W, ay1), hot and chrome_col(ChromeColor.Popin, 235) or chrome_col(ChromeColor.PopinIdle, 180), 6, 0)
+            imgui.DrawListAddTriangleFilled(dl, vec2(ax0 + 20, aym - 11), vec2(ax0 + 20, aym + 11), vec2(ax0 + 8, aym), ink)
+          end
+          if pl.order_next then
+            local ax0 = vp.x + pl.width - 2 - WORLD_ORDER_W
+            local hot = button == WORLD_BUTTON_ORDER_NEXT
+            imgui.DrawListAddRectFilled(dl, vec2(ax0, ay0), vec2(ax0 + WORLD_ORDER_W, ay1), hot and chrome_col(ChromeColor.Popin, 235) or chrome_col(ChromeColor.PopinIdle, 180), 6, 0)
+            imgui.DrawListAddTriangleFilled(dl, vec2(ax0 + 10, aym - 11), vec2(ax0 + 22, aym), vec2(ax0 + 10, aym + 11), ink)
+          end
+        end
+        -- the hovered or grabbed edge glows (in panel pixels: it bends with the curve)
+        if grip_live then world_grip_glow(dl, vp, pl.width, pl.height, grip, world_grip_scale(&cam, &b, pl.width, pl.height, grip), resizing_this) end
         if focused then
           -- drawn as short segments so it bends with the panel's curve
-          local col = im_col32(200, 160, 90, 220)
+          local col = chrome_col(ChromeColor.Accent, 220)
           local SEG <comptime> = 32
           for k = 0, < SEG do
             local xa = vp.x + pl.width * k / SEG
@@ -833,14 +1239,23 @@ global function draw_world(now: float64): void
           imgui.DrawListAddLine(dl, vec2(vp.x + 1.5, vp.y), vec2(vp.x + 1.5, vp.y + pl.height), col, 3.0)
           imgui.DrawListAddLine(dl, vec2(vp.x + pl.width - 1.5, vp.y), vec2(vp.x + pl.width - 1.5, vp.y + pl.height), col, 3.0)
         end
+        rain_panel_front(dl, vp, &pl, s.id) -- raindrops on the glass
         bell_panel_border(dl, vp, pl.width, pl.height, s.id)
+        if s.kind == TransportKind.Window then remotewin_popups(s, dl, vp) end -- menus over everything of the panel
         if carried then
           draw_drag_grip(dl, vp, pl.width, pl.height, host.drag.u, host.drag.v)
         elseif drag_alt and host.drag.id == 0 and drag_in.hover_id == s.id then
           draw_drag_grip(dl, vp, pl.width, pl.height, mu, mv)
         end
-        world_transform_vertices(dl, first_cmd, first, &cam, &b, vp, vp, prez, now, ft, full_at, panel_occ)
+        world_transform_vertices(dl, first_cmd, first, &cam, &b, vp, vp, prez, now, ft, flat, panel_occ)
+        -- beneath the game's HUD: cut where it is shown (not once flown full screen)
+        if host.hud_mask.n > 0 and ft < 0.5 then hudmask_cut(dl, first_idx, first, &host.hud_mask, imgui.DrawListPrimReserve) end
         if depth_on then depthpass_panel_end(dl) end
+        if resizing_this then -- its size beside the cursor, flat on the screen
+          local terminal = s.kind ~= TransportKind.Window and s.kind ~= TransportKind.Panel
+          local ldl = imgui.GetForegroundDrawList ~= nilptr and imgui.GetForegroundDrawList() or dl
+          world_resize_label(ldl, mouse, pl.width, pl.height, terminal and (@integer)(s.cols) or 0, terminal and (@integer)(s.rows) or 0)
+        end
         if focused then look_on, look_x, look_y, look_z = true, pl.x, pl.y, pl.z end
         -- the bell's light behind this panel is hidden (not while it flies to full screen)
         local cover: WorldCover
@@ -858,6 +1273,41 @@ global function draw_world(now: float64): void
     local ts = find_session(oid)
     if ts ~= nilptr then
       local e = policy_world_command(oid, ts.run_occluded and 'occluded off' or 'occluded on')
+      e:destroy()
+    end
+  end
+  host.world_pets = pets_now
+  do -- the title drag: its state machine, then the swap it asks for
+    local st = world_order_drag_step(&host.order_drag, order_in)
+    if st.swap then
+      host.world_order_swap_id, host.world_order_swap_with = st.id, st.over
+    end
+  end
+  if host.world_order_swap_id ~= 0 then
+    local a, b = host.world_order_swap_id, host.world_order_swap_with
+    host.world_order_swap_id, host.world_order_swap_with = 0, 0
+    local sb: stringbuilder
+    sb:writef('order swap %d', b)
+    local cmd = sb:promote()
+    local e = policy_world_command(a, cmd)
+    if #e > 0 then sayf(LOG_WARN, 'order: %s', e) end
+    e:destroy()
+    cmd:destroy()
+  end
+  if host.world_order_id ~= 0 then
+    local oid = host.world_order_id
+    host.world_order_id = 0
+    local e = policy_world_command(oid, host.world_order_next and 'order right' or 'order left')
+    if #e > 0 then sayf(LOG_WARN, 'order: %s', e) end
+    e:destroy()
+  end
+  if host.world_pet_toggle_id ~= 0 then
+    local tid = host.world_pet_toggle_id
+    host.world_pet_toggle_id = 0
+    local ts = world_panel(tid)
+    if ts ~= nilptr then
+      local e = world_toggle_pet(ts)
+      if #e > 0 then sayf(LOG_WARN, 'pin: %s', e) end
       e:destroy()
     end
   end

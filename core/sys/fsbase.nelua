@@ -1,0 +1,76 @@
+-- File helpers without Lua, shared by the core (core/sys/fs.nelua exposes
+-- them to Lua) and ghostty-agent: fs_mkdir and fs_make_private.
+require 'string'
+require 'core.sys.winpath'
+
+## if ccinfo.is_windows then
+## cinclude '<windows.h>'
+-- the wide entry points: paths here are UTF-8 (core/sys/winpath.nelua), and the
+-- ANSI ones would drop a user name the active code page cannot spell
+local function CreateDirectoryW(path: pointer, sa: pointer): cint <cimport, nodecl> end
+local function GetLastError(): uint32 <cimport, nodecl> end
+local ERROR_ALREADY_EXISTS: uint32 <cimport, nodecl, const>
+## linklib 'advapi32'
+local function GetCurrentProcess(): pointer <cimport, nodecl> end
+local function OpenProcessToken(process: pointer, access: uint32, token: *pointer): cint <cimport, nodecl> end
+local function GetTokenInformation(token: pointer, class: cint, info: pointer, len: uint32, retlen: *uint32): cint <cimport, nodecl> end
+local function CloseHandle(h: pointer): cint <cimport, nodecl> end
+local function InitializeAcl(acl: pointer, len: uint32, revision: uint32): cint <cimport, nodecl> end
+local function AddAccessAllowedAce(acl: pointer, revision: uint32, mask: uint32, sid: pointer): cint <cimport, nodecl> end
+local function InitializeSecurityDescriptor(sd: pointer, revision: uint32): cint <cimport, nodecl> end
+local function SetSecurityDescriptorDacl(sd: pointer, present: cint, acl: pointer, defaulted: cint): cint <cimport, nodecl> end
+local function SetSecurityDescriptorControl(sd: pointer, mask: uint16, bits: uint16): cint <cimport, nodecl> end
+local function SetFileSecurityW(path: pointer, info: uint32, sd: pointer): cint <cimport, nodecl> end
+local TOKEN_QUERY: uint32 <cimport, nodecl, const>
+local TokenUser: cint <cimport, nodecl, const>
+local ACL_REVISION: uint32 <cimport, nodecl, const>
+local FILE_ALL_ACCESS: uint32 <cimport, nodecl, const>
+local SECURITY_DESCRIPTOR_REVISION: uint32 <cimport, nodecl, const>
+local SE_DACL_PROTECTED: uint16 <cimport, nodecl, const>
+local DACL_SECURITY_INFORMATION: uint32 <cimport, nodecl, const>
+## else
+## cinclude '<sys/stat.h>'
+## cinclude '<errno.h>'
+local function c_mkdir(path: cstring, mode: cuint): cint <cimport 'mkdir', nodecl> end
+local function chmod(path: cstring, mode: cuint): cint <cimport, nodecl> end
+local errno: cint <cimport, nodecl>
+local EEXIST: cint <cimport, nodecl, const>
+## end
+
+-- true when the directory now exists (created or already there)
+global function fs_mkdir(path: cstring): boolean
+  ## if ccinfo.is_windows then
+    local w: [WINPATH_MAX]uint16
+    if winpath_wide((@string)(path), (@*[0]uint16)(&w), WINPATH_MAX) < 0 then return false end
+    return CreateDirectoryW((@pointer)(&w), nilptr) ~= 0 or GetLastError() == ERROR_ALREADY_EXISTS
+  ## else
+    return c_mkdir(path, 493) == 0 or errno == EEXIST -- 0755
+  ## end
+end
+
+-- true when only the current user can open the file: mode 0600, or on Windows
+-- a protected DACL naming just the user, which Wine maps onto the unix mode
+global function fs_make_private(path: cstring): boolean
+  ## if ccinfo.is_windows then
+    local w: [WINPATH_MAX]uint16
+    if winpath_wide((@string)(path), (@*[0]uint16)(&w), WINPATH_MAX) < 0 then return false end
+    local token: pointer
+    if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) == 0 then return false end
+    local user: [64]usize -- TOKEN_USER: the SID pointer first, then the SID itself
+    local len: uint32 = 0
+    local got = GetTokenInformation(token, TokenUser, &user, #user * #usize, &len)
+    CloseHandle(token)
+    if got == 0 then return false end
+    local acl: [32]usize
+    local sd: [8]usize
+    return InitializeAcl(&acl, #acl * #usize, ACL_REVISION) ~= 0
+      and AddAccessAllowedAce(&acl, ACL_REVISION, FILE_ALL_ACCESS, (@pointer)(user[0])) ~= 0
+      and InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION) ~= 0
+      and SetSecurityDescriptorDacl(&sd, 1, &acl, 0) ~= 0
+      and SetSecurityDescriptorControl(&sd, SE_DACL_PROTECTED, SE_DACL_PROTECTED) ~= 0
+      and SetFileSecurityW((@pointer)(&w), DACL_SECURITY_INFORMATION, &sd) ~= 0
+  ## else
+    return chmod(path, 384) == 0 -- 0600
+  ## end
+end
+

@@ -1,0 +1,66 @@
+-- One cheap sample of this process: memory the process owns, its working set,
+-- and its kernel, GDI and USER handle counts. For the leak watch
+-- (core/app/selftest.nelua): a plugin that leaks on reload shows up as these
+-- numbers climbing from one core load to the next. A few system calls, no
+-- allocation, safe on the render thread. Fields a platform cannot give are 0.
+require 'string'
+
+global ProcStat = @record{
+  private_bytes: uint64,  -- Windows: PrivateUsage; Linux: data + stack pages
+  working_set: uint64,    -- resident bytes
+  handles: uint32,        -- Windows kernel handles; Linux: 0
+  gdi: uint32,
+  user: uint32,
+}
+
+## if ccinfo.is_windows then
+## cinclude '<windows.h>'
+## cinclude '<psapi.h>'
+local PROCESS_MEMORY_COUNTERS_EX <cimport, nodecl> = @record{
+  cb: uint32, PageFaultCount: uint32, PeakWorkingSetSize: usize, WorkingSetSize: usize,
+  QuotaPeakPagedPoolUsage: usize, QuotaPagedPoolUsage: usize, QuotaPeakNonPagedPoolUsage: usize,
+  QuotaNonPagedPoolUsage: usize, PagefileUsage: usize, PeakPagefileUsage: usize, PrivateUsage: usize,
+}
+local function GetCurrentProcess(): pointer <cimport, nodecl> end
+local function K32GetProcessMemoryInfo(process: pointer, counters: *PROCESS_MEMORY_COUNTERS_EX, cb: uint32): cint <cimport, nodecl> end
+local function GetProcessHandleCount(process: pointer, count: *uint32): cint <cimport, nodecl> end
+local function GetGuiResources(process: pointer, flags: uint32): uint32 <cimport, nodecl> end
+
+global function procstat_sample(): ProcStat
+  local s: ProcStat
+  local me = GetCurrentProcess()
+  local pmc: PROCESS_MEMORY_COUNTERS_EX
+  pmc.cb = (@uint32)(#PROCESS_MEMORY_COUNTERS_EX)
+  if K32GetProcessMemoryInfo(me, &pmc, pmc.cb) ~= 0 then
+    s.private_bytes = pmc.PrivateUsage
+    s.working_set = pmc.WorkingSetSize
+  end
+  local n: uint32 = 0
+  if GetProcessHandleCount(me, &n) ~= 0 then s.handles = n end
+  s.gdi = GetGuiResources(me, 0)  -- GR_GDIOBJECTS
+  s.user = GetGuiResources(me, 1) -- GR_USEROBJECTS
+  return s
+end
+## else
+## cinclude '<stdio.h>'
+## cinclude '<unistd.h>'
+local FILE <cimport, nodecl, forwarddecl> = @record{}
+local function fopen(path: cstring, mode: cstring): *FILE <cimport, nodecl> end
+local function fscanf(f: *FILE, fmt: cstring, ...: cvarargs): cint <cimport, nodecl> end
+local function fclose(f: *FILE): cint <cimport, nodecl> end
+local function getpagesize(): cint <cimport, nodecl> end
+
+global function procstat_sample(): ProcStat
+  local s: ProcStat
+  local f = fopen('/proc/self/statm', 'r')
+  if f == nilptr then return s end
+  local size: culong, resident: culong, shared: culong, text: culong, lib: culong, data: culong
+  if fscanf(f, '%lu %lu %lu %lu %lu %lu', &size, &resident, &shared, &text, &lib, &data) == 6 then
+    local page = (@uint64)(getpagesize())
+    s.working_set = (@uint64)(resident) * page
+    s.private_bytes = (@uint64)(data) * page
+  end
+  fclose(f)
+  return s
+end
+## end

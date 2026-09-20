@@ -1,0 +1,367 @@
+-- PNG for the plugin's own screenshots (docs/CAPTURE.md): BGRA (or RGBA)
+-- pixels in, a PNG file out. Pure: no GPU, no shim, no ImGui, so
+-- tests/test_pngenc.nelua checks it on the host.
+--
+-- Why an encoder of our own instead of the game's screenshot key: the game's
+-- shot is taken before Dalamud's ImGui renders, so the terminals are not in it
+-- (core/capture.nelua grabs the frame ImGui drew into instead). And the
+-- gallery on spacegho.st takes PNG or JPEG only, at most 8 MB, so a stored
+-- (uncompressed) PNG would be too large at 1440p and above.
+--
+-- The stream is a single fixed-Huffman deflate block over PNG-filtered rows
+-- (Sub, Up or Paeth, whichever predicts the row best), with greedy LZ77
+-- matching. That is a fraction of zlib's ratio on photographs and close to it
+-- on flat UI, which is what a terminal screenshot is.
+--
+-- Encoding runs in steps: png_step encodes at most as many rows as it is
+-- given, so the caller can spread one screenshot over several frames and never
+-- hold up the game for a whole image (core/app/capture.nelua's budget).
+require 'vector'
+require 'memory'
+require 'math'
+require 'string'
+
+global PNG_SIG: [8]uint8 <const> = { 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a }
+
+-- Deflate --------------------------------------------------------------------
+
+local WSIZE: usize <comptime> = 32768        -- deflate's window
+local HSIZE: usize <comptime> = 65536        -- hash buckets
+local MIN_MATCH: usize <comptime> = 3
+local MAX_MATCH: usize <comptime> = 258
+local MAX_CHAIN: integer <comptime> = 24     -- candidates tried per position
+local NICE_MATCH: usize <comptime> = 128     -- long enough to stop looking
+
+-- One encode at a time (a screenshot, and the frames of a clip one by one), so
+-- the match tables are module state instead of a third of a megabyte per
+-- encoder record.
+local head: [HSIZE]int32
+local chain: [WSIZE]int32
+
+local LEN_BASE: [29]uint16 <const> = { 3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258 }
+local LEN_EXTRA: [29]uint8 <const> = { 0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0 }
+local DIST_BASE: [30]uint16 <const> = { 1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577 }
+local DIST_EXTRA: [30]uint8 <const> = { 0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13 }
+
+local crc_table: [256]uint32
+local crc_ready: boolean = false
+
+local function crc_init(): void
+  for i = 0, < 256 do
+    local c: uint32 = (@uint32)(i)
+    for _ = 1, 8 do
+      if (c & 1) ~= 0 then c = (c >> 1) ~ 0xEDB88320 else c = c >> 1 end
+    end
+    crc_table[i] = c
+  end
+  crc_ready = true
+end
+
+-- CRC-32 as PNG uses it (table driven: the bitwise one in core/dualsense.nelua
+-- would cost eight loops a byte over a megabyte of image data).
+global function png_crc32(crc: uint32, data: *[0]uint8, n: usize): uint32
+  if not crc_ready then crc_init() end
+  local c = ~crc
+  for i: usize = 0, < n do c = (c >> 8) ~ crc_table[(c ~ data[i]) & 0xff] end
+  return ~c
+end
+
+global PngEnc = @record{
+  w: integer, h: integer,
+  src: *[0]uint8,        -- borrowed pixels, four bytes a pixel
+  stride: usize,
+  bgr: boolean,          -- true: blue first (D3D11 BGRA), false: red first
+  row: integer,          -- next row to filter
+  out: vector(uint8),    -- the file so far
+  fl: vector(uint8),     -- the filtered rows: deflate's window lives in here
+  pos: usize,            -- bytes of `fl` already compressed
+  bitbuf: uint32, bitcnt: integer,
+  a1: uint32, a2: uint32, -- adler-32 halves
+  idat_at: usize,        -- offset of the IDAT chunk's length field
+  started: boolean,
+  done: boolean,
+  failed: boolean,
+}
+
+global function png_enc_destroy(e: *PngEnc): void
+  e.out:destroy()
+  e.fl:destroy()
+  $e = {}
+end
+
+-- Bits ------------------------------------------------------------------------
+-- Deflate packs bits low end first; Huffman codes go in high bit first, so a
+-- code is reversed before it is written. Extra bits are written as they are.
+
+local function put_bits(e: *PngEnc, v: uint32, n: integer): void
+  e.bitbuf = e.bitbuf | ((v & ((1_u32 << n) - 1)) << e.bitcnt)
+  e.bitcnt = e.bitcnt + n
+  while e.bitcnt >= 8 do
+    e.out:push((@uint8)(e.bitbuf & 0xff))
+    e.bitbuf = e.bitbuf >> 8
+    e.bitcnt = e.bitcnt - 8
+  end
+end
+
+local function put_code(e: *PngEnc, code: uint32, n: integer): void
+  local r: uint32 = 0
+  for i = 0, < n do r = (r << 1) | ((code >> i) & 1) end
+  put_bits(e, r, n)
+end
+
+local function put_literal(e: *PngEnc, b: uint8): void
+  if b <= 143 then put_code(e, 0x30 + (@uint32)(b), 8)
+  else put_code(e, 0x190 + (@uint32)(b) - 144, 9) end
+end
+
+local function put_symbol(e: *PngEnc, sym: integer): void
+  if sym <= 279 then put_code(e, (@uint32)(sym - 256), 7)
+  else put_code(e, 0xc0 + (@uint32)(sym - 280), 8) end
+end
+
+local function put_match(e: *PngEnc, len: usize, dist: usize): void
+  local li = 28
+  while li > 0 and (@usize)(LEN_BASE[li]) > len do li = li - 1 end
+  put_symbol(e, 257 + li)
+  local lx = LEN_EXTRA[li]
+  if lx > 0 then put_bits(e, (@uint32)(len - (@usize)(LEN_BASE[li])), (@integer)(lx)) end
+  local di = 29
+  while di > 0 and (@usize)(DIST_BASE[di]) > dist do di = di - 1 end
+  put_code(e, (@uint32)(di), 5)
+  local dx = DIST_EXTRA[di]
+  if dx > 0 then put_bits(e, (@uint32)(dist - (@usize)(DIST_BASE[di])), (@integer)(dx)) end
+end
+
+-- LZ77 ------------------------------------------------------------------------
+
+local function hash3(a: uint8, b: uint8, c: uint8): usize
+  return (@usize)((((@uint32)(a) << 10) ~ ((@uint32)(b) << 5) ~ (@uint32)(c)) & (HSIZE - 1))
+end
+
+local function insert(p: usize, fl: *[0]uint8): void
+  local hv = hash3(fl[p], fl[p+1], fl[p+2])
+  chain[p & (WSIZE - 1)] = head[hv]
+  head[hv] = (@int32)(p) + 1
+end
+
+-- Compress `fl[e.pos .. limit)`. Matches may not reach past `limit`, so a call
+-- that is not the last one stops three bytes short of it and the next call
+-- picks the rest up.
+local function compress_to(e: *PngEnc, limit: usize): void
+  if limit <= e.pos then return end
+  local fl = (@*[0]uint8)(&e.fl[0])
+  local p = e.pos
+  while p < limit do
+    local left = limit - p
+    local best_len: usize, best_dist: usize = 0, 0
+    if left >= MIN_MATCH then
+      local hv = hash3(fl[p], fl[p+1], fl[p+2])
+      local cand = (@integer)(head[hv]) - 1
+      local tries = 0
+      local maxl = left
+      if maxl > MAX_MATCH then maxl = MAX_MATCH end
+      while cand >= 0 and tries < MAX_CHAIN do
+        local dist = p - (@usize)(cand)
+        if dist == 0 or dist > WSIZE then break end
+        if best_len == 0 or fl[(@usize)(cand) + best_len] == fl[p + best_len] then
+          local l: usize = 0
+          while l < maxl and fl[(@usize)(cand) + l] == fl[p + l] do l = l + 1 end
+          if l > best_len then
+            best_len, best_dist = l, dist
+            if l >= NICE_MATCH then break end
+          end
+        end
+        cand = (@integer)(chain[(@usize)(cand) & (WSIZE - 1)]) - 1
+        tries = tries + 1
+      end
+      if best_len < MIN_MATCH then best_len = 0 end
+    end
+    if best_len >= MIN_MATCH then
+      put_match(e, best_len, best_dist)
+      for k: usize = 0, < best_len do
+        if p + k + MIN_MATCH <= limit then insert(p + k, fl) end
+      end
+      p = p + best_len
+    else
+      put_literal(e, fl[p])
+      if p + MIN_MATCH <= limit then insert(p, fl) end
+      p = p + 1
+    end
+  end
+  e.pos = p
+end
+
+-- PNG ------------------------------------------------------------------------
+
+local function put_u32be(e: *PngEnc, v: uint32): void
+  e.out:push((@uint8)((v >> 24) & 0xff))
+  e.out:push((@uint8)((v >> 16) & 0xff))
+  e.out:push((@uint8)((v >> 8) & 0xff))
+  e.out:push((@uint8)(v & 0xff))
+end
+
+-- A chunk's length is only known once its data is there: write a placeholder,
+-- then patch it and append the CRC in chunk_end.
+local function chunk_begin(e: *PngEnc, a: byte, b: byte, c: byte, d: byte): usize
+  local at = (@usize)(#e.out)
+  put_u32be(e, 0)
+  e.out:push(a) e.out:push(b) e.out:push(c) e.out:push(d)
+  return at
+end
+
+local function chunk_end(e: *PngEnc, at: usize): void
+  local n = (@usize)(#e.out) - (at + 8)
+  local p = (@*[0]uint8)(&e.out[at])
+  p[0], p[1], p[2], p[3] = (@uint8)((n >> 24) & 0xff), (@uint8)((n >> 16) & 0xff), (@uint8)((n >> 8) & 0xff), (@uint8)(n & 0xff)
+  local crc = png_crc32(0, (@*[0]uint8)(&e.out[at + 4]), n + 4)
+  put_u32be(e, crc)
+end
+
+-- Start an encode of `w` x `h` pixels at `src` (four bytes a pixel, `stride`
+-- bytes a row). `src` is borrowed: it must stay put and unchanged until
+-- png_step reports done.
+global function png_begin(e: *PngEnc, src: *[0]uint8, stride: usize, w: integer, h: integer, bgr: boolean): boolean
+  png_enc_destroy(e)
+  if src == nilptr or w <= 0 or h <= 0 or stride < (@usize)(w) * 4 then
+    e.failed = true
+    return false
+  end
+  e.w, e.h, e.src, e.stride, e.bgr = w, h, src, stride, bgr
+  e.a1, e.a2 = 1, 0
+  memory.zero(&head, #head)
+  memory.zero(&chain, #chain)
+  e.out:reserve((@usize)(w) * (@usize)(h) + 4096)
+  e.fl:reserve(((@usize)(w) * 3 + 1) * (@usize)(h))
+  e.out:push(PNG_SIG[0]) e.out:push(PNG_SIG[1]) e.out:push(PNG_SIG[2]) e.out:push(PNG_SIG[3])
+  e.out:push(PNG_SIG[4]) e.out:push(PNG_SIG[5]) e.out:push(PNG_SIG[6]) e.out:push(PNG_SIG[7])
+  local ihdr = chunk_begin(e, 'I'_b, 'H'_b, 'D'_b, 'R'_b)
+  put_u32be(e, (@uint32)(w))
+  put_u32be(e, (@uint32)(h))
+  e.out:push(8)  -- bits a channel
+  e.out:push(2)  -- colour type 2: truecolour, no alpha
+  e.out:push(0) e.out:push(0) e.out:push(0) -- deflate, adaptive filtering, no interlace
+  chunk_end(e, ihdr)
+  e.idat_at = chunk_begin(e, 'I'_b, 'D'_b, 'A'_b, 'T'_b)
+  e.out:push(0x78) e.out:push(0x01) -- zlib header, 32 KB window
+  put_bits(e, 3, 3)                 -- BFINAL 1, BTYPE 01 (fixed Huffman)
+  e.started = true
+  return true
+end
+
+-- Paeth's predictor (PNG filter 4).
+local function paeth(a: integer, b: integer, c: integer): integer
+  local p = a + b - c
+  local pa, pb, pc = math.abs(p - a), math.abs(p - b), math.abs(p - c)
+  if pa <= pb and pa <= pc then return a end
+  if pb <= pc then return b end
+  return c
+end
+
+-- One row's RGB bytes from the source, and the row above it (nilptr on row 0).
+local function raw_row(e: *PngEnc, y: integer, dst: *[0]uint8): void
+  local s = (@*[0]uint8)(&e.src[(@usize)(y) * e.stride])
+  local r0, b0 = 2, 0
+  if not e.bgr then r0, b0 = 0, 2 end
+  for x = 0, < e.w do
+    dst[x*3] = s[x*4 + r0]
+    dst[x*3+1] = s[x*4+1]
+    dst[x*3+2] = s[x*4 + b0]
+  end
+end
+
+-- Filter `rows` more rows into e.fl and compress what that made. True once the
+-- whole image is encoded (e.out then holds the file).
+global function png_step(e: *PngEnc, rows: integer): boolean
+  if e.done or e.failed or not e.started then return e.done end
+  if rows < 1 then rows = 1 end
+  local n = (@usize)(e.w) * 3
+  local cur: vector(uint8)
+  local up: vector(uint8)
+  cur:resize(n)
+  up:resize(n)
+  defer cur:destroy() up:destroy() end
+  local last = e.row + rows
+  if last > e.h then last = e.h end
+  while e.row < last do
+    local y = e.row
+    raw_row(e, y, (@*[0]uint8)(&cur[0]))
+    if y > 0 then raw_row(e, y - 1, (@*[0]uint8)(&up[0])) else memory.zero(&up[0], n) end
+    -- pick the filter whose output has the smallest sum of magnitudes
+    local sums: [3]uinteger = { 0, 0, 0 }
+    for i: usize = 0, < n do
+      local a: integer = i >= 3 and (@integer)(cur[i - 3]) or 0
+      local b: integer = (@integer)(up[i])
+      local c: integer = i >= 3 and (@integer)(up[i - 3]) or 0
+      local x: integer = (@integer)(cur[i])
+      local vs = (@uint8)((x - a) & 0xff)
+      local vu = (@uint8)((x - b) & 0xff)
+      local vp = (@uint8)((x - paeth(a, b, c)) & 0xff)
+      sums[0] = sums[0] + (@uinteger)(vs < 128 and vs or 256 - (@integer)(vs))
+      sums[1] = sums[1] + (@uinteger)(vu < 128 and vu or 256 - (@integer)(vu))
+      sums[2] = sums[2] + (@uinteger)(vp < 128 and vp or 256 - (@integer)(vp))
+    end
+    local pick = 0
+    if sums[1] < sums[pick] then pick = 1 end
+    if sums[2] < sums[pick] then pick = 2 end
+    local ft: uint8 = pick == 0 and 1 or (pick == 1 and 2 or 4)
+    local at = (@usize)(#e.fl)
+    e.fl:resize(at + 1 + n)
+    local f = (@*[0]uint8)(&e.fl[at])
+    f[0] = ft
+    for i: usize = 0, < n do
+      local a: integer = i >= 3 and (@integer)(cur[i - 3]) or 0
+      local b: integer = (@integer)(up[i])
+      local c: integer = i >= 3 and (@integer)(up[i - 3]) or 0
+      local x: integer = (@integer)(cur[i])
+      local v: integer = 0
+      if ft == 1 then v = x - a elseif ft == 2 then v = x - b else v = x - paeth(a, b, c) end
+      f[1 + i] = (@uint8)(v & 0xff)
+    end
+    -- adler-32 runs over the filtered stream, filter bytes included
+    local a1, a2 = e.a1, e.a2
+    for i: usize = 0, < 1 + n do
+      a1 = (a1 + (@uint32)(f[i])) % 65521
+      a2 = (a2 + a1) % 65521
+    end
+    e.a1, e.a2 = a1, a2
+    e.row = e.row + 1
+  end
+  local total = (@usize)(#e.fl)
+  if e.row < e.h then
+    -- keep a match's worth of lookahead for the next call
+    if total > MIN_MATCH then compress_to(e, total - MIN_MATCH) end
+    return false
+  end
+  compress_to(e, total)
+  put_symbol(e, 256) -- end of block
+  if e.bitcnt > 0 then put_bits(e, 0, 8 - e.bitcnt) end
+  put_u32be(e, (e.a2 << 16) | e.a1)
+  chunk_end(e, e.idat_at)
+  local iend = chunk_begin(e, 'I'_b, 'E'_b, 'N'_b, 'D'_b)
+  chunk_end(e, iend)
+  e.fl:destroy() -- the window is not needed once the stream is closed
+  e.done = true
+  return true
+end
+
+-- The whole image in one go (tests, and small crops).
+global function png_encode(src: *[0]uint8, stride: usize, w: integer, h: integer, bgr: boolean, out: *vector(uint8)): boolean
+  local e: PngEnc
+  if not png_begin(&e, src, stride, w, h, bgr) then png_enc_destroy(&e) return false end
+  while not png_step(&e, 64) do end
+  out:clear()
+  out:resize((@usize)(#e.out))
+  if #e.out > 0 then memory.copy(&out[0], &e.out[0], (@usize)(#e.out)) end
+  png_enc_destroy(&e)
+  return true
+end
+
+-- The width and height an IHDR declares, or (0, 0) when `data` is not a PNG.
+global function png_size(data: *[0]uint8, len: usize): (integer, integer)
+  if len < 24 then return 0, 0 end
+  for i = 0, < 8 do if data[i] ~= PNG_SIG[i] then return 0, 0 end end
+  if data[12] ~= 'I'_b or data[13] ~= 'H'_b or data[14] ~= 'D'_b or data[15] ~= 'R'_b then return 0, 0 end
+  local w = ((@integer)(data[16]) << 24) | ((@integer)(data[17]) << 16) | ((@integer)(data[18]) << 8) | (@integer)(data[19])
+  local h = ((@integer)(data[20]) << 24) | ((@integer)(data[21]) << 16) | ((@integer)(data[22]) << 8) | (@integer)(data[23])
+  return w, h
+end

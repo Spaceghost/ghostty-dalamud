@@ -6,6 +6,10 @@ require 'stringbuilder'
 require 'core.lua'
 require 'core.world'
 require 'core.sys.fs'
+require 'core.sys.winpath'
+require 'core.desk'
+require 'core.theme'
+require 'core.tooltip'
 require 'io'
 
 global Profile = @record{
@@ -16,6 +20,7 @@ global Profile = @record{
   host: string,             -- transport-specific target (agent host, superlogical url)
   port: integer,
   cwd: string,
+  fallback: string,         -- agent profiles: the profile (by name) to open instead while no agent answers
 }
 
 global DropdownCfg = @record{
@@ -43,6 +48,20 @@ global AgentCfg = @record{
   token_file: string,
 }
 
+-- Remote desktop windows (lua/windows.lua, CONFIG.windows).
+global WindowsCfg = @record{
+  agent: string,            -- '' = the CONFIG.agent connection (the only one supported so far)
+  max_w: integer,           -- largest frame the agent sends; bigger windows are scaled down there
+  max_h: integer,
+  fps: integer,
+  open_at: string,          -- where a new window panel goes, as /term pin takes it ('here': in front of you)
+  autopull: vector(string), -- CONFIG.windows.auto: `/term window pull` arguments to run once a character is loaded
+  never: vector(string),    -- CONFIG.windows.never: windows and apps never shown in game (app id, desktop id, title part; * globs)
+  auto_open: string,        -- CONFIG.windows.auto_open: new windows of the agent's compositor as panels: 'all', 'related', 'none'
+  links: string,            -- CONFIG.windows.links: where terminal links open: 'game' (the agent's compositor, a panel) or 'host'
+  reserved_chords: vector(string), -- CONFIG.windows.reserved_chords: keys never sent to a window or typed into a terminal (core/keychords.nelua)
+}
+
 -- Per-frame Lua hooks; each remembers its own last logged error.
 global POLICY_HOOK_PLACE <comptime> = 0
 global POLICY_HOOK_ON_FRAME <comptime> = 1
@@ -50,7 +69,11 @@ global POLICY_HOOK_ON_KEY <comptime> = 2
 global POLICY_HOOK_RESIZE <comptime> = 3
 global POLICY_HOOK_SETTINGS_DRAW <comptime> = 4
 global POLICY_HOOK_SETTINGS_BADGE <comptime> = 5
-global POLICY_HOOK_COUNT <comptime> = 6
+global POLICY_HOOK_THEME <comptime> = 6
+global POLICY_HOOK_ON_EVENT <comptime> = 7
+global POLICY_HOOK_GALLERY <comptime> = 8
+global POLICY_HOOK_ASK <comptime> = 9
+global POLICY_HOOK_COUNT <comptime> = 10
 
 global Policy = @record{
   L: *lua_State,
@@ -83,6 +106,7 @@ global Policy = @record{
   world_occlusion: uint8,   -- WORLD_OCCLUSION_* (CONFIG.world.occlusion)
   world_occlusion_tolerance: float32, -- yalms a panel may sit behind the scene before it hides (grows with distance and slope)
   world_occlusion_edge: float32,      -- pixels over which a covered edge blends
+  windows: WindowsCfg,
   last_hook_error: [POLICY_HOOK_COUNT]string,  -- per POLICY_HOOK_*: the last error logged (each distinct text logs once)
 }
 
@@ -149,6 +173,7 @@ local function read_profile(L: *lua_State, idx: cint): Profile
   p.host = lua_field_string(L, idx, 'host', '')
   p.port = lua_field_integer(L, idx, 'port', 0)
   p.cwd = lua_field_string(L, idx, 'cwd', '')
+  p.fallback = lua_field_string(L, idx, 'fallback', '')
   lua_getfield(L, idx, 'command')
   if lua_type(L, -1) == LUA_TTABLE then
     read_string_list(L, -1, &p.argv)
@@ -164,15 +189,17 @@ local function read_profile(L: *lua_State, idx: cint): Profile
   return p
 end
 
+-- Free what a profile owns (the configured ones, and ones the core builds).
+global function profile_free(p: *Profile): void
+  p.name:destroy() p.transport:destroy() p.host:destroy() p.cwd:destroy() p.fallback:destroy()
+  for k = 0, < #p.argv do p.argv[k]:destroy() end
+  p.argv:destroy()
+  for k = 0, < #p.env do p.env[k]:destroy() end
+  p.env:destroy()
+end
+
 local function clear_profiles(): void
-  for i = 0, < #policy.profiles do
-    local p = &policy.profiles[i]
-    p.name:destroy() p.transport:destroy() p.host:destroy() p.cwd:destroy()
-    for k = 0, < #p.argv do p.argv[k]:destroy() end
-    p.argv:destroy()
-    for k = 0, < #p.env do p.env[k]:destroy() end
-    p.env:destroy()
-  end
+  for i = 0, < #policy.profiles do profile_free(&policy.profiles[i]) end
   policy.profiles:clear()
 end
 
@@ -195,6 +222,97 @@ end
 -- not have; the core reads it from the controller (core/sys/dualsense_reader.nelua).
 global function policy_gamepad_hid(name: string): boolean
   return name == 'create'
+end
+
+-- Themes (core/theme.nelua) ----------------------------------------------------------
+
+-- The integer colour in field `k` of the table at `idx`; false when absent.
+local function field_color(L: *lua_State, idx: cint, k: cstring): (boolean, integer)
+  lua_getfield(L, idx, k)
+  local ok = lua_type(L, -1) == LUA_TNUMBER
+  local v: integer = 0
+  if ok then v = (@integer)(lua_tointegerx(L, -1, nilptr)) end
+  lua_pop(L, 1)
+  if v < 0 or v > 0xFFFFFF then return false, 0 end
+  return ok, v
+end
+
+-- Read a table from lua/themes.lua's resolve() at stack index `idx`:
+-- { terminal = { background, ..., palette = { [i] } }, chrome = { [key] } }.
+-- Returns true when the colours changed.
+global function policy_theme_read(L: *lua_State, idx: cint): boolean
+  local t: TermTheme
+  memory.zero(&t, #TermTheme)
+  local chrome: [CHROME_COLOR_COUNT]uint32 = CHROME_SPACEGHOST
+  if lua_type(L, idx) ~= LUA_TTABLE then return theme_install(&t, &chrome) end
+  lua_getfield(L, idx, 'terminal')
+  local term = lua_gettop(L)
+  if lua_type(L, term) == LUA_TTABLE then
+    local ok, v = field_color(L, term, 'background')
+    if ok then t.has_background, t.background = true, theme_rgb(v) end
+    ok, v = field_color(L, term, 'foreground')
+    if ok then t.has_foreground, t.foreground = true, theme_rgb(v) end
+    ok, v = field_color(L, term, 'cursor')
+    if ok then t.has_cursor, t.cursor = true, theme_rgb(v) end
+    ok, v = field_color(L, term, 'cursor_text')
+    if ok then t.has_cursor_text, t.cursor_text = true, theme_rgb(v) end
+    ok, v = field_color(L, term, 'selection_background')
+    if ok then t.has_sel_bg, t.sel_bg = true, theme_rgb(v) end
+    ok, v = field_color(L, term, 'selection_foreground')
+    if ok then t.has_sel_fg, t.sel_fg = true, theme_rgb(v) end
+    lua_getfield(L, term, 'palette')
+    local pal = lua_gettop(L)
+    if lua_type(L, pal) == LUA_TTABLE then
+      for i = 0, 255 do
+        lua_rawgeti(L, pal, i)
+        if lua_type(L, -1) == LUA_TNUMBER then
+          local c = (@integer)(lua_tointegerx(L, -1, nilptr))
+          if c >= 0 and c <= 0xFFFFFF then
+            t.palette_set[i] = true
+            t.palette[i] = theme_rgb(c)
+          end
+        end
+        lua_pop(L, 1)
+      end
+    end
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 1)
+  lua_getfield(L, idx, 'chrome')
+  local ct = lua_gettop(L)
+  if lua_type(L, ct) == LUA_TTABLE then
+    for i = 0, < CHROME_COLOR_COUNT do
+      local ok, v = field_color(L, ct, (@cstring)(CHROME_COLOR_KEYS[i].data))
+      if ok then chrome[i] = (@uint32)(v) end
+    end
+  end
+  lua_pop(L, 1)
+  return theme_install(&t, &chrome)
+end
+
+-- The theme named by CONFIG.theme, as CONFIG.themes.resolve (lua/themes.lua)
+-- gives it, into theme_term and chrome_colors. Without the module (an
+-- init.lua that bypasses settings.apply) or when it fails, the built-in look.
+local function read_theme(L: *lua_State, t: cint): void
+  lua_getfield(L, t, 'themes')
+  if lua_type(L, -1) == LUA_TTABLE then
+    lua_getfield(L, -1, 'resolve')
+    if lua_type(L, -1) == LUA_TFUNCTION then
+      lua_getfield(L, t, 'theme')
+      if lua_pcall(L, 1, 1, 0) == LUA_OK then
+        policy_theme_read(L, lua_gettop(L))
+      else
+        log_hook_error(L, POLICY_HOOK_THEME, 'themes.resolve')
+        theme_reset()
+      end
+    else
+      theme_reset()
+    end
+    lua_pop(L, 2)
+  else
+    theme_reset()
+    lua_pop(L, 1)
+  end
 end
 
 -- Scalar settings from the CONFIG table at stack index t (used at load and
@@ -276,6 +394,49 @@ local function read_settings(L: *lua_State, t: cint): void
   end
   lua_pop(L, 1)
 
+  read_theme(L, t)
+
+  lua_getfield(L, t, 'tooltips')
+  if lua_type(L, -1) == LUA_TTABLE then
+    tooltip_delay = math.clamp(lua_field_number(L, lua_gettop(L), 'delay', 0.45), 0, 5)
+  end
+  lua_pop(L, 1)
+
+  lua_getfield(L, t, 'windows')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) lua_createtable(L, 0, 0) end
+  local wn: cint = lua_gettop(L)
+  policy.windows.agent:destroy()
+  policy.windows.agent = lua_field_string(L, wn, 'agent', '')
+  policy.windows.open_at:destroy()
+  policy.windows.open_at = lua_field_string(L, wn, 'open_at', 'here')
+  policy.windows.auto_open:destroy()
+  policy.windows.auto_open = lua_field_string(L, wn, 'auto_open', 'all')
+  policy.windows.links:destroy()
+  policy.windows.links = lua_field_string(L, wn, 'links', 'game')
+  policy.windows.max_w = math.clamp(lua_field_integer(L, wn, 'max_w', 1920), 64, 4096)
+  policy.windows.max_h = math.clamp(lua_field_integer(L, wn, 'max_h', 1200), 64, 4096)
+  policy.windows.fps = math.clamp(lua_field_integer(L, wn, 'fps', 30), 1, 120)
+  for i = 0, < #policy.windows.autopull do policy.windows.autopull[i]:destroy() end
+  policy.windows.autopull:clear()
+  lua_getfield(L, wn, 'auto')
+  read_string_list(L, lua_gettop(L), &policy.windows.autopull)
+  lua_pop(L, 1)
+  for i = 0, < #policy.windows.never do policy.windows.never[i]:destroy() end
+  policy.windows.never:clear()
+  lua_getfield(L, wn, 'never')
+  read_string_list(L, lua_gettop(L), &policy.windows.never)
+  lua_pop(L, 1)
+  for i = 0, < #policy.windows.reserved_chords do policy.windows.reserved_chords[i]:destroy() end
+  policy.windows.reserved_chords:clear()
+  lua_getfield(L, wn, 'reserved_chords')
+  if lua_type(L, -1) == LUA_TNIL then
+    policy.windows.reserved_chords:push(string.copy('super+*')) -- XivDesktop's default chords
+  else
+    read_string_list(L, lua_gettop(L), &policy.windows.reserved_chords) -- {} reserves nothing
+  end
+  lua_pop(L, 1)
+  lua_pop(L, 1)
+
   lua_getfield(L, t, 'popup')
   if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) lua_createtable(L, 0, 0) end
   local pp: cint = lua_gettop(L)
@@ -303,6 +464,16 @@ global function policy_unload(): void
   policy.agent.host:destroy()
   policy.agent.token:destroy()
   policy.agent.token_file:destroy()
+  policy.windows.open_at:destroy()
+  policy.windows.auto_open:destroy()
+  policy.windows.links:destroy()
+  policy.windows.agent:destroy()
+  for i = 0, < #policy.windows.autopull do policy.windows.autopull[i]:destroy() end
+  policy.windows.autopull:destroy()
+  for i = 0, < #policy.windows.reserved_chords do policy.windows.reserved_chords[i]:destroy() end
+  policy.windows.reserved_chords:destroy()
+  for i = 0, < #policy.windows.never do policy.windows.never[i]:destroy() end
+  policy.windows.never:destroy()
   policy = {}
 end
 
@@ -320,6 +491,7 @@ global function policy_load_dirs(install: string, config: string, configs_root: 
   luaL_openlibs(L)
   world_lua_register(L)
   fs_lua_register(L)
+  desk_lua_register(L)
   policy.L = L
 
   local sb: stringbuilder
@@ -347,18 +519,38 @@ end
   end
   bootstrap:destroy()
 
-  -- the user's init.lua (it carries the agent token) wins over the shipped one
+  -- the user's init.lua (it carries the agent token) wins over the shipped one.
+  -- Both the probe and the load read the file through core/sys/winpath.nelua,
+  -- not io.open or luaL_loadfilex: those are ANSI on Windows, so under a
+  -- Dalamud folder whose path the active code page cannot spell (a user name
+  -- with non-ASCII characters) the core would not come up at all.
   local dir = config
-  do
-    local probe = config .. '/lua/init.lua'
-    local f = io.open(probe, 'rb')
-    if not f:isopen() then dir = install end
-    f:destroy() -- close() alone keeps the stream record allocated (no GC)
-    probe:destroy()
+  local probe = config .. '/lua/init.lua'
+  local chunk = winpath_read_file(probe)
+  probe:destroy()
+  if #chunk == 0 then
+    dir = install
+    chunk:destroy()
+    local shipped = install .. '/lua/init.lua'
+    chunk = winpath_read_file(shipped)
+    shipped:destroy()
   end
   local path = dir .. '/lua/init.lua'
-  local rc = luaL_loadfilex(L, (@cstring)(path.data), nilptr)
+  if #chunk == 0 then
+    local sb2: stringbuilder
+    sb2:write('cannot read ', path)
+    local why = sb2:promote()
+    set_error(why)
+    why:destroy()
+    path:destroy()
+    chunk:destroy()
+    return false
+  end
+  local name = '@' .. path -- Lua shows a chunk name starting with @ as a file
+  local rc = luaL_loadbufferx(L, (@cstring)(chunk.data), chunk.size, (@cstring)(name.data), nilptr)
+  name:destroy()
   path:destroy()
+  chunk:destroy()
   if rc ~= LUA_OK then
     set_lua_error(L)
     return false
@@ -374,6 +566,13 @@ end
   -- keep the config table reachable as a global for keymap callbacks
   lua_pushvalue(L, -1)
   lua_setglobal(L, 'CONFIG')
+  -- an init.lua from before a module existed (the user's copy in the config
+  -- home is never replaced) gets the shipped module's defaults
+  if luaL_loadstring(L, "for _, n in ipairs({ 'themes', 'tooltips', 'assistant', 'ask', 'windows', 'adopt', 'rain', 'gallery' }) do if CONFIG[n] == nil then local ok, m = pcall(require, n) if ok then CONFIG[n] = m end end end") == LUA_OK then
+    if lua_pcall(L, 0, 0, 0) ~= LUA_OK then lua_pop(L, 1) end
+  else
+    lua_pop(L, 1)
+  end
 
   local t: cint = lua_gettop(L)
   read_settings(L, t)
@@ -449,6 +648,25 @@ global function policy_profile(i: integer): *Profile
   return &policy.profiles[i]
 end
 
+-- The profile called `name`, if any.
+global function policy_profile_named(name: string): *Profile
+  if #name == 0 then return nilptr end
+  for i = 0, < #policy.profiles do
+    if policy.profiles[i].name == name then return &policy.profiles[i] end
+  end
+  return nilptr
+end
+
+-- The profile a new terminal opens for profile `p`: its `fallback` instead
+-- while the agent is down (no agent answered the last attempt), when the
+-- fallback names a local (conpty) profile. Otherwise `p`.
+global function policy_open_profile(p: *Profile, agent_down: boolean): *Profile
+  if p == nilptr or not agent_down or p.transport ~= 'agent' then return p end
+  local f = policy_profile_named(p.fallback)
+  if f == nilptr or f.transport ~= 'conpty' then return p end
+  return f
+end
+
 -- World panels ------------------------------------------------------------------
 -- Both call into CONFIG.world (lua/world.lua); a missing module disables the
 -- feature quietly.
@@ -484,6 +702,23 @@ global function policy_world_command(id: integer, args: string): string
   return err
 end
 
+-- CONFIG.world.kind(terminal_id) -> its anchor's kind ('pet', 'world', 'follow',
+-- 'orbit', 'hud'); '' without an anchor or an older lua/world.lua.
+global function policy_world_kind(id: integer): string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return string.copy('') end
+  if not push_world_fn(L, 'kind') then return string.copy('') end
+  lua_pushinteger(L, id)
+  local kind: string
+  if lua_pcall(L, 1, 1, 0) == LUA_OK and lua_type(L, -1) == LUA_TSTRING then
+    local len: usize = 0
+    local s = lua_tolstring(L, -1, &len)
+    kind = string.copy(string{data=(@*[0]byte)(s), size=len})
+  end
+  lua_pop(L, 3)
+  return kind
+end
+
 -- CONFIG.world.place(terminal_id, time, focused) -> placement table or nil (hidden).
 global function policy_world_place(id: integer, t: float64, focused: boolean): (boolean, WorldPlacement)
   local pl: WorldPlacement
@@ -503,6 +738,7 @@ global function policy_world_place(id: integer, t: float64, focused: boolean): (
     pl.z = (@float32)(lua_field_number(L, r, 'z', 0))
     pl.yaw = (@float32)(lua_field_number(L, r, 'yaw', 0))
     pl.pitch = (@float32)(lua_field_number(L, r, 'pitch', 0))
+    pl.roll = (@float32)(lua_field_number(L, r, 'roll', 0))
     pl.width = (@float32)(lua_field_number(L, r, 'width', 900))
     pl.height = (@float32)(lua_field_number(L, r, 'height', 520))
     pl.ppm = (@float32)(lua_field_number(L, r, 'pixels_per_yalm', 300))
@@ -519,6 +755,10 @@ global function policy_world_place(id: integer, t: float64, focused: boolean): (
     pl.light_g = (@float32)(lua_field_number(L, r, 'light_g', 1))
     pl.light_b = (@float32)(lua_field_number(L, r, 'light_b', 1))
     pl.light_shadows = lua_field_boolean(L, r, 'light_shadows', false)
+    pl.pet = lua_field_boolean(L, r, 'pet', false)
+    pl.order_prev = lua_field_boolean(L, r, 'order_prev', false)
+    pl.order_next = lua_field_boolean(L, r, 'order_next', false)
+    pl.hud = lua_field_boolean(L, r, 'hud', false)
     ok = true
   end
   lua_pop(L, 3)
@@ -592,6 +832,20 @@ global function policy_anim_key(t: float64): void
   lua_pop(L, 2)
 end
 
+-- CONFIG.animation.on_event(kind, time, a, b): something the character can
+-- react to (core/app/reactions.nelua): 'bell', 'done' (a = exit status, b =
+-- seconds the command ran, -1 unknown), 'output' (a = bytes this frame).
+global function policy_anim_event(kind: cstring, t: float64, a: float64, b: float64): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_anim_fn(L, 'on_event') then return end
+  lua_pushstring(L, kind)
+  lua_pushnumber(L, t)
+  lua_pushnumber(L, a)
+  lua_pushnumber(L, b)
+  if lua_pcall(L, 4, 0, 0) ~= LUA_OK then log_hook_error(L, POLICY_HOOK_ON_EVENT, 'animation.on_event') lua_pop(L, 1) end
+  lua_pop(L, 2)
+end
+
 -- CONFIG.world.resize(terminal_id, width, height): the user dragged a panel edge.
 global function policy_world_resize(id: integer, w: float64, h: float64): void
   local L = policy.L
@@ -601,6 +855,32 @@ global function policy_world_resize(id: integer, w: float64, h: float64): void
   lua_pushnumber(L, h)
   if lua_pcall(L, 3, 0, 0) ~= LUA_OK then log_hook_error(L, POLICY_HOOK_RESIZE, 'world.resize') lua_pop(L, 1) end
   lua_pop(L, 2)
+end
+
+-- CONFIG.world.dock(terminal_id, x, y, scale) -> nil or an error string: a
+-- carried panel let go at a side of the view (or with Ctrl) docks there as a
+-- HUD panel, its centre at (x, y) in fractions of the view, `scale` screen
+-- pixels per panel pixel.
+global function policy_world_dock(id: integer, x: float32, y: float32, scale: float32): string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return string.copy('no config') end
+  if not push_world_fn(L, 'dock') then return string.copy('lua/world.lua has no dock') end
+  lua_pushinteger(L, id)
+  lua_pushnumber(L, x)
+  lua_pushnumber(L, y)
+  lua_pushnumber(L, scale)
+  local err: string
+  if lua_pcall(L, 4, 1, 0) ~= LUA_OK or lua_type(L, -1) == LUA_TSTRING then
+    local len: usize = 0
+    local msg = lua_tolstring(L, -1, &len)
+    if msg ~= nilptr then
+      err = string.copy(string{data=(@*[0]byte)(msg), size=len})
+    else
+      err = string.copy('lua error')
+    end
+  end
+  lua_pop(L, 3)
+  return err
 end
 
 -- CONFIG.world.drop(terminal_id, pose) -> nil or an error string: a panel
@@ -731,6 +1011,87 @@ global function policy_settings_badge(): boolean
   return on
 end
 
+-- Tooltips and themes -----------------------------------------------------------------
+
+-- CONFIG.tooltips[key] (lua/tooltips.lua), or a copy of `fallback`. Asked
+-- only while a tooltip shows. The caller destroys the result.
+global function policy_tooltip(key: string, fallback: string): string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return fallback:copy() end
+  lua_getglobal(L, 'CONFIG')
+  local out: string
+  if lua_type(L, -1) == LUA_TTABLE then
+    lua_getfield(L, -1, 'tooltips')
+    if lua_type(L, -1) == LUA_TTABLE then
+      lua_pushlstring(L, (@cstring)(key.data), key.size)
+      lua_gettable(L, -2)
+      if lua_type(L, -1) == LUA_TSTRING then
+        local len: usize = 0
+        local p = lua_tolstring(L, -1, &len)
+        out = string.copy(string{data=(@*[0]byte)(p), size=len})
+      end
+      lua_pop(L, 1)
+    end
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 1)
+  if #out == 0 then return fallback:copy() end
+  return out
+end
+
+local function copy_string_at(L: *lua_State, idx: cint): string
+  local len: usize = 0
+  local p = lua_tolstring(L, idx, &len)
+  if p == nilptr then return (@string){} end
+  return string.copy(string{data=(@*[0]byte)(p), size=len})
+end
+
+-- /term theme [name]: CONFIG.themes.command lists the themes or names the
+-- one to switch to, which CONFIG.settings.set_theme applies and saves.
+-- Returns the message to show; the caller re-reads the settings.
+global function policy_theme_command(args: string): string
+  local L = policy.L
+  local msg: string
+  if L == nilptr or not policy.loaded then return msg end
+  lua_getglobal(L, 'CONFIG')
+  local c = lua_gettop(L)
+  if lua_type(L, c) ~= LUA_TTABLE then lua_pop(L, 1) return string.copy('themes: no configuration loaded') end
+  lua_getfield(L, c, 'themes')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return string.copy('themes: lua/themes.lua is missing') end
+  lua_getfield(L, -1, 'command')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return string.copy('themes: lua/themes.lua is missing') end
+  lua_pushlstring(L, (@cstring)(args.data), args.size)
+  lua_getfield(L, c, 'theme')
+  if lua_pcall(L, 2, 2, 0) ~= LUA_OK then
+    msg = copy_string_at(L, -1)
+    lua_pop(L, 3)
+    return msg
+  end
+  msg = copy_string_at(L, -2)
+  if lua_type(L, -1) == LUA_TSTRING then
+    local name = lua_gettop(L)
+    lua_getfield(L, c, 'settings')
+    local set_ok = false
+    if lua_type(L, -1) == LUA_TTABLE then
+      lua_getfield(L, -1, 'set_theme')
+      if lua_type(L, -1) == LUA_TFUNCTION then
+        lua_pushvalue(L, name)
+        set_ok = lua_pcall(L, 1, 0, 0) == LUA_OK
+        if not set_ok then lua_pop(L, 1) end
+      else
+        lua_pop(L, 1)
+      end
+    end
+    lua_pop(L, 1)
+    if not set_ok then -- no settings module: switch without saving
+      lua_pushvalue(L, name)
+      lua_setfield(L, c, 'theme')
+    end
+  end
+  lua_pop(L, 4) -- message, name, themes, CONFIG
+  return msg
+end
+
 -- Visual bell ---------------------------------------------------------------------
 -- CONFIG.bell.style(terminal_id) from lua/bell.lua, asked once per bell;
 -- false when it returns nil (the bell is off) or the module is missing.
@@ -849,4 +1210,444 @@ global function policy_showcase_delay(): float64
   if lua_type(L, -1) == LUA_TTABLE then d = lua_field_number(L, lua_gettop(L), 'start_delay', 4) end
   lua_pop(L, 2)
   return d
+end
+
+-- /term ask -----------------------------------------------------------------------
+-- CONFIG.assistant (lua/assistant.lua) decides what the assistant terminal
+-- runs; the core only opens it. The question travels as one argv element.
+global AssistantOpen = @record{
+  argv: vector(string),
+  transport: string,        -- "agent" | "conpty"
+  local_fallback: boolean,  -- agent: run the same argv over ConPTY while no agent answers
+  view: string,             -- "pet" | "tab" | "window"
+  label: string,
+}
+
+function AssistantOpen:destroy(): void
+  for i = 0, < #self.argv do self.argv[i]:destroy() end
+  self.argv:destroy()
+  self.transport:destroy()
+  self.view:destroy()
+  self.label:destroy()
+end
+
+local function push_assistant_fn(L: *lua_State, name: cstring): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'assistant')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, name)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  return true -- stack: CONFIG, assistant, fn
+end
+
+local function lua_string_at(L: *lua_State, idx: cint): string
+  local len: usize = 0
+  local p = lua_tolstring(L, idx, &len)
+  if p == nilptr then return string.copy('error object is not a string') end
+  return string.copy(string{data=(@*[0]byte)(p), size=len})
+end
+
+-- CONFIG.assistant.core_open(question): true and what to open, or false and
+-- why nothing opens (turned off, a bad command, no lua/assistant.lua).
+global function policy_assistant_open(question: string): (boolean, AssistantOpen, string)
+  local spec: AssistantOpen
+  local err: string
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_assistant_fn(L, 'core_open') then
+    err = string.copy('no assistant configuration (CONFIG.assistant, lua/assistant.lua)')
+    return false, spec, err
+  end
+  lua_pushlstring(L, (@cstring)(question.data), question.size)
+  if lua_pcall(L, 1, 2, 0) ~= LUA_OK then
+    err = lua_string_at(L, -1)
+    lua_pop(L, 3)
+    return false, spec, err
+  end
+  local ok = false
+  if lua_type(L, -2) == LUA_TTABLE then
+    local r: cint = lua_gettop(L) - 1
+    lua_getfield(L, r, 'argv')
+    read_string_list(L, -1, &spec.argv)
+    lua_pop(L, 1)
+    spec.transport = lua_field_string(L, r, 'transport', 'agent')
+    spec.local_fallback = lua_field_boolean(L, r, 'local_fallback', false)
+    spec.view = lua_field_string(L, r, 'view', 'pet')
+    spec.label = lua_field_string(L, r, 'label', 'assistant')
+    ok = #spec.argv > 0
+    if not ok then err = string.copy('assistant: empty command') end
+  elseif lua_type(L, -1) == LUA_TSTRING then
+    err = lua_string_at(L, -1)
+  else
+    err = string.copy('assistant.core_open returned nothing')
+  end
+  lua_pop(L, 4)
+  return ok, spec, err
+end
+
+-- CONFIG.assistant.core_exit(status, refused): the text shown when the
+-- assistant ends (or never started); a plain line when Lua has none.
+global function policy_assistant_exit(status: int32, refused: boolean): string
+  local L = policy.L
+  if L ~= nilptr and policy.loaded and push_assistant_fn(L, 'core_exit') then
+    lua_pushinteger(L, status)
+    lua_pushboolean(L, refused and 1 or 0)
+    if lua_pcall(L, 2, 1, 0) == LUA_OK and lua_type(L, -1) == LUA_TSTRING then
+      local text = lua_string_at(L, -1)
+      lua_pop(L, 3)
+      return text
+    end
+    lua_pop(L, 3)
+  end
+  return string.copy('\r\n[assistant exited]\r\n')
+end
+
+-- Self-test ------------------------------------------------------------------------
+-- require('selftest').run(suite, scratch) from lua/selftest.lua: one line per
+-- case, "name\tstatus\tmessage". False with the error when the module is
+-- missing or the call fails.
+global function policy_selftest(suite: string, scratch: string): (boolean, string)
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return false, string.copy('the Lua policy is not loaded') end
+  local top = lua_gettop(L)
+  lua_getglobal(L, 'require')
+  lua_pushstring(L, 'selftest')
+  local ok = lua_pcall(L, 1, 1, 0) == LUA_OK and lua_type(L, -1) == LUA_TTABLE
+  if ok then
+    lua_getfield(L, -1, 'run')
+    lua_pushlstring(L, (@cstring)(suite.data), suite.size)
+    lua_pushlstring(L, (@cstring)(scratch.data), scratch.size)
+    ok = lua_pcall(L, 2, 1, 0) == LUA_OK
+  end
+  local out: string
+  if lua_isstring(L, -1) ~= 0 then
+    local len: usize = 0
+    local p = lua_tolstring(L, -1, &len)
+    out = string.copy(string{data=(@*[0]byte)(p), size=len})
+  elseif ok then
+    ok = false
+    out = string.copy('selftest.run returned no text')
+  else
+    out = string.copy('selftest.run failed')
+  end
+  lua_settop(L, top)
+  return ok, out
+end
+
+-- Remote windows (lua/windows.lua) ----------------------------------------------
+
+local function push_windows_fn(L: *lua_State, name: cstring): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'windows')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, name)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  return true -- stack: CONFIG, windows, fn
+end
+
+-- CONFIG.windows.size(panel_id, window_w, window_h, chrome_px): the window's
+-- first frame arrived; its panel takes the window's aspect (`chrome_px` panel
+-- pixels above the picture for the title strip). False when it could not run.
+global function policy_windows_size(id: integer, w: integer, h: integer, chrome: float64): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_windows_fn(L, 'size') then return false end
+  lua_pushinteger(L, id)
+  lua_pushinteger(L, w)
+  lua_pushinteger(L, h)
+  lua_pushnumber(L, chrome)
+  local ok = lua_pcall(L, 4, 0, 0) == LUA_OK
+  if not ok then log_hook_error(L, POLICY_HOOK_RESIZE, 'windows.size') lua_pop(L, 1) end
+  lua_pop(L, 2)
+  return ok
+end
+
+-- Window panels saved with the layout (lua/windows.lua's window-state.lua).
+-- `key`, `match`, `title` are borrowed when saving, owned when read back.
+global WindowSaveEntry = @record{ id: integer, key: string, match: string, title: string }
+
+local function push_lstr(L: *lua_State, v: string, k: cstring): void
+  lua_pushlstring(L, (@cstring)(v.data), v.size)
+  lua_setfield(L, -2, k)
+end
+
+-- CONFIG.windows.save_state({ {id=, key=, match=, title=}, ... }): the anchors
+-- come from lua/world.lua by panel id.
+global function policy_windows_save(entries: *vector(WindowSaveEntry)): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_windows_fn(L, 'save_state') then return end
+  lua_createtable(L, (@cint)(#entries), 0)
+  for i = 0, < #entries do
+    local e = entries[i]
+    lua_createtable(L, 0, 4)
+    lua_pushinteger(L, e.id) lua_setfield(L, -2, 'id')
+    push_lstr(L, e.key, 'key')
+    push_lstr(L, e.match, 'match')
+    push_lstr(L, e.title, 'title')
+    lua_rawseti(L, -2, i + 1)
+  end
+  if lua_pcall(L, 1, 0, 0) ~= LUA_OK then log_hook_error(L, POLICY_HOOK_RESIZE, 'windows.save_state') lua_pop(L, 1) end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.windows.saved() -> { {key=, match=, title=}, ... } into `out` (owned strings).
+global function policy_windows_saved(out: *vector(WindowSaveEntry)): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_windows_fn(L, 'saved') then return end
+  if lua_pcall(L, 0, 1, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_RESIZE, 'windows.saved')
+    lua_pop(L, 3)
+    return
+  end
+  local t = lua_gettop(L)
+  if lua_type(L, t) == LUA_TTABLE then
+    local n = (@integer)(lua_rawlen(L, t))
+    for i = 1, n do
+      lua_rawgeti(L, t, i)
+      if lua_type(L, -1) == LUA_TTABLE then
+        local e = lua_gettop(L)
+        out:push(WindowSaveEntry{ key = lua_field_string(L, e, 'key', ''), match = lua_field_string(L, e, 'match', ''),
+          title = lua_field_string(L, e, 'title', '') })
+      end
+      lua_pop(L, 1)
+    end
+  end
+  lua_pop(L, 3)
+end
+
+-- CONFIG.windows.restore(panel_id, n): panel `panel_id` takes saved entry n's
+-- anchor (from 1). True when there was one.
+global function policy_windows_restore(id: integer, n: integer): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_windows_fn(L, 'restore') then return false end
+  lua_pushinteger(L, id)
+  lua_pushinteger(L, n)
+  local ok = false
+  if lua_pcall(L, 2, 1, 0) == LUA_OK then
+    ok = lua_toboolean(L, -1) ~= 0
+  else
+    log_hook_error(L, POLICY_HOOK_RESIZE, 'windows.restore')
+  end
+  lua_pop(L, 3)
+  return ok
+end
+
+-- CONFIG.windows.beside(panel_id, other_id, forward) -> nil or an error
+-- string: panel `panel_id` pinned to the right of panel `other_id`, facing
+-- the same way, `forward` yalms in front of it.
+global function policy_windows_beside(id: integer, other: integer, forward: float64): string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return string.copy('no config') end
+  if not push_windows_fn(L, 'beside') then return string.copy('lua/windows.lua has no beside') end
+  lua_pushinteger(L, id)
+  lua_pushinteger(L, other)
+  lua_pushnumber(L, forward)
+  local err: string
+  if lua_pcall(L, 3, 1, 0) ~= LUA_OK or lua_type(L, -1) == LUA_TSTRING then
+    local len: usize = 0
+    local msg = lua_tolstring(L, -1, &len)
+    err = msg ~= nilptr and string.copy(string{data=(@*[0]byte)(msg), size=len}) or string.copy('lua error')
+  end
+  lua_pop(L, 3)
+  return err
+end
+
+-- CONFIG.windows.pin(panel_id, args) -> nil or an error string: `/term pin`
+-- on a window panel moves it, keeping its size.
+global function policy_windows_pin(id: integer, args: string): string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return string.copy('no config') end
+  if not push_windows_fn(L, 'pin') then return string.copy('lua/windows.lua is not loaded (CONFIG.windows)') end
+  lua_pushinteger(L, id)
+  lua_pushlstring(L, (@cstring)(args.data), args.size)
+  local err: string
+  if lua_pcall(L, 2, 1, 0) ~= LUA_OK or lua_type(L, -1) == LUA_TSTRING then
+    local len: usize = 0
+    local msg = lua_tolstring(L, -1, &len)
+    if msg ~= nilptr then
+      err = string.copy(string{data=(@*[0]byte)(msg), size=len})
+    else
+      err = string.copy('lua error')
+    end
+  end
+  lua_pop(L, 3)
+  return err
+end
+
+-- Screenshot gallery (lua/gallery.lua) --------------------------------------------
+
+local function push_gallery_fn(L: *lua_State, name: cstring): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'gallery')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, name)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  return true -- stack: CONFIG, gallery, fn
+end
+
+-- CONFIG.gallery.tick(now, shown): watches the screenshot folder while a
+-- terminal is (or just was) on screen; true while its prompt should be drawn.
+global function policy_gallery_tick(now: float64, shown: boolean): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_gallery_fn(L, 'tick') then return false end
+  lua_pushnumber(L, now)
+  lua_pushboolean(L, shown and 1 or 0)
+  local draw = false
+  if lua_pcall(L, 2, 1, 0) == LUA_OK then
+    draw = lua_toboolean(L, -1) ~= 0
+  else
+    log_hook_error(L, POLICY_HOOK_GALLERY, 'gallery.tick')
+  end
+  lua_pop(L, 3)
+  return draw
+end
+
+-- CONFIG.gallery.draw(): the prompt's contents (ghostty.ui), inside its window.
+global function policy_gallery_draw(): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_gallery_fn(L, 'draw') then return end
+  if lua_pcall(L, 0, 0, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_GALLERY, 'gallery.draw')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.gallery.on_upload(id, status, text): an upload the shim finished.
+global function policy_gallery_uploaded(id: integer, status: integer, text: string): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_gallery_fn(L, 'on_upload') then return end
+  lua_pushinteger(L, id)
+  lua_pushinteger(L, status)
+  lua_pushlstring(L, (@cstring)(text.data), text.size)
+  if lua_pcall(L, 3, 0, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_GALLERY, 'gallery.on_upload')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.gallery.offer(path): put a file the plugin wrote itself in front of
+-- the share prompt (/term shot). True when lua/gallery.lua took it.
+global function policy_gallery_offer(path: string): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_gallery_fn(L, 'offer') then return false end
+  lua_pushlstring(L, (@cstring)(path.data), path.size)
+  if lua_pcall(L, 1, 0, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_GALLERY, 'gallery.offer')
+    lua_pop(L, 3)
+    return false
+  end
+  lua_pop(L, 2)
+  return true
+end
+
+-- CONFIG.gallery.command(args) -> the line to show for /term share; empty when
+-- the module is missing or failed (the error is logged).
+global function policy_gallery_command(args: string): string
+  local out: string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return out end
+  if not push_gallery_fn(L, 'command') then return string.copy('lua/gallery.lua is not loaded (CONFIG.gallery)') end
+  lua_pushlstring(L, (@cstring)(args.data), args.size)
+  if lua_pcall(L, 1, 1, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_GALLERY, 'gallery.command')
+  elseif lua_type(L, -1) == LUA_TSTRING then
+    out = copy_string_at(L, -1)
+  end
+  lua_pop(L, 3)
+  return out
+end
+
+-- The /ask panel (lua/ask.lua) ------------------------------------------------------
+
+local function push_ask_fn(L: *lua_State, name: cstring): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'ask')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, name)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  return true -- stack: CONFIG, ask, fn
+end
+
+-- CONFIG.ask.command(args) -> true when the panel took `/ask args`; else
+-- false, and the question for the assistant terminal (lua/assistant.lua) in
+-- `question` (owned). Without lua/ask.lua every /ask opens the terminal.
+global function policy_ask_command(args: string): (boolean, string)
+  local question: string
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_ask_fn(L, 'command') then return false, args:copy() end
+  lua_pushlstring(L, (@cstring)(args.data), args.size)
+  local handled = false
+  if lua_pcall(L, 1, 2, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_ASK, 'ask.command')
+    lua_pop(L, 3)
+    return false, args:copy()
+  end
+  handled = lua_toboolean(L, -2) ~= 0
+  if not handled then
+    if lua_type(L, -1) == LUA_TSTRING then question = copy_string_at(L, -1) else question = args:copy() end
+  end
+  lua_pop(L, 4)
+  return handled, question
+end
+
+-- CONFIG.ask.tick(now) -> shown, focus: the panel is up; `focus` once when
+-- it should take the keyboard (opened or asked from the chat box).
+global function policy_ask_tick(now: float64): (boolean, boolean)
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_ask_fn(L, 'tick') then return false, false end
+  lua_pushnumber(L, now)
+  local shown, focus = false, false
+  if lua_pcall(L, 1, 2, 0) == LUA_OK then
+    shown = lua_toboolean(L, -2) ~= 0
+    focus = lua_toboolean(L, -1) ~= 0
+    lua_pop(L, 2)
+  else
+    log_hook_error(L, POLICY_HOOK_ASK, 'ask.tick')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+  return shown, focus
+end
+
+-- CONFIG.ask.draw(): the panel's contents (ghostty.ui), inside its window.
+global function policy_ask_draw(): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_ask_fn(L, 'draw') then return end
+  if lua_pcall(L, 0, 0, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_ASK, 'ask.draw')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.ask.on_line(job, line): one line of a job's output (no line end).
+global function policy_ask_line(job: integer, line: string): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_ask_fn(L, 'on_line') then return end
+  lua_pushinteger(L, job)
+  lua_pushlstring(L, (@cstring)(line.data), line.size)
+  if lua_pcall(L, 2, 0, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_ASK, 'ask.on_line')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.ask.on_exit(job, status, refused): the job ended (refused: it never
+-- started, e.g. the agent could not run the command).
+global function policy_ask_exit(job: integer, status: integer, refused: boolean): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_ask_fn(L, 'on_exit') then return end
+  lua_pushinteger(L, job)
+  lua_pushinteger(L, status)
+  lua_pushboolean(L, refused and 1 or 0)
+  if lua_pcall(L, 3, 0, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_ASK, 'ask.on_exit')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
 end

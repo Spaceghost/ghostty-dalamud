@@ -1,0 +1,170 @@
+-- UTF-8 <-> UTF-16 for the Windows wide file APIs, so a path with a non-ASCII
+-- character in it (a player's Windows user name, a plugin folder under it)
+-- survives the trip into FindFirstFileW, CreateDirectoryW and the rest.
+-- Windows' ANSI entry points go through the active code page, which cannot
+-- spell most names, while everything above this file speaks UTF-8.
+--
+-- On Windows the conversion is MultiByteToWideChar/WideCharToMultiByte with
+-- CP_UTF8, so it matches what the OS itself does with the bytes. On POSIX no
+-- wide API is called, but the same sources build for the host tests, so a
+-- small UTF-8 <-> UTF-16 conversion written here stands in and is what
+-- tests/test_winpath.nelua round-trips.
+require 'string'
+require 'stringbuilder'
+require 'io'
+
+-- uint16 units in a wide path buffer, the terminating nul included. Windows'
+-- own MAX_PATH is 260; a path built from a known folder plus the game's
+-- screenshot folders is longer than that but nowhere near this.
+global WINPATH_MAX: usize <comptime> = 1024
+
+## if ccinfo.is_windows then
+## cinclude '<windows.h>'
+-- the string arguments are `pointer` so C converts them to the real LPWSTR /
+-- LPCSTR of the prototype in windows.h (nodecl: that prototype is the one used)
+local function MultiByteToWideChar(cp: cuint, flags: uint32, s: pointer, slen: cint, out: pointer, outlen: cint): cint <cimport, nodecl> end
+local function WideCharToMultiByte(cp: cuint, flags: uint32, w: pointer, wlen: cint, out: pointer, outlen: cint, def: pointer, used: pointer): cint <cimport, nodecl> end
+local CP_UTF8: cuint <comptime> = 65001
+local function CreateFileW(path: pointer, access: uint32, share: uint32, sa: pointer, disp: uint32, flags: uint32, tmpl: pointer): pointer <cimport, nodecl> end
+local function ReadFile(h: pointer, buf: pointer, n: uint32, got: *uint32, ov: pointer): cint <cimport, nodecl> end
+local function GetFileSizeEx(h: pointer, size: *int64): cint <cimport, nodecl> end
+local function CloseHandle(h: pointer): cint <cimport, nodecl> end
+local INVALID_HANDLE_VALUE: pointer <cimport, nodecl, const>
+local GENERIC_READ: uint32 <comptime> = 0x80000000
+local FILE_SHARE_READ: uint32 <comptime> = 1
+local OPEN_EXISTING: uint32 <comptime> = 3
+local READ_CHUNK: usize <comptime> = 0x400000 -- ReadFile counts in uint32
+## end
+
+-- UTF-8 `s` into `out` as nul-terminated UTF-16; `cap` counts uint16 units,
+-- the nul included. Returns the units written without the nul, or -1 when the
+-- conversion fails or does not fit.
+global function winpath_wide(s: string, out: *[0]uint16, cap: usize): isize
+  if cap == 0 then return -1 end
+  if s.size == 0 then out[0] = 0 return 0 end
+  ## if ccinfo.is_windows then
+    local n = MultiByteToWideChar(CP_UTF8, 0, (@pointer)(s.data), (@cint)(s.size), (@pointer)(&out[0]), (@cint)(cap - 1))
+    if n <= 0 then return -1 end
+    out[(@usize)(n)] = 0
+    return (@isize)(n)
+  ## else
+    local w: usize = 0
+    local i: usize = 0
+    while i < s.size do
+      local c: uint32 = s.data[i]
+      local cp: uint32 = 0xFFFD -- a byte that is not a sequence we know becomes U+FFFD
+      local len: usize = 1
+      local b1: uint32, b2: uint32, b3: uint32 = 0, 0, 0 -- the continuation bytes, when they are there
+      if i + 1 < s.size then b1 = (@uint32)(s.data[i + 1]) & 0x3F end
+      if i + 2 < s.size then b2 = (@uint32)(s.data[i + 2]) & 0x3F end
+      if i + 3 < s.size then b3 = (@uint32)(s.data[i + 3]) & 0x3F end
+      if c < 0x80 then
+        cp = c
+      elseif (c & 0xE0) == 0xC0 and i + 1 < s.size then
+        cp = (@uint32)(((c & 0x1F) << 6) | b1)
+        len = 2
+      elseif (c & 0xF0) == 0xE0 and i + 2 < s.size then
+        cp = (@uint32)(((c & 0x0F) << 12) | (b1 << 6) | b2)
+        len = 3
+      elseif (c & 0xF8) == 0xF0 and i + 3 < s.size then
+        cp = (@uint32)(((c & 0x07) << 18) | (b1 << 12) | (b2 << 6) | b3)
+        len = 4
+      end
+      i = i + len
+      if cp > 0x10FFFF or (cp >= 0xD800 and cp <= 0xDFFF) then cp = 0xFFFD end
+      if cp >= 0x10000 then
+        if w + 2 >= cap then return -1 end
+        local v: uint32 = cp - 0x10000
+        out[w] = (@uint16)(0xD800 | (v >> 10))
+        out[w + 1] = (@uint16)(0xDC00 | (v & 0x3FF))
+        w = w + 2
+      else
+        if w + 1 >= cap then return -1 end
+        out[w] = (@uint16)(cp)
+        w = w + 1
+      end
+    end
+    out[w] = 0
+    return (@isize)(w)
+  ## end
+end
+
+-- Nul-terminated UTF-16 `w` as a new UTF-8 string (the caller destroys it);
+-- empty when the conversion fails.
+global function winpath_utf8(w: *[0]uint16): string
+  if w == nilptr or w[0] == 0 then return (@string){} end
+  ## if ccinfo.is_windows then
+    local n = WideCharToMultiByte(CP_UTF8, 0, (@pointer)(&w[0]), -1, nilptr, 0, nilptr, nilptr)
+    if n <= 1 then return (@string){} end -- 1: the nul alone
+    local s = string.create((@usize)(n - 1))
+    if WideCharToMultiByte(CP_UTF8, 0, (@pointer)(&w[0]), -1, (@pointer)(s.data), n, nilptr, nilptr) <= 0 then
+      s:destroy()
+      return (@string){}
+    end
+    return s
+  ## else
+    local sb: stringbuilder
+    local i: usize = 0
+    while w[i] ~= 0 do
+      local u: uint32 = w[i]
+      i = i + 1
+      if u >= 0xD800 and u <= 0xDBFF and w[i] >= 0xDC00 and w[i] <= 0xDFFF then
+        u = (@uint32)(0x10000 + ((u - 0xD800) << 10) + ((@uint32)(w[i]) - 0xDC00))
+        i = i + 1
+      elseif u >= 0xD800 and u <= 0xDFFF then
+        u = 0xFFFD -- a surrogate with no partner
+      end
+      if u < 0x80 then
+        sb:writebyte((@byte)(u))
+      elseif u < 0x800 then
+        sb:writebyte((@byte)(0xC0 | (u >> 6)))
+        sb:writebyte((@byte)(0x80 | (u & 0x3F)))
+      elseif u < 0x10000 then
+        sb:writebyte((@byte)(0xE0 | (u >> 12)))
+        sb:writebyte((@byte)(0x80 | ((u >> 6) & 0x3F)))
+        sb:writebyte((@byte)(0x80 | (u & 0x3F)))
+      else
+        sb:writebyte((@byte)(0xF0 | (u >> 18)))
+        sb:writebyte((@byte)(0x80 | ((u >> 12) & 0x3F)))
+        sb:writebyte((@byte)(0x80 | ((u >> 6) & 0x3F)))
+        sb:writebyte((@byte)(0x80 | (u & 0x3F)))
+      end
+    end
+    return sb:promote()
+  ## end
+end
+
+-- The whole of `path`, or an empty string when it cannot be read (the caller
+-- destroys it). This exists because Lua's and the CRT's own open are ANSI on
+-- Windows: a file under a folder the active code page cannot spell does not
+-- open at all, however correct its UTF-8 name is. Anything in the core that
+-- reads a shipped file by path (the fallback fonts of core/glyphfb.nelua, for
+-- one) wants this rather than io.open.
+global function winpath_read_file(path: string): string
+  ## if ccinfo.is_windows then
+    local w: [WINPATH_MAX]uint16
+    if winpath_wide(path, (@*[0]uint16)(&w), WINPATH_MAX) < 0 then return (@string){} end
+    local h = CreateFileW((@pointer)(&w), GENERIC_READ, FILE_SHARE_READ, nilptr, OPEN_EXISTING, 0, nilptr)
+    if h == INVALID_HANDLE_VALUE then return (@string){} end
+    local size: int64 = 0
+    if GetFileSizeEx(h, &size) == 0 or size <= 0 then CloseHandle(h) return (@string){} end
+    local s = string.create((@usize)(size))
+    local at: usize = 0
+    while at < s.size do
+      local want: usize = s.size - at
+      if want > READ_CHUNK then want = READ_CHUNK end
+      local got: uint32 = 0
+      if ReadFile(h, (@pointer)(&s.data[at]), (@uint32)(want), &got, nilptr) == 0 or got == 0 then break end
+      at = at + (@usize)(got)
+    end
+    CloseHandle(h)
+    if at < s.size then s:destroy() return (@string){} end
+    return s
+  ## else
+    local f = io.open(path, 'rb')
+    if not f:isopen() then f:destroy() return (@string){} end
+    local data = f:read('a')
+    f:destroy()
+    return data
+  ## end
+end

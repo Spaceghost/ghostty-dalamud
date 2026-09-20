@@ -1,0 +1,395 @@
+-- Remote window frames (docs/REMOTE_WINDOWS.md): which parts of a window
+-- changed, their pixels as QOI chunk streams, and the WFRAME payloads that
+-- carry them. Pure: no sockets, no GPU. The agent encodes, the plugin
+-- decodes, tests/test_wincodec.nelua checks both on the host.
+--
+-- Pixels are BGRA, rows top to bottom, alpha ignored (decoded as 255).
+require 'vector'
+require 'memory'
+require 'math'
+require 'core.protocol'
+
+global WinRect = @record{ x: uint16, y: uint16, w: uint16, h: uint16 }
+
+global WINCODEC_TILE: integer <comptime> = 32
+global WINCODEC_ENC_RAW: uint8 <comptime> = 0
+global WINCODEC_ENC_QOI: uint8 <comptime> = 1
+global WINCODEC_FLAG_KEY: uint8 <comptime> = 1
+global WINCODEC_FLAG_END: uint8 <comptime> = 2
+global WINCODEC_FRAME_HEAD: usize <comptime> = 4 + 4 + 2 + 2 + 1 + 2 -- sid, seq, w, h, flags, nrect
+global WINCODEC_RECT_HEAD: usize <comptime> = 2 * 4 + 1 + 4           -- x, y, w, h, enc, len
+-- rectangles are cut into bands no larger than this raw, so every one fits a frame
+global WINCODEC_BAND_BYTES: integer <comptime> = 1024 * 1024
+-- a WFRAME's payload stops growing past this (well under PROTO_MAX_PAYLOAD)
+global WINCODEC_FRAME_BUDGET: usize <comptime> = 2 * 1024 * 1024
+
+-- Changed tiles ---------------------------------------------------------------
+
+local function tile_differs(a: *[0]uint8, a_stride: usize, b: *[0]uint8, b_stride: usize, x: integer, y: integer, w: integer, h: integer): boolean
+  local n = (@usize)(w * 4)
+  for row = y, < y + h do
+    local pa = (@*[0]uint8)(&a[(@usize)(row) * a_stride + (@usize)(x * 4)])
+    local pb = (@*[0]uint8)(&b[(@usize)(row) * b_stride + (@usize)(x * 4)])
+    -- alpha is ignored: compare the three colour bytes of each pixel
+    for i: usize = 0, < n, 4 do
+      if pa[i] ~= pb[i] or pa[i+1] ~= pb[i+1] or pa[i+2] ~= pb[i+2] then return true end
+    end
+  end
+  return false
+end
+
+-- The rectangles where `cur` differs from `prev` (both w x h), tile by tile:
+-- runs of changed tiles in a tile row become one rectangle, and a rectangle
+-- that continues one directly above with the same span grows it instead.
+-- `prev` nilptr: the whole window.
+global function wincodec_diff(prev: *[0]uint8, prev_stride: usize, cur: *[0]uint8, cur_stride: usize,
+                              w: integer, h: integer, out: *vector(WinRect)): void
+  out:clear()
+  if w <= 0 or h <= 0 then return end
+  if prev == nilptr then
+    out:push(WinRect{ x = 0, y = 0, w = (@uint16)(w), h = (@uint16)(h) })
+    return
+  end
+  local T = WINCODEC_TILE
+  local y = 0
+  while y < h do
+    local th = math.min(T, h - y)
+    local row_first = #out
+    local x = 0
+    while x < w do
+      local tw = math.min(T, w - x)
+      if tile_differs(prev, prev_stride, cur, cur_stride, x, y, tw, th) then
+        local x0 = x
+        x = x + tw
+        while x < w do
+          local tw2 = math.min(T, w - x)
+          if not tile_differs(prev, prev_stride, cur, cur_stride, x, y, tw2, th) then break end
+          x = x + tw2
+        end
+        local r = WinRect{ x = (@uint16)(x0), y = (@uint16)(y), w = (@uint16)(x - x0), h = (@uint16)(th) }
+        -- grow a rectangle that ends on the row above with exactly this span
+        local merged = false
+        for k = 0, < row_first do
+          local a = &out[k]
+          if a.x == r.x and a.w == r.w and (@integer)(a.y) + (@integer)(a.h) == y then
+            a.h = a.h + r.h
+            merged = true
+            break
+          end
+        end
+        if not merged then out:push(r) end
+      else
+        x = x + tw
+      end
+    end
+    y = y + th
+  end
+end
+
+-- Scaling --------------------------------------------------------------------
+
+-- Shrink a w x h frame by the smallest integer factor that fits max_w x max_h
+-- (0: no limit that way), each output pixel the average of its factor x
+-- factor box (fewer at the right and bottom edges, so nothing is cut off).
+-- Returns (factor, out_w, out_h). Factor 1: nothing is written, use `src` as
+-- it is; otherwise `out` holds out_w x out_h pixels, stride out_w * 4, alpha 255.
+global function wincodec_downscale(src: *[0]uint8, stride: usize, w: integer, h: integer,
+                                   max_w: integer, max_h: integer, out: *vector(uint8)): (integer, integer, integer)
+  local f = 1
+  if max_w > 0 and w > max_w then f = math.max(f, (w + max_w - 1) // max_w) end
+  if max_h > 0 and h > max_h then f = math.max(f, (h + max_h - 1) // max_h) end
+  if f == 1 or w <= 0 or h <= 0 then return 1, w, h end
+  local ow, oh = (w + f - 1) // f, (h + f - 1) // f
+  out:resize((@usize)(ow * oh * 4))
+  local o = (@*[0]uint8)(&out[0])
+  for oy = 0, < oh do
+    local y0 = oy * f
+    local y1 = math.min(y0 + f, h)
+    for ox = 0, < ow do
+      local x0 = ox * f
+      local x1 = math.min(x0 + f, w)
+      local sb: uinteger, sg: uinteger, sr: uinteger = 0, 0, 0
+      for y = y0, < y1 do
+        local p = (@*[0]uint8)(&src[(@usize)(y) * stride])
+        for x = x0, < x1 do
+          sb = sb + p[x*4] sg = sg + p[x*4+1] sr = sr + p[x*4+2]
+        end
+      end
+      local n = (@uinteger)((y1 - y0) * (x1 - x0))
+      local i = (oy * ow + ox) * 4
+      o[i], o[i+1], o[i+2], o[i+3] = (@uint8)((sb + n // 2) // n), (@uint8)((sg + n // 2) // n), (@uint8)((sr + n // 2) // n), 255
+    end
+  end
+  return f, ow, oh
+end
+
+-- QOI ------------------------------------------------------------------------
+-- The chunk format of https://qoiformat.org without header or end marker.
+-- Alpha is always 255, so QOI_OP_RGBA never appears.
+
+local QOI_OP_INDEX: uint8 <comptime> = 0x00
+local QOI_OP_DIFF: uint8 <comptime> = 0x40
+local QOI_OP_LUMA: uint8 <comptime> = 0x80
+local QOI_OP_RUN: uint8 <comptime> = 0xc0
+local QOI_OP_RGB: uint8 <comptime> = 0xfe
+local QOI_OP_RGBA: uint8 <comptime> = 0xff
+local QOI_MASK: uint8 <comptime> = 0xc0
+
+local function qoi_hash(r: uint8, g: uint8, b: uint8): usize
+  return ((@usize)(r) * 3 + (@usize)(g) * 5 + (@usize)(b) * 7 + 255 * 11) % 64
+end
+
+-- Append the rectangle (x, y, w, h) of `src` to `out` as QOI chunks.
+global function wincodec_qoi_encode(src: *[0]uint8, stride: usize, x: integer, y: integer, w: integer, h: integer, out: *vector(uint8)): void
+  local index: [64]uint32
+  memory.zero(&index, #index)
+  local pr: uint8, pg: uint8, pb: uint8 = 0, 0, 0
+  local run = 0
+  -- worst case 4 bytes a pixel; reserve so pushes below never reallocate
+  local base = #out
+  out:resize(base + (@usize)(w * h * 4))
+  local o = (@*[0]uint8)(&out[0])
+  local n = base
+  for row = y, < y + h do
+    local p = (@*[0]uint8)(&src[(@usize)(row) * stride + (@usize)(x * 4)])
+    for i = 0, < w do
+      local b, g, r = p[i*4], p[i*4+1], p[i*4+2]
+      if r == pr and g == pg and b == pb then
+        run = run + 1
+        if run == 62 then
+          o[n] = QOI_OP_RUN | 61 n = n + 1
+          run = 0
+        end
+      else
+        if run > 0 then
+          o[n] = QOI_OP_RUN | (@uint8)(run - 1) n = n + 1
+          run = 0
+        end
+        local hi = qoi_hash(r, g, b)
+        local packed = (@uint32)(r) | ((@uint32)(g) << 8) | ((@uint32)(b) << 16) | 0xff000000
+        if index[hi] == packed then
+          o[n] = QOI_OP_INDEX | (@uint8)(hi) n = n + 1
+        else
+          index[hi] = packed
+          local vr: integer = (@int8)(r - pr)
+          local vg: integer = (@int8)(g - pg)
+          local vb: integer = (@int8)(b - pb)
+          local vg_r = vr - vg
+          local vg_b = vb - vg
+          if vr > -3 and vr < 2 and vg > -3 and vg < 2 and vb > -3 and vb < 2 then
+            o[n] = QOI_OP_DIFF | (@uint8)((vr + 2) << 4) | (@uint8)((vg + 2) << 2) | (@uint8)(vb + 2) n = n + 1
+          elseif vg_r > -9 and vg_r < 8 and vg > -33 and vg < 32 and vg_b > -9 and vg_b < 8 then
+            o[n] = QOI_OP_LUMA | (@uint8)(vg + 32)
+            o[n+1] = (@uint8)((vg_r + 8) << 4) | (@uint8)(vg_b + 8)
+            n = n + 2
+          else
+            o[n] = QOI_OP_RGB o[n+1] = r o[n+2] = g o[n+3] = b
+            n = n + 4
+          end
+        end
+        pr, pg, pb = r, g, b
+      end
+    end
+  end
+  if run > 0 then o[n] = QOI_OP_RUN | (@uint8)(run - 1) n = n + 1 end
+  out:resize(n)
+end
+
+-- Decode `len` bytes of QOI chunks into the rectangle (x, y, w, h) of `dst`
+-- (BGRA, `stride` bytes a row). False when the data is short, long or broken;
+-- whatever decoded before that stays written.
+global function wincodec_qoi_decode(data: *[0]uint8, len: usize, dst: *[0]uint8, stride: usize,
+                                    x: integer, y: integer, w: integer, h: integer): boolean
+  local index: [64]uint32
+  memory.zero(&index, #index)
+  local r: uint8, g: uint8, b: uint8 = 0, 0, 0
+  local run = 0
+  local pos: usize = 0
+  for row = y, < y + h do
+    local p = (@*[0]uint8)(&dst[(@usize)(row) * stride + (@usize)(x * 4)])
+    for i = 0, < w do
+      if run > 0 then
+        run = run - 1
+      else
+        if pos >= len then return false end
+        local b1 = data[pos]
+        pos = pos + 1
+        if b1 == QOI_OP_RGB then
+          if pos + 3 > len then return false end
+          r, g, b = data[pos], data[pos+1], data[pos+2]
+          pos = pos + 3
+        elseif b1 == QOI_OP_RGBA then
+          if pos + 4 > len then return false end
+          r, g, b = data[pos], data[pos+1], data[pos+2]
+          pos = pos + 4
+        elseif b1 & QOI_MASK == QOI_OP_INDEX then
+          local v = index[b1]
+          r, g, b = (@uint8)(v & 0xff), (@uint8)((v >> 8) & 0xff), (@uint8)((v >> 16) & 0xff)
+        elseif b1 & QOI_MASK == QOI_OP_DIFF then
+          r = r + ((b1 >> 4) & 3) - 2
+          g = g + ((b1 >> 2) & 3) - 2
+          b = b + (b1 & 3) - 2
+        elseif b1 & QOI_MASK == QOI_OP_LUMA then
+          if pos >= len then return false end
+          local b2 = data[pos]
+          pos = pos + 1
+          local vg = (b1 & 0x3f) - 32
+          g = g + vg
+          r = r + vg - 8 + ((b2 >> 4) & 0x0f)
+          b = b + vg - 8 + (b2 & 0x0f)
+        else -- QOI_OP_RUN
+          run = (@integer)(b1 & 0x3f)
+        end
+        index[qoi_hash(r, g, b)] = (@uint32)(r) | ((@uint32)(g) << 8) | ((@uint32)(b) << 16) | 0xff000000
+      end
+      p[i*4], p[i*4+1], p[i*4+2], p[i*4+3] = b, g, r, 255
+    end
+  end
+  return pos == len and run == 0
+end
+
+-- WFRAME ---------------------------------------------------------------------
+
+-- Split rectangles whose raw pixels exceed WINCODEC_BAND_BYTES into bands of rows.
+global function wincodec_band(rects: *vector(WinRect)): void
+  local i = 0
+  while i < #rects do
+    local r = rects[i]
+    local rows_max = math.max(1, WINCODEC_BAND_BYTES // math.max(1, (@integer)(r.w) * 4))
+    if (@integer)(r.h) > rows_max then
+      rects[i].h = (@uint16)(rows_max)
+      rects:insert(i + 1, WinRect{ x = r.x, y = r.y + (@uint16)(rows_max), w = r.w, h = r.h - (@uint16)(rows_max) })
+    end
+    i = i + 1
+  end
+end
+
+local function put_frame_head(q: *ByteQueue, sid: uint32, seq: uint32, w: uint16, h: uint16, flags: uint8, nrect: uint16, body_len: usize): void
+  local hd: [5 + WINCODEC_FRAME_HEAD]uint8
+  hd[0] = PROTO_WFRAME
+  proto.put_u32((@*[0]uint8)(&hd[1]), (@uint32)(WINCODEC_FRAME_HEAD + body_len))
+  proto.put_u32((@*[0]uint8)(&hd[5]), sid)
+  proto.put_u32((@*[0]uint8)(&hd[9]), seq)
+  proto.put_u16((@*[0]uint8)(&hd[13]), w)
+  proto.put_u16((@*[0]uint8)(&hd[15]), h)
+  hd[17] = flags
+  proto.put_u16((@*[0]uint8)(&hd[18]), nrect)
+  q:push(&hd, #hd)
+end
+
+-- Encode `rects` of `src` (w x h, `stride`) and append the WFRAMEs of one
+-- `seq` to `q`: as many as the budget needs, the last one flagged END.
+-- `key`: the rectangles cover the whole window. `scratch` is reused between
+-- calls to keep allocations down. Returns the bytes appended.
+global function wincodec_write_frames(q: *ByteQueue, sid: uint32, seq: uint32, src: *[0]uint8, stride: usize,
+                                      w: integer, h: integer, key: boolean, rects: *vector(WinRect),
+                                      scratch: *vector(uint8), body: *vector(uint8)): usize
+  local before = q:len()
+  wincodec_band(rects)
+  body:clear()
+  local nrect = 0
+  local flags: uint8 = key and WINCODEC_FLAG_KEY or 0
+  for i = 0, < #rects do
+    local r = rects[i]
+    scratch:clear()
+    wincodec_qoi_encode(src, stride, r.x, r.y, r.w, r.h, scratch)
+    local raw_len = (@usize)(r.w) * (@usize)(r.h) * 4
+    local enc = WINCODEC_ENC_QOI
+    local len = (@usize)(#scratch)
+    if len >= raw_len then enc, len = WINCODEC_ENC_RAW, raw_len end
+    if nrect > 0 and (@usize)(#body) + WINCODEC_RECT_HEAD + len > WINCODEC_FRAME_BUDGET then
+      put_frame_head(q, sid, seq, (@uint16)(w), (@uint16)(h), flags, (@uint16)(nrect), #body)
+      q:push((@*[0]uint8)(&body[0]), #body)
+      body:clear()
+      nrect = 0
+    end
+    local at = #body
+    body:resize(at + WINCODEC_RECT_HEAD + len)
+    local p = (@*[0]uint8)(&body[at])
+    proto.put_u16(p, r.x)
+    proto.put_u16((@*[0]uint8)(&p[2]), r.y)
+    proto.put_u16((@*[0]uint8)(&p[4]), r.w)
+    proto.put_u16((@*[0]uint8)(&p[6]), r.h)
+    p[8] = enc
+    proto.put_u32((@*[0]uint8)(&p[9]), (@uint32)(len))
+    local dst = (@*[0]uint8)(&p[WINCODEC_RECT_HEAD])
+    if enc == WINCODEC_ENC_QOI then
+      memory.copy(dst, &scratch[0], len)
+    else
+      for row = 0, < (@integer)(r.h) do
+        memory.copy(&dst[(@usize)(row) * (@usize)(r.w) * 4],
+          &src[((@usize)(r.y) + (@usize)(row)) * stride + (@usize)(r.x) * 4], (@usize)(r.w) * 4)
+      end
+    end
+    nrect = nrect + 1
+    if nrect == 0xffff then -- the count is 16 bits
+      put_frame_head(q, sid, seq, (@uint16)(w), (@uint16)(h), flags, (@uint16)(nrect), #body)
+      q:push((@*[0]uint8)(&body[0]), #body)
+      body:clear()
+      nrect = 0
+    end
+  end
+  put_frame_head(q, sid, seq, (@uint16)(w), (@uint16)(h), flags | WINCODEC_FLAG_END, (@uint16)(nrect), #body)
+  if #body > 0 then q:push((@*[0]uint8)(&body[0]), #body) end
+  return q:len() - before
+end
+
+-- A parsed WFRAME header; rectangles are walked with wincodec_next_rect.
+global WinFrame = @record{
+  sid: uint32, seq: uint32, w: uint16, h: uint16, flags: uint8, nrect: uint16,
+  data: *[0]uint8, len: usize, pos: usize, left: integer,
+}
+
+global WinFrameRect = @record{ r: WinRect, enc: uint8, data: *[0]uint8, len: usize }
+
+global function wincodec_parse(payload: *[0]uint8, len: usize): (boolean, WinFrame)
+  local f: WinFrame
+  if len < WINCODEC_FRAME_HEAD then return false, f end
+  f.sid = proto.get_u32(payload)
+  f.seq = proto.get_u32((@*[0]uint8)(&payload[4]))
+  f.w = proto.get_u16((@*[0]uint8)(&payload[8]))
+  f.h = proto.get_u16((@*[0]uint8)(&payload[10]))
+  f.flags = payload[12]
+  f.nrect = proto.get_u16((@*[0]uint8)(&payload[13]))
+  f.data, f.len, f.pos, f.left = payload, len, WINCODEC_FRAME_HEAD, f.nrect
+  return true, f
+end
+
+-- The next rectangle, or false at the end or on a malformed one (the rest is
+-- dropped). Rectangles outside the frame's size are malformed too.
+global function wincodec_next_rect(f: *WinFrame): (boolean, WinFrameRect)
+  local fr: WinFrameRect
+  if f.left <= 0 or f.pos + WINCODEC_RECT_HEAD > f.len then f.left = 0 return false, fr end
+  local p = (@*[0]uint8)(&f.data[f.pos])
+  fr.r = { x = proto.get_u16(p), y = proto.get_u16((@*[0]uint8)(&p[2])),
+           w = proto.get_u16((@*[0]uint8)(&p[4])), h = proto.get_u16((@*[0]uint8)(&p[6])) }
+  fr.enc = p[8]
+  fr.len = (@usize)(proto.get_u32((@*[0]uint8)(&p[9])))
+  if f.pos + WINCODEC_RECT_HEAD + fr.len > f.len
+     or (@integer)(fr.r.x) + (@integer)(fr.r.w) > (@integer)(f.w)
+     or (@integer)(fr.r.y) + (@integer)(fr.r.h) > (@integer)(f.h)
+     or (fr.enc == WINCODEC_ENC_RAW and fr.len ~= (@usize)(fr.r.w) * (@usize)(fr.r.h) * 4) then
+    f.left = 0
+    return false, fr
+  end
+  fr.data = (@*[0]uint8)(&p[WINCODEC_RECT_HEAD])
+  f.pos = f.pos + WINCODEC_RECT_HEAD + fr.len
+  f.left = f.left - 1
+  return true, fr
+end
+
+-- Write one rectangle's pixels into `dst` (the frame's w x h, `stride`).
+global function wincodec_apply_rect(fr: *WinFrameRect, dst: *[0]uint8, stride: usize): boolean
+  local r = fr.r
+  if fr.enc == WINCODEC_ENC_RAW then
+    for row = 0, < (@integer)(r.h) do
+      local d = (@*[0]uint8)(&dst[((@usize)(r.y) + (@usize)(row)) * stride + (@usize)(r.x) * 4])
+      memory.copy(d, &fr.data[(@usize)(row) * (@usize)(r.w) * 4], (@usize)(r.w) * 4)
+      for i = 0, < (@integer)(r.w) do d[i*4+3] = 255 end
+    end
+    return true
+  elseif fr.enc == WINCODEC_ENC_QOI then
+    return wincodec_qoi_decode(fr.data, fr.len, dst, stride, r.x, r.y, r.w, r.h)
+  end
+  return false
+end

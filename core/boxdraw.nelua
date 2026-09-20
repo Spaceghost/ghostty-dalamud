@@ -1,0 +1,286 @@
+-- Cell-filling glyphs drawn as geometry instead of font glyphs, as Ghostty
+-- does: box drawing (U+2500..257F), block elements (U+2580..259F), braille
+-- (U+2800..28FF) and the powerline separators (U+E0B0..E0BF). Fonts either
+-- lack these or draw them with gaps between cells; shapes line up exactly.
+require 'math'
+require 'core.imgui'
+
+-- The four arms of each box-drawing character, up/right/down/left:
+-- 0 none, 1 light, 2 heavy, 3 double. '....' marks the ones drawn by hand
+-- (dashes, arcs, diagonals).
+local BOX_ARMS: string = [[
+0101020210102020................................0110021001200220
+0011001200210022110012002100220010011002200120021110121021101120
+2120221012202220101110122011102120212012102220220111011202110212
+0121012202210222110111021201120221012102220122021111111212111212
+211111212121211222111122122122121222212222212222................
+0303303003100130033000130031003313003100330010033001300313103130
+3330101330313033031301310333130331013303131331313333............
+................000110000100001000022000020000200201102001022010]]
+
+-- Whether `cp` is drawn here rather than through the font.
+global function boxdraw_handles(cp: uint32): boolean
+  return (cp >= 0x2500 and cp <= 0x259F) or (cp >= 0x2800 and cp <= 0x28FF) or
+    (cp >= 0xE0B0 and cp <= 0xE0BF)
+end
+
+local snap_px: boolean = true
+
+local function s(v: float32): float32
+  if snap_px then return math.floor(v + 0.5) end
+  return v
+end
+
+local function fill(dl: *ImDrawList, x0: float32, y0: float32, x1: float32, y1: float32, col: uint32): void
+  x0 = s(x0) y0 = s(y0) x1 = s(x1) y1 = s(y1)
+  -- a line never rounds away to nothing
+  if x1 <= x0 then x1 = x0 + 1 end
+  if y1 <= y0 then y1 = y0 + 1 end
+  imgui.DrawListAddRectFilled(dl, vec2(x0, y0), vec2(x1, y1), col, 0.0, 0)
+end
+
+local function hline(dl: *ImDrawList, x0: float32, x1: float32, yc: float32, t: float32, col: uint32): void
+  fill(dl, x0, yc - t * 0.5, x1, yc + t * 0.5, col)
+end
+
+local function vline(dl: *ImDrawList, y0: float32, y1: float32, xc: float32, t: float32, col: uint32): void
+  fill(dl, xc - t * 0.5, y0, xc + t * 0.5, y1, col)
+end
+
+local function arm(code: uint32): integer
+  return (@integer)(code) - 48
+end
+
+-- Half the width an arm occupies across its axis.
+local function half(k: integer, lw: float32): float32
+  if k == 3 then return lw * 1.5 end
+  return k * lw * 0.5
+end
+
+local function single(k: integer): boolean return k == 1 or k == 2 end
+
+local function draw_arms(dl: *ImDrawList, u: integer, r: integer, d: integer, l: integer, x: float32, y: float32, w: float32, h: float32, lw: float32, col: uint32): void
+  local cx = x + w * 0.5
+  local cy = y + h * 0.5
+  local g = lw -- double lines sit at centre ± g
+  -- single and heavy arms reach past the centre by the widest perpendicular arm
+  local ext_h = math.max(single(u) and half(u, lw) or 0, single(d) and half(d, lw) or 0)
+  local ext_v = math.max(single(l) and half(l, lw) or 0, single(r) and half(r, lw) or 0)
+  local vdouble = u == 3 or d == 3
+  local hdouble = l == 3 or r == 3
+
+  if single(r) then
+    local x0 = cx - ext_h
+    if vdouble and l == 0 then x0 = cx + g - lw * 0.5 end
+    hline(dl, x0, x + w, cy, r * lw, col)
+  end
+  if single(l) then
+    local x1 = cx + ext_h
+    if vdouble and r == 0 then x1 = cx - g + lw * 0.5 end
+    hline(dl, x, x1, cy, l * lw, col)
+  end
+  if single(d) then
+    local y0 = cy - ext_v
+    if hdouble and u == 0 then y0 = cy + g - lw * 0.5 end
+    vline(dl, y0, y + h, cx, d * lw, col)
+  end
+  if single(u) then
+    local y1 = cy + ext_v
+    if hdouble and d == 0 then y1 = cy - g + lw * 0.5 end
+    vline(dl, y, y1, cx, u * lw, col)
+  end
+
+  local hw = lw * 0.5
+  if r == 3 then
+    local top = cx
+    if u == 3 then top = cx + g elseif d == 3 then top = cx - g end
+    local bot = cx
+    if d == 3 then bot = cx + g elseif u == 3 then bot = cx - g end
+    hline(dl, top - hw, x + w, cy - g, lw, col)
+    hline(dl, bot - hw, x + w, cy + g, lw, col)
+  end
+  if l == 3 then
+    local top = cx
+    if u == 3 then top = cx - g elseif d == 3 then top = cx + g end
+    local bot = cx
+    if d == 3 then bot = cx - g elseif u == 3 then bot = cx + g end
+    hline(dl, x, top + hw, cy - g, lw, col)
+    hline(dl, x, bot + hw, cy + g, lw, col)
+  end
+  if d == 3 then
+    local left = cy
+    if l == 3 then left = cy + g elseif r == 3 then left = cy - g end
+    local right = cy
+    if r == 3 then right = cy + g elseif l == 3 then right = cy - g end
+    vline(dl, left - hw, y + h, cx - g, lw, col)
+    vline(dl, right - hw, y + h, cx + g, lw, col)
+  end
+  if u == 3 then
+    local left = cy
+    if l == 3 then left = cy - g elseif r == 3 then left = cy + g end
+    local right = cy
+    if r == 3 then right = cy - g elseif l == 3 then right = cy + g end
+    vline(dl, y, left + hw, cx - g, lw, col)
+    vline(dl, y, right + hw, cx + g, lw, col)
+  end
+end
+
+-- Dashed lines: `n` dashes with gaps, centred in the cell.
+local function dashes(dl: *ImDrawList, horizontal: boolean, n: integer, t: float32, x: float32, y: float32, w: float32, h: float32, col: uint32): void
+  local len = horizontal and w or h
+  local seg = len / n
+  local gap = math.max(1.0, seg * 0.35)
+  for i = 0, < n do
+    local a = i * seg + gap * 0.5
+    local b = (i + 1) * seg - gap * 0.5
+    if horizontal then hline(dl, x + a, x + b, y + h * 0.5, t, col)
+    else vline(dl, y + a, y + b, x + w * 0.5, t, col) end
+  end
+end
+
+-- Rounded corners: a quarter circle joined to the two cell edges it faces.
+-- (sx, sy) point from the cell centre towards the arms.
+local function arc(dl: *ImDrawList, sx: float32, sy: float32, x: float32, y: float32, w: float32, h: float32, lw: float32, col: uint32): void
+  local cx = x + w * 0.5
+  local cy = y + h * 0.5
+  local r = math.min(w, h) * 0.5
+  local pts: [12]ImVec2
+  local ox = cx + sx * r
+  local oy = cy + sy * r
+  pts[0] = vec2(cx, sy > 0 and y + h or y)
+  for i = 0, 9 do
+    local th = (@float32)(i) / 9.0 * (math.pi * 0.5)
+    pts[i + 1] = vec2(ox - sx * r * math.cos(th), oy - sy * r * math.sin(th))
+  end
+  pts[11] = vec2(sx > 0 and x + w or x, cy)
+  imgui.DrawListAddPolyline(dl, &pts[0], 12, col, 0, lw)
+end
+
+local function quadrants(dl: *ImDrawList, bits: integer, x: float32, y: float32, w: float32, h: float32, col: uint32): void
+  local mx = x + w * 0.5
+  local my = y + h * 0.5
+  if bits & 1 ~= 0 then fill(dl, x, y, mx, my, col) end
+  if bits & 2 ~= 0 then fill(dl, mx, y, x + w, my, col) end
+  if bits & 4 ~= 0 then fill(dl, x, my, mx, y + h, col) end
+  if bits & 8 ~= 0 then fill(dl, mx, my, x + w, y + h, col) end
+end
+
+-- Quadrant masks for U+2596..259F (1 upper left, 2 upper right, 4 lower left, 8 lower right).
+local QUADRANTS: [10]integer = { 4, 8, 1, 13, 9, 7, 11, 2, 6, 14 }
+
+local function blocks(dl: *ImDrawList, cp: uint32, x: float32, y: float32, w: float32, h: float32, col: uint32): void
+  if cp == 0x2580 then fill(dl, x, y, x + w, y + h * 0.5, col)
+  elseif cp <= 0x2588 then -- lower eighths through the full block
+    local k = (@float32)(cp - 0x2580) / 8.0
+    fill(dl, x, y + h * (1 - k), x + w, y + h, col)
+  elseif cp <= 0x258F then -- left seven eighths down to one eighth
+    local k = (@float32)(0x2590 - cp) / 8.0
+    fill(dl, x, y, x + w * k, y + h, col)
+  elseif cp == 0x2590 then fill(dl, x + w * 0.5, y, x + w, y + h, col)
+  elseif cp <= 0x2593 then -- shades
+    local a = (col >> 24) & 0xFF
+    local k: uint32 = cp - 0x2590 -- 1..3 quarters
+    fill(dl, x, y, x + w, y + h, (col & 0x00FFFFFF) | ((a * k // 4) << 24))
+  elseif cp == 0x2594 then fill(dl, x, y, x + w, y + h / 8, col)
+  elseif cp == 0x2595 then fill(dl, x + w * 7 / 8, y, x + w, y + h, col)
+  else quadrants(dl, QUADRANTS[cp - 0x2596], x, y, w, h, col) end
+end
+
+-- Braille: dots 1-3 and 7 down the left column, 4-6 and 8 down the right.
+local BRAILLE_COL: [8]integer = { 0, 0, 0, 1, 1, 1, 0, 1 }
+local BRAILLE_ROW: [8]integer = { 0, 1, 2, 0, 1, 2, 3, 3 }
+
+local function braille(dl: *ImDrawList, bits: uint32, x: float32, y: float32, w: float32, h: float32, col: uint32): void
+  local d = math.max(1.0, math.floor(w / 4 + 0.5))
+  for i = 0, < 8 do
+    if bits & (1 << i) ~= 0 then
+      local px = x + w * (BRAILLE_COL[i] * 2 + 1) / 4 - d * 0.5
+      local py = y + h * (BRAILLE_ROW[i] * 2 + 1) / 8 - d * 0.5
+      fill(dl, px, py, px + d, py + d, col)
+    end
+  end
+end
+
+local function tri(dl: *ImDrawList, ax: float32, ay: float32, bx: float32, by: float32, cx: float32, cy: float32, col: uint32): void
+  imgui.DrawListAddTriangleFilled(dl, vec2(ax, ay), vec2(bx, by), vec2(cx, cy), col)
+end
+
+-- A half ellipse bulging right (dir 1) or left (dir -1) from the edge it sits on.
+local function half_disc(dl: *ImDrawList, dir: float32, filled: boolean, x: float32, y: float32, w: float32, h: float32, lw: float32, col: uint32): void
+  local ex = dir > 0 and x or x + w
+  local cy = y + h * 0.5
+  local pts: [17]ImVec2
+  for i = 0, 16 do
+    local th = -math.pi * 0.5 + (@float32)(i) / 16.0 * math.pi
+    pts[i] = vec2(ex + dir * w * math.cos(th), cy + h * 0.5 * math.sin(th))
+  end
+  if filled then
+    for i = 0, < 16 do tri(dl, ex, cy, pts[i].x, pts[i].y, pts[i + 1].x, pts[i + 1].y, col) end
+  else
+    imgui.DrawListAddPolyline(dl, &pts[0], 17, col, 0, lw)
+  end
+end
+
+local function powerline(dl: *ImDrawList, cp: uint32, x: float32, y: float32, w: float32, h: float32, lw: float32, col: uint32): void
+  local cy = y + h * 0.5
+  local r = x + w
+  local b = y + h
+  if cp == 0xE0B0 then tri(dl, x, y, r, cy, x, b, col)
+  elseif cp == 0xE0B2 then tri(dl, r, y, x, cy, r, b, col)
+  elseif cp == 0xE0B1 or cp == 0xE0B3 then
+    local pts: [3]ImVec2
+    if cp == 0xE0B1 then pts = { vec2(x, y), vec2(r, cy), vec2(x, b) }
+    else pts = { vec2(r, y), vec2(x, cy), vec2(r, b) } end
+    imgui.DrawListAddPolyline(dl, &pts[0], 3, col, 0, lw)
+  elseif cp == 0xE0B4 then half_disc(dl, 1, true, x, y, w, h, lw, col)
+  elseif cp == 0xE0B5 then half_disc(dl, 1, false, x, y, w, h, lw, col)
+  elseif cp == 0xE0B6 then half_disc(dl, -1, true, x, y, w, h, lw, col)
+  elseif cp == 0xE0B7 then half_disc(dl, -1, false, x, y, w, h, lw, col)
+  elseif cp == 0xE0B8 then tri(dl, x, y, x, b, r, b, col)
+  elseif cp == 0xE0BA then tri(dl, r, y, r, b, x, b, col)
+  elseif cp == 0xE0BC then tri(dl, x, y, r, y, x, b, col)
+  elseif cp == 0xE0BE then tri(dl, x, y, r, y, r, b, col)
+  elseif cp == 0xE0B9 or cp == 0xE0BF then imgui.DrawListAddLine(dl, vec2(x, y), vec2(r, b), col, lw)
+  else imgui.DrawListAddLine(dl, vec2(r, y), vec2(x, b), col, lw) end
+end
+
+-- Draw `cp` (boxdraw_handles(cp) must hold) filling the cell at (x, y).
+-- `snap` aligns lines to whole pixels (2D); world panels pass false.
+global function boxdraw_draw(dl: *ImDrawList, cp: uint32, x: float32, y: float32, w: float32, h: float32, col: uint32, snap: boolean): void
+  snap_px = snap
+  local lw = math.max(1.0, math.floor(math.min(w, h * 0.5) / 8 + 0.5))
+  if cp >= 0x2800 and cp <= 0x28FF then braille(dl, cp - 0x2800, x, y, w, h, col) return end
+  if cp >= 0xE0B0 then powerline(dl, cp, x, y, w, h, lw, col) return end
+  if cp >= 0x2580 then blocks(dl, cp, x, y, w, h, col) return end
+  local i: usize = (cp - 0x2500) * 4
+  i = i + i // 64 -- the table's newlines
+  local arms: string = BOX_ARMS
+  local c0 = arms.data[i]
+  if c0 ~= 46 then -- '.'
+    draw_arms(dl, arm(c0), arm(arms.data[i + 1]), arm(arms.data[i + 2]), arm(arms.data[i + 3]), x, y, w, h, lw, col)
+    return
+  end
+  if cp >= 0x2504 and cp <= 0x250B then
+    local k = cp - 0x2504
+    dashes(dl, k % 4 < 2, k < 4 and 3 or 4, (k % 2 + 1) * lw, x, y, w, h, col)
+  elseif cp >= 0x254C and cp <= 0x254F then
+    local k = cp - 0x254C
+    dashes(dl, k < 2, 2, (k % 2 + 1) * lw, x, y, w, h, col)
+  elseif cp == 0x256D then arc(dl, 1, 1, x, y, w, h, lw, col)
+  elseif cp == 0x256E then arc(dl, -1, 1, x, y, w, h, lw, col)
+  elseif cp == 0x256F then arc(dl, -1, -1, x, y, w, h, lw, col)
+  elseif cp == 0x2570 then arc(dl, 1, -1, x, y, w, h, lw, col)
+  else -- U+2571..2573 diagonals
+    if cp ~= 0x2572 then imgui.DrawListAddLine(dl, vec2(x + w, y), vec2(x, y + h), col, lw) end
+    if cp ~= 0x2571 then imgui.DrawListAddLine(dl, vec2(x, y), vec2(x + w, y + h), col, lw) end
+  end
+end
+
+-- The single code point of a one-code-point UTF-8 grapheme, else 0.
+global function boxdraw_codepoint(p: *[0]uint8, len: usize): uint32
+  local b0 = p[0]
+  if len == 3 and b0 & 0xF0 == 0xE0 then
+    return ((@uint32)(b0 & 0x0F) << 12) | ((@uint32)(p[1] & 0x3F) << 6) | (@uint32)(p[2] & 0x3F)
+  end
+  return 0
+end

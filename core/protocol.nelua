@@ -26,8 +26,21 @@
 -- Version 1 agents greet with "ghostty-agent 1", report a failed OPEN or an
 -- unknown ATTACH id as ERR text, acknowledge ATTACH with OK "attached" and
 -- ignore `fed`; the client translates those into the version 2 events.
+--   WGEOM (agent -> client, additive): where the window and its popups are in
+--   a stream's picture; docs/REMOTE_WINDOWS.md. Clients that do not know it
+--   ignore it (the picture still maps input 1:1).
 --   CLIP_SET text -> OK            CLIP_GET -> CLIP text   (host system clipboard)
 --   TITLE   id, text (forwarded from OSC title changes seen by the agent; optional)
+--
+-- Version 3 adds remote desktop windows (docs/REMOTE_WINDOWS.md): WLIST,
+-- WOPEN, WACK, WINPUT, WCLOSE from the client; WLISTR, WOPENED, WFRAME, WEND
+-- from the agent. Clients send them only to agents greeting with version 3+.
+--
+-- Version 4 adds raw jobs (docs/JOBS.md): a process on pipes instead of a
+-- PTY, for a program whose output the client parses rather than draws --
+-- a Claude Code session in stream-json mode above all. JOPEN, JDATA, JCLOSE,
+-- JSIG, JATTACH from the client; JOPENED, JOUT, JEXIT from the agent.
+-- Clients send them only to agents greeting with version 4+.
 
 global proto = @record{}
 
@@ -41,6 +54,21 @@ global PROTO_DETACH: uint8 <comptime> = 7
 global PROTO_LIST: uint8 <comptime> = 8
 global PROTO_CLIP_SET: uint8 <comptime> = 9   -- text: put on the host's system clipboard
 global PROTO_CLIP_GET: uint8 <comptime> = 10  -- ask for the host's system clipboard
+global PROTO_WLIST: uint8 <comptime> = 11     -- version 3: desktop windows the agent can capture
+global PROTO_WOPEN: uint8 <comptime> = 12     -- req u32, wid u32, max_w u16, max_h u16, fps u8 [, match text]
+global PROTO_WACK: uint8 <comptime> = 13      -- sid, seq u32: frame presented
+global PROTO_WINPUT: uint8 <comptime> = 14    -- sid, kind u8, body
+global PROTO_WCLOSE: uint8 <comptime> = 15    -- sid
+global PROTO_JOPEN: uint8 <comptime> = 29     -- version 4: req u32, flags u8, argv... "\0\0" env... (docs/JOBS.md)
+global PROTO_JDATA: uint8 <comptime> = 30     -- jid, bytes for the job's stdin (no bytes: close its stdin)
+global PROTO_JCLOSE: uint8 <comptime> = 31    -- jid: kill the job
+global PROTO_JSIG: uint8 <comptime> = 32      -- jid, sig u8
+global PROTO_JATTACH: uint8 <comptime> = 33   -- jid: take over a kept job, with its replay
+-- Clips of the game's own frames (docs/CAPTURE.md): the plugin captures, the
+-- host encodes. Frames are QOI (or raw) BGRA, exactly as a window stream's are.
+global PROTO_COPEN: uint8 <comptime> = 37    -- req u32, kind u8 (0 gif, 1 mp4), w u16, h u16, fps u8
+global PROTO_CFRAME: uint8 <comptime> = 38   -- cid u32, seq u32, enc u8, pixels of the whole frame
+global PROTO_CEND: uint8 <comptime> = 39     -- cid u32, flags u8 (1: cancel, write nothing)
 
 global PROTO_OK: uint8 <comptime> = 16
 global PROTO_ERR: uint8 <comptime> = 17
@@ -50,8 +78,39 @@ global PROTO_EXIT: uint8 <comptime> = 20
 global PROTO_LISTR: uint8 <comptime> = 21
 global PROTO_CLIP: uint8 <comptime> = 22      -- reply to CLIP_GET: the clipboard text
 global PROTO_ATTACHED: uint8 <comptime> = 23  -- version 2: ATTACH replayed
+global PROTO_WLISTR: uint8 <comptime> = 24    -- lines "wid\tw\th\tapp\ttitle\n"
+global PROTO_WOPENED: uint8 <comptime> = 25   -- req u32, sid, w u16, h u16, title (sid 0: failed, text says why)
+global PROTO_WFRAME: uint8 <comptime> = 26    -- sid, seq u32, w u16, h u16, flags u8, nrect u16, rects
+global PROTO_WEND: uint8 <comptime> = 27      -- sid, reason
+global PROTO_WGEOM: uint8 <comptime> = 28     -- sid, seq u32, n u16, n x (x u16, y u16, w u16, h u16): window, then popups
+global PROTO_JOPENED: uint8 <comptime> = 34   -- req u32, jid u32, pid u32 (jid 0: failed, the text says why)
+global PROTO_JOUT: uint8 <comptime> = 35      -- jid, stream u8 (1 stdout, 2 stderr), bytes
+global PROTO_JEXIT: uint8 <comptime> = 36     -- jid, status i32 (128 + signal when killed)
+global PROTO_COPENED: uint8 <comptime> = 40   -- req u32, cid u32, text (cid 0: refused, the text says why)
+global PROTO_CDONE: uint8 <comptime> = 41     -- cid u32, status i32 (0 ok), the file's path or why not
 
-global PROTO_VERSION: integer <comptime> = 2
+-- JOPEN flags
+global JOB_FLAG_KEEP: uint8 <comptime> = 1    -- bit 0: outlive the connection; JATTACH picks it up again
+
+-- JOUT streams
+global JOB_OUT: uint8 <comptime> = 1
+global JOB_ERR: uint8 <comptime> = 2
+
+global JOB_NO_JOB: uint32 <comptime> = 0xFFFFFFFF -- JEXIT status for an unknown jid
+
+-- WINPUT kinds
+global WIN_INPUT_MOVE: uint8 <comptime> = 1   -- x i16, y i16
+global WIN_INPUT_BUTTON: uint8 <comptime> = 2 -- x i16, y i16, button u8, down u8
+global WIN_INPUT_WHEEL: uint8 <comptime> = 3  -- x i16, y i16, dx i16, dy i16 (1/120 notches)
+global WIN_INPUT_KEY: uint8 <comptime> = 4    -- hid u16, down u8, mods u8
+global WIN_INPUT_TEXT: uint8 <comptime> = 5   -- UTF-8
+global WIN_INPUT_FOCUS: uint8 <comptime> = 6
+global WIN_MOD_CTRL: uint8 <comptime> = 1
+global WIN_MOD_SHIFT: uint8 <comptime> = 2
+global WIN_MOD_ALT: uint8 <comptime> = 4
+global WIN_MOD_SUPER: uint8 <comptime> = 8
+
+global PROTO_VERSION: integer <comptime> = 4
 global PROTO_NO_SESSION: uint32 <comptime> = 0xFFFFFFFF -- EXIT status for an unknown id
 
 global PROTO_HEADER: usize <comptime> = 5

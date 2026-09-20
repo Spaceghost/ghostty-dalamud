@@ -1,0 +1,311 @@
+-- Shared pieces of the panels pulled in from the flat UI (docs/ADOPT.md):
+-- adopted ImGui windows (core/app/adopt.nelua) and the game's chat
+-- (core/app/chatpanel.nelua). Both are Sessions of kind Panel in host.world,
+-- so placement, pins, Alt + drag, close and sleeping come from the terminal
+-- code; worldview hands their content area to panel_content
+-- (core/app/panels.nelua).
+--
+-- Here: the fly-out from the flat position (the full-screen flight run
+-- backwards), the title strip with its "back to UI" button, and the calls
+-- into CONFIG.adopt (lua/adopt.lua).
+require 'core.app.terminal'
+require 'core.imgui_internal'
+require 'core.adopt'
+
+-- Panel pixels of the title strip above the content, and around the rest.
+global PANEL_TITLE: float32 <comptime> = 34
+global PANEL_PAD: float32 <comptime> = 10
+-- The "back to UI" button at the left end of the title strip.
+global PANEL_BACK_X: float32 <comptime> = 8
+global PANEL_BACK_Y: float32 <comptime> = 5
+global PANEL_BACK_W: float32 <comptime> = 118
+global PANEL_BACK_H: float32 <comptime> = 24
+
+-- Something was pulled or given back: core/app/panels.nelua saves the list.
+global panels_dirty: boolean = false
+
+-- Flight ------------------------------------------------------------------------------
+-- A panel pulled off the flat UI starts where the flat window was, drawn flat
+-- on the screen (worldview's full-screen flight at t = 1 with that rectangle),
+-- and eases into its place in the world (t -> 0).
+
+local Flight = @record{ id: integer, t: float32, v: float32, rect: ImVec4, at: float64 }
+local flights: vector(Flight)
+
+-- Start the fly-out of panel `id` from screen rectangle `rect` (x0, y0, x1, y1:
+-- the whole panel, title strip included).
+global function panel_flight_start(id: integer, rect: ImVec4): void
+  for i = 0, < #flights do
+    if flights[i].id == id then flights:remove(i) break end
+  end
+  if rect.z - rect.x < 8 or rect.w - rect.y < 8 then return end
+  flights:push(Flight{ id = id, t = 1, v = 0, rect = rect, at = host.last_time })
+end
+
+global function panel_flight_active(id: integer): boolean
+  for i = 0, < #flights do
+    if flights[i].id == id then return true end
+  end
+  return false
+end
+
+-- worldview, per panel of kind Panel (`w` x `h` pixels): while flying, the flat
+-- rectangle and the flight's t replace the full-screen ones.
+global function panel_flight(id: integer, ft: float32, flat: WorldFlat, full_this: boolean, w: float32, h: float32): (float32, WorldFlat, boolean)
+  for i = 0, < #flights do
+    local f = &flights[i]
+    if f.id == id then
+      if host.world_full_id == id then flights:remove(i) break end -- full screen asked for: that flight wins
+      local dt = (@float32)(math.clamp(host.last_time - f.at, 0, 0.1))
+      f.at = host.last_time
+      f.t, f.v = world_ease(f.t, f.v, 0, dt, math.max(host.world_tuning.full_ease, 0.05))
+      if f.t <= 0.002 then
+        flights:remove(i)
+        break
+      end
+      local vp = imgui.GetMainViewport().Pos
+      return f.t, world_flat_rect(ImVec4{ vp.x + f.rect.x, vp.y + f.rect.y, vp.x + f.rect.z, vp.y + f.rect.w }, w, h), true
+    end
+  end
+  return ft, flat, full_this
+end
+
+global function panel_flights_clear(): void
+  flights:destroy()
+end
+
+-- The title strip ---------------------------------------------------------------------
+
+-- The title strip of a pulled panel: its label and the "back to UI" button.
+-- Returns whether that button was clicked this frame.
+global function panel_title_strip(dl: *ImDrawList, vp: ImVec2, width: float32, label: string,
+                                  mu: float32, mv: float32, click: boolean, over_other: boolean): boolean
+  local r: ImVec4 = { PANEL_BACK_X, PANEL_BACK_Y, PANEL_BACK_X + PANEL_BACK_W, PANEL_BACK_Y + PANEL_BACK_H }
+  local hot = not over_other and adopt_in_rect(r, mu, mv)
+  imgui.DrawListAddRectFilled(dl, vec2(vp.x + r.x, vp.y + r.y), vec2(vp.x + r.z, vp.y + r.w),
+    hot and chrome_col(ChromeColor.Popin, 235) or chrome_col(ChromeColor.PopinIdle, 180), 5, 0)
+  local ink = chrome_col(ChromeColor.Ink, 255)
+  -- an arrow down into a flat bar: back onto the screen
+  local ax = vp.x + r.x + 14
+  local ay = vp.y + r.y + 5
+  imgui.DrawListAddLine(dl, vec2(ax, ay), vec2(ax, ay + 9), ink, 2)
+  imgui.DrawListAddTriangleFilled(dl, vec2(ax - 5, ay + 8), vec2(ax + 5, ay + 8), vec2(ax, ay + 13), ink)
+  imgui.DrawListAddLine(dl, vec2(ax - 7, ay + 15), vec2(ax + 7, ay + 15), ink, 2)
+  if host.api.push_world_font ~= nilptr then host.api.push_world_font() end
+  local size = imgui.GetFontSize() * 0.5
+  local text: cstring = 'back to UI'
+  imgui.DrawListAddText(dl, imgui.GetFont(), size, vec2(ax + 14, vp.y + r.y + (PANEL_BACK_H - size) * 0.5), ink, text, nilptr, 0, nilptr)
+  if #label > 0 then
+    local clip: ImVec4 = { vp.x + r.z + 8, vp.y, vp.x + width - WORLD_BUTTON_PITCH * WORLD_BUTTON_COUNT - 10, vp.y + PANEL_TITLE }
+    local z = label .. '\0' -- DrawListAddText wants the end or a NUL
+    imgui.DrawListAddText(dl, imgui.GetFont(), size * 1.2, vec2(clip.x + 4, vp.y + (PANEL_TITLE - size * 1.2) * 0.5),
+      im_col32(236, 228, 214, 235), (@cstring)(z.data), nilptr, 0, &clip)
+    z:destroy()
+  end
+  if host.api.pop_font ~= nilptr then host.api.pop_font() end
+  return hot and click
+end
+
+-- A line of status text in the content area (waiting, not drawn...).
+global function panel_status(dl: *ImDrawList, vp: ImVec2, width: float32, height: float32, a: string, b: string): void
+  if host.api.push_world_font ~= nilptr then host.api.push_world_font() end
+  local size = imgui.GetFontSize() * 0.6
+  local sb: stringbuilder
+  sb:write(a, b, '\0')
+  local z = sb:promote()
+  local clip: ImVec4 = { vp.x + PANEL_PAD, vp.y + PANEL_TITLE, vp.x + width - PANEL_PAD, vp.y + height - PANEL_PAD }
+  imgui.DrawListAddText(dl, imgui.GetFont(), size, vec2(vp.x + PANEL_PAD + 10, vp.y + PANEL_TITLE + 20),
+    chrome_col(ChromeColor.InkDim, 230), (@cstring)(z.data), nilptr, width - 2 * PANEL_PAD - 20, &clip)
+  z:destroy()
+  if host.api.pop_font ~= nilptr then host.api.pop_font() end
+end
+
+-- CONFIG.adopt (lua/adopt.lua) -------------------------------------------------------------
+
+-- CONFIG.adopt on the stack (1 pushed + CONFIG under it), or false with nothing pushed.
+local function push_adopt(L: *lua_State): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'adopt')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  return true
+end
+
+local function to_string(L: *lua_State, idx: cint): string
+  if lua_isstring(L, idx) == 0 then
+    local none: string
+    return none
+  end
+  local len: usize = 0
+  local p = lua_tolstring(L, idx, &len)
+  return string{data=(@*[0]byte)(p), size=len}:copy()
+end
+
+-- What CONFIG.adopt.resolve says about `name`: its kind ('imgui' | 'native',
+-- '' when refused), the window title, the plugin and the label; for a refusal
+-- the reason is in `title`. All owned.
+global function adopt_lua_resolve(name: string): (string, string, string, string)
+  local kind: string, title: string, plugin: string, label: string
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_adopt(L) then
+    return kind, string.copy('lua/adopt.lua is not loaded (CONFIG.adopt)'), plugin, label
+  end
+  lua_getfield(L, -1, 'resolve')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then
+    lua_pop(L, 3)
+    return kind, string.copy('CONFIG.adopt.resolve is missing'), plugin, label
+  end
+  lua_pushlstring(L, (@cstring)(name.data), name.size)
+  if lua_pcall(L, 1, 4, 0) ~= LUA_OK then
+    title = to_string(L, -1)
+    lua_pop(L, 3)
+    return kind, title, plugin, label
+  end
+  if lua_isstring(L, -4) ~= 0 then
+    kind = to_string(L, -4)
+    title = to_string(L, -3)
+    plugin = to_string(L, -2)
+    label = to_string(L, -1)
+  else
+    title = to_string(L, -3) -- nil, why
+    if #title == 0 then title = string.copy('not a window') end
+  end
+  lua_pop(L, 6)
+  return kind, title, plugin, label
+end
+
+-- CONFIG.adopt.size(id, w, h, chrome_w, chrome_h): the pet takes the window's size.
+global function adopt_lua_size(id: integer, w: float32, h: float32, chrome_w: float32, chrome_h: float32): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_adopt(L) then return end
+  lua_getfield(L, -1, 'size')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return end
+  lua_pushinteger(L, id)
+  lua_pushnumber(L, w)
+  lua_pushnumber(L, h)
+  lua_pushnumber(L, chrome_w)
+  lua_pushnumber(L, chrome_h)
+  if lua_pcall(L, 5, 0, 0) ~= LUA_OK then
+    local e = to_string(L, -1)
+    logf(LOG_WARN, 'adopt.size: %s', e)
+    e:destroy()
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.adopt.save(names): the names pulled, one per line.
+global function adopt_lua_save(names: string): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_adopt(L) then return end
+  lua_getfield(L, -1, 'save')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return end
+  lua_pushlstring(L, (@cstring)(names.data), names.size)
+  if lua_pcall(L, 1, 0, 0) ~= LUA_OK then lua_pop(L, 1) end
+  lua_pop(L, 2)
+end
+
+-- CONFIG.adopt[fn]() -> a string (owned; '' when it fails): saved() and
+-- auto_names(), names one per line.
+global function adopt_lua_names(fn: cstring): string
+  local out: string
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_adopt(L) then return out end
+  lua_getfield(L, -1, fn)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return out end
+  if lua_pcall(L, 0, 1, 0) == LUA_OK then out = to_string(L, -1) end
+  lua_pop(L, 3)
+  return out
+end
+
+-- CONFIG.adopt[field] as a string (owned; `def` when not one).
+global function adopt_lua_field(field: cstring, def: string): string
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_adopt(L) then return def:copy() end
+  local s = lua_field_string(L, -1, field, def)
+  lua_pop(L, 2)
+  return s
+end
+
+global function adopt_lua_bool(field: cstring, def: boolean): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_adopt(L) then return def end
+  local b = lua_field_boolean(L, -1, field, def)
+  lua_pop(L, 2)
+  return b
+end
+
+-- CONFIG.adopt[field] as a number.
+global function adopt_lua_number(field: cstring, def: float64): float64
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_adopt(L) then return def end
+  local n = lua_field_number(L, -1, field, def)
+  lua_pop(L, 2)
+  return n
+end
+
+-- CONFIG.adopt.crops(name): whether the pet crops window `name` to what it
+-- draws with its own textures (Mappy's map), leaving its margins out.
+global function adopt_lua_crops(name: string): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_adopt(L) then return false end
+  lua_getfield(L, -1, 'crops')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  lua_pushlstring(L, (@cstring)(name.data), #name)
+  local r = false
+  if lua_pcall(L, 1, 1, 0) == LUA_OK then r = lua_toboolean(L, -1) ~= 0 end
+  lua_pop(L, 3)
+  return r
+end
+
+-- CONFIG.adopt.chat[field] as a number.
+global function adopt_lua_chat_number(field: cstring, def: float64): float64
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_adopt(L) then return def end
+  lua_getfield(L, -1, 'chat')
+  local n = def
+  if lua_type(L, -1) == LUA_TTABLE then n = lua_field_number(L, -1, field, def) end
+  lua_pop(L, 3)
+  return n
+end
+
+-- CONFIG.adopt.chat.addons, one per line (owned).
+global function adopt_lua_chat_addons(): string
+  local sb: stringbuilder
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_adopt(L) then return sb:promote() end
+  lua_getfield(L, -1, 'chat')
+  if lua_type(L, -1) == LUA_TTABLE then
+    lua_getfield(L, -1, 'addons')
+    if lua_type(L, -1) == LUA_TTABLE then
+      local n = (@integer)(lua_rawlen(L, -1))
+      for i = 1, n do
+        lua_rawgeti(L, -1, i)
+        local s = to_string(L, -1)
+        if #s > 0 then sb:write(s, '\n') end
+        s:destroy()
+        lua_pop(L, 1)
+      end
+    end
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 3)
+  return sb:promote()
+end
+
+-- CONFIG.adopt.chat_colour(kind) -> the UiConfig option name (owned) and the
+-- built-in 0xRRGGBB colour.
+global function adopt_lua_chat_colour(kind: integer): (string, uint32)
+  local key: string
+  local rgb: uint32 = 0xdddddd
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_adopt(L) then return key, rgb end
+  lua_getfield(L, -1, 'chat_colour')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return key, rgb end
+  lua_pushinteger(L, kind)
+  if lua_pcall(L, 1, 2, 0) ~= LUA_OK then lua_pop(L, 3) return key, rgb end
+  key = to_string(L, -2)
+  if lua_type(L, -1) == LUA_TNUMBER then rgb = (@uint32)(lua_tointegerx(L, -1, nilptr)) end
+  lua_pop(L, 4)
+  return key, rgb
+end

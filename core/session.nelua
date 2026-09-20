@@ -8,9 +8,17 @@ require 'core.selection'
 require 'core.protocol'
 require 'core.agent_client'
 require 'core.sys.conpty'
+require 'core.sys.procpipe'
 require 'core.policy'
+require 'core.cmdwatch'
 
-global TransportKind = @enum(cint){ None = 0, Agent, ConPty, Superlogical }
+-- Window: a desktop window streamed by the agent (core/app/remotewin.nelua).
+-- Its terminal is a small local one that only shows status text; nothing
+-- typed into it goes anywhere.
+-- Panel: a world panel another module draws (a flat window pulled into the world, core/app/panels.nelua).
+-- Pipe: a local process on pipes, no terminal at all (core/sys/procpipe.nelua):
+-- the /ask panel's hidden assistant, whose output is parsed, not drawn.
+global TransportKind = @enum(cint){ None = 0, Agent, ConPty, Superlogical, Window, Panel, Pipe }
 
 global Session = @record{
   id: integer,
@@ -20,9 +28,12 @@ global Session = @record{
   kind: TransportKind,
   agent: *AgentClient,
   agent_id: uint32,
+  job: boolean,             -- Agent: a raw job on pipes (docs/JOBS.md), not a PTY; agent_id is its jid
+  job_req: uint32,          -- the JOPEN this session waits for (JOPENED answers by req)
   awaiting_open: boolean,
   keep_on_agent: boolean,   -- on destroy, detach and leave the shell running
   conpty: ConPty,
+  pipe: ProcPipe,
   title: string,
   label: string,
   exited: boolean,
@@ -39,6 +50,8 @@ global Session = @record{
   woke_at: float64,         -- host time it last woke (content fades in); 0 = never slept
   present_t: float32,       -- world panel: 0 placed .. 1 presented (floated toward you)
   present_v: float32,       -- its ease velocity
+  posed: boolean,           -- world panel: placed last frame at pose_* (where it was drawn, presented)
+  pose_x: float32, pose_y: float32, pose_z: float32, pose_yaw: float32, pose_pitch: float32,
   cell_w_px: uint32,
   cell_h_px: uint32,
   cell_w: float32,          -- cell size as last drawn, for mouse hit testing
@@ -47,6 +60,7 @@ global Session = @record{
   pending_out: ByteQueue,   -- bytes typed before the agent acknowledged OPEN
   unread: boolean,          -- output arrived while the tab was not visible
   bells: integer,           -- BEL characters received; the host turns new ones into the visual bell
+  cmd: CmdWatch,            -- OSC 133 command marks and output volume, for the character's reactions
   cols: uint16,
   rows: uint16,
   replaying: boolean,       -- the agent is replaying old output: libghostty's answers to it are dropped
@@ -54,6 +68,12 @@ global Session = @record{
   fed: uint64,              -- agent output bytes fed to the terminal (ATTACH asks only for the rest); FED_UNKNOWN after a lost replay
   open_argv: vector(string), -- what OPEN asks for, kept until the agent answers (a reconnect asks again)
   open_env: vector(string),
+  fallback: string,         -- the profile to switch to if the agent turns out to be down (Profile.fallback)
+  assistant: boolean,       -- /term ask: stays open after its process exits, which it announces itself
+  local_fallback: boolean,  -- agent down: run open_argv over ConPTY (an assistant on native Windows)
+  capture: boolean,         -- /ask panel: output goes to `captured` for core/app/ask.nelua, not the screen
+  captured: ByteQueue,
+  window_close: function(s: *Session): void, -- Window: let go of the stream (remotewin), once; Panel: give the window back
 }
 
 
@@ -62,7 +82,13 @@ global Session = @record{
 local FED_UNKNOWN: uint64 <comptime> = 0xffffffffffffffff_u64
 
 function Session:feed(data: *[0]uint8, len: usize): void
+  if self.capture then
+    self.captured:push(data, len)
+    if self.fed ~= FED_UNKNOWN then self.fed = self.fed + len end
+    return
+  end
   self.view:feed(data, len)
+  if self.replaying then self.cmd:reset_scan() else self.cmd:scan(data, len) end
   if self.fed ~= FED_UNKNOWN then self.fed = self.fed + len end
   self.unread = true
 end
@@ -76,11 +102,15 @@ function Session:write(data: *[0]uint8, len: usize): void
   if self.kind == TransportKind.Agent then
     if self.awaiting_open or self.agent == nilptr then
       self.pending_out:push(data, len)
+    elseif self.job then
+      self.agent:jdata(self.agent_id, data, len)
     else
       self.agent:write(self.agent_id, data, len)
     end
   elseif self.kind == TransportKind.ConPty then
     self.conpty:write(data, len)
+  elseif self.kind == TransportKind.Pipe then
+    self.pipe:write(data, len)
   end
 end
 
@@ -155,12 +185,29 @@ end
 -- sent (not connected); the host calls it again once the agent is ready.
 function Session:reopen(): boolean
   if self.kind ~= TransportKind.Agent or self.agent == nilptr or not self.awaiting_open or self.exited then return false end
+  if self.job then
+    -- an agent below version 4 has no jobs: the same command on a PTY, which
+    -- is what every agent before them did (its output may then be reflowed)
+    if not self.agent:jobs_ok() then
+      if self.agent.state == AgentState.Ready then
+        -- (core/app/agent.nelua logs it: this module is below the log)
+        self.job = false
+        self.job_req = 0
+      else
+        return false -- not connected yet: ask again once it is
+      end
+    else
+      self.job_req = self.agent:job_req()
+      return self.agent:jopen(self.job_req, 0, &self.open_argv, &self.open_env)
+    end
+  end
   return self.agent:open(self.cols, self.rows, &self.open_argv, &self.open_env)
 end
 
 -- Subscribe again to a running shell (wake, reconnect). The agent replays
 -- what this terminal has not seen; answers to it are dropped until ATTACHED.
 function Session:reattach(): void
+  if self.job then return end -- a job is not kept: it ends with the connection
   if self.kind ~= TransportKind.Agent or self.agent == nilptr or self.awaiting_open or self.exited then return end
   -- an earlier replay is still on its way and may reset the screen: counting it tells nothing
   if self.replaying then self.fed = FED_UNKNOWN end
@@ -180,29 +227,47 @@ function Session:init_local(id: integer, label: string, cols: uint16, rows: uint
   return true
 end
 
-function Session:init(id: integer, profile: *Profile, cols: uint16, rows: uint16, agent: *AgentClient): boolean
-  if not session_setup(self, id, cols, rows) then return false end
-  self.label = profile.name:copy()
-
-  if profile.transport == 'conpty' then
+-- Start the transport of a profile that does not need the agent.
+local function open_local_transport(self: *Session, profile: *Profile): void
+  if profile.transport == 'pipe' then
+    -- output that is parsed, not drawn: no pseudo console to reflow it
+    self.kind = TransportKind.Pipe
+    if not self.pipe:open(&profile.argv, profile.cwd) then
+      self:feed_text('\r\n[ghostty] the command could not be started on this machine.\r\n')
+      self.exited = true
+    end
+  elseif profile.transport == 'conpty' then
     self.kind = TransportKind.ConPty
-    if not self.conpty:open(&profile.argv, profile.cwd, cols, rows) then
+    if not self.conpty:open(&profile.argv, profile.cwd, self.cols, self.rows) then
       self:feed_text('\r\n[ghostty] ConPTY is unavailable on this host (needs Windows 10 1809+ or a recent Wine).\r\n')
       self.exited = true
     end
-  elseif profile.transport == 'superlogical' then
+  else
     self.kind = TransportKind.Superlogical
     self:feed_text('\r\n[ghostty] Superlogical support is waiting on its public client protocol.\r\n')
     self:feed_text('[ghostty] Until then use the "agent" transport, which streams raw PTY bytes the same way.\r\n')
     self.exited = true
+  end
+end
+
+function Session:init(id: integer, profile: *Profile, cols: uint16, rows: uint16, agent: *AgentClient): boolean
+  if not session_setup(self, id, cols, rows) then return false end
+  self.label = profile.name:copy()
+
+  if profile.transport == 'conpty' or profile.transport == 'superlogical' or profile.transport == 'pipe' then
+    open_local_transport(self, profile)
   else
     self.kind = TransportKind.Agent
+    -- 'job': the agent runs it on pipes instead of a PTY (docs/JOBS.md), for
+    -- output the plugin parses; it falls back to a PTY on an older agent
+    self.job = profile.transport == 'job'
     self.agent = agent
     if agent == nilptr then
       self:feed_text('\r\n[ghostty] no agent configured\r\n')
       self.exited = true
     else
       self.awaiting_open = true
+      self.fallback = profile.fallback:copy()
       -- copies: a reload replaces the profiles while this may still wait
       for i = 0, < #profile.argv do self.open_argv:push(profile.argv[i]:copy()) end
       for i = 0, < #profile.env do self.open_env:push(profile.env[i]:copy()) end
@@ -228,6 +293,12 @@ end
 -- running there). wake() reattaches; the agent sends what the terminal missed
 -- (or, when too much went by, resets it and replays what it kept).
 function Session:sleep(): void
+  if self.kind == TransportKind.Window or self.kind == TransportKind.Panel then
+    -- a window stream sleeps by not acknowledging frames (remotewin): the agent stops sending
+    if not self.exited then self.sleeping = true end
+    return
+  end
+  if self.job then return end -- nothing draws a job: it has no screen to stop streaming
   if self.kind ~= TransportKind.Agent or self.agent == nilptr or self.awaiting_open or self.sleeping or self.exited then return end
   self.agent:detach(self.agent_id)
   self.sleeping = true
@@ -249,16 +320,43 @@ local function free_open_request(self: *Session): void
   self.open_env:destroy()
 end
 
+-- An agent terminal still waiting for its shell when the agent turned out to
+-- be down: open its fallback profile here instead. Typed input goes along.
+function Session:use_fallback(profile: *Profile): void
+  if self.kind ~= TransportKind.Agent or not self.awaiting_open or self.exited then return end
+  free_open_request(self)
+  self.awaiting_open = false
+  self.agent = nilptr
+  self.job = false -- it runs here now, not as a job on the agent
+  self.job_req = 0
+  self.label:destroy()
+  self.label = profile.name:copy()
+  self:feed_text('[ghostty] no agent answered; opening the local fallback\r\n')
+  open_local_transport(self, profile)
+  if not self.exited and self.pending_out:len() > 0 then
+    if self.kind == TransportKind.ConPty then
+      self.conpty:write(self.pending_out:peek(), self.pending_out:len())
+    elseif self.kind == TransportKind.Pipe then
+      self.pipe:write(self.pending_out:peek(), self.pending_out:len())
+    end
+  end
+  self.pending_out:consume(self.pending_out:len())
+end
+
 -- Called by the host when the agent acknowledges OPEN.
 function Session:agent_opened(agent_id: uint32): void
   self.agent_id = agent_id
   self.awaiting_open = false
   free_open_request(self)
   if self.pending_out:len() > 0 then
-    self.agent:write(agent_id, self.pending_out:peek(), self.pending_out:len())
+    if self.job then
+      self.agent:jdata(agent_id, self.pending_out:peek(), self.pending_out:len())
+    else
+      self.agent:write(agent_id, self.pending_out:peek(), self.pending_out:len())
+    end
     self.pending_out:consume(self.pending_out:len())
   end
-  self.agent:resize(agent_id, self.cols, self.rows)
+  if not self.job then self.agent:resize(agent_id, self.cols, self.rows) end -- a job has no window size
 end
 
 -- ATTACHED: the replay for one ATTACH is complete; `total` is the output position then.
@@ -281,6 +379,13 @@ function Session:mark_exited(status: int32): void
   self.exited = true
   self.exit_status = status
   self.process_exited = true
+  if self.assistant then
+    -- lua/assistant.lua words it: a hint for a missing command (127), then "[assistant exited]"
+    local note = policy_assistant_exit(status, false)
+    self:feed_text(note)
+    note:destroy()
+    return
+  end
   local sb: stringbuilder
   sb:writef('\r\n\27[90m[process exited with status %d]\27[0m\r\n', status)
   local msg = sb:promote()
@@ -295,7 +400,7 @@ function Session:resize(cols: uint16, rows: uint16, cell_w_px: uint32, cell_h_px
   self.cols = cols
   self.rows = rows
   ghostty_key_encoder_setopt_from_terminal(self.encoder, self.view.term)
-  if self.kind == TransportKind.Agent and not self.awaiting_open and self.agent ~= nilptr then
+  if self.kind == TransportKind.Agent and not self.awaiting_open and self.agent ~= nilptr and not self.job then
     self.agent:resize(self.agent_id, cols, rows)
   elseif self.kind == TransportKind.ConPty then
     self.conpty:resize(cols, rows)
@@ -314,13 +419,28 @@ function Session:pump(): void
     if self.conpty:poll_exit() then
       self:mark_exited((@int32)(self.conpty.exit_code))
     end
+  elseif self.kind == TransportKind.Pipe and not self.exited then
+    local buf: [32768]uint8
+    local drained = false
+    for _ = 1, 8 do
+      local n = self.pipe:read(&buf, 32768)
+      if n == 0 then drained = true break end
+      self:feed(&buf, n)
+    end
+    -- the exit is only reported once the pipe is empty, so the last lines a
+    -- program wrote before exiting are not lost behind its status
+    if drained and self.pipe:poll_exit() then
+      self:mark_exited((@int32)(self.pipe.exit_code))
+    end
   end
   -- keep the key encoder in sync with terminal modes (kitty keyboard, app cursor keys)
   ghostty_key_encoder_setopt_from_terminal(self.encoder, self.view.term)
 end
 
 function Session:close(): void
-  if self.kind == TransportKind.Agent and self.agent ~= nilptr and not self.awaiting_open then
+  if self.kind == TransportKind.Agent and self.agent ~= nilptr and not self.awaiting_open and self.job then
+    self.agent:jclose(self.agent_id) -- jobs are never kept
+  elseif self.kind == TransportKind.Agent and self.agent ~= nilptr and not self.awaiting_open then
     if self.keep_on_agent then
       self.agent:detach(self.agent_id)
     else
@@ -328,6 +448,12 @@ function Session:close(): void
     end
   elseif self.kind == TransportKind.ConPty then
     self.conpty:close()
+  elseif self.kind == TransportKind.Pipe then
+    self.pipe:close()
+  elseif (self.kind == TransportKind.Window or self.kind == TransportKind.Panel) and self.window_close ~= nilptr then
+    local f = self.window_close
+    self.window_close = nilptr
+    f(self)
   end
   self.exited = true
 end
@@ -340,7 +466,9 @@ function Session:destroy(): void
   self.title:destroy()
   self.label:destroy()
   self.pending_out:destroy()
+  self.captured:destroy()
   free_open_request(self)
+  self.fallback:destroy()
   $self = {}
 end
 

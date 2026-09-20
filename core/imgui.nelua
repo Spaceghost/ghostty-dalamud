@@ -24,8 +24,15 @@ global ImDrawCmd <cimport, nodecl> = @record{
   UserCallbackData: pointer,
 }
 global ImVector_ImDrawCmd <cimport, nodecl> = @record{ Size: cint, Capacity: cint, Data: *[0]ImDrawCmd }
--- Only the buffers are used (world-space panels remap vertices after drawing).
-global ImDrawList <cimport, nodecl> = @record{ CmdBuffer: ImVector_ImDrawCmd, VtxBuffer: ImVector_ImDrawVert }
+global ImVector_ImDrawIdx <cimport, nodecl> = @record{ Size: cint, Capacity: cint, Data: *[0]uint16 }
+global ImDrawCmdHeader <cimport, nodecl> = @record{ ClipRect: ImVec4, TextureId: pointer, VtxOffset: cuint }
+-- Only the buffers are used (world-space panels remap vertices after drawing;
+-- /term selftest counts them), the texture of the next command, and the
+-- write cursors core/hudmask.nelua puts back after rewriting a list's tail.
+global ImDrawList <cimport, nodecl> = @record{
+  CmdBuffer: ImVector_ImDrawCmd, IdxBuffer: ImVector_ImDrawIdx, VtxBuffer: ImVector_ImDrawVert, _CmdHeader: ImDrawCmdHeader,
+  _VtxCurrentIdx: cuint, _VtxWritePtr: *ImDrawVert, _IdxWritePtr: *uint16,
+}
 global ImFont <cimport, nodecl> = @record{}
 global ImGuiViewport <cimport, nodecl> = @record{ ID: uint32, Flags: cint, Pos: ImVec2, Size: ImVec2, WorkPos: ImVec2, WorkSize: ImVec2 }
 global ImVector_ImWchar <cimport, nodecl> = @record{ Size: cint, Capacity: cint, Data: *[0]uint16 }
@@ -33,12 +40,14 @@ global ImVector_ImWchar <cimport, nodecl> = @record{ Size: cint, Capacity: cint,
 -- Only the ImGuiIO fields the plugin reads are declared; the C compiler uses
 -- the full definition from cimgui.h for offsets.
 global ImGuiIO <cimport, nodecl> = @record{
+  ConfigFlags: cint,
   DeltaTime: float32,
   DisplaySize: ImVec2,
   WantCaptureMouse: boolean,
   WantCaptureKeyboard: boolean,
   WantTextInput: boolean,
   MouseWheel: float32,
+  MouseWheelH: float32,
   KeyCtrl: boolean,
   KeyShift: boolean,
   KeyAlt: boolean,
@@ -81,6 +90,10 @@ global ImGuiIO <cimport, nodecl> = @record{
 ##  'ImDrawFlags_RoundCornersTop','ImGuiButtonFlags_MouseButtonLeft','ImGuiButtonFlags_MouseButtonMiddle',
 ##  'ImGuiCol_PopupBg','ImGuiCol_Border','ImGuiCol_ResizeGrip','ImGuiCol_ResizeGripHovered','ImGuiCol_ResizeGripActive',
 ##  'ImGuiStyleVar_PopupRounding','ImGuiStyleVar_PopupBorderSize','ImGuiSliderFlags_AlwaysClamp',
+##  'ImGuiCol_CheckMark','ImGuiCol_SliderGrab','ImGuiCol_SliderGrabActive',
+##  'ImGuiInputTextFlags_EnterReturnsTrue','ImGuiCol_Button','ImGuiCol_ButtonHovered','ImGuiCol_ButtonActive',
+##  'ImGuiCol_FrameBg','ImGuiCol_Header','ImGuiCol_HeaderHovered','ImGuiConfigFlags_NoMouseCursorChange',
+##  'ImGuiInputTextFlags_CtrlEnterForNewLine','ImGuiCol_ScrollbarBg','ImGuiCol_ScrollbarGrab',
 ## }
 ## for _, c in ipairs(consts) do
   global #|c|#: cint <cimport, nodecl, const>
@@ -170,6 +183,11 @@ global ImGuiApi = @record{
   DrawListPushClipRect: function(dl: *ImDrawList, min: ImVec2, max: ImVec2, intersect: boolean): void,
   DrawListPopClipRect: function(dl: *ImDrawList): void,
   FontCalcTextSizeA: function(pOut: *ImVec2, font: *ImFont, size: float32, max_width: float32, wrap_width: float32, text_begin: cstring, text_end: cstring, remaining: *cstring): void,
+  -- the font's glyph for a BMP code point (16-bit ImWchar), nilptr when it has none (core/glyphfb.nelua)
+  FontFindGlyphNoFallback: function(font: *ImFont, c: uint16): pointer,
+  -- the same, but a code point the font lacks gives its fallback glyph: how core/glyphfb.nelua
+  -- asks a cimgui that does not export ImFont_FindGlyphNoFallback
+  FontFindGlyph: function(font: *ImFont, c: uint16): pointer,
   -- raw triangles with per-vertex colour (soft gradients: the visual bell)
   DrawListPrimReserve: function(dl: *ImDrawList, idx_count: cint, vtx_count: cint): void,
   DrawListPrimVtx: function(dl: *ImDrawList, pos: ImVec2, uv: ImVec2, col: uint32): void,
@@ -189,6 +207,15 @@ global ImGuiApi = @record{
   CloseCurrentPopup: function(): void,
   -- callback: function(list: *ImDrawList, cmd: *ImDrawCmd): void, or IMDRAW_CALLBACK_RESET
   DrawListAddCallback: function(dl: *ImDrawList, callback: pointer, callback_data: pointer): void,
+  -- a textured rectangle (remote windows: the ImTextureID is Dalamud's D3D11 shader resource view)
+  DrawListAddImage: function(dl: *ImDrawList, tex: pointer, p_min: ImVec2, p_max: ImVec2, uv_min: ImVec2, uv_max: ImVec2, col: uint32): void,
+  -- a one-line text box (the Windows picker's Run:); callback unused (nilptr)
+  InputText: function(label: cstring, buf: cstring, buf_size: csize, flags: cint, callback: pointer, user_data: pointer): boolean,
+  -- the /ask panel's input box and its scrolled conversation (core/ui.nelua); optional
+  InputTextMultiline: function(label: cstring, buf: cstring, buf_size: csize, size: ImVec2, flags: cint, callback: pointer, user_data: pointer): boolean,
+  SetScrollHereY: function(center_y_ratio: float32): void,
+  GetScrollY: function(): float32,
+  GetScrollMaxY: function(): float32,
 }
 
 -- Draw-list callback that makes the renderer restore its own state. Dalamud's
@@ -224,13 +251,17 @@ global imgui: ImGuiApi
 ##  {'DrawListAddRectFilled','ImDrawList_AddRectFilled'},{'DrawListAddRect','ImDrawList_AddRect'},{'DrawListAddTriangleFilled','ImDrawList_AddTriangleFilled'},
 ##  {'DrawListAddLine','ImDrawList_AddLine'},{'DrawListAddText','ImDrawList_AddText_FontPtr'},
 ##  {'DrawListPushClipRect','ImDrawList_PushClipRect'},{'DrawListPopClipRect','ImDrawList_PopClipRect'},
-##  {'FontCalcTextSizeA','ImFont_CalcTextSizeA'},
+##  {'FontCalcTextSizeA','ImFont_CalcTextSizeA'},{'FontFindGlyphNoFallback','ImFont_FindGlyphNoFallback',true},{'FontFindGlyph','ImFont_FindGlyph',true},
 ##  {'DrawListPrimReserve','ImDrawList_PrimReserve'},{'DrawListPrimVtx','ImDrawList_PrimVtx'},
 ##  {'GetFontTexUvWhitePixel','igGetFontTexUvWhitePixel'},
 ##  {'DrawListAddCircle','ImDrawList_AddCircle'},{'DrawListAddCircleFilled','ImDrawList_AddCircleFilled'},{'DrawListAddPolyline','ImDrawList_AddPolyline'},
 ##  {'BeginTooltip','igBeginTooltip'},{'EndTooltip','igEndTooltip'},{'IsMouseDragging','igIsMouseDragging'},{'IsItemActivated','igIsItemActivated'},{'IsItemDeactivatedAfterEdit','igIsItemDeactivatedAfterEdit',true},
 ##  {'OpenPopup','igOpenPopup_Str'},{'BeginPopup','igBeginPopup'},{'EndPopup','igEndPopup'},{'CloseCurrentPopup','igCloseCurrentPopup'},
 ##  {'DrawListAddCallback','ImDrawList_AddCallback'},
+##  {'DrawListAddImage','ImDrawList_AddImage',true},
+##  {'InputText','igInputText',true},
+##  {'InputTextMultiline','igInputTextMultiline',true},{'SetScrollHereY','igSetScrollHereY',true},
+##  {'GetScrollY','igGetScrollY',true},{'GetScrollMaxY','igGetScrollMaxY',true},
 ## }
 
 global ImGuiResolver = @function(name: cstring): pointer

@@ -1,0 +1,198 @@
+-- The game's chat as a world panel: the pure parts (docs/ADOPT.md; the panel
+-- is core/app/chatpanel.nelua). A ring of the last lines the shim forwarded
+-- (gu_chat), word wrapping against a measuring function, and the input line.
+require 'string'
+require 'vector'
+require 'math'
+
+global CHATLOG_MAX_LINES <comptime> = 500
+global CHATLOG_MAX_TEXT <comptime> = 2000   -- bytes kept of one message
+global CHATLOG_INPUT_MAX <comptime> = 500   -- the game's chat box takes 500 UTF-8 bytes
+
+global ChatLine = @record{
+  kind: uint16,       -- XivChatType (the channel, 0..127)
+  seq: uint64,        -- monotonic, 1 for the first line ever
+  sender: string,     -- plain UTF-8, may be empty (owned)
+  text: string,       -- plain UTF-8 (owned)
+}
+
+-- The last CHATLOG_MAX_LINES lines, oldest first from `head`.
+global ChatRing = @record{
+  lines: vector(ChatLine),
+  head: integer,
+  next_seq: uint64,
+}
+
+-- A copy of `s` cut to `max` bytes on a character boundary, with control
+-- characters (newlines included) turned into spaces.
+global function chatlog_clean(s: string, max: integer): string
+  local n = math.min(#s, max)
+  -- never end inside a UTF-8 sequence
+  if n < #s then
+    while n > 0 and (s.data[n] & 0xC0) == 0x80 do n = n - 1 end
+  end
+  local sb: stringbuilder
+  for i = 0, < n do
+    local c = s.data[i]
+    if c < 32 or c == 127 then sb:writebyte(' '_b) else sb:writebyte(c) end
+  end
+  return sb:promote()
+end
+
+global function chatlog_push(r: *ChatRing, kind: integer, sender: string, text: string): void
+  r.next_seq = r.next_seq + 1
+  local line: ChatLine = {
+    kind = (@uint16)(kind & 0x7F), seq = r.next_seq,
+    sender = chatlog_clean(sender, 128), text = chatlog_clean(text, CHATLOG_MAX_TEXT),
+  }
+  if #r.lines < CHATLOG_MAX_LINES then
+    r.lines:push(line)
+  else
+    local old = &r.lines[r.head]
+    old.sender:destroy()
+    old.text:destroy()
+    r.lines[r.head] = line
+    r.head = (r.head + 1) % CHATLOG_MAX_LINES
+  end
+end
+
+global function chatlog_count(r: *ChatRing): integer
+  return #r.lines
+end
+
+-- Line `i`, 0 the oldest kept.
+global function chatlog_line(r: *ChatRing, i: integer): *ChatLine
+  if i < 0 or i >= #r.lines then return nilptr end
+  return &r.lines[(r.head + i) % #r.lines]
+end
+
+global function chatlog_destroy(r: *ChatRing): void
+  for i = 0, < #r.lines do
+    r.lines[i].sender:destroy()
+    r.lines[i].text:destroy()
+  end
+  r.lines:destroy()
+  r.head = 0
+end
+
+-- Wrapping -----------------------------------------------------------------------
+
+-- A wrapped row: bytes [start, start + len) of the text.
+global ChatSpan = @record{ start: integer, len: integer }
+-- Width of bytes [start, start + len) of `s` in the panel's font.
+global ChatMeasure = @function(s: string, start: integer, len: integer): float32
+
+local function utf8_len(c: uint8): integer
+  if c < 0x80 then return 1 elseif c < 0xE0 then return 2 elseif c < 0xF0 then return 3 end
+  return 4
+end
+
+-- Rows of `s` at most `width` wide: breaks after spaces; a word wider than a
+-- row is cut between characters. At least one row, even for empty text.
+global function chatlog_wrap(s: string, width: float32, measure: ChatMeasure, out: *vector(ChatSpan)): void
+  out:clear()
+  local n = #s
+  if n == 0 or width <= 0 then out:push(ChatSpan{ start = 0, len = n }) return end
+  local row_start = 0
+  local i = 0
+  while row_start < n do
+    -- grow the row word by word while it fits
+    local fit_end = row_start -- end of what fits so far
+    i = row_start
+    while i < n do
+      -- the next word and the spaces after it
+      local j = i
+      while j < n and s.data[j] ~= ' '_b do j = j + utf8_len(s.data[j]) end
+      while j < n and s.data[j] == ' '_b do j = j + 1 end
+      if j > n then j = n end
+      -- the row up to the end of the word, trailing spaces not counted
+      local k = j
+      while k > i and s.data[k - 1] == ' '_b do k = k - 1 end
+      if measure(s, row_start, k - row_start) <= width then
+        fit_end = j
+        i = j
+      else
+        break
+      end
+    end
+    if fit_end == row_start then
+      -- one word wider than the row: as many characters as fit (at least one)
+      local k = row_start + utf8_len(s.data[row_start])
+      while k < n and s.data[k] ~= ' '_b do
+        local nk = k + utf8_len(s.data[k])
+        if nk > n or measure(s, row_start, nk - row_start) > width then break end
+        k = nk
+      end
+      if k > n then k = n end
+      fit_end = k
+    end
+    out:push(ChatSpan{ start = row_start, len = fit_end - row_start })
+    row_start = fit_end
+  end
+end
+
+-- The input line ---------------------------------------------------------------------
+
+global ChatInput = @record{ buf: vector(uint8) }
+
+-- Append a code point (UTF-8); false when it does not fit or is a control.
+global function chatinput_insert(inp: *ChatInput, cp: uint32): boolean
+  if cp < 32 or cp == 127 or (cp >= 0xD800 and cp <= 0xDFFF) or cp > 0x10FFFF then return false end
+  local b: [4]uint8
+  local n = 0
+  if cp < 0x80 then
+    b[0] = (@uint8)(cp) n = 1
+  elseif cp < 0x800 then
+    b[0], b[1] = (@uint8)(0xC0 | (cp >> 6)), (@uint8)(0x80 | (cp & 0x3F)) n = 2
+  elseif cp < 0x10000 then
+    b[0], b[1], b[2] = (@uint8)(0xE0 | (cp >> 12)), (@uint8)(0x80 | ((cp >> 6) & 0x3F)), (@uint8)(0x80 | (cp & 0x3F)) n = 3
+  else
+    b[0], b[1] = (@uint8)(0xF0 | (cp >> 18)), (@uint8)(0x80 | ((cp >> 12) & 0x3F))
+    b[2], b[3] = (@uint8)(0x80 | ((cp >> 6) & 0x3F)), (@uint8)(0x80 | (cp & 0x3F)) n = 4
+  end
+  if #inp.buf + n > CHATLOG_INPUT_MAX then return false end
+  for i = 0, < n do inp.buf:push(b[i]) end
+  return true
+end
+
+-- Remove the last character.
+global function chatinput_backspace(inp: *ChatInput): void
+  while #inp.buf > 0 do
+    local c = inp.buf:pop()
+    if (c & 0xC0) ~= 0x80 then break end
+  end
+end
+
+-- The text typed so far (borrowed until the next change).
+global function chatinput_text(inp: *ChatInput): string
+  if #inp.buf == 0 then return '' end
+  return string{ data = (@*[0]byte)(&inp.buf[0]), size = #inp.buf }
+end
+
+-- The line to send, trimmed (owned; empty when there is nothing to send), and
+-- the input cleared.
+global function chatinput_take(inp: *ChatInput): string
+  local t = chatinput_text(inp)
+  local a, b = 0, #t
+  while a < b and t.data[a] == ' '_b do a = a + 1 end
+  while b > a and t.data[b - 1] == ' '_b do b = b - 1 end
+  local out: string
+  if b > a then out = t:subview(a + 1, b):copy() end
+  inp.buf:clear()
+  return out
+end
+
+global function chatinput_destroy(inp: *ChatInput): void
+  inp.buf:destroy()
+end
+
+-- Colours ------------------------------------------------------------------------------
+
+-- A game log colour (UiConfig ColorSay etc., 0xAARRGGBB) as an ImGui colour
+-- (IM_COL32, ABGR) at full alpha.
+global function chatlog_game_colour(argb: uint32): uint32
+  local r = (argb >> 16) & 0xFF
+  local g = (argb >> 8) & 0xFF
+  local b = argb & 0xFF
+  return r | (g << 8) | (b << 16) | 0xFF000000_u32
+end

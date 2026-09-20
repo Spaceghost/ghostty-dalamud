@@ -3,6 +3,8 @@
 require 'core.app.panic'
 require 'core.app.commands'
 require 'core.app.hostsurface'
+require 'core.app.cursor'
+require 'core.buildinfo'
 require 'allocators.default'
 
 -- Exports -----------------------------------------------------------------------
@@ -77,8 +79,10 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
       -- nothing runs per frame from here: let go of what the game still shows or does for us
       host.disabled_teardown = true
       teardown_effects()
+      panels_let_go() -- pulled windows back to the flat UI (they come back when switched on again)
       dualsense_reader_close(&host.dualsense)
       host.world_focus = 0
+      cursor_release() -- the in-game cursor rule is off with the rest
       agent_hold_sessions() -- the connection goes unread from here on
     end
     return
@@ -88,6 +92,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     agent_release_sessions()
   end
   if not ensure_imgui() then return end
+  glyphfb_frame(ui_device()) -- fallback glyphs draw on Dalamud's device (core/glyphfb.nelua)
   local now = imgui.GetTime()
   local dt = now - host.last_time
   if dt < 0 or dt > 0.5 then dt = 1.0 / 60.0 end
@@ -95,7 +100,9 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
   agent_pump(now)
   for i = 0, < #host.sessions do
     local s = host.sessions[i]
-    if s.kind == TransportKind.ConPty then s:pump() end
+    -- ConPTY and pipe transports are polled here: a hidden session (the /ask
+    -- panel's) is never drawn, so nothing else would read it
+    if s.kind == TransportKind.ConPty or s.kind == TransportKind.Pipe then s:pump() end
   end
   -- suspended: the legacy core draws; keep sessions and the agent alive only
   local live = boot.state == HostState.Active
@@ -141,13 +148,18 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
   end
   host.terminal_focused = host.terminal_focused_now
   host.terminal_focused_now = false
+  remotewin_tick(now, live and in_world) -- window streams: lost connections, closing, auto pulls
+  panels_tick(now, live, in_world) -- flat windows pulled into the world: chat lines, life cycle, restore
   if live then
     poll_toggle_key()
     draw_dropdown(now, dt)
     draw_windows()
     draw_anchored_popup()
+    draw_inventory() -- the info bar entry's list of every terminal
     draw_settings()
+    draw_window_picker() -- /window (core/app/winpicker.nelua)
   end
+  ask_frame(now, live) -- /ask: answers arriving, and the panel while it is up (core/app/ask.nelua)
   reap_exited(now)
   -- only after the layout came back: saving earlier (or while the agent is
   -- unreachable) would overwrite the state we are about to restore
@@ -157,14 +169,24 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
   end
   if live and in_world then
     sync_animation()
+    reactions_tick(now) -- bells, finished commands, output: the character's reactions
     policy_anim_frame(now)
+    desk_props_sync() -- the desk scene's furniture, as lua/desk.lua asked for it
     apply_world_pins(now)
+    local under = world_under_ui_begin() -- beneath other plugins' overlays (Umbra's toolbar)
+    draw_rain_world(now) -- drops fallen off world screens, behind them (core/app/rain.nelua)
     draw_world(now)
+    panels_after_world(now) -- the "pull into world" grip over flat windows
     draw_bell(now) -- after the world screens: light behind one is cut out, not painted over it
+    world_under_ui_end(under)
   else
     occluders_destroy_all() -- no character (loading screen, logout): boards go before the scene they sit in
+    desk_props_destroy_all() -- and the desk scene's furniture
   end
   bell_demo_tick(now)
+  -- the gallery prompt: a screenshot taken while a terminal is on screen (lua/gallery.lua)
+  gallery_frame(now, host.dropdown_open or surface.popup_open or (in_world and host.world_visible and #host.world > 0), live)
+  if live then selftest_tick(in_world) end -- /term selftest: one step per frame
   -- a click on the game world (not an ImGui window, not a panel) unfocuses
   -- every terminal so the keyboard goes back to the game
   if live and (host.drop_focus or world_click_off(now)) then
@@ -173,6 +195,12 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     imgui.SetWindowFocusNil()
   end
   update_status()
+  -- last of all: /term shot and /term clip arm their frame grab here, so the
+  -- callback that copies the back buffer lands after everything drew into it
+  capture_frame(now, live)
+  ipc_frame() -- queued IPC changes, then the snapshot IPC reads answer from (after the status: it is in there)
+  -- over ghostty UI the game keeps its own cursor (core/app/cursor.nelua): read at the next NewFrame
+  cursor_frame(live and cursor_over_ours())
 end
 
 -- Draw the popup terminal into `dl` at the given rectangle: the Umbra toolbar
@@ -227,18 +255,45 @@ global function gu_status(buf: *[0]cchar, cap: usize): usize <cexport, codename 
   return n
 end
 
+-- GhosttyDalamud.v1.Call (docs/IPC.md): one JSON request from another plugin,
+-- on any thread. The JSON response goes to `out` (at most `cap` bytes with its
+-- NUL); returns its length. Reads answer from the last frame's snapshot,
+-- changes are queued for the next frame (core/app/ipc.nelua).
+global function gu_call(request: cstring, out: *[0]cchar, cap: usize): usize <cexport, codename 'gu_call'>
+  return ipc_call(request, out, cap)
+end
+
+-- A chat message from the game (the shim's IChatGui handler): its XivChatType,
+-- sender and text as plain UTF-8. Any thread; the frame picks it up
+-- (core/app/chatpanel.nelua).
+global function gu_chat(kind: cint, sender: cstring, text: cstring): void <cexport, codename 'gu_chat'>
+  if not host.initialized then return end
+  chatpanel_post(kind, sender, text)
+end
+
 global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   defer surface_reset() end -- whatever state we were in, forget the shim's callbacks
   if not host.initialized then return end
   surface_shutdown() -- commands, info bar entry and IPC go first
+  selftest_shutdown() -- a run not handing over to the next core reports itself interrupted
   showcase_stop() -- demo terminals never outlive the session; yours come back
   teardown_effects()
+  panels_shutdown() -- pulled windows back to the flat UI, the hooks into ImGui off
+  ask_shutdown() -- /ask's hidden sessions end (before the others are left running)
+  cursor_release() -- the game's cursor flag as it was before us
+  capture_app_shutdown() -- a clip on the host is told to stop; the HUD comes back
   depthpass_shutdown()
   dualsense_reader_close(&host.dualsense) -- no handle or pending read may outlive this module
   -- Leave agent shells running so the next start reattaches to them.
   for i = 0, < #host.sessions do host.sessions[i].keep_on_agent = true end
   if host.layout_restored then save_world_state() end
   for i = #host.sessions - 1, 0, -1 do session_remove(host.sessions[i]) end
+  glyphfb_shutdown() -- the fallback glyph atlas and fonts
+  remotewin_shutdown() -- its panels went with their sessions (no WCLOSE: the agent keeps their windows)
+  window_picker_shutdown()
+  chatpanel_forget_log()
+  keychords_shutdown() -- run-time reserved chords (IPC keys.reserve) go with this core
+  ipc_shutdown() -- the channel was unregistered with the other surfaces
   agent_final_flush() -- the queued DETACH/CLOSE frames, before the socket goes away
   host.sessions:destroy()
   host.dropdown_tabs:destroy()
@@ -267,7 +322,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
 end
 
 global function gu_version(): cstring <cexport, codename 'gu_version'>
-  return 'ghostty-dalamud 0.2.0'
+  return build_version_cstr()
 end
 
 -- Called from the shim's hook on the game's walk input (every game frame).

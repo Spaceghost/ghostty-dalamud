@@ -1,0 +1,171 @@
+-- Reserved key chords: keys another program owns while a terminal or a remote
+-- window panel has the keyboard. XivDesktop (a separate plugin) reads
+-- sway-style chords (Super+... by default, Alt+Shift+... or Ctrl+Alt+... when
+-- configured); without this a focused window panel would forward them and
+-- the app would type them too. A reserved key is neither sent to the remote
+-- window nor typed into a focused terminal.
+--
+-- A chord is text: modifiers and a key joined by '+', case-insensitive, e.g.
+-- 'super+*', 'alt+shift+*', 'ctrl+alt+return', 'super+shift+q'. Modifiers:
+-- ctrl (control), shift, alt, super (win, logo, mod4). The key is a name of
+-- core/input.nelua's keymap ('a', '1', 'f5', 'enter' or 'return', 'left',
+-- 'space', 'minus', ...) or '*' for any key. A chord matches while all of
+-- its modifiers are held, whatever else is; '*' needs at least one modifier.
+--
+-- Two lists apply: CONFIG.windows.reserved_chords (lua/windows.lua; default
+-- { 'super+*' }) and what plugins reserve at run time over IPC
+-- (`keys.reserve`, docs/IPC.md), one list per caller. The run-time lists live
+-- as long as this core does: a reloaded core forgets them.
+require 'string'
+require 'vector'
+require 'stringbuilder'
+require 'core.policy'
+require 'core.input'
+
+global KEYCHORD_CTRL: uint8 <comptime> = 1  -- the WINPUT mods bits (core/protocol.nelua)
+global KEYCHORD_SHIFT: uint8 <comptime> = 2
+global KEYCHORD_ALT: uint8 <comptime> = 4
+global KEYCHORD_SUPER: uint8 <comptime> = 8
+
+global KeyChord = @record{ mods: uint8, any: boolean, key: string } -- key borrowed from the chord text
+
+local function lower_eq(a: string, b: string): boolean
+  if #a ~= #b then return false end
+  for i = 0, < #a do
+    local c = a.data[i]
+    if c >= 'A'_b and c <= 'Z'_b then c = c + 32 end
+    if c ~= b.data[i] then return false end
+  end
+  return true
+end
+
+-- The keymap name `word` stands for ('' when none). Borrowed from the keymap.
+local function key_name(word: string): string
+  if lower_eq(word, 'return') then word = 'enter' end
+  if lower_eq(word, 'esc') then word = 'escape' end
+  for i = 0, < input_key_count() do
+    local k = input_key(i)
+    if lower_eq(word, k.name) then return k.name end
+  end
+  return ''
+end
+
+-- Parse a chord. False and why when it is not one.
+global function keychord_parse(text: string): (boolean, KeyChord, string)
+  local c: KeyChord
+  local start: usize = 0
+  local have_key = false
+  for pos: usize = 0, <= text.size do
+    if pos == text.size or text.data[pos] == '+'_b then
+      local word = string{data = pos > start and (@*[0]byte)(&text.data[start]) or nilptr, size = pos - start}
+      start = pos + 1
+      if #word == 0 then return false, c, 'an empty part (write "super+*")' end
+      if have_key then return false, c, 'the key must come last' end
+      if lower_eq(word, 'ctrl') or lower_eq(word, 'control') then c.mods = c.mods | KEYCHORD_CTRL
+      elseif lower_eq(word, 'shift') then c.mods = c.mods | KEYCHORD_SHIFT
+      elseif lower_eq(word, 'alt') then c.mods = c.mods | KEYCHORD_ALT
+      elseif lower_eq(word, 'super') or lower_eq(word, 'win') or lower_eq(word, 'logo') or lower_eq(word, 'mod4') then
+        c.mods = c.mods | KEYCHORD_SUPER
+      elseif word == '*' then
+        c.any, have_key = true, true
+      else
+        local name = key_name(word)
+        if #name == 0 then return false, c, 'unknown key (a keymap name such as a, f5, enter, left, or *)' end
+        c.key, have_key = name, true
+      end
+    end
+  end
+  if not have_key then return false, c, 'no key (end with a key name or *)' end
+  if c.any and c.mods == 0 then return false, c, '"*" needs a modifier (it would reserve every key)' end
+  return true, c, ''
+end
+
+local function chord_matches(text: string, mods: uint8, name: string): boolean
+  local ok, c = keychord_parse(text)
+  if not ok or (mods & c.mods) ~= c.mods then return false end
+  return c.any or (#name > 0 and c.key == name)
+end
+
+-- Run-time reservations, one list per caller (owned).
+local Reservation = @record{ caller: string, chords: vector(string) }
+local reserved: vector(Reservation)
+
+local function each_list(mods: uint8, name: string): boolean
+  for i = 0, < #policy.windows.reserved_chords do
+    if chord_matches(policy.windows.reserved_chords[i], mods, name) then return true end
+  end
+  for r = 0, < #reserved do
+    for i = 0, < #reserved[r].chords do
+      if chord_matches(reserved[r].chords[i], mods, name) then return true end
+    end
+  end
+  return false
+end
+
+-- The modifiers ImGui reports, as KEYCHORD_* bits.
+global function keychord_mods(io: *ImGuiIO): uint8
+  local m: uint8 = 0
+  if io.KeyCtrl then m = m | KEYCHORD_CTRL end
+  if io.KeyShift then m = m | KEYCHORD_SHIFT end
+  if io.KeyAlt then m = m | KEYCHORD_ALT end
+  if io.KeySuper then m = m | KEYCHORD_SUPER end
+  return m
+end
+
+-- Key `name` (a keymap name) pressed with `mods` (KEYCHORD_* bits): reserved?
+global function keychord_reserved(mods: uint8, name: string): boolean
+  if mods == 0 and #policy.windows.reserved_chords == 0 and #reserved == 0 then return false end
+  return each_list(mods, name)
+end
+
+-- Held modifiers that reserve every key (a '*' chord): typed text goes too.
+global function keychord_reserves_all(mods: uint8): boolean
+  if mods == 0 then return false end
+  return each_list(mods, '')
+end
+
+local function drop(r: *Reservation): void
+  for i = 0, < #r.chords do r.chords[i]:destroy() end
+  r.chords:destroy()
+  r.caller:destroy()
+end
+
+-- Replace `caller`'s reserved chords with `chords` (an empty list lets them
+-- go). All are checked first: one bad chord changes nothing. '' and why.
+global function keychords_reserve(caller: string, chords: *vector(string)): string
+  for i = 0, < #chords do
+    local ok, _, err = keychord_parse(chords[i])
+    if not ok then
+      local sb: stringbuilder
+      sb:write('chord "', chords[i], '": ', err)
+      return sb:promote()
+    end
+  end
+  for r = 0, < #reserved do
+    if reserved[r].caller == caller then
+      drop(&reserved[r])
+      reserved:remove(r)
+      break
+    end
+  end
+  if #chords > 0 then
+    local r: Reservation = { caller = caller:copy() }
+    for i = 0, < #chords do r.chords:push(chords[i]:copy()) end
+    reserved:push(r)
+  end
+  return string{}
+end
+
+-- How many run-time chords `caller` holds (every caller's when `all`).
+global function keychords_count(caller: string, all: boolean): integer
+  local n = 0
+  for r = 0, < #reserved do
+    if all or reserved[r].caller == caller then n = n + #reserved[r].chords end
+  end
+  return n
+end
+
+global function keychords_shutdown(): void
+  for r = 0, < #reserved do drop(&reserved[r]) end
+  reserved:destroy()
+end

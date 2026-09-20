@@ -1,0 +1,290 @@
+-- World panels beneath the game's own HUD (CONFIG.world.under_hud,
+-- docs/ADOPT.md). Not yet observed in game.
+--
+-- Dalamud draws ImGui after the game has drawn its UI, so anything ghostty
+-- puts on the screen covers the hotbars, the chat log, the minimap, the party
+-- list. There is no depth or stencil to share with the game's UI renderer, so
+-- the panel is cut instead: once a panel's vertices are projected onto the
+-- screen (world_transform_vertices), every one of its triangles that touches
+-- the rectangle of a shown HUD addon is clipped on the CPU and only the parts
+-- outside the rectangles are kept. Where a panel is cut, the game's UI below
+-- it shows through.
+--
+-- Why not a stencil: the ImGui backend Dalamud renders with owns the render
+-- state between draw commands; a callback that writes a stencil would have to
+-- set up and restore D3D11 state around every panel, and the HUD rectangles
+-- are plain axis-aligned boxes that the CPU cuts in a few microseconds.
+--
+-- The rectangles come from the shim (GuHostApi.hud_rects: the visible units
+-- of the game's AtkStage, with their names); which ones count is decided
+-- here (hudmask_set: names in CONFIG.world.under_hud_ignore and anything
+-- covering most of the screen are left out).
+require 'math'
+require 'vector'
+require 'string'
+require 'core.imgui'
+require 'core.adopt'
+
+global HUDMASK_MAX: integer <comptime> = 64
+global HUDMASK_NAME: integer <comptime> = 32
+
+-- One shown addon, as the shim fills it (mirrors GuHudRect in Native.cs).
+global GuHudRect = @record{
+  x: float32, y: float32, w: float32, h: float32, -- screen pixels (the game window's)
+  name: [HUDMASK_NAME]cchar,                      -- the addon's name, NUL-terminated
+}
+
+global HudMask = @record{
+  n: integer,
+  r: [HUDMASK_MAX]ImVec4, -- x0, y0, x1, y1
+}
+
+-- A rectangle as big as this share of the screen is a full-screen layer
+-- (name plates, fades, screen text), not a HUD element.
+global HUDMASK_MAX_SHARE: float32 <comptime> = 0.6
+
+-- Whether `name` is one of the lines of `ignore`.
+local function ignored(name: string, ignore: string): boolean
+  local i = 0
+  while i < #ignore do
+    local j = i
+    while j < #ignore and ignore.data[j] ~= '\n'_b do j = j + 1 end
+    if j - i == #name and j > i and ignore:subview(i + 1, j) == name then return true end
+    i = j + 1
+  end
+  return false
+end
+
+-- The mask from `n` addon rectangles: offset by the viewport origin (ox, oy),
+-- without those named in `ignore` (one per line), empty or as big as most of
+-- the sw x sh screen. At most HUDMASK_MAX.
+global function hudmask_set(mask: *HudMask, rects: *[0]GuHudRect, n: integer, ignore: string,
+                            ox: float32, oy: float32, sw: float32, sh: float32): void
+  mask.n = 0
+  for i = 0, < n do
+    if mask.n >= HUDMASK_MAX then break end
+    local r = &rects[i]
+    if r.w < 1 or r.h < 1 then continue end
+    if sw > 0 and sh > 0 and r.w * r.h >= HUDMASK_MAX_SHARE * sw * sh then continue end
+    r.name[HUDMASK_NAME - 1] = 0
+    local name: string = (@cstring)(&r.name[0])
+    if ignored(name, ignore) then continue end
+    mask.r[mask.n] = ImVec4{ ox + r.x, oy + r.y, ox + r.x + r.w, oy + r.y + r.h }
+    mask.n = mask.n + 1
+  end
+end
+
+-- Whether screen point (x, y) lies on the HUD.
+global function hudmask_hit(mask: *HudMask, x: float32, y: float32): boolean
+  for i = 0, < mask.n do
+    local r = mask.r[i]
+    if x >= r.x and x < r.z and y >= r.y and y < r.w then return true end
+  end
+  return false
+end
+
+-- Cutting --------------------------------------------------------------------------
+
+local function poly_area(p: *AdoptPoly): float32
+  local a: float32 = 0
+  for i = 0, < p.n do
+    local q, r = p.v[i], p.v[(i + 1) % p.n]
+    a = a + q.x * r.y - r.x * q.y
+  end
+  return math.abs(a) * 0.5
+end
+
+-- A convex polygon as triangles (a fan) onto `out`; slivers are dropped.
+local function push_tris(p: *AdoptPoly, out: *vector(AdoptPoly)): void
+  if p.n < 3 or poly_area(p) < 1e-3 then return end
+  for t = 1, p.n - 2 do
+    local tri: AdoptPoly
+    tri.n = 3
+    tri.v[0], tri.v[1], tri.v[2] = p.v[0], p.v[t], p.v[t + 1]
+    if poly_area(&tri) >= 1e-4 then out:push(tri) end
+  end
+end
+
+-- Triangle `p` minus rectangle `r`, as triangles onto `out`: the parts left
+-- of it, right of it, and above and below it between its sides.
+global function hudmask_subtract(p: *AdoptPoly, r: ImVec4, out: *vector(AdoptPoly)): void
+  local minx, maxx, miny, maxy = p.v[0].x, p.v[0].x, p.v[0].y, p.v[0].y
+  for i = 1, < p.n do
+    minx, maxx = math.min(minx, p.v[i].x), math.max(maxx, p.v[i].x)
+    miny, maxy = math.min(miny, p.v[i].y), math.max(maxy, p.v[i].y)
+  end
+  if maxx <= r.x or minx >= r.z or maxy <= r.y or miny >= r.w then
+    out:push($p) -- apart
+    return
+  end
+  local left = $p
+  adopt_clip_half(&left, 0, r.x, -1)
+  push_tris(&left, out)
+  local right = $p
+  adopt_clip_half(&right, 0, r.z, 1)
+  push_tris(&right, out)
+  local mid = $p
+  adopt_clip_half(&mid, 0, r.x, 1)
+  adopt_clip_half(&mid, 0, r.z, -1)
+  local top = mid
+  adopt_clip_half(&top, 1, r.y, -1)
+  push_tris(&top, out)
+  local bottom = mid
+  adopt_clip_half(&bottom, 1, r.w, 1)
+  push_tris(&bottom, out)
+end
+
+-- Pieces one triangle may break into before it is left whole (a triangle
+-- under many small rectangles; never seen with the game's HUD).
+local HUDMASK_PIECES_MAX <comptime> = 512
+
+local work_a: vector(AdoptPoly)
+local work_b: vector(AdoptPoly)
+local new_idx: vector(uint16)
+local new_vtx: vector(ImDrawVert)
+local CmdCount = @record{ cmd: integer, start: integer, count: integer }
+local counts: vector(CmdCount)
+
+-- Triangle `tri` minus every rectangle of `mask` (those in `active`), into
+-- work_a. False when it broke into too many pieces.
+local function cut_triangle(tri: *AdoptPoly, mask: *HudMask, active: *[HUDMASK_MAX]boolean): boolean
+  work_a:clear()
+  work_a:push($tri)
+  for ri = 0, < mask.n do
+    if not active[ri] then continue end
+    work_b:clear()
+    for k = 0, < #work_a do
+      hudmask_subtract(&work_a[k], mask.r[ri], &work_b)
+      if #work_b > HUDMASK_PIECES_MAX then return false end
+    end
+    work_a, work_b = work_b, work_a
+    if #work_a == 0 then return true end
+  end
+  return true
+end
+
+-- Grows a draw list's buffers (ImDrawList_PrimReserve; tests pass a fake).
+global HudMaskReserve = @function(dl: *ImDrawList, idx_count: cint, vtx_count: cint): void
+
+-- Cut the mask out of what was drawn into `dl` from index `first_idx` and
+-- vertex `first_vtx` on (screen positions). Commands keep their order,
+-- textures and callbacks; triangles apart from every rectangle keep their
+-- vertices, triangles under one are dropped, triangles across an edge are
+-- replaced by their pieces (new vertices at the end of the buffer, colours
+-- and uvs interpolated). A triangle whose new vertices would not fit its
+-- command's 16-bit indices is kept whole. -> triangles cut or dropped.
+global function hudmask_cut(dl: *ImDrawList, first_idx: integer, first_vtx: integer, mask: *HudMask, reserve: HudMaskReserve): integer
+  if dl == nilptr or mask.n == 0 or reserve == nilptr then return 0 end
+  local nv0: integer = dl.VtxBuffer.Size
+  local ni0: integer = dl.IdxBuffer.Size
+  if first_idx < 0 or first_idx >= ni0 or first_vtx < 0 or first_vtx >= nv0 then return 0 end
+  -- only the rectangles that touch what was drawn
+  local bx0, by0, bx1, by1: float32, float32, float32, float32 = 1e30, 1e30, -1e30, -1e30
+  for i = first_vtx, < nv0 do
+    local p = dl.VtxBuffer.Data[i].pos
+    bx0, by0 = math.min(bx0, p.x), math.min(by0, p.y)
+    bx1, by1 = math.max(bx1, p.x), math.max(by1, p.y)
+  end
+  local active: [HUDMASK_MAX]boolean
+  local any = false
+  for ri = 0, < mask.n do
+    local r = mask.r[ri]
+    active[ri] = not (bx1 <= r.x or bx0 >= r.z or by1 <= r.y or by0 >= r.w)
+    any = any or active[ri]
+  end
+  if not any then return 0 end
+  new_idx:clear()
+  new_vtx:clear()
+  counts:clear()
+  local changed = 0
+  -- the list's last command is the one ImGui appends to; its vertices start at its VtxOffset
+  local last_off: integer = dl.CmdBuffer.Size > 0 and (@integer)(dl.CmdBuffer.Data[dl.CmdBuffer.Size - 1].VtxOffset) or 0
+  for c = 0, < dl.CmdBuffer.Size do
+    local cmd = &dl.CmdBuffer.Data[c]
+    local c0: integer = cmd.IdxOffset
+    local c1: integer = c0 + (@integer)(cmd.ElemCount)
+    if c1 <= first_idx and not (c0 >= first_idx) then continue end -- before the panel
+    if cmd.UserCallback ~= nilptr or cmd.ElemCount == 0 then
+      counts:push(CmdCount{ cmd = c, start = #new_idx, count = 0 })
+      continue
+    end
+    local kept_before = math.max(first_idx - c0, 0) -- indices of this command drawn before the panel stay
+    local start = #new_idx
+    local off: integer = cmd.VtxOffset
+    local e = math.max(c0, first_idx)
+    while e + 2 < c1 do
+      local ia, ib, ic = dl.IdxBuffer.Data[e], dl.IdxBuffer.Data[e + 1], dl.IdxBuffer.Data[e + 2]
+      e = e + 3
+      local tri: AdoptPoly
+      tri.n = 3
+      local ids: [3]uint16 = { ia, ib, ic }
+      local ok = true
+      for k = 0, 2 do
+        local vi = (@integer)(ids[k]) + off
+        if vi >= nv0 then ok = false break end
+        local v = &dl.VtxBuffer.Data[vi]
+        tri.v[k] = { x = v.pos.x, y = v.pos.y, u = v.uv.x, v = v.uv.y, col = v.col }
+      end
+      local touches = false
+      if ok then
+        local minx = math.min(tri.v[0].x, math.min(tri.v[1].x, tri.v[2].x))
+        local maxx = math.max(tri.v[0].x, math.max(tri.v[1].x, tri.v[2].x))
+        local miny = math.min(tri.v[0].y, math.min(tri.v[1].y, tri.v[2].y))
+        local maxy = math.max(tri.v[0].y, math.max(tri.v[1].y, tri.v[2].y))
+        for ri = 0, < mask.n do
+          local r = mask.r[ri]
+          if active[ri] and not (maxx <= r.x or minx >= r.z or maxy <= r.y or miny >= r.w) then touches = true break end
+        end
+      end
+      if not touches or not cut_triangle(&tri, mask, &active) then
+        new_idx:push(ia) new_idx:push(ib) new_idx:push(ic)
+        continue
+      end
+      -- new vertices go after the list's; each must be reachable from this command's VtxOffset
+      if nv0 + #new_vtx + #work_a * 3 - off > 65535 then
+        new_idx:push(ia) new_idx:push(ib) new_idx:push(ic)
+        continue
+      end
+      changed = changed + 1
+      for k = 0, < #work_a do
+        for j = 0, 2 do
+          local a = work_a[k].v[j]
+          new_idx:push((@uint16)(nv0 + #new_vtx - off))
+          new_vtx:push(ImDrawVert{ pos = vec2(a.x, a.y), uv = vec2(a.u, a.v), col = a.col })
+        end
+      end
+    end
+    counts:push(CmdCount{ cmd = c, start = start - kept_before, count = #new_idx - start + kept_before })
+  end
+  if changed == 0 then return 0 end
+  -- the new vertices must be addressable from the last command too (ImGui's
+  -- 16-bit indices); past that, ImGui would open a new command mid-rewrite
+  if (nv0 - last_off) + #new_vtx >= 65536 then return 0 end
+  local ni1 = first_idx + #new_idx
+  local grow_i = math.max(ni1 - ni0, 0)
+  if grow_i > 0 or #new_vtx > 0 then reserve(dl, (@cint)(grow_i), (@cint)(#new_vtx)) end
+  if dl.IdxBuffer.Capacity < ni1 or dl.VtxBuffer.Capacity < nv0 + #new_vtx then return 0 end -- could not grow
+  for i = 0, < #new_idx do dl.IdxBuffer.Data[first_idx + i] = new_idx[i] end
+  for i = 0, < #new_vtx do dl.VtxBuffer.Data[nv0 + i] = new_vtx[i] end
+  dl.IdxBuffer.Size = (@cint)(ni1)
+  dl.VtxBuffer.Size = (@cint)(nv0 + #new_vtx)
+  for i = 0, < #counts do
+    local cc = counts[i]
+    local cmd = &dl.CmdBuffer.Data[cc.cmd]
+    cmd.IdxOffset = (@cuint)(first_idx + cc.start)
+    cmd.ElemCount = (@cuint)(cc.count)
+  end
+  -- where ImGui writes next
+  dl._VtxWritePtr = &dl.VtxBuffer.Data[dl.VtxBuffer.Size]
+  dl._IdxWritePtr = &dl.IdxBuffer.Data[dl.IdxBuffer.Size]
+  dl._VtxCurrentIdx = (@cuint)(dl.VtxBuffer.Size - last_off)
+  return changed
+end
+
+global function hudmask_destroy(): void
+  work_a:destroy()
+  work_b:destroy()
+  new_idx:destroy()
+  new_vtx:destroy()
+  counts:destroy()
+end
