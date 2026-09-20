@@ -131,15 +131,15 @@ def main() -> None:
         ap.error('Invalid identity')
     head = git('rev-parse', 'HEAD').strip().decode()
     if not args.apply:
-        print('Dry run: --apply is required to rewrite objects and main.')
+        print('Dry run: --apply is required to rewrite objects and master.')
         return
     refs = git('for-each-ref', '--format=%(refname)', 'refs/heads', 'refs/tags').splitlines()
-    if refs != [b'refs/heads/main']:
+    if refs != [b'refs/heads/master']:
         raise RuntimeError('Use scrub-history.sh for a repository with multiple branches.')
     if git('status', '--porcelain').strip():
         raise RuntimeError('Worktree is not clean.')
     new_head, commits, objects = rewrite(head, args.name.encode(), args.email.encode())
-    git('update-ref', 'refs/heads/main', new_head, head)
+    git('update-ref', 'refs/heads/master', new_head, head)
     git('reset', '--hard', new_head)
     print(f'Identity rewrite: {commits} commits rewritten; {objects} reachable objects checked; 0 original identity remnants.')
     print('New head:', new_head)

@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # Shared build helpers. Callers provide ROOT; this file does not change cwd.
-CC="${CC:-gcc}"
+# The C compiler is Zig through tools/zig-cc.sh: one pinned toolchain builds
+# the Nelua compiler, the Lua objects and every Nelua target, host and
+# Windows alike, and the build needs no system gcc. Set CC to override.
+BUILD_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CC="${CC:-$BUILD_COMMON_DIR/zig-cc.sh}"
 JOBS="${JOBS:-$(getconf _NPROCESSORS_ONLN 2>/dev/null || printf 1)}"
 case "$JOBS" in ''|*[!0-9]*|0) JOBS=1 ;; esac
 require_linux_build_host() {

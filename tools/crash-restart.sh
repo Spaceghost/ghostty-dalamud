@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# LINUX / WINE ONLY: for XIVLauncher.Core as a flatpak on Linux. Nothing a
+# Windows player needs runs through this script (or any bash script).
+#
 # Watch for a new Dalamud appcrash log and answer the crash dialog with
 # "Restart normally" + "Restart" by running build/dist/crash-restart.exe inside
 # the running XIVLauncher.Core flatpak sandbox (it must share the game's wineserver).

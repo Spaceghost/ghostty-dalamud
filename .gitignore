@@ -13,5 +13,9 @@ __pycache__/
 
 # runtime state is not source
 /world-state.lua
+/window-state.lua
 /animation-reset-done
 /settings.lua
+/adopted.lua
+# This machine's Incus remote name and other local build settings.
+/build.env
