@@ -17,22 +17,16 @@ Statuses mean exactly what they mean in the Changelog tab in game:
 
 BETA is built and merged but has not been seen working in game yet; SOON is still being built. Entries move into a release once they have been verified in game.
 
-### Being built
-
 * Clean first build: the toolchain and the Dalamud references it compiles against are pinned and checked before use, the default shell is chosen per platform, and a fresh clone builds with nothing else installed.
+* Emoji, CJK and other wide glyphs drawn through the same fallback, with Noto Sans Symbols 2 and an optional monochrome Noto Emoji you drop in yourself.
 
-### Merged, not yet verified in game
+## [0.3.0] — Released 2026-09-20
+
+BETA entries are in this release but have not been verified in game yet; they become NEW or FIX once they have been seen working.
 
 * Sharing to the gallery signs in first: the first Share shows a short code and opens the link page in your browser; sign in there, approve Ghostty, and the screenshot goes up by itself. The link is kept for next time and never logged; /term share unlink forgets it. Not yet tried in game.
 * Screenshots that have the terminals in them: /term shot (or the shutter button in the dropdown) photographs the frame the game just drew, ImGui and all, writes a PNG into the plugin's screenshots folder and offers it to the share prompt at once. "panel" crops to the terminal in focus, "clean" hides the game's own UI for the shot. The game's own screenshot key takes its picture before Dalamud draws, so it is the one shot a terminal cannot be in. Not yet tried in game.
 * Short clips: /term clip [seconds] [gif|mp4] records a few seconds of the game and hands the frames to ghostty-agent, which encodes them with ffmpeg on the host so the game never stutters over it. Clips are for your own use; the gallery takes PNG and JPEG only. Needs ffmpeg on the host; it says so when there is none. Not yet tried in game.
-
-### Being built
-
-* Emoji, CJK and other wide glyphs drawn through the same fallback, with Noto Sans Symbols 2 and an optional monochrome Noto Emoji you drop in yourself.
-
-### Merged, not yet verified in game
-
 * Double-clicking a screen to full screen keeps its pixels: the panel is scaled into place instead of re-flowed, so text no longer spills past its edges on the way there and the shell is not redrawn twice a round trip. Not yet tried in game.
 * A plugin window pulled into the world now fits the panel it lives in instead of sitting in a band of empty space, and re-fits when you resize the panel — Mappy lays its map out for the screen. Not yet tried in game.
 * Other plugins' windows can be pulled into the world as screens (Mappy automatically), and so can the game's chat log. Not yet tried in game.
