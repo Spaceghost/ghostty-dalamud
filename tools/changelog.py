@@ -6,6 +6,10 @@ Settings, and CHANGELOG.md is generated from it so the two can never disagree.
 
     tools/changelog.py            write CHANGELOG.md
     tools/changelog.py --check    exit 1 (and print a diff) if it is out of date
+    tools/changelog.py --dump     the sections as JSON (tools/releasekit.py reads this)
+    tools/changelog.py --release X.Y.Z --date YYYY-MM-DD [--title TITLE]
+                                  turn the unreleased section into release X.Y.Z;
+                                  tools/release.sh does this, nobody needs to by hand
 
 Python, not Lua, only because CI and every developer machine already has
 python3 and a Lua interpreter is not part of this repository's toolchain
@@ -97,6 +101,7 @@ def parse(text):
             "version": field(chunk, "version"),
             "title": field(chunk, "title"),
             "blurb": field(chunk, "blurb"),
+            "date": field(chunk, "date") if re.search(r"\bdate\s*=", chunk) else None,
             "items": [],
         }
         i = items_at + len("items = {")
@@ -130,6 +135,8 @@ def render(releases):
         unreleased = rel["version"] == "next"
         if unreleased:
             out.append("\n## [Unreleased] — %s\n" % rel["title"])
+        elif rel["date"] and rel["date"] not in rel["title"]:
+            out.append("\n## [%s] — %s — %s\n" % (rel["version"], rel["date"], rel["title"]))
         else:
             out.append("\n## [%s] — %s\n" % (rel["version"], rel["title"]))
         out.append("\n%s\n" % rel["blurb"])
@@ -148,7 +155,77 @@ def render(releases):
     return "".join(out)
 
 
+RELEASED_BLURB = (
+    "BETA entries are in this release but have not been verified in game yet; "
+    "they become NEW or FIX once they have been seen working."
+)
+
+
+def lua_quote(text):
+    return "'" + text.replace("\\", "\\\\").replace("'", "\\'") + "'"
+
+
+def release(text, version, date, title):
+    """lua/changelog.lua with its unreleased section turned into release `version`.
+
+    Entries still being built ('next') stay behind in the unreleased section; everything
+    else moves, status and all. The file keeps one item per line, which is what this
+    relies on, and parse() checks the result before anything is written."""
+    lines = text.split("\n")
+    head = next((n for n, l in enumerate(lines) if re.search(r"\bversion\s*=\s*['\"]next['\"]", l)), None)
+    if head is None:
+        raise LuaError("no unreleased (version = 'next') section to release")
+    first = next(n for n in range(head, len(lines)) if "items = {" in lines[n]) + 1
+    last = first
+    while re.match(r"\s*\{\s*['\"]", lines[last]):
+        last += 1
+    items = lines[first:last]
+    staying = [l for l in items if re.match(r"\s*\{\s*['\"]next['\"]", l)]
+    moving = [l for l in items if l not in staying]
+    if not moving:
+        raise LuaError("nothing in the unreleased section is merged yet")
+    pad = re.match(r"\s*", lines[head]).group(0)
+    block = [
+        pad + "version = %s, title = %s, date = %s," % (
+            lua_quote(version), lua_quote(title or "Released " + date), lua_quote(date)),
+        pad + "blurb = %s," % lua_quote(RELEASED_BLURB),
+        pad + "items = {",
+    ] + moving + [pad + "},"]
+    if staying:  # the unreleased section stays, holding them, above the new release
+        new = lines[:first] + staying + lines[last:last + 2] + [pad[:-2] + "{"] + block
+    else:
+        new = lines[:head] + block
+    out = "\n".join(new + lines[last + 1:])
+    have = {r["version"]: r for r in parse(out)}
+    if len(have[version]["items"]) != len(moving) or len(have.get("next", {"items": []})["items"]) != len(staying):
+        raise LuaError("lua/changelog.lua is not laid out one item per line; release it by hand")
+    return out
+
+
 def main(argv):
+    args = argv[1:]
+    if args[:1] == ["--dump"] and len(args) == 1:
+        import json
+        with open(SOURCE, encoding="utf-8") as fh:
+            rels = parse(fh.read())
+        for rel in rels:
+            rel["items"] = [{"status": tag, "text": body} for tag, body in rel["items"]]
+        json.dump(rels, sys.stdout, indent=1)
+        return 0
+    if args[:1] == ["--release"]:
+        import argparse
+        ap = argparse.ArgumentParser()
+        ap.add_argument("--release", required=True)
+        ap.add_argument("--date", required=True)
+        ap.add_argument("--title")
+        opts = ap.parse_args(args)
+        with open(SOURCE, encoding="utf-8") as fh:
+            text = fh.read()
+        text = release(text, opts.release, opts.date, opts.title)
+        with open(SOURCE, "w", encoding="utf-8") as fh:
+            fh.write(text)
+        print("released %s in %s" % (opts.release, os.path.relpath(SOURCE, ROOT)))
+        return 0
     check = "--check" in argv[1:]
     if [a for a in argv[1:] if a != "--check"]:
         sys.stderr.write(__doc__)

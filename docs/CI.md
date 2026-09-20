@@ -12,7 +12,7 @@ set up .NET, restore caches and call it.
 | push to any branch, pull request from a fork, manual | `ci.yml` → `hosted` | `tools/ci/run.sh test build` on a GitHub-hosted runner | artifact `ghostty-dalamud-<sha>` = `build/dist/` (kept 14 days) |
 | the same, when `CI_SELF_HOSTED` is `true`; never a fork | `ci.yml` → `self-hosted` | the same stages on the self-hosted runner | nothing uploaded; it is a second opinion, not the artifact |
 | every push and pull request | `ci.yml` → `ingame-dryrun` | `tools/ci/run.sh ingame-dryrun` | pass/fail only; see [The dry run](#the-dry-run) |
-| tag `v*` | `release.yml` | `tools/ci/run.sh all` | GitHub Release for the tag with `build/release/*` (plugin zip, pluginmaster JSON) |
+| tag `v*` | `release.yml` | `tools/ci/run.sh all` | GitHub Release for the tag with `build/release/*` (plugin zip, pluginmaster JSON, `SHA256SUMS`) and notes from the changelog |
 | push to `master`, manual; never pull requests or forks | `ingame.yml` → `ingame` | ci.yml's artifact of the commit, then `tools/ci/run.sh ingame` on the gaming PC after the owner approves | artifact `ingame-report-<sha>-<attempt>` (kept 30 days); see [In-game tests](#in-game-tests) |
 | manual with `dry_run` | `ingame.yml` → `dry-run` | `tools/ci/run.sh ingame-dryrun` on a GitHub-hosted runner | pass/fail; no game, no secret, no runner |
 
@@ -536,20 +536,9 @@ password manager sessions), not just the two folders and the network.
 
 ## Cutting a release
 
-1. Make sure `master` is green and that `tools/package.sh` exists on it (the
-   release fails with "no build/release/*.zip" otherwise).
-2. Bump the version wherever `tools/package.sh` reads it, commit.
-3. Tag and push:
-
-   ```sh
-   git tag -a v0.5.0 -m "v0.5.0"
-   git push origin v0.5.0
-   ```
-
-4. `release.yml` tests, builds and packages, then creates the GitHub Release
-   `v0.5.0` with generated notes and the files in `build/release/`. A tag with
-   a `-` (`v0.5.0-rc1`) becomes a pre-release. Re-running the workflow for an
-   existing release replaces its files.
+Run `tools/release.sh test` or `tools/release.sh stable X.Y.Z`; it checks, bumps the
+version, tags, pushes, waits for `release.yml` and verifies the result. Nobody tags by
+hand. [RELEASING.md](RELEASING.md) has the whole of it.
 
 ### The two channels, and the plugin repository
 

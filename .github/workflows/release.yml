@@ -1,5 +1,15 @@
-# On a v* tag: test, build and package, then attach the plugin zip and the
-# pluginmaster JSON to a GitHub Release for the tag; see docs/CI.md.
+# On a v* tag pushed by tools/release.sh: test, build and package on a GitHub-hosted
+# runner, then publish the GitHub Release the plugin repository listing points at.
+#
+#   v0.3.0          stable. .../releases/latest/download/latest.zip and pluginmaster.json
+#                   are what spacegho.st/mods/ffxiv/plugins.json serves; the names never
+#                   change, so neither do the URLs.
+#   v0.3.1-test.1   testing. A prerelease under its own tag, and copied onto the floating
+#                   `testing` prerelease, so .../releases/download/testing/latest.zip is
+#                   always the newest test build. It never touches a stable release.
+#
+# The job refuses a fork, a tag that is not on master, and a tag that does not name the
+# version in the manifest. Notes come from the changelog; see docs/RELEASING.md.
 name: Release
 
 on:
@@ -14,7 +24,9 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ${{ fromJSON(vars.CI_RUNS_ON || '"ubuntu-latest"') }}
+    # never from a fork, and only on GitHub's own runners
+    if: github.repository == 'Spaceghost/ghostty-dalamud'
+    runs-on: ubuntu-latest
     timeout-minutes: 90
     permissions:
       contents: write
@@ -22,7 +34,11 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          fetch-depth: 0 # check-tag looks for the tag's commit on master, and at older tags
           persist-credentials: false
+
+      - name: Check the tag against the manifest, the changelog and master
+        run: tools/releasekit.py check-tag "$GITHUB_REF_NAME"
 
       - name: Probe for the .NET SDK
         id: dotnet
@@ -63,34 +79,46 @@ jobs:
           TESTING: ${{ contains(github.ref_name, '-') && '1' || '0' }}
         run: tools/ci/run.sh all
 
-      - name: Check the release files
+      - name: Check the release files, and write SHA256SUMS
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
-          if ! compgen -G 'build/release/*.zip' >/dev/null; then
-            echo "::error::no build/release/*.zip: this checkout has no tools/package.sh, or it wrote no zip"
-            exit 1
-          fi
-          compgen -G 'build/release/*.json' >/dev/null ||
-            echo "::warning::no pluginmaster JSON in build/release"
-          ls -la build/release
+          set -euo pipefail
+          cd build/release
+          for f in latest.zip ${{ contains(github.ref_name, '-') && 'pluginmaster-testing.json' || 'pluginmaster.json' }}; do
+            [[ -s "$f" ]] || { echo "::error::build/release/$f is missing"; exit 1; }
+          done
+          python3 -c 'import json,sys; json.load(open(sys.argv[1]))' pluginmaster*.json
+          rm -f SHA256SUMS
+          sha256sum -- * >SHA256SUMS
+          cat SHA256SUMS
+          cd "$GITHUB_WORKSPACE"
+          tools/releasekit.py notes "$TAG" --assets build/release >"$RUNNER_TEMP/notes.md"
+          tools/releasekit.py title "$TAG" >"$RUNNER_TEMP/title.txt"
 
-      - name: Publish the GitHub Release
+      - name: Publish the release for this tag
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
-          pre=()
-          [[ "$TAG" == *-* ]] && pre=(--prerelease)
+          set -euo pipefail
+          title="$(cat "$RUNNER_TEMP/title.txt")"
+          kind=(--latest)
+          [[ "$TAG" == *-* ]] && kind=(--prerelease --latest=false)
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" build/release/* --clobber
+            gh release edit "$TAG" --title "$title" --notes-file "$RUNNER_TEMP/notes.md"
           else
-            gh release create "$TAG" build/release/* --verify-tag --title "$TAG" --generate-notes "${pre[@]}"
+            gh release create "$TAG" build/release/* --verify-tag --title "$title" \
+              --notes-file "$RUNNER_TEMP/notes.md" "${kind[@]}"
           fi
 
-      # The testing channel is one floating prerelease called `testing`, so
-      # spacegho.st/mods/ffxiv/plugins.json can name a download URL that never changes.
-      # A stable tag leaves it alone.
-      - name: Move the testing channel onto this build
+      # The testing channel is one floating prerelease called `testing`, so the listing can
+      # name a download URL that never changes. It is a mailbox for the newest test build:
+      # its notes say which tag and commit that is. A stable tag never runs this step, and
+      # this step never touches a stable release.
+      - name: Put this build on the testing channel
         if: contains(github.ref_name, '-')
         env:
           GH_TOKEN: ${{ github.token }}
@@ -99,17 +127,26 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
-          notes="Rolling testing channel: the newest test build (currently $TAG).
-
-          Opt in per plugin in /xlplugins after adding
-          https://spacegho.st/mods/ffxiv/plugins.json as a custom plugin repository."
+          title="$(sed 's/ v[0-9].*//' "$RUNNER_TEMP/title.txt") testing channel"
+          {
+            printf '> [!NOTE]\n> **The rolling testing channel.** It always carries the newest test build: now [%s](https://github.com/%s/releases/tag/%s), commit %s.\n\n' \
+              "$TAG" "$GH_REPO" "$TAG" "${SHA:0:7}"
+            cat "$RUNNER_TEMP/notes.md"
+          } >"$RUNNER_TEMP/testing.md"
           if gh release view testing >/dev/null 2>&1; then
-            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/testing" -f sha="$SHA" -F force=true
-            gh release edit testing --prerelease --notes "$notes"
+            # Moving the tag is a courtesy; the token may not be allowed to, and the
+            # notes name the real tag and commit either way.
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/testing" -f sha="$SHA" -F force=true >/dev/null ||
+              echo "::warning::could not move the testing tag; its release notes name $TAG"
             gh release upload testing build/release/* --clobber
+            # older builds' versioned zips: gone only once the new files are in place
+            gh release view testing --json assets -q '.assets[].name' | while read -r old; do
+              [[ -e "build/release/$old" ]] || gh release delete-asset testing "$old" --yes
+            done
+            gh release edit testing --prerelease --latest=false --title "$title" --notes-file "$RUNNER_TEMP/testing.md"
           else
-            gh release create testing build/release/* --target "$SHA" --prerelease \
-              --title "Testing channel" --notes "$notes"
+            gh release create testing build/release/* --target "$SHA" --prerelease --latest=false \
+              --title "$title" --notes-file "$RUNNER_TEMP/testing.md"
           fi
 
       - name: Upload build/release
