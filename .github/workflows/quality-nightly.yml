@@ -1,0 +1,86 @@
+# The nightly set: fuzzing (random seeds, and coverage-guided with a corpus that
+# persists between runs), the heap-growth soak, and the thread sanitizer over
+# the agent. Same reporting as quality.yml.
+name: Quality (nightly)
+
+on:
+  schedule:
+    - cron: '17 9 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nightly-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  nightly:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: fuzz
+            run: 'FUZZ_SECONDS=1500 tools/ci/run.sh fuzz'
+          - kind: fuzz-coverage
+            run: 'FUZZ_SECONDS=1500 FUZZ_ENGINE=libfuzzer tools/ci/run.sh fuzz'
+          - kind: soak
+            run: 'GHOSTTY_HEAP_ITERS=300 GHOSTTY_FUZZ_ITERS=300 tools/ci/run.sh test'
+          - kind: tsan-agent
+            run: 'SAN=tsan ONLY=agent tools/ci/run.sh test'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install the tools the checks use
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q shellcheck lua-check valgrind clang
+          tools/ci/fetch-tool.sh actionlint
+          tools/ci/fetch-tool.sh gitleaks
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+      - name: Cache toolchains and vendor checkouts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/ghostty-dalamud-ci
+            vendor
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+      - name: Cache the fuzz corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: ${{ matrix.kind }}
+        id: check
+        env:
+          CHECK: ${{ matrix.run }}
+        run: |
+          mkdir -p build
+          set -o pipefail
+          bash -c "$CHECK" 2>&1 | tee "build/check-${{ matrix.kind }}.log"
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tools/ci/report-issue.sh "${{ matrix.kind }}" "${{ steps.check.outcome == 'success' && 'pass' || 'fail' }}" "build/check-${{ matrix.kind }}.log"
+      - name: Upload logs and reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.kind }}-${{ github.run_id }}
+          path: |
+            build/check-*.log
+            build/*.log
+            build/static
+            build/fuzz
+            build/massif
+          if-no-files-found: ignore

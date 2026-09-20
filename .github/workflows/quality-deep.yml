@@ -1,0 +1,92 @@
+# The slow checks, once a week: the whole host suite under valgrind memcheck,
+# helgrind and DRD over the agent, a massif heap profile, a long soak and long
+# fuzzing. Same reporting as quality.yml.
+name: Quality (weekly, deep)
+
+on:
+  schedule:
+    - cron: '29 10 * * 0'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deep-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  deep:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    permissions:
+      contents: read
+      issues: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - kind: valgrind
+            run: 'SAN=valgrind tools/ci/run.sh test'
+          - kind: helgrind-agent
+            run: 'SAN=helgrind ONLY=agent tools/ci/run.sh test'
+          - kind: drd-agent
+            run: 'SAN=drd ONLY=agent tools/ci/run.sh test'
+          - kind: massif
+            run: 'tools/ci/run.sh massif'
+          - kind: soak-long
+            run: 'GHOSTTY_HEAP_ITERS=3000 GHOSTTY_FUZZ_ITERS=3000 tools/ci/run.sh test'
+          - kind: fuzz-long
+            run: 'FUZZ_SECONDS=14400 tools/ci/run.sh fuzz'
+          - kind: fuzz-coverage-long
+            run: 'FUZZ_SECONDS=14400 FUZZ_ENGINE=libfuzzer tools/ci/run.sh fuzz'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Install the tools the checks use
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q shellcheck lua-check valgrind clang
+          tools/ci/fetch-tool.sh actionlint
+          tools/ci/fetch-tool.sh gitleaks
+          echo "$HOME/.local/bin" >>"$GITHUB_PATH"
+      - name: Cache toolchains and vendor checkouts
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/ghostty-dalamud-ci
+            vendor
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+      - name: Cache the fuzz corpus
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: build/fuzz/corpus
+          key: fuzz-corpus-${{ github.run_id }}
+          restore-keys: fuzz-corpus-
+      - name: ${{ matrix.kind }}
+        id: check
+        env:
+          CHECK: ${{ matrix.run }}
+        run: |
+          mkdir -p build
+          set -o pipefail
+          bash -c "$CHECK" 2>&1 | tee "build/check-${{ matrix.kind }}.log"
+      - name: Report
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: tools/ci/report-issue.sh "${{ matrix.kind }}" "${{ steps.check.outcome == 'success' && 'pass' || 'fail' }}" "build/check-${{ matrix.kind }}.log"
+      - name: Upload logs and reports
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ matrix.kind }}-${{ github.run_id }}
+          path: |
+            build/check-*.log
+            build/*.log
+            build/static
+            build/fuzz
+            build/massif
+          if-no-files-found: ignore

@@ -1,0 +1,159 @@
+# In-game tests on the gaming PC: the commit's core swapped into the running
+# game, `/term selftest` through XivMcp, the JSON report as an artifact.
+# See docs/CI.md, "In-game tests". Never runs for pull requests or forks;
+# every run waits in the ffxiv-live environment for the owner's approval.
+#
+# Two ways to run it:
+#
+#   for real     push to the default branch, or dispatch with dry_run off. The
+#                job lands on the gaming PC's runner (label ffxiv-live), waits
+#                in the ffxiv-live environment for a human, and only then gets
+#                XIVMCP_CI_TOKEN.
+#   dry run      dispatch with dry_run on, or let ci.yml's ingame-dryrun job do
+#                it on every push. tools/ci/mock-xivmcp.py stands in for XivMcp,
+#                the loader and `/term selftest`, on a GitHub-hosted runner,
+#                with no secret and no game. This is how the workflow and
+#                tools/ci/ingame.sh are exercised when the game is not there.
+name: In-game
+
+on:
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: 'Suites for /term selftest (all, or names from /term selftest list)'
+        required: false
+        default: all
+      build_here:
+        description: 'Build on the gaming PC when ci.yml has no artifact for this commit (uses its memory while the game runs)'
+        type: boolean
+        required: false
+        default: false
+      dry_run:
+        description: 'Exercise this workflow against a stand-in for XivMcp and the game: GitHub-hosted, no secret, no game'
+        type: boolean
+        required: false
+        default: false
+  push:
+    branches: [master]
+    paths-ignore: ['**.md', 'docs/**']
+
+permissions: {}
+
+# one game, one run at a time; a newer run waits instead of cancelling a run in the game
+concurrency:
+  group: ingame-ffxiv-live
+  cancel-in-progress: false
+
+jobs:
+  # The workflow's own dry run: everything except the game. It never touches the
+  # ffxiv-live environment, the runner or the secret, so it is safe to dispatch
+  # from any branch, and it fails if tools/ci/ingame.sh stops handling any of
+  # the exit statuses the real run depends on.
+  dry-run:
+    if: ${{ inputs.dry_run }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: In-game dry run (mock XivMcp)
+        run: tools/ci/run.sh ingame-dryrun
+      - name: Say what this did and did not prove
+        run: |
+          {
+            echo '### In-game dry run'
+            echo
+            echo 'tools/ci/ingame.sh ran against tools/ci/mock-xivmcp.py, not the game.'
+            echo 'It proves the protocol, the file handshake and every exit status;'
+            echo 'it proves nothing about the game, the loader or /term selftest itself.'
+          } >>"$GITHUB_STEP_SUMMARY"
+
+  ingame:
+    # a fork's copy of this workflow has no business on this runner, and a dry
+    # run must never reach it
+    if: ${{ !github.event.repository.fork && !inputs.dry_run }}
+    runs-on: [self-hosted, ffxiv-live]
+    environment: ffxiv-live
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read # find and download ci.yml's artifact of this commit
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Find ci.yml's build of this commit
+        id: build
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          # wait (up to 9 minutes) for a ci.yml run of this commit that is still going
+          for _ in $(seq 1 54); do
+            run="$(gh run list --workflow ci.yml --commit "$SHA" --limit 20 --json databaseId,status,conclusion \
+              --jq '[.[] | select(.status == "completed" and .conclusion == "success")][0].databaseId // empty')"
+            [[ -n "$run" ]] && break
+            busy="$(gh run list --workflow ci.yml --commit "$SHA" --limit 20 --json status \
+              --jq '[.[] | select(.status != "completed")] | length')"
+            [[ "$busy" == 0 ]] && break
+            echo "ci.yml is still running for $SHA; waiting"
+            sleep 10
+          done
+          echo "run_id=${run:-}" >>"$GITHUB_OUTPUT"
+          if [[ -n "${run:-}" ]]; then echo "using the artifact of ci.yml run $run"; else echo "no successful ci.yml run for $SHA"; fi
+
+      - name: Download build/dist
+        if: steps.build.outputs.run_id != ''
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ghostty-dalamud-${{ github.sha }}
+          path: build/dist
+          run-id: ${{ steps.build.outputs.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Build here
+        if: steps.build.outputs.run_id == '' && inputs.build_here
+        run: tools/ci/run.sh build
+
+      - name: Check for a build
+        run: |
+          if [[ ! -f build/dist/build-info.json ]]; then
+            echo "::error::no ci.yml artifact for ${GITHUB_SHA} and no build here; rerun once ci.yml has passed, or dispatch with build_here"
+            exit 1
+          fi
+          cat build/dist/build-info.json
+
+      - name: In-game self-test
+        id: ingame
+        env:
+          XIVMCP_CI_TOKEN: ${{ secrets.XIVMCP_CI_TOKEN }}
+          XIVMCP_URL: ${{ vars.XIVMCP_URL }}
+          GHOSTTY_DEV_PLUGIN_DIR: ${{ vars.GHOSTTY_DEV_PLUGIN_DIR }}
+          GHOSTTY_CONFIG_DIR: ${{ vars.GHOSTTY_CONFIG_DIR }}
+          INGAME_SUITES: ${{ inputs.suites || 'all' }}
+        run: |
+          rc=0
+          tools/ci/run.sh ingame || rc=$?
+          if [[ $rc == 3 ]]; then
+            # GitHub has no neutral job result: a skip passes, marked by this notice and the step summary
+            echo "::notice title=In-game tests::skipped: game not available"
+            echo "skipped=true" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          exit "$rc"
+
+      - name: Upload the report
+        if: ${{ always() && hashFiles('build/ingame/ingame-report.json') != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ingame-report-${{ github.sha }}-${{ github.run_attempt }}
+          path: build/ingame/ingame-report.json
+          if-no-files-found: error
+          retention-days: 30

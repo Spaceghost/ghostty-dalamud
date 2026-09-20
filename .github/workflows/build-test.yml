@@ -1,0 +1,99 @@
+# The build-and-test job, once, so ci.yml can run it on more than one kind of
+# runner without two copies of the steps drifting apart. Called only by other
+# workflows in this repository (`workflow_call`); it has no trigger of its own.
+#
+# The caller decides *where* it runs and whether the fork guard lets it run at
+# all: this workflow deliberately contains no such check, because a reusable
+# workflow cannot see the caller's event as reliably as the caller can. See
+# ci.yml and docs/CI.md.
+name: Build and test
+
+on:
+  workflow_call:
+    inputs:
+      runs_on:
+        description: 'runs-on, as JSON: a string like "ubuntu-latest" or an array of labels'
+        required: true
+        type: string
+      artifact:
+        description: 'name for the build/dist artifact; empty uploads nothing'
+        required: false
+        default: ''
+        type: string
+      cache:
+        description: 'read and write the Actions caches (off for a runner with its own warm cache)'
+        required: false
+        default: true
+        type: boolean
+      stages:
+        description: 'tools/ci/run.sh stages'
+        required: false
+        default: 'test build'
+        type: string
+      timeout:
+        required: false
+        default: 90
+        type: number
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ${{ fromJSON(inputs.runs_on) }}
+    timeout-minutes: ${{ inputs.timeout }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Say where this is running
+        run: |
+          printf 'runner: %s %s %s, labels from runs-on: %s\n' \
+            "$RUNNER_OS" "$RUNNER_ARCH" "$RUNNER_NAME" '${{ inputs.runs_on }}'
+          printf 'stages: %s\n' '${{ inputs.stages }}'
+
+      - name: Probe for the .NET SDK
+        id: dotnet
+        run: |
+          if command -v dotnet >/dev/null && dotnet --list-sdks | grep -q '^10\.'; then
+            echo "have=true" >>"$GITHUB_OUTPUT"
+          else
+            echo "have=false" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Install the .NET SDK
+        if: steps.dotnet.outputs.have != 'true'
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Cache toolchains and vendor checkouts
+        if: inputs.cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/ghostty-dalamud-ci
+            vendor
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+      - name: Cache Zig build caches
+        if: inputs.cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/zig-global
+            build/zig-cache-linux
+            build/zig-cache-win
+          key: zig-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+
+      - name: Test and build
+        run: tools/ci/run.sh ${{ inputs.stages }}
+
+      - name: Upload build/dist
+        if: inputs.artifact != ''
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ${{ inputs.artifact }}
+          path: build/dist
+          if-no-files-found: error
+          retention-days: 14
