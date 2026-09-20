@@ -1,4 +1,6 @@
-// IPC the Umbra toolbar widget calls (shim/Umbra.Ghostty/GhosttyIpc.cs).
+// IPC the Umbra toolbar widget calls (shim/Umbra.Ghostty/GhosttyIpc.cs), and
+// GhosttyDalamud.v1.Call for any plugin (docs/IPC.md): JSON in, JSON out,
+// answered by the core on the caller's thread.
 // Registered and unregistered only when the core asks, through GuHostApi.
 // Channel names carry a version: a widget from another version sees nothing
 // and reads as offline.
@@ -13,6 +15,7 @@ internal static unsafe class GhosttyIpc
     private static ICallGateProvider<nint, float, float, float, float, int, object>? _popupDraw;
     private static ICallGateProvider<object>? _popupReset;
     private static ICallGateProvider<string, object>? _post;
+    private static ICallGateProvider<string, string>? _call;
 
     public static void Register()
     {
@@ -26,6 +29,11 @@ internal static unsafe class GhosttyIpc
         _popupReset.RegisterAction(PopupReset);
         _post = Plugin.Pi.GetIpcProvider<string, object>("GhosttyDalamud.v1.Post");
         _post.RegisterAction(Post);
+        if (Native.Call != null)
+        {
+            _call = Plugin.Pi.GetIpcProvider<string, string>("GhosttyDalamud.v1.Call");
+            _call.RegisterFunc(Native.CallJson);
+        }
     }
 
     public static void Unregister()
@@ -35,11 +43,13 @@ internal static unsafe class GhosttyIpc
         _popupDraw?.UnregisterAction();
         _popupReset?.UnregisterAction();
         _post?.UnregisterAction();
+        _call?.UnregisterFunc();
         _status = null;
         _popupSize = null;
         _popupDraw = null;
         _popupReset = null;
         _post = null;
+        _call = null;
     }
 
     private static (int, int) PopupSize()
