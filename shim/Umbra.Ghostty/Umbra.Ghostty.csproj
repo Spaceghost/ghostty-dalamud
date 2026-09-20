@@ -19,7 +19,7 @@
     <RootNamespace>Umbra.Ghostty</RootNamespace>
     <AssemblyName>Umbra.Ghostty</AssemblyName>
     <Version>0.2.0.0</Version>
-    <Authors>Spaceghost</Authors>
+    <Authors>Johnneylee Jack Rollins</Authors>
     <Description>Umbra toolbar widget for the Ghostty terminal plugin (GhosttyDalamud).</Description>
     <IsPackable>false</IsPackable>
     <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
