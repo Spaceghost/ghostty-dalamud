@@ -279,7 +279,7 @@ if [[ "$MODE" == podman ]]; then
     "Environment=RUNNER_URL=$URL"
     "Environment=RUNNER_LABELS=$LABELS"
     "Environment=RUNNER_NAME=$NAME"
-    "Environment=RUNNER_TOKEN_COMMAND=$TOKEN_CMD_EFF"
+    "Environment=\"RUNNER_TOKEN_COMMAND=$TOKEN_CMD_EFF\""
   )
   [[ ${#podman_args[@]} -gt 0 ]] && unit_env+=("Environment=PODMAN_RUN_ARGS=${podman_args[*]}")
 else
@@ -359,7 +359,7 @@ LOOP
     "Environment=RUNNER_LABELS=$LABELS"
     "Environment=RUNNER_NAME=$NAME"
   )
-  [[ -n "$TOKEN_CMD_EFF" ]] && unit_env+=("Environment=RUNNER_TOKEN_COMMAND=$TOKEN_CMD_EFF")
+  [[ -n "$TOKEN_CMD_EFF" ]] && unit_env+=("Environment=\"RUNNER_TOKEN_COMMAND=$TOKEN_CMD_EFF\"")
 fi
 
 # The unit. `# runner:` lines are what `status` reads back.
