@@ -1,6 +1,14 @@
 # Ghostty for Dalamud
 
-![Ghostty for FFXIV: Eorzea is a terminal multiplexer](images/banner.png)
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="images/readme/hero-dark.png">
+    <source media="(prefers-color-scheme: light)" srcset="images/readme/hero-light.png">
+    <img src="images/readme/hero-dark.png" width="100%" alt="Ghostty for FFXIV: Eorzea is a terminal multiplexer">
+  </picture>
+</p>
+
+<img src="images/icon.png" width="96" height="96" align="right" alt="Ghostty icon">
 
 **Vote on what it does next: https://spacegho.st/mods/ffxiv/term/vote/**
 
