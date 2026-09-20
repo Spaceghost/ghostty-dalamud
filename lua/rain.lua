@@ -27,6 +27,16 @@ local M = {
   gravity = 12,             -- yalms/s^2
   fling_speed = 2.5,        -- yalms/s off the blade tip
   max_particles = 256,      -- falling at once, all panels together (the core holds at most 256)
+  -- rain follows shelter: a screen only gets rain where the sky can reach it.
+  -- The core casts three rays up from each screen's top edge against the
+  -- game's collision (cached, a few times a second), so a screen out in the
+  -- open is rained on while you stand under a roof, one under an overhang
+  -- only on its exposed side, and indoors nothing is. false: the weather alone
+  -- decides, as before. /term rain on ignores shelter (it is for testing).
+  shelter = true,
+  -- territory ids that never get rain whatever the weather and the rays say
+  -- (add your own: [id] = true). Housing interiors are known from the game.
+  indoor_zones = {},
 }
 
 -- Weather id (the game's Weather sheet) -> rain intensity 0..1. Anything not
@@ -51,6 +61,7 @@ function M.intensity()
   if not (ghostty and ghostty.env) then return 0 end
   local _, rain, weather = ghostty.env()
   if not weather or weather == 0 then return 0 end
+  if ghostty.zone and M.indoor_zones[ghostty.zone()] then return 0 end
   local i = math.max(M.weather[weather] or 0, rain or 0)
   return math.max(0, math.min(1, i))
 end
@@ -73,6 +84,7 @@ function M.frame()
   frame.gravity = M.gravity
   frame.fling_speed = M.fling_speed
   frame.max_particles = M.max_particles
+  frame.shelter = M.shelter ~= false and M.mode ~= 'on'
   return frame
 end
 

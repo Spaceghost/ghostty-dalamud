@@ -117,6 +117,9 @@ global GuHostApi = @record{
   -- nilptr in older shims: the gallery page opens instead
   http_post: function(id: cint, url: cstring, headers: cstring, content_type: cstring,
                       path: cstring, body: cstring, body_len: usize): cint,
+  -- 1 while the game has the character inside a housing interior; nilptr in
+  -- older shims: the collision rays alone decide (core/app/rain.nelua)
+  indoor: function(): cint,
 }
 
 global LOG_INFO: cint <comptime> = 1

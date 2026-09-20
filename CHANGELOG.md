@@ -17,6 +17,12 @@ Statuses mean exactly what they mean in the Changelog tab in game:
 
 BETA is built and merged but has not been seen working in game yet; SOON is still being built. Entries move into a release once they have been verified in game.
 
+### Merged, not yet verified in game
+
+* Rain follows shelter: a screen gets rain only where the sky can reach it. One out in the open is rained on even while you stand under a roof, one half under an overhang only on its open side, and indoors nothing is — no drops, no run-off, no flung water — with the glass drying gradually as a pet screen follows you inside. Drops that fall off stop at the first floor below them (Settings, Light: Rain follows shelter). Not yet tried in game.
+
+### Being built
+
 * Clean first build: the toolchain and the Dalamud references it compiles against are pinned and checked before use, the default shell is chosen per platform, and a fresh clone builds with nothing else installed.
 * Emoji, CJK and other wide glyphs drawn through the same fallback, with Noto Sans Symbols 2 and an optional monochrome Noto Emoji you drop in yourself.
 

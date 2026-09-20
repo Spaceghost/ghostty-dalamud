@@ -413,4 +413,188 @@ do
   rain_reset()
   print('drawing OK')
 end
+-- Shelter: rain reaches a panel only where the sky does -----------------------------
+-- A fake scene: a roof at y = 10 over everything west of x = 0, the ground at
+-- y = 0, and a mezzanine floor at y = 3 east of x = 20. The player stands
+-- under the roof throughout; only the panels' own positions matter.
+local up_rays: integer, down_rays: integer = 0, 0
+local function fake_raycast(ox: float32, oy: float32, oz: float32, dx: float32, dy: float32, dz: float32,
+                            max: float32, hx: *float32, hy: *float32, hz: *float32): cint
+  assert(dx == 0 and dz == 0 and (dy == 1 or dy == -1), 'rain casts straight up or down')
+  local y: float32 = -1000
+  if dy > 0 then
+    up_rays = up_rays + 1
+    if ox < 0 and oy < 10 then y = 10 end
+  else
+    down_rays = down_rays + 1
+    y = (ox > 20 and oy >= 3) and 3 or 0
+    if oy < y then y = -1000 end
+  end
+  if y < -999 or math.abs(y - oy) > max then return 0 end
+  $hx, $hy, $hz = ox, y, oz
+  return 1
+end
+local function fake_player(which: cint, id: uint64, out: *GuObject): cint
+  $out = { found = 1, x = -30, y = 0, z = 0 } -- well under the roof
+  return 1
+end
+local indoors: cint = 0
+local function fake_indoor(): cint return indoors end
+local function run_lua(code: cstring): void
+  assert(luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, 'lua')
+end
+local function lua_kb(): float64
+  assert(luaL_loadstring(policy.L, "return collectgarbage('count')") == LUA_OK and lua_pcall(policy.L, 0, 1, 0) == LUA_OK)
+  local kb = lua_tonumberx(policy.L, -1, nilptr)
+  lua_pop(policy.L, 1)
+  return kb
+end
+do
+  -- the record on its own: due, first answer taken whole, later ones eased, the blend
+  local sh: RainShelter
+  assert(sh:exposure() == 1 and sh:at_x(0.3) == 1, 'never cast: open sky')
+  assert(sh:due(0, 0, 0, 0), 'never cast: due')
+  local pts: [RAIN_SHELTER_N][3]float32 = { { -1, 2, 0 }, { 1, 2, 0 }, { 3, 2, 0 } }
+  up_rays = 0
+  sh:cast(fake_raycast, &pts, 10)
+  assert(up_rays == RAIN_SHELTER_N, 'one ray per sample')
+  assert(sh.open[0] == 0 and sh.open[1] == 1 and sh.open[2] == 1, 'the first answer is taken as it is')
+  assert(near(sh:exposure(), 0.75, 1e-5) and sh:at_x(0) == 0 and near(sh:at_x(0.25), 0.5, 1e-5) and sh:at_x(0.75) == 1, 'blended across the width')
+  assert(not sh:due(10.1, 1, 2, 0), 'cached while it stays put')
+  assert(sh:due(10.26, 1, 2, 0), 'cast again after the period')
+  assert(not sh:due(10.05, 3, 2, 0), 'a moved panel still waits the minimum gap')
+  assert(sh:due(10.1, 3, 2, 0), 'then casts sooner than the period')
+  assert(not sh:due(10.1, 1.1, 2, 0), 'a small move does not count')
+  for i = 0, < RAIN_SHELTER_N do pts[i][0] = pts[i][0] - 10 end -- all under the roof now
+  sh:cast(fake_raycast, &pts, 10.3)
+  assert(sh.open[1] == 1 and sh.target[1] == 0, 'a later answer is only the target')
+  for i = 1, 30 do sh:ease(1 / 60) end
+  assert(sh.open[1] > 0.4 and sh.open[1] < 0.6, 'half way after half a second')
+  for i = 1, 40 do sh:ease(1 / 60) end
+  assert(sh:exposure() == 0, 'covered after about a second')
+  print('shelter record OK')
+end
+do
+  run_lua([[
+    ghostty.env = function() return 43200, 0, 8 end -- showers
+    ghostty.zone = function() return 132 end
+    CONFIG.rain.mode = 'auto'
+    CONFIG.rain.wiper_style = 'back'
+  ]])
+  rain_reset()
+  host.api.raycast = fake_raycast
+  host.api.get_object = fake_player
+  host.api.indoor = fake_indoor
+  local o = vec2(100, 50)
+  local now: float64 = 1000
+  -- 800 px at 300 px per yalm: 2.67 yalms wide, facing +Z, so right is +X
+  local open_pl: WorldPlacement = { x = 5, y = 2, z = 0, width = 800, height = 500, ppm = 300, opacity = 0.9, tint_r = 1, tint_g = 1, tint_b = 1 }
+  local roof_pl, half_pl, loft_pl = open_pl, open_pl, open_pl
+  roof_pl.x = -8
+  half_pl.x = -0.5  -- samples at x = -1.83, -0.5 and 0.83: only the right corner sees the sky
+  loft_pl.x, loft_pl.y = 25, 5 -- above the mezzanine, the player a floor below
+
+  -- (a) open sky over the panel, the player under the roof: it rains on it;
+  -- (b) under the roof: nothing at all; (c) half under: the open side only
+  local before = lua_kb()
+  run_lua("collectgarbage('collect') collectgarbage('stop')")
+  before = lua_kb()
+  up_rays = 0
+  for i = 1, 60 * 12 do
+    rain_panel_back(nilptr, o, &open_pl, 21, now, 1)
+    rain_panel_back(nilptr, o, &roof_pl, 22, now, 1)
+    rain_panel_back(nilptr, o, &half_pl, 23, now, 1)
+    assert(rain_rays_frame <= RAIN_RAYS_FRAME, 'ray budget per frame')
+    local r = rain_panel_find(22)
+    assert(r.level == 0 and r:count() == 0 and r.nemit == 0 and not r.wiping, 'under the roof: never a drop')
+    now = now + 1 / 60
+  end
+  local grew = lua_kb() - before
+  run_lua("collectgarbage('restart')")
+  print('3 panels for 720 frames made KB', grew)
+  assert(grew < 8, 'rain makes Lua garbage every frame')
+  -- 12 s, 3 panels that stay put: one cast each per 0.25 s, not one per frame
+  assert(up_rays == rain_rays_total and up_rays >= 3 * RAIN_SHELTER_N * 40 and up_rays <= 3 * RAIN_SHELTER_N * 50, 'casts are cached and throttled')
+  local a, h = rain_panel_find(21), rain_panel_find(23)
+  assert(near(a.level, 1, 1e-3) and a:count() > 10 and a.wiping, 'open sky: full rain')
+  assert(near(h.shelter:exposure(), 0.25, 1e-5) and near(h.level, 0.25, 1e-3), 'half under: the exposed share')
+  local wet_side, dry_side = 0, 0
+  for k = 0, < RAIN_MAX_DROPS do
+    if h.drops[k].kind == 1 then
+      if h.drops[k].x < 380 then dry_side = dry_side + 1 else wet_side = wet_side + 1 end
+    end
+  end
+  assert(wet_side > 2 and dry_side == 0, 'drops only where the sky reaches')
+  print('shelter a, b, c OK')
+
+  -- (e) what falls off lands on the first floor below it, not at the player's height
+  rain_reset()
+  for i = 1, 60 * 20 do rain_panel_back(nilptr, o, &loft_pl, 24, now, 1) now = now + 1 / 60 end
+  local fell = 0
+  for i = 0, < RAIN_MAX_FALL do
+    if rain_pool.p[i].live then
+      fell = fell + 1
+      assert(rain_pool.p[i].ground == 3, 'the mezzanine catches it')
+    end
+  end
+  assert(fell > 0 and down_rays > 0, 'drops fell off the loft panel')
+  print('shelter e OK')
+
+  -- (f) a pet panel carried indoors: exposure eases, the glass dries after it
+  local pet = open_pl
+  for i = 1, 60 * 6 do rain_panel_back(nilptr, o, &pet, 25, now, 1) now = now + 1 / 60 end
+  local p = rain_panel_find(25)
+  assert(p.level > 0.99 and p:count() > 10, 'wet outside')
+  pet.x = -8
+  rain_pool:clear()
+  up_rays = 0
+  for i = 1, 30 do rain_panel_back(nilptr, o, &pet, 25, now, 1) now = now + 1 / 60 end
+  local e = p.shelter:exposure()
+  assert(e > 0.3 and e < 0.7, 'half a second in: half way')
+  assert(p:count() > 0, 'the glass is still wet')
+  for i = 1, 60 do rain_panel_back(nilptr, o, &pet, 25, now, 1) now = now + 1 / 60 end
+  assert(p.shelter:exposure() == 0 and p.level > 0.3 and p:count() > 0, 'sheltered, still drying')
+  local shed_before = rain_pool.live
+  for i = 1, 60 * 5 do rain_panel_back(nilptr, o, &pet, 25, now, 1) now = now + 1 / 60 end
+  assert(p.level == 0 and p:count() == 0, 'dry in the end')
+  assert(rain_pool.live <= shed_before, 'nothing shed once sheltered')
+  -- a panel moving every frame (6 yalms a second, under the roof) casts at the
+  -- minimum gap, not every frame
+  up_rays = 0
+  for i = 1, 60 do
+    pet.x = pet.x - 0.1
+    rain_panel_back(nilptr, o, &pet, 25, now, 1)
+    now = now + 1 / 60
+  end
+  assert(up_rays >= RAIN_SHELTER_N * 8 and up_rays <= RAIN_SHELTER_N * 13, 'a moving panel is throttled')
+  -- ten new panels in one frame share the frame's budget
+  for id = 40, 49 do rain_panel_back(nilptr, o, &open_pl, id, now, 1) end
+  assert(rain_rays_frame <= RAIN_RAYS_FRAME and rain_rays_frame > 0, 'the budget holds with many panels')
+  assert(not rain_panel_find(49).shelter.known and rain_panel_find(49).level == 0, 'a panel waiting for its rays stays dry meanwhile')
+  print('shelter f, throttle OK')
+
+  -- (d) indoors by the game's word, or by the zone list: dry under open sky
+  rain_reset()
+  indoors = 1
+  for i = 1, 120 do rain_panel_back(nilptr, o, &open_pl, 26, now, 1) now = now + 1 / 60 end
+  assert(rain_panel_find(26).level == 0 and rain_rays_total == 0, 'a housing interior: no rain, no rays')
+  indoors = 0
+  run_lua("CONFIG.rain.indoor_zones[132] = true")
+  for i = 1, 120 do rain_panel_back(nilptr, o, &open_pl, 26, now, 1) now = now + 1 / 60 end
+  assert(rain_panel_find(26).level == 0, 'a listed zone: no rain')
+  run_lua("CONFIG.rain.indoor_zones[132] = nil")
+  -- the toggle off, and /term rain on: the weather alone, even under the roof
+  run_lua("CONFIG.rain.shelter = false")
+  for i = 1, 120 do rain_panel_back(nilptr, o, &roof_pl, 27, now, 1) now = now + 1 / 60 end
+  assert(rain_panel_find(27).level > 0.5 and rain_rays_total == 0, 'shelter off: rain everywhere, no rays')
+  run_lua("CONFIG.rain.shelter = true")
+  -- dry weather: no rays either
+  run_lua("ghostty.env = function() return 43200, 0, 1 end")
+  rain_reset()
+  for i = 1, 60 do rain_panel_back(nilptr, o, &open_pl, 28, now, 1) now = now + 1 / 60 end
+  assert(rain_rays_total == 0, 'no rain, no rays')
+  host.api.raycast, host.api.get_object, host.api.indoor = nilptr, nilptr, nilptr
+  rain_reset()
+  print('shelter d OK')
+end
 print('OK')

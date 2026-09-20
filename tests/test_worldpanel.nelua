@@ -354,6 +354,24 @@ do
     for id = 201, 203 do w.forget(id) end
     print('placing 3 lined-up pets for 600 frames made KB', grew)
     assert(grew < 64, 'lining pets up makes garbage every frame')
+    -- and the rain policy the core asks beside each placement (lua/rain.lua):
+    -- the frame table is reused, the zone list and the anchors are only read
+    local r = CONFIG.rain
+    r.indoor_zones[9999] = true
+    for f = 1, 5 do r.frame() for id = 201, 203 do r.panel(id) end end
+    collectgarbage('collect')
+    collectgarbage('stop')
+    before = collectgarbage('count')
+    for f = 1, 600 do
+      local fr = r.frame()
+      assert(fr.intensity > 0 and fr.shelter == true)
+      for id = 201, 203 do assert(r.panel(id)) end
+    end
+    grew = collectgarbage('count') - before
+    collectgarbage('restart')
+    r.indoor_zones[9999] = nil
+    print('rain policy for 3 panels and 600 frames made KB', grew)
+    assert(grew < 4, 'the rain policy makes garbage every frame')
   ]]
   assert(luaL_loadstring(policy.L, code) == LUA_OK, 'load')
   if lua_pcall(policy.L, 0, 0, 0) ~= LUA_OK then

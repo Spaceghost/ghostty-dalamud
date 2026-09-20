@@ -92,6 +92,7 @@ internal static unsafe class HostApi
         Api->GameString     = &GameString;
         Api->HudRects       = &HudRects;
         Api->HttpPost       = &HttpPost;
+        Api->Indoor         = &Indoor;
     }
 
     public static void Free()
@@ -821,6 +822,16 @@ internal static unsafe class HostApi
             o->CleanupRender();
             o->Dtor(1);
             return 1;
+        } catch { return 0; }
+    }
+
+    // 1 while the game has the character inside a housing interior (rain never reaches there).
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int Indoor()
+    {
+        try {
+            var h = FFXIVClientStructs.FFXIV.Client.Game.HousingManager.Instance();
+            return h != null && h->IndoorTerritory != null ? 1 : 0;
         } catch { return 0; }
     }
 

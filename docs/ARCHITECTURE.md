@@ -335,6 +335,24 @@ it, and `lua/rain.lua` decides whether it rains and holds the tunables.
   used when it is higher. Weather 0 counts as no weather, meaning indoors, so
   it is dry. `/term rain on|off|auto` forces rain on or off, or follows the
   weather again. `CONFIG.rain.panel(id)` keeps HUD-anchored panels dry.
+* **Shelter.** The weather says whether it rains; whether rain reaches a
+  panel is asked per panel, of the game's collision, not of where the player
+  stands. While it rains, `rain_panel_shelter` casts three rays straight up
+  (60 yalms) from the panel's top edge — left corner, centre, right corner, a
+  hand's width in front of the glass — through the host's `raycast`. Open sky
+  over a sample means rain lands on that part; a roof or overhang means it
+  does not. The answers live in the panel's `RainShelter`: cast again every
+  0.25 s, sooner (at most every 0.08 s) once the panel has moved 0.25 yalms,
+  never more than 12 rays a frame for all panels together, and none at all in
+  dry weather. Each sample eases over a second. The panel's intensity is the
+  weather's times the exposed share of its width, and new drops land across
+  the width in proportion to the blended samples, so a panel half under an
+  overhang is wet on its open half only. A sheltered panel's target is 0: its
+  drops evaporate over `fade` seconds and nothing is shed or flung. A housing
+  interior (`indoor`, `HousingManager.IndoorTerritory`) and the territories
+  in `CONFIG.rain.indoor_zones` are dry whatever the rays say. `/term rain on`
+  and `CONFIG.rain.shelter = false` rain on every panel. Older shims without
+  `raycast` behave as before. Not yet observed in game.
 * **Drops.** Each panel has a fixed `RainPanel` holding up to 120 drops and a
   seeded xorshift generator, so the same seed and steps always give the same
   rain. The panel's level fades toward the intensity over `fade` seconds, and
