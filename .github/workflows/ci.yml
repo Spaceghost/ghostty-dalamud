@@ -2,7 +2,7 @@ name: Plugin candidate
 on:
   pull_request:
   push:
-    branches: [main, release/dalamud-submission-prep]
+    branches: [master, main, release/dalamud-submission-prep]
   workflow_dispatch:
     inputs:
       runner:
@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           persist-credentials: false
       - run: python3 -m unittest discover -s tests -p 'test_*.py' -v
       - run: for script in tools/*.sh tests/run.sh; do bash -n "$script"; done
@@ -39,7 +39,7 @@ jobs:
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
-          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
@@ -70,13 +70,13 @@ jobs:
           with open(os.environ['GITHUB_PATH'], 'a') as output:
               output.write(str(binary.parent) + '\n')
           PY
-      - name: Build, host-test and validate the private candidate
+      - name: Build, host-test and validate the candidate
         run: tools/build-release.sh
-      - name: Retain private candidate and generated restore evidence
+      - name: Retain candidate and generated restore evidence
         if: success()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          name: GhosttyDalamud-candidate-${{ github.event.pull_request.head.sha || github.sha }}
+          name: GhosttyDalamud-candidate-${{ github.sha }}
           if-no-files-found: error
           retention-days: 7
           path: |
