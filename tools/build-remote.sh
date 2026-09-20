@@ -86,7 +86,10 @@ remote_env() {
   epoch="$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 1)"
   e+=(--env "SOURCE_DATE_EPOCH=$epoch")
   local v
-  for v in SKIP_WIN SKIP_SHIM SKIP_UMBRA SKIP_DEPS SKIP_WAYLAND MAC BUILD_COMMIT BUILD_ID; do
+  # SAN and its option strings travel too, so the sanitizer suites can run here
+  # rather than on the machine the game is on.
+  for v in SKIP_WIN SKIP_SHIM SKIP_UMBRA SKIP_DEPS SKIP_WAYLAND MAC BUILD_COMMIT BUILD_ID \
+           SAN ASAN_OPTIONS UBSAN_OPTIONS LSAN_OPTIONS; do
     [[ -n "${!v:-}" ]] && e+=(--env "$v=${!v}")
   done
   printf '%s\n' "${e[@]}"
