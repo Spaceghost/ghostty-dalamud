@@ -6,6 +6,7 @@
 require 'core.host'
 require 'string'
 require 'arg'
+require 'os'
 
 ## if pragmas.glibc_heap then
 local mallinfo2_t <cimport 'struct mallinfo2', cinclude '<malloc.h>', nodecl> = @record{
@@ -70,7 +71,10 @@ local function cycle(n: integer): void
   assert(#host.sessions == 0 and #host.status == 0, 'host state cleared')
 end
 
-local CYCLES <comptime> = 8
+-- GHOSTTY_HEAP_ITERS raises this for the nightly soak
+local env_cycles: string = os.getenv('GHOSTTY_HEAP_ITERS')
+local CYCLES: integer = 8
+if env_cycles.size > 0 and tointeger(env_cycles) > 8 then CYCLES = tointeger(env_cycles) end
 ## if pragmas.glibc_heap then
 local warm: usize = 0
 ## end

@@ -53,8 +53,10 @@ local function expect(want: string, why: string): void
 end
 
 local vote_logs: integer = 0 -- lua/vote.lua saying it cannot open the page
+local warned: string -- the last warning
 local function quiet(level: cint, msg: cstring): void
   if (@string)(msg):find('vote:', 1, true) > 0 then vote_logs = vote_logs + 1 end
+  if level == LOG_WARN and (@string)(msg):find('cimgui', 1, true) == 0 then warned:destroy() warned = string.copy(msg) end
 end
 local open_ok: cint = 1
 local function open_url(url: cstring): cint
@@ -175,10 +177,16 @@ do
   assert(host.settings_open, 'in order: closed by the command, reopened by /xlplugins Settings')
 
   -- info bar clicks go through CONFIG.host.dtr.on_click
-  assert(not host.dropdown_open and not surface.popup_open)
-  gu_event(GuEventKind.DtrClick, 0, 0, 100, 20, nilptr) -- left
+  assert(not host.dropdown_open and not surface.popup_open and not surface.list_open)
+  gu_event(GuEventKind.DtrClick, 0, 0, 100, 20, nilptr) -- left: every terminal
+  gu_frame()
+  assert(surface.list_open and surface.last_action == 'list' and not host.dropdown_open)
+  assert(surface.list_x == 100 and surface.list_y == 20, 'the list anchored at the click')
+  gu_event(GuEventKind.DtrClick, 0, 0, 100, 20, nilptr) -- left again: closed
+  gu_event(GuEventKind.DtrClick, 0, 2, 100, 20, nilptr) -- alt+left: the dropdown
   gu_event(GuEventKind.DtrClick, 1, 0, 100, 20, nilptr) -- right
   gu_frame()
+  assert(not surface.list_open, 'a second click closes the list')
   assert(host.dropdown_open and surface.popup_open and surface.last_action == 'popup')
   assert(surface.popup_x == 100 and surface.popup_y == 20, 'popup anchored at the click')
   local a = surface_click_action(0, 4) assert(a == 'window', 'shift+click') a:destroy()
@@ -192,7 +200,9 @@ do
   lua('CONFIG.host = nil')
   a = surface_click_action(1, 0) assert(a == 'popup') a:destroy()
   a = surface_click_action(0, 4) assert(a == 'window') a:destroy()
-  a = surface_click_action(0, 0) assert(a == 'toggle') a:destroy()
+  a = surface_click_action(0, 0) assert(a == 'list') a:destroy()
+  a = surface_click_action(0, 2) assert(a == 'toggle', 'alt+click') a:destroy()
+  a = surface_click_action(0, 1) assert(a == 'world', 'ctrl+click') a:destroy()
   assert(gu_command('reload') == 0) -- CONFIG.host back
   reset_calls()
 
@@ -360,6 +370,159 @@ do
   assert(vote_logs == 1, 'logged once, with the link')
   gu_shutdown()
   expect(UNREGISTERED, 'shutdown')
+end
+
+-- The screenshot gallery: uploads go through the shim, answers come back as events -------------
+-- (lua/gallery.lua itself: tests/test_gallery.lua)
+local function http_upload(id: cint, url: cstring, path: cstring, ctype: cstring): cint
+  assert((@string)(path) == 'C:\\shots\\ffxiv_1.png' and (@string)(ctype) == 'image/png', 'path and type as given')
+  rec('http_upload', url)
+  return 1
+end
+local function http_post(id: cint, url: cstring, headers: cstring, ctype: cstring, path: cstring, body: cstring, body_len: usize): cint
+  if path ~= nilptr then
+    assert((@string)(path) == 'C:\\shots\\ffxiv_1.png' and body == nilptr and body_len == 0, 'a file: no body')
+    assert((@string)(headers) == 'Authorization: Bearer gvt_test' and (@string)(ctype) == 'image/png', 'headers and type as given')
+    rec('http_post file', url)
+  else
+    assert(headers == nilptr and (@string)(ctype) == 'application/json', 'no headers, the type as given')
+    assert(body_len == 23 and (@string)(body) == '{"client_id":"ghostty"}', 'the body as given')
+    rec('http_post body', url)
+  end
+  return 1
+end
+local function game_string(name: cstring, buf: *[0]cchar, cap: usize): usize
+  if (@string)(name) ~= 'player' then return 0 end
+  local v: string = 'Wyn Ghostty@Gilgamesh'
+  for i = 0, < #v do buf[i] = (@cchar)(v.data[i]) end
+  buf[#v] = 0
+  return #v
+end
+do
+  local a: GuHostApi = api
+  a.http_upload = http_upload
+  a.game_string = game_string
+  assert(gu_init_ex(&a, &info) == INIT_OK)
+  expect(REGISTERED, 'registers the same')
+  lua([[assert(ghostty.game_string('player') == 'Wyn Ghostty@Gilgamesh' and ghostty.game_string('user_path') == nil)
+    assert(ghostty.http_upload('https://spacegho.st/mods/ffxiv/term/gallery/api/upload', 'C:\\shots\\ffxiv_1.png', 'image/png') == 1)
+    local no, why = ghostty.http_upload('http://example.org/', 'C:\\shots\\ffxiv_1.png', 'image/png')
+    assert(no == nil and why:find('https'), 'only https')
+    assert(ghostty.http_upload('https://example.org/', '', 'image/png') == nil, 'a file is needed')
+    CONFIG.gallery.on_upload = function(id, status, text) GALLERY_SEEN = id .. ' ' .. status .. ' ' .. text end]])
+  expect('http_upload https://spacegho.st/mods/ffxiv/term/gallery/api/upload', 'only the https upload reaches the shim')
+  gu_event(GuEventKind.HttpDone, 1, 201, 0, 0, '{"ok":true,"status":"pending"}')
+  gu_frame()
+  lua([[assert(GALLERY_SEEN == '1 201 {"ok":true,"status":"pending"}', tostring(GALLERY_SEEN))]])
+  gu_event(GuEventKind.HttpDone, 2, 0, 0, 0, nilptr)
+  gu_frame()
+  lua([[assert(GALLERY_SEEN == '2 0 ', 'no text: an empty string')]])
+  assert(gu_command('share off') == 0 and gu_command('share gallery') == 0, '/term share reaches lua/gallery.lua')
+  expect('open_url https://spacegho.st/mods/ffxiv/term/gallery/', 'share gallery opens the page')
+  lua([[assert(ghostty.http_post == nil, 'a shim without http_post: not offered')]])
+  gu_shutdown()
+  expect(UNREGISTERED, 'shutdown')
+
+  -- the sign-in and the signed upload: a JSON body, or a file with an Authorization header
+  local p: GuHostApi = a
+  p.http_post = http_post
+  assert(gu_init_ex(&p, &info) == INIT_OK)
+  expect(REGISTERED, 'registers the same')
+  lua([[local id = ghostty.http_post('https://spacegho.st/mods/ffxiv/term/vote/api/device/code', nil, 'application/json', nil, '{"client_id":"ghostty"}')
+    assert(type(id) == 'number', 'a body')
+    assert(ghostty.http_post('https://spacegho.st/mods/ffxiv/term/gallery/api/upload', 'Authorization: Bearer gvt_test', 'image/png', 'C:\\shots\\ffxiv_1.png') == id + 1, 'a file')
+    local no, why = ghostty.http_post('http://example.org/', nil, 'application/json', nil, '{}')
+    assert(no == nil and why:find('https'), 'only https')
+    assert(ghostty.http_post('https://example.org/', nil, 'application/json') == nil, 'a body or a file is needed')]])
+  expect('http_post body https://spacegho.st/mods/ffxiv/term/vote/api/device/code|http_post file https://spacegho.st/mods/ffxiv/term/gallery/api/upload', 'both reach the shim, https only')
+  gu_shutdown()
+  expect(UNREGISTERED, 'shutdown')
+
+  -- a shim from before the gallery: neither function is there, the page opens instead
+  local old: GuHostApi = a
+  old.size = (@usize)(&old.http_upload) - (@usize)(&old)
+  assert(gu_init_ex(&old, &info) == INIT_OK)
+  expect(REGISTERED, 'an older shim registers the same')
+  assert(host.api.http_upload == nilptr and host.api.game_string == nilptr, 'nothing copied past size')
+  lua([[assert(ghostty.http_upload == nil and ghostty.game_string == nil)]])
+  gu_shutdown()
+  expect(UNREGISTERED, 'shutdown')
+end
+
+-- Commands of their own: /window, /ask, /agent (CONFIG.host.verb_commands) -----------------------
+-- A shim with command_add_tagged registers each with its tag; its handler
+-- posts Chat with `a` = tag. The older shim above logged them once instead.
+local tagged: [8]string
+local tag_help: [8]string
+local function command_add_tagged(name: cstring, help: cstring, tag: cint): cint
+  assert(tag >= 1 and tag <= 8)
+  tagged[tag - 1]:destroy() tagged[tag - 1] = string.copy(name)
+  tag_help[tag - 1]:destroy() tag_help[tag - 1] = string.copy(help)
+  rec('tagged', name)
+  return 1
+end
+-- chat_print: short results in the game chat as well as the log
+local chatted: string
+local chats = 0
+local function chat_print(text: cstring): cint
+  chatted:destroy() chatted = string.copy(text)
+  chats = chats + 1
+  return 1
+end
+local function tag_of(name: string): cint
+  for i = 0, < 8 do if tagged[i] == name then return i + 1 end end
+  return 0
+end
+do
+  local newer: GuHostApi = api
+  newer.command_add_tagged = command_add_tagged
+  newer.chat_print = chat_print
+  assert(gu_init_ex(&newer, &info) == INIT_OK)
+  local got = joined()
+  ## for _, want in ipairs{'add /term', 'add /tomestone', 'add /tome', 'tagged /window', 'tagged /ask', 'tagged /agent'} do
+    assert(got:find(#[want]#, 1, true) > 0, #[want]#)
+  ## end
+  got:destroy()
+  reset_calls()
+  local w, a, g = tag_of('/window'), tag_of('/ask'), tag_of('/agent')
+  assert(w > 0 and a > 0 and g > 0 and w ~= a and a ~= g, 'distinct tags')
+  assert(tag_help[w - 1]:find('pull [match|#wid] | run CMD', 1, true) > 0, 'help from lua/tooltips.lua')
+  lua("assert(ghostty.host_info().commands['/window'] == true)")
+  gu_event(GuEventKind.Chat, w, 0, 0, 0, 'desktop')
+  gu_frame()
+  assert(warned:find('window desktop: not available yet', 1, true) > 0, warned)
+  assert(chatted == '[ghostty] window desktop: not available yet (reserved for a whole remote desktop on a panel)', 'said in the chat too: ' .. chatted)
+  gu_event(GuEventKind.Chat, w, 0, 0, 0, '')
+  gu_frame()
+  assert(host.window_picker_open, '/window alone: the Windows picker')
+  gu_event(GuEventKind.Chat, w, 0, 0, 0, '')
+  gu_frame()
+  assert(not host.window_picker_open, 'and again: closed')
+  gu_event(GuEventKind.Chat, w, 0, 0, 0, 'teleport')
+  gu_frame()
+  assert(warned:find('usage: /window', 1, true) == 1, warned)
+  gu_event(GuEventKind.Chat, w, 0, 0, 0, 'run')
+  gu_frame()
+  assert(warned:find('usage: /window run', 1, true) == 1, warned)
+  gu_event(GuEventKind.Chat, w, 0, 0, 0, 'pull Firefox')
+  gu_frame()
+  assert(warned:find('window pull: ', 1, true) == 1, 'the same path as /term window pull: ' .. warned)
+  assert(chatted:find('[ghostty] window pull: ', 1, true) == 1, 'a failed pull reaches the chat: ' .. chatted)
+  gu_event(GuEventKind.Chat, g, 0, 0, 0, 'status')
+  gu_frame()
+  assert(warned == 'usage: /agent ask [question]', warned)
+  gu_event(GuEventKind.Chat, 0, 0, 0, 0, 'config')
+  host.settings_open = false
+  gu_frame()
+  assert(host.settings_open, 'tag 0 is still a /term line')
+  gu_shutdown()
+  got = joined()
+  ## for _, want in ipairs{'remove /term', 'remove /window', 'remove /ask', 'remove /agent'} do
+    assert(got:find(#[want]#, 1, true) > 0, #[want]#)
+  ## end
+  got:destroy()
+  reset_calls()
+  for i = 0, < 8 do tagged[i]:destroy() tag_help[i]:destroy() end
 end
 
 -- gu_init (tests, plain embedding) without the surface callbacks registers nothing ----------------

@@ -1,0 +1,9 @@
+# valgrind suppressions for SAN=valgrind runs of tests/run.sh. As with
+# tests/lsan.supp: vendored and system code only.
+{
+   glibc-dlopen-keeps-the-link-map
+   Memcheck:Leak
+   match-leak-kinds: reachable,possible
+   ...
+   fun:_dl_open
+}

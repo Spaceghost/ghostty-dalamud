@@ -1,0 +1,175 @@
+-- /term selftest: the pure parts (core/selftest_logic.nelua) and the runner
+-- in an embedded core without ImGui or a game (core/app/selftest.nelua).
+require 'core.selftest_logic'
+require 'string'
+require 'io'
+require 'os'
+require 'arg'
+
+-- Suite selection ------------------------------------------------------------------
+do
+  local ok, mask, list, err = selftest_parse('')
+  assert(ok and mask == SELFTEST_ALL and not list, 'no suites = all')
+  ok, mask, list, err = selftest_parse('all')
+  assert(ok and mask == SELFTEST_ALL)
+  ok, mask, list, err = selftest_parse('  list ')
+  assert(ok and list, 'list')
+  ok, mask, list, err = selftest_parse('terminal, render world')
+  assert(ok and mask == ((1 << 1) | (1 << 2) | (1 << 3)), 'spaces and commas')
+  ok, mask, list, err = selftest_parse('terminal bogus')
+  assert(not ok and err:find('unknown suite "bogus"', 1, true) > 0, 'unknown suite')
+  err:destroy()
+  ok, mask, list, err = selftest_parse('list core')
+  assert(not ok, 'list takes nothing')
+  err:destroy()
+  local sel = selftest_selection_text((1 << 0) | (1 << 8))
+  assert(sel == 'core loader', sel)
+  sel:destroy()
+  assert(selftest_suite_index('loader') == SELFTEST_SUITE_COUNT - 1, 'loader runs last')
+  print('parse OK')
+end
+
+-- JSON, summary, hash ---------------------------------------------------------------
+do
+  local sb: stringbuilder
+  selftest_json_string(&sb, 'a"b\\c\nd\t\1é')
+  local j = sb:promote()
+  assert(j == '"a\\"b\\\\c\\nd\\t\\u0001é"', j)
+  j:destroy()
+
+  local cases: vector(SelftestCase)
+  selftest_add(&cases, 'core', 'loaded', SelftestStatus.Pass, 1, 'ok')
+  selftest_add(&cases, 'terminal', 'grid', SelftestStatus.Fail, 2, 'bad\tcell\nhere')
+  selftest_add(&cases, 'agent', 'echo', SelftestStatus.Skip, 0, 'no agent')
+  assert(cases[1].message == 'bad cell here', 'fields lose tabs and newlines')
+  local meta: SelftestMeta = {
+    run_id = 'r1', selection = 'core terminal agent', state = 'complete', build_id = 'b1', commit = 'c1',
+    core_version = 'v', plugin_version = '0.2.0.0', game_version = 'g', platform = 'linux', host_kind = 'embedded',
+    started_utc = 's', finished_utc = 'f', duration_ms = 12,
+  }
+  local rep = selftest_report_json(&meta, &cases, true)
+  io.write(rep)
+  assert(rep:find('"complete": true', 1, true) > 0 and rep:find('"ok": false', 1, true) > 0)
+  assert(rep:find('"summary": { "passed": 1, "failed": 1, "skipped": 1, "total": 3 }', 1, true) > 0)
+  assert(rep:find('{ "suite": "terminal", "case": "grid", "status": "fail", "ms": 2, "message": "bad cell here" }', 1, true) > 0)
+  assert(rep:find('"id": "b1"', 1, true) > 0 and rep:find('"commit": "c1"', 1, true) > 0)
+  rep:destroy()
+  local sum = selftest_summary(&meta, &cases)
+  print(sum)
+  assert(sum == 'selftest core terminal agent: FAIL, 1 passed, 1 failed, 1 skipped in 12 ms (build b1); first failure terminal/grid: bad cell here', sum)
+  sum:destroy()
+
+  -- the state handed across a core swap
+  local st: SelftestState = { run_id = string.copy('run-7'), selection = 0x1ff, next = 8, step = 1, started_ms = 1234,
+    started_utc = string.copy('2026-09-19T00:00:00Z'), swap_ms = 99, fp = string.copy('tab=1,2;settings=x') }
+  for i = 0, < #cases do selftest_add(&st.cases, cases[i].suite, cases[i].name, cases[i].status, cases[i].ms, cases[i].message) end
+  local enc = selftest_state_encode(&st)
+  local back: SelftestState
+  assert(selftest_state_decode(enc, &back), 'state decodes')
+  assert(back.run_id == 'run-7' and back.selection == 0x1ff and back.next == 8 and back.step == 1)
+  assert(back.started_ms == 1234 and back.swap_ms == 99 and back.fp == 'tab=1,2;settings=x')
+  assert(back.started_utc == '2026-09-19T00:00:00Z' and #back.cases == 3)
+  assert(back.cases[1].status == SelftestStatus.Fail and back.cases[1].message == 'bad cell here' and back.cases[2].ms == 0)
+  selftest_state_destroy(&back)
+  local bad: SelftestState
+  assert(not selftest_state_decode('not a state\nrun\tx\nnext\t1\n', &bad), 'magic line')
+  assert(not selftest_state_decode('ghostty-selftest-state 1\nnext\t1\n', &bad), 'no run id')
+  assert(not selftest_state_decode('ghostty-selftest-state 1\nrun\tx\nnext\tbogus\n', &bad), 'bad number')
+  assert(not selftest_state_decode('ghostty-selftest-state 1\nrun\tx\nnext\t99\n', &bad), 'next out of range')
+  assert(not selftest_state_decode('ghostty-selftest-state 1\nrun\tx\nnext\t1\ncase\ta\tb\tmaybe\t1\tm\n', &bad), 'bad status')
+  enc:destroy()
+  selftest_state_destroy(&st)
+  selftest_cases_clear(&cases)
+  cases:destroy()
+
+  assert(selftest_fnv(SELFTEST_FNV_START, '') == 0xcbf29ce484222325_u64)
+  assert(selftest_fnv(SELFTEST_FNV_START, 'a') == 0xaf63dc4c8601ec8c_u64, 'FNV-1a 64 of "a"')
+  local hx = selftest_hex64(0xaf63dc4c8601ec8c_u64)
+  assert(hx == 'af63dc4c8601ec8c', hx)
+  hx:destroy()
+
+  local views: SelftestViews
+  views.tabs:push(3) views.tabs:push(1) views.world:push(9)
+  local fp = selftest_fingerprint(&views, 0xff, 'b1')
+  assert(fp == 'tab=1,3;window=;min=;world=9;settings=00000000000000ff;build=b1', fp)
+  fp:destroy()
+  selftest_views_destroy(&views)
+
+  local ok, v = selftest_json_string_field('{\n  "Name": "Ghostty",\n  "AssemblyVersion" : "0.2.0.0",\n}', 'AssemblyVersion')
+  assert(ok and v == '0.2.0.0', v)
+  v:destroy()
+  ok, v = selftest_json_string_field('{"a": 1}', 'AssemblyVersion')
+  assert(not ok)
+  print('report OK')
+end
+
+-- Terminal read back and render hash --------------------------------------------------
+do
+  local tv: TermView
+  assert(tv:init(SELFTEST_VT_COLS, SELFTEST_VT_ROWS))
+  local ok, err = selftest_vt_check(&tv)
+  if not ok then print(err) end
+  assert(ok, 'terminal read back')
+  tv:destroy()
+
+  local rok, h, calls, out = selftest_render_ops()
+  io.write(out)
+  local hx = selftest_hex64(h)
+  print('render ops', calls, hx)
+  assert(rok and calls > 20)
+  assert(hx == SELFTEST_RENDER_HASH, 'SELFTEST_RENDER_HASH in core/selftest_logic.nelua must be ' .. hx)
+  -- the same terminal twice: the same calls
+  local rok2, h2, calls2, out2 = selftest_render_ops()
+  assert(rok2 and h2 == h and calls2 == calls, 'recorded calls are deterministic')
+  -- the real draw functions are back afterwards
+  assert(imgui.DrawListAddText == nilptr, 'recorders removed')
+  hx:destroy() out:destroy() out2:destroy()
+  print('terminal OK')
+end
+
+-- World round trip against a camera like the game's (tests/test_world.nelua):
+-- row vectors, reversed Z with an infinite far plane, near 0.1, FoV 0.78.
+local function game_camera(ex: float64, ey: float64, ez: float64, yaw: float64, pitch: float64, w: float32, h: float32): GuCamera
+  local c: GuCamera = { width = w, height = h }
+  local fx, fy, fz = math.sin(yaw) * math.cos(pitch), math.sin(pitch), math.cos(yaw) * math.cos(pitch)
+  local zx, zy, zz = -fx, -fy, -fz
+  local xl = math.sqrt(zz * zz + zx * zx)
+  local xx, xy, xz = zz / xl, 0.0, -zx / xl
+  local yx, yy, yz = zy * xz - zz * xy, zz * xx - zx * xz, zx * xy - zy * xx
+  local v: [16]float64 = {
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(ex * xx + ey * xy + ez * xz), -(ex * yx + ey * yy + ez * yz), -(ex * zx + ey * zy + ez * zz), 1,
+  }
+  local f = 1 / math.tan(0.78 / 2)
+  local p: [16]float64 = { f * h / math.max(w, 1.0_f32), 0, 0, 0, 0, f, 0, 0, 0, 0, 0, -1, 0, 0, 0.1, 0 }
+  for r = 0, < 4 do
+    for k = 0, < 4 do
+      local sum: float64 = 0
+      for j = 0, < 4 do sum = sum + v[r * 4 + j] * p[j * 4 + k] end
+      c.m[r * 4 + k] = sum
+    end
+  end
+  return c
+end
+do
+  local yaws: [3]float64 = { 0.6, -2.4, 3.1 }
+  local pitches: [3]float64 = { -0.15, 0.4, -1.2 }
+  for i = 0, < 3 do
+    local cam = game_camera(100 + 850 * i, 5 + 60 * i, -200 - 1100 * i, yaws[i], pitches[i], 2560, 1440) -- out to zone-edge coordinates
+    local st, worst, msg = selftest_world_roundtrip(&cam)
+    print('world:', selftest_status_name(st), msg)
+    assert(st == SelftestStatus.Pass, msg)
+    msg:destroy()
+  end
+  local flat: GuCamera = { width = 1920, height = 1080 }
+  local st, worst, msg = selftest_world_roundtrip(&flat)
+  assert(st == SelftestStatus.Fail, 'a zero matrix is no camera')
+  msg:destroy()
+  local tiny = game_camera(0, 0, 0, 0, 0, 0, 0)
+  st, worst, msg = selftest_world_roundtrip(&tiny)
+  assert(st == SelftestStatus.Fail and msg:find('viewport', 1, true) > 0)
+  msg:destroy()
+  print('world OK')
+end
+
+print('OK')

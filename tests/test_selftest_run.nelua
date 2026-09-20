@@ -1,0 +1,182 @@
+-- /term selftest end to end in an embedded core (no ImGui, no game, no
+-- agent): the command, one suite per tick, the Lua suites through the policy,
+-- skips for what needs the game, and the report files in a scratch config
+-- directory. The in-game parts (offscreen draw list, live camera, agent echo,
+-- loader swap) are only exercised in the game.
+require 'core.host'
+require 'string'
+require 'io'
+require 'os'
+require 'arg'
+
+local root: string = arg[1]
+local config: string = arg[2]
+
+local logs: stringbuilder
+local function log_cb(level: cint, msg: cstring): void
+  logs:write(msg, '\n')
+end
+local api: GuHostApi = { size = #GuHostApi, log = log_cb }
+local info: GuInitInfo = {
+  size = #GuInitInfo, host_kind = HOST_KIND_EMBEDDED,
+  install_dir = (@cstring)(root.data), config_dir = (@cstring)(config.data), configs_root = '',
+}
+assert(gu_init_ex(&api, &info) == INIT_OK)
+
+local function read(path: string): string
+  local f = io.open(path, 'rb')
+  assert(f:isopen(), path)
+  local s = f:read('a')
+  f:destroy()
+  return s
+end
+local function exists(path: string): boolean
+  local f = io.open(path, 'rb')
+  local ok = f:isopen()
+  f:destroy()
+  return ok
+end
+
+-- the first tick of a core says which build it is
+selftest_tick(false)
+local loaded = read(config .. '/selftest/core-loaded.json')
+print(loaded)
+assert(loaded:find('"build_id": "unstamped"', 1, true) > 0 and loaded:find('"commit": "unknown"', 1, true) > 0)
+loaded:destroy()
+
+assert(gu_command('selftest bogus') == 4, 'unknown suite refused')
+assert(gu_command('selftest list') == 0)
+local l = logs:promote()
+assert(l:find('selftest loader:', 1, true) > 0 and l:find('unknown suite "bogus"', 1, true) > 0)
+l:destroy()
+
+-- everything: suites that need the game or an agent skip, the rest pass
+local sessions_before = #host.sessions
+assert(gu_command('selftest') == 0 and selftest_running())
+assert(gu_command('selftest core') == 4, 'one run at a time')
+local latest = config .. '/selftest/latest.json'
+local first = read(latest)
+assert(first:find('"complete": false', 1, true) > 0 and first:find('"state": "running"', 1, true) > 0, 'a running report first')
+first:destroy()
+local ticks = 0
+while selftest_running() and ticks < 100 do
+  selftest_tick(false)
+  ticks = ticks + 1
+end
+assert(not selftest_running(), 'the run finishes')
+assert(#host.sessions == sessions_before, 'no terminal left behind')
+local rep = read(latest)
+io.write(rep)
+local function has(s: string) assert(rep:find(s, 1, true) > 0, s) end
+has('"complete": true')
+has('"ok": true')
+has('"state": "complete"')
+has('"selection": "core terminal render world settings themes bell agent loader"')
+has('"id": "unstamped"')
+has('"plugin_version": "unknown"') -- no GhosttyDalamud.json beside a checkout's lua/
+has('{ "suite": "core", "case": "active", "status": "pass"')
+has('{ "suite": "core", "case": "imgui", "status": "skip"')
+has('{ "suite": "terminal", "case": "vt read back", "status": "pass"')
+has('{ "suite": "terminal", "case": "local session", "status": "pass"')
+has('{ "suite": "render", "case": "recorded calls", "status": "pass"')
+has('{ "suite": "render", "case": "offscreen draw list", "status": "skip"')
+has('{ "suite": "world", "case": "projection round trip", "status": "skip"')
+has('{ "suite": "settings", "case": "current values", "status": "pass"')
+has('{ "suite": "settings", "case": "typed values", "status": "pass"')
+has('{ "suite": "settings", "case": "slider clamping", "status": "pass"')
+has('{ "suite": "settings", "case": "restored", "status": "pass"')
+has('{ "suite": "bell", "case": "bell styles", "status": "pass"')
+has('{ "suite": "bell", "case": "showcase terminals", "status": "pass"')
+has('{ "suite": "bell", "case": "bell restored", "status": "pass"')
+has('{ "suite": "agent", "case": "echo", "status": "skip"')
+has('{ "suite": "loader", "case": "swap", "status": "skip"')
+assert(rep:find('"status": "fail"', 1, true) == 0, 'nothing failed')
+rep:destroy()
+assert(not exists(config .. '/selftest/scratch/settings.lua'), 'the settings scratch file is removed')
+assert(not exists(config .. '/settings.lua'), "the player's settings file is never written")
+local s = logs:promote()
+assert(s:find('selftest core terminal render world settings themes bell agent loader: PASS', 1, true) > 0, 'one-line summary')
+s:destroy()
+
+-- a timestamped copy beside latest.json
+do
+  local found = false
+  local dir = config .. '/selftest'
+  local p = io.popen('ls ' .. dir)
+  local listing = p:read('a')
+  p:close()
+  found = listing:find('report-', 1, true) > 0 and listing:find('-unstamped.json', 1, true) > 0
+  assert(found, 'timestamped report')
+end
+
+-- a state file from a previous core is picked up once and removed; one that
+-- is not readable is ignored (and removed as well)
+do
+  gu_shutdown()
+  local f = io.open(config .. '/selftest/state.tsv', 'wb')
+  f:write('garbage\n')
+  f:destroy()
+  assert(gu_init_ex(&api, &info) == INIT_OK)
+  selftest_tick(false)
+  assert(not selftest_running() and not exists(config .. '/selftest/state.tsv'), 'garbage state dropped')
+  local s2 = logs:promote()
+  assert(s2:find('ignored an unreadable state file', 1, true) > 0)
+  s2:destroy()
+end
+
+-- a state file handed over by the previous core (the loader suite): the run
+-- carries on with the cases it brings, compares what survived the swap once
+-- the layout is back (the fake clock passes the wait), and asks for the swap
+-- back, which fails here: a checkout has no ghostty_core.dll to touch
+do
+  gu_shutdown()
+  procguard_fake.now_ms = 100000
+  local f = io.open(config .. '/selftest/state.tsv', 'wb')
+  f:write('ghostty-selftest-state 1\nrun\tr-9\nselection\t257\nnext\t8\nstep\t1\nstarted_ms\t90000\n',
+    'started_utc\t2026-09-19T00:00:00Z\nswap_ms\t99000\n',
+    'fp\ttab=;window=;min=;world=;settings=0000000000000000;build=unstamped\n',
+    'case\tcore\tactive\tpass\t0\tactivation ACTIVE\n')
+  f:destroy()
+  assert(gu_init_ex(&api, &info) == INIT_OK)
+  selftest_tick(false)
+  assert(selftest_running() and not exists(config .. '/selftest/state.tsv'), 'the run continues, the state file is gone')
+  for _ = 1, 3 do selftest_tick(false) end
+  procguard_fake.now_ms = procguard_fake.now_ms + 21000 -- past the wait for the agent's layout
+  local n = 0
+  while selftest_running() and n < 10 do selftest_tick(false) n = n + 1 end
+  assert(not selftest_running())
+  local rep4 = read(latest)
+  io.write(rep4)
+  assert(rep4:find('"run_id": "r-9"', 1, true) > 0 and rep4:find('"selection": "core loader"', 1, true) > 0)
+  assert(rep4:find('{ "suite": "core", "case": "active", "status": "pass"', 1, true) > 0, 'cases from before the swap')
+  assert(rep4:find('{ "suite": "loader", "case": "swap", "status": "pass"', 1, true) > 0, 'nothing changed across the swap')
+  assert(rep4:find('{ "suite": "loader", "case": "swap back", "status": "fail"', 1, true) > 0, 'no core file to touch')
+  assert(not exists(config .. '/selftest/state.tsv'), 'no state left behind')
+  rep4:destroy()
+
+  -- a state file older than two minutes is a leftover: dropped, no run
+  gu_shutdown()
+  procguard_fake.now_ms = 500000
+  local g = io.open(config .. '/selftest/state.tsv', 'wb')
+  g:write('ghostty-selftest-state 1\nrun\told\nselection\t256\nnext\t8\nstep\t1\nswap_ms\t1000\n')
+  g:destroy()
+  assert(gu_init_ex(&api, &info) == INIT_OK)
+  selftest_tick(false)
+  assert(not selftest_running() and not exists(config .. '/selftest/state.tsv'), 'stale state dropped')
+end
+
+-- only the named suites run
+assert(gu_command('selftest render, bell') == 0)
+while selftest_running() do selftest_tick(false) end
+local rep2 = read(latest)
+assert(rep2:find('"selection": "render bell"', 1, true) > 0 and rep2:find('"suite": "core"', 1, true) == 0)
+rep2:destroy()
+
+-- shutting down in the middle of a run reports it interrupted
+assert(gu_command('selftest core terminal') == 0)
+selftest_tick(false)
+gu_shutdown()
+local rep3 = read(latest)
+assert(rep3:find('"case": "interrupted", "status": "fail"', 1, true) > 0 and rep3:find('"complete": true', 1, true) > 0)
+rep3:destroy()
+print('OK')

@@ -1,0 +1,119 @@
+-- agent/browser.nelua: which URLs the compositor's browser gets, the
+-- browser's command line for one (Exec field codes, --wayland-browser CMD),
+-- the separate profile of --wayland-browser-profile as argv, and telling a
+-- browser's windows and processes by name. Pure; starts nothing.
+require 'agent.browser'
+require 'string'
+require 'io'
+require 'os'
+
+local function check(ok: boolean, what: string): void
+  if not ok then io.stderr:write('FAIL: ', what, '\n') os.exit(1) end
+end
+
+local function eq(got: string, want: string, what: string): void
+  if got ~= want then io.stderr:write('FAIL: ', what, '\n  got:  ', got, '\n  want: ', want, '\n') os.exit(1) end
+end
+
+-- URLs
+do
+  eq(browser_url_check('https://example.org/a?b=c#d'), '', 'https')
+  eq(browser_url_check('HTTP://example.org'), '', 'http, any case')
+  eq(browser_url_check('mailto:someone@example.org'), '', 'mailto')
+  check(#browser_url_check('file:///etc/passwd') > 0, 'file: refused')
+  check(#browser_url_check('javascript:alert(1)') > 0, 'javascript: refused')
+  check(#browser_url_check('https://') > 0, 'a scheme alone')
+  check(#browser_url_check('https://a b') > 0, 'a blank')
+  check(#browser_url_check('https://a\nb') > 0, 'a newline')
+  check(#browser_url_check('') > 0, 'empty')
+end
+
+-- the command line for one URL: the first %u/%U/%f/%F/%s is the URL, quoted
+do
+  local url = "https://example.org/it's?a=1&b=$(x)"
+  local q = "'https://example.org/it'\\''s?a=1&b=$(x)'"
+  local c = browser_expand('firefox %u', url, 'Firefox', 'firefox')
+  eq(c, 'firefox ' .. q, 'Exec %u')
+  c:destroy()
+  c = browser_expand('/usr/bin/google-chrome-stable %U', url, 'Chrome', '')
+  eq(c, '/usr/bin/google-chrome-stable ' .. q, 'Exec %U')
+  c:destroy()
+  c = browser_expand('flatpak run --branch=stable --arch=x86_64 --command=firefox --file-forwarding org.mozilla.firefox @@u %u @@', 'https://x.org', 'Firefox', '')
+  eq(c, "flatpak run --branch=stable --arch=x86_64 --command=firefox --file-forwarding org.mozilla.firefox @@u 'https://x.org' @@", 'Flatpak Exec')
+  c:destroy()
+  c = browser_expand('mybrowser --new-tab %s --then %u %%', 'https://x.org', '', '')
+  eq(c, "mybrowser --new-tab 'https://x.org' --then  %", '%s (as $BROWSER), later codes go, %%')
+  c:destroy()
+  c = browser_expand('epiphany %i %c', 'https://x.org', 'Web', 'org.gnome.Epiphany')
+  eq(c, "epiphany --icon 'org.gnome.Epiphany' 'Web' 'https://x.org'", '%i %c, no URL code: appended')
+  c:destroy()
+  c = browser_expand('luakit', 'https://x.org', '', '')
+  eq(c, "luakit 'https://x.org'", 'a bare command gets the URL appended')
+  c:destroy()
+end
+
+-- the program, and the browser family
+do
+  local p, stop = browser_program("env MOZ_X=1 /usr/lib64/firefox/firefox 'https://x.org'")
+  eq(p, 'firefox', 'program after env')
+  check(stop == 38, 'where the program word ends')
+  p:destroy()
+  p = browser_program("flatpak run --branch=stable org.mozilla.firefox @@u 'https://x.org' @@")
+  eq(p, 'org.mozilla.firefox', 'a Flatpak app id')
+  p:destroy()
+  eq(browser_family('firefox'), 'firefox', 'firefox')
+  eq(browser_family('org.mozilla.firefox'), 'firefox', 'Flatpak Firefox')
+  eq(browser_family('librewolf'), 'firefox', 'LibreWolf')
+  eq(browser_family('google-chrome-stable'), 'chromium', 'Chrome')
+  eq(browser_family('com.brave.Browser'), 'chromium', 'Flatpak Brave')
+  eq(browser_family('Chromium-browser'), 'chromium', 'any case')
+  eq(browser_family('microsoft-edge'), 'chromium', 'Edge')
+  eq(browser_family('epiphany'), '', 'not a family with a profile switch')
+end
+
+-- --wayland-browser-profile: argv only
+do
+  check(browser_profile_ok('ffxiv') and browser_profile_ok('game.2_b-c'), 'profile names')
+  check(not browser_profile_ok('') and not browser_profile_ok('a/b') and not browser_profile_ok('..') and not browser_profile_ok('a b'), 'bad profile names')
+  local d = browser_profile_dir('firefox', '', 'ffxiv', '/home/u', '')
+  eq(d, '/home/u/.local/share/ghostty-agent/firefox-ffxiv', 'native profile dir')
+  d:destroy()
+  d = browser_profile_dir('chromium', '', 'ffxiv', '/home/u', '/data')
+  eq(d, '/data/ghostty-agent/chromium-ffxiv', 'XDG_DATA_HOME')
+  d:destroy()
+  d = browser_profile_dir('firefox', 'org.mozilla.firefox', 'ffxiv', '/home/u', '/data')
+  eq(d, '/home/u/.var/app/org.mozilla.firefox/ghostty-agent-ffxiv', 'a Flatpak browser keeps it in its own directory')
+  d:destroy()
+  local ok, c = browser_with_profile("firefox 'https://x.org'", 'firefox', '/p/fx')
+  check(ok, 'Firefox takes a profile')
+  eq(c, "firefox --profile '/p/fx' 'https://x.org'", 'Firefox: --profile DIR before the URL')
+  c:destroy()
+  ok, c = browser_with_profile("env A=1 /usr/bin/google-chrome-stable 'https://x.org'", 'chromium', '/p/ch')
+  check(ok, 'Chrome takes a profile')
+  eq(c, "env A=1 /usr/bin/google-chrome-stable --user-data-dir='/p/ch' 'https://x.org'", 'Chromium family: --user-data-dir=DIR')
+  c:destroy()
+  ok, c = browser_with_profile("flatpak run --branch=stable org.mozilla.firefox @@u 'https://x.org' @@", 'firefox', '/h/.var/app/org.mozilla.firefox/ghostty-agent-ffxiv')
+  eq(c, "flatpak run --branch=stable org.mozilla.firefox --profile '/h/.var/app/org.mozilla.firefox/ghostty-agent-ffxiv' @@u 'https://x.org' @@", 'Flatpak: after the app id')
+  c:destroy()
+  ok, c = browser_with_profile("epiphany 'https://x.org'", '', '/p/x')
+  check(not ok and c:find('Firefox and Chromium', 1, true) > 0, 'other browsers: refused with why')
+  c:destroy()
+end
+
+-- windows and processes of a browser
+do
+  check(browser_window_matches('firefox', 'firefox'), 'same app id')
+  check(browser_window_matches('google-chrome', 'google-chrome-stable'), 'one contains the other')
+  check(browser_window_matches('org.mozilla.firefox', 'org.mozilla.firefox'), 'Flatpak app id')
+  check(browser_window_matches('Chromium-browser', 'chromium'), 'the same family, any case')
+  check(not browser_window_matches('org.gnome.Nautilus', 'firefox'), 'another app')
+  check(not browser_window_matches('', 'firefox'), 'no app id')
+  check(browser_comm_matches('firefox', 'firefox'), 'comm')
+  check(browser_comm_matches('firefox-bin', 'firefox'), 'Firefox\'s binary')
+  check(browser_comm_matches('chrome', 'google-chrome-stable'), 'Chrome\'s wrapper')
+  check(browser_comm_matches('chromium-browse', 'chromium-browser'), 'cut to 15 bytes')
+  check(not browser_comm_matches('bash', 'firefox'), 'another process')
+  check(not browser_comm_matches('chrome', 'chromium'), 'Chrome is not Chromium')
+end
+
+print('test_agent_browser OK')

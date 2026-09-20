@@ -1,0 +1,232 @@
+-- /term ask: tests/test_assistant.lua drives lua/assistant.lua on its own;
+-- here the core's side through the exported host surface: the argv a
+-- question becomes (one element, whatever it holds), chat without one, the
+-- view each setting opens, the off switch, the terminal staying open with
+-- "[assistant exited]" and the not-found hint, and the local fallback.
+require 'core.host'
+require 'string'
+require 'io'
+require 'os'
+require 'arg'
+
+local root: string = arg[1]
+
+do
+  local L = luaL_newstate()
+  luaL_openlibs(L)
+  local script = root .. '/tests/test_assistant.lua'
+  if luaL_loadfilex(L, (@cstring)(script.data), nilptr) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_pushlstring(L, (@cstring)(root.data), root.size)
+  if lua_pcall(L, 1, 0, 0) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_close(L)
+  script:destroy()
+end
+
+local function log_cb(level: cint, msg: cstring): void io.write('[log ', level, '] ', msg, '\n') end
+local api: GuHostApi = { size = #GuHostApi, log = log_cb }
+assert(gu_init(&api, (@cstring)(root.data)) == 0)
+
+local function lua_run(code: cstring): void
+  assert(luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, code)
+end
+
+-- these are the terminal's tests: the /ask panel (tests/test_ask.nelua) steps aside
+lua_run("CONFIG.assistant.ui = 'terminal'")
+
+local function newest(): *Session
+  assert(#host.sessions > 0)
+  return host.sessions[#host.sessions - 1]
+end
+
+-- open_argv joined with US (0x1f), which no test argument contains
+local function argv_is(s: *Session, want: string): boolean
+  local sb: stringbuilder
+  for i = 0, < #s.open_argv do
+    if i > 0 then sb:write('\x1f') end
+    sb:write(s.open_argv[i])
+  end
+  local got = sb:promote()
+  local same = got == want
+  if not same then print('argv:', got) end
+  got:destroy()
+  return same
+end
+
+-- Everything on the terminal's screen, a line per row (triple-click selects a row).
+local function screen(s: *Session): string
+  local sb: stringbuilder
+  for row = 0, < (@integer)(s.rows) do
+    local st: SelectionState
+    if selection_press(&s.view, &st, 0, row, 3, false) then
+      local line = selection_text(&s.view)
+      sb:write(line, '\n')
+      line:destroy()
+    end
+    selection_clear(&s.view, &st)
+  end
+  return sb:promote()
+end
+
+-- the shipped config: almanac as a pet, on
+do
+  local ok, spec, err = policy_assistant_open('hello')
+  assert(ok and #err == 0, err)
+  assert(spec.view == 'pet' and spec.transport == 'agent' and not spec.local_fallback and spec.label == 'assistant')
+  assert(#spec.argv == 4 and spec.argv[0] == 'almanac' and spec.argv[3] == 'hello')
+  spec:destroy() err:destroy()
+end
+
+-- a tab: the question is the rest of the line, one argv element
+lua_run("CONFIG.assistant.view = 'tab'")
+do
+  local tabs = #host.dropdown_tabs
+  assert(gu_command("ask what's my next MSQ step?") == 0)
+  assert(#host.dropdown_tabs == tabs + 1 and host.dropdown_tabs[#host.dropdown_tabs - 1] == newest(), 'a tab')
+  local s = newest()
+  assert(s.assistant and s.label == 'assistant' and s.kind == TransportKind.Agent and s.awaiting_open)
+  assert(argv_is(s, "almanac\x1fask\x1f--\x1fwhat's my next MSQ step?"))
+  assert(host.dropdown_open, 'the drop-down shows it')
+end
+
+-- nothing a shell would interpret is touched
+do
+  local q = 'say "hi"; rm -rf ~ && $(id) `id` | x > y \'q\' naïve 日本語 🐉'
+  local cmd = 'ask ' .. q
+  assert(gu_command(cmd) == 0)
+  local want = 'almanac\x1fask\x1f--\x1f' .. q
+  assert(argv_is(newest(), want))
+  cmd:destroy() want:destroy()
+end
+
+-- no question: the interactive session
+assert(gu_command('ask') == 0 and argv_is(newest(), 'almanac\x1fchat'))
+assert(gu_command('ask    ') == 0 and argv_is(newest(), 'almanac\x1fchat'))
+-- "asking" is not ask
+assert(gu_command('asking') == 3)
+
+-- a window
+lua_run("CONFIG.assistant.view = 'window'")
+do
+  local n = #host.windows
+  assert(gu_command('ask q') == 0)
+  assert(#host.windows == n + 1 and host.windows[#host.windows - 1] == newest(), 'a window')
+end
+
+-- a pet with no character loaded (this API has no get_object): a tab instead
+lua_run("CONFIG.assistant.view = 'pet'")
+do
+  local tabs, world = #host.dropdown_tabs, #host.world
+  assert(gu_command('ask q') == 0)
+  assert(#host.world == world and #host.dropdown_tabs == tabs + 1, 'no character: a tab')
+end
+
+-- off: nothing opens
+lua_run("CONFIG.assistant.enabled = false")
+do
+  local n = #host.sessions
+  assert(gu_command('ask q') == 4 and gu_command('ask') == 4)
+  assert(#host.sessions == n, 'off: no terminal')
+end
+lua_run("CONFIG.assistant.enabled = true")
+
+-- a bad command is refused, not run
+lua_run("CONFIG.assistant.ask = 'almanac ask'")
+do
+  local n = #host.sessions
+  assert(gu_command('ask q') == 4 and #host.sessions == n)
+end
+lua_run("CONFIG.assistant.ask = { 'almanac', 'ask', '--' }")
+
+-- no lua/assistant.lua (an old init.lua copy): refused with a message
+lua_run("SAVED_ASSISTANT = CONFIG.assistant; CONFIG.assistant = nil")
+do
+  local ok, spec, err = policy_assistant_open('q')
+  assert(not ok and #err > 0)
+  spec:destroy() err:destroy()
+  local text = policy_assistant_exit(0, false)
+  assert(text:find('[assistant exited]', 1, true) > 0, 'a plain line without Lua')
+  text:destroy()
+end
+lua_run("CONFIG.assistant = SAVED_ASSISTANT")
+
+-- the command was not found (the agent's child exits 127): the hint, then
+-- "[assistant exited]", and the terminal stays
+do
+  lua_run("CONFIG.assistant.view = 'tab'")
+  assert(gu_command('ask q') == 0)
+  local s = newest()
+  s.awaiting_open = false -- as if the agent had opened it
+  s:mark_exited(127)
+  assert(s.process_exited and s.exited)
+  local text = screen(s)
+  print(text)
+  assert(text:find('[assistant exited] (status 127)', 1, true) > 0)
+  assert(text:find('not found', 1, true) > 0 and text:find('almanac', 1, true) > 0, 'the hint')
+  assert(text:find('process exited', 1, true) == 0, 'not the plain line')
+  text:destroy()
+  local id = s.id
+  reap_exited(100.0)
+  reap_exited(200.0)
+  assert(find_session(id) == s, 'close_on_exit leaves the assistant open')
+  -- it closes like any terminal
+  close_terminal(s)
+  assert(find_session(id) == nilptr)
+end
+
+-- a clean exit: just the line
+do
+  assert(gu_command('ask q') == 0)
+  local s = newest()
+  s.awaiting_open = false
+  s:mark_exited(0)
+  local text = screen(s)
+  assert(text:find('[assistant exited]', 1, true) > 0 and text:find('not found', 1, true) == 0)
+  text:destroy()
+end
+
+-- the agent refused to start it (what the Windows agent does): the hint too
+do
+  for i = #host.sessions - 1, 0, -1 do close_terminal(host.sessions[i]) end
+  host.pending_open:clear()
+  assert(gu_command('ask q') == 0)
+  local s = newest()
+  assert(#host.pending_open == 1 and host.pending_open[0] == s)
+  local why: string = 'cannot run almanac'
+  local ev: AgentEvent = { typ = PROTO_OPENED, id = 0, data = (@*[0]uint8)(why.data), len = why.size }
+  agent_event(nilptr, &ev)
+  assert(s.exited)
+  local text = screen(s)
+  assert(text:find('agent refused', 1, true) > 0 and text:find('[assistant did not start]', 1, true) > 0)
+  assert(text:find('not found', 1, true) > 0)
+  text:destroy()
+end
+
+-- local fallback (native Windows): with no agent answering, the same argv
+-- over ConPTY; the host build has none, so the terminal says so and ends
+do
+  local spec: AssistantOpen
+  spec.argv:push(string.copy('almanac')) spec.argv:push(string.copy('chat'))
+  spec.transport = string.copy('agent')
+  spec.local_fallback = true
+  spec.view = string.copy('tab')
+  spec.label = string.copy('assistant')
+  local down = host.agent_down
+  host.agent_down = true
+  local s = session_new_assistant(&spec, 80, 24)
+  assert(s ~= nilptr and s.kind == TransportKind.ConPty and s.assistant and s.exited)
+  host.agent_down = false
+  local s2 = session_new_assistant(&spec, 80, 24)
+  assert(s2.kind == TransportKind.Agent and s2.local_fallback and s2.awaiting_open)
+  assert(argv_is(s2, 'almanac\x1fchat'))
+  host.agent_down = down
+  spec:destroy()
+end
+
+gu_shutdown()
+print('OK')

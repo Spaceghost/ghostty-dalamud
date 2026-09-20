@@ -1,0 +1,60 @@
+-- The coverage-guided twin of tests/fuzz.nelua: one libFuzzer entry point over
+-- the same three parsers. The first byte picks the target, the rest is the
+-- input. Built by tools/ci/fuzz.sh with FUZZ_ENGINE=libfuzzer (clang,
+-- -fsanitize=fuzzer,address,undefined); Nelua's own main is renamed and run
+-- once from LLVMFuzzerInitialize so module-level state exists.
+require 'core.ghostty'
+require 'core.protocol'
+require 'agent.logic'
+require 'string'
+require 'vector'
+
+## cemitdecl 'int nelua_entry_main(int argc, char **argv);'
+## cemitdecl 'int LLVMFuzzerInitialize(int *argc, char ***argv) { nelua_entry_main(*argc, *argv); return 0; }'
+
+local function fuzz_vt(data: *[0]uint8, size: usize): void
+  local term: GhosttyTerminal
+  if ghostty_terminal_new(nilptr, &term, 80, 24) ~= GHOSTTY_SUCCESS then return end
+  defer ghostty_terminal_free(term) end
+  ghostty_terminal_resize(term, 80, 24, 8, 16)
+  local state: GhosttyRenderState
+  if ghostty_render_state_new(nilptr, &state) ~= GHOSTTY_SUCCESS then return end
+  defer ghostty_render_state_free(state) end
+  ghostty_terminal_vt_write(term, data, size)
+  ghostty_render_state_update(state, term)
+end
+
+local function fuzz_proto(data: *[0]uint8, size: usize): void
+  local q: ByteQueue
+  defer q:destroy() end
+  q:push(data, size)
+  while true do
+    local ok, typ, payload, len = proto.read_frame(&q)
+    if not ok then break end
+    local sum: uint64 = 0
+    for i = 0, < len do sum = sum + payload[i] end
+    proto.frame_consume(&q, len)
+  end
+end
+
+local function fuzz_agent(data: *[0]uint8, size: usize): void
+  local raw = string{data = (@*[0]byte)(data), size = size}
+  local argv, env = agent_split_nul(data, size)
+  for i = 0, < #argv do argv[i]:destroy() end
+  for i = 0, < #env do env[i]:destroy() end
+  argv:destroy() env:destroy()
+  local h, p = agent_parse_hostport(raw) h:destroy()
+  local t = agent_trim(raw) t:destroy()
+  local c = agent_crlf(raw) c:destroy()
+  local ok, k, v = agent_env_split(raw) k:destroy() v:destroy()
+end
+
+local function LLVMFuzzerTestOneInput(data: *[0]uint8, size: usize): cint <cexport 'LLVMFuzzerTestOneInput'>
+  if size < 2 then return 0 end
+  local rest = (@*[0]uint8)(&data[1])
+  local which = data[0] % 3
+  if which == 0 then fuzz_vt(rest, size - 1)
+  elseif which == 1 then fuzz_proto(rest, size - 1)
+  else fuzz_agent(rest, size - 1) end
+  return 0
+end

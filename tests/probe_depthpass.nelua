@@ -205,7 +205,7 @@ local cmd: [1]ImDrawCmd
 local dl: ImDrawList
 dl.CmdBuffer = { Size = 1, Capacity = 1, Data = (@*[0]ImDrawCmd)(&cmd) }
 dl.VtxBuffer = { Size = n, Capacity = n, Data = (@*[0]ImDrawVert)(&verts) }
-world_transform_vertices(&dl, 1, 0, &cam, &b, vec2(0, 0), vec2(0, 0), 1, 0, 0, vec2(0, 0), nilptr)
+world_transform_vertices(&dl, 1, 0, &cam, &b, vec2(0, 0), vec2(0, 0), 1, 0, 0, WorldFlat{ sx = 1, sy = 1 }, nilptr)
 local vb_desc: D3D11_BUFFER_DESC = { ByteWidth = (@cuint)(n * #ImDrawVert), Usage = 0, BindFlags = 1 } -- VERTEX_BUFFER
 local vb_data: D3D11_SUBRESOURCE_DATA = { pSysMem = &verts }
 local vb: *ID3D11Buffer

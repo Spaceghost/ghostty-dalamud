@@ -1,0 +1,210 @@
+-- The pure parts of the agent's Wayland compositor backend
+-- (agent/capture_wayland.nelua, agent/wayland_keys.nelua): USB HID -> evdev,
+-- codepoint -> key and Shift against a real xkb keymap ("us", default rules),
+-- "run:" parsing, WLIST lines and matching. Built only with -D WAYLAND
+-- (tests/run.sh, when vendor/wayland-sdk is there); starts no compositor.
+require 'core.protocol'
+require 'agent.capture'
+require 'string'
+require 'stringbuilder'
+
+-- HID usages
+assert(wayland_hid_to_evdev(0x04) == 30)   -- a
+assert(wayland_hid_to_evdev(0x1D) == 44)   -- z
+assert(wayland_hid_to_evdev(0x1E) == 2)    -- 1
+assert(wayland_hid_to_evdev(0x27) == 11)   -- 0
+assert(wayland_hid_to_evdev(0x28) == 28)   -- Enter
+assert(wayland_hid_to_evdev(0x29) == 1)    -- Esc
+assert(wayland_hid_to_evdev(0x2A) == 14)   -- Backspace
+assert(wayland_hid_to_evdev(0x2B) == 15)   -- Tab
+assert(wayland_hid_to_evdev(0x2C) == 57)   -- Space
+assert(wayland_hid_to_evdev(0x38) == 53)   -- /
+assert(wayland_hid_to_evdev(0x3A) == 59)   -- F1
+assert(wayland_hid_to_evdev(0x45) == 88)   -- F12
+assert(wayland_hid_to_evdev(0x68) == 183)  -- F13
+assert(wayland_hid_to_evdev(0x73) == 194)  -- F24
+assert(wayland_hid_to_evdev(0x49) == 110)  -- Insert
+assert(wayland_hid_to_evdev(0x4A) == 102)  -- Home
+assert(wayland_hid_to_evdev(0x4B) == 104)  -- PageUp
+assert(wayland_hid_to_evdev(0x4C) == 111)  -- Delete
+assert(wayland_hid_to_evdev(0x4D) == 107)  -- End
+assert(wayland_hid_to_evdev(0x4E) == 109)  -- PageDown
+assert(wayland_hid_to_evdev(0x4F) == 106)  -- Right
+assert(wayland_hid_to_evdev(0x50) == 105)  -- Left
+assert(wayland_hid_to_evdev(0x51) == 108)  -- Down
+assert(wayland_hid_to_evdev(0x52) == 103)  -- Up
+assert(wayland_hid_to_evdev(0xE0) == 29)   -- LCtrl
+assert(wayland_hid_to_evdev(0xE1) == 42)   -- LShift
+assert(wayland_hid_to_evdev(0xE2) == 56)   -- LAlt
+assert(wayland_hid_to_evdev(0xE3) == 125)  -- LMeta
+assert(wayland_hid_to_evdev(0xE6) == 100)  -- RAlt
+assert(wayland_hid_to_evdev(0x00) == 0)
+assert(wayland_hid_to_evdev(0x74) == 0)
+assert(wayland_hid_to_evdev(0xE8) == 0)
+
+-- codepoints through a real keymap
+local km: *xkb_keymap
+local function expect(cp: uint32, code: uint32, shift: boolean)
+  local ok, c, s = wayland_key_for_codepoint(km, cp)
+  if not ok or c ~= code or s ~= shift then
+    print('codepoint', cp, 'got', ok, c, s, 'want', code, shift)
+    assert(false)
+  end
+end
+do
+  local ctx: *xkb_context
+  ctx, km = wayland_keymap('us')
+  assert(km ~= nilptr, 'xkb keymap (xkeyboard-config data)')
+  expect(0x61, 30, false)  -- a
+  expect(0x41, 30, true)   -- A
+  expect(0x68, 35, false)  -- h
+  expect(0x31, 2, false)   -- 1 (the digit row, not the keypad)
+  expect(0x21, 2, true)    -- !
+  expect(0x20, 57, false)  -- space
+  expect(0x2D, 12, false)  -- -
+  expect(0x5F, 12, true)   -- _
+  expect(0x2F, 53, false)  -- /
+  expect(0x3F, 53, true)   -- ?
+  expect(0x7E, 41, true)   -- ~
+  expect(0x0A, 28, false)  -- newline -> Enter
+  expect(0x09, 15, false)  -- tab
+  local ok = wayland_key_for_codepoint(km, 0x00E9) -- é: not on "us" at level 1/2
+  assert(not ok)
+  ok = wayland_key_for_codepoint(km, 0x1F600)       -- an emoji: nowhere
+  assert(not ok)
+  xkb_keymap_unref(km)
+  xkb_context_unref(ctx)
+  -- another layout: the same codepoints land on other keys
+  ctx, km = wayland_keymap('de')
+  assert(km ~= nilptr)
+  expect(0x7A, 21, false)  -- z sits where "us" has y
+  expect(0x00E4, 40, false) -- ä
+  xkb_keymap_unref(km)
+  xkb_context_unref(ctx)
+end
+
+-- the launched program's name, for finding a window it handed over to another process
+do
+  local n = wayland_launch_name('gnome-disks'); assert(n == 'gnome-disks') n:destroy()
+  n = wayland_launch_name('  env GDK_SCALE=2 /usr/bin/Gnome-Text-Editor --new-window'); assert(n == 'gnome-text-editor') n:destroy()
+  n = wayland_launch_name('A=1'); assert(n == '') n:destroy()
+  n = wayland_flatpak_id('flatpak run --branch=stable --arch=x86_64 --command=1password com.onepassword.OnePassword --silent'); assert(n == 'com.onepassword.OnePassword') n:destroy()
+  n = wayland_flatpak_id('/usr/bin/flatpak run org.gnome.Calculator'); assert(n == 'org.gnome.Calculator') n:destroy()
+  n = wayland_flatpak_id('yad --title=x'); assert(n == '') n:destroy()
+end
+
+-- app: / desktop: match forms
+do
+  local ok, rest = wayland_match_form('app: org.gnome.Calculator \n', 'app:')
+  assert(ok and rest == 'org.gnome.Calculator') rest:destroy()
+  ok = wayland_match_form('app:', 'app:')
+  assert(not ok)
+  ok = wayland_match_form('run:app:x', 'app:')
+  assert(not ok)
+  ok, rest = wayland_match_form('desktop:sway --unsupported-gpu', 'desktop:')
+  assert(ok and rest == 'sway --unsupported-gpu') rest:destroy()
+end
+
+-- desktop: commands
+local function fake_installed(name: string): boolean
+  return name == 'sway' or name == 'cage'
+end
+do
+  local ok, cmd, why = wayland_desktop_command('', fake_installed)
+  assert(ok and cmd == 'sway') cmd:destroy()
+  ok, cmd, why = wayland_desktop_command('labwc', fake_installed)
+  assert(not ok and why == "labwc is not installed on the agent's machine") why:destroy()
+  ok, cmd = wayland_desktop_command('sway --unsupported-gpu', fake_installed)
+  assert(ok and cmd == 'sway --unsupported-gpu') cmd:destroy()
+  ok, cmd = wayland_desktop_command('cage foot', fake_installed)
+  assert(ok and cmd == 'cage -- foot') cmd:destroy()
+  ok, cmd = wayland_desktop_command('cage -- foot -e top', fake_installed)
+  assert(ok and cmd == 'cage -- foot -e top') cmd:destroy()
+  ok, cmd, why = wayland_desktop_command('cage', fake_installed)
+  assert(not ok and why:find('one app', 1, true) > 0) why:destroy()
+  ok, cmd, why = wayland_desktop_command('', function(n: string): boolean return false end)
+  assert(not ok and why:find('no nested desktop', 1, true) > 0) why:destroy()
+end
+
+-- window keys
+do
+  local ok, k = wayland_parse_key('key:5f3a.2\torg.gnome.TextEditor\tnotes.txt\n')
+  assert(ok and k.launch == '5f3a.2' and k.app == 'org.gnome.TextEditor' and k.title == 'notes.txt')
+  local okl, kl = wayland_parse_key('key:5f3a.2\n')
+  assert(okl and kl.launch == '5f3a.2' and #kl.app == 0 and #kl.title == 0) -- the WLISTR column as is
+  assert(wayland_key_score(kl, (@WindowKey){ launch = '5f3a.2', app = 'x', title = 'y' }, false) == 100)
+  assert(wayland_key_score(kl, (@WindowKey){ launch = '5f3a.3', app = 'x', title = 'y' }, false) == 0)
+  assert(not wayland_parse_key('key:'))
+  assert(not wayland_parse_key('run:x'))
+  local c: WindowKey = { launch = '5f3a.2', app = 'org.gnome.TextEditor', title = 'other.txt' }
+  assert(wayland_key_score(k, c, false) == 100) -- the same launch, whatever the title became
+  assert(wayland_key_score(k, c, true) == 0)    -- streamed already
+  c.launch = ''
+  assert(wayland_key_score(k, c, false) == 10)  -- same app, another title
+  c.title = 'notes.txt'
+  assert(wayland_key_score(k, c, false) == 30)
+  c.app = 'yad'
+  assert(wayland_key_score(k, c, false) == 0)   -- another app never fits
+  local _, k2 = wayland_parse_key('key:\t\tSome Title')
+  local c2: WindowKey = { title = 'Some Title - edited' }
+  assert(wayland_key_score(k2, c2, false) == 10) -- no app: the title near
+end
+
+-- render node choice
+do
+  local csv = '00000000:02:00.0, 3454, 8192\n00000000:03:00.0, 953, 8188\n'
+  local f, t = wayland_nvidia_vram(csv, '0000:03:00.0')
+  assert(f == 953 and t == 8188)
+  f, t = wayland_nvidia_vram(csv, '0000:09:00.0')
+  assert(f == -1 and t == -1)
+  -- this PC: the 3070 drives the display, the 4060 runs an LLM (953 MiB free)
+  local nodes: vector(RenderNode)
+  nodes:push({ path = '/dev/dri/renderD128', pci = '0000:03:00.0', driver = 'nvidia', display = false, free_mb = 953, total_mb = 8188 })
+  nodes:push({ path = '/dev/dri/renderD129', pci = '0000:02:00.0', driver = 'nvidia', display = true, free_mb = 3454, total_mb = 8192 })
+  local p, why = wayland_pick_render_node('auto', &nodes)
+  assert(#p == 0 and why:find('953 MiB free', 1, true) > 0 and why:find('drives a display', 1, true) > 0)
+  nodes[0].free_mb = 4000
+  p, why = wayland_pick_render_node('', &nodes)
+  assert(p == '/dev/dri/renderD128')
+  nodes[0].free_mb = -1
+  p, why = wayland_pick_render_node('auto', &nodes)
+  assert(#p == 0 and why:find('unknown', 1, true) > 0)
+  p = wayland_pick_render_node('none', &nodes) assert(#p == 0)
+  p = wayland_pick_render_node('/dev/dri/renderD129', &nodes) assert(p == '/dev/dri/renderD129')
+  p, why = wayland_pick_render_node('bogus', &nodes) assert(#p == 0 and why:find('unknown render node', 1, true) > 0)
+  local empty: vector(RenderNode)
+  p, why = wayland_pick_render_node('auto', &empty) assert(#p == 0 and why:find('no render node', 1, true) > 0)
+end
+
+-- run: parsing
+do
+  local ok, cmd = wayland_parse_run('run:foot')
+  assert(ok and cmd == 'foot') cmd:destroy()
+  ok, cmd = wayland_parse_run('run:  yad --text-info --title=a b \n')
+  assert(ok and cmd == 'yad --text-info --title=a b') cmd:destroy()
+  ok = wayland_parse_run('run:')
+  assert(not ok)
+  ok = wayland_parse_run('run:   ')
+  assert(not ok)
+  ok = wayland_parse_run('foot')
+  assert(not ok)
+  ok = wayland_parse_run('Run:foot') -- the prefix is exact
+  assert(not ok)
+end
+
+-- WLIST lines and matching
+do
+  local sb: stringbuilder
+  sb:write(WAYLAND_LAUNCH_LINE)
+  wayland_list_line(&sb, 7, 640, 437, 'org.gnome.TextEditor', 'notes\tand\nstuff', '')
+  wayland_list_line(&sb, 8, 500, 300, 'yad', 'x', '5f3a.2')
+  local s = sb:promote()
+  assert(s == '0\t0\t0\tlaunch\trun:COMMAND or app:NAME to start an app in the game\n7\t640\t437\torg.gnome.TextEditor\tnotes and stuff\t\n8\t500\t300\tyad\tx\t5f3a.2\n')
+  s:destroy()
+  assert(wayland_contains('Text Editor', 'text'))
+  assert(wayland_contains('YAD', 'yad'))
+  assert(wayland_contains('anything', ''))
+  assert(not wayland_contains('calculator', 'editor'))
+end
+
+print('capture_wayland pure parts OK')

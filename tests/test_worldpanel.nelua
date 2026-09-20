@@ -3,6 +3,8 @@
 require 'core.world'
 require 'core.policy'
 require 'core.app.worldview'
+require 'core.app.commands' -- /term pin
+require 'core.app.cursor'
 require 'string'
 require 'math'
 require 'arg'
@@ -132,8 +134,9 @@ do
   assert(world_title_button(w, 1790, 10) == WORLD_BUTTON_CLOSE)
   assert(world_title_button(w, 1750, 10) == WORLD_BUTTON_FULL)
   assert(world_title_button(w, 1720, 10) == WORLD_BUTTON_POPIN)
-  assert(world_title_button(w, 1680, 10) == WORLD_BUTTON_OCCLUDED, 'fourth button left of pop-in')
-  assert(world_title_button(w, 1650, 10) == WORLD_BUTTON_NONE, 'nothing left of the buttons')
+  assert(world_title_button(w, 1680, 10) == WORLD_BUTTON_PET, 'pin <-> pet next to pop-in')
+  assert(world_title_button(w, 1650, 10) == WORLD_BUTTON_OCCLUDED, 'keep running left of it')
+  assert(world_title_button(w, 1610, 10) == WORLD_BUTTON_NONE, 'nothing left of the buttons')
   assert(world_title_button(w, 1790, 40) == WORLD_BUTTON_NONE, 'below the title row')
   assert(world_title_button(w, 1790, -1) == WORLD_BUTTON_NONE, 'above the panel')
   assert(world_title_button(w, 1801, 10) == WORLD_BUTTON_NONE, 'right of the panel')
@@ -144,6 +147,7 @@ do
     assert(world_title_button(w, x + 13, 13) == b, 'square centre hits its own button')
   end
   assert(world_title_button_x(w, WORLD_BUTTON_CLOSE) == w - 30 and world_title_button_x(w, WORLD_BUTTON_POPIN) == w - 98, 'existing buttons keep their places')
+  assert(world_title_button_x(w, WORLD_BUTTON_PET) == w - 132 and WORLD_BUTTON_COUNT == 5)
   print('title buttons OK')
 end
 
@@ -334,9 +338,22 @@ do
     end
     local grew = collectgarbage('count') - before
     collectgarbage('restart')
-    for id = 201, 203 do w.forget(id) end
     print('placing 3 pets for 600 frames made KB', grew)
     assert(grew < 64, 'placing pets makes garbage every frame')
+    -- and with one focused: the others line up beside it
+    for f = 1, 5 do for id = 201, 203 do assert(w.place(id, 511 + f / 60, id == 202)) end end
+    collectgarbage('collect')
+    collectgarbage('stop')
+    before = collectgarbage('count')
+    for f = 1, 600 do
+      local t = 512 + f / 60
+      for id = 201, 203 do assert(w.place(id, t, id == 202)) end
+    end
+    grew = collectgarbage('count') - before
+    collectgarbage('restart')
+    for id = 201, 203 do w.forget(id) end
+    print('placing 3 lined-up pets for 600 frames made KB', grew)
+    assert(grew < 64, 'lining pets up makes garbage every frame')
   ]]
   assert(luaL_loadstring(policy.L, code) == LUA_OK, 'load')
   if lua_pcall(policy.L, 0, 0, 0) ~= LUA_OK then
@@ -512,6 +529,8 @@ local function fake_viewport(): *ImGuiViewport return &viewport end
 local function fake_mouse(out: *ImVec2): void $out = mouse_at end
 local function fake_false_flags(flags: cint): boolean return false end
 local function fake_want(want: boolean): void end
+local want_mouse = false
+local function fake_want_mouse(want: boolean): void if want then want_mouse = true end end
 local function fake_font(): *ImFont return nilptr end
 local function fake_font_size(): float32 return 16 end
 local function fake_time(): float64 return now end
@@ -522,6 +541,19 @@ local function fake_frame_count(): cint return frame_count end
 local function fake_key_down(key: cint): boolean return false end
 local function fake_key_pressed(key: cint, rep: boolean): boolean return false end
 local function fake_set_clipboard(text: cstring): void end
+-- ImGui's AddCallback: a command of its own (reusing an empty last one), then a fresh one
+local function fake_callback(l: *ImDrawList, cb: pointer, data: pointer): void
+  assert(l.CmdBuffer.Size + 2 <= MAX_CMDS)
+  local c = &cmds[l.CmdBuffer.Size - 1]
+  if c.ElemCount ~= 0 or c.UserCallback ~= nilptr then
+    cmds[l.CmdBuffer.Size] = { ClipRect = c.ClipRect }
+    l.CmdBuffer.Size = l.CmdBuffer.Size + 1
+    c = &cmds[l.CmdBuffer.Size - 1]
+  end
+  c.UserCallback, c.UserCallbackData = cb, data
+  cmds[l.CmdBuffer.Size] = { ClipRect = c.ClipRect }
+  l.CmdBuffer.Size = l.CmdBuffer.Size + 1
+end
 
 local function resolver(name: cstring): pointer
   local n: string = name
@@ -540,7 +572,7 @@ local function resolver(name: cstring): pointer
   if n == 'igGetMainViewport' then return (@pointer)(fake_viewport) end
   if n == 'igGetMousePos' then return (@pointer)(fake_mouse) end
   if n == 'igIsWindowHovered' then return (@pointer)(fake_false_flags) end
-  if n == 'igSetNextFrameWantCaptureMouse' then return (@pointer)(fake_want) end
+  if n == 'igSetNextFrameWantCaptureMouse' then return (@pointer)(fake_want_mouse) end
   if n == 'igSetNextFrameWantCaptureKeyboard' then return (@pointer)(fake_want) end
   if n == 'igGetFont' then return (@pointer)(fake_font) end
   if n == 'igGetFontSize' then return (@pointer)(fake_font_size) end
@@ -552,6 +584,7 @@ local function resolver(name: cstring): pointer
   if n == 'igIsKeyDown' then return (@pointer)(fake_key_down) end
   if n == 'igIsKeyPressed' then return (@pointer)(fake_key_pressed) end
   if n == 'igSetClipboardText' then return (@pointer)(fake_set_clipboard) end
+  if n == 'ImDrawList_AddCallback' then return (@pointer)(fake_callback) end
   return nilptr
 end
 
@@ -568,6 +601,169 @@ local function fake_camera(c: *GuCamera): cint
   c.m[15] = -15
   c.m[14] = 0.1
   return 1
+end
+
+-- Pets with a real camera: none placed between the camera and the player, and
+-- ghostty.camera()'s three values all read (one truncated read broke every pet).
+do
+  world_host.get_camera = fake_camera
+  local code: cstring = [[
+    local w = CONFIG.world
+    local cx, _, cz = ghostty.camera()
+    assert(cx and cz, 'the fake camera is seen')
+    local back = math.atan(-cx, -cz)
+    for id = 301, 305 do assert(w.command(id, 'pet') == nil) end
+    for f = 1, 240 do for id = 301, 305 do assert(w.place(id, 700 + f / 60, false)) end end
+    local p = ghostty.player()
+    for id = 301, 305 do
+      local a = w.anchors[id]
+      local rel = math.abs((math.atan(a.px - p.x, a.pz - p.z) - back + math.pi) % (2 * math.pi) - math.pi)
+      assert(rel >= w.pet.camera_clear - 1e-3, 'a pet sits between the camera and the player')
+    end
+    for id = 301, 305 do w.forget(id) end
+  ]]
+  assert(luaL_loadstring(policy.L, code) == LUA_OK, 'load')
+  if lua_pcall(policy.L, 0, 0, 0) ~= LUA_OK then
+    print(lua_tolstring(policy.L, -1, nilptr))
+    assert(false, 'pets clear of the camera line')
+  end
+  world_host.get_camera = nilptr
+  print('pets clear of the camera OK')
+end
+
+-- Focusing a pet lines the others up beside it in the pet order, clear of the
+-- camera's line, smaller; they go back to their slots when focus leaves. The
+-- order is changed with `order` and kept in the saved state.
+do
+  world_host.get_camera = fake_camera
+  local code: cstring = [[
+    local w = CONFIG.world
+    local cx, _, cz = ghostty.camera()
+    local back = math.atan(-cx, -cz)
+    local ids = { 401, 402, 403, 404 }
+    for _, id in ipairs(ids) do assert(w.command(id, 'pet') == nil) end
+    local t = 900
+    local outs = {}
+    local function settle(focus_id, frames)
+      for _ = 1, frames do
+        t = t + 1 / 60
+        for _, id in ipairs(ids) do outs[id] = assert(w.place(id, t, id == focus_id)) end
+      end
+    end
+    local p = ghostty.player()
+    local function ang(id) local a = w.anchors[id] return math.atan(a.px - p.x, a.pz - p.z) end
+    local function dist(id) local a = w.anchors[id] return math.sqrt((a.px - p.x) ^ 2 + (a.pz - p.z) ^ 2) end
+    local function rel(id, to) return (ang(id) - to + math.pi) % (2 * math.pi) - math.pi end
+    settle(nil, 300)
+    local slot = {}
+    for _, id in ipairs(ids) do slot[id] = { w.anchors[id].px, w.anchors[id].pz } end
+    local base_ppy = outs[401].pixels_per_yalm
+    assert(outs[401].order_next and not outs[404].order_next and outs[404].order_prev, 'arrows where there is a neighbour')
+
+    -- a focused pet: the ones before it to its left, the ones after it to its
+    -- right, further out (or a tier up) the further away in the order; smaller,
+    -- clear of each other, the camera's line and the cone behind you
+    local function check_row(fid)
+      settle(fid, 300)
+      local af, fo = ang(fid), w.anchors[fid].order
+      for _, id in ipairs(ids) do
+        local a, o = w.anchors[id], outs[id]
+        assert(math.abs(rel(id, back)) >= w.pet.camera_clear - 1e-3, 'a pet sits between the camera and the player')
+        assert(math.abs(rel(id, math.pi)) >= w.pet.behind_clear - 1e-3, 'a pet sits behind the player')
+        if id ~= fid then
+          if a.order < fo then assert(rel(id, af) > 0.05, 'before the focused one: on its left')
+          else assert(rel(id, af) < -0.05, 'after the focused one: on its right') end
+          assert(o.pixels_per_yalm > base_ppy * 1.2, 'lined-up pets are smaller')
+          assert(math.abs(o.width - outs[fid].width) < 1e-6, 'shrinking keeps the terminal grid')
+          assert(dist(id) >= dist(fid) - 0.05, 'the row runs through the focused pet')
+          for _, jd in ipairs(ids) do
+            local b = w.anchors[jd]
+            if jd ~= fid and jd ~= id and (a.order < fo) == (b.order < fo) and math.abs(outs[jd].y - o.y) < 1e-3
+               and math.abs(b.order - fo) > math.abs(a.order - fo) then
+              assert(math.abs(rel(jd, af)) > math.abs(rel(id, af)), 'further in the order: further out')
+            end
+          end
+        end
+        for _, jd in ipairs(ids) do
+          if jd ~= id then
+            local q = outs[jd]
+            local sep = math.sqrt((o.x - q.x) ^ 2 + (o.z - q.z) ^ 2)
+            local hh = o.height / o.pixels_per_yalm / 2 + q.height / q.pixels_per_yalm / 2
+            assert(sep >= w.anchors[id].phw + w.anchors[jd].phw - 1e-3 or math.abs(o.y - q.y) >= hh - 0.03, 'lined-up pets overlap')
+          end
+        end
+      end
+      assert(math.abs(outs[fid].pixels_per_yalm - base_ppy) < 0.5, 'the focused pet keeps its size')
+    end
+    check_row(402)
+    check_row(401)
+    check_row(404)
+
+    -- focus leaves: back to the slots, full size
+    settle(nil, 400)
+    for _, id in ipairs(ids) do
+      local a = w.anchors[id]
+      assert(math.sqrt((a.px - slot[id][1]) ^ 2 + (a.pz - slot[id][2]) ^ 2) < 0.05, 'back in its slot')
+      assert(math.abs(outs[id].pixels_per_yalm - base_ppy) < 1e-3, 'back to full size')
+    end
+
+    -- the order: swap 401 right, past 402; the slots follow it
+    assert(w.command(401, 'order right') == nil)
+    assert(w.anchors[401].order > w.anchors[402].order, 'swapped with its neighbour')
+    settle(nil, 400)
+    local function near_slot(id, other)
+      local a = w.anchors[id]
+      return math.sqrt((a.px - slot[other][1]) ^ 2 + (a.pz - slot[other][2]) ^ 2) < 0.05
+    end
+    assert(near_slot(401, 402) and near_slot(402, 401), 'the swapped pets trade slots')
+    assert(w.command(404, 'order first') == nil and w.command(404, 'order left') == nil, 'first, then left of first: stays first')
+    assert(w.anchors[404].order < w.anchors[402].order, 'order first')
+    assert(w.command(404, 'order 3') == nil)
+    assert(w.command(404, 'order sideways') ~= nil, 'usage')
+    assert(w.command(999, 'order left') ~= nil, 'not a world terminal')
+    assert(w.command(405, 'here') == nil and w.command(405, 'order left') ~= nil, 'a pin has no place in the order')
+    w.forget(405)
+    -- pin <-> pet keeps its place in the order
+    local o3 = w.anchors[403].order
+    assert(w.toggle(403, 1, 2, 3, 0) == nil and w.anchors[403].kind == 'world' and w.anchors[403].order == o3)
+    assert(w.toggle(403) == nil and w.anchors[403].kind == 'pet' and w.anchors[403].order == o3, 'pin <-> pet keeps the order')
+    -- saved with the pet; the row and the scale are not
+    local list = {}
+    for i, id in ipairs(ids) do list[i] = { id = id, agent = 9400 + i, view = 'world', font_scale = 0 } end
+    settle(402, 30)
+    w.save_state(list)
+    local saved = assert(w._last_saved)
+    assert(saved:find('order = ' .. w.anchors[401].order, 1, true), 'the order is saved')
+    assert(not saved:find('lu_', 1, true) and not saved:find('ls =', 1, true) and not saved:find('phw', 1, true), 'the row is not saved')
+    os.remove((GHOSTTY_PLUGIN_DIR or '.') .. '/world-state.lua')
+    w._last_saved = nil
+    for _, id in ipairs(ids) do w.forget(id) end
+  ]]
+  assert(luaL_loadstring(policy.L, code) == LUA_OK, 'load')
+  if lua_pcall(policy.L, 0, 0, 0) ~= LUA_OK then
+    print(lua_tolstring(policy.L, -1, nilptr))
+    assert(false, 'pets line up beside a focused one')
+  end
+  world_host.get_camera = nilptr
+  print('pet lineup and order OK')
+end
+
+-- The arrows' hit areas and the draw-list reorder ------------------------------------
+do
+  assert(world_order_button(1000, 600, 10, 300, true, true) == WORLD_BUTTON_ORDER_PREV, 'left arrow')
+  assert(world_order_button(1000, 600, 990, 300, true, true) == WORLD_BUTTON_ORDER_NEXT, 'right arrow')
+  assert(world_order_button(1000, 600, 10, 300, false, true) == WORLD_BUTTON_NONE, 'no neighbour before: no arrow')
+  assert(world_order_button(1000, 600, 10, 100, true, true) == WORLD_BUTTON_NONE, 'only halfway down')
+  assert(world_order_button(1000, 600, 500, 300, true, true) == WORLD_BUTTON_NONE, 'not in the middle')
+  local c: [6]ImDrawCmd
+  for i = 0, < 6 do c[i].ElemCount = i end
+  local v: ImVector_ImDrawCmd = { Size = 6, Capacity = 6, Data = (@*[0]ImDrawCmd)(&c) }
+  world_cmds_to_front(&v, 2)
+  assert(c[0].ElemCount == 2 and c[1].ElemCount == 3 and c[3].ElemCount == 5 and c[4].ElemCount == 0 and c[5].ElemCount == 1, 'rotated, order kept')
+  world_cmds_to_front(&v, 0)
+  world_cmds_to_front(&v, 6)
+  assert(c[0].ElemCount == 2 and c[5].ElemCount == 1, 'nothing to move')
+  print('order arrows and draw-list reorder OK')
 end
 local function game_player(which: cint, id: uint64, out: *GuObject): cint
   $out = {}
@@ -627,6 +823,59 @@ local function new_panel(pin: string): *Session
   return s
 end
 
+-- Resize test helpers (file scope: Nelua functions do not close over locals)
+local game: GuCamera
+local L, R, T, B = WORLD_GRIP_LEFT, WORLD_GRIP_RIGHT, WORLD_GRIP_TOP, WORLD_GRIP_BOTTOM
+local function held_frame(): void
+  reset_list()
+  now = now + 1.0 / 60
+  frame_count = frame_count + 1
+  host.lmb_pressed, host.lmb_down = false, true
+  want_mouse = false
+  draw_world(now)
+end
+local function place(id: integer): WorldPlacement
+  local ok, pl = policy_world_place(id, now, host.world_focus == id)
+  assert(ok)
+  return pl
+end
+-- panel pixel (u, v) of a pose on the screen
+local function screen_of(pl: WorldPlacement, u: float32, v: float32): ImVec2
+  local b = world_basis(pl)
+  local x, y, z = world_point(&b, u, v)
+  local ok, sx, sy = world_project(&game, x, y, z)
+  assert(ok)
+  return vec2(sx, sy)
+end
+local function apart(a: ImVec2, b: ImVec2): float32 return math.sqrt((a.x - b.x) ^ 2 + (a.y - b.y) ^ 2) end
+
+-- the grip across the right edge at mid height, in screen pixels: how thick,
+-- and how far it reaches out past the edge
+local function band(id: integer): (float32, float32)
+  local pl = place(id)
+  local b = world_basis(pl)
+  local e, inner = screen_of(pl, pl.width, pl.height * 0.5), screen_of(pl, pl.width - 100, pl.height * 0.5)
+  local dx, dy = e.x - inner.x, e.y - inner.y
+  local l = math.sqrt(dx * dx + dy * dy)
+  dx, dy = dx / l, dy / l
+  local n, reach = 0, (@float32)(-1e9)
+  for k = -240, 240 do
+    local t = (@float32)(k) * 0.25
+    local uok, _, mu, mv = world_hit(&game, &b, vec2(e.x + dx * t, e.y + dy * t))
+    if uok and world_grip_at(&game, &b, pl.width, pl.height, mu, mv) & R ~= 0 then
+      n = n + 1
+      reach = math.max(reach, t)
+    end
+  end
+  return n * 0.25, reach
+end
+-- a fake ImGui context for the cursor rule: our window, a popup of it, another plugin's
+local cursor_ctx: ImGuiContext
+local cursor_ours: ImGuiWindow
+local cursor_popup: ImGuiWindow
+local cursor_other: ImGuiWindow
+local function fake_ctx(): *ImGuiContext return &cursor_ctx end
+
 do
   while #host.world > 0 do close_terminal(host.world[0]) end
   assert(#host.sessions == 0)
@@ -683,15 +932,62 @@ do
   now = now + 0.5
   mouse_at = panel_screen(s.id, 1790, 1030)
   world_frame(true)
-  assert(host.world_drag_id == 0 and host.world_focus == s.id, 'the resize grip of an unfocused panel only focuses it')
+  assert(host.world_drag_id == s.id and host.world_focus == s.id, 'the grip of an unfocused panel resizes at once, and focuses it')
   world_frame(false)
-  now = now + 0.5
-  world_frame(true)
-  assert(host.world_drag_id == s.id, 'the grip of the focused panel resizes')
-  world_frame(false)
-  assert(host.world_drag_id == 0)
+  assert(host.world_drag_id == 0 and host.walk.id == 0, 'released: done, and no walk-up')
   mouse_at = vec2(-5000, -5000)
   print('world clicks OK')
+
+  -- Pin <-> pet: the title button next to pop-in ------------------------------------------
+  do
+    local function anchor_kind(id: integer): string
+      local L = policy.L
+      lua_getglobal(L, 'require') lua_pushstring(L, 'world')
+      assert(lua_pcall(L, 1, 1, 0) == LUA_OK)
+      lua_getfield(L, -1, 'anchors') lua_rawgeti(L, -1, id)
+      local kind: string = 'none'
+      if lua_type(L, -1) == LUA_TTABLE then
+        lua_getfield(L, -1, 'kind')
+        kind = string.copy(lua_tolstring(L, -1, nilptr))
+      end
+      lua_settop(L, 0)
+      return kind
+    end
+    host.world_focus = s.id
+    world_frame(false)
+    local ok0, pl0 = policy_world_place(s.id, now, true)
+    assert(ok0 and not pl0.pet and anchor_kind(s.id) == 'world')
+    -- a click on it: the pin becomes a pet (the paw)
+    now = now + 0.5
+    mouse_at = panel_screen(s.id, world_title_button_x(pl0.width, WORLD_BUTTON_PET) + 13, 13)
+    world_frame(true)
+    world_frame(false)
+    assert(anchor_kind(s.id) == 'pet' and host.world_pet_toggle_id == 0, 'the paw makes it a pet')
+    assert(host.walk.id == 0, 'a title button walks nowhere')
+    for _ = 1, 30 do world_frame(false) end -- the pet floats to its place beside you
+    local ok1, pl1 = policy_world_place(s.id, now, true)
+    assert(ok1 and pl1.pet and s.posed, 'a pet, shown')
+    local px, py, pz, pyaw = s.pose_x, s.pose_y, s.pose_z, s.pose_yaw
+    -- and again: the pet is pinned right where it is shown, facing the same way (the pin)
+    now = now + 0.5
+    mouse_at = panel_screen(s.id, world_title_button_x(pl1.width, WORLD_BUTTON_PET) + 13, 13)
+    px, py, pz, pyaw = s.pose_x, s.pose_y, s.pose_z, s.pose_yaw
+    world_frame(true)
+    assert(anchor_kind(s.id) == 'world', 'the pin pins it')
+    local ok2, pl2 = policy_world_place(s.id, now, true)
+    assert(ok2 and not pl2.pet and near(pl2.x, px, 0.05) and near(pl2.y, py, 0.05) and near(pl2.z, pz, 0.05) and near(pl2.yaw, pyaw, 0.01),
+      'pinned at the pose it was shown at')
+    world_frame(false)
+    -- /term pin toggle does the same for the focused panel
+    host.world_focus = s.id
+    assert(run_command('pin toggle') == 0 and anchor_kind(s.id) == 'pet', '/term pin toggle')
+    assert(run_command('pin here') == 0 and anchor_kind(s.id) == 'world', '/term pin here on a focused world terminal')
+    host.world_focus = 0
+    assert(run_command('pin toggle') == 4, 'nothing focused: nothing to toggle')
+    mouse_at = vec2(-5000, -5000)
+    print('world pin <-> pet OK')
+  end
+
 
   -- The log: one line while nothing changes -------------------------------------------
   for _ = 1, 10 do world_frame(false) end
@@ -717,6 +1013,90 @@ do
   world_frame(false)
   assert(host.world_tuning.walk ~= want, 'read again half a second later')
   print('world tuning OK')
+
+  local keep_lines, keep_drawing = diag_lines, diag_drawing -- the summary lines below are not the ones counted
+  -- Pet order: the arrows on a hovered pet's edges, and /term order ----------------------
+  do
+    local function order_of(id: integer): integer
+      local L = policy.L
+      lua_getglobal(L, 'require') lua_pushstring(L, 'world')
+      assert(lua_pcall(L, 1, 1, 0) == LUA_OK)
+      lua_getfield(L, -1, 'anchors') lua_rawgeti(L, -1, id)
+      lua_getfield(L, -1, 'order')
+      local o = lua_tointegerx(L, -1, nilptr)
+      lua_settop(L, 0)
+      return o
+    end
+    local pa = new_panel('pet')
+    local pb = new_panel('pet')
+    host.world_focus = 0
+    for _ = 1, 120 do world_frame(false) end
+    assert(order_of(pa.id) < order_of(pb.id), 'new pets join the order at the end')
+    local oka, pla = policy_world_place(pa.id, now, false)
+    assert(oka and pla.order_next and not pla.order_prev, 'the first pet: an arrow to the next only')
+    -- a click on its right arrow: it swaps with the next one (and takes focus, but walks nowhere)
+    now = now + 0.5
+    mouse_at = panel_screen(pa.id, pla.width - 2 - WORLD_ORDER_W * 0.5, pla.height * 0.5)
+    world_frame(false)
+    world_frame(true)
+    assert(order_of(pa.id) > order_of(pb.id) and host.world_order_id == 0, 'the right arrow moves it after its neighbour')
+    assert(host.world_focus == pa.id and host.walk.id == 0, 'an arrow focuses, walks nowhere')
+    world_frame(false)
+    mouse_at = vec2(-5000, -5000)
+    -- /term order on the focused pet
+    assert(run_command('order left') == 0 and order_of(pa.id) < order_of(pb.id), '/term order left')
+    assert(run_command('order last') == 0 and order_of(pa.id) > order_of(pb.id), '/term order last')
+    assert(run_command('order sideways') == 4, 'a bad /term order')
+    host.world_focus = s.id
+    assert(run_command('order left') == 4, 'a pin has no place in the order')
+    host.world_focus = 0
+    assert(run_command('order left') == 5, 'nothing focused')
+    close_terminal(pa)
+    close_terminal(pb)
+    print('world pet order OK')
+  end
+
+  -- Under the other plugins' overlays: what Umbra drew into the background
+  -- list before us ends up after everything of ours -------------------------------------
+  do
+    host.world_focus = s.id
+    reset_list()
+    cmds[0].ClipRect = { 1, 2, 3, 4 } -- "Umbra's toolbar"
+    quad(vec2(0, 0), vec2(2560, 40), 0xff00ff00_u32)
+    host.world_tuning.under_ui = true
+    local base = world_under_ui_begin()
+    assert(base == 1 and dl.CmdBuffer.Size == 3 and cmds[1].UserCallback == (@pointer)(IMDRAW_CALLBACK_RESET), 'a fresh command of ours')
+    now = now + 1.0 / 60
+    draw_world(now)
+    local ours: cint = 0
+    for i = 1, < dl.CmdBuffer.Size do ours = ours + cmds[i].ElemCount end
+    assert(ours > 0, 'the panel drew')
+    world_under_ui_end(base)
+    local n = dl.CmdBuffer.Size
+    assert(cmds[0].UserCallback == (@pointer)(IMDRAW_CALLBACK_RESET), 'ours first')
+    assert(cmds[n - 3].ClipRect.x == 1 and cmds[n - 3].ElemCount == 4, 'Umbra\'s command after all of ours')
+    assert(cmds[n - 2].UserCallback == (@pointer)(IMDRAW_CALLBACK_RESET) and cmds[n - 1].ElemCount == 0 and cmds[n - 1].UserCallback == nilptr,
+      'a fresh last command for whoever draws next')
+    local after: cint = 0
+    for i = 0, < n - 3 do after = after + cmds[i].ElemCount end
+    assert(after == ours, 'nothing of ours lost')
+    -- nothing drawn before us: nothing to go under
+    reset_list()
+    assert(world_under_ui_begin() == -1 and dl.CmdBuffer.Size == 1)
+    world_under_ui_end(-1)
+    -- turned off
+    quad(vec2(0, 0), vec2(10, 10), 0xff00ff00_u32)
+    host.world_tuning.under_ui = false
+    assert(world_under_ui_begin() == -1 and dl.CmdBuffer.Size == 1, 'CONFIG.world.under_ui = false')
+    assert(luaL_loadstring(policy.L, 'CONFIG.world.under_ui = false') == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+    assert(not world_read_tuning(policy.L).under_ui, 'under_ui read from lua/world.lua')
+    assert(luaL_loadstring(policy.L, 'CONFIG.world.under_ui = true') == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+    assert(world_read_tuning(policy.L).under_ui)
+    host.world_tuning.under_ui = true
+    host.world_focus = 0
+    print('world under other overlays OK')
+  end
+  diag_lines, diag_drawing = keep_lines, keep_drawing
 
   -- Level of detail: text too small to read is not drawn -----------------------------
   host.world_focus = 0
@@ -777,4 +1157,239 @@ do
   sleep_unseen(now)
   assert(s.sleeping, 'unseen for 30 s: sleeps')
   print('world sleep OK')
+
+  -- Tooltips: a title button hovered in world space explains itself after a moment --
+  do
+    while #host.world > 0 do close_terminal(host.world[0]) end
+    local t = new_panel('here')
+    world_frame(false)
+    local ok, pl = policy_world_place(t.id, now, false)
+    assert(ok)
+    local function tip_text(): string
+      return string{data = (@*[0]byte)(&tooltip_last), size = (@usize)(tooltip_last_len)}
+    end
+    local function hover(id: integer, u: float32, v: float32, frames: integer): integer
+      local before = tooltip_shown
+      for _ = 1, frames do
+        mouse_at = panel_screen(id, u, v)
+        world_frame(false)
+      end
+      return tooltip_shown - before
+    end
+    assert(hover(t.id, pl.width - 30 + 13, 17, 20) == 0, 'not before the delay')
+    assert(hover(t.id, pl.width - 30 + 13, 17, 20) > 0 and tip_text() == 'Close this screen', 'close: ' .. tip_text())
+    assert(hover(t.id, world_title_button_x(pl.width, WORLD_BUTTON_OCCLUDED) + 13, 17, 40) > 0 and tip_text():find('Sleeps while nobody sees it', 1, true) == 1, tip_text())
+    assert(hover(t.id, world_title_button_x(pl.width, WORLD_BUTTON_PET) + 13, 17, 40) > 0 and tip_text() == 'Let it float beside you as a pet', 'pin: ' .. tip_text())
+    assert(hover(t.id, 400, 300, 40) == 0, 'the terminal itself shows none')
+    close_terminal(t)
+    print('world tooltips OK')
+  end
+
+  -- Resizing by the edges (core/app/resize.nelua) --------------------------------------
+  do
+    while #host.world > 0 do close_terminal(host.world[0]) end
+    host.world_focus = 0
+    mouse_at = vec2(-5000, -5000)
+    fake_camera(&game)
+    local near_p, far_p = new_panel('here'), new_panel('at 0 40 1.7')
+    world_frame(false)
+    local near_px, near_out = band(near_p.id)
+    local far_px, far_out = band(far_p.id)
+    assert(near_px >= 12 and near_px <= 16 and far_px >= 12 and far_px <= 16, 'the grip is about 14 screen pixels thick near and far')
+    assert(math.abs(near_px - far_px) < 1.5 and near_out >= 5 and far_out >= 5, 'the same on screen, reaching past the edge')
+    -- far away the old 28 panel pixels were under 2 screen pixels
+    local far_b = world_basis(place(far_p.id))
+    assert(world_grip_scale(&game, &far_b, 1800, 1040, R) * 28 < 2)
+    close_terminal(near_p)
+    close_terminal(far_p)
+    print('world grip size OK')
+
+    -- each edge and corner of a pin: a press resizes at once, the grabbed edge
+    -- follows the cursor and the opposite one stays put
+    local modes: [8]integer = { L, R, T, B, L | T, R | T, L | B, R | B }
+    for i = 0, < 8 do
+      local m = modes[i]
+      host.world_focus = 0
+      local p = new_panel('here')
+      world_frame(false)
+      local pl = place(p.id)
+      local w, h = pl.width, pl.height
+      -- just inside the edge; the top right corner just outside (the title buttons are inside)
+      local gu: float32 = (m & L ~= 0) and 4 or ((m & R ~= 0) and w - 4 or w * 0.4)
+      local gv: float32 = (m & T ~= 0) and 4 or ((m & B ~= 0) and h - 4 or h * 0.5)
+      if m == R | T then gu, gv = w + 5, -5 end
+      local fu: float32 = (m & R ~= 0) and 0 or ((m & L ~= 0) and w or w * 0.5)
+      local fv: float32 = (m & B ~= 0) and 0 or ((m & T ~= 0) and h or h * 0.5)
+      local fixed = screen_of(pl, fu, fv)
+      now = now + 1
+      mouse_at = screen_of(pl, gu, gv)
+      world_frame(true)
+      assert(host.world_drag_id == p.id and host.world_focus == p.id, 'a press on the grip resizes (and focuses) at once')
+      local du: float32 = (m & L ~= 0) and -240 or ((m & R ~= 0) and 240 or 0)
+      local dv: float32 = (m & T ~= 0) and -160 or ((m & B ~= 0) and 160 or 0)
+      for k = 1, 4 do
+        mouse_at = screen_of(pl, gu + du * k / 4, gv + dv * k / 4)
+        held_frame()
+        assert(want_mouse, 'the mouse is ours while resizing')
+      end
+      held_frame()
+      local pl2 = place(p.id)
+      assert(near(pl2.width, w + math.abs(du), 1) and near(pl2.height, h + math.abs(dv), 1), 'the edge moved as far as the cursor')
+      local fu2: float32 = (m & R ~= 0) and 0 or ((m & L ~= 0) and pl2.width or pl2.width * 0.5)
+      local fv2: float32 = (m & B ~= 0) and 0 or ((m & T ~= 0) and pl2.height or pl2.height * 0.5)
+      assert(apart(screen_of(pl2, fu2, fv2), fixed) < 1, 'the opposite edge stays within a pixel')
+      world_frame(false)
+      assert(host.world_drag_id == 0, 'released: done')
+      close_terminal(p)
+    end
+    print('world resize edges and corners OK')
+
+    -- Alt + press on a grip still picks the panel up
+    do
+      host.world_focus = 0
+      local p = new_panel('here')
+      world_frame(false)
+      local pl = place(p.id)
+      now = now + 1
+      mouse_at = screen_of(pl, pl.width - 4, pl.height * 0.5)
+      io_state.KeyAlt = true
+      world_frame(true)
+      assert(host.drag.id == p.id and host.world_drag_id == 0, 'Alt: carried, not resized')
+      world_frame(false)
+      io_state.KeyAlt = false
+      assert(host.drag.id == 0 and host.world_drag_id == 0)
+      local pl2 = place(p.id)
+      assert(near(pl2.width, pl.width, 0.01) and near(pl2.height, pl.height, 0.01), 'the size is kept')
+      close_terminal(p)
+      print('world resize Alt moves OK')
+    end
+
+    -- released anywhere: off the panel, or with the panel gone from view
+    do
+      host.world_focus = 0
+      local p = new_panel('here')
+      world_frame(false)
+      local pl = place(p.id)
+      now = now + 1
+      mouse_at = screen_of(pl, pl.width - 4, pl.height * 0.5)
+      world_frame(true)
+      assert(host.world_drag_id == p.id)
+      mouse_at = vec2(2550, 20)
+      held_frame()
+      assert(host.world_drag_id == p.id and want_mouse, 'held off the panel: still resizing, the mouse still ours')
+      world_frame(false)
+      assert(host.world_drag_id == 0, 'let go off the panel: done')
+      now = now + 1
+      mouse_at = screen_of(place(p.id), place(p.id).width - 4, place(p.id).height * 0.5)
+      world_frame(true)
+      assert(host.world_drag_id == p.id)
+      local e = policy_world_command(p.id, 'hide')
+      e:destroy()
+      held_frame()
+      world_frame(false)
+      assert(host.world_drag_id == 0, 'let go with the panel hidden: done')
+      close_terminal(p)
+      print('world resize release OK')
+    end
+
+    -- a pet grows about its centre, the grabbed edge still under the cursor
+    -- (a pet faces your character, so it may be seen from behind: the cursor
+    -- is aimed by projecting the panel, never by screen arithmetic)
+    do
+      host.world_focus = 0
+      local p = new_panel('pet')
+      for _ = 1, 60 do world_frame(false) end
+      local pl = place(p.id)
+      local grab = screen_of(pl, pl.width - 4, pl.height * 0.5)
+      local target = screen_of(pl, pl.width + 140, pl.height * 0.5)
+      now = now + 1
+      mouse_at = grab
+      world_frame(true)
+      assert(host.world_drag_id == p.id, 'a pet resizes without focus too')
+      for k = 1, 150 do
+        local t = (@float32)(math.min(k, 30)) / 30
+        mouse_at = vec2(grab.x + (target.x - grab.x) * t, grab.y + (target.y - grab.y) * t)
+        held_frame()
+      end
+      local pl2 = place(p.id)
+      local e1 = panel_screen(p.id, pl2.width, pl2.height * 0.5)
+      local e2 = panel_screen(p.id, 0, pl2.height * 0.5)
+      assert(pl2.width > pl.width + 100 and near(pl2.height, pl.height, 0.01), 'wider, same height')
+      -- across the edge only: a pet bobs up and down while it is held
+      assert(math.min(math.abs(e1.x - mouse_at.x), math.abs(e2.x - mouse_at.x)) < 6, 'the grabbed edge ends up under the cursor')
+      world_frame(false)
+      close_terminal(p)
+      print('world resize pet OK')
+    end
+
+    -- a HUD panel keeps its opposite edge on the screen; the size stays in its terms
+    do
+      world_host.get_camera = fake_camera
+      host.world_focus = 0
+      local p = new_panel('hud 0.5 0.5 1.6 0.5')
+      world_frame(false)
+      local pl = place(p.id)
+      local right = screen_of(pl, pl.width, pl.height * 0.5)
+      local grab = screen_of(pl, 4, pl.height * 0.5)
+      local target = screen_of(pl, -120, pl.height * 0.5)
+      now = now + 1
+      mouse_at = grab
+      world_frame(true)
+      assert(host.world_drag_id == p.id, 'a HUD panel resizes without focus')
+      for k = 1, 12 do
+        local t = (@float32)(math.min(k, 6)) / 6
+        mouse_at = vec2(grab.x + (target.x - grab.x) * t, grab.y + (target.y - grab.y) * t)
+        held_frame()
+      end
+      local pl2 = place(p.id)
+      local right2 = screen_of(pl2, pl2.width, pl2.height * 0.5)
+      world_frame(false)
+      -- the cursor went from 4 pixels inside the edge to 120 outside it
+      assert(near(pl2.width, pl.width + 124, 2), 'the left edge followed the cursor')
+      assert(math.abs(right2.x - right.x) < 1, 'the right edge stays')
+      assert(near(pl2.ppm, pl.ppm, pl.ppm * 1e-3), 'the same screen pixels per panel pixel')
+      close_terminal(p)
+      world_host.get_camera = nilptr
+      print('world resize HUD OK')
+    end
+
+    -- the game keeps its own cursor over ghostty UI (core/app/cursor.nelua)
+    do
+      cursor_ours.Name = '##ghostty_dropdown'
+      cursor_popup.Name = '##Combo_00'
+      cursor_popup.RootWindowPopupTree = &cursor_ours
+      cursor_other.Name = 'Some other plugin'
+      imgui_int_bound = true
+      imgui_int.GetCurrentContext = fake_ctx
+      local function frame_flag(): boolean
+        world_frame(false)
+        cursor_frame(cursor_over_ours())
+        return io_state.ConfigFlags & ImGuiConfigFlags_NoMouseCursorChange ~= 0
+      end
+      io_state.ConfigFlags = 0
+      host.world_focus = 0
+      local p = new_panel('here')
+      world_frame(false)
+      mouse_at = panel_screen(p.id, 400, 300)
+      assert(frame_flag(), 'over a world panel: the game cursor stays')
+      mouse_at = vec2(-5000, -5000)
+      assert(not frame_flag(), 'off it: cleared again')
+      cursor_ctx.HoveredWindow = &cursor_ours
+      assert(frame_flag(), 'over one of our windows')
+      cursor_ctx.HoveredWindow = &cursor_popup
+      assert(frame_flag(), 'over a popup of our window')
+      cursor_ctx.HoveredWindow = &cursor_other
+      assert(not frame_flag(), 'over another plugin\'s window: left alone')
+      cursor_ctx.HoveredWindow = nilptr
+      io_state.ConfigFlags = ImGuiConfigFlags_NoMouseCursorChange -- set by someone else
+      mouse_at = panel_screen(p.id, 400, 300)
+      assert(frame_flag())
+      mouse_at = vec2(-5000, -5000)
+      assert(frame_flag(), 'a flag we did not set is not ours to clear')
+      io_state.ConfigFlags = 0
+      close_terminal(p)
+      imgui_int.GetCurrentContext = nilptr
+      print('world cursor OK')
+    end
+  end
 end

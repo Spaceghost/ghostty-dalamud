@@ -1,0 +1,145 @@
+-- Manual smoke test of the Windows wide path APIs, run ON Windows (not part of
+-- tests/run.sh, which builds for the host, where the wide code is not even
+-- compiled). It is the other half of tests/test_winpath.nelua: that one checks
+-- the UTF-8 <-> UTF-16 conversion and the UTF-8 path API on the host, this one
+-- checks that the real calls behind them accept and return a non-ASCII name.
+--
+-- Cross-compile it beside the plugin (ghostty_core.dll's compiler and libraries):
+--
+--   ZIG=/path/to/zig vendor/nelua-lang/nelua --cc tools/zig-cc-win.sh -P nogc \
+--     --cflags="-O2 -I$PWD/vendor/lua/src -L$PWD/build/lua-win" \
+--     --cache-dir build/win/cache-smoke -L . \
+--     -o build/dist/smoke-winpath.exe tests/smoke_winpath_windows.nelua
+--
+-- then run smoke-winpath.exe on a Windows machine. It makes, and removes
+-- again, a folder named Jürgen-プレイ under the user's profile. Each step
+-- prints PASS or FAIL; the exit code is the number of failures.
+require 'core.sys.fs'
+require 'core.sys.fsbase'
+require 'core.sys.winpath'
+require 'string'
+require 'io'
+require 'os'
+
+## cinclude '<windows.h>'
+local function CreateFileW(path: pointer, access: uint32, share: uint32, sa: pointer, disp: uint32, flags: uint32, tmpl: pointer): pointer <cimport, nodecl> end
+local function WriteFile(h: pointer, buf: pointer, n: uint32, wrote: *uint32, ov: pointer): cint <cimport, nodecl> end
+local function CloseHandle(h: pointer): cint <cimport, nodecl> end
+local function DeleteFileW(path: pointer): cint <cimport, nodecl> end
+local function RemoveDirectoryW(path: pointer): cint <cimport, nodecl> end
+local INVALID_HANDLE_VALUE: pointer <cimport, nodecl, const>
+local GENERIC_WRITE: uint32 <comptime> = 0x40000000
+local CREATE_ALWAYS: uint32 <comptime> = 2
+
+local NAME: string = 'J\xC3\xBCrgen-\xE3\x83\x97\xE3\x83\xAC\xE3\x82\xA4' -- Jürgen-プレイ in UTF-8
+
+local failures = 0
+local function step(name: string, ok: boolean, detail: string): void
+  if ok then print('PASS', name, detail) else print('FAIL', name, detail) failures = failures + 1 end
+end
+
+-- the conversion itself, here through MultiByteToWideChar/WideCharToMultiByte
+local function round(s: string): boolean
+  local w: [WINPATH_MAX]uint16
+  if winpath_wide(s, (@*[0]uint16)(&w), WINPATH_MAX) < 0 then return false end
+  local back = winpath_utf8((@*[0]uint16)(&w))
+  local ok = back == s
+  back:destroy()
+  return ok
+end
+step('UTF-8 round trip, ASCII', round('C:\\Users\\me\\Documents'), '')
+step('UTF-8 round trip, two-byte', round('C:\\Users\\J\xC3\xBCrgen'), 'Jürgen')
+step('UTF-8 round trip, three-byte', round('C:\\Users\\\xE3\x83\x97\xE3\x83\xAC\xE3\x82\xA4'), 'プレイ')
+step('UTF-8 round trip, four-byte', round('C:\\Users\\\xF0\x9F\x99\x82'), 'an emoji')
+
+-- the core's ghostty table, with only the file functions on it
+local L = luaL_newstate()
+luaL_openlibs(L)
+lua_createtable(L, 0, 8)
+lua_setglobal(L, 'ghostty')
+fs_lua_register(L)
+
+-- ghostty.known_folder(which) -> '' when it answered nothing
+local function known_folder(which: cstring): string
+  lua_getglobal(L, 'ghostty')
+  lua_getfield(L, -1, 'known_folder')
+  lua_pushstring(L, which)
+  if lua_pcall(L, 1, 1, 0) ~= LUA_OK then lua_settop(L, 0) return (@string){} end
+  local p = lua_tolstring(L, -1, nilptr)
+  local s: string = ''
+  if p ~= nilptr then
+    local view: string = p
+    s = view:copy()
+  end
+  lua_settop(L, 0)
+  return s
+end
+
+local profile = known_folder('profile')
+step('known_folder profile (SHGetKnownFolderPath)', profile.size > 0, profile)
+local documents = known_folder('documents')
+step('known_folder documents', documents.size > 0, documents)
+local pictures = known_folder('pictures')
+step('known_folder pictures', pictures.size > 0, pictures)
+if profile.size == 0 then
+  print(string.format('%d FAILED', failures))
+  os.exit(failures)
+end
+
+local base = string.format('%s\\ghostty-winpath-smoke', profile)
+local dir = string.format('%s\\%s', base, NAME)
+local file = string.format('%s\\ffxiv_09192026_203512_123.png', dir)
+step('mkdir with a non-ASCII name (CreateDirectoryW)',
+  fs_mkdir((@cstring)(base.data)) and fs_mkdir((@cstring)(dir.data)) and fs_mkdir((@cstring)(dir.data)), dir)
+step('make_private on it (SetFileSecurityW)', fs_make_private((@cstring)(dir.data)), '')
+
+local wfile: [WINPATH_MAX]uint16
+local wrote = false
+if winpath_wide(file, (@*[0]uint16)(&wfile), WINPATH_MAX) >= 0 then
+  local h = CreateFileW((@pointer)(&wfile), GENERIC_WRITE, 0, nilptr, CREATE_ALWAYS, 0, nilptr)
+  if h ~= INVALID_HANDLE_VALUE then
+    local n: uint32 = 0
+    local bytes: string = 'PNGDATA'
+    wrote = WriteFile(h, (@pointer)(bytes.data), 7, &n, nilptr) ~= 0 and n == 7
+    CloseHandle(h)
+  end
+end
+step('a screenshot written into it (CreateFileW)', wrote, file)
+
+-- the Lua side: listdir gives the name back as the same UTF-8 bytes, and
+-- file_size reads a file through the non-ASCII folder
+local chunk: string = [[
+local base, dir, file, name = ...
+local seen, names = {}, {}
+for _, n in ipairs(ghostty.listdir(base) or {}) do seen[n] = true names[#names + 1] = n end
+assert(seen[name], 'listdir gave ' .. table.concat(names, ','))
+assert(ghostty.file_size(file) == 7, 'file_size said ' .. tostring(ghostty.file_size(file)))
+assert(ghostty.file_size(dir) == nil, 'a folder has no size')
+assert(ghostty.file_size(file .. '.missing') == nil, 'a missing file has no size')
+]]
+local err: string = ''
+if luaL_loadstring(L, (@cstring)(chunk.data)) ~= LUA_OK then
+  err = (@string)(lua_tolstring(L, -1, nilptr))
+else
+  lua_pushlstring(L, (@cstring)(base.data), base.size)
+  lua_pushlstring(L, (@cstring)(dir.data), dir.size)
+  lua_pushlstring(L, (@cstring)(file.data), file.size)
+  lua_pushlstring(L, (@cstring)(NAME.data), NAME.size)
+  if lua_pcall(L, 4, 0, 0) ~= LUA_OK then err = (@string)(lua_tolstring(L, -1, nilptr)) end
+end
+step('listdir and file_size on the non-ASCII folder (FindFirstFileW, GetFileAttributesExW)', err.size == 0, err)
+
+-- what core/glyphfb.nelua's fallback fonts need instead of io.open, which is ANSI
+local data = winpath_read_file(file)
+step('read a file through the non-ASCII folder (CreateFileW)', data == 'PNGDATA', string.format('%d bytes', data.size))
+data:destroy()
+
+-- tidy up: the folder was made in the user's profile
+DeleteFileW((@pointer)(&wfile))
+local wdir: [WINPATH_MAX]uint16
+if winpath_wide(dir, (@*[0]uint16)(&wdir), WINPATH_MAX) >= 0 then RemoveDirectoryW((@pointer)(&wdir)) end
+if winpath_wide(base, (@*[0]uint16)(&wdir), WINPATH_MAX) >= 0 then RemoveDirectoryW((@pointer)(&wdir)) end
+
+lua_close(L)
+print(failures == 0 and 'ALL PASS' or string.format('%d FAILED', failures))
+os.exit(failures)

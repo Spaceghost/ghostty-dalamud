@@ -1,0 +1,307 @@
+-- HUD panels: roll in the panel basis, the camera frame, lua/world.lua's `hud`
+-- anchor (docked spot and size at rest, the Lakitu lag on a camera turn and
+-- its settling, clamps, zoom), docking maths and persistence.
+require 'core.world'
+require 'core.policy'
+require 'string'
+require 'math'
+require 'arg'
+require 'os'
+require 'vector'
+
+local function near(a: float64, b: float64, eps: float64): boolean return math.abs(a - b) < eps end
+
+-- A camera like the game's: row vectors, reversed Z with an infinite far plane,
+-- near 0.1, vertical FoV `fov`, at a 2560x1440 viewport.
+local function game_camera(ex: float64, ey: float64, ez: float64, yaw: float64, pitch: float64, fov: float64): GuCamera
+  local c: GuCamera = { width = 2560, height = 1440 }
+  local fx, fy, fz = math.sin(yaw) * math.cos(pitch), math.sin(pitch), math.cos(yaw) * math.cos(pitch)
+  local zx, zy, zz = -fx, -fy, -fz
+  local xl = math.sqrt(zz * zz + zx * zx)
+  local xx, xy, xz = zz / xl, 0.0, -zx / xl
+  local yx, yy, yz = zy * xz - zz * xy, zz * xx - zx * xz, zx * xy - zy * xx
+  local v: [16]float64 = {
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(ex * xx + ey * xy + ez * xz), -(ex * yx + ey * yy + ez * yz), -(ex * zx + ey * zy + ez * zz), 1,
+  }
+  local f = 1 / math.tan(fov / 2)
+  local p: [16]float64 = { f * 1440 / 2560, 0, 0, 0, 0, f, 0, 0, 0, 0, 0, -1, 0, 0, 0.1, 0 }
+  for r = 0, < 4 do
+    for k = 0, < 4 do
+      local sum: float64 = 0
+      for j = 0, < 4 do sum = sum + v[r * 4 + j] * p[j * 4 + k] end
+      c.m[r * 4 + k] = sum
+    end
+  end
+  return c
+end
+
+-- Roll ------------------------------------------------------------------------------
+do
+  local gc = game_camera(100, 5, -200, 0.6, -0.15, 0.78)
+  local fwx, fwz = math.sin(0.6), math.cos(0.6)
+  local base: WorldPlacement = { x = 100 + fwx * 6, y = 4.2, z = -200 + fwz * 6, yaw = 0.6 + math.pi, pitch = 0.2,
+    width = 1800, height = 1040, ppm = 640 }
+  local b0 = world_basis(base)
+  assert(b0.ry == 0, 'no roll: right stays level')
+  local rolls: [4]float32 = { -0.3, 0.1, 0.5, 1.2 }
+  for i = 0, < 4 do
+    local pl = base
+    pl.roll = rolls[i]
+    local b = world_basis(pl)
+    -- right and up stay unit and square to each other and to the unrolled normal
+    local ul = math.sqrt(b.ux * b.ux + b.uy * b.uy + b.uz * b.uz) / b.ypp
+    assert(near(b.rx * b.rx + b.ry * b.ry + b.rz * b.rz, 1, 1e-5) and near(ul, 1, 1e-4), 'unit axes')
+    assert(near((b.rx * b.ux + b.ry * b.uy + b.rz * b.uz) / b.ypp, 0, 1e-5), 'right is square to up')
+    local a = world_axes(pl.yaw, pl.pitch)
+    assert(near(b.rx * a.nx + b.ry * a.ny + b.rz * a.nz, 0, 1e-5), 'rolled in the panel plane')
+    -- right rotated toward the unrolled up by the roll angle
+    local c = (b.rx * a.ux + b.ry * a.uy + b.rz * a.uz)
+    assert(near(c, math.sin(rolls[i]), 1e-5), 'counterclockwise by the roll')
+    -- the precomputed projection and the depth inverse agree with world_point
+    local pre = world_panel_projection(&gc, &b)
+    local okb, inv = world_basis_inverse(&b)
+    assert(okb)
+    for k = 0, < 9 do
+      local u, v = (@float32)(k * 220), (@float32)(k * 130)
+      local x, y, z = world_point(&b, u, v)
+      local okw, wx, wy = world_project(&gc, x, y, z)
+      local okp, px, py = world_project_uv(&pre, u, v)
+      assert(okw and okp and near(px, wx, 0.25) and near(py, wy, 0.25), 'projection with roll')
+      local ox, oy, oz = x - b.cx, y - b.cy, z - b.cz
+      local lat = inv[0] * ox + inv[1] * oy + inv[2] * oz
+      local dv = inv[6] * ox + inv[7] * oy + inv[8] * oz
+      assert(near(lat, (u - b.hw) * b.ypp, 1e-3) and near(dv, b.hh - v, 0.05), 'depth inverse with roll')
+    end
+  end
+  print('roll OK')
+end
+
+-- The camera frame ------------------------------------------------------------------
+do
+  local gc = game_camera(3, 4, 5, 0.9, -0.3, 0.78)
+  local ok, v = world_view(&gc)
+  assert(ok and near(v.x, 3, 1e-3) and near(v.y, 4, 1e-3) and near(v.z, 5, 1e-3), 'camera position')
+  assert(near(v.fx, math.sin(0.9) * math.cos(-0.3), 1e-5) and near(v.fy, math.sin(-0.3), 1e-5), 'forward')
+  assert(near(v.tan_y, math.tan(0.39), 1e-5) and near(v.tan_x, math.tan(0.39) * 2560 / 1440, 1e-5), 'field of view')
+  assert(near(v.rx * v.fx + v.ry * v.fy + v.rz * v.fz, 0, 1e-5) and near(v.ux * v.rx + v.uy * v.ry + v.uz * v.rz, 0, 1e-5), 'square axes')
+  -- a point placed by the frame lands where it should on screen
+  local d, a, bb = 4.0, 0.5, -0.25
+  local x = v.x + d * (v.fx + a * v.tan_x * v.rx + bb * v.tan_y * v.ux)
+  local y = v.y + d * (v.fy + a * v.tan_x * v.ry + bb * v.tan_y * v.uy)
+  local z = v.z + d * (v.fz + a * v.tan_x * v.rz + bb * v.tan_y * v.uz)
+  local okp, sx, sy = world_project(&gc, x, y, z)
+  assert(okp and near(sx, 2560 * (a + 1) / 2, 0.05) and near(sy, 1440 * (1 - bb) / 2, 0.05), 'NDC mapping')
+  local oks, fx, fy, sc = world_hud_spot(&v, x, y, z, 640)
+  assert(oks and near(fx, 0.75, 1e-4) and near(fy, 0.625, 1e-4) and near(sc, 1440 / (2 * d * v.tan_y * 640), 1e-4), 'spot')
+  print('camera frame OK')
+end
+
+-- Docking maths -------------------------------------------------------------------------
+do
+  -- mid-screen: nothing, unless forced (Ctrl): then where the carry had it
+  local d = world_hud_dock(2560, 1440, 1200, 700, 50, -20, 300, 200, 40, 16, false)
+  assert(not d.ok, 'mid-screen does not dock')
+  d = world_hud_dock(2560, 1440, 1200, 700, 50, -20, 300, 200, 40, 16, true)
+  assert(d.ok and near(d.x, 1150 / 2560, 1e-5) and near(d.y, 720 / 1440, 1e-5) and not (d.left or d.right or d.top or d.bottom), 'forced: kept where carried')
+  -- the left edge: flush against it, height where carried
+  d = world_hud_dock(2560, 1440, 30, 700, 0, 0, 300, 200, 40, 16, false)
+  assert(d.ok and d.left and not d.top and near(d.x, 316 / 2560, 1e-5) and near(d.y, 700 / 1440, 1e-5), 'left edge')
+  -- the bottom-right corner
+  d = world_hud_dock(2560, 1440, 2550, 1430, 0, 0, 300, 200, 40, 16, false)
+  assert(d.ok and d.right and d.bottom and near(d.x, (2560 - 316) / 2560, 1e-5) and near(d.y, (1440 - 216) / 1440, 1e-5), 'corner')
+  -- the top edge near the right: kept on screen sideways
+  d = world_hud_dock(2560, 1440, 2500, 10, -200, 0, 300, 200, 40, 16, false)
+  assert(d.ok and d.top and not d.right and near(d.x, (2560 - 316) / 2560, 1e-5) and near(d.y, 216 / 1440, 1e-5), 'kept on screen')
+  -- bigger than the view: centred
+  d = world_hud_dock(2560, 1440, 5, 700, 0, 0, 2000, 900, 40, 16, false)
+  assert(d.ok and near(d.x, 0.5, 1e-5) and near(d.y, 0.5, 1e-5), 'too big: centred')
+  print('dock maths OK')
+end
+
+-- lua/world.lua `hud` ----------------------------------------------------------------
+local cam_now: GuCamera
+local function fake_camera(c: *GuCamera): cint $c = cam_now return 1 end
+local function fake_object(which: cint, id: uint64, out: *GuObject): cint
+  $out = { x = 10, y = 0, z = 20, rotation = 0, entity_id = 7, territory = 132, found = 1 }
+  return 1
+end
+world_host.get_camera = fake_camera
+world_host.get_object = fake_object
+
+local root: string = arg[1]
+assert(policy_load(root), policy.error)
+local function lua_ok(code: string): boolean
+  if luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK then return true end
+  print(lua_tolstring(policy.L, -1, nilptr))
+  lua_pop(policy.L, 1)
+  return false
+end
+
+-- The panel's centre on screen, its projected size, and its roll (radians).
+local function shown(pl: WorldPlacement): (float64, float64, float64, float64, float64)
+  local b = world_basis(pl)
+  local q: [4]ImVec2
+  assert(world_corners(&cam_now, &b, &q), 'in view')
+  assert(not world_backfacing(&q), 'faces the camera')
+  local okc, cx, cy = world_project(&cam_now, pl.x, pl.y, pl.z)
+  assert(okc)
+  local w = math.sqrt((q[1].x - q[0].x) ^ 2 + (q[1].y - q[0].y) ^ 2)
+  local h = math.sqrt((q[3].x - q[0].x) ^ 2 + (q[3].y - q[0].y) ^ 2)
+  return cx, cy, w, h, math.atan(-(q[1].y - q[0].y), q[1].x - q[0].x)
+end
+
+do
+  local t = world_read_tuning(policy.L)
+  assert(t.hud_dock and t.hud_edge == 40 and t.hud_margin == 16, 'lua/world.lua dock tuning read')
+  assert(lua_ok('CONFIG.world.hud.bob = 0'))
+  cam_now = game_camera(0, 5, 0, 0.3, -0.2, 0.78)
+
+  -- at rest: centred on the docked spot, its pixels `scale` screen pixels each
+  assert(#policy_world_command(1, 'hud 0.8 0.25 1.6 0.5') == 0)
+  local ok, pl = policy_world_place(1, 0, false)
+  assert(ok and pl.hud and not pl.pet and near(pl.roll, 0, 1e-6), 'a HUD panel')
+  assert(pl.tint_r == 1 and pl.tint_g == 1 and pl.tint_b == 1 and pl.backlight == 0 and pl.light_intensity == 0, 'no world light')
+  local cx, cy, w, h, roll = shown(pl)
+  assert(near(cx, 0.8 * 2560, 1) and near(cy, 0.25 * 1440, 1), 'centre on the spot')
+  assert(near(w, 1800 * 0.5, 1) and near(h, 1040 * 0.5, 1), 'apparent size kept')
+  -- another distance: same place and size on screen
+  assert(#policy_world_command(1, 'hud 0.8 0.25 4 0.5') == 0)
+  ok, pl = policy_world_place(1, 0.01, false)
+  local cx2, cy2, w2, h2 = shown(pl)
+  assert(near(cx2, cx, 1) and near(cy2, cy, 1) and near(w2, w, 1) and near(h2, h, 1), 'distance does not change the screen size')
+  assert(#policy_world_command(1, 'hud 0.8 0.25 1.6 0.5') == 0)
+
+  -- a camera turn: it lags (slides back, faces where the camera looked, banks), then settles
+  local yaw, dt = 0.3, 1.0 / 60
+  local tt: float64 = 1
+  cam_now = game_camera(0, 5, 0, yaw, -0.2, 0.78)
+  ok, pl = policy_world_place(1, tt, false)
+  local okv, v0 = world_view(&cam_now)
+  local max_off, max_roll = 0.0, 0.0
+  local lag_sign = 0.0
+  for i = 1, 30 do -- 0.5 s at 1.5 rad/s
+    tt = tt + dt
+    yaw = yaw + 1.5 * dt
+    local okp, vp = world_view(&cam_now)
+    cam_now = game_camera(0, 5, 0, yaw, -0.2, 0.78)
+    local okn, vn = world_view(&cam_now)
+    local toward_right = vn.fx * vp.rx + vn.fy * vp.ry + vn.fz * vp.rz -- > 0: turning to the right on screen
+    ok, pl = policy_world_place(1, tt, false)
+    local sx, sy, sw, sh, sr = shown(pl)
+    max_off, max_roll = math.max(max_off, math.abs(sx - 0.8 * 2560)), math.max(max_roll, math.abs(pl.roll))
+    if i == 20 then lag_sign = (sx - 0.8 * 2560) * toward_right end
+  end
+  assert(max_off > 20 and lag_sign < 0, 'slides back against the turn')
+  assert(max_roll > 0.02, 'banks with the turn')
+  local okf, vf = world_view(&cam_now)
+  local nrm = world_axes(pl.yaw, pl.pitch)
+  assert(nrm.nx * vf.fx + nrm.ny * vf.fy + nrm.nz * vf.fz > -0.9999, 'twisted away from the camera while turning')
+  for i = 1, 240 do -- the camera stops: 4 s
+    tt = tt + dt
+    ok, pl = policy_world_place(1, tt, false)
+  end
+  cx, cy, w, h, roll = shown(pl)
+  assert(near(cx, 0.8 * 2560, 1) and near(cy, 0.25 * 1440, 1) and near(w, 900, 1) and near(roll, 0, 1e-3), 'settles back on the spot')
+
+  -- a wild spin: clamped, no NaN
+  local max_tilt, max_drag = 0.30, 0.05
+  local spun = 0.0
+  for i = 1, 90 do
+    tt = tt + dt
+    yaw = yaw + 20 * dt -- far past max_turn, under a cut
+    cam_now = game_camera(0, 5, 0, yaw, -0.2 + 0.1 * math.sin(i * 0.7), 0.78)
+    ok, pl = policy_world_place(1, tt, false)
+    assert(ok and pl.x == pl.x and pl.yaw == pl.yaw, 'no NaN')
+    assert(math.abs(pl.roll) <= max_tilt + 1e-4, 'bank clamped')
+    spun = math.max(spun, math.abs(pl.roll))
+    local okn, vn = world_view(&cam_now)
+    local a = world_axes(pl.yaw, pl.pitch)
+    local facing = -(a.nx * vn.fx + a.ny * vn.fy + a.nz * vn.fz)
+    assert(facing >= math.cos(math.sqrt(2) * max_tilt) - 1e-3, 'twist clamped')
+    local okc, sx, sy = world_project(&cam_now, pl.x, pl.y, pl.z)
+    assert(okc and math.abs(sx / 2560 - 0.8) <= max_drag + 1e-3 and math.abs(sy / 1440 - 0.25) <= max_drag + 1e-3, 'slide clamped')
+  end
+  assert(spun > max_tilt - 0.01, 'the spin reached the clamp')
+  cam_now = game_camera(0, 5, 0, yaw, -0.2, 0.78)
+  for i = 1, 300 do tt = tt + dt ok, pl = policy_world_place(1, tt, false) end
+
+  -- zoom: the camera backs out along its view and the field of view narrows; no jump
+  ok, pl = policy_world_place(1, tt, false)
+  local okz, vz = world_view(&cam_now)
+  cam_now = game_camera(-vz.fx * 6, 5 - vz.fy * 6, -vz.fz * 6, yaw, -0.2, 0.6)
+  tt = tt + dt
+  ok, pl = policy_world_place(1, tt, false)
+  cx, cy, w, h = shown(pl)
+  assert(near(cx, 0.8 * 2560, 1) and near(cy, 0.25 * 1440, 1) and near(w, 900, 1) and near(h, 520, 1), 'zoom: same spot, same size')
+
+  -- the idle bob stays small
+  assert(lua_ok('CONFIG.world.hud.bob = 0.003'))
+  local lo, hi = 1e9, -1e9
+  for i = 1, 300 do
+    tt = tt + dt
+    ok, pl = policy_world_place(1, tt, false)
+    local sx, sy = shown(pl)
+    lo, hi = math.min(lo, sy), math.max(hi, sy)
+  end
+  assert(hi - lo > 1 and hi - lo < 0.006 * 1440 + 1, 'a gentle bob')
+  assert(lua_ok('CONFIG.world.hud.bob = 0'))
+  print('hud pose OK')
+
+  -- /term pin hud with no spot: docked where the panel shows now, at the size it shows
+  cam_now = game_camera(10, 1.7, 17, 0, 0, 0.78)
+  assert(#policy_world_command(2, 'here') == 0)
+  ok, pl = policy_world_place(2, tt, false)
+  local sx0, sy0, sw0, sh0 = shown(pl)
+  assert(#policy_world_command(2, 'hud') == 0)
+  tt = tt + dt
+  ok, pl = policy_world_place(2, tt, false)
+  local sx1, sy1, sw1, sh1 = shown(pl)
+  assert(ok and pl.hud and near(sx1, sx0, 1) and near(sy1, sy0, 1) and near(sw1, sw0, 1) and near(sh1, sh0, 1), 'docked where and as big as it was')
+  -- a new terminal docked without a size: fits the screen
+  assert(lua_ok('CONFIG.world.anchors[3] = {}'))
+  assert(#policy_world_command(3, 'hud 0.5 0.5') == 0)
+  ok, pl = policy_world_place(3, tt, false)
+  local sx3, sy3, sw3, sh3 = shown(pl)
+  assert(sw3 <= 0.45 * 2560 + 1 and sh3 <= 0.45 * 1440 + 1, 'fits')
+  assert(#policy_world_command(3, 'hud 0.5') > 0, 'X without Y is refused')
+
+  -- the dock hook (drag-to-dock), then pin <-> pet leaves it a pet
+  assert(#policy_world_dock(3, 0.1, 0.9, 0.4) == 0)
+  ok, pl = policy_world_place(3, tt, false)
+  sx3, sy3, sw3 = shown(pl)
+  assert(near(sx3, 256, 1) and near(sy3, 1296, 1) and near(sw3, 1800 * 0.4, 1), 'docked by the hook')
+  assert(not world_lua_walkable(policy.L, 3), 'not walkable')
+  assert(#policy_world_command(3, 'toggle') == 0)
+  assert(lua_ok('assert(CONFIG.world.anchors[3].kind == "pet")'), 'the title button makes it a pet')
+
+  -- dragged out into the world: a pin again
+  assert(#policy_world_dock(4, 0.5, 0.5, 1) > 0, 'unknown panel')
+  local pose: WorldPlacement = { x = 1, y = 2, z = 3, yaw = 0.5, width = 1800, height = 1040, ppm = 640 }
+  assert(#policy_world_drop(1, pose, 0, 0) == 0)
+  ok, pl = policy_world_place(1, tt, false)
+  assert(ok and not pl.hud and near(pl.x, 1, 1e-4), 'dropped in the world: a pin')
+  assert(#policy_world_command(1, 'hud 0.25 0.75 2 0.8') == 0)
+
+  -- persisted in screen fractions: another resolution keeps the spot
+  local entries: vector(LayoutEntry)
+  entries:push(LayoutEntry{ id = 1, agent = 9101, view = 'world', font_scale = 0 })
+  policy_world_save(&entries)
+  entries:destroy()
+  assert(lua_ok([[
+    local s = dofile(GHOSTTY_PLUGIN_DIR .. "/world-state.lua")[9101]
+    assert(s.kind == "hud" and s.sx == 0.25 and s.sy == 0.75 and s.dist == 2 and s.scale == 0.8, "saved")
+    assert(s._hud == nil and s.x == nil and s.lx == nil, "no spring state saved")
+    CONFIG.world.forget(1)
+    assert(CONFIG.world.restore(1, 9101) == "world" and CONFIG.world.anchors[1].kind == "hud", "restored")
+  ]]), 'persistence round-trips')
+  os.remove(root .. '/world-state.lua')
+  cam_now = game_camera(0, 5, 0, 1, 0.1, 0.78)
+  cam_now.width, cam_now.height = 1920, 1080 -- same aspect, another size
+  ok, pl = policy_world_place(1, tt + 10, false)
+  local sx4, sy4, sw4 = shown(pl)
+  assert(near(sx4, 0.25 * 1920, 1) and near(sy4, 0.75 * 1080, 1), 'screen fractions survive a new resolution')
+  print('hud anchor OK')
+end
+
+print('test_worldhud OK')
