@@ -107,6 +107,100 @@ function RainShelter:exposure(): float32
   return sum / (RAIN_SHELTER_N - 1)
 end
 
+-- Motion: what the panel itself is doing in the world, measured from the pose
+-- the core drew each frame and nothing else -- so it holds for every way a
+-- panel moves (pet springs, the lineup, order swaps, dragging, pin and pet
+-- toggles, orbits, followed targets, the presented float, the full-screen
+-- flight, adopted and remote windows). Velocity and acceleration are finite
+-- differences, the acceleration low-passed over RAIN_MOTION_TAU so one noisy
+-- frame is not a jolt and the same move sheds the same at any frame rate.
+-- `calm` is the velocity from before a jolt: what a drop still has when the
+-- glass is jerked from under it. A jump no panel could make (a teleport, a
+-- zone change, /term pin here) or a gap in the frames starts the history over.
+global RAIN_MOTION_TAU: float32 <comptime> = 0.05
+global RAIN_MOTION_CALM: float32 <comptime> = 0.15
+global RAIN_MOTION_GAP: float32 <comptime> = 0.25   -- seconds without a frame: start over
+global RAIN_MOTION_TURN: float32 <comptime> = 1.5   -- radians in one frame: a re-placement, not a spin
+
+global RainMotion = @record{
+  n: integer,                                   -- poses in a row: 1 position, 2 velocity, 3 acceleration
+  x: float32, y: float32, z: float32, yaw: float32, roll: float32, bulge: float32,
+  vx: float32, vy: float32, vz: float32, wyaw: float32, wroll: float32, vbulge: float32,
+  ax: float32, ay: float32, az: float32,        -- filtered acceleration, world, yalms/s^2
+  spin: float32,                                -- filtered: what turning and bending do at the panel's edge, yalms/s^2
+  cvx: float32, cvy: float32, cvz: float32,     -- calm velocity
+  cwyaw: float32, cwroll: float32,
+  resets: integer,                              -- discontinuities seen (tests)
+}
+
+function RainMotion:reset(): void
+  local r = self.resets
+  $self = {}
+  self.resets = r
+end
+
+local function wrap_pi(a: float32): float32
+  while a > math.pi do a = a - 2 * math.pi end
+  while a < -math.pi do a = a + 2 * math.pi end
+  return a
+end
+
+-- Take this frame's pose: the centre, yaw and roll, `bulge` (how far a curved
+-- panel's edges stand in front of its middle, yalms) and `half` (half its
+-- width, yalms). True once there is an acceleration to act on.
+function RainMotion:track(x: float32, y: float32, z: float32, yaw: float32, roll: float32, bulge: float32, half: float32,
+                          dt: float32, jump: float32, max_speed: float32): boolean
+  if dt <= 1e-5 then return self.n >= 3 end
+  local dx, dy, dz = x - self.x, y - self.y, z - self.z
+  local dyaw, droll = wrap_pi(yaw - self.yaw), wrap_pi(roll - self.roll)
+  local dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+  local jumped = self.n > 0 and (dt > RAIN_MOTION_GAP or dist > jump or dist > max_speed * dt or
+    math.abs(dyaw) > RAIN_MOTION_TURN or math.abs(droll) > RAIN_MOTION_TURN)
+  if self.n == 0 or jumped then
+    if jumped then self.resets = self.resets + 1 end
+    self:reset()
+    self.x, self.y, self.z, self.yaw, self.roll, self.bulge, self.n = x, y, z, yaw, roll, bulge, 1
+    return false
+  end
+  local vx, vy, vz = dx / dt, dy / dt, dz / dt
+  local wyaw, wroll, vbulge = dyaw / dt, droll / dt, (bulge - self.bulge) / dt
+  if self.n >= 2 then
+    local k = 1 - math.exp(-dt / RAIN_MOTION_TAU)
+    self.ax = self.ax + ((vx - self.vx) / dt - self.ax) * k
+    self.ay = self.ay + ((vy - self.vy) / dt - self.ay) * k
+    self.az = self.az + ((vz - self.vz) / dt - self.az) * k
+    local spin = (math.abs(wyaw - self.wyaw) + math.abs(wroll - self.wroll)) / dt * half
+      + (wyaw * wyaw + wroll * wroll) * half + math.abs(vbulge - self.vbulge) / dt
+    self.spin = self.spin + (spin - self.spin) * k
+    -- the calm velocity follows the panel's, but hardly at all while it is being
+    -- jerked: the water keeps what it had before the jolt
+    local lin = math.sqrt(self.ax * self.ax + self.ay * self.ay + self.az * self.az)
+    local c = 1 - math.exp(-dt / (RAIN_MOTION_CALM * (1 + lin / 10)))
+    self.cvx, self.cvy, self.cvz = self.cvx + (vx - self.cvx) * c, self.cvy + (vy - self.cvy) * c, self.cvz + (vz - self.cvz) * c
+    local ca = 1 - math.exp(-dt / RAIN_MOTION_CALM)
+    self.cwyaw, self.cwroll = self.cwyaw + (wyaw - self.cwyaw) * ca, self.cwroll + (wroll - self.cwroll) * ca
+  else
+    self.cvx, self.cvy, self.cvz, self.cwyaw, self.cwroll = vx, vy, vz, wyaw, wroll
+  end
+  self.x, self.y, self.z, self.yaw, self.roll, self.bulge = x, y, z, yaw, roll, bulge
+  self.vx, self.vy, self.vz, self.wyaw, self.wroll, self.vbulge = vx, vy, vz, wyaw, wroll, vbulge
+  if self.n < 3 then self.n = self.n + 1 end
+  return self.n >= 3
+end
+
+-- How hard the glass is being jerked, yalms/s^2.
+function RainMotion:jolt(): float32
+  return math.sqrt(self.ax * self.ax + self.ay * self.ay + self.az * self.az) + self.spin
+end
+
+-- The panel's unit axes in the world and its scale, for RainPanel:shake.
+global RainAxes = @record{
+  rx: float32, ry: float32, rz: float32, -- right
+  ux: float32, uy: float32, uz: float32, -- up
+  fx: float32, fy: float32, fz: float32, -- front normal
+  ypp: float32,                          -- yalms per pixel
+}
+
 -- A drop leaving the glass, in panel pixels: where, and which way (unit).
 -- Run-off moves `speed` panel pixels per second; flung drops leave at the
 -- configured fling speed.
@@ -115,6 +209,8 @@ global RainEmit = @record{
   du: float32, dv: float32,
   speed: float32,
   fling: boolean,
+  world: boolean,          -- shaken off (RainPanel:shake): it leaves with the world velocity below, yalms/s
+  wx: float32, wy: float32, wz: float32,
 }
 
 -- What lua/rain.lua decides for one frame (CONFIG.rain.frame()), with the
@@ -135,6 +231,15 @@ global RainParams = @record{
   fling_speed: float32,    -- yalms/s off the blade tip
   max_particles: integer,  -- world droplets at once, up to RAIN_MAX_FALL
   shelter: boolean,        -- rain only where the sky reaches the panel (RainShelter)
+  -- shaking the water off (RainMotion, RainPanel:shake)
+  shake: boolean,
+  shake_slide: float32,       -- yalms/s^2 of panel acceleration from which drops slide on the glass
+  shake_accel: float32,       -- ... and from which they come off
+  shake_per: float32,         -- share of the drops that comes off per yalm/s of velocity change past that
+  shake_slide_speed: float32, -- pixels per second a drop slides at the come-off threshold
+  shake_jump: float32,        -- yalms in one frame that is a teleport, not a shake
+  shake_max_speed: float32,   -- yalms/s no panel really moves at: also a teleport
+  shake_max: integer,         -- drops shaken off one panel in one step, up to RAIN_MAX_EMIT
 }
 
 global RainDrop = @record{
@@ -164,6 +269,11 @@ global RainPanel = @record{
   vis: float32,            -- frame visibility, for the front pass
   turned: boolean,         -- the current sweep has passed its far end
   carried: integer,        -- drops the blade has collected since it last flung
+  motion: RainMotion,      -- what the panel is doing in the world (core/app/rain.nelua feeds it the drawn pose)
+  ground: float32,         -- the ground the panel's last droplet found (core/app/rain.nelua)
+  ground_known: boolean,
+  shake_acc: float32,      -- drops owed to the shaking, the fraction carried over
+  shaken: integer,         -- drops shaken off so far (tests)
   shelter: RainShelter,    -- where the sky reaches this panel (core/app/rain.nelua keeps it current)
   nemit: integer,
   emit: [RAIN_MAX_EMIT]RainEmit, -- drops that left the glass this step (core/app/rain.nelua takes them)
@@ -431,6 +541,87 @@ function RainPanel:step(prm: *RainParams, w: float32, h: float32, dt: float32): 
     end
     self:wipe(prev, self.angle, w, h)
   end
+end
+
+-- The velocity (yalms/s, world) a drop at panel pixel (px, py) still has when
+-- the glass is jerked away: the panel's calm velocity there -- its centre's,
+-- plus what turning about the vertical (yaw) and about the normal (roll) give
+-- a point that far out -- so a hard stop sheds forward, a sudden start leaves
+-- the water behind, and a spin throws it off along the tangent.
+function RainPanel:shed_velocity(ax: *RainAxes, w: float32, h: float32, px: float32, py: float32): (float32, float32, float32)
+  local m = &self.motion
+  local s, t = (px - w * 0.5) * ax.ypp, (h * 0.5 - py) * ax.ypp
+  -- yaw turns the right axis toward -front; roll turns right toward up
+  local vx = m.cvx - m.cwyaw * s * ax.fx + m.cwroll * (s * ax.ux - t * ax.rx)
+  local vy = m.cvy - m.cwyaw * s * ax.fy + m.cwroll * (s * ax.uy - t * ax.ry)
+  local vz = m.cvz - m.cwyaw * s * ax.fz + m.cwroll * (s * ax.uz - t * ax.rz)
+  return vx, vy, vz
+end
+
+function RainPanel:shake_off(i: integer, ax: *RainAxes, w: float32, h: float32): void
+  local d = &self.drops[i]
+  local vx, vy, vz = self:shed_velocity(ax, w, h, d.x, d.y)
+  -- a little scatter, and a touch off the glass so it clears the panel
+  local j = 0.25_f32
+  vx = vx + (self:rand() - 0.5) * j + ax.fx * 0.15
+  vy = vy + (self:rand() - 0.5) * j + ax.fy * 0.15
+  vz = vz + (self:rand() - 0.5) * j + ax.fz * 0.15
+  self:push_emit({ u = math.clamp(d.x, 0, w), v = math.clamp(d.y, 0, h), world = true, wx = vx, wy = vy, wz = vz })
+  d.kind = 0
+  self.live = self.live - 1
+  self.shaken = self.shaken + 1
+end
+
+-- The panel's own motion on the water, after :step. Gentle acceleration (from
+-- shake_slide) makes the drops slide across the glass against it, streaking;
+-- past shake_accel they come off, in proportion to how far past and for how
+-- long (so per unit of velocity change, whatever the frame rate), at most
+-- shake_max a step. Turning and bending count through the motion's `spin`,
+-- which pushes drops outward from the middle.
+function RainPanel:shake(prm: *RainParams, ax: *RainAxes, w: float32, h: float32, dt: float32): void
+  local m = &self.motion
+  if not prm.shake or m.n < 3 or self.live <= 0 then self.shake_acc = 0 return end
+  dt = math.clamp(dt, 0, 0.1)
+  local jolt = m:jolt()
+  local slide_from = math.max(prm.shake_slide, 0.1)
+  local off_from = math.max(prm.shake_accel, slide_from + 0.1)
+  if jolt > slide_from then
+    -- slide: against the acceleration within the glass, outward for the spin
+    local ar = m.ax * ax.rx + m.ay * ax.ry + m.az * ax.rz
+    local au = m.ax * ax.ux + m.ay * ax.uy + m.az * ax.uz
+    local push = prm.shake_slide_speed * math.min((jolt - slide_from) / (off_from - slide_from), 2.5) * dt
+    local lin_r, lin_u, out = -ar / jolt * push, -au / jolt * push, m.spin / jolt * push
+    for i = 0, < RAIN_MAX_DROPS do
+      local d = &self.drops[i]
+      if d.kind == 1 then
+        local ox, oy = d.x - w * 0.5, d.y - h * 0.5
+        local ol = math.max(math.sqrt(ox * ox + oy * oy), 1)
+        local nx, ny = d.x + lin_r + ox / ol * out, d.y - lin_u + oy / ol * out
+        if not d.moving and ny - d.y > 30 * dt then d.moving, d.trail_y = true, d.y end -- it streaks as it goes
+        d.x, d.y = nx, ny
+        if nx < 0 or nx > w or ny < 0 or ny > h then self:shake_off(i, ax, w, h) end
+      end
+    end
+  end
+  -- come off: the further past the threshold and the longer, the more of them.
+  -- What a jolt owes is paid out at shake_max a step, after it has passed if
+  -- need be, so a low frame rate sheds as much as a high one.
+  if jolt > off_from then
+    self.shake_acc = math.min(self.shake_acc + prm.shake_per * (jolt - off_from) * dt * math.max(self.live, 8), RAIN_MAX_DROPS)
+  end
+  local n = math.min(math.min((@integer)(math.floor(self.shake_acc)), math.clamp(prm.shake_max, 0, RAIN_MAX_EMIT)), self.live)
+  self.shake_acc = self.shake_acc - n
+  local start = n > 0 and (@integer)(self:rand() * RAIN_MAX_DROPS) % RAIN_MAX_DROPS or 0
+  local k = 0
+  while n > 0 and k < RAIN_MAX_DROPS do
+    local i = (start + k) % RAIN_MAX_DROPS
+    if self.drops[i].kind == 1 then
+      self:shake_off(i, ax, w, h)
+      n = n - 1
+    end
+    k = k + 1
+  end
+  if self.live <= 0 then self.shake_acc = 0 end
 end
 
 -- Drops (not smears) on the panel.

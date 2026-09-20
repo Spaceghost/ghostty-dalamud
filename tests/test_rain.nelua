@@ -443,6 +443,7 @@ local function fake_indoor(): cint return indoors end
 local function run_lua(code: cstring): void
   assert(luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, 'lua')
 end
+local before_kb: float64 = 0
 local function lua_kb(): float64
   assert(luaL_loadstring(policy.L, "return collectgarbage('count')") == LUA_OK and lua_pcall(policy.L, 0, 1, 0) == LUA_OK)
   local kb = lua_tonumberx(policy.L, -1, nilptr)
@@ -596,5 +597,226 @@ do
   host.api.raycast, host.api.get_object, host.api.indoor = nilptr, nilptr, nilptr
   rain_reset()
   print('shelter d OK')
+end
+-- Shaking the water off ----------------------------------------------------------------
+-- Every way a panel moves reaches the rain as the same thing: the pose the
+-- core draws, frame after frame. One synthetic pose track per movement mode,
+-- through RainMotion and RainPanel:shake as core/app/rain.nelua runs them.
+-- (Pets behind a walking, running, sprinting, mounted and turning character
+-- are run on the real lua/world.lua springs in tests/test_worldpanel; the
+-- spring tracks here are a bare spring behind a moving point.)
+local Mode = @enum{
+  Walk = 0, RunStop, Mount, TurnBack, SideSwap, Lineup, LineupSmall, OrderSwap, DragGentle, DragFirm, DragFling,
+  Resize, PinToggle, PinHere, OrbitSlow, OrbitFast, FollowTarget, Present, Flight, HudUndock, Appear,
+  Teleport, Spin, CurveSnap, HardStop, SuddenStart, OrderSwapNear,
+}
+local Pose = @record{ x: float32, y: float32, z: float32, yaw: float32, roll: float32, curve: float32, w: float32, hud: boolean, unseen: boolean }
+local Follow = @record{ x: float32, v: float32, on: boolean }
+-- the pets' spring (lua/world.lua: stiffness 5, damping 0.8), or any other stiffness
+function Follow:to(target: float32, dt: float32, k: float32, zeta: float32): float32
+  if not self.on then self.x, self.v, self.on = target, 0, true end
+  local w = math.sqrt(k) * 2
+  local steps = math.max(1, (@integer)(math.ceil(dt * 120)))
+  local hh = dt / steps
+  for i = 1, steps do
+    self.v = self.v + (w * w * (target - self.x) - 2 * zeta * w * self.v) * hh
+    self.x = self.x + self.v * hh
+  end
+  return self.x
+end
+local function smooth(u: float32): float32
+  u = math.clamp(u, 0, 1)
+  return u * u * (3 - 2 * u)
+end
+local function ramp(t: float32, from: float32, to: float32, speed: float32): float32 -- distance run between two times
+  return speed * (math.clamp(t, from, to) - from)
+end
+local function pose_at(mode: Mode, t: float32, dt: float32, fa: *Follow, fb: *Follow): Pose
+  local p: Pose = { y = 2, w = 800 }
+  switch mode do
+  case Mode.Walk then p.z = fa:to(ramp(t, 0.5, 2.5, 2.4), dt, 5, 0.8)
+  case Mode.RunStop then p.z = fa:to(ramp(t, 0.5, 2.5, 6), dt, 5, 0.8)
+  case Mode.Mount then p.z = fa:to(ramp(t, 0.5, 2.5, 25), dt, 5, 0.8)
+  case Mode.TurnBack then p.z = fa:to(ramp(t, 0.5, 2, 12) - ramp(t, 2, 3.5, 12), dt, 5, 0.8)
+  case Mode.SideSwap then -- round the character to its other side
+    local a = math.pi * smooth((t - 1) / 0.7)
+    p.x, p.z, p.yaw = 1.5 * math.cos(a), 1.5 * math.sin(a), a
+  case Mode.Lineup then p.x = fa:to((t > 1 and t < 2.5) and 2 or 0, dt, 8.2, 1) -- eased over about 0.35 s, and back
+  case Mode.LineupSmall then p.x = fa:to((t > 1 and t < 2.5) and 0.15 or 0, dt, 8.2, 1)
+  case Mode.OrderSwap then p.x = fa:to(t > 1 and 3 or 0, dt, 5, 0.8) -- the outer pets trade places
+  case Mode.OrderSwapNear then p.x = fa:to(t > 1 and 0.8 or 0, dt, 5, 0.8) -- neighbours do
+  case Mode.DragGentle then p.x = 0.5 * math.sin(2 * math.pi * 0.25 * t)
+  case Mode.DragFirm then p.x = 0.5 * math.sin(2 * math.pi * 1 * t)
+  case Mode.DragFling then p.x = 0.5 * math.sin(2 * math.pi * 4 * t)
+  case Mode.Resize then p.w = 800 + 400 * smooth((t - 1) / 0.3)
+  case Mode.PinToggle then p.x, p.y = fa:to(t > 1 and 2.5 or 0, dt, 5, 0.8), 2 + fb:to(t > 1 and 0.5 or 0, dt, 5, 0.8)
+  case Mode.PinHere then p.x = t > 1 and 2 or 0 -- put somewhere else in one frame
+  case Mode.OrbitSlow then
+    local a = 2 * math.pi * t / 8
+    p.x, p.z, p.yaw = 2 * math.sin(a), 2 * math.cos(a), a
+  case Mode.OrbitFast then
+    local a = 2 * math.pi * t / 1.2
+    p.x, p.z, p.yaw = 2 * math.sin(a), 2 * math.cos(a), a
+  case Mode.FollowTarget then p.x = fa:to(t > 1 and 8 or 0, dt, 5, 0.8) -- its target blinks 8 yalms away
+  case Mode.Present then p.z = fa:to((t > 1 and t < 2.5) and 3 or 0, dt, 8.2, 1) -- floats toward the camera
+  case Mode.Flight then p.z, p.y = 4 * (smooth((t - 1) / 0.4) - smooth((t - 2.5) / 0.4)), 2 + smooth((t - 1) / 0.4) - smooth((t - 2.5) / 0.4)
+  case Mode.HudUndock then
+    p.hud = t < 1
+    if p.hud then p.x, p.z = 50 + 9 * math.sin(t * 40), 9 * math.cos(t * 33) end -- rides the camera
+  case Mode.Appear then
+    p.unseen = t < 1 -- an adopted or remote window not in the world yet
+    p.x, p.z = 12, -7
+  case Mode.Teleport then
+    local off: float32 = t > 0.3 and 100 or 0
+    p.x, p.z = off, off + fa:to(t > 1.5 and 4 or 0, dt, 8.2, 1) -- ... and is then moved roughly
+  case Mode.Spin then p.yaw = 8 * math.max(t - 1, 0)
+  case Mode.CurveSnap then p.curve = t > 1 and 1.5 * smooth((t - 1) / 0.1) + 40 * (1 - smooth((t - 1) / 0.1)) or 40
+  case Mode.HardStop then p.x = ramp(t, 0, 2, 6)
+  case Mode.SuddenStart then p.x = ramp(t, 2, 4, 6)
+  end
+  return p
+end
+local Shed = @record{
+  n: integer, resets: integer, max_step: integer, left: integer, slid: boolean,
+  vx: float32, vy: float32, vz: float32, -- mean world velocity of what came off after `after`
+  tang: float32,                         -- ... and its mean speed along the spin's tangent
+}
+local function shake_params(): RainParams
+  local prm = params(1, RainWiper.None)
+  prm.shake, prm.shake_slide, prm.shake_accel, prm.shake_per = true, 10, 30, 0.15 -- lua/rain.lua's
+  prm.shake_slide_speed, prm.shake_jump, prm.shake_max_speed, prm.shake_max = 260, 3, 40, 12
+  return prm
+end
+local function shake_track(mode: Mode, fps: float32, after: float32): Shed
+  local prm = shake_params()
+  local p: RainPanel
+  p:init(5, 77)
+  for i = 1, 60 * 12 do p:step(&prm, W, H, 1 / 60) end -- wet glass
+  assert(p.live > 50, 'wet to begin with')
+  local out: Shed
+  local fa: Follow, fb: Follow
+  local dt: float32 = 1 / fps
+  local counted = 0
+  for i = 0, (@integer)(4 * fps) do
+    local po = pose_at(mode, i * dt, dt, &fa, &fb)
+    p.nemit = 0 -- (no p:step here: nothing lands, dries or trickles, so every change is the shaking's)
+    if po.hud or po.unseen then p.motion:reset() continue end
+    local sy, cy, sr, cr = math.sin(po.yaw), math.cos(po.yaw), math.sin(po.roll), math.cos(po.roll)
+    local ax: RainAxes = { rx = cr * cy, ry = sr, rz = -cr * sy, ux = -sr * cy, uy = cr, uz = sr * sy, fx = sy, fy = 0, fz = cy, ypp = 1 / 300 }
+    local half = po.w * 0.5 / 300
+    local bulge: float32 = po.curve > 0.01 and po.curve * (1 - math.cos(math.min(half / po.curve, 1.5))) or 0
+    if p.motion:track(po.x, po.y, po.z, po.yaw, po.roll, bulge, half, dt, prm.shake_jump, prm.shake_max_speed) then
+      local sum: float32 = 0
+      for k = 0, < RAIN_MAX_DROPS do if p.drops[k].kind == 1 then sum = sum + p.drops[k].x + p.drops[k].y end end
+      local live = p.live
+      p:shake(&prm, &ax, po.w, H, dt)
+      if p.live == live then
+        local now_sum: float32 = 0
+        for k = 0, < RAIN_MAX_DROPS do if p.drops[k].kind == 1 then now_sum = now_sum + p.drops[k].x + p.drops[k].y end end
+        if math.abs(now_sum - sum) > 1 then out.slid = true end
+      end
+    end
+    assert(p.nemit <= RAIN_MAX_EMIT, 'never more leaves in a step than the buffer holds')
+    out.max_step = math.max(out.max_step, p.nemit)
+    for k = 0, < p.nemit do
+      local e = &p.emit[k]
+      if e.world and i * dt >= after then
+        counted = counted + 1
+        out.vx, out.vy, out.vz = out.vx + e.wx, out.vy + e.wy, out.vz + e.wz
+        local side: float32 = e.u < po.w * 0.5 and -1 or 1
+        out.tang = out.tang - (e.wx * ax.fx + e.wz * ax.fz) * side
+      end
+    end
+  end
+  if counted > 0 then out.vx, out.vy, out.vz, out.tang = out.vx / counted, out.vy / counted, out.vz / counted, out.tang / counted end
+  out.n, out.resets, out.left = p.shaken, p.motion.resets, p.live
+  return out
+end
+do
+  local names: [27]string = { 'walk', 'run-stop', 'mount', 'turn back', 'side swap', 'lineup', 'small lineup', 'order swap',
+    'gentle drag', 'firm drag', 'fling', 'resize', 'pin toggle', 'pin here', 'slow orbit', 'fast orbit', 'follow target',
+    'present', 'flight', 'HUD undock', 'appear', 'teleport', 'spin', 'curve snap', 'hard stop', 'sudden start', 'near order swap' }
+  -- whether water comes off: no for the gentle ways and the discontinuities
+  local sheds: [27]boolean = { false, false, true, true, true, true, false, true,
+    false, false, true, false, true, false, false, true, true,
+    true, true, false, false, true, true, true, true, true, false }
+  local r: [27]Shed
+  for m = 0, < 27 do
+    r[m] = shake_track((@Mode)(m), 60, 0)
+    print(names[m], 'shed', r[m].n, 'left', r[m].left, 'resets', r[m].resets)
+    -- a firm drag only slides them: the few that come off are the ones pushed past an edge
+    if m == Mode.DragFirm then assert(r[m].n < 15, names[m])
+    elseif sheds[m] then assert(r[m].n > 0, names[m]) else assert(r[m].n == 0, names[m]) end
+    assert(r[m].max_step <= RAIN_MAX_EMIT, 'capped per step')
+  end
+  assert(not r[Mode.DragGentle].slid and not r[Mode.OrbitSlow].slid and r[Mode.DragFirm].slid, 'in between, the drops slide instead')
+  assert(r[Mode.Lineup].n < r[Mode.FollowTarget].n and r[Mode.PinToggle].left > 0, 'rougher sheds more; a short rough move leaves some')
+  assert(r[Mode.DragFling].left < 10, 'a fling strips the glass')
+  assert(r[Mode.PinHere].resets == 1 and r[Mode.Teleport].resets == 1 and r[Mode.FollowTarget].resets == 0, 'a jump resets the history, a spring does not')
+  assert(r[Mode.Teleport].n > 0, 'and after a teleport a rough move sheds again')
+  assert(r[Mode.HudUndock].resets == 0 and r[Mode.Appear].resets == 0, 'docked or unseen: no history at all')
+  -- directions: a hard stop sheds forward, a sudden start leaves the water
+  -- standing (it falls), a spin sheds along the tangent
+  local stop, start, spin = shake_track(Mode.HardStop, 60, 1.9), shake_track(Mode.SuddenStart, 60, 1.9), shake_track(Mode.Spin, 60, 1)
+  print('hard stop vx', stop.vx, 'sudden start vx', start.vx, 'spin tangent', spin.tang)
+  assert(stop.vx > 2 and math.abs(stop.vz) < 0.5, 'a hard stop throws the water forward')
+  assert(math.abs(start.vx) < 1.5, 'a sudden start leaves it behind')
+  assert(spin.tang > 0.5, 'a spin throws it off along the tangent')
+  -- the same move sheds about the same at any frame rate
+  local a30, a144 = shake_track(Mode.Lineup, 30, 0), shake_track(Mode.Lineup, 144, 0)
+  print('lineup shed at 30, 60, 144 fps', a30.n, r[Mode.Lineup].n, a144.n)
+  local base = r[Mode.Lineup].n
+  assert(math.abs(a30.n - base) <= math.max(base * 0.4, 4) and math.abs(a144.n - base) <= math.max(base * 0.4, 4), 'frame-rate independent')
+  print('shake tracks OK')
+end
+do
+  -- through the drawing pass: a wet panel flung about sheds world droplets that
+  -- land on the first surface below, within the particle cap; a teleport sheds none
+  run_lua([[
+    ghostty.env = function() return 43200, 0, 8 end
+    CONFIG.rain.mode = 'auto'
+  ]])
+  rain_reset()
+  host.api.raycast = fake_raycast
+  local o = vec2(100, 50)
+  local now: float64 = 5000
+  local pl: WorldPlacement = { x = 25, y = 5, z = 0, width = 800, height = 500, ppm = 300, opacity = 0.9, tint_r = 1, tint_g = 1, tint_b = 1 }
+  run_lua("CONFIG.rain.wiper_style = 'none' CONFIG.rain.max_particles = 40")
+  for i = 1, 60 * 8 do rain_panel_back(nilptr, o, &pl, 31, now, 1) now = now + 1 / 60 end
+  local p = rain_panel_find(31)
+  rain_pool:clear()
+  local wet = p.live
+  pl.x = 125 -- a teleport
+  for i = 1, 30 do rain_panel_back(nilptr, o, &pl, 31, now, 1) now = now + 1 / 60 end
+  assert(p.shaken == 0 and p.motion.resets == 1, 'a teleport sheds nothing')
+  before_kb = lua_kb()
+  run_lua("collectgarbage('collect') collectgarbage('stop')")
+  before_kb = lua_kb()
+  for i = 1, 120 do
+    pl.x = 125 + 0.5 * math.sin(2 * math.pi * 4 * i / 60)
+    rain_panel_back(nilptr, o, &pl, 31, now, 1)
+    assert(rain_pool.live <= 40, 'the particle cap holds')
+    now = now + 1 / 60
+  end
+  local grew = lua_kb() - before_kb
+  run_lua("collectgarbage('restart')")
+  assert(grew < 8, 'shaking makes Lua garbage')
+  assert(p.shaken > wet / 2 and rain_pool.live > 0, 'flung about: the water comes off into the world')
+  for i = 0, < RAIN_MAX_FALL do
+    if rain_pool.p[i].live then assert(rain_pool.p[i].ground == 3, 'and lands on the first floor below') end
+  end
+  run_lua("CONFIG.rain.shake = false")
+  local shaken = p.shaken
+  for i = 1, 60 * 4 do rain_panel_back(nilptr, o, &pl, 31, now, 1) now = now + 1 / 60 end -- wet again, standing still
+  for i = 1, 60 do
+    pl.x = 125 + 0.5 * math.sin(2 * math.pi * 4 * i / 60)
+    rain_panel_back(nilptr, o, &pl, 31, now, 1)
+    now = now + 1 / 60
+  end
+  assert(p.shaken == shaken, 'switched off: nothing is shaken off')
+  run_lua("CONFIG.rain.shake = true CONFIG.rain.wiper_style = 'back' CONFIG.rain.max_particles = 256")
+  host.api.raycast = nilptr
+  rain_reset()
+  print('shake drawing OK')
 end
 print('OK')
