@@ -11,11 +11,22 @@ local function check(res: cint, what: string)
   end
 end
 
+-- -P nogc: string.format allocates, so a printed line is freed after it is printed.
+local function printf(fmt: string, ...: varargs)
+  local line: string = string.format(fmt, ...)
+  print(line)
+  line:destroy()
+end
+
 -- Verify the sized-struct ABI sizes against the manifest shipped by the library.
 local manifest: string = ghostty_type_json()
 local function manifest_size(name: string): integer
-  local pos = manifest:find('"' .. name .. '"', 1, true)
-  assert(pos > 0, "type missing from manifest: " .. name)
+  -- -P nogc: every concat allocates, and chaining two of them strands the one in
+  -- the middle, so the needle is built in one step and freed before returning.
+  local needle: string = string.format('"%s"', name)
+  local pos = manifest:find(needle, 1, true)
+  needle:destroy()
+  assert(pos > 0, 'type missing from manifest')
   local spos = manifest:find('"size":', pos, true)
   assert(spos > 0)
   local i = spos + 7
@@ -39,7 +50,11 @@ check(ghostty_terminal_resize(term, 20, 5, 8, 16), 'terminal_resize')
 
 local replies: string = ''
 local function write_pty(terminal: GhosttyTerminal, userdata: pointer, data: *[0]uint8, len: usize): void
-  replies = replies .. string{data=(@*[0]byte)(data), size=len}:copy()
+  local chunk: string = string{data=(@*[0]byte)(data), size=len}:copy()
+  local grown: string = replies .. chunk
+  chunk:destroy()
+  replies:destroy()
+  replies = grown
 end
 check(ghostty_terminal_set(term, GHOSTTY_TERMINAL_OPT_WRITE_PTY, (@pointer)(write_pty)), 'set write_pty')
 
@@ -52,10 +67,10 @@ check(ghostty_render_state_update(state, term), 'render_state_update')
 
 local colors: GhosttyRenderStateColors = { size = #GhosttyRenderStateColors }
 check(ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors), 'get colors')
-print(string.format('default fg=%d,%d,%d bg=%d,%d,%d palette[1]=%d,%d,%d',
+printf('default fg=%d,%d,%d bg=%d,%d,%d palette[1]=%d,%d,%d',
   colors.foreground.r, colors.foreground.g, colors.foreground.b,
   colors.background.r, colors.background.g, colors.background.b,
-  colors.palette[1].r, colors.palette[1].g, colors.palette[1].b))
+  colors.palette[1].r, colors.palette[1].g, colors.palette[1].b)
 
 local iter: GhosttyRenderStateRowIterator
 check(ghostty_render_state_row_iterator_new(nilptr, &iter), 'row_iterator_new')
@@ -73,15 +88,21 @@ while ghostty_render_state_row_iterator_next(iter) do
     local gb: GhosttyBuffer = { ptr = &buf, cap = 16, len = 0 }
     check(ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &gb), 'graphemes utf8')
     if gb.len == 0 then
-      line = line .. '.'
+      local grown: string = line .. '.'
+      line:destroy()
+      line = grown
     else
-      line = line .. string{data=(@*[0]byte)(&buf), size=gb.len}:copy()
+      local cell: string = string{data=(@*[0]byte)(&buf), size=gb.len}:copy()
+      local grown: string = line .. cell
+      cell:destroy()
+      line:destroy()
+      line = grown
       local style: GhosttyStyle = { size = #GhosttyStyle }
       check(ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_STYLE, &style), 'style')
       local fg: GhosttyColorRgb
       local has_fg = ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_FG_COLOR, &fg) == GHOSTTY_SUCCESS
       if y == 1 and has_fg then
-        print(string.format('  fg=%d,%d,%d bold=%s', fg.r, fg.g, fg.b, style.bold))
+        printf('  fg=%d,%d,%d bold=%s', fg.r, fg.g, fg.b, style.bold)
       elseif y == 1 and style.bold then
         print('  bold cell (default fg)')
       end
@@ -90,16 +111,20 @@ while ghostty_render_state_row_iterator_next(iter) do
   rows[y] = line
   y = y + 1
 end
-for i = 0, y - 1 do print(string.format('row %d: [%s]', i, rows[i])) end
+for i = 0, y - 1 do printf('row %d: [%s]', i, rows[i]) end
 assert(rows[0]:subview(1, 2) == 'Hi', 'row 0 text')
 assert(rows[1]:subview(1, 3) == 'red', 'row 1 text')
 
 local cursor: GhosttyRenderStateCursor = { size = #GhosttyRenderStateCursor }
 check(ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cursor), 'get cursor')
-print(string.format('cursor at %d,%d visible=%s', cursor.viewport_x, cursor.viewport_y, cursor.visible))
+printf('cursor at %d,%d visible=%s', cursor.viewport_x, cursor.viewport_y, cursor.visible)
 assert(cursor.viewport_y == 1 and cursor.viewport_x == 8)
-print('pty replies (DSR response):', replies:gsub('\27', 'ESC'))
+local shown: string = replies:gsub('\27', 'ESC')
+print('pty replies (DSR response):', shown)
+shown:destroy()
 assert(replies == "\27[2;9R", "expected cursor position report")
+replies:destroy()
+for i = 0, y - 1 do rows[i]:destroy() end
 
 -- Key encoding: Enter and ctrl+c.
 local enc: GhosttyKeyEncoder
