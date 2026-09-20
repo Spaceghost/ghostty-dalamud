@@ -1,0 +1,105 @@
+# On a v* tag: build the plugin on a GitHub-hosted runner exactly as CI does, package it,
+# and publish it as a GitHub Release whose asset URLs the plugin repository listing at
+# https://spacegho.st/mods/ffxiv/plugins.json points at.
+#
+#   v0.2.0          a stable release: .../releases/latest/download/latest.zip follows it
+#   v0.2.0-test.1   a test build: a prerelease under its own tag, and copied onto the
+#                   floating `testing` release, so .../releases/download/testing/latest.zip
+#                   is always the newest test build. Only players who asked Dalamud for
+#                   testing builds see it.
+#
+# The build steps are the ones in ci.yml; keep the two in step.
+name: Release
+on:
+  push:
+    tags: ['v*']
+permissions: {}
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: actions/setup-dotnet@67a3573c9a986a3f9c594539f4ab511d57bb3ce9
+        with:
+          dotnet-version: '10.0.x'
+      - name: Test native-cache file isolation without loading the game
+        run: dotnet run --project tests/cache/CacheTests.csproj -c Release
+      - name: Install pinned Zig from the official distribution
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, shutil, tarfile, urllib.request
+          root = pathlib.Path(os.environ['RUNNER_TEMP']) / 'ghostty-zig'
+          root.mkdir(parents=True, exist_ok=True)
+          version = next(line.split('=', 1)[1].strip() for line in pathlib.Path('toolchain.env').read_text().splitlines() if line.startswith('ZIG_VERSION='))
+          with urllib.request.urlopen('https://ziglang.org/download/index.json', timeout=60) as response:
+              release = json.load(response)[version]['x86_64-linux']
+          assert release['tarball'].startswith('https://ziglang.org/'), 'unexpected toolchain origin'
+          archive = root / 'zig.tar.xz'
+          with urllib.request.urlopen(release['tarball'], timeout=120) as response, archive.open('wb') as output:
+              shutil.copyfileobj(response, output)
+          with archive.open('rb') as stream:
+              assert hashlib.file_digest(stream, 'sha256').hexdigest() == release['shasum'], 'toolchain checksum mismatch'
+          with tarfile.open(archive) as tar:
+              tar.extractall(root, filter='data')
+          binaries = list(root.glob('*/zig'))
+          assert len(binaries) == 1, 'unexpected toolchain layout'
+          with open(os.environ['GITHUB_PATH'], 'a') as output:
+              output.write(str(binaries[0].parent) + '\n')
+          PY
+      - run: tools/fetch-vendor.sh
+      - run: tools/build.sh
+      - name: Check the manifest names this tag's version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          version = json.load(open('build/dist/GhosttyDalamud/GhosttyDalamud.json'))['AssemblyVersion']
+          want = 'v' + version.removesuffix('.0')
+          tag = os.environ['TAG']
+          assert tag == want or tag.startswith(want + '-'), f'tag {tag} does not name AssemblyVersion {version}'
+          PY
+      - name: Package
+        env:
+          TESTING: ${{ contains(github.ref_name, '-') && '1' || '0' }}
+        run: tools/package.sh
+      - name: Publish the release for this tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          pre=()
+          [[ "$TAG" == *-* ]] && pre=(--prerelease)
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" build/release/* --clobber
+          else
+            gh release create "$TAG" build/release/* --verify-tag --title "Ghostty $TAG" --generate-notes "${pre[@]}"
+          fi
+      - name: Move the testing channel onto this build
+        if: contains(github.ref_name, '-')
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          notes="Rolling testing channel: the newest test build (currently $TAG)."
+          if gh release view testing >/dev/null 2>&1; then
+            gh api -X PATCH "repos/$GH_REPO/git/refs/tags/testing" -f sha="$SHA" -F force=true
+            gh release edit testing --prerelease --notes "$notes"
+            gh release upload testing build/release/* --clobber
+          else
+            gh release create testing build/release/* --target "$SHA" --prerelease --title "Testing channel" --notes "$notes"
+          fi

@@ -74,6 +74,23 @@ manifest, native DLLs and `lua/` directory together. The optional widget and
 host agent are separate outputs in `build/dist/`. Game, Dalamud and Umbra
 reference assemblies must not be copied into the plugin package.
 
+## Install from the plugin repository
+
+Ghostty is listed in a third-party Dalamud repository, next to the author's other
+FFXIV mods. In game: `/xlsettings` → **Experimental** → **Custom Plugin
+Repositories** → paste `https://spacegho.st/mods/ffxiv/plugins.json` → **+** →
+**Save and Close**; then `/xlplugins` → **All Plugins** → **Ghostty** → **Install**.
+
+While Ghostty only has test builds it is shown only to players who asked for them:
+`/xlsettings` → **Experimental** → **Get plugin testing builds**. Dalamud will say
+nobody but the author reviewed a third-party repository, which is true. Releases are
+built on GitHub Actions from a tag (`.github/workflows/release.yml`): `v0.2.0` is a
+stable release, `v0.2.0-test.1` moves the floating `testing` release, and
+`tools/package.sh` writes the `latest.zip` and `pluginmaster.json` either one carries.
+
+Building it yourself, below, needs none of this and stays the supported path for
+anyone who wants to read the code first.
+
 ## Install for development
 
 For Wine/XIVLauncher.Core, start the agent on the same POSIX host:
