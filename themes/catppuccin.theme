@@ -1,0 +1,51 @@
+# Catppuccin Mocha (the catppuccin/ghostty port, unchanged), plus the
+# Ghostty-FFXIV extension in "# ffxiv:" comments: the glass UI in the
+# same flavour (https://catppuccin.com/palette).
+
+palette = 0=#45475a
+palette = 1=#f38ba8
+palette = 2=#a6e3a1
+palette = 3=#f9e2af
+palette = 4=#89b4fa
+palette = 5=#f5c2e7
+palette = 6=#94e2d5
+palette = 7=#a6adc8
+palette = 8=#585b70
+palette = 9=#f38ba8
+palette = 10=#a6e3a1
+palette = 11=#f9e2af
+palette = 12=#89b4fa
+palette = 13=#f5c2e7
+palette = 14=#94e2d5
+palette = 15=#bac2de
+background = 1e1e2e
+foreground = cdd6f4
+cursor-color = f5e0dc
+cursor-text = 11111b
+selection-background = 353749
+selection-foreground = cdd6f4
+split-divider-color = 313244
+
+# ffxiv: accent = #cba6f7
+# ffxiv: accent-2 = #89dceb
+# ffxiv: ok = #a6e3a1
+# ffxiv: ink = #cdd6f4
+# ffxiv: ink-dim = #a6adc8
+# ffxiv: ink-faint = #6c7086
+# ffxiv: glass-top = #313244
+# ffxiv: glass-bottom = #11111b
+# ffxiv: glass-flat = #1e1e2e
+# ffxiv: glow = #b4befe
+# ffxiv: panel = #181825
+# ffxiv: tooltip = #181825
+# ffxiv: tab = #cdd6f4
+# ffxiv: close = #f38ba8
+# ffxiv: full = #b4befe
+# ffxiv: popin = #fab387
+# ffxiv: sleep = #cba6f7
+# ffxiv: chip = #313244
+# ffxiv: chip-hot = #585b70
+# ffxiv: chip-ink = #cdd6f4
+# ffxiv: label = #11111b
+# ffxiv: label-ink = #cdd6f4
+# ffxiv: bell = #89dceb

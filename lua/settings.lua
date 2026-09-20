@@ -8,6 +8,9 @@
 
 local changelog = require('changelog')
 local vote = require('vote')
+local themes = require('themes')
+local tooltips = require('tooltips')
+local gallery = require('gallery')
 
 local S = {}
 
@@ -17,6 +20,9 @@ local PAD = { 'select', 'create', 'start', 'l3', 'r3', 'dpad_up', 'dpad_down', '
 local DTR_MODES = { 'auto', 'always', 'never' }
 
 S.schema = {
+  { 'Theme', {
+    { 'theme', 'theme', 'Theme' },
+  } },
   { 'Keys & controller', {
     { 'toggle_mods', 'combo', MODS, 'Dropdown toggle modifiers (+ `)' },
     { 'world_toggle_mods', 'combo', MODS, 'World terminals toggle modifiers (+ `)' },
@@ -61,6 +67,7 @@ S.schema = {
     { 'world.occlusion', 'combo', { 'depth', 'capsule', 'off' }, 'Occlusion (depth = game geometry hides panels)' },
     { 'world.occlusion_tolerance', 'slider', 0.005, 0.2, 'Occlusion tolerance (yalms)' },
     { 'world.occlusion_edge', 'slider', 0, 3, 'Occlusion edge softness (px)' },
+    { 'world.under_hud', 'checkbox', 'Panels go beneath the game\'s HUD (hotbars, chat, minimap)' },
   } },
   { 'Clicked world panels', {
     { 'world.present.enabled', 'checkbox', 'Float a clicked panel toward you' },
@@ -97,6 +104,10 @@ S.schema = {
   } },
   { 'Character animation', {
     { 'animation.enabled', 'checkbox', 'Hold a pose while a terminal is out or focused' },
+    { 'animation.style', 'combo', { 'phone', 'desk' }, 'Style (phone in hand, or working at a desk)' },
+    { 'animation.desk.scale', 'combo', { 'normal', 'fit', '0.75', '1.25', '1.5', '2' }, 'Desk size (normal = sized for a Midlander)' },
+    { 'animation.desk.chair_scale', 'combo', { 'fit', 'normal', '0.75', '1.25', '1.5', '2' }, 'Chair size' },
+    { 'animation.reactions', 'checkbox', 'React to bells, failed and long commands, output and idling' },
     { 'animation.preset', 'combo', { 'device', 'book', 'pen', 'photograph', 'think', 'lookout' }, 'Pose' },
     { 'animation.custom_timeline', 'slider_int', 0, 40000, 'Custom ActionTimeline id (0 = use the pose)' },
     { 'animation.typing_speed', 'slider', 1, 4, 'Pose animation speed while typing' },
@@ -115,6 +126,29 @@ S.schema = {
     { 'bell.accent.r', 'slider', 0, 1, 'Accent colour: red' },
     { 'bell.accent.g', 'slider', 0, 1, 'Accent colour: green' },
     { 'bell.accent.b', 'slider', 0, 1, 'Accent colour: blue' },
+  } },
+  { 'Assistant (/term ask)', {
+    { 'assistant.enabled', 'checkbox', '/term ask opens the assistant' },
+    { 'assistant.ui', 'combo', { 'panel', 'terminal' }, '/ask answers in (panel: chat bubbles with follow-ups)' },
+    { 'assistant.game_actions', 'checkbox', 'The panel offers game actions (the game still asks you first)' },
+    { 'assistant.echo', 'checkbox', 'Also print the start of each answer in the chat' },
+    { 'assistant.stream', 'argv', 'The panel runs' },
+    { 'assistant.view', 'combo', { 'pet', 'tab', 'window' }, 'Opens as (pet needs your character; else a tab)' },
+    { 'assistant.transport', 'combo', { 'default', 'agent', 'conpty' }, 'Runs through (default: as your first profile)' },
+    { 'assistant.chat', 'argv', '/term ask runs' },
+    { 'assistant.ask', 'argv', '/term ask <question> runs, plus the question' },
+  } },
+  { 'Flat windows in the world', {
+    { 'adopt.auto.mappy', 'checkbox', 'Mappy\'s map is a world panel whenever it is open' },
+  } },
+  { 'Remote windows', {
+    { 'windows.auto_open', 'combo', { 'all', 'related', 'none' }, 'New windows of the agent become panels (related: dialogs and windows of apps you have out)' },
+    { 'windows.links', 'combo', { 'game', 'host' }, 'Terminal links open in the game (the agent\'s browser, as a panel) or on the desktop' },
+    { 'windows.never', 'list', 'Never show in game (app id, desktop id or part of a title; * matches anything)' },
+  } },
+  { 'Gallery', {
+    { 'gallery.prompt', 'checkbox', 'Offer to share screenshots taken while a terminal is on screen' },
+    { 'gallery.credit', 'checkbox', 'Credit shared screenshots to my character' },
   } },
   { 'Info bar & hidden UI', {
     { 'host.dtr.mode', 'combo', DTR_MODES, 'Server info bar entry (auto: only without the Umbra widget)' },
@@ -173,8 +207,29 @@ local function sanitize(path, value)
   return math.min(math.max(value, e[3]), e[4])
 end
 
+-- Each setting's shipped value, for its tooltip (captured before saved values).
+S.defaults = {}
+
+local function capture_defaults(config)
+  S.defaults = {}
+  for _, section in ipairs(S.schema) do
+    for _, e in ipairs(section[2]) do
+      local v = get(config, e[1])
+      if type(v) ~= 'table' and type(v) ~= 'function' then S.defaults[e[1]] = v end
+    end
+  end
+  if S.defaults.theme == nil then S.defaults.theme = themes.DEFAULT end
+end
+
 -- Layer saved values over the config (called from init.lua before returning).
 function S.apply(config)
+  -- an init.lua copied before themes and tooltips existed still gets them
+  if config.themes == nil then config.themes = themes end
+  if config.tooltips == nil then config.tooltips = tooltips end
+  -- ...and the gallery prompt, whose saved choices land in its module
+  if config.gallery == nil then config.gallery = gallery end
+  if type(config.theme) ~= 'string' or config.theme == '' then config.theme = themes.DEFAULT end
+  capture_defaults(config)
   local chunk = loadfile(file())
   if chunk then
     local ok, saved = pcall(chunk)
@@ -189,7 +244,38 @@ function S.apply(config)
     end
   end
   S.config = config
+  themes.apply(config, S.values)
   return config
+end
+
+-- Switch the theme (the settings window and /term theme) and save it.
+function S.set_theme(name)
+  local config = S.config or CONFIG
+  if type(config) ~= 'table' then return end
+  config.theme = name
+  S.values.theme = name
+  themes.apply(config, S.values)
+  S.save()
+end
+
+-- The tooltip of setting `path`: its sentence and its default.
+local function show_default(v)
+  if type(v) == 'boolean' then return v and 'on' or 'off' end
+  if type(v) == 'number' then
+    if v == math.floor(v) then return string.format('%d', v) end
+    return (string.format('%.3f', v):gsub('0+$', ''))
+  end
+  if v == '' then return 'none' end
+  return tostring(v)
+end
+
+function S.tooltip(path)
+  local tips = (S.config and S.config.tooltips) or tooltips
+  local text = tips.settings and tips.settings[path]
+  if not text then return nil end
+  local d = S.defaults[path]
+  if d ~= nil then text = text .. ' Default: ' .. show_default(d) .. '.' end
+  return text
 end
 
 function S.save()
@@ -200,6 +286,11 @@ function S.save()
   for _, k in ipairs(keys) do
     local v = S.values[k]
     local lit = type(v) == 'string' and string.format('%q', v) or tostring(v)
+    if type(v) == 'table' then -- a list of strings (kind 'list')
+      local items = {}
+      for i, s in ipairs(v) do items[i] = string.format('%q', tostring(s)) end
+      lit = '{ ' .. table.concat(items, ', ') .. ' }'
+    end
     out[#out + 1] = string.format('  [%q] = %s,\n', k, lit)
   end
   out[#out + 1] = '}\n'
@@ -213,10 +304,11 @@ function S.badge()
   return vote.unseen(S.values) > 0
 end
 
--- Back to the defaults. The vote page marker is not a setting and stays.
+-- Back to the defaults. The vote page marker and the gallery's link to your
+-- account (/term share unlink ends that) are not settings and stay.
 function S.reset()
   local seen = S.values[vote.KEY]
-  S.values = { [vote.KEY] = seen }
+  S.values = { [vote.KEY] = seen, ['gallery.token'] = S.values['gallery.token'] }
   S.save()
 end
 
@@ -265,13 +357,19 @@ function S.draw_settings(ui)
   local save_now = false -- toggles and choices save at once, sliders when released
   ui.text('Changes apply immediately and are saved to settings.lua.')
   ui.separator()
+  local tips = config.tooltips or tooltips
+  local tip = ui.tip or function() end -- an older core has no tooltips
   for si, section in ipairs(S.schema) do
-    if ui.header(section[1], si == 1) then
+    local open = ui.header(section[1], si <= 2)
+    tip(tips.sections and tips.sections[section[1]])
+    if open then
       for _, e in ipairs(section[2]) do
         local path, kind = e[1], e[2]
         local cur = get(config, path)
         local c, v, done = false, cur, false
-        if kind == 'slider' then
+        if kind == 'theme' then
+          c, v = S.draw_theme(ui, e[3] .. '##' .. path, cur, tip, tips)
+        elseif kind == 'slider' then
           c, v, done = ui.slider(e[5] .. '##' .. path, tonumber(cur) or e[3], e[3], e[4])
         elseif kind == 'slider_int' then
           c, v, done = ui.slider_int(e[5] .. '##' .. path, math.floor(tonumber(cur) or e[3]), e[3], e[4])
@@ -279,12 +377,23 @@ function S.draw_settings(ui)
           c, v = ui.checkbox(e[3] .. '##' .. path, cur and true or false)
         elseif kind == 'combo' then
           c, v = ui.combo(e[4] .. '##' .. path, tostring(cur or ''), e[3])
+        elseif kind == 'list' then
+          c, v = S.draw_list(ui, path, e[3], cur)
+        elseif kind == 'argv' then
+          -- a command line, read-only here: edit it in the Lua module
+          local words = {}
+          for i, w in ipairs(type(cur) == 'table' and cur or {}) do words[i] = string.format('%q', w) end
+          ui.wrapped(e[3] .. ': ' .. table.concat(words, ' ') .. ' (edit in lua/)', 0.72, 0.74, 0.78)
         end
-        if c then
+        if kind ~= 'theme' then tip(S.tooltip(path)) end
+        if c and kind == 'theme' then
+          S.set_theme(v)
+          changed = true
+        elseif c then
           set(config, path, v)
           S.values[path] = v
           changed = true
-          if kind == 'checkbox' or kind == 'combo' then save_now = true end
+          if kind == 'checkbox' or kind == 'combo' or kind == 'list' then save_now = true end
         end
         if done then save_now = true end
       end
@@ -292,12 +401,74 @@ function S.draw_settings(ui)
   end
   S.draw_status(ui)
   ui.separator()
-  if ui.button('Reset all to defaults') then
+  local reset = ui.button('Reset all to defaults')
+  tip(tips.reset)
+  if reset then
     S.reset()
     ui.text('Defaults restore on the next reload (/term reload).')
   end
   if save_now then S.save() end
   return changed
+end
+
+-- A list of strings: each with a remove button, and a box to add one
+-- (Enter or Add). Returns changed and the new list (a copy).
+S.drafts = {}
+function S.draw_list(ui, path, label, cur)
+  local list = type(cur) == 'table' and cur or {}
+  ui.text(label)
+  local out, changed = {}, false
+  for i, item in ipairs(list) do
+    if ui.button('x##' .. path .. i) then
+      changed = true
+    else
+      out[#out + 1] = item
+    end
+    ui.same_line()
+    ui.text(tostring(item))
+  end
+  if #list == 0 then ui.wrapped('(none)', 0.72, 0.74, 0.78) end
+  if ui.input then
+    local _, draft, entered = ui.input('##add' .. path, S.drafts[path] or '')
+    S.drafts[path] = draft
+    ui.same_line()
+    local add = ui.button('Add##' .. path)
+    draft = draft:match('^%s*(.-)%s*$')
+    if (add or entered) and draft ~= '' then
+      out[#out + 1] = draft
+      S.drafts[path] = ''
+      changed = true
+    end
+  end
+  return changed, out
+end
+
+-- The Theme combo: picking one applies it at once (live), hovering one in
+-- the list shows its colours, and the closed combo shows the current one's.
+function S.draw_theme(ui, label, cur, tip, tips)
+  local names = themes.names()
+  if #names == 0 then names = { themes.DEFAULT } end
+  local shown = {}
+  for i, n in ipairs(names) do
+    shown[i] = n
+    if themes.source(n) == 'user' then shown[i] = n .. ' (yours)' end
+  end
+  local current = tostring(cur or themes.DEFAULT)
+  local cur_label = current
+  for i, n in ipairs(names) do if n == current then cur_label = shown[i] end end
+  local c, v, hovered = ui.combo(label, cur_label, shown)
+  if hovered then
+    local name = names[hovered] or current
+    tip(name .. ': ' .. (tips.theme_item or ''), themes.swatch(name), true)
+  else
+    tip((S.tooltip('theme') or tips.theme or ''), themes.swatch(current))
+  end
+  if c then
+    for i, n in ipairs(shown) do
+      if n == v then return true, names[i] end
+    end
+  end
+  return false, current
 end
 
 -- Read-only: how the core is hosted, what it registered, and which lua files
