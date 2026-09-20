@@ -1,0 +1,266 @@
+-- End to end on Linux: the plugin's own agent client (core/agent_client.nelua)
+-- against a real ghostty-agent running its Wayland compositor
+-- (`--windows wayland`, started by tests/run.sh), with a real GTK app
+-- launched into it. Checks WOPEN run:, WOPENED, the KEY frame and deltas
+-- decoded the way core/app/remotewin.nelua decodes them, WACK pacing, TEXT
+-- reaching the app, and writes the first and last pictures as PPM.
+--
+-- Usage: test_e2e_wayland PORT TOKEN OUTDIR TITLE
+require 'core.agent_client'
+require 'core.wincodec'
+require 'string'
+require 'vector'
+require 'memory'
+require 'io'
+require 'os'
+require 'arg'
+
+## cinclude '<unistd.h>'
+local function usleep(us: cuint): cint <cimport, nodecl> end
+
+local port: uint16 = (@uint16)(tointeger(arg[1]))
+local token: string = arg[2]
+local outdir: string = arg[3]
+local title: string = arg[4]
+local clipfile: string = #arg >= 5 and arg[5] or ''
+
+local State = @record{
+  opened: boolean, refused: boolean, ended: boolean,
+  sid: uint32, w: integer, h: integer,
+  pixels: vector(uint8),
+  frames: integer,     -- END seqs presented
+  keys: integer,       -- KEY frames
+  deltas: integer,
+  pending_ack: boolean, ack_seq: uint32,
+  why: string,
+  geoms: integer,      -- WGEOMs seen
+  gn: integer,         -- boxes in the latest
+  gwin: [4]integer,    -- its first box (the window)
+  gpop: [4]integer,    -- its second (a popup), if any
+  list: string,        -- the latest WLISTR
+}
+local st: State
+
+local function on_event(ctx: pointer, ev: *AgentEvent): void
+  if ev.typ == PROTO_WOPENED then
+    if ev.id == 0 then
+      st.refused = true
+      st.why = string{data=(@*[0]byte)(ev.data), size=ev.len}:copy()
+    else
+      st.opened, st.sid = true, ev.id
+    end
+  elseif ev.typ == PROTO_WFRAME then
+    local ok, f = wincodec_parse(ev.data, ev.len)
+    assert(ok, 'a WFRAME parses')
+    if f.sid ~= st.sid then return end -- another stream (the one before, still open)
+    if f.w ~= st.w or f.h ~= st.h then
+      assert(f.flags & WINCODEC_FLAG_KEY ~= 0, 'a size change comes as a KEY frame')
+      st.w, st.h = f.w, f.h
+      st.pixels:resize((@usize)(st.w * st.h * 4))
+    end
+    while true do
+      local okr, fr = wincodec_next_rect(&f)
+      if not okr then break end
+      assert(wincodec_apply_rect(&fr, (@*[0]uint8)(&st.pixels[0]), (@usize)(st.w * 4)), 'a rectangle decodes')
+    end
+    if f.flags & WINCODEC_FLAG_END ~= 0 then
+      st.frames = st.frames + 1
+      if f.flags & WINCODEC_FLAG_KEY ~= 0 then st.keys = st.keys + 1 else st.deltas = st.deltas + 1 end
+      st.pending_ack, st.ack_seq = true, f.seq
+    end
+  elseif ev.typ == PROTO_WGEOM then
+    -- the agent_client hands unknown kinds over whole: sid, seq, n, boxes
+    assert(ev.len >= 10, 'a WGEOM has its header')
+    local n = (@integer)(proto.get_u16((@*[0]uint8)(&ev.data[8])))
+    assert(ev.len == (@usize)(10 + n * 8), 'a WGEOM is its boxes long')
+    st.geoms, st.gn = st.geoms + 1, n
+    for k = 0, < 4 do
+      st.gwin[k] = proto.get_u16((@*[0]uint8)(&ev.data[10 + k * 2]))
+      st.gpop[k] = n > 1 and (@integer)(proto.get_u16((@*[0]uint8)(&ev.data[18 + k * 2]))) or 0
+    end
+  elseif ev.typ == PROTO_WLISTR then
+    st.list:destroy()
+    st.list = string{data=(@*[0]byte)(ev.data), size=ev.len}:copy()
+  elseif ev.typ == PROTO_WEND then
+    st.ended = true
+  end
+end
+
+local client: AgentClient
+client:init('127.0.0.1', port, token)
+client.on_event = on_event
+
+local function pump_for(seconds: number, until_fn: function(): boolean): boolean
+  local t0 = os.now()
+  while os.now() - t0 < seconds do
+    client:pump(os.now())
+    if st.pending_ack then
+      st.pending_ack = false
+      client:wack(st.sid, st.ack_seq) -- presented at once, as the plugin does while the panel is seen
+    end
+    client:flush()
+    if until_fn ~= nilptr and until_fn() then return true end
+    usleep(5000)
+  end
+  return false
+end
+
+local function write_ppm(path: string): void
+  local f = io.open(path, 'wb')
+  assert(f:isopen(), 'can write ' .. path)
+  f:write(('P6\n%d %d\n255\n'):format(st.w, st.h))
+  local row: vector(uint8)
+  row:resize((@usize)(st.w * 3))
+  for y = 0, < st.h do
+    for x = 0, < st.w do
+      local p = (y * st.w + x) * 4
+      row[x*3], row[x*3+1], row[x*3+2] = st.pixels[p+2], st.pixels[p+1], st.pixels[p]
+    end
+    f:write(string{data=(@*[0]byte)(&row[0]), size=#row})
+  end
+  f:close()
+end
+
+client:connect(os.now())
+assert(pump_for(5, function(): boolean return client:ready() end), 'connected to the agent')
+assert(client:windows_ok(), 'the agent speaks version 3')
+
+local cmd = 'run:yad --text-info --editable --width=560 --height=360 --title=' .. title
+assert(client:wopen(1, 0, 1920, 1200, 30, cmd))
+assert(pump_for(20, function(): boolean return st.opened or st.refused end), 'WOPENED arrives')
+if st.refused then print('refused: ' .. st.why) end
+assert(st.opened, 'the compositor opened the app')
+assert(pump_for(10, function(): boolean return st.frames >= 1 end), 'a first frame arrives')
+assert(st.keys >= 1 and st.w > 100 and st.h > 100, 'a KEY frame of a real window size')
+pump_for(0.5, nilptr) -- let the first paint settle
+write_ppm(outdir .. '/e2e-first.ppm')
+local first: vector(uint8)
+first:resize(#st.pixels)
+memory.copy(&first[0], &st.pixels[0], #st.pixels)
+
+-- click into the text view, then type through TEXT
+local b: [6]uint8
+proto.put_u16(&b, (@uint16)(st.w // 2))
+proto.put_u16((@*[0]uint8)(&b[2]), (@uint16)(st.h // 2))
+b[4], b[5] = 0, 1
+client:winput(st.sid, WIN_INPUT_BUTTON, &b, 6)
+b[5] = 0
+client:winput(st.sid, WIN_INPUT_BUTTON, &b, 6)
+local text: string = 'typed from FFXIV\n'
+client:winput(st.sid, WIN_INPUT_TEXT, (@*[0]uint8)(text.data), text.size)
+local before = st.frames
+assert(pump_for(5, function(): boolean return st.frames >= before + 1 end), 'typing produces new frames')
+pump_for(1.0, nilptr)
+assert(st.deltas >= 1, 'later frames are deltas')
+local changed = 0
+if #first == #st.pixels then
+  for i = 0, < #first // 4 do
+    if first[i*4] ~= st.pixels[i*4] or first[i*4+1] ~= st.pixels[i*4+1] or first[i*4+2] ~= st.pixels[i*4+2] then changed = changed + 1 end
+  end
+end
+assert(changed > 50, 'the typed text shows in the picture')
+write_ppm(outdir .. '/e2e-typed.ppm')
+
+-- a context menu near the right edge: WGEOM says the picture now holds the
+-- window and a menu reaching past it, and the frame grows to match
+assert(st.geoms >= 1 and st.gn == 1, 'a WGEOM with the window alone came with the first frame')
+local ww, wh = st.gwin[2], st.gwin[3]
+assert(ww == st.w and wh == st.h, 'the window box is the whole picture before a menu')
+proto.put_u16(&b, (@uint16)(st.w - 20))
+proto.put_u16((@*[0]uint8)(&b[2]), (@uint16)(st.h // 2))
+b[4], b[5] = 1, 1
+client:winput(st.sid, WIN_INPUT_BUTTON, &b, 6)
+b[5] = 0
+client:winput(st.sid, WIN_INPUT_BUTTON, &b, 6)
+assert(pump_for(5, function(): boolean return st.gn >= 2 and st.w > ww end), 'a WGEOM with a menu, and a wider picture')
+print(('e2e menu: picture %dx%d, window %d,%d %dx%d, menu %d,%d %dx%d'):format(st.w, st.h,
+  st.gwin[0], st.gwin[1], st.gwin[2], st.gwin[3], st.gpop[0], st.gpop[1], st.gpop[2], st.gpop[3]))
+assert(st.gwin[2] == ww and st.gwin[3] == wh, 'the window keeps its size in the picture')
+assert(st.gpop[0] + st.gpop[2] > st.gwin[0] + st.gwin[2], 'the menu reaches past the window')
+write_ppm(outdir .. '/e2e-menu.ppm')
+local esc: [4]uint8 = { 0x29, 0, 1, 0 }
+client:winput(st.sid, WIN_INPUT_KEY, &esc, 4)
+esc[2] = 0
+client:winput(st.sid, WIN_INPUT_KEY, &esc, 4)
+assert(pump_for(5, function(): boolean return st.gn == 1 and st.w == ww end), 'the menu closed: the window alone again')
+print(('e2e: %dx%d, %d frames (%d key, %d delta), %d pixels changed by typing'):format(st.w, st.h, st.frames, st.keys, st.deltas, changed))
+-- the clipboard (the agent runs with --clipboard-file): a copy in the app
+-- reaches the host clipboard; the game's CLIP_SET is what the app pastes
+local function chord(hid: uint16): void
+  local kb: [4]uint8
+  proto.put_u16(&kb, hid)
+  kb[2], kb[3] = 1, WIN_MOD_CTRL
+  client:winput(st.sid, WIN_INPUT_KEY, &kb, 4)
+  kb[2] = 0
+  client:winput(st.sid, WIN_INPUT_KEY, &kb, 4)
+end
+local function clip_now(): string
+  local f = io.open(clipfile, 'rb')
+  if not f:isopen() then return (@string){} end
+  local t = f:read('a')
+  f:close()
+  return t
+end
+if #clipfile > 0 then
+  chord(0x04) chord(0x06) -- ctrl+a, ctrl+c
+  assert(pump_for(5, function(): boolean local t = clip_now() return t:find('typed from FFXIV', 1, true) > 0 end), 'the app\'s copy reached the host clipboard')
+  client:clip_set('from the game ✓')
+  pump_for(0.5, nilptr)
+  chord(0x04) chord(0x19) -- ctrl+a, ctrl+v: the game's text replaces it
+  pump_for(0.5, nilptr)
+  chord(0x04) chord(0x06) -- and copied back out
+  assert(pump_for(5, function(): boolean return clip_now() == 'from the game ✓' end), 'the app pasted the game\'s copy: ' .. clip_now())
+  print('e2e clipboard: app -> host and game -> app OK')
+end
+
+-- persistence: the connection goes (a plugin reload); the app stays. A new
+-- connection lists the window with its launch id and opens it again by key.
+client:flush()
+client:disconnect()
+usleep(300000)
+local oldsid = st.sid
+st.opened, st.frames, st.keys, st.w, st.h = false, 0, 0, 0, 0
+local client2: AgentClient
+client2:init('127.0.0.1', port, token)
+client2.on_event = on_event
+client = client2
+client:connect(os.now())
+assert(pump_for(5, function(): boolean return client:ready() end), 'reconnected')
+client:wlist()
+assert(pump_for(5, function(): boolean return #st.list > 0 end), 'WLISTR after reconnect')
+local at = st.list:find(title .. '\t', 1, true)
+assert(at > 0, 'the app outlived its connection: ' .. st.list)
+local nl = st.list:find('\n', at, true)
+local launch = st.list:sub(at + #title + 1, nl - 1)
+assert(#launch > 0, 'the window has a launch id')
+assert(client:wopen(2, 0, 1920, 1200, 30, 'key:' .. launch .. '\tyad\t' .. title))
+assert(pump_for(5, function(): boolean return st.opened or st.refused end), 'WOPENED for the key')
+assert(st.opened and st.sid ~= oldsid, 'the saved window opened again as a new stream')
+assert(pump_for(5, function(): boolean return st.keys >= 1 end), 'a KEY frame of the re-attached window')
+print(('e2e reattach: launch %s, %dx%d'):format(launch, st.w, st.h))
+-- GTK4 regression (outputs once advertised 0 Hz and GTK4 died with SIGFPE
+-- 1.6 s after mapping): a Flatpak GTK4 app stays mapped for 5 s. Text Editor
+-- --standalone, so a copy already open on the desktop does not take the launch.
+if os.execute('flatpak info org.gnome.TextEditor >/dev/null 2>&1') then
+  local keep_sid, keep_w, keep_h = st.sid, st.w, st.h
+  st.opened, st.refused, st.ended, st.frames, st.keys, st.w, st.h, st.sid = false, false, false, 0, 0, 0, 0, 0
+  assert(client:wopen(3, 0, 1920, 1200, 30, 'run:flatpak run org.gnome.TextEditor --standalone'))
+  assert(pump_for(30, function(): boolean return st.opened or st.refused end), 'WOPENED for the GTK4 app')
+  if st.refused then print('refused: ' .. st.why) end
+  assert(st.opened, 'the GTK4 app opened a window')
+  local gsid = st.sid
+  local ended_early = pump_for(5, function(): boolean return st.ended end)
+  assert(not ended_early, 'the GTK4 app stayed mapped for 5 s')
+  assert(st.keys >= 1, 'the GTK4 app sent frames')
+  print(('e2e GTK4: org.gnome.TextEditor %dx%d stayed mapped 5 s, %d frames'):format(st.w, st.h, st.frames))
+  client:wclose(gsid) -- the app closes with its stream
+  client:flush()
+  pump_for(1, nilptr)
+  st.sid, st.w, st.h = keep_sid, keep_w, keep_h
+else
+  print('skip: flatpak org.gnome.TextEditor is not installed (GTK4 check)')
+end
+
+-- the stream stays open: run.sh stops the agent, which must end the app
+client:flush()
+print('test_e2e_wayland OK')

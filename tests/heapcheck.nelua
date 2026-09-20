@@ -1,0 +1,71 @@
+-- Heap accounting shared by the host tests: run a hot path over and over and
+-- assert the heap in use stops growing. A leak of one allocation per frame is
+-- invisible in a single pass and obvious after a hundred.
+--
+-- Only glibc has mallinfo2, so tests/run.sh compiles the tests that use this
+-- with `-P glibc_heap` and runs them with
+--   GLIBC_TUNABLES=glibc.malloc.tcache_count=0:glibc.malloc.mxfast=0
+-- because the per-thread cache and the fast bins keep freed chunks counted as
+-- in use. Without the pragma every check here is a no-op that still compiles,
+-- so the same test runs on a musl or Windows host (and under AddressSanitizer,
+-- which replaces malloc and makes mallinfo2 meaningless; there LeakSanitizer
+-- is the check instead).
+require 'string'
+require 'io'
+require 'os'
+
+## if pragmas.glibc_heap then
+local mallinfo2_t <cimport 'struct mallinfo2', cinclude '<malloc.h>', nodecl> = @record{
+  arena: usize, ordblks: usize, smblks: usize, hblks: usize, hblkhd: usize,
+  usmblks: usize, fsmblks: usize, uordblks: usize, fordblks: usize, keepcost: usize,
+}
+local function mallinfo2(): mallinfo2_t <cimport, cinclude '<malloc.h>', nodecl> end
+## end
+
+-- true when this build can actually see the heap
+global HEAPCHECK_ON: boolean = #[not not pragmas.glibc_heap]#
+
+global function heap_in_use(): usize
+  ## if pragmas.glibc_heap then
+    local mi = mallinfo2()
+    return mi.uordblks + mi.hblkhd
+  ## else
+    return 0
+  ## end
+end
+
+-- How many times heap_stable repeats a body. GHOSTTY_HEAP_ITERS raises it for
+-- a long soak (the sanitizer CI job) without touching the tests.
+global function heap_iters(default: integer): integer
+  local env = os.getenv('GHOSTTY_HEAP_ITERS')
+  if env.size > 0 then
+    local n = tointeger(env, 10)
+    if n > 2 then return n end
+  end
+  return default
+end
+
+-- Run `body` `iters` times; the first two are warm-up (first-use caches, lazily
+-- grown vectors), then the heap in use must not grow again. Fails with the
+-- label and the growth when it does.
+global function heap_stable(label: string, iters: integer, body: function(i: integer): void)
+  local warm: usize = 0
+  local peak: usize = 0
+  for i = 1, iters do
+    body(i)
+    if HEAPCHECK_ON then
+      local used = heap_in_use()
+      if i == 2 then warm = used end
+      if i > 2 and used > peak then peak = used end
+    end
+  end
+  if not HEAPCHECK_ON then
+    io.write('heap ', label, ': skipped (no mallinfo2 in this build)\n')
+    return
+  end
+  if peak > warm then
+    io.write('heap ', label, ': grew by ', peak - warm, ' bytes over ', iters, ' runs (warm ', warm, ', peak ', peak, ')\n')
+    error('heap grows every run: ' .. label)
+  end
+  io.write('heap ', label, ': flat at ', warm, ' bytes over ', iters, ' runs\n')
+end

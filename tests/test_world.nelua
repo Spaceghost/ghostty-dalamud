@@ -172,6 +172,35 @@ assert(math.sqrt((pa.x - 10) ^ 2 + (pa.z - 20) ^ 2) >= 1200 / 660 / 2 + 0.6 - 0.
 assert(math.sqrt((pb.x - 10) ^ 2 + (pb.z - 20) ^ 2) >= 1520 / 660 / 2 + 0.6 - 0.01, 'pet 10 keeps clear of the character')
 print('resize/spacing OK')
 
+-- The pet order: `/term order swap ID` exchanges two pets' places, which is
+-- what dragging one pet's title onto another does (world_order_drag_step).
+do
+  local function lua_ok(code: cstring): boolean
+    return luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK
+  end
+  local function cmd(id: integer, args: string): string
+    return policy_world_command(id, args)
+  end
+  local e = cmd(9, 'order first')
+  assert(#e == 0, e) e:destroy()
+  assert(lua_ok("local A = CONFIG.world.anchors assert(A[9].order < A[10].order, 'pet 9 first')"), 'order first')
+  e = cmd(9, 'order swap 10')
+  assert(#e == 0, e) e:destroy()
+  assert(lua_ok("local A = CONFIG.world.anchors assert(A[9].order > A[10].order, 'places exchanged')"), 'swap')
+  e = cmd(9, 'order swap 9')
+  assert(#e == 0, e) e:destroy()
+  assert(lua_ok("local A = CONFIG.world.anchors assert(A[9].order > A[10].order, 'unchanged')"), 'swapping with itself changes nothing')
+  e = cmd(9, 'order swap 4321')
+  assert(#e > 0 and e:find('not a pet', 1, true) > 0, e) e:destroy()
+  e = cmd(9, 'order swap')
+  assert(#e > 0 and e:find('usage', 1, true) > 0, e) e:destroy()
+  e = cmd(9, 'order sideways')
+  assert(#e > 0 and e:find('usage', 1, true) > 0, e) e:destroy()
+  e = cmd(9, 'order swap 10') -- back as they were
+  assert(#e == 0, e) e:destroy()
+  print('order swap OK')
+end
+
 -- Persistence: the layout survives a reload keyed by agent session id.
 do
   local entries: vector(LayoutEntry)
@@ -356,15 +385,53 @@ do
   end
   local okc, ex, ey, ez = world_camera_position(&gc)
   assert(okc and math.abs(ex - 100) < 1e-3 and math.abs(ey - 5) < 1e-3 and math.abs(ez + 200) < 1e-3, 'camera position from the matrix')
-  -- (b) reversed Z with an infinite far plane is recognised; standard Z is not
-  local okz, zn = world_reverse_infinite(&gc)
-  assert(okz and math.abs(zn - 0.1) < 1e-6, 'game camera: reversed Z, infinite, near 0.1')
+  -- (b) the depth mapping, ndc z = a + b / depth, for every perspective
+  -- projection: reversed with an infinite far plane (the game's, as far as is
+  -- known), reversed with a finite one, and a standard forward one
+  local okz, a, b = world_depth_mapping(&gc)
+  assert(okz and a == 0 and math.abs(b - 0.1) < 1e-6, 'game camera: reversed Z, infinite far plane, near 0.1')
+  assert(world_depth_reversed(b), 'reversed Z: the depth grows toward the camera')
+  assert(math.abs(world_depth_ndc(a, b, b) - 1) < 1e-9 and math.abs(world_depth_ndc(a, b, 1e9)) < 1e-9,
+    '1 at the near plane, 0 at infinity')
+  local NEAR: float64, FAR: float64 = 0.1, 1000.0
+  -- reversed, finite: 1 at the near plane, 0 at the far one
+  local rev = gc
+  local ra, rb = -NEAR / (FAR - NEAR), NEAR * FAR / (FAR - NEAR)
+  rev.m[2], rev.m[6], rev.m[10], rev.m[14] = ra * gc.m[3], ra * gc.m[7], ra * gc.m[11], rb + ra * gc.m[15]
+  local okr, ra2, rb2 = world_depth_mapping(&rev)
+  assert(okr and math.abs(ra2 - ra) < 1e-6 and math.abs(rb2 - rb) < 1e-6, 'reversed Z with a finite far plane')
+  assert(world_depth_reversed(rb2))
+  assert(math.abs(world_depth_ndc(ra2, rb2, NEAR) - 1) < 1e-5 and math.abs(world_depth_ndc(ra2, rb2, FAR)) < 1e-5,
+    'reversed and finite: 1 near, 0 far')
+  -- standard: 0 at the near plane, 1 at the far one, so b is negative and the
+  -- comparison runs the other way round
   local std = gc
-  std.m[2], std.m[6], std.m[10], std.m[14] = gc.m[3] * 1.0001, gc.m[7] * 1.0001, gc.m[11] * 1.0001, -0.1
-  assert(not world_reverse_infinite(&std), 'standard Z is rejected')
-  assert(not world_reverse_infinite(&cam), 'a matrix with no z column is rejected')
-  local okf = world_depth_frame(&std)
-  assert(not okf, 'no depth frame for a standard-Z camera')
+  local sa, sb = FAR / (FAR - NEAR), -NEAR * FAR / (FAR - NEAR)
+  std.m[2], std.m[6], std.m[10], std.m[14] = sa * gc.m[3], sa * gc.m[7], sa * gc.m[11], sb + sa * gc.m[15]
+  local oks, sa2, sb2 = world_depth_mapping(&std)
+  -- (the matrix is float32 and its last row carries the camera's position, so
+  -- a and b come back to about a part in 1e5)
+  assert(oks and math.abs(sa2 - sa) < 1e-4 and math.abs(sb2 - sb) < 1e-4, 'a standard projection is read back too')
+  assert(not world_depth_reversed(sb2), 'forward Z: the depth grows away from the camera')
+  assert(math.abs(world_depth_ndc(sa2, sb2, NEAR)) < 1e-3 and math.abs(world_depth_ndc(sa2, sb2, FAR) - 1) < 1e-3,
+    'standard: 0 near, 1 far')
+  -- what is refused: a depth column that is no distance at all, and no
+  -- perspective divide (orthographic)
+  local skew = gc
+  skew.m[2] = gc.m[2] + 1
+  assert(not world_depth_mapping(&skew), 'a depth column that is not a * w + b is rejected')
+  local flat = gc
+  flat.m[14] = 0
+  assert(not world_depth_mapping(&flat), 'depth that carries no distance is rejected')
+  local ortho = gc
+  ortho.m[3], ortho.m[7], ortho.m[11], ortho.m[15] = 0, 0, 0, 1
+  assert(not world_depth_mapping(&ortho), 'no perspective divide is rejected')
+  assert(not world_depth_mapping(&cam), 'a matrix with no z or w column is rejected')
+  assert(not world_depth_frame(&ortho), 'no depth frame without a perspective divide')
+  do -- the frame carries the mapping
+    local okdf, df = world_depth_frame(&std)
+    assert(okdf and math.abs(df.depth_a - sa) < 1e-4 and math.abs(df.depth_b - sb) < 1e-4, 'the frame carries a and b')
+  end
 
   -- (c) the shader's ray depth at every transformed vertex equals the vertex's
   -- own depth: flat and curved panels, tilted, turned, and mirrored from behind
@@ -402,10 +469,10 @@ do
         cmd[0] = {}
         dl3.CmdBuffer = { Size = 1, Capacity = 1, Data = (@*[0]ImDrawCmd)(&cmd) }
         dl3.VtxBuffer = { Size = n, Capacity = 1024, Data = (@*[0]ImDrawVert)(&verts) }
-        world_transform_vertices(&dl3, 1, 0, &gc, &b3, vec2(0, 0), vec2(0, 0), 1, 0, 0, vec2(0, 0), nilptr)
+        world_transform_vertices(&dl3, 1, 0, &gc, &b3, vec2(0, 0), vec2(0, 0), 1, 0, 0, WorldFlat{ sx = 1, sy = 1 }, nilptr)
         local okp, params = world_depth_params(&frame, &gc, &b3, 2560, 1440, 1280, 720, 0.01, 1, 1)
         assert(okp, 'params packed')
-        assert(params.v[36] == (@float32)(0.1) and params.v[39] == 1 and params.v[34] == 0.5 and params.v[32] == 2560, 'constants in their cbuffer slots')
+        assert(params.v[36] == (@float32)(0.1) and params.v[23] == 0 and params.v[39] == 1 and params.v[34] == 0.5 and params.v[32] == 2560, 'constants in their cbuffer slots')
         assert(params.v[40] == 2560 and params.v[41] == 1440 and params.v[42] == 1280 and params.v[43] == 720, 'depth texture size in the last row')
         for i = 0, < n do
           local x3, y3, z3 = world_point(&b3, uvs[i].x, uvs[i].y)
@@ -421,6 +488,38 @@ do
     end
   end
   assert(cases == 24 and mirrored == 6, 'every case ran, the turned-away ones mirrored')
+
+  -- (d) the ray maths holds for the other depth conventions too: the shader
+  -- unprojects through a matrix whose depth column is normalised
+  -- (world_depth_vp), so only the constants a and b change with the camera
+  local cams: [3]GuCamera = { gc, rev, std }
+  local as: [3]float64 = { 0, ra, sa }
+  local bs: [3]float64 = { 0.1, rb, sb }
+  for ci = 0, < 3 do
+    local c2 = cams[ci]
+    local okd2, frame2 = world_depth_frame(&c2)
+    assert(okd2, 'depth frame for every convention')
+    assert(math.abs(frame2.depth_a - as[ci]) < 1e-4 and math.abs(frame2.depth_b - bs[ci]) < 1e-4, 'the mapping in the frame')
+    local pl4: WorldPlacement = { x = 100 + fwx * 6, y = 4.2, z = -200 + fwz * 6, yaw = 0.6 + math.pi + 0.5,
+      pitch = 0.2, width = 1800, height = 1040, ppm = 640, curve = 2 }
+    local b4 = world_basis(pl4)
+    local okp2, params2 = world_depth_params(&frame2, &c2, &b4, 2560, 1440, 2560, 1440, 0.01, 1, 1)
+    assert(okp2 and math.abs(params2.v[36] - bs[ci]) < 1e-4 and math.abs(params2.v[23] - as[ci]) < 1e-4, 'a and b in their slots')
+    for gy = 0, 6 do
+      for gx = 0, 8 do
+        local u, v = (@float32)(1800 * gx / 8), (@float32)(1040 * gy / 6)
+        local x4, y4, z4 = world_point(&b4, u, v)
+        local sok, sx4, sy4 = world_project(&c2, x4, y4, z4)
+        assert(sok, 'panel pixel on screen')
+        local want = world_depth(&c2, x4, y4, z4)
+        local got = world_panel_ray_depth(&params2, sx4, sy4)
+        assert(math.abs(got - want) < 1e-3 * want, 'ray depth matches whatever the depth convention')
+        -- and the depth value the shader compares against round-trips
+        local ndc = world_depth_ndc(frame2.depth_a, frame2.depth_b, want)
+        assert(math.abs(frame2.depth_b / (ndc - frame2.depth_a) - want) < 1e-4 * want, 'ndc z back to distance')
+      end
+    end
+  end
   print('depth maths OK')
 end
 

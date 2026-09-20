@@ -1,0 +1,336 @@
+-- core/capture.nelua on the host: the crop maths, and the whole state machine
+-- driven through a fake D3D11 (`capture_fake`) in the same way
+-- tests/test_wintex-style fakes stand in for a GPU. No ImGui and no Dalamud:
+-- the callback the renderer would run is called straight from here.
+require 'core.capture'
+require 'vector'
+require 'math'
+
+-- A fake GPU ------------------------------------------------------------------
+
+local FakeTex = @record{ w: uint32, h: uint32, fmt: cint, px: vector(uint8), live: boolean }
+
+local frame: FakeTex          -- what the renderer has bound
+local staging: FakeTex        -- what capture.nelua asked us to make
+local have_target = true
+local target_calls = 0
+local stage_calls = 0
+local copy_calls = 0
+local release_calls = 0
+local map_delay = 0           -- times map says "still drawing" before it works
+local map_fails = false
+local map_pitch_extra: uint32 = 0 -- padding at the end of each row, as a real map has
+
+local function fake_target(tex: *pointer, w: *uint32, h: *uint32, fmt: *cint): cint
+  target_calls = target_calls + 1
+  if not have_target then return 0 end
+  $tex, $w, $h, $fmt = (@pointer)(&frame), frame.w, frame.h, frame.fmt
+  return 1
+end
+
+local function fake_stage(device: pointer, w: uint32, h: uint32, fmt: cint, tex: *pointer): clong
+  stage_calls = stage_calls + 1
+  staging.w, staging.h, staging.fmt, staging.live = w, h, fmt, true
+  staging.px:resize(((@usize)(w) * 4 + (@usize)(map_pitch_extra)) * (@usize)(h))
+  $tex = (@pointer)(&staging)
+  return 0
+end
+
+local function fake_copy(src: pointer, dst: pointer, x: uint32, y: uint32, w: uint32, h: uint32): void
+  copy_calls = copy_calls + 1
+  local s = (@*FakeTex)(src)
+  local d = (@*FakeTex)(dst)
+  local spitch = (@usize)(s.w) * 4
+  local dpitch = (@usize)(w) * 4 + (@usize)(map_pitch_extra)
+  for row: usize = 0, < (@usize)(h) do
+    for i: usize = 0, < (@usize)(w) * 4 do
+      d.px[row * dpitch + i] = s.px[((@usize)(y) + row) * spitch + (@usize)(x) * 4 + i]
+    end
+  end
+end
+
+local function fake_map(tex: pointer, data: *pointer, pitch: *uint32): cint
+  if map_fails then return -1 end
+  if map_delay > 0 then
+    map_delay = map_delay - 1
+    return 0
+  end
+  local t = (@*FakeTex)(tex)
+  $data = (@pointer)(&t.px[0])
+  $pitch = (@uint32)(t.w) * 4 + map_pitch_extra
+  return 1
+end
+
+local function fake_unmap(tex: pointer): void end
+
+local function fake_release(tex: pointer): void
+  -- the target's reference is let go of every frame; only the staging texture's
+  -- release says a new one was needed
+  if tex == (@pointer)(&staging) then
+    release_calls = release_calls + 1
+    staging.live = false
+  end
+end
+
+local api: CaptureApi = {
+  target = fake_target, stage = fake_stage, copy = fake_copy,
+  map = fake_map, unmap = fake_unmap, release = fake_release,
+}
+capture_fake = &api
+
+local DEVICE: pointer = (@pointer)((@usize)(0x1234))
+
+-- A frame with a recognisable pattern; `bgr` decides the byte order.
+local function set_frame(w: uint32, h: uint32, fmt: cint): void
+  frame.w, frame.h, frame.fmt = w, h, fmt
+  frame.px:resize((@usize)(w) * (@usize)(h) * 4)
+  for y: usize = 0, < (@usize)(h) do
+    for x: usize = 0, < (@usize)(w) do
+      local i = (y * (@usize)(w) + x) * 4
+      frame.px[i] = (@uint8)(x & 0xff)         -- first channel
+      frame.px[i+1] = (@uint8)(y & 0xff)
+      frame.px[i+2] = (@uint8)((x + y) & 0xff) -- third channel
+      frame.px[i+3] = 7                        -- alpha the readback must overwrite
+    end
+  end
+end
+
+-- Crop maths -------------------------------------------------------------------
+
+do
+  local ok, x, y, w, h = capture_crop(10, 20, 100, 50, 1920, 1080)
+  assert(ok and x == 10 and y == 20 and w == 100 and h == 50, 'a rectangle inside the frame')
+
+  ok, x, y, w, h = capture_crop(10.4, 20.6, 100.2, 50.1, 1920, 1080)
+  assert(ok and x == 10 and y == 20 and w == 101 and h == 51, 'rounded outwards, so no edge is lost')
+
+  ok, x, y, w, h = capture_crop(-40, -10, 100, 50, 1920, 1080)
+  assert(ok and x == 0 and y == 0 and w == 60 and h == 40, 'clamped to the top left')
+
+  ok, x, y, w, h = capture_crop(1900, 1070, 100, 50, 1920, 1080)
+  assert(ok and x == 1900 and y == 1070 and w == 20 and h == 10, 'clamped to the bottom right')
+
+  ok, x, y, w, h = capture_crop(2000, 20, 100, 50, 1920, 1080)
+  assert(not ok, 'entirely off screen: refused')
+  ok, x, y, w, h = capture_crop(10, 20, 0, 50, 1920, 1080)
+  assert(not ok, 'no width: refused')
+  ok, x, y, w, h = capture_crop(10, 20, 100, 50, 0, 1080)
+  assert(not ok, 'no frame: refused')
+  ok, x, y, w, h = capture_crop(-100, 20, 40, 50, 1920, 1080)
+  assert(not ok, 'entirely left of the frame: refused')
+end
+
+-- Formats ----------------------------------------------------------------------
+
+do
+  local ok, bgr = capture_fmt_bgr(CAPTURE_FMT_B8G8R8A8)
+  assert(ok and bgr, 'BGRA')
+  ok, bgr = capture_fmt_bgr(CAPTURE_FMT_B8G8R8A8_SRGB)
+  assert(ok and bgr, 'BGRA sRGB')
+  ok, bgr = capture_fmt_bgr(CAPTURE_FMT_R8G8B8A8)
+  assert(ok and not bgr, 'RGBA')
+  ok, bgr = capture_fmt_bgr(24) -- R10G10B10A2
+  assert(not ok, 'a ten bit frame is not one we read')
+  ok, bgr = capture_fmt_bgr(2)
+  assert(not ok, 'nor a float one')
+end
+
+-- The whole frame --------------------------------------------------------------
+
+do
+  set_frame(64, 32, CAPTURE_FMT_B8G8R8A8)
+  assert(capture.state == CaptureState.Idle, 'idle to begin with')
+  assert(capture_arm(DEVICE, 0, 0, 0, 0), 'armed')
+  assert(capture.state == CaptureState.Armed and capture_busy(), 'waiting for the renderer')
+  assert(capture_poll() == CaptureState.Armed, 'nothing to read before the callback runs')
+  map_delay = 2
+  capture_render_cb(nilptr, nilptr)
+  assert(capture.state == CaptureState.Staged, 'the callback made the copy')
+  assert(capture.w == 64 and capture.h == 32, 'the whole frame, whose size only the callback knew')
+  assert(capture_poll() == CaptureState.Staged and capture_poll() == CaptureState.Staged,
+    'the readback waits for the GPU instead of stalling it')
+  assert(capture_poll() == CaptureState.Ready, 'and then it is there')
+  assert(#capture.pixels == 64 * 32 * 4, 'every pixel came back')
+  local same = true
+  for i: usize = 0, < 64 * 32 do
+    if capture.pixels[i*4] ~= frame.px[i*4] or capture.pixels[i*4+1] ~= frame.px[i*4+1]
+       or capture.pixels[i*4+2] ~= frame.px[i*4+2] or capture.pixels[i*4+3] ~= 255 then same = false end
+  end
+  assert(same, 'BGRA is copied as it is, with alpha made opaque')
+  assert(capture.taken == 1, 'one frame taken')
+  capture_reset()
+  assert(capture.state == CaptureState.Idle, 'and it is idle again')
+end
+
+-- A row pitch larger than the row ----------------------------------------------
+
+do
+  map_pitch_extra = 48 -- a real staging texture is padded
+  capture_release()    -- so the next one is made at the new pitch
+  set_frame(40, 8, CAPTURE_FMT_B8G8R8A8)
+  assert(capture_arm(DEVICE, 0, 0, 0, 0), 'armed')
+  capture_render_cb(nilptr, nilptr)
+  assert(capture_poll() == CaptureState.Ready, 'read back')
+  local same = true
+  for y: usize = 0, < 8 do
+    for x: usize = 0, < 40 do
+      local d = (y * 40 + x) * 4
+      local s = (y * 40 + x) * 4
+      if capture.pixels[d] ~= frame.px[s] or capture.pixels[d+2] ~= frame.px[s+2] then same = false end
+    end
+  end
+  assert(same, 'the padding at the end of each row is not part of the picture')
+  capture_reset()
+  map_pitch_extra = 0
+  capture_release()
+end
+
+-- A frame whose red comes first -------------------------------------------------
+
+do
+  set_frame(16, 4, CAPTURE_FMT_R8G8B8A8)
+  assert(capture_arm(DEVICE, 0, 0, 0, 0), 'armed')
+  capture_render_cb(nilptr, nilptr)
+  assert(capture_poll() == CaptureState.Ready, 'read back')
+  local swapped = true
+  for i: usize = 0, < 16 * 4 do
+    -- what came in as R,G,B must be handed out as B,G,R
+    if capture.pixels[i*4] ~= frame.px[i*4+2] or capture.pixels[i*4+2] ~= frame.px[i*4] then swapped = false end
+  end
+  assert(swapped, 'an RGBA swap chain is turned into the BGRA everything else here speaks')
+  capture_reset()
+end
+
+-- A crop -----------------------------------------------------------------------
+
+do
+  set_frame(64, 32, CAPTURE_FMT_B8G8R8A8)
+  assert(capture_arm(DEVICE, 8, 4, 16, 8), 'armed with a crop')
+  capture_render_cb(nilptr, nilptr)
+  assert(capture.w == 16 and capture.h == 8, 'the crop')
+  assert(capture_poll() == CaptureState.Ready, 'read back')
+  local same = true
+  for y: usize = 0, < 8 do
+    for x: usize = 0, < 16 do
+      local d = (y * 16 + x) * 4
+      local s = ((4 + y) * 64 + 8 + x) * 4
+      if capture.pixels[d] ~= frame.px[s] or capture.pixels[d+1] ~= frame.px[s+1] then same = false end
+    end
+  end
+  assert(same, 'and it is the right rectangle')
+  capture_reset()
+
+  -- a crop that hangs off the edge is cut to the frame inside the callback
+  assert(capture_arm(DEVICE, 60, 30, 40, 40), 'armed past the edge')
+  capture_render_cb(nilptr, nilptr)
+  assert(capture.w == 4 and capture.h == 2, 'cut to what the frame has')
+  assert(capture_poll() == CaptureState.Ready, 'read back')
+  capture_reset()
+
+  -- a crop whose origin is outside it cannot be cut to anything
+  assert(capture_arm(DEVICE, 100, 0, 8, 8), 'armed outside')
+  capture_render_cb(nilptr, nilptr)
+  assert(capture.state == CaptureState.Failed and #capture.reason > 0, 'refused with a reason')
+  capture_reset()
+end
+
+-- The staging texture is kept, and remade only when it must be -------------------
+
+do
+  set_frame(32, 16, CAPTURE_FMT_B8G8R8A8)
+  capture_release()
+  stage_calls, release_calls = 0, 0
+  for _ = 1, 3 do
+    assert(capture_arm(DEVICE, 0, 0, 0, 0), 'armed')
+    capture_render_cb(nilptr, nilptr)
+    assert(capture_poll() == CaptureState.Ready, 'read back')
+    capture_reset()
+  end
+  assert(stage_calls == 1, 'three frames of a clip share one staging texture')
+  set_frame(32, 16, CAPTURE_FMT_R8G8B8A8) -- the format changed under us
+  assert(capture_arm(DEVICE, 0, 0, 0, 0), 'armed')
+  capture_render_cb(nilptr, nilptr)
+  assert(stage_calls == 2 and release_calls == 1, 'a new format gets a new staging texture')
+  assert(capture_poll() == CaptureState.Ready, 'read back')
+  capture_reset()
+  set_frame(48, 16, CAPTURE_FMT_R8G8B8A8) -- and so does a new size
+  assert(capture_arm(DEVICE, 0, 0, 0, 0), 'armed')
+  capture_render_cb(nilptr, nilptr)
+  assert(stage_calls == 3, 'a new size too')
+  assert(capture_poll() == CaptureState.Ready, 'read back')
+  capture_reset()
+end
+
+-- Refusals and skips -------------------------------------------------------------
+
+do
+  set_frame(32, 16, CAPTURE_FMT_B8G8R8A8)
+  local before = capture.skipped
+  assert(capture_arm(DEVICE, 0, 0, 0, 0), 'armed')
+  assert(not capture_arm(DEVICE, 0, 0, 0, 0), 'a second request while one is in flight is refused')
+  assert(capture.skipped == before + 1, 'and counted as a skipped frame, not queued')
+  capture_render_cb(nilptr, nilptr)
+  assert(not capture_arm(DEVICE, 0, 0, 0, 0), 'still busy while the copy is being read')
+  assert(capture_poll() == CaptureState.Ready, 'read back')
+  capture_reset()
+
+  assert(not capture_arm(nilptr, 0, 0, 0, 0), 'no device: refused')
+  assert(capture.state == CaptureState.Failed and #capture.reason > 0, 'with a reason')
+  capture_reset()
+
+  assert(not capture_arm(DEVICE, 0, 0, CAPTURE_MAX_SIDE + 1, 8), 'an absurd size: refused')
+  capture_reset()
+
+  -- a renderer that never runs draw-list callbacks must not leave it armed for good
+  local misses = capture.misses
+  assert(capture_arm(DEVICE, 0, 0, 0, 0), 'armed')
+  for _ = 1, CAPTURE_ARM_LIMIT do capture_poll() end
+  assert(capture.state == CaptureState.Armed, 'it waits patiently')
+  assert(capture_poll() == CaptureState.Failed, 'and then gives up')
+  assert(capture.misses == misses + 1 and #capture.reason > 0, 'saying the renderer ran no callback')
+  capture_reset()
+
+  -- no render target bound
+  have_target = false
+  assert(capture_arm(DEVICE, 0, 0, 0, 0), 'armed')
+  capture_render_cb(nilptr, nilptr)
+  assert(capture.state == CaptureState.Failed and #capture.reason > 0, 'nothing bound: a reason')
+  have_target = true
+  capture_reset()
+
+  -- a pixel format we cannot read
+  set_frame(16, 8, 24)
+  assert(capture_arm(DEVICE, 0, 0, 0, 0), 'armed')
+  capture_render_cb(nilptr, nilptr)
+  assert(capture.state == CaptureState.Failed and #capture.reason > 0, 'an unreadable format: a reason')
+  capture_reset()
+
+  -- a map that fails outright, not one that is merely busy
+  set_frame(16, 8, CAPTURE_FMT_B8G8R8A8)
+  assert(capture_arm(DEVICE, 0, 0, 0, 0), 'armed')
+  capture_render_cb(nilptr, nilptr)
+  map_fails = true
+  assert(capture_poll() == CaptureState.Failed, 'a failed map fails the capture')
+  map_fails = false
+  capture_reset()
+
+  -- a copy that never becomes readable
+  set_frame(16, 8, CAPTURE_FMT_B8G8R8A8)
+  assert(capture_arm(DEVICE, 0, 0, 0, 0), 'armed')
+  capture_render_cb(nilptr, nilptr)
+  map_delay = CAPTURE_MAP_LIMIT + 4
+  for _ = 1, CAPTURE_MAP_LIMIT + 1 do capture_poll() end
+  assert(capture.state == CaptureState.Failed, 'a frame that never arrives is given up on')
+  map_delay = 0
+  capture_reset()
+
+  -- the callback does nothing at all unless a capture is armed
+  copy_calls = 0
+  capture_render_cb(nilptr, nilptr)
+  assert(copy_calls == 0, 'an unarmed callback is free')
+end
+
+capture_shutdown()
+frame.px:destroy()
+staging.px:destroy()
+print('test_capture OK')

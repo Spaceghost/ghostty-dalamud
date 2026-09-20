@@ -1,0 +1,220 @@
+-- core/wincodec.nelua: changed tiles, QOI both ways, WFRAME packing and parsing.
+require 'core.wincodec'
+require 'vector'
+require 'memory'
+require 'string'
+
+local function image(w: integer, h: integer, seed: integer): vector(uint8)
+  local v: vector(uint8)
+  v:resize((@usize)(w * h * 4))
+  for y = 0, < h do
+    for x = 0, < w do
+      local i = (y * w + x) * 4
+      -- flat areas, gradients and noise, like a window
+      if x < w // 3 then
+        v[i], v[i+1], v[i+2] = 30, 30, 36
+      elseif x < 2 * w // 3 then
+        v[i], v[i+1], v[i+2] = (@uint8)((x + seed) & 255), (@uint8)(y & 255), 128
+      else
+        local n = (x * 7919 + y * 104729 + seed * 31) % 251
+        v[i], v[i+1], v[i+2] = (@uint8)(n), (@uint8)(n * 3 & 255), (@uint8)(n * 5 & 255)
+      end
+      v[i+3] = (@uint8)(x & 255) -- alpha is noise: it must be ignored
+    end
+  end
+  return v
+end
+
+local function same_rgb(a: *[0]uint8, b: *[0]uint8, n: integer): boolean
+  for i = 0, < n do
+    local o = i * 4
+    if a[o] ~= b[o] or a[o+1] ~= b[o+1] or a[o+2] ~= b[o+2] then return false end
+  end
+  return true
+end
+
+-- QOI round trip of a whole image and of a sub-rectangle
+do
+  local w, h = 301, 177
+  local src = image(w, h, 3)
+  local enc: vector(uint8)
+  wincodec_qoi_encode((@*[0]uint8)(&src[0]), (@usize)(w * 4), 0, 0, w, h, &enc)
+  assert(#enc < w * h * 4, 'QOI compresses a window-like image')
+  local dst: vector(uint8)
+  dst:resize((@usize)(w * h * 4))
+  assert(wincodec_qoi_decode((@*[0]uint8)(&enc[0]), #enc, (@*[0]uint8)(&dst[0]), (@usize)(w * 4), 0, 0, w, h))
+  assert(same_rgb((@*[0]uint8)(&src[0]), (@*[0]uint8)(&dst[0]), w * h))
+  for i = 0, < w * h do assert(dst[i*4+3] == 255, 'decoded alpha is opaque') end
+  -- truncated data fails
+  assert(not wincodec_qoi_decode((@*[0]uint8)(&enc[0]), #enc - 1, (@*[0]uint8)(&dst[0]), (@usize)(w * 4), 0, 0, w, h))
+  -- a rectangle in the middle
+  local sub: vector(uint8)
+  wincodec_qoi_encode((@*[0]uint8)(&src[0]), (@usize)(w * 4), 50, 20, 90, 40, &sub)
+  local d2: vector(uint8)
+  d2:resize((@usize)(w * h * 4))
+  assert(wincodec_qoi_decode((@*[0]uint8)(&sub[0]), #sub, (@*[0]uint8)(&d2[0]), (@usize)(w * 4), 50, 20, 90, 40))
+  for y = 20, < 60 do
+    assert(same_rgb((@*[0]uint8)(&src[(y * w + 50) * 4]), (@*[0]uint8)(&d2[(y * w + 50) * 4]), 90))
+  end
+  assert(d2[0] == 0 and d2[3] == 0, 'outside the rectangle untouched')
+  -- every op: large jumps (RGB), small (DIFF), medium (LUMA), repeats (RUN > 62), index hits
+  local w3 = 400
+  local v3: vector(uint8)
+  v3:resize((@usize)(w3 * 4))
+  for x = 0, < w3 do
+    local c: uint8 = x < 100 and 7 or (x < 200 and (@uint8)(x * 97 & 255) or (x < 300 and (@uint8)(x & 255) or (@uint8)((x // 3) * 5 & 255)))
+    v3[x*4], v3[x*4+1], v3[x*4+2] = c, (@uint8)(c + 3), (@uint8)(255 - c)
+  end
+  local e3: vector(uint8)
+  wincodec_qoi_encode((@*[0]uint8)(&v3[0]), (@usize)(w3 * 4), 0, 0, w3, 1, &e3)
+  local o3: vector(uint8)
+  o3:resize((@usize)(w3 * 4))
+  assert(wincodec_qoi_decode((@*[0]uint8)(&e3[0]), #e3, (@*[0]uint8)(&o3[0]), (@usize)(w3 * 4), 0, 0, w3, 1))
+  assert(same_rgb((@*[0]uint8)(&v3[0]), (@*[0]uint8)(&o3[0]), w3))
+end
+
+-- changed tiles
+do
+  local w, h = 200, 100
+  local a = image(w, h, 1)
+  local b: vector(uint8)
+  b:resize(#a)
+  memory.copy(&b[0], &a[0], #a)
+  local rects: vector(WinRect)
+  wincodec_diff((@*[0]uint8)(&a[0]), (@usize)(w * 4), (@*[0]uint8)(&b[0]), (@usize)(w * 4), w, h, &rects)
+  assert(#rects == 0, 'identical: nothing changed')
+  b[3] = 1 -- alpha only
+  wincodec_diff((@*[0]uint8)(&a[0]), (@usize)(w * 4), (@*[0]uint8)(&b[0]), (@usize)(w * 4), w, h, &rects)
+  assert(#rects == 0, 'alpha changes are not changes')
+  -- one pixel in tile (1, 0), and columns in tiles 4, 5 and 6 from y 10 to the bottom
+  b[(5 * w + 40) * 4] = b[(5 * w + 40) * 4] + 1
+  for y = 10, < 100 do b[(y * w + 170) * 4 + 1] = b[(y * w + 170) * 4 + 1] ~ 0xff end
+  for y = 10, < 100 do b[(y * w + 195) * 4 + 1] = b[(y * w + 195) * 4 + 1] ~ 0xff end
+  for y = 10, < 100 do b[(y * w + 130) * 4 + 1] = b[(y * w + 130) * 4 + 1] ~ 0xff end
+  wincodec_diff((@*[0]uint8)(&a[0]), (@usize)(w * 4), (@*[0]uint8)(&b[0]), (@usize)(w * 4), w, h, &rects)
+  -- (32,0 32x32); (128,0 72x100): tiles 4..6 (the last 8 px wide) merged down 4 tile rows (the last 4 px tall)
+  assert(#rects == 2, 'two rectangles')
+  assert(rects[0].x == 32 and rects[0].y == 0 and rects[0].w == 32 and rects[0].h == 32)
+  assert(rects[1].x == 128 and rects[1].y == 0 and rects[1].w == 72 and rects[1].h == 100, 'vertical runs merge; edges clamp')
+  -- whole window when there is no previous frame
+  wincodec_diff(nilptr, 0, (@*[0]uint8)(&b[0]), (@usize)(w * 4), w, h, &rects)
+  assert(#rects == 1 and rects[0].w == w and rects[0].h == h)
+end
+
+-- downscaling: the smallest integer factor that fits, box averages, ragged edges
+do
+  local w, h = 10, 5
+  local src: vector(uint8)
+  src:resize((@usize)(w * h * 4))
+  for y = 0, < h do
+    for x = 0, < w do
+      local i = (y * w + x) * 4
+      src[i], src[i+1], src[i+2], src[i+3] = (@uint8)(x * 10), (@uint8)(y * 20), 200, 7
+    end
+  end
+  local out: vector(uint8)
+  local f, ow, oh = wincodec_downscale((@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, 0, 0, &out)
+  assert(f == 1 and ow == w and oh == h and #out == 0, 'no limit: untouched')
+  f, ow, oh = wincodec_downscale((@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, 10, 5, &out)
+  assert(f == 1 and #out == 0, 'fits already')
+  f, ow, oh = wincodec_downscale((@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, 4, 0, &out)
+  -- 10 / 4 needs factor 3: 4 x 2 pixels, the last column and row from partial boxes
+  assert(f == 3 and ow == 4 and oh == 2 and #out == 4 * 2 * 4)
+  assert(out[0] == 10 and out[1] == 20 and out[2] == 200 and out[3] == 255, 'box average of x 0..2, y 0..2')
+  assert(out[3*4] == 90 and out[3*4+1] == 20, 'right edge: column 9 alone')
+  local b = (1 * 4 + 1) * 4
+  assert(out[b] == 40 and out[b+1] == 70, 'bottom edge: x 3..5, y 3..4')
+  f, ow, oh = wincodec_downscale((@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, 100, 2, &out)
+  assert(f == 3 and ow == 4 and oh == 2, 'the height limit decides')
+  f, ow, oh = wincodec_downscale((@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, 5, 5, &out)
+  assert(f == 2 and ow == 5 and oh == 3)
+  assert(out[0] == 5 and out[1] == 10, 'factor 2 averages four pixels (rounded)')
+end
+
+-- banding keeps every rectangle's raw size under the limit
+do
+  local rects: vector(WinRect)
+  rects:push(WinRect{ x = 0, y = 0, w = 2000, h = 1000 })
+  wincodec_band(&rects)
+  local rows = 0
+  for i = 0, < #rects do
+    assert((@integer)(rects[i].w) * (@integer)(rects[i].h) * 4 <= WINCODEC_BAND_BYTES)
+    assert(rects[i].y == rows, 'bands are contiguous')
+    rows = rows + rects[i].h
+  end
+  assert(rows == 1000)
+end
+
+-- WFRAME: write, parse, apply; a noisy 1920x1080 key frame spans several WFRAMEs
+local function roundtrip(w: integer, h: integer, seed: integer): (integer, usize)
+  local src = image(w, h, seed)
+  local rects: vector(WinRect)
+  wincodec_diff(nilptr, 0, (@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, &rects)
+  local q: ByteQueue
+  local scratch: vector(uint8)
+  local body: vector(uint8)
+  local bytes = wincodec_write_frames(&q, 7, 42, (@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, true, &rects, &scratch, &body)
+  assert(bytes == q:len())
+  local dst: vector(uint8)
+  dst:resize((@usize)(w * h * 4))
+  local frames = 0
+  local ended = false
+  while true do
+    local ok, typ, payload, len = proto.read_frame(&q)
+    if not ok then break end
+    assert(typ == PROTO_WFRAME and not ended, 'END comes last')
+    assert(len <= PROTO_MAX_PAYLOAD)
+    local okf, f = wincodec_parse(payload, len)
+    assert(okf and f.sid == 7 and f.seq == 42 and f.w == w and f.h == h and f.flags & WINCODEC_FLAG_KEY ~= 0)
+    local n = 0
+    while true do
+      local okr, fr = wincodec_next_rect(&f)
+      if not okr then break end
+      assert(wincodec_apply_rect(&fr, (@*[0]uint8)(&dst[0]), (@usize)(w * 4)))
+      n = n + 1
+    end
+    assert(n == f.nrect, 'every rectangle parsed')
+    ended = f.flags & WINCODEC_FLAG_END ~= 0
+    frames = frames + 1
+    proto.frame_consume(&q, len)
+  end
+  assert(ended, 'the last WFRAME is flagged END')
+  assert(same_rgb((@*[0]uint8)(&src[0]), (@*[0]uint8)(&dst[0]), w * h), 'the frame arrives intact')
+  return frames, bytes
+end
+
+do
+  local frames, bytes = roundtrip(64, 48, 5)
+  assert(frames == 1)
+  frames, bytes = roundtrip(1920, 1080, 9)
+  print(('1920x1080 key frame: %d WFRAMEs, %d bytes (raw %d)'):format(frames, bytes, 1920 * 1080 * 4))
+  assert(frames >= 2, 'a large frame is split under the budget')
+end
+
+-- malformed input is refused, not read past
+do
+  local okf, f = wincodec_parse(nilptr, 3)
+  assert(not okf)
+  local buf: [64]uint8
+  memory.zero(&buf, 64)
+  proto.put_u16((@*[0]uint8)(&buf[8]), 10)  -- w
+  proto.put_u16((@*[0]uint8)(&buf[10]), 10) -- h
+  proto.put_u16((@*[0]uint8)(&buf[13]), 1)  -- one rect
+  local p = (@*[0]uint8)(&buf[WINCODEC_FRAME_HEAD])
+  proto.put_u16((@*[0]uint8)(&p[0]), 8)     -- x 8, w 4: past the right edge
+  proto.put_u16((@*[0]uint8)(&p[4]), 4)
+  proto.put_u16((@*[0]uint8)(&p[6]), 1)
+  p[8] = WINCODEC_ENC_RAW
+  proto.put_u32((@*[0]uint8)(&p[9]), 16)
+  okf, f = wincodec_parse(&buf, WINCODEC_FRAME_HEAD + WINCODEC_RECT_HEAD + 16)
+  assert(okf)
+  local okr, fr = wincodec_next_rect(&f)
+  assert(not okr, 'a rectangle outside the frame is refused')
+  proto.put_u16((@*[0]uint8)(&p[0]), 0)
+  proto.put_u32((@*[0]uint8)(&p[9]), 17)    -- raw length that does not match
+  okf, f = wincodec_parse(&buf, WINCODEC_FRAME_HEAD + WINCODEC_RECT_HEAD + 17)
+  okr, fr = wincodec_next_rect(&f)
+  assert(not okr, 'a raw rectangle of the wrong length is refused')
+end
+
+print('test_wincodec OK')

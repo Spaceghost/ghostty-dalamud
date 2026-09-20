@@ -1,0 +1,328 @@
+-- agent/clips.nelua on the host: COPEN's answers and refusals, the frames it
+-- accepts and drops, the frame budget, CEND running a real encoder process
+-- (a stand-in script, pointed at by GHOSTTY_FFMPEG) and the CDONE that comes
+-- back, and what happens when the encoder fails, when a clip is cancelled and
+-- when the client goes away.
+--
+-- Run with the scratch directory as its first argument; run.sh points
+-- GHOSTTY_CLIP_DIR and GHOSTTY_FFMPEG into it.
+require 'agent.clips'
+require 'core.wincodec'
+require 'os'
+require 'io'
+require 'vector'
+require 'string'
+require 'arg'
+
+local scratch: string = arg[1]
+
+local clips: AgentClips
+local outq: ByteQueue
+local logged: integer = 0
+
+local function queue_of(ci: usize): *ByteQueue
+  return &outq
+end
+
+local function logline(msg: string): void
+  logged = logged + 1
+end
+
+clips.queue_of, clips.log_fn, clips.next_cid = queue_of, logline, 1
+
+local function path_of(name: string): string
+  return scratch .. '/' .. name
+end
+
+local FFMPEG = path_of('fake-ffmpeg')
+
+-- A stand-in encoder: it writes an empty file where its last argument says.
+local function write_fake(ok: boolean): void
+  local sb: stringbuilder
+  sb:write("printf '%s\\n' '#!/bin/sh' 'for a in \"$@\"; do last=$a; done' ")
+  if ok then
+    sb:write("': > \"$last\"' 'exit 0' > ")
+  else
+    sb:write("'echo ffmpeg-said-no >&2' 'exit 1' > ")
+  end
+  sb:write(FFMPEG, ' && chmod +x ', FFMPEG)
+  local cmd = sb:promote()
+  assert(os.execute(cmd), 'the stand-in encoder was written')
+  cmd:destroy()
+end
+
+-- Frames ----------------------------------------------------------------------
+
+local function send(typ: uint8, payload: *[0]uint8, len: usize): void
+  clips:handle(0, &outq, typ, payload, len)
+end
+
+local function copen(req: uint32, kind: uint8, w: uint16, h: uint16, fps: uint8): void
+  local b: [10]uint8
+  proto.put_u32(&b, req)
+  b[4] = kind
+  proto.put_u16((@*[0]uint8)(&b[5]), w)
+  proto.put_u16((@*[0]uint8)(&b[7]), h)
+  b[9] = fps
+  send(PROTO_COPEN, (@*[0]uint8)(&b), 10)
+end
+
+-- The next frame in the queue: its type, and the payload as a copy.
+local function take(): (boolean, uint8, vector(uint8))
+  local out: vector(uint8)
+  local ok, typ, payload, len = proto.read_frame(&outq)
+  if not ok then return false, 0, out end
+  out:resize(len)
+  for i: usize = 0, < len do out[i] = payload[i] end
+  proto.frame_consume(&outq, len)
+  return true, typ, out
+end
+
+local function text_of(p: *vector(uint8), at: usize): string
+  if #p <= at then return (@string){} end
+  return string.copy(string{ data = (@*[0]byte)(&p[at]), size = (@usize)(#p) - at })
+end
+
+-- A frame of pixels, QOI or raw.
+local function frame_bytes(w: integer, h: integer, seed: integer, qoi: boolean, out: *vector(uint8)): uint8
+  local px: vector(uint8)
+  defer px:destroy() end
+  px:resize((@usize)(w * h * 4))
+  for i = 0, < w * h do
+    px[i*4] = (@uint8)((i + seed) & 0xff)
+    px[i*4+1] = (@uint8)(seed & 0xff)
+    px[i*4+2] = (@uint8)((i * 3 + seed) & 0xff)
+    px[i*4+3] = 255
+  end
+  out:clear()
+  if qoi then
+    wincodec_qoi_encode((@*[0]uint8)(&px[0]), (@usize)(w * 4), 0, 0, w, h, out)
+    return WINCODEC_ENC_QOI
+  end
+  out:resize((@usize)(w * h * 4))
+  for i = 0, < w * h * 4 do out[i] = px[i] end
+  return WINCODEC_ENC_RAW
+end
+
+local function cframe(cid: uint32, seq: uint32, enc: uint8, body: *vector(uint8)): void
+  local p: vector(uint8)
+  defer p:destroy() end
+  p:resize(9 + (@usize)(#body))
+  proto.put_u32((@*[0]uint8)(&p[0]), cid)
+  proto.put_u32((@*[0]uint8)(&p[4]), seq)
+  p[8] = enc
+  for i = 0, < #body do p[9 + i] = body[i] end
+  send(PROTO_CFRAME, (@*[0]uint8)(&p[0]), (@usize)(#p))
+end
+
+local function cend(cid: uint32, cancel: boolean): void
+  local b: [5]uint8
+  proto.put_u32(&b, cid)
+  b[4] = cancel and 1 or 0
+  send(PROTO_CEND, (@*[0]uint8)(&b), 5)
+end
+
+local function file_there(path: string): boolean
+  local f = io.open(path, 'rb')
+  if not f:isopen() then f:destroy() return false end
+  f:destroy()
+  return true
+end
+
+-- Wait for the encoder to finish, with a bound so a stuck one fails the test.
+local function wait_done(): (boolean, uint8, vector(uint8))
+  for _ = 1, 200 do
+    clips:tick(0)
+    local ok, typ, p = take()
+    if ok then return ok, typ, p end
+    os.execute('sleep 0.05')
+  end
+  local none: vector(uint8)
+  return false, 0, none
+end
+
+-- No encoder on the host ---------------------------------------------------------
+
+do
+  os.remove(FFMPEG) -- GHOSTTY_FFMPEG points at something that is not there
+  copen(1, CLIPS_KIND_GIF, 64, 32, 10)
+  local ok, typ, p = take()
+  assert(ok and typ == PROTO_COPENED, 'COPEN is answered')
+  assert(proto.get_u32((@*[0]uint8)(&p[0])) == 1, 'with the request it answers')
+  assert(proto.get_u32((@*[0]uint8)(&p[4])) == 0, 'refused: no clip id')
+  local why = text_of(&p, 8)
+  assert(#why > 0 and why:find('ffmpeg', 1, true) > 0, 'and the reason names ffmpeg: ' .. why)
+  why:destroy()
+  p:destroy()
+  assert(#clips.clips == 0, 'nothing is recording')
+end
+
+-- Refusals that need no encoder --------------------------------------------------
+
+do
+  write_fake(true)
+  clips.looked = false -- look for the encoder again now that it is there
+  copen(2, CLIPS_KIND_GIF, 8, 8, 10) -- too small
+  local ok, typ, p = take()
+  assert(ok and typ == PROTO_COPENED and proto.get_u32((@*[0]uint8)(&p[4])) == 0, 'a tiny frame is refused')
+  p:destroy()
+  copen(3, CLIPS_KIND_GIF, 64, 32, 200) -- too fast
+  ok, typ, p = take()
+  assert(ok and proto.get_u32((@*[0]uint8)(&p[4])) == 0, 'an absurd frame rate is refused')
+  p:destroy()
+  copen(4, 9, 64, 32, 10) -- not a kind we know
+  ok, typ, p = take()
+  assert(ok and proto.get_u32((@*[0]uint8)(&p[4])) == 0, 'an unknown kind is refused')
+  p:destroy()
+  local short: [4]uint8 = { 0, 0, 0, 5 }
+  send(PROTO_COPEN, (@*[0]uint8)(&short), 4)
+  ok, typ, p = take()
+  assert(ok and typ == PROTO_COPENED and proto.get_u32((@*[0]uint8)(&p[4])) == 0, 'a short COPEN is answered, not ignored')
+  p:destroy()
+  assert(#clips.clips == 0, 'still nothing recording')
+end
+
+-- A clip from end to end ----------------------------------------------------------
+
+local out_path: string
+do
+  copen(5, CLIPS_KIND_GIF, 64, 32, 10)
+  local ok, typ, p = take()
+  assert(ok and typ == PROTO_COPENED, 'answered')
+  local cid = proto.get_u32((@*[0]uint8)(&p[4]))
+  assert(cid ~= 0, 'recording')
+  p:destroy()
+  assert(#clips.clips == 1, 'one clip')
+  out_path = clips.clips[0].out_path:copy()
+  assert(out_path:find('.gif', 1, true) > 0, 'a GIF was asked for: ' .. out_path)
+
+  local body: vector(uint8)
+  defer body:destroy() end
+  local enc = frame_bytes(64, 32, 1, true, &body)
+  cframe(cid, 1, enc, &body)
+  assert(clips.clips[0].frames == 1 and clips.clips[0].bad == 0, 'a QOI frame is decoded and written')
+  enc = frame_bytes(64, 32, 2, false, &body)
+  cframe(cid, 2, enc, &body)
+  assert(clips.clips[0].frames == 2, 'a raw frame too')
+
+  -- a raw frame of the wrong length, a broken QOI one and an unknown encoding
+  body:resize(10)
+  cframe(cid, 3, WINCODEC_ENC_RAW, &body)
+  cframe(cid, 4, WINCODEC_ENC_QOI, &body)
+  cframe(cid, 5, 7, &body)
+  assert(clips.clips[0].frames == 2, 'none of those became a frame')
+  assert(clips.clips[0].bad == 3, 'all three were counted as dropped')
+
+  -- frames for a clip nobody opened, and from another connection
+  enc = frame_bytes(64, 32, 3, true, &body)
+  cframe(cid + 100, 6, enc, &body)
+  clips:handle(1, &outq, PROTO_CFRAME, nilptr, 0)
+  assert(clips.clips[0].frames == 2, 'and neither of those')
+
+  -- the budget: a clip that has had its fill takes no more
+  clips.clips[0].frames = CLIPS_MAX_FRAMES
+  cframe(cid, 7, enc, &body)
+  assert(clips.clips[0].frames == CLIPS_MAX_FRAMES, 'the frame budget holds')
+  clips.clips[0].frames = 2
+
+  assert(file_there(clips.clips[0].raw_path), 'the raw frames are on disk')
+  local raw = clips.clips[0].raw_path:copy()
+  cend(cid, false)
+  assert(#clips.clips == 1 and clips.clips[0].encoding, 'the encoder was started')
+  local dok, dtyp, dp = wait_done()
+  assert(dok and dtyp == PROTO_CDONE, 'CDONE comes back')
+  assert(proto.get_u32((@*[0]uint8)(&dp[0])) == cid, 'for this clip')
+  assert(proto.get_u32((@*[0]uint8)(&dp[4])) == 0, 'and it worked')
+  local path = text_of(&dp, 8)
+  assert(path == out_path, 'carrying the file it wrote: ' .. path)
+  path:destroy()
+  dp:destroy()
+  assert(file_there(out_path), 'the clip is there')
+  assert(not file_there(raw), 'and the raw frames were cleaned up')
+  raw:destroy()
+  assert(#clips.clips == 0, 'the clip is done with')
+end
+
+-- An encoder that fails ------------------------------------------------------------
+
+do
+  write_fake(false)
+  clips.looked = false
+  copen(6, CLIPS_KIND_MP4, 64, 32, 10)
+  local ok, typ, p = take()
+  local cid = proto.get_u32((@*[0]uint8)(&p[4]))
+  assert(ok and cid ~= 0, 'recording')
+  assert(clips.clips[0].out_path:find('.mp4', 1, true) > 0, 'an MP4 this time')
+  p:destroy()
+  local body: vector(uint8)
+  defer body:destroy() end
+  local enc = frame_bytes(64, 32, 4, true, &body)
+  cframe(cid, 1, enc, &body)
+  cend(cid, false)
+  local dok, dtyp, dp = wait_done()
+  assert(dok and dtyp == PROTO_CDONE, 'CDONE comes back')
+  assert(proto.get_u32((@*[0]uint8)(&dp[4])) ~= 0, 'as a failure')
+  local why = text_of(&dp, 8)
+  assert(why:find('ffmpeg-said-no', 1, true) > 0, 'with what the encoder said: ' .. why)
+  why:destroy()
+  dp:destroy()
+  assert(#clips.clips == 0, 'and it is forgotten')
+end
+
+-- Nothing to encode, cancelling, and a connection that goes away ---------------------
+
+do
+  write_fake(true)
+  clips.looked = false
+  copen(7, CLIPS_KIND_GIF, 64, 32, 10)
+  local ok, typ, p = take()
+  local cid = proto.get_u32((@*[0]uint8)(&p[4]))
+  assert(ok and cid ~= 0, 'recording')
+  p:destroy()
+  cend(cid, false) -- no frames ever arrived
+  ok, typ, p = take()
+  assert(ok and typ == PROTO_CDONE and proto.get_u32((@*[0]uint8)(&p[4])) ~= 0, 'nothing to encode is a failure, not a file')
+  p:destroy()
+  assert(#clips.clips == 0, 'and nothing is left recording')
+
+  copen(8, CLIPS_KIND_GIF, 64, 32, 10)
+  ok, typ, p = take()
+  cid = proto.get_u32((@*[0]uint8)(&p[4]))
+  p:destroy()
+  local body: vector(uint8)
+  defer body:destroy() end
+  local enc = frame_bytes(64, 32, 5, true, &body)
+  cframe(cid, 1, enc, &body)
+  local raw = clips.clips[0].raw_path:copy()
+  cend(cid, true) -- cancelled
+  assert(#clips.clips == 0, 'a cancelled clip is dropped')
+  assert(not file_there(raw), 'its frames go with it')
+  ok, typ, p = take()
+  assert(not ok, 'and nobody is told about a clip they cancelled')
+  p:destroy()
+  raw:destroy()
+
+  copen(9, CLIPS_KIND_GIF, 64, 32, 10)
+  ok, typ, p = take()
+  cid = proto.get_u32((@*[0]uint8)(&p[4]))
+  p:destroy()
+  cframe(cid, 1, enc, &body)
+  local raw2 = clips.clips[0].raw_path:copy()
+  clips:client_gone(1) -- someone else's connection
+  assert(#clips.clips == 1, 'another connection going away changes nothing')
+  clips:client_gone(0)
+  assert(#clips.clips == 0, 'ours takes its recording with it')
+  assert(not file_there(raw2), 'and its frames')
+  raw2:destroy()
+end
+
+-- Frames that are not ours are not answered ---------------------------------------
+
+do
+  assert(not clips:handle(0, &outq, PROTO_DATA, nilptr, 0), 'clips only claim clip frames')
+end
+
+out_path:destroy()
+clips:destroy()
+outq:destroy()
+print('test_clips OK')

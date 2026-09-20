@@ -1,0 +1,29 @@
+-- The screenshot gallery: tests/test_gallery.lua drives lua/gallery.lua and
+-- lua/settings.lua in a Lua state with the core's ghostty table, against a
+-- scratch config directory.
+require 'core.policy'
+require 'string'
+require 'io'
+require 'os'
+require 'arg'
+
+local root: string = arg[1]
+local scratch: string = arg[2]
+
+local L = luaL_newstate()
+luaL_openlibs(L)
+world_lua_register(L)
+fs_lua_register(L)
+local script = root .. '/tests/test_gallery.lua'
+if luaL_loadfilex(L, (@cstring)(script.data), nilptr) ~= LUA_OK then
+  io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+  os.exit(1)
+end
+lua_pushlstring(L, (@cstring)(root.data), root.size)
+lua_pushlstring(L, (@cstring)(scratch.data), scratch.size)
+if lua_pcall(L, 2, 0, 0) ~= LUA_OK then
+  io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+  os.exit(1)
+end
+lua_close(L)
+print('OK')

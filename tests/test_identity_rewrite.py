@@ -18,7 +18,7 @@ class IdentityRewrite(unittest.TestCase):
             old = Path.cwd()
             os.chdir(directory)
             try:
-                subprocess.run(['git', 'init', '-q', '-b', 'main'], check=True)
+                subprocess.run(['git', 'init', '-q', '-b', 'master'], check=True)
                 def g(*args):
                     return subprocess.check_output(['git', *args], stderr=subprocess.DEVNULL)
                 g('config', 'user.name', 'Private Test Maintainer')
@@ -64,7 +64,7 @@ class IdentityRewrite(unittest.TestCase):
             try:
                 def g(*args):
                     return subprocess.check_output(['git', *args], stderr=subprocess.DEVNULL)
-                g('init', '-q', '-b', 'main')
+                g('init', '-q', '-b', 'master')
                 g('config', 'user.name', 'Private Test Maintainer')
                 g('config', 'user.email', 'private-test@example.invalid')
                 Path('binary.dat').write_bytes(b'\0prefix' + 'Private Test Maintainer'.encode('utf-16le'))

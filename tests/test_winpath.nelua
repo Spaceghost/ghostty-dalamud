@@ -1,0 +1,90 @@
+-- Unicode-correct paths (core/sys/winpath.nelua): the UTF-8 <-> UTF-16
+-- conversion the Windows wide file APIs are fed with, then
+-- tests/test_winpath.lua for the UTF-8 path APIs from Lua (ghostty.mkdir,
+-- listdir, file_size, known_folder) and lua/gallery.lua's folder precedence
+-- with a non-ASCII profile.
+--
+-- What is not here: the wide calls themselves (FindFirstFileW,
+-- CreateDirectoryW, SHGetKnownFolderPath, GetModuleFileNameW). Those need
+-- Windows; tests/smoke_windows_win32.nelua asserts them there. On the host the
+-- conversion is Nelua's own, which is what these assertions exercise.
+require 'core.policy'
+require 'core.sys.winpath'
+require 'string'
+require 'io'
+require 'os'
+require 'arg'
+
+local root: string = arg[1]
+local scratch: string = arg[2]
+
+-- UTF-8 -> UTF-16 -> UTF-8 comes back byte for byte.
+local function round(s: string): boolean
+  local w: [WINPATH_MAX]uint16
+  if winpath_wide(s, (@*[0]uint16)(&w), WINPATH_MAX) < 0 then return false end
+  local back = winpath_utf8((@*[0]uint16)(&w))
+  local ok = back == s
+  back:destroy()
+  return ok
+end
+
+assert(round(''), 'an empty path')
+assert(round('C:\\Users\\me\\Documents\\My Games'), 'ASCII')
+assert(round('C:\\Users\\J\xC3\xBCrgen\\Documents'), 'a two-byte sequence (Jürgen)')
+assert(round('C:\\Users\\\xE3\x83\x97\xE3\x83\xAC\xE3\x82\xA4\\shots'), 'a three-byte sequence (プレイ)')
+assert(round('C:\\Users\\\xF0\x9F\x99\x82\\shots'), 'a four-byte sequence (an emoji)')
+
+do -- a code point above U+FFFF is a surrogate pair in UTF-16, and the buffer is nul-terminated
+  local w: [WINPATH_MAX]uint16
+  local n = winpath_wide('a\xF0\x9F\x99\x82', (@*[0]uint16)(&w), WINPATH_MAX)
+  assert(n == 3, 'one ASCII unit and a surrogate pair')
+  assert(w[0] == 0x61 and w[1] >= 0xD800 and w[1] <= 0xDBFF and w[2] >= 0xDC00 and w[2] <= 0xDFFF, 'the pair')
+  assert(w[3] == 0, 'nul-terminated')
+end
+
+do -- bytes that are not a sequence, and a surrogate with no partner, become U+FFFD
+  local w: [WINPATH_MAX]uint16
+  assert(winpath_wide('a\xFFb', (@*[0]uint16)(&w), WINPATH_MAX) == 3 and w[1] == 0xFFFD, 'a stray byte')
+  local lone: [3]uint16 = { 0x41, 0xD800, 0 }
+  local s = winpath_utf8((@*[0]uint16)(&lone))
+  assert(s == 'A\xEF\xBF\xBD', 'a lone surrogate')
+  s:destroy()
+end
+
+do -- the nul has to fit too
+  local small: [4]uint16
+  assert(winpath_wide('abcd', (@*[0]uint16)(&small), 4) < 0, 'four units and a nul do not fit in four')
+  assert(winpath_wide('abc', (@*[0]uint16)(&small), 4) == 3 and small[3] == 0, 'three do')
+  assert(winpath_wide('abc', (@*[0]uint16)(&small), 0) < 0, 'no room at all')
+end
+
+do -- the Lua side, against the real core functions
+  local L = luaL_newstate()
+  luaL_openlibs(L)
+  world_lua_register(L)
+  fs_lua_register(L)
+  local script = root .. '/tests/test_winpath.lua'
+  if luaL_loadfilex(L, (@cstring)(script.data), nilptr) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_pushlstring(L, (@cstring)(root.data), root.size)
+  lua_pushlstring(L, (@cstring)(scratch.data), scratch.size)
+  if lua_pcall(L, 2, 0, 0) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_close(L)
+end
+
+do -- winpath_read_file through the folder the Lua half just made
+  local shot = string.format('%s/winpath/J\xC3\xBCrgen-\xE3\x83\x97\xE3\x83\xAC\xE3\x82\xA4/ffxiv_09192026_203512_123.png', scratch)
+  local data = winpath_read_file(shot)
+  assert(data == 'PNGDATA', 'read a file through a non-ASCII folder')
+  data:destroy()
+  local missing = winpath_read_file(shot .. '.missing')
+  assert(missing.size == 0, 'nothing back for a file that is not there')
+  shot:destroy()
+end
+
+print('OK')

@@ -5,6 +5,36 @@ static void Check(bool value, string message)
     if (!value) throw new Exception(message);
 }
 
+// Release packages ship without the developer loader: the installed core is
+// loaded in place, nothing is cached or polled, and a missing core is an error
+// before startup rather than a crash after it.
+{
+    string releaseRoot = Path.Combine(Path.GetTempPath(), "ghostty-cache-test-" + Guid.NewGuid().ToString("N"));
+    string releaseInstall = Path.Combine(releaseRoot, "install");
+    string releaseConfig = Path.Combine(releaseRoot, "config");
+    Directory.CreateDirectory(releaseInstall);
+    string releaseCore = Path.Combine(releaseInstall, "ghostty_core.dll");
+    File.WriteAllText(releaseCore, "core-one");
+    try
+    {
+        using (var direct = new NativeCache(releaseInstall, releaseConfig))
+        {
+            Check(!direct.HotReloadEnabled, "Release must not require a loader");
+            Check(direct.CorePath == releaseCore, "Release loads its installed core directly");
+            Check(!Directory.Exists(releaseConfig), "Release must not write a cache");
+            File.Delete(releaseCore);
+            Check(direct.Refresh(1) == null, "Release must not poll or rewrite the native DLL");
+        }
+        Check(Directory.Exists(releaseInstall), "Release disposal must not delete the installation");
+        bool missingRejected = false;
+        try { using var missing = new NativeCache(releaseInstall, releaseConfig); }
+        catch (FileNotFoundException) { missingRejected = true; }
+        Check(missingRejected, "A missing core must be reported before startup");
+    }
+    finally { Directory.Delete(releaseRoot, recursive: true); }
+}
+
+// Developer builds ship the loader: every instance stages its own writable copy.
 string root = Path.Combine(Path.GetTempPath(), "ghostty-cache-test-" + Guid.NewGuid().ToString("N"));
 string install = Path.Combine(root, "read-only install");
 string config = Path.Combine(root, "user config");
@@ -19,6 +49,7 @@ File.SetAttributes(loader, FileAttributes.ReadOnly);
 try
 {
     using var first = new NativeCache(install, config);
+    Check(first.HotReloadEnabled, "Development hot reload must remain available");
     using var second = new NativeCache(install, config);
     string firstDirectory = Path.GetDirectoryName(first.CorePath)!;
     string secondDirectory = Path.GetDirectoryName(second.CorePath)!;

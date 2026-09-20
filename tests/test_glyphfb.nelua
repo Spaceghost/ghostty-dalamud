@@ -1,0 +1,339 @@
+-- Fallback glyphs (core/glyphfb.nelua): code points the ImGui font cannot draw
+-- are rasterized from fonts/ into a texture and drawn as images, through a
+-- fake ImGui and a fake D3D11. Arguments: the repository root, and optionally
+-- a CJK font file (GHOSTTY_TEST_CJK_FONT in tests/run.sh) to check the host
+-- CJK font of the chain against a real one -- skipped when it is not given,
+-- since no CJK font is small enough to ship with the tests.
+require 'core.ghostty'
+require 'core.imgui'
+require 'core.termview'
+require 'core.render'
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'io'
+require 'arg'
+require 'tests.heapcheck'
+
+local root: string = arg[1]
+local cjk: string = #arg >= 2 and arg[2] or ''
+local log: stringbuilder
+local images, texts = 0, 0
+
+local function fake_calc(pOut: *ImVec2, font: *ImFont, size: float32, max_width: float32, wrap_width: float32, text_begin: cstring, text_end: cstring, remaining: *cstring): void
+  pOut.x = 8.0
+  pOut.y = 16.0
+end
+local function fake_rect(dl: *ImDrawList, p_min: ImVec2, p_max: ImVec2, col: uint32, rounding: float32, flags: cint): void end
+local function fake_line(dl: *ImDrawList, p1: ImVec2, p2: ImVec2, col: uint32, thickness: float32): void end
+local rects = 0
+local function fake_rect_outline(dl: *ImDrawList, p_min: ImVec2, p_max: ImVec2, col: uint32, rounding: float32, flags: cint, thickness: float32): void
+  rects = rects + 1
+  log:writef('rectout %.1f,%.1f-%.1f,%.1f col=%08x\n', p_min.x, p_min.y, p_max.x, p_max.y, col)
+end
+local function fake_text(dl: *ImDrawList, font: *ImFont, font_size: float32, pos: ImVec2, col: uint32, text_begin: cstring, text_end: cstring, wrap_width: float32, clip: *ImVec4): void
+  texts = texts + 1
+  local s = string{data=(@*[0]byte)(text_begin), size=(@usize)((@isize)(text_end) - (@isize)(text_begin))}
+  log:writef('text %.0f,%.0f "%s"\n', pos.x, pos.y, s)
+end
+local function fake_image(dl: *ImDrawList, tex: pointer, p_min: ImVec2, p_max: ImVec2, uv_min: ImVec2, uv_max: ImVec2, col: uint32): void
+  images = images + 1
+  log:writef('image %.1f,%.1f-%.1f,%.1f tex=%p col=%08x\n', p_min.x, p_min.y, p_max.x, p_max.y, tex, col)
+  assert(uv_min.x < uv_max.x and uv_min.y < uv_max.y and uv_max.x <= 1 and uv_max.y <= 1)
+end
+-- the ImGui font has every BMP glyph but U+E28E, U+2B1B and U+65E5 (the wide
+-- ones), as the merged terminal font lacks ideographs outside its kana ranges
+local HAVE: [1]uint8
+local function fake_find(font: *ImFont, c: uint16): pointer
+  if c == 0xE28E or c == 0x2B1B or c == 0x65E5 then return nilptr end
+  return &HAVE
+end
+-- a cimgui without ImFont_FindGlyphNoFallback: ImFont_FindGlyph gives the
+-- font's fallback glyph for what it lacks, U+0001 included
+local FALLBACK: [1]uint8
+local function fake_find_any(font: *ImFont, c: uint16): pointer
+  if c == 0xE28E or c == 0x2B1B or c == 0x65E5 or c == 0x0001 then return &FALLBACK end
+  return &HAVE
+end
+
+local function resolver(name: cstring): pointer
+  local n: string = name
+  if n == 'ImFont_CalcTextSizeA' then return (@pointer)(fake_calc) end
+  if n == 'ImDrawList_AddRectFilled' then return (@pointer)(fake_rect) end
+  if n == 'ImDrawList_AddRect' then return (@pointer)(fake_rect_outline) end
+  if n == 'ImDrawList_AddLine' then return (@pointer)(fake_line) end
+  if n == 'ImDrawList_AddText_FontPtr' then return (@pointer)(fake_text) end
+  if n == 'ImDrawList_AddImage' then return (@pointer)(fake_image) end
+  if n == 'ImFont_FindGlyphNoFallback' then return (@pointer)(fake_find) end
+  return nilptr
+end
+imgui_bind(resolver, nilptr)
+
+-- Fake D3D11: every upload's alpha is checked for a drawn glyph.
+local FAKE_DEVICE: pointer = (@pointer)(0x5000)
+local creates, releases, uploads, inked = 0, 0, 0, 0
+local last_w: uint32 = 0
+local function tex_create(device: pointer, w: uint32, h: uint32, tex: *pointer, srv: *pointer): clong
+  creates = creates + 1
+  assert(w == GLYPHFB_ATLAS and h == GLYPHFB_ATLAS)
+  $tex, $srv = (@pointer)(0x100 + creates), (@pointer)(0x200 + creates)
+  return 0
+end
+local function tex_update(device: pointer, tex: pointer, r: WinRect, src: pointer, pitch: uint32): void
+  assert(device == FAKE_DEVICE and tex ~= nilptr)
+  assert(pitch == (@uint32)(r.w) * 4)
+  uploads = uploads + 1
+  last_w = r.w
+  local px = (@*[0]uint8)(src)
+  local ink = 0
+  for y = 0, < (@integer)(r.h) do
+    for x = 0, < (@integer)(r.w) do
+      local o = y * (@integer)(pitch) + x * 4
+      assert(px[o] == 255 and px[o + 1] == 255 and px[o + 2] == 255, 'white glyph')
+      local border = x == 0 or y == 0 or x == (@integer)(r.w) - 1 or y == (@integer)(r.h) - 1
+      if border then assert(px[o + 3] == 0, 'transparent border') end
+      if px[o + 3] > 128 then ink = ink + 1 end
+    end
+  end
+  if ink > 0 then inked = inked + 1 end
+end
+local function tex_release(tex: pointer, srv: pointer): void releases = releases + 1 end
+local fake_tex: WinTexApi = { create = tex_create, update = tex_update, release = tex_release }
+wintex_fake = &fake_tex
+
+-- UTF-8 decoding of the first code point
+do
+  local b: [4]uint8 = { 0xF3, 0xB0, 0x84, 0xB3 }
+  assert(glyphfb_codepoint(&b, 4) == 0xF0133)
+  assert(glyphfb_codepoint(&b, 3) == 0) -- cut short
+  local e: [3]uint8 = { 0xEE, 0x8A, 0x8E }
+  assert(glyphfb_codepoint(&e, 3) == 0xE28E)
+end
+assert(not glyphfb_wants(nilptr, 65))
+assert(glyphfb_wants(nilptr, 0xF0133))
+assert(not glyphfb_wants(nilptr, 0xE28E)) -- no font to ask: the ImGui font draws it
+assert(glyphfb_wants((@*ImFont)(&HAVE), 0xE28E))
+assert(not glyphfb_wants((@*ImFont)(&HAVE), 0xE0A0))
+assert(not glyphfb_wants((@*ImFont)(&HAVE), 0xFFFD), 'U+FFFD is the no-glyph mark itself')
+
+-- A cimgui that does not export ImFont_FindGlyphNoFallback: the same answers
+-- through ImFont_FindGlyph, by comparing against the fallback glyph
+do
+  local saved = imgui.FontFindGlyphNoFallback
+  imgui.FontFindGlyphNoFallback = nilptr
+  imgui.FontFindGlyph = fake_find_any
+  assert(glyphfb_wants((@*ImFont)(&HAVE), 0xE28E), 'missing: the fallback glyph came back')
+  assert(glyphfb_wants((@*ImFont)(&HAVE), 0x2B1B))
+  assert(not glyphfb_wants((@*ImFont)(&HAVE), 0xE0A0), 'present: its own glyph came back')
+  assert(glyphfb_wants((@*ImFont)(&HAVE), 0xF0133), 'above U+FFFF, whatever the font says')
+  imgui.FontFindGlyph = nilptr -- neither export: the ImGui font draws BMP glyphs, as before
+  assert(not glyphfb_wants((@*ImFont)(&HAVE), 0xE28E))
+  imgui.FontFindGlyphNoFallback = saved
+end
+
+-- No device yet: nothing from here, the ImGui font draws (as before)
+local v: TermView
+assert(v:init(20, 2))
+local motd: string = "A\u{F0133}\u{F0219}\u{E28E}\u{10FFFD}\u{F12E9}\u{F0133}"
+v:feed((@*[0]uint8)(motd.data), motd.size)
+assert(v:update())
+local m = render_measure((@*ImFont)(&HAVE), 16.0)
+render_termview(nilptr, &v, vec2(0, 0), m, true, true, 255, 0)
+assert(images == 0 and creates == 0, 'no device: no fallback')
+log:clear()
+
+-- With a device: the missing glyphs become images at their cells, tinted by the foreground
+glyphfb_set_dir(root .. '/fonts')
+glyphfb_frame(FAKE_DEVICE)
+assert(creates == 1)
+-- the chain is read lazily: a Nerd Font icon opens only the first file
+assert(glyphfb_has(0xF0133, 8.0, 16.0, 1))
+assert(glyphfb_stats.fonts == 1, 'only the Nerd Font was read')
+images, texts, rects = 0, 0, 0
+local red: string = "\r\n\27[31m\u{F07C0}"
+v:feed((@*[0]uint8)(red.data), red.size)
+assert(v:update())
+render_termview(nilptr, &v, vec2(0, 0), m, true, true, 255, 0)
+local out = log:promote()
+io.write(out)
+assert(glyphfb_stats.fonts == 3, 'U+10FFFD is in no font, so the whole bundled chain was read')
+assert(out:find('image 8.0,0.0-16.0,16.0', 1, true) > 0, 'U+F0133 as an image on its cell')
+assert(out:find('image 16.0,0.0-24.0,16.0', 1, true) > 0, 'U+F0219')
+assert(out:find('image 24.0,0.0-32.0,16.0', 1, true) > 0, 'U+E28E, missing from the ImGui font')
+assert(out:find('rectout 33.0,1.0-39.0,15.0', 1, true) > 0, 'U+10FFFD is in no font: the tofu box, inset in its cell')
+assert(out:find('text 32,0', 1, true) <= 0, 'and never the ImGui font (which would draw U+FFFD)')
+assert(out:find('image 40.0,0.0-48.0,16.0', 1, true) > 0, 'U+F12E9')
+assert(out:find('text 0,0 "A"', 1, true) > 0, 'ASCII stays text')
+assert(out:find('image 0.0,16.0-8.0,32.0 tex=0x201 col=ff', 1, true) > 0, 'second row, red tint')
+assert(images == 6, 'five on row one (U+F0133 twice), one on row two')
+assert(rects == 1, 'one tofu box, for U+10FFFD')
+-- one raster per distinct glyph and size; the repeated U+F0133 came from the cache
+assert(glyphfb_stats.rasterized == 5 and uploads == 5 and inked == 5, 'every glyph has ink')
+assert(last_w == 10)
+
+-- Drawn again: all from the cache
+render_termview(nilptr, &v, vec2(0, 0), m, true, true, 255, 0)
+assert(glyphfb_stats.rasterized == 5 and uploads == 5)
+
+-- A world panel: not snapped, the box follows the (fractional) cell
+do
+  log:clear()
+  render_world = true
+  local mw = m
+  mw.cell_w = 8.5
+  render_termview(nilptr, &v, vec2(0.25, 0), mw, true, true, 255, 0)
+  render_world = false
+  local w = log:promote()
+  assert(w:find('image 8.8,0.0-17.2,16.0', 1, true) > 0, 'world: unsnapped cell box')
+  w:destroy()
+end
+
+-- Emoji and wide (double-width) glyphs through the fallback atlas. U+2B1B is
+-- in Noto Sans Symbols 2 and U+1F600 in Noto Emoji; both are East Asian Wide,
+-- so libghostty gives them two cells and the image must cover both, leaving
+-- the cell after them to the next glyph.
+do
+  log:clear()
+  images, texts, rects = 0, 0, 0
+  local w: TermView
+  assert(w:init(12, 1))
+  local wide: string = "\u{2B1B}\u{1F600}X"
+  w:feed((@*[0]uint8)(wide.data), wide.size)
+  assert(w:update())
+  local before = glyphfb_stats.rasterized
+  render_termview(nilptr, &w, vec2(0, 0), m, true, true, 255, 0)
+  local o = log:promote()
+  io.write(o)
+  assert(o:find('image 0.0,0.0-16.0,16.0', 1, true) > 0, 'U+2B1B fills exactly two cells')
+  assert(o:find('image 16.0,0.0-32.0,16.0', 1, true) > 0, 'U+1F600 fills the next two')
+  assert(o:find('text 32,0 "X"', 1, true) > 0, 'the cell after the wide pair is the next glyph, not overlapped')
+  assert(images == 2 and rects == 0, 'two images, no tofu: both fonts have their glyph')
+  assert(glyphfb_stats.rasterized == before + 2)
+  assert(last_w == 18, 'the upload is two cells plus the border wide')
+  assert(glyphfb_stats.fonts == 3)
+  -- the same glyph in one cell is a different box, and narrower
+  assert(glyphfb_has(0x2B1B, 8.0, 16.0, 1))
+  assert(last_w == 10)
+  o:destroy()
+  w:destroy()
+end
+
+-- The tofu box carries the code point's hex digits wherever they are legible:
+-- not in an 8x16 cell (checked above: box only), but in a large one.
+do
+  log:clear()
+  rects, texts = 0, 0
+  glyphfb_tofu(nilptr, 0x10FFFD, 0.0, 0.0, 32.0, 64.0, 1, 0xFFFFFFFF, true, (@*ImFont)(&HAVE), 64.0)
+  glyphfb_tofu(nilptr, 0xE28E, 100.0, 0.0, 32.0, 64.0, 1, 0xFFFFFFFF, true, (@*ImFont)(&HAVE), 64.0)
+  local o = log:promote()
+  io.write(o)
+  assert(rects == 2 and texts == 5, 'two boxes; three rows of digits above the BMP, two in it')
+  assert(o:find('"10"', 1, true) > 0 and o:find('"FF"', 1, true) > 0 and o:find('"FD"', 1, true) > 0, 'U+10FFFD in three rows')
+  assert(o:find('"E2"', 1, true) > 0 and o:find('"8E"', 1, true) > 0, 'U+E28E in two')
+  -- no font, no digits, and nothing at all in a cell with no room for a box
+  rects, texts = 0, 0
+  glyphfb_tofu(nilptr, 0xE28E, 0.0, 0.0, 32.0, 64.0, 1, 0xFFFFFFFF, true, nilptr, 64.0)
+  glyphfb_tofu(nilptr, 0xE28E, 0.0, 0.0, 3.0, 64.0, 1, 0xFFFFFFFF, true, (@*ImFont)(&HAVE), 64.0)
+  assert(rects == 1 and texts == 0)
+  o:destroy()
+end
+
+-- A full atlas: the glyph that does not fit waits a frame, then the cache starts over
+do
+  local big: float32 = 240 -- 242-pixel slots: 4 x 4 fit below the 18-pixel shelf of the cells above
+  local cps: [3]uint32 = { 0xF0133, 0xF0219, 0xF02B4 }
+  local n = 0
+  for k = 0, < 17 do
+    local ok = glyphfb_has(cps[k % 3], big - k, big, 1)
+    if ok then n = n + 1 end
+  end
+  assert(n == 16, 'sixteen big glyphs fit')
+  assert(not glyphfb_has(0xF04D3, big, big - 1, 1), 'the atlas is full')
+  assert(glyphfb_has(0xF0133, big, big, 1), 'a cached glyph still draws this frame')
+  glyphfb_frame(FAKE_DEVICE)
+  assert(glyphfb_stats.resets == 1)
+  assert(glyphfb_has(0xF04D3, big, big - 1, 1), 'room again after the reset')
+end
+
+
+-- A font behind the bundled chain (the host's CJK font, core/app/lifecycle.nelua).
+-- With a fonts directory that holds none of the chain, only the added file can
+-- answer, which is what proves it is consulted.
+do
+  glyphfb_set_dir(root .. '/tests')
+  glyphfb_frame(FAKE_DEVICE)
+  assert(not glyphfb_has(0x2B1B, 8.0, 16.0, 1), 'no chain font in tests/')
+  assert(glyphfb_stats.fonts == 0)
+  glyphfb_add_font(root .. '/fonts/NotoSansSymbols2-Regular.ttf')
+  glyphfb_frame(FAKE_DEVICE)
+  assert(glyphfb_has(0x2B1B, 8.0, 16.0, 1), 'the added font answers')
+  assert(glyphfb_stats.fonts == 1)
+  glyphfb_add_font(root .. '/fonts/NotoSansSymbols2-Regular.ttf') -- again: ignored
+  glyphfb_frame(FAKE_DEVICE)
+  assert(glyphfb_has(0x2B1B, 8.0, 16.0, 1))
+  assert(glyphfb_stats.fonts == 1, 'the same path is not added twice')
+  assert(not glyphfb_has(0x4E00, 8.0, 16.0, 1), 'no CJK in it, and it is cached as missing')
+  -- a real CJK font, when one was named: the ideographs the merged ImGui
+  -- ranges leave out, above U+FFFF included, and a wide one over two cells
+  if #cjk > 0 then
+    glyphfb_add_font(cjk)
+    glyphfb_frame(FAKE_DEVICE)
+    assert(glyphfb_has(0x65E5, 8.0, 16.0, 2), 'a wide ideograph over two cells')
+    assert(last_w == 18)
+    assert(glyphfb_has(0x4E00, 8.0, 16.0, 2))
+    assert(glyphfb_has(0x3042, 8.0, 16.0, 2), 'kana')
+    assert(glyphfb_has(0x2A6B2, 8.0, 16.0, 2), 'CJK Extension B, above U+FFFF')
+    assert(glyphfb_stats.fonts == 2)
+    -- and through the renderer: the ideograph over both of its cells, the
+    -- cell after the pair still the next glyph's
+    log:clear()
+    images, texts, rects = 0, 0, 0
+    local c: TermView
+    assert(c:init(8, 1))
+    local jp: string = "\u{65E5}X"
+    c:feed((@*[0]uint8)(jp.data), jp.size)
+    assert(c:update())
+    render_termview(nilptr, &c, vec2(0, 0), m, true, true, 255, 0)
+    local jo = log:promote()
+    io.write(jo)
+    assert(jo:find('image 0.0,0.0-16.0,16.0', 1, true) > 0, 'U+65E5 over exactly two cells')
+    assert(jo:find('text 16,0 "X"', 1, true) > 0, 'the next glyph starts at the third cell')
+    assert(images == 1 and rects == 0, 'one image, no tofu')
+    jo:destroy()
+    c:destroy()
+    print('  with the CJK font ' .. cjk)
+  else
+    print('  no CJK font given (GHOSTTY_TEST_CJK_FONT): the real-ideograph checks were skipped')
+  end
+  glyphfb_set_dir(root .. '/fonts')
+  glyphfb_frame(FAKE_DEVICE)
+end
+-- Soak: fill the atlas past full, let the reset evict everything, again and
+-- again: the cache, the shelves and the pixel copies must come back to the same size
+do
+  local function fill_and_reset(i: integer): void
+    local cps: [4]uint32 = { 0xF0133, 0xF0219, 0xF02B4, 0xF04D3 }
+    for k = 0, < 40 do
+      glyphfb_has(cps[k % 4], 200 - (k % 7), 200 - (i % 5), 1)
+    end
+    glyphfb_frame(FAKE_DEVICE) -- a full atlas starts over here
+    for k = 0, < 12 do
+      glyphfb_has(cps[k % 4], 16 + k, 18, 1 + k % 2)
+    end
+    glyphfb_frame(FAKE_DEVICE)
+  end
+  heap_stable('glyph atlas fill, evict, reset', heap_iters(40), fill_and_reset)
+end
+
+-- A new device: the texture is made again
+glyphfb_frame((@pointer)(0x6000))
+assert(releases == 1)
+glyphfb_frame(nilptr) -- no device this frame: keep the last one
+assert(releases == 1)
+
+glyphfb_shutdown()
+assert(releases == 2 and glyphfb_stats.fonts == 0)
+wintex_fake = nilptr
+out:destroy()
+v:destroy()
+print('glyphfb OK')

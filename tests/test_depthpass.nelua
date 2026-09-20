@@ -133,6 +133,7 @@ local EYE_X <comptime> = 10
 local EYE_Y <comptime> = 1.7
 local EYE_Z <comptime> = 15
 local standard_z = false
+local skew_z = false -- a depth column that is no distance mapping: the depth test cannot run
 local function fake_camera(c: *GuCamera): cint
   -- reversed Z, infinite far plane, near 0.1, FoV 0.78, looking along +Z
   $c = { width = 2560, height = 1440 }
@@ -147,7 +148,11 @@ local function fake_camera(c: *GuCamera): cint
   c.m[15] = -EYE_Z
   c.m[14] = 0.1                    -- reversed Z: clip z is the near plane
   if standard_z then
+    -- forward Z: ndc z grows with distance (1 - 0.1 / depth)
     c.m[10], c.m[14] = 1, -EYE_Z - 0.1
+  end
+  if skew_z then
+    c.m[2] = 1 -- clip z takes the world x with it: no longer a * clip w + b
   end
   return 1
 end
@@ -279,7 +284,8 @@ assert(cmds[f.first_begin].UserCallbackData == &depthpass.pool[0], 'the callback
 local depth_cut = f.cut -- vertices transparent by themselves; compared with `off` below
 do
   local p = &depthpass.pool[0]
-  assert(p.v[36] == (@float32)(0.1) and p.v[39] == 1, 'near plane and full strength')
+  assert(p.v[36] == (@float32)(0.1) and p.v[23] == 0 and p.v[39] == 1, 'reversed Z with an infinite far plane: ndc z = 0.1 / depth, full strength')
+  assert(depthpass.reversed, 'the comparison runs the reversed-Z way round')
   assert(p.v[34] == 0.5 and p.v[35] == 0.5, 'depth rendered at half resolution: half a texel per pixel')
   assert(p.v[32] == 2560 and p.v[33] == 1440, 'viewport')
   assert(p.v[40] == 2560 and p.v[41] == 1440 and p.v[42] == 1280 and p.v[43] == 720, 'depth texture: allocated, then rendered size')
@@ -367,13 +373,36 @@ scene_ok = 1
 scene.srv = nilptr
 expect_capsule('no view', 'no shader resource view')
 scene.srv = (@pointer)(0x5000)
-standard_z = true
-expect_capsule('standard-Z camera', 'reversed-Z')
-standard_z = false
+skew_z = true
+expect_capsule('a camera whose depth is no distance', 'cannot be read back as distance')
+skew_z = false
 f = frame()
 render()
 assert(f.begins == 1 and depthpass.ready, 'depth recovers by itself')
 assert(depth_logs == 5, 'each change of reason logged once: four fallbacks and the recovery')
+
+-- A forward-Z camera (ndc z growing with distance) is depth-tested too, with
+-- the mapping's offset in the constants and the comparison the other way round
+standard_z = true
+f = frame()
+render()
+assert(f.begins == 1 and depthpass.ready, 'a forward-Z camera keeps the depth test: ' .. depthpass.reason)
+do
+  local p = &depthpass.pool[0]
+  assert(math.abs(p.v[36] + 0.1) < 1e-6 and math.abs(p.v[23] - 1) < 1e-6, 'ndc z = -0.1 / depth + 1')
+  assert(not depthpass.reversed, 'forward Z compares the other way round')
+  -- the ray maths is the mapping's business no longer: depths still match
+  local _, pl = policy_world_place(501, now, false)
+  local want = pl.z - EYE_Z
+  for i = 0, < dl.VtxBuffer.Size do
+    local d = world_panel_ray_depth(p, verts[i].pos.x, verts[i].pos.y)
+    assert(math.abs(d - want) < 0.01 * want, 'vertex depth with a forward-Z camera')
+  end
+end
+standard_z = false
+f = frame()
+render()
+assert(depthpass.ready and depthpass.reversed, 'back to the game\'s reversed Z')
 
 -- a renderer that never runs callbacks: the capsule takes over, until retried
 local switched = -1

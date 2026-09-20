@@ -1,0 +1,283 @@
+-- core/pngenc.nelua on the host: the file's structure (signature, chunk CRCs,
+-- IHDR, IEND), that the pixels really come back out, that stepping in small
+-- budgets gives the same file as one go, and that a screenshot-like frame
+-- compresses well below the gallery's 8 MB.
+--
+-- The inflater below is part of the test, not of the plugin: it understands
+-- exactly the one stream core/pngenc.nelua writes (a single fixed-Huffman
+-- deflate block), which is what makes it short enough to be evidence rather
+-- than a second encoder to trust.
+require 'core.pngenc'
+require 'vector'
+require 'math'
+
+-- A test-only reader of our own output --------------------------------------------
+
+local Bits = @record{ data: *[0]uint8, len: usize, pos: usize, bit: integer }
+
+local function get_bit(b: *Bits): integer
+  if b.pos >= b.len then return 0 end
+  local v = (@integer)((b.data[b.pos] >> b.bit) & 1)
+  b.bit = b.bit + 1
+  if b.bit == 8 then b.bit = 0 b.pos = b.pos + 1 end
+  return v
+end
+
+local function get_bits(b: *Bits, n: integer): integer -- low bit first (extra bits)
+  local v = 0
+  for i = 0, < n do v = v | (get_bit(b) << i) end
+  return v
+end
+
+local function get_code(b: *Bits, n: integer): integer -- high bit first (Huffman codes)
+  local v = 0
+  for _ = 1, n do v = (v << 1) | get_bit(b) end
+  return v
+end
+
+local LEN_BASE: [29]integer <const> = { 3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131,163,195,227,258 }
+local LEN_EXTRA: [29]integer <const> = { 0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5,5,5,5,0 }
+local DIST_BASE: [30]integer <const> = { 1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577 }
+local DIST_EXTRA: [30]integer <const> = { 0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13 }
+
+-- Inflate one fixed-Huffman block (what png_begin starts).
+local function inflate_fixed(data: *[0]uint8, len: usize, out: *vector(uint8)): boolean
+  local b: Bits = { data = data, len = len, pos = 0, bit = 0 }
+  local final = get_bit(&b)
+  local btype = get_bits(&b, 2)
+  if final ~= 1 or btype ~= 1 then return false end
+  while true do
+    local c = get_code(&b, 7)
+    local sym = 0
+    if c < 0x18 then
+      sym = 256 + c
+    else
+      c = (c << 1) | get_bit(&b)
+      if c >= 0x30 and c <= 0xbf then
+        sym = c - 0x30
+      elseif c >= 0xc0 and c <= 0xc7 then
+        sym = 280 + c - 0xc0
+      else
+        c = (c << 1) | get_bit(&b)
+        if c < 0x190 or c > 0x1ff then return false end
+        sym = 144 + c - 0x190
+      end
+    end
+    if sym == 256 then return true end
+    if sym < 256 then
+      out:push((@uint8)(sym))
+    else
+      local li = sym - 257
+      if li < 0 or li > 28 then return false end
+      local l = LEN_BASE[li] + get_bits(&b, LEN_EXTRA[li])
+      local di = get_code(&b, 5)
+      if di > 29 then return false end
+      local d = DIST_BASE[di] + get_bits(&b, DIST_EXTRA[di])
+      if d > #out then return false end
+      local start = #out - d
+      for k = 0, < l do out:push(out[start + k]) end
+    end
+  end
+  return false
+end
+
+-- The IDAT bytes of a PNG, with its declared size; also checks every chunk CRC.
+local function png_idat(file: *vector(uint8)): (boolean, integer, integer, vector(uint8))
+  local idat: vector(uint8)
+  local p = (@*[0]uint8)(&file[0])
+  local n = (@usize)(#file)
+  for i = 0, < 8 do if p[i] ~= PNG_SIG[i] then return false, 0, 0, idat end end
+  local w, h = png_size(p, n)
+  local at: usize = 8
+  local saw_iend = false
+  while at + 12 <= n do
+    local clen = ((@usize)(p[at]) << 24) | ((@usize)(p[at+1]) << 16) | ((@usize)(p[at+2]) << 8) | (@usize)(p[at+3])
+    if at + 12 + clen > n then return false, 0, 0, idat end
+    local want = ((@uint32)(p[at+8+clen]) << 24) | ((@uint32)(p[at+9+clen]) << 16) | ((@uint32)(p[at+10+clen]) << 8) | (@uint32)(p[at+11+clen])
+    if png_crc32(0, (@*[0]uint8)(&p[at+4]), clen + 4) ~= want then return false, 0, 0, idat end
+    if p[at+4] == 'I'_b and p[at+5] == 'D'_b and p[at+6] == 'A'_b and p[at+7] == 'T'_b then
+      for k: usize = 0, < clen do idat:push(p[at + 8 + k]) end
+    elseif p[at+4] == 'I'_b and p[at+5] == 'E'_b and p[at+6] == 'N'_b and p[at+7] == 'D'_b then
+      saw_iend = true
+    end
+    at = at + 12 + clen
+  end
+  if not saw_iend or at ~= n then return false, 0, 0, idat end
+  return true, w, h, idat
+end
+
+local function paeth(a: integer, b: integer, c: integer): integer
+  local pp = a + b - c
+  local pa, pb, pc = math.abs(pp - a), math.abs(pp - b), math.abs(pp - c)
+  if pa <= pb and pa <= pc then return a end
+  if pb <= pc then return b end
+  return c
+end
+
+-- Decode a PNG this module wrote back to RGB rows.
+local function png_pixels(file: *vector(uint8)): (boolean, integer, integer, vector(uint8))
+  local rgb: vector(uint8)
+  local ok, w, h, idat = png_idat(file)
+  defer idat:destroy() end
+  if not ok or w <= 0 or h <= 0 then return false, 0, 0, rgb end
+  if #idat < 2 then return false, 0, 0, rgb end
+  local raw: vector(uint8)
+  defer raw:destroy() end
+  if not inflate_fixed((@*[0]uint8)(&idat[2]), (@usize)(#idat) - 2 - 4, &raw) then return false, 0, 0, rgb end
+  local stride = w * 3
+  if #raw ~= (stride + 1) * h then return false, 0, 0, rgb end
+  rgb:resize((@usize)(stride * h))
+  for y = 0, < h do
+    local ft = raw[y * (stride + 1)]
+    for i = 0, < stride do
+      local x = (@integer)(raw[y * (stride + 1) + 1 + i])
+      local a = i >= 3 and (@integer)(rgb[y * stride + i - 3]) or 0
+      local b = y > 0 and (@integer)(rgb[(y - 1) * stride + i]) or 0
+      local c = (i >= 3 and y > 0) and (@integer)(rgb[(y - 1) * stride + i - 3]) or 0
+      local v = 0
+      if ft == 0 then v = x
+      elseif ft == 1 then v = x + a
+      elseif ft == 2 then v = x + b
+      elseif ft == 3 then v = x + (a + b) // 2
+      elseif ft == 4 then v = x + paeth(a, b, c)
+      else return false, 0, 0, rgb end
+      rgb[y * stride + i] = (@uint8)(v & 0xff)
+    end
+  end
+  return true, w, h, rgb
+end
+
+-- A frame that looks like a screenshot: a gradient sky, a dark terminal panel
+-- with rows of text-like runs, and a few flat boxes.
+local function make_frame(w: integer, h: integer, px: *vector(uint8)): void
+  px:resize((@usize)(w * h * 4))
+  for y = 0, < h do
+    for x = 0, < w do
+      local i = (y * w + x) * 4
+      local b, g, r: uint8 = (@uint8)(40 + y * 60 // h), (@uint8)(60 + y * 80 // h), (@uint8)(90 + y * 90 // h)
+      if x > w // 6 and x < w - w // 6 and y > h // 4 and y < h - h // 5 then
+        b, g, r = 18, 20, 24 -- the panel
+        if (y % 3) == 0 and ((x // 7) % 3) ~= 0 then b, g, r = 200, 210, 215 end -- text runs
+      end
+      px[i], px[i+1], px[i+2], px[i+3] = b, g, r, 255
+    end
+  end
+end
+
+-- Structure, and the pixels coming back --------------------------------------
+
+do
+  local px: vector(uint8)
+  defer px:destroy() end
+  make_frame(64, 40, &px)
+  local file: vector(uint8)
+  defer file:destroy() end
+  assert(png_encode((@*[0]uint8)(&px[0]), 64 * 4, 64, 40, true, &file), 'encode')
+  local w, h = png_size((@*[0]uint8)(&file[0]), (@usize)(#file))
+  assert(w == 64 and h == 40, 'IHDR carries the size')
+  local ok, dw, dh, rgb = png_pixels(&file)
+  defer rgb:destroy() end
+  assert(ok, 'the file parses, every chunk CRC matches and the stream inflates')
+  assert(dw == 64 and dh == 40, 'decoded size')
+  local same = true
+  for y = 0, < 40 do
+    for x = 0, < 64 do
+      local s = (y * 64 + x) * 4
+      local d = (y * 64 + x) * 3
+      -- BGRA in, RGB out
+      if rgb[d] ~= px[s+2] or rgb[d+1] ~= px[s+1] or rgb[d+2] ~= px[s] then same = false end
+    end
+  end
+  assert(same, 'every pixel survives the round trip')
+end
+
+-- RGBA input (a swap chain that is not BGRA) -----------------------------------
+
+do
+  local px: vector(uint8)
+  defer px:destroy() end
+  px:resize(2 * 2 * 4)
+  for i = 0, < 4 do
+    px[i*4], px[i*4+1], px[i*4+2], px[i*4+3] = (@uint8)(10 + i), (@uint8)(50 + i), (@uint8)(90 + i), 255
+  end
+  local file: vector(uint8)
+  defer file:destroy() end
+  assert(png_encode((@*[0]uint8)(&px[0]), 8, 2, 2, false, &file), 'encode rgba')
+  local ok, _, _, rgb = png_pixels(&file)
+  defer rgb:destroy() end
+  assert(ok, 'rgba file decodes')
+  for i = 0, < 4 do
+    assert(rgb[i*3] == px[i*4] and rgb[i*3+1] == px[i*4+1] and rgb[i*3+2] == px[i*4+2], 'red first is kept')
+  end
+end
+
+-- Stepping in budgets, and refusals ------------------------------------------
+
+do
+  local px: vector(uint8)
+  defer px:destroy() end
+  make_frame(96, 64, &px)
+  local whole: vector(uint8)
+  defer whole:destroy() end
+  assert(png_encode((@*[0]uint8)(&px[0]), 96 * 4, 96, 64, true, &whole), 'one go')
+
+  local e: PngEnc
+  assert(png_begin(&e, (@*[0]uint8)(&px[0]), 96 * 4, 96, 64, true), 'begin')
+  local steps = 0
+  while not png_step(&e, 3) do
+    steps = steps + 1
+    assert(steps < 1000, 'stepping ends')
+  end
+  assert(steps >= 20, 'a three-row budget really took many frames')
+  -- a smaller budget shifts where matches end, so the bytes are not the same
+  -- file; what must hold is that it is a valid PNG of the same pixels and much
+  -- the same size
+  local okw, ww, wh, wrgb = png_pixels(&whole)
+  local oks, sw, sh, srgb = png_pixels(&e.out)
+  defer wrgb:destroy() srgb:destroy() end
+  assert(okw and oks and ww == sw and wh == sh, 'both files decode')
+  local same = #wrgb == #srgb
+  if same then for i = 0, < #wrgb do if wrgb[i] ~= srgb[i] then same = false end end end
+  assert(same, 'stepping gives the same pixels as one go')
+  assert(#e.out < #whole + #whole // 4 + 64, 'and much the same size')
+  assert(png_step(&e, 3), 'done stays done')
+  png_enc_destroy(&e)
+
+  local bad: PngEnc
+  assert(not png_begin(&bad, nilptr, 0, 4, 4, true), 'no pixels: refused')
+  assert(not png_begin(&bad, (@*[0]uint8)(&px[0]), 96 * 4, 0, 4, true), 'no width: refused')
+  assert(not png_begin(&bad, (@*[0]uint8)(&px[0]), 3, 4, 4, true), 'a stride shorter than the row: refused')
+  png_enc_destroy(&bad)
+end
+
+-- Not a PNG ------------------------------------------------------------------
+
+do
+  local junk: [32]uint8
+  for i = 0, < 32 do junk[i] = (@uint8)(i) end
+  local w, h = png_size((@*[0]uint8)(&junk), 32)
+  assert(w == 0 and h == 0, 'png_size refuses what is not a PNG')
+  local short: [4]uint8 = { 0x89, 0x50, 0x4e, 0x47 }
+  w, h = png_size((@*[0]uint8)(&short), 4)
+  assert(w == 0 and h == 0, 'and a truncated one')
+end
+
+-- A frame the size of a real screenshot: it must fit the gallery's 8 MB ------
+
+do
+  local w, h = 1920, 1080
+  local px: vector(uint8)
+  defer px:destroy() end
+  make_frame(w, h, &px)
+  local file: vector(uint8)
+  defer file:destroy() end
+  assert(png_encode((@*[0]uint8)(&px[0]), (@usize)(w * 4), w, h, true, &file), 'encode 1080p')
+  local raw = w * h * 3
+  print('1080p frame: ' .. tostring(#file) .. ' bytes, raw ' .. tostring(raw))
+  assert(#file < 8 * 1024 * 1024, 'a 1080p screenshot fits what the gallery takes')
+  assert(#file * 4 < raw, 'and it really is compressed')
+  local dw, dh = png_size((@*[0]uint8)(&file[0]), (@usize)(#file))
+  assert(dw == w and dh == h, '1080p size')
+end
+
+print('test_pngenc OK')

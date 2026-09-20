@@ -1,0 +1,168 @@
+-- core/sys/procpipe.nelua: the transport the /ask panel's hidden session uses
+-- for a local assistant, a child process on pipes instead of a pseudo
+-- console. What matters here is that the bytes the child writes are the bytes
+-- we read: one JSON object per line, however long the line, with no CR/LF
+-- inserted at a console width and no escape sequences added. That is the whole
+-- reason this transport exists (a ConPTY is a screen and reflows its rows).
+--
+-- This runs the POSIX half (fork/exec pipes), which is what the host build
+-- compiles. The Windows half is CreateProcessW with anonymous pipes and a
+-- kill-on-close job object; only a real Windows machine can run it, so its
+-- checks live in tests/smoke_procpipe_windows.nelua (cross-compiled for
+-- Windows, run there by hand).
+require 'core.sys.procpipe'
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'io'
+require 'os'
+
+## cinclude '<unistd.h>'
+## cinclude '<signal.h>'
+local function usleep(us: cuint): cint <cimport, nodecl> end
+local function kill(pid: cint, sig: cint): cint <cimport, nodecl> end
+
+local function argv_of(a: string, b: string, c: string): vector(string)
+  local v: vector(string)
+  v:push(a:copy())
+  if #b > 0 then v:push(b:copy()) end
+  if #c > 0 then v:push(c:copy()) end
+  return v
+end
+
+local function argv_free(v: *vector(string)): void
+  for i = 0, < #$v do ($v)[i]:destroy() end
+  v:destroy()
+end
+
+-- Everything the child writes, until it exits (or the deadline passes).
+local function run(sh: string, stdin_text: string): (string, uint32, boolean)
+  local v = argv_of('/bin/sh', '-c', sh)
+  local p: ProcPipe
+  assert(p:open(&v, (@string){}), 'the child started')
+  argv_free(&v)
+  if #stdin_text > 0 then
+    p:write((@pointer)(stdin_text.data), stdin_text.size)
+  end
+  p:close_stdin() -- these children read to EOF or not at all
+  local sb: stringbuilder
+  local buf: [4096]uint8
+  local exited = false
+  for _ = 1, 4000 do -- at most ~20 s
+    local n = p:read(&buf, 4096)
+    if n > 0 then
+      sb:write(string{data = (@*[0]byte)(&buf), size = n})
+    else
+      if p:poll_exit() then
+        -- drain what was still in the pipe after the exit
+        local more = p:read(&buf, 4096)
+        while more > 0 do
+          sb:write(string{data = (@*[0]byte)(&buf), size = more})
+          more = p:read(&buf, 4096)
+        end
+        exited = true
+        break
+      end
+      usleep(5000)
+    end
+  end
+  local code = p.exit_code
+  local out = sb:promote()
+  p:close()
+  return out, code, exited
+end
+
+-- a line far longer than any console is one line, byte for byte
+do
+  -- 4000 digits printed in one go, then a newline: a ConPTY would hand this
+  -- back as rows of its own width
+  local out, code, exited = run('i=0; while [ $i -lt 400 ]; do printf 0123456789; i=$((i+1)); done; printf "\\n"', (@string){})
+  assert(exited and code == 0, 'the child exited cleanly')
+  assert(#out == 4001, 'got ' .. #out .. ' bytes, wanted 4001')
+  assert(out:sub(4001, 4001) == '\n', 'one newline, at the end')
+  assert(out:find('\r', 1, true) == 0, 'no CR was added') -- string.find gives 0 when there is none
+  for i = 1, 4000 do
+    local c = out:sub(i, i)
+    assert(c >= '0' and c <= '9', 'byte ' .. i .. ' is not a digit: ' .. c)
+  end
+  out:destroy()
+end
+
+-- stdout and stderr both arrive (a stray line is what the panel shows as the
+-- reason an answer failed)
+do
+  local out, code, exited = run('printf "out\\n"; printf "err\\n" >&2', (@string){})
+  assert(exited and code == 0)
+  assert(out:find('out\n', 1, true) ~= 0 and out:find('err\n', 1, true) ~= 0, 'both streams: ' .. out)
+  out:destroy()
+end
+
+-- the exit status reaches the caller (the panel prints it)
+do
+  local out, code, exited = run('exit 7', (@string){})
+  assert(exited and code == 7, 'status 7, got ' .. code)
+  out:destroy()
+end
+
+-- a command that is not there exits 127, which is how the panel knows to say
+-- "the assistant was not found" (lua/assistant.lua)
+do
+  local v = argv_of('ghostty-no-such-command-xyz', (@string){}, (@string){})
+  local p: ProcPipe
+  local ok = p:open(&v, (@string){})
+  argv_free(&v)
+  assert(ok, 'fork/exec starts even for a missing command')
+  local exited = false
+  for _ = 1, 2000 do
+    if p:poll_exit() then exited = true break end
+    usleep(5000)
+  end
+  assert(exited and p.exit_code == 127, 'status 127, got ' .. p.exit_code)
+  p:close()
+end
+
+-- stdin: what is written reaches the child, and closing it is EOF
+do
+  local v = argv_of('/bin/cat', (@string){}, (@string){})
+  local p: ProcPipe
+  assert(p:open(&v, (@string){}))
+  argv_free(&v)
+  local msg: string = '{"type":"text","text":"hello"}\n'
+  p:write((@pointer)(msg.data), msg.size)
+  p:close_stdin()
+  local sb: stringbuilder
+  local buf: [4096]uint8
+  for _ = 1, 2000 do
+    local n = p:read(&buf, 4096)
+    if n > 0 then
+      sb:write(string{data = (@*[0]byte)(&buf), size = n})
+    elseif p:poll_exit() then
+      break -- nothing waiting and it is gone
+    else
+      usleep(5000)
+    end
+  end
+  local out = sb:promote()
+  assert(out == msg, 'cat gave back what was written: [' .. out .. ']')
+  out:destroy()
+  p:close()
+end
+
+-- close() ends a child that is still running, and reaps it
+do
+  local v = argv_of('/bin/sh', '-c', 'sleep 30')
+  local p: ProcPipe
+  assert(p:open(&v, (@string){}))
+  argv_free(&v)
+  local pid = p.pid
+  assert(pid > 0)
+  p:close()
+  local gone = false
+  for _ = 1, 400 do
+    if kill(pid, 0) ~= 0 then gone = true break end
+    usleep(5000)
+  end
+  assert(gone, 'the child is gone after close()')
+end
+
+print('OK')

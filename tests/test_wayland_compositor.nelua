@@ -1,0 +1,569 @@
+-- End to end: the agent's Wayland compositor (agent/capture_wayland.nelua)
+-- with a real client. Starts the backend on a private socket, launches
+-- `yad --text-info --editable` (GTK3) into it through WOPEN's "run:", waits
+-- for the window to map, checks the first frame (sane size, not one flat
+-- colour), clicks into the text, types "echo hi" + Enter through TEXT and
+-- checks the pixels changed, checks WLIST, then closes the stream (the app
+-- is asked to close) and shuts the compositor down, killing whatever is left.
+-- The client gets only our WAYLAND_DISPLAY (DISPLAY is unset), so nothing
+-- reaches the host desktop.
+--
+-- Args: output directory for first.png and typed.png (the frame after
+-- launch and after typing). Skips (exit 0 with a note) when yad is not installed.
+require 'core.protocol' -- before agent.capture: its backends use WIN_INPUT_*
+require 'agent.capture'
+require 'string'
+require 'stringbuilder'
+require 'io'
+require 'os'
+require 'arg'
+require 'vector'
+require 'memory'
+require 'math'
+
+## cinclude '<poll.h>'
+## cinclude '<unistd.h>'
+local pollfd <cimport, nodecl, ctypedef> = @record{ fd: cint, events: cshort, revents: cshort }
+local function poll(fds: *[0]pollfd, n: culong, timeout: cint): cint <cimport, nodecl> end
+local function getpid(): cint <cimport, nodecl> end
+local function unsetenv(name: cstring): cint <cimport, nodecl> end
+local function setenv(name: cstring, value: cstring, overwrite: cint): cint <cimport, nodecl> end
+local function access(path: cstring, mode: cint): cint <cimport, nodecl> end
+local POLLIN: cshort <cimport, nodecl, const>
+
+local outdir: string = #arg >= 1 and arg[1] or '.'
+
+if access('/usr/bin/yad', 1) ~= 0 then
+  print('skip: /usr/bin/yad is not installed')
+  return 0
+end
+unsetenv('DISPLAY') -- belt and braces: the launcher unsets it for the client too
+
+local function check(ok: boolean, what: string): void
+  if not ok then
+    io.stderr:write('FAIL: ', what, '\n')
+    capture_wayland_shutdown()
+    os.exit(1)
+  end
+end
+
+do
+  local sb: stringbuilder
+  sb:writef('ghostty-test-%d', getpid())
+  capture_wayland_configure(sb:promote(), 'us')
+end
+-- the host clipboard, as the agent would hand it in (tests: a string)
+local host_clip: string = 'from the host clipboard'
+local host_sets = 0
+local sets0 = 0
+local function test_clip_get(): (boolean, string) return true, string.copy(host_clip) end
+local function test_clip_set(p: *[0]uint8, n: usize): boolean
+  host_clip = string{data=(@*[0]byte)(p), size=n}:copy()
+  host_sets = host_sets + 1
+  return true
+end
+capture_wayland_set_clipboard(test_clip_get, test_clip_set)
+local ok, be, why = capture_select('wayland')
+check(ok, 'backend: ' .. why)
+print('socket ' .. capture_wayland_socket())
+
+-- one main loop turn: sleep on the backend's fd as the agent does, then pump
+local function turn(ms: integer): void
+  local fds: [4]cint
+  local n = be.poll_fds(&fds, 4)
+  local pf: [4]pollfd
+  for i = 0, < n do pf[i] = { fd = fds[i], events = POLLIN } end
+  local w = be.wait_ms()
+  if w < 0 or w > ms then w = ms end
+  poll(&pf, (@culong)(n), (@cint)(w))
+  be.pump()
+end
+
+local function run_for(seconds: float64): void
+  local until_t = os.now() + seconds
+  while os.now() < until_t do turn(20) end
+end
+
+local function frame_of(h: pointer): CaptureFrame
+  local fr: CaptureFrame
+  check(be.frame(h, &fr), 'a frame')
+  return fr
+end
+
+-- PNG, uncompressed (stored deflate blocks): enough to look at a frame.
+local crc_table: [256]uint32
+for n = 0, < 256 do
+  local c: uint32 = (@uint32)(n)
+  for _ = 1, 8 do
+    if c & 1 ~= 0 then c = 0xEDB88320 ~ (c >> 1) else c = c >> 1 end
+  end
+  crc_table[n] = c
+end
+
+local function be32(sb: *stringbuilder, v: uint32): void
+  sb:writebyte((@uint8)(v >> 24)) sb:writebyte((@uint8)((v >> 16) & 255))
+  sb:writebyte((@uint8)((v >> 8) & 255)) sb:writebyte((@uint8)(v & 255))
+end
+
+local function chunk(out: *stringbuilder, typ: string, body: string): void
+  be32(out, (@uint32)(#body))
+  local crc: uint32 = 0xFFFFFFFF
+  for i = 1, #typ do crc = crc_table[(crc ~ typ:byte(i)) & 255] ~ (crc >> 8) end
+  for i = 1, #body do crc = crc_table[(crc ~ body:byte(i)) & 255] ~ (crc >> 8) end
+  out:write(typ, body)
+  be32(out, crc ~ 0xFFFFFFFF)
+end
+
+local function save_png(fr: CaptureFrame, name: string): void
+  -- raw scanlines: filter byte 0, then RGB
+  local raw: stringbuilder
+  for y = 0, < fr.h do
+    raw:writebyte(0)
+    for x = 0, < fr.w do
+      local o = (@usize)(y) * fr.stride + (@usize)(x) * 4
+      raw:writebyte(fr.pixels[o + 2]) raw:writebyte(fr.pixels[o + 1]) raw:writebyte(fr.pixels[o])
+    end
+  end
+  local r = raw:promote()
+  local z: stringbuilder
+  z:writebyte(0x78) z:writebyte(0x01)
+  local pos, a, b = 0, 1_u32, 0_u32
+  while true do
+    local n = math.min(#r - pos, 65535)
+    z:writebyte(pos + n >= #r and 1 or 0)
+    z:writebyte((@uint8)(n & 255)) z:writebyte((@uint8)(n >> 8))
+    z:writebyte((@uint8)(~n & 255)) z:writebyte((@uint8)((~n >> 8) & 255))
+    for i = pos + 1, pos + n do
+      local c = r:byte(i)
+      z:writebyte(c)
+      a = (a + c) % 65521
+      b = (b + a) % 65521
+    end
+    pos = pos + n
+    if pos >= #r then break end
+  end
+  be32(&z, (b << 16) | a)
+  r:destroy()
+  local zs = z:promote()
+  local hdr: stringbuilder
+  be32(&hdr, (@uint32)(fr.w)) be32(&hdr, (@uint32)(fr.h))
+  hdr:writebyte(8) hdr:writebyte(2) hdr:writebyte(0) hdr:writebyte(0) hdr:writebyte(0)
+  local hs = hdr:promote()
+  local out: stringbuilder
+  out:write('\x89PNG\r\n\x1a\n')
+  chunk(&out, 'IHDR', hs)
+  chunk(&out, 'IDAT', zs)
+  chunk(&out, 'IEND', '')
+  local png = out:promote()
+  local path = outdir .. '/' .. name
+  local f = io.open(path, 'wb')
+  check(f:isopen(), 'open ' .. path)
+  f:write(png)
+  f:close()
+  png:destroy() zs:destroy() hs:destroy()
+  print('saved ' .. path)
+end
+
+-- how many pixels differ between two BGRA frames of the same size
+local function differing(a: *[0]uint8, b: *[0]uint8, n: usize): integer
+  local d = 0
+  for i = 0, < n // 4 do
+    local o = i * 4
+    if a[o] ~= b[o] or a[o+1] ~= b[o+1] or a[o+2] ~= b[o+2] then d = d + 1 end
+  end
+  return d
+end
+
+
+-- Right-click near the window's bottom-right corner: the context menu opens
+-- beyond the window, so the picture grows to hold it and the boxes say where
+-- the window and the menu are; Escape closes it and the picture shrinks back.
+local function popup_check(h: pointer, w0: integer, h0: integer, name: string): void
+  local e: CaptureInput = { kind = WIN_INPUT_BUTTON, x = w0 - 30, y = h0 // 2, button = 1, down = true }
+  be.input(h, &e)
+  e.down = false
+  be.input(h, &e)
+  local t1 = os.now()
+  local f: CaptureFrame
+  while os.now() - t1 < 5 do
+    turn(20)
+    if be.frame(h, &f) and f.nbox >= 2 and (f.w > w0 or f.h > h0) then break end
+  end
+  f = frame_of(h)
+  print(string.format('%s menu open: picture %dx%d, %d boxes, window at %d,%d %dx%d, menu at %d,%d %dx%d', name, f.w, f.h, f.nbox,
+    f.nbox > 0 and f.boxes[0].x or -1, f.nbox > 0 and f.boxes[0].y or -1, f.nbox > 0 and f.boxes[0].w or -1, f.nbox > 0 and f.boxes[0].h or -1,
+    f.nbox > 1 and f.boxes[1].x or -1, f.nbox > 1 and f.boxes[1].y or -1, f.nbox > 1 and f.boxes[1].w or -1, f.nbox > 1 and f.boxes[1].h or -1))
+  check(f.nbox >= 2, name .. ': the menu is a box of the picture')
+  check(f.w > w0 or f.h > h0, name .. ': the picture grew beyond the window')
+  check(f.boxes[0].w == w0 and f.boxes[0].h == h0, name .. ': box 0 is the window')
+  check(f.boxes[1].x + f.boxes[1].w > f.boxes[0].x + f.boxes[0].w, name .. ': the menu reaches past the window\'s right edge')
+  -- the menu has pixels of its own out there (not black)
+  local mx, my = f.boxes[1].x + f.boxes[1].w - 8, f.boxes[1].y + f.boxes[1].h // 2
+  local o = (@usize)(my) * f.stride + (@usize)(mx) * 4
+  check(f.pixels[o] ~= 0 or f.pixels[o + 1] ~= 0 or f.pixels[o + 2] ~= 0, name .. ': menu pixels outside the window')
+  save_png(f, name .. '-menu.png')
+  e = { kind = WIN_INPUT_KEY, hid = 0x29, down = true } -- Escape
+  be.input(h, &e)
+  e.down = false
+  be.input(h, &e)
+  t1 = os.now()
+  while os.now() - t1 < 5 do
+    turn(20)
+    if be.frame(h, &f) and f.w == w0 and f.h == h0 then break end
+  end
+  f = frame_of(h)
+  check(f.w == w0 and f.h == h0 and f.nbox == 1, name .. ': back to the window alone after Escape')
+end
+
+-- WLIST before anything runs: only the launch line
+do
+  local l = be.list()
+  check(l == WAYLAND_LAUNCH_LINE, 'empty list: ' .. l)
+  l:destroy()
+end
+
+-- launch; pending until the app's first toplevel maps
+local h, err = be.open(0, 'run:yad --text-info --editable --width=640 --height=400 --title=ghostty-wayland-test')
+check(h ~= nilptr, 'open: ' .. err)
+local st, sw = be.state(h)
+check(st == CAPTURE_PENDING, 'pending right after launch')
+local t0 = os.now()
+while st == CAPTURE_PENDING and os.now() - t0 < 30 do
+  turn(50)
+  st, sw = be.state(h)
+end
+check(st == CAPTURE_LIVE, 'live: ' .. sw)
+print(string.format('mapped after %.2f s, title "%s"', os.now() - t0, be.title(h)))
+
+-- first frame: wait for one, then let it settle
+local fr: CaptureFrame
+t0 = os.now()
+while not be.frame(h, &fr) and os.now() - t0 < 10 do turn(20) end
+run_for(1.0)
+fr = frame_of(h)
+print(string.format('first frame %dx%d serial %d', fr.w, fr.h, fr.serial))
+check(fr.w >= 200 and fr.h >= 150 and fr.w <= 4096 and fr.h <= 4096, 'sane size')
+do
+  local first = fr.pixels[0] | (@uint32)(fr.pixels[1]) << 8 | (@uint32)(fr.pixels[2]) << 16
+  local other = 0
+  for i = 0, < fr.w * fr.h do
+    local o = i * 4
+    local c = fr.pixels[o] | (@uint32)(fr.pixels[o+1]) << 8 | (@uint32)(fr.pixels[o+2]) << 16
+    if c ~= first then other = other + 1 end
+  end
+  print('pixels unlike the first: ' .. tostring(other))
+  check(other > 1000, 'the frame is not one flat colour')
+  -- the window geometry starts at (0,0): no black band of client shadow
+  -- (or of an unrendered scan-out buffer) down the left edge
+  local black = 0
+  for y = 0, < fr.h do
+    local o = (@usize)(y) * fr.stride
+    if fr.pixels[o] == 0 and fr.pixels[o+1] == 0 and fr.pixels[o+2] == 0 then black = black + 1 end
+  end
+  check(black < fr.h // 4, 'left edge is the window, not shadow')
+end
+save_png(fr, 'first.png')
+local before: vector(uint8)
+before:resize((@usize)(fr.w * fr.h * 4))
+for y = 0, < fr.h do
+  memory.copy(&before[(@usize)(y * fr.w * 4)], &fr.pixels[(@usize)(y) * fr.stride], (@usize)(fr.w * 4))
+end
+local w0, h0, serial0 = fr.w, fr.h, fr.serial
+
+-- WLIST shows the window by title
+do
+  local l = be.list()
+  check(l:find('ghostty-wayland-test', 1, true) > 0, 'listed: ' .. l)
+  io.write(l)
+  l:destroy()
+end
+
+-- click into the text view, then type
+local ev: CaptureInput = { kind = WIN_INPUT_FOCUS }
+be.input(h, &ev)
+ev = { kind = WIN_INPUT_MOVE, x = w0 // 2, y = h0 // 3 }
+be.input(h, &ev)
+ev = { kind = WIN_INPUT_BUTTON, x = w0 // 2, y = h0 // 3, button = 0, down = true }
+be.input(h, &ev)
+ev.down = false
+be.input(h, &ev)
+run_for(0.3)
+ev = { kind = WIN_INPUT_TEXT, text = 'echo hi\n' }
+be.input(h, &ev)
+ev = { kind = WIN_INPUT_KEY, hid = 0x0B, down = true, mods = WIN_MOD_SHIFT } -- Shift+h via KEY
+be.input(h, &ev)
+ev.down = false
+be.input(h, &ev)
+ev = { kind = WIN_INPUT_WHEEL, x = w0 // 2, y = h0 // 3, dy = 120 }
+be.input(h, &ev)
+-- count frames for a while (the caret blinks, typing redraws)
+local frames = 0
+local last = serial0
+t0 = os.now()
+while os.now() - t0 < 2.0 do
+  turn(10)
+  local f2: CaptureFrame
+  if be.frame(h, &f2) and f2.serial ~= last then frames = frames + 1 last = f2.serial end
+end
+print(string.format('%d new frames in 2 s after typing', frames))
+fr = frame_of(h)
+check(fr.serial ~= serial0, 'a new frame after typing')
+check(fr.w == w0 and fr.h == h0, 'same size after typing')
+local changed = differing(&before[0], fr.pixels, (@usize)(fr.w * fr.h * 4))
+print('pixels changed by typing: ' .. tostring(changed))
+check(changed > 50, 'typing changed the pixels')
+save_png(fr, 'typed.png')
+popup_check(h, w0, h0, 'xdg')
+
+-- the client goes away (release): the window and yad stay, listed with a
+-- launch id; "key:" finds the window again, and a key for a window that is
+-- not there ends after a short wait
+be.release(h)
+run_for(0.5)
+do
+  local l = be.list()
+  local at = l:find('ghostty-wayland-test\t', 1, true)
+  check(at > 0, 'the window stays after release: ' .. l)
+  local nl = l:find('\n', at, true)
+  local launch = l:sub(at + #'ghostty-wayland-test\t', nl - 1)
+  check(#launch > 0, 'a launch id in the list')
+  print('launch id ' .. launch)
+  local hk, errk = be.open(0, 'key:' .. launch) -- the launch id alone, as the plugin sends it
+  check(hk ~= nilptr, 'key open: ' .. errk)
+  local sk = be.state(hk)
+  check(sk == CAPTURE_LIVE and be.title(hk) == 'ghostty-wayland-test', 'key: re-attached at once')
+  h = hk
+  local hm = be.open(0, 'key:\tno-such-app\tnothing')
+  local t2 = os.now()
+  local sm, wm = be.state(hm)
+  while sm == CAPTURE_PENDING and os.now() - t2 < 8 do turn(50) sm, wm = be.state(hm) end
+  check(sm == CAPTURE_ENDED, 'a missing key ends: ' .. wm)
+  print(string.format('missing key ended after %.1f s: %s', os.now() - t2, wm))
+  be.close(hm)
+  l:destroy() launch:destroy()
+end
+
+-- close: the launched app is asked to close (also when re-attached by its
+-- key); its exit is reaped
+be.close(h)
+run_for(1.0)
+do
+  local l = be.list()
+  check(l == WAYLAND_LAUNCH_LINE, 'window gone from the list after close: ' .. l)
+  l:destroy()
+end
+-- An X11 client through Xwayland: the same yad forced onto X11. Xwayland
+-- starts with it (lazily); its toplevel is a window like the xdg one.
+local function wait_live(hx: pointer, secs: float64): (integer, string)
+  local t1 = os.now()
+  local s1, w1 = be.state(hx)
+  while s1 == CAPTURE_PENDING and os.now() - t1 < secs do turn(50) s1, w1 = be.state(hx) end
+  return s1, w1
+end
+do
+  local tx = os.now()
+  local hx, errx = be.open(0, 'run:env GDK_BACKEND=x11 yad --text-info --editable --width=500 --height=300 --title=ghostty-x11-test')
+  check(hx ~= nilptr, 'x11 open: ' .. errx)
+  local sx, wx = wait_live(hx, 30)
+  check(sx == CAPTURE_LIVE, 'x11 live: ' .. wx)
+  print(string.format('X11 window mapped after %.2f s (Xwayland start included), title "%s"', os.now() - tx, be.title(hx)))
+  local fx: CaptureFrame
+  tx = os.now()
+  while not be.frame(hx, &fx) and os.now() - tx < 10 do turn(20) end
+  run_for(1.0)
+  fx = frame_of(hx)
+  print(string.format('X11 first frame %dx%d', fx.w, fx.h))
+  check(fx.w >= 200 and fx.h >= 150 and fx.w <= 2048 and fx.h <= 2048, 'x11 sane size')
+  save_png(fx, 'x11-first.png')
+  local l = be.list()
+  check(l:find('ghostty-x11-test', 1, true) > 0, 'x11 listed: ' .. l)
+  io.write(l)
+  l:destroy()
+  local bx: vector(uint8)
+  bx:resize((@usize)(fx.w * fx.h * 4))
+  for y = 0, < fx.h do memory.copy(&bx[(@usize)(y * fx.w * 4)], &fx.pixels[(@usize)(y) * fx.stride], (@usize)(fx.w * 4)) end
+  local xw, xh = fx.w, fx.h
+  ev = { kind = WIN_INPUT_MOVE, x = xw // 2, y = xh // 3 }
+  be.input(hx, &ev)
+  ev = { kind = WIN_INPUT_BUTTON, x = xw // 2, y = xh // 3, button = 0, down = true }
+  be.input(hx, &ev)
+  ev.down = false
+  be.input(hx, &ev)
+  run_for(0.3)
+  ev = { kind = WIN_INPUT_TEXT, text = 'typed into X11\n' }
+  be.input(hx, &ev)
+  run_for(1.0)
+  fx = frame_of(hx)
+  check(fx.w == xw and fx.h == xh, 'x11 same size after typing')
+  local cx = differing(&bx[0], fx.pixels, (@usize)(fx.w * fx.h * 4))
+  print('X11 pixels changed by typing: ' .. tostring(cx))
+  check(cx > 50, 'typing reached the X11 app')
+  save_png(fx, 'x11-typed.png')
+  popup_check(hx, xw, xh, 'x11')
+  bx:destroy()
+  be.close(hx) -- WM_DELETE_WINDOW: yad exits
+  run_for(1.0)
+  l = be.list()
+  check(l == WAYLAND_LAUNCH_LINE, 'x11 window gone after close: ' .. l)
+  l:destroy()
+end
+
+-- Installed apps: the host's real catalog is listed (counted, its icons
+-- cached into the scratch directory), then a
+-- made-up data home adds one app whose SVG icon gets cached as a PNG, and
+-- "app:NAME" launches it by fuzzy name. XDG_CACHE_HOME points into the
+-- scratch directory so the test writes nothing under ~/.cache.
+do
+  local cache = outdir .. '/xdg-cache'
+  setenv('XDG_CACHE_HOME', (@cstring)(cache.data), 1)
+  os.execute("rm -rf '" .. cache .. "'")
+  local host_apps = be.apps()
+  local n = 0
+  for i = 1, #host_apps do if host_apps:byte(i) == 10 then n = n + 1 end end
+  print(string.format('host catalog: %d app lines', n))
+  host_apps:destroy()
+  local home = outdir .. '/xdg-home'
+  os.execute("rm -rf '" .. home .. "' && mkdir -p '" .. home .. "/applications'")
+  local f = io.open(home .. '/applications/ghostty-test-yad.desktop', 'wb')
+  check(f:isopen(), 'write the desktop file')
+  f:write('[Desktop Entry]\nType=Application\nName=Ghostty Test Viewer\nExec=yad --text-info --width=300 --height=200 --title=ghostty-app-test %U\nIcon=' .. home .. '/icon.svg\nCategories=Utility;\n')
+  f:close()
+  f = io.open(home .. '/icon.svg', 'wb')
+  f:write('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><circle cx="8" cy="8" r="7" fill="teal"/></svg>')
+  f:close()
+  setenv('XDG_DATA_HOME', (@cstring)(home.data), 1)
+  local l = be.apps()
+  local want = 'app\tghostty-test-yad\tGhostty Test Viewer\t' .. cache .. '/ghostty-agent/icons/ghostty-test-yad-128.png\tUtility;\n'
+  check(l:find(want, 1, true) > 0, 'the made-up app listed with its icon path')
+  l:destroy()
+  local png = cache .. '/ghostty-agent/icons/ghostty-test-yad-128.png'
+  local t1 = os.now()
+  while access((@cstring)(png.data), 0) ~= 0 and os.now() - t1 < 10 do turn(50) end
+  check(access((@cstring)(png.data), 0) == 0, 'the icon was cached as ' .. png)
+  print(string.format('icon cached after %.2f s', os.now() - t1))
+  local ha, erra = be.open(0, 'app:ghostty test view')
+  check(ha ~= nilptr, 'app open: ' .. erra)
+  local sa, wa = wait_live(ha, 30)
+  check(sa == CAPTURE_LIVE, 'app live: ' .. wa)
+  check(be.title(ha) == 'ghostty-app-test', 'the app launched by name: ' .. be.title(ha))
+  be.close(ha)
+  run_for(0.5)
+  local hb, errb = be.open(0, 'app:no-such-app-qqq')
+  check(hb == nilptr and errb:find('no installed app', 1, true) > 0, 'unknown app refused: ' .. errb)
+  unsetenv('XDG_DATA_HOME')
+  unsetenv('XDG_CACHE_HOME')
+end
+
+-- A nested desktop: cage (a wlroots kiosk compositor, the one installed
+-- here) as our client, running yad inside it; the stream is cage's window.
+if access('/usr/bin/cage', 1) == 0 then
+  local hd, errd = be.open(0, 'desktop:cage yad --text-info --title=ghostty-nested-test')
+  check(hd ~= nilptr, 'desktop open: ' .. errd)
+  local sd, wd = wait_live(hd, 30)
+  check(sd == CAPTURE_LIVE, 'nested desktop live: ' .. wd)
+  local fd: CaptureFrame
+  local td = os.now()
+  while not be.frame(hd, &fd) and os.now() - td < 10 do turn(20) end
+  run_for(1.5)
+  fd = frame_of(hd)
+  local first = fd.pixels[0] | (@uint32)(fd.pixels[1]) << 8 | (@uint32)(fd.pixels[2]) << 16
+  local other = 0
+  for i = 0, < fd.w * fd.h do
+    local o = i * 4
+    local c = fd.pixels[o] | (@uint32)(fd.pixels[o+1]) << 8 | (@uint32)(fd.pixels[o+2]) << 16
+    if c ~= first then other = other + 1 end
+  end
+  print(string.format('nested cage: %dx%d, title "%s", %d pixels unlike the first', fd.w, fd.h, be.title(hd), other))
+  check(other > 1000, 'the nested desktop shows its app')
+  save_png(fd, 'nested-cage.png')
+  be.close(hd)
+  run_for(1.0)
+else
+  print('skip: cage is not installed (nested desktop)')
+end
+local hn, errn = be.open(0, 'desktop:no-such-compositor-qq')
+check(hn == nilptr and errn:find('not installed', 1, true) > 0, 'unknown desktop refused: ' .. errn)
+
+-- text-input-v3 and the clipboard, read back through yad --entry, which
+-- prints its text when Enter closes it
+local function entry_run(title: string, input: function(h: pointer): void): string
+  local out = outdir .. '/' .. title .. '.txt'
+  os.execute("rm -f '" .. out .. "'")
+  local he, erre = be.open(0, "run:yad --entry --width=400 --title=" .. title .. " > '" .. out .. "'")
+  check(he ~= nilptr, 'entry open: ' .. erre)
+  local se, we = wait_live(he, 30)
+  check(se == CAPTURE_LIVE, 'entry live: ' .. we)
+  run_for(0.8) -- mapped, focused, the text input enabled
+  input(he)
+  local t1 = os.now()
+  local text: string
+  while os.now() - t1 < 5 do
+    turn(50)
+    local f = io.open(out, 'rb')
+    if f:isopen() then
+      text = f:read('a')
+      f:close()
+      if #text > 0 then break end
+    end
+  end
+  be.close(he)
+  run_for(0.3)
+  return text
+end
+do
+  local typed = entry_run('ghostty-ti-test', function(h: pointer): void
+    local e: CaptureInput = { kind = WIN_INPUT_TEXT, text = 'héllo ✓ 日本 Ω\n' }
+    be.input(h, &e)
+  end)
+  print('text-input read back: ' .. typed)
+  check(typed == 'héllo ✓ 日本 Ω\n', 'TEXT with characters no us key types arrived whole')
+  -- paste: the host clipboard's text lands in the entry (ctrl+v)
+  local pasted = entry_run('ghostty-paste-test', function(h: pointer): void
+    local e: CaptureInput = { kind = WIN_INPUT_KEY, hid = 0x19, down = true, mods = WIN_MOD_CTRL } -- ctrl+v
+    be.input(h, &e)
+    e.down = false
+    be.input(h, &e)
+    run_for(0.5)
+    e = { kind = WIN_INPUT_TEXT, text = '\n' }
+    be.input(h, &e)
+  end)
+  print('pasted: ' .. pasted)
+  check(pasted == 'from the host clipboard\n', 'an app pasted the host clipboard')
+  -- copy: text selected and copied in an app reaches the host clipboard
+  sets0 = host_sets
+  entry_run('ghostty-copy-test', function(h: pointer): void
+    local e: CaptureInput = { kind = WIN_INPUT_TEXT, text = 'copied in the app ✓' }
+    be.input(h, &e)
+    local keys: [2]uint16 = { 0x04, 0x06 } -- ctrl+a, ctrl+c
+    for k = 0, < 2 do
+      e = { kind = WIN_INPUT_KEY, hid = keys[k], down = true, mods = WIN_MOD_CTRL }
+      be.input(h, &e)
+      e.down = false
+      be.input(h, &e)
+    end
+    local t2 = os.now()
+    while host_sets == sets0 and os.now() - t2 < 3 do turn(20) end
+    e = { kind = WIN_INPUT_TEXT, text = '\n' }
+    be.input(h, &e)
+  end)
+  print('host clipboard after the copy: ' .. host_clip)
+  check(host_clip == 'copied in the app ✓', 'the app\'s copy reached the host clipboard')
+end
+
+-- an open by match that never shows up times out as pending; not waited
+-- for here (30 s) - check it is pending and close it
+local h2 = be.open(0, 'no-such-window-anywhere')
+check(h2 ~= nilptr, 'match open')
+st = be.state(h2)
+check(st == CAPTURE_PENDING, 'match open waits')
+be.close(h2)
+-- a launch that exits without a window ends with its status
+local h3 = be.open(0, 'run:exit 3')
+check(h3 ~= nilptr, 'run open')
+t0 = os.now()
+st, sw = be.state(h3)
+while st == CAPTURE_PENDING and os.now() - t0 < 5 do turn(50) st, sw = be.state(h3) end
+check(st == CAPTURE_ENDED and sw:find('status 3', 1, true) > 0, 'exit status: ' .. sw)
+be.close(h3)
+capture_wayland_shutdown()
+print('wayland compositor OK')

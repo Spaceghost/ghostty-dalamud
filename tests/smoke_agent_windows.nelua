@@ -1,0 +1,172 @@
+-- Manual smoke test of a Windows ghostty-agent.exe, run from the host (not
+-- part of tests/run.sh: it needs the agent running on Windows or under Wine).
+--
+--   ghostty-agent.exe --listen 127.0.0.1:PORT --token-file TOKENFILE   (on Windows / under Wine)
+--   vendor/nelua-lang/nelua --cc tools/zig-cc.sh -P nogc -L . tests/smoke_agent_windows.nelua PORT TOKEN
+--
+-- Each step prints PASS or FAIL and the run goes on; the exit code is the
+-- number of failed steps. It opens cmd.exe, types into it, reads the output,
+-- resizes it, reattaches from a second connection, lists sessions after a
+-- disconnect, round-trips the Win32 clipboard, checks the exit status and a
+-- command that cannot start.
+require 'core.agent_client'
+require 'string'
+require 'vector'
+require 'io'
+require 'os'
+require 'arg'
+
+## cinclude '<unistd.h>'
+local function usleep(us: cuint): cint <cimport, nodecl> end
+
+local port: uint16 = (@uint16)(tointeger(arg[1]))
+local token: string = arg[2]
+
+local got: string = ''
+local opened_id: uint32 = 0
+local opened_count = 0
+local open_error: string = ''
+local exit_status: int32 = -1
+local exited = false
+local attached_count = 0
+local clip: string = ''
+local clip_answered = false
+local listr: string = ''
+local failures = 0
+
+local function on_event(ctx: pointer, ev: *AgentEvent): void
+  local text = string{data=(@*[0]byte)(ev.data), size=ev.len}
+  if ev.typ == PROTO_OPENED then
+    opened_id = ev.id
+    opened_count = opened_count + 1
+    if ev.id == 0 then open_error = text:copy() end
+  elseif ev.typ == PROTO_SDATA then got = got .. text
+  elseif ev.typ == PROTO_EXIT then exited = true exit_status = ev.status
+  elseif ev.typ == PROTO_ATTACHED then attached_count = attached_count + 1
+  elseif ev.typ == PROTO_CLIP then clip_answered = true if ev.status >= 0 then clip = text:copy() end
+  elseif ev.typ == PROTO_LISTR then listr = text:copy()
+  elseif ev.typ == PROTO_ERR then io.stderr:write('agent error: ', text, '\n')
+  end
+end
+
+local now: float64 = 0.0
+local function pump(c: *AgentClient, ticks: integer, done: function(): boolean): boolean
+  for _ = 1, ticks do
+    c:pump(now)
+    now = now + 0.01
+    if done() then return true end
+    usleep(10000)
+  end
+  return done()
+end
+
+local function step(name: string, ok: boolean, detail: string): void
+  if ok then print('PASS', name) else print('FAIL', name, detail) failures = failures + 1 end
+end
+
+local connecting: *AgentClient = nilptr -- closures are not supported: the condition reads this
+local function handshake_done(): boolean
+  return connecting:ready() or connecting.state == AgentState.Failed
+end
+
+local function connect(c: *AgentClient): boolean
+  c:init('127.0.0.1', port, token)
+  c.on_event = on_event
+  c:connect(now)
+  connecting = c
+  return pump(c, 500, handshake_done) and c:ready()
+end
+
+local c: AgentClient
+step('handshake', connect(&c), c.last_error)
+if not c:ready() then os.exit(1) end
+print('greeting version', c.version, 'nonce', c.nonce)
+
+local argv: vector(string)
+argv:push('cmd.exe')
+argv:push('/q')
+local env: vector(string)
+env:push('FOO=bar')
+env:push('PWD=C:\\')
+c:open(80, 24, &argv, &env)
+pump(&c, 1000, function(): boolean return opened_count > 0 end)
+step('OPEN cmd.exe', opened_id ~= 0, open_error)
+local sid = opened_id
+
+-- cmd prints `smoke-ok` only when it runs the line: the typed `smoke^-ok` differs
+local line: string = 'echo hi\recho smoke^-ok %FOO% & cd\r'
+c:write(sid, (@*[0]uint8)(line.data), line.size)
+pump(&c, 1500, function(): boolean return got:find('smoke-ok bar', 1, true) > 0 and got:find('C:\\\r', 1, true) > 0 end)
+print('--- output so far:')
+print((got:gsub('\27%[[%d;?]*[%a]', '')))
+print('---')
+step('echo hi through ConPTY', got:find('hi', 1, true) > 0, 'no "hi" in the output')
+step('command ran with the env override', got:find('smoke-ok bar', 1, true) > 0, 'no "smoke-ok bar"')
+step('PWD sets the working directory', got:find('C:\\\r', 1, true) > 0 or got:find('C:\\\n', 1, true) > 0 or got:find('C:\\>', 1, true) > 0, 'no C:\\ in the output')
+
+c:resize(sid, 100, 30)
+got = ''
+local mode: string = 'mode con\r'
+c:write(sid, (@*[0]uint8)(mode.data), mode.size)
+pump(&c, 800, function(): boolean return got:find('100', 1, true) > 0 and got:find('30', 1, true) > 0 end)
+print('mode con:', (got:gsub('\27%[[%d;?]*[%a]', '')))
+if got:find('mode con', 1, true) > 0 and got:find('recognize', 1, true) > 0 then
+  print('SKIP', 'RESIZE reaches the console (mode con)', 'no mode.exe here (Wine)')
+else
+  step('RESIZE reaches the console (mode con)', got:find('100', 1, true) > 0, 'mode con did not report 100 columns')
+end
+
+-- another connection reattaches and gets the history
+do
+  local d: AgentClient
+  local ok = connect(&d)
+  got = ''
+  attached_count = 0
+  if ok then
+    d:attach(sid, 0)
+    pump(&d, 500, function(): boolean return attached_count > 0 end)
+  end
+  step('ATTACH from a second connection replays history', ok and attached_count > 0 and got:find('smoke-ok', 1, true) > 0, 'no replay')
+  d:destroy()
+end
+
+-- the first client goes away completely; the session stays
+c:destroy()
+do
+  local e: AgentClient
+  local ok = connect(&e)
+  listr = ''
+  if ok then
+    e:list()
+    pump(&e, 300, function(): boolean return #listr > 0 end)
+  end
+  print('LIST:', listr)
+  step('session survives the client disconnecting', listr:find('cmd.exe', 1, true) > 0, 'not in LIST')
+
+  e:clip_set('copied in eorzea\nsecond line')
+  e:clip_get()
+  pump(&e, 300, function(): boolean return clip_answered end)
+  print('clipboard:', clip)
+  step('Win32 clipboard round trip', clip == 'copied in eorzea\r\nsecond line', 'got "' .. clip .. '"')
+
+  attached_count = 0
+  exited = false
+  e:attach(sid, 0)
+  pump(&e, 300, function(): boolean return attached_count > 0 end)
+  local bye: string = 'exit 7\r'
+  e:write(sid, (@*[0]uint8)(bye.data), bye.size)
+  pump(&e, 1000, function(): boolean return exited end)
+  step('EXIT with the shell status', exited and exit_status == 7, 'status ' .. tostring(exit_status))
+
+  argv:clear()
+  argv:push('no-such-program-ghostty.exe')
+  opened_count = 0
+  open_error = ''
+  e:open(80, 24, &argv, nilptr)
+  pump(&e, 500, function(): boolean return opened_count > 0 end)
+  print('open error:', open_error)
+  step('a command that cannot start is refused', opened_id == 0 and #open_error > 0, 'opened anyway')
+  e:destroy()
+end
+print('failures:', failures)
+os.exit(failures)

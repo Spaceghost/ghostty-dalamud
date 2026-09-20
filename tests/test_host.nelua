@@ -75,6 +75,55 @@ do
   c1:destroy() c2:destroy()
 end
 
+-- The info bar entry's list (core/app/inventory.nelua): every terminal by
+-- kind, in order pets, pins, windows, tabs, minimized; a pick brings that one
+-- forward and closes the list.
+do
+  assert(inventory_world_kind('pet') == InventoryKind.Pet and inventory_world_kind('hud') == InventoryKind.Docked)
+  assert(inventory_world_kind('world') == InventoryKind.Pin and inventory_world_kind('orbit') == InventoryKind.Pin
+    and inventory_world_kind('follow') == InventoryKind.Pin and inventory_world_kind('') == InventoryKind.Pin)
+  assert(inventory_kind_name(InventoryKind.Minimized) == 'minimized' and inventory_kind_name(InventoryKind.Pet) == 'pet')
+  -- lua/world.lua names an anchor's kind for the core
+  assert(luaL_loadstring(policy.L, "CONFIG.world.anchors[777] = { kind = 'pet' } CONFIG.world.anchors[778] = { kind = 'hud' }") == LUA_OK
+    and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  local k1, k2, k3 = policy_world_kind(777), policy_world_kind(778), policy_world_kind(779)
+  assert(k1 == 'pet' and k2 == 'hud' and k3 == '', 'CONFIG.world.kind')
+  k1:destroy() k2:destroy() k3:destroy()
+  assert(luaL_loadstring(policy.L, "CONFIG.world.anchors[777] = nil CONFIG.world.anchors[778] = nil") == LUA_OK
+    and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+
+  local rows: vector(InventoryRow)
+  inventory_collect(&rows)
+  local total = #host.world + #host.windows + #host.dropdown_tabs + #host.minimized
+  assert(total >= 2 and #rows == total, 'every terminal listed')
+  assert(rows[#rows - 1].kind == InventoryKind.Minimized and rows[#rows - 1].s.id == left, 'minimized last')
+  local tabs = 0
+  for i = 0, < #rows do
+    if rows[i].kind == InventoryKind.Tab then
+      assert(i == 0 or rows[i - 1].kind ~= InventoryKind.Minimized, 'tabs before minimized')
+      tabs = tabs + 1
+    end
+  end
+  assert(tabs == #host.dropdown_tabs)
+  rows:destroy()
+
+  inventory_toggle(5, 6)
+  assert(surface.list_open and surface.list_x == 5 and surface.list_y == 6 and surface.list_frames == 0)
+  inventory_pick(left)
+  assert(inventory_apply_pick() and not surface.list_open and #host.minimized == 0, 'a pick restores it and closes the list')
+  assert(not inventory_apply_pick(), 'the pick is consumed')
+  inventory_toggle(0, 0)
+  inventory_pick(99999)
+  assert(not inventory_apply_pick() and surface.list_open, 'a vanished terminal: nothing happens')
+  inventory_toggle(0, 0)
+  assert(not surface.list_open, 'a second click closes it')
+  assert(inventory_height(3, 1000) == 34 + 3 * 28 + 8 and inventory_height(0, 1000) == 34 + 28 + 8)
+  assert(inventory_height(100, 300) == 300, 'at most the given height')
+  local c = string.format('min %d', left)
+  assert(gu_command(c) == 0 and #host.minimized == 1)
+  c:destroy()
+end
+
 -- /term reload detaches agent shells instead of closing them (even when the new
 -- config fails to load), lets go of the full-screen panel, drag, camera, walk
 -- and animation, and saves the layout only when LISTR has restored it.

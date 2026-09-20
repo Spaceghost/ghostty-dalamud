@@ -1,0 +1,13 @@
+# LeakSanitizer suppressions for SAN=asan runs of tests/run.sh.
+# Only vendored or system code belongs here: a leak in core/, agent/ or lua/ is
+# a defect to fix, not to suppress. Each entry says what holds the allocation.
+
+# Lua 5.4 keeps its state for the life of the process in a few tests that never
+# call lua_close (the plugin closes it; core/lua.nelua's own tests do too).
+leak:luaS_newlstr
+leak:luaM_malloc_
+
+# dlopen of the loader test's core: glibc keeps the link map of a library that
+# stays loaded until exit.
+leak:_dl_catch_exception
+leak:dl_open_worker

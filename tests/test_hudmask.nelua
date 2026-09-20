@@ -1,0 +1,229 @@
+-- World panels beneath the game's HUD (core/hudmask.nelua): which addon
+-- rectangles count, a triangle minus a rectangle, and cutting the rectangles
+-- out of the tail of a draw list built by hand (full, partial and corner
+-- overlaps, a command shared with what came before, callbacks, colours and
+-- uvs of the new vertices, ImGui's write cursors afterwards).
+require 'core.hudmask'
+require 'string'
+require 'vector'
+require 'math'
+
+local function near(a: float32, b: float32, eps: float32): boolean return math.abs(a - b) < eps end
+
+-- rectangles ----------------------------------------------------------------------------------
+local function named(x: float32, y: float32, w: float32, h: float32, name: string): GuHudRect
+  local r: GuHudRect = { x = x, y = y, w = w, h = h }
+  for i = 0, < math.min(#name, HUDMASK_NAME - 1) do r.name[i] = (@cchar)(name.data[i]) end
+  return r
+end
+do
+  local rs: [5]GuHudRect = {
+    named(10, 900, 400, 60, '_ActionBar'),
+    named(0, 0, 2560, 1440, 'NamePlate'),        -- full screen: never
+    named(2200, 20, 300, 300, '_NaviMap'),
+    named(5, 5, 0, 0, 'Empty'),                  -- nothing to cut
+    named(100, 100, 50, 50, 'Ignored'),
+  }
+  local mask: HudMask
+  hudmask_set(&mask, (@*[0]GuHudRect)(&rs), 5, 'Other\nIgnored\n', 0, 0, 2560, 1440)
+  assert(mask.n == 2, 'the hotbar and the minimap count')
+  assert(mask.r[0].x == 10 and mask.r[0].w == 960 and mask.r[1].x == 2200, 'x0 y0 x1 y1')
+  hudmask_set(&mask, (@*[0]GuHudRect)(&rs), 5, 'Ignore', 100, 50, 2560, 1440)
+  assert(mask.n == 3 and mask.r[0].x == 110 and mask.r[0].y == 950, 'offset by the viewport; a name is matched whole')
+  assert(hudmask_hit(&mask, 120, 960) and not hudmask_hit(&mask, 5, 5), 'hit test')
+  hudmask_set(&mask, (@*[0]GuHudRect)(&rs), 5, '', 0, 0, 2560, 1440)
+  assert(mask.n == 3, 'nothing ignored: all but the full-screen and empty ones')
+  print('rectangles OK')
+end
+
+-- a triangle minus a rectangle ---------------------------------------------------------------------
+local function tri_area(p: *AdoptPoly): float32
+  return math.abs((p.v[1].x - p.v[0].x) * (p.v[2].y - p.v[0].y) - (p.v[2].x - p.v[0].x) * (p.v[1].y - p.v[0].y)) * 0.5
+end
+do
+  local t: AdoptPoly
+  t.n = 3
+  t.v[0] = { x = 0, y = 0 } t.v[1] = { x = 100, y = 0 } t.v[2] = { x = 0, y = 100 }
+  local out: vector(AdoptPoly)
+  -- a rectangle across the middle of the triangle
+  hudmask_subtract(&t, ImVec4{ 20, 20, 40, 40 }, &out)
+  local a: float32 = 0
+  for i = 0, < #out do
+    a = a + tri_area(&out[i])
+    local cx = (out[i].v[0].x + out[i].v[1].x + out[i].v[2].x) / 3
+    local cy = (out[i].v[0].y + out[i].v[1].y + out[i].v[2].y) / 3
+    assert(not (cx > 20 and cx < 40 and cy > 20 and cy < 40), 'no piece inside the rectangle')
+  end
+  assert(near(a, 5000 - 400, 0.5), 'the triangle less the rectangle')
+  -- apart: unchanged; covered: gone
+  out:clear()
+  hudmask_subtract(&t, ImVec4{ 200, 200, 300, 300 }, &out)
+  assert(#out == 1 and near(tri_area(&out[0]), 5000, 0.01), 'apart')
+  out:clear()
+  hudmask_subtract(&t, ImVec4{ -10, -10, 200, 200 }, &out)
+  assert(#out == 0, 'covered')
+  -- a rectangle across the corner at (100, 0): the part x >= 60 of the triangle is a
+  -- triangle 40 wide and 40 high; the rectangle takes the part of it below y 30
+  out:clear()
+  hudmask_subtract(&t, ImVec4{ 60, -10, 200, 30 }, &out)
+  a = 0
+  for i = 0, < #out do a = a + tri_area(&out[i]) end
+  local corner: float32 = 40 * 40 * 0.5 - 10 * 10 * 0.5 -- that part, less the tip above y 30
+  assert(near(a, 5000 - corner, 0.5), 'the corner cut off')
+  out:destroy()
+  print('subtract OK')
+end
+
+-- cutting a draw list ------------------------------------------------------------------------------
+local cmds: [64]ImDrawCmd
+local idx: [4096]uint16
+local vtx: [4096]ImDrawVert
+local dl: ImDrawList
+local reserves = 0
+local function reset(): void
+  cmds[0] = { ClipRect = { 0, 0, 2560, 1440 } }
+  dl.CmdBuffer = { Size = 1, Capacity = 64, Data = (@*[0]ImDrawCmd)(&cmds) }
+  dl.IdxBuffer = { Size = 0, Capacity = 4096, Data = (@*[0]uint16)(&idx) }
+  dl.VtxBuffer = { Size = 0, Capacity = 4096, Data = (@*[0]ImDrawVert)(&vtx) }
+  dl._VtxCurrentIdx = 0
+end
+-- as ImDrawList::PrimReserve
+local function fake_reserve(l: *ImDrawList, ni: cint, nv: cint): void
+  reserves = reserves + 1
+  l.CmdBuffer.Data[l.CmdBuffer.Size - 1].ElemCount = l.CmdBuffer.Data[l.CmdBuffer.Size - 1].ElemCount + (@cuint)(ni)
+  l.VtxBuffer.Size = l.VtxBuffer.Size + nv
+  l.IdxBuffer.Size = l.IdxBuffer.Size + ni
+end
+local function new_cmd(tex: usize): void
+  local n = dl.CmdBuffer.Size
+  cmds[n] = { ClipRect = { 0, 0, 2560, 1440 }, TextureId = (@pointer)(tex), IdxOffset = (@cuint)(dl.IdxBuffer.Size) }
+  dl.CmdBuffer.Size = n + 1
+end
+local function callback(): void
+  new_cmd(0)
+  cmds[dl.CmdBuffer.Size - 1].UserCallback = (@pointer)(0x1234_usize)
+  new_cmd(0)
+end
+-- a quad with uvs 0..1 across it and a colour fading left to right, into the last command
+local function quad(x0: float32, y0: float32, x1: float32, y1: float32): void
+  local b = dl.VtxBuffer.Size
+  vtx[b] = { pos = vec2(x0, y0), uv = vec2(0, 0), col = 0xff000000 }
+  vtx[b + 1] = { pos = vec2(x1, y0), uv = vec2(1, 0), col = 0xff0000ff }
+  vtx[b + 2] = { pos = vec2(x1, y1), uv = vec2(1, 1), col = 0xff0000ff }
+  vtx[b + 3] = { pos = vec2(x0, y1), uv = vec2(0, 1), col = 0xff000000 }
+  local ks: [6]integer = { 0, 1, 2, 0, 2, 3 }
+  for k = 0, < 6 do idx[dl.IdxBuffer.Size + k] = (@uint16)(b + ks[k]) end
+  dl.VtxBuffer.Size = b + 4
+  dl.IdxBuffer.Size = dl.IdxBuffer.Size + 6
+  cmds[dl.CmdBuffer.Size - 1].ElemCount = cmds[dl.CmdBuffer.Size - 1].ElemCount + 6
+  dl._VtxCurrentIdx = (@cuint)(dl.VtxBuffer.Size)
+end
+-- the area drawn by indices [i0, i1), and whether any triangle's centre is inside `r`
+local function drawn_area(i0: integer, i1: integer, r: ImVec4): (float32, boolean)
+  local a: float32 = 0
+  local inside = false
+  local e = i0
+  while e + 2 < i1 do
+    local p, q, s = vtx[idx[e]].pos, vtx[idx[e + 1]].pos, vtx[idx[e + 2]].pos
+    a = a + math.abs((q.x - p.x) * (s.y - p.y) - (s.x - p.x) * (q.y - p.y)) * 0.5
+    local cx, cy = (p.x + q.x + s.x) / 3, (p.y + q.y + s.y) / 3
+    if cx > r.x and cx < r.z and cy > r.y and cy < r.w then inside = true end
+    e = e + 3
+  end
+  return a, inside
+end
+-- every command follows the one before in the index buffer
+local function contiguous(): boolean
+  local at: integer = 0
+  for c = 0, < dl.CmdBuffer.Size do
+    if (@integer)(cmds[c].IdxOffset) ~= at then return false end
+    at = at + (@integer)(cmds[c].ElemCount)
+  end
+  return at == dl.IdxBuffer.Size
+end
+local function mask1(r: ImVec4): HudMask
+  local m: HudMask
+  m.n = 1
+  m.r[0] = r
+  return m
+end
+
+do
+  -- a band through the middle of a panel quad
+  reset()
+  quad(0, 0, 100, 100)
+  local band: ImVec4 = { 40, -10, 60, 110 }
+  local m = mask1(band)
+  local cut = hudmask_cut(&dl, 0, 0, &m, fake_reserve)
+  assert(cut == 2, 'both triangles cut')
+  local a, inside = drawn_area(0, dl.IdxBuffer.Size, band)
+  assert(near(a, 10000 - 2000, 0.5) and not inside, 'the band is gone, the rest drawn')
+  assert(contiguous() and cmds[0].ElemCount == (@cuint)(dl.IdxBuffer.Size), 'one command, all of it')
+  assert(dl._VtxCurrentIdx == (@cuint)(dl.VtxBuffer.Size), 'ImGui writes after the new vertices')
+  assert(dl._VtxWritePtr == &vtx[dl.VtxBuffer.Size] and dl._IdxWritePtr == &idx[dl.IdxBuffer.Size], 'write pointers')
+  -- the new vertices on the band's edges: uv and colour interpolated
+  local found = false
+  for i = 4, < dl.VtxBuffer.Size do
+    if near(vtx[i].pos.x, 40, 0.01) and near(vtx[i].pos.y, 0, 0.01) then
+      found = true
+      assert(near(vtx[i].uv.x, 0.4, 0.001), 'uv at 40 %')
+      assert(((vtx[i].col & 0xff)) == 102 or ((vtx[i].col & 0xff)) == 101, 'red at 40 %')
+    end
+  end
+  assert(found, 'a vertex where the band starts')
+  print('band OK')
+end
+
+do
+  -- a corner overlap, and a rectangle apart: only the corner goes
+  reset()
+  quad(0, 0, 100, 100)
+  local m: HudMask
+  m.n = 2
+  m.r[0] = ImVec4{ 80, 80, 120, 120 }
+  m.r[1] = ImVec4{ 500, 500, 600, 600 }
+  assert(hudmask_cut(&dl, 0, 0, &m, fake_reserve) > 0)
+  local a, inside = drawn_area(0, dl.IdxBuffer.Size, m.r[0])
+  assert(near(a, 10000 - 400, 0.5) and not inside, 'the corner cut')
+  -- apart from everything: untouched, nothing reserved
+  reset()
+  quad(0, 0, 100, 100)
+  local before = reserves
+  local far = mask1(ImVec4{ 300, 300, 400, 400 })
+  assert(hudmask_cut(&dl, 0, 0, &far, fake_reserve) == 0 and reserves == before and dl.IdxBuffer.Size == 6, 'untouched')
+  -- under the HUD entirely: nothing drawn
+  local all = mask1(ImVec4{ -5, -5, 105, 105 })
+  assert(hudmask_cut(&dl, 0, 0, &all, fake_reserve) == 2)
+  assert(dl.IdxBuffer.Size == 0 and cmds[0].ElemCount == 0 and contiguous(), 'all gone')
+  print('corner, apart, covered OK')
+end
+
+do
+  -- a list with something before the panel in the same command (ImGui merged
+  -- the panel's first draw into it), a callback in the panel, a second texture
+  reset()
+  quad(0, 0, 100, 100)          -- someone else's, inside the rectangle: must stay
+  local first_idx, first_vtx = dl.IdxBuffer.Size, dl.VtxBuffer.Size
+  quad(200, 0, 300, 100)        -- the panel, same command
+  callback()                    -- a depth callback, then a fresh command
+  new_cmd(0x55)
+  quad(200, 100, 300, 200)      -- the panel, another texture
+  local r: ImVec4 = { 250, -10, 400, 400 } -- the right half of the panel
+  local m = mask1(r)
+  assert(hudmask_cut(&dl, first_idx, first_vtx, &m, fake_reserve) == 4)
+  assert(contiguous(), 'commands follow each other')
+  assert(cmds[0].IdxOffset == 0 and cmds[0].ElemCount > 6, 'the shared command keeps what came before')
+  local a0 = drawn_area(0, 6, ImVec4{})
+  assert(near(a0, 10000, 0.01), 'what came before is untouched')
+  local a1, in1 = drawn_area(6, (@integer)(cmds[0].ElemCount), r)
+  assert(near(a1, 5000, 0.5) and not in1, 'the panel in that command lost its right half')
+  assert(cmds[1].UserCallback ~= nilptr and cmds[1].ElemCount == 0, 'the callback stays, in place')
+  local last = dl.CmdBuffer.Size - 1
+  assert(cmds[last].TextureId == (@pointer)(0x55_usize), 'the texture stays with its command')
+  local a2, in2 = drawn_area((@integer)(cmds[last].IdxOffset), (@integer)(cmds[last].IdxOffset + cmds[last].ElemCount), r)
+  assert(near(a2, 5000, 0.5) and not in2, 'and so did the one in the next')
+  print('shared command and callbacks OK')
+end
+
+hudmask_destroy()
+print('test_hudmask OK')

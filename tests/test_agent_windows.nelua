@@ -1,0 +1,528 @@
+-- End to end: remote window streams through a running ghostty-agent started
+-- with `--windows test` (see tests/run.sh), over raw protocol frames: WLIST,
+-- WOPEN by id and by match, WOPENED, KEY and delta WFRAMEs rebuilt against
+-- the test backend's own pixels, downscaling, flow control, every WINPUT
+-- kind, WCLOSE, WEND, failures, and streams staying with their connection.
+require 'core.sys.net'
+require 'core.protocol'
+require 'core.wincodec'
+require 'agent.capture' -- capture_test_render: the pixels the agent's test backend draws
+require 'string'
+require 'vector'
+require 'memory'
+require 'io'
+require 'os'
+require 'arg'
+
+## cinclude '<unistd.h>'
+local function usleep(us: cuint): cint <cimport, nodecl> end
+
+local port: uint16 = (@uint16)(tointeger(arg[1]))
+local token: string = arg[2]
+local port_off: uint16 = (@uint16)(tointeger(arg[3])) -- an agent started with --windows off
+
+local Msg = @record{ typ: uint8, data: vector(uint8) }
+
+local Conn = @record{
+  sock: NetSocket,
+  inq: ByteQueue,
+  outq: ByteQueue,
+  msgs: vector(Msg),
+  closed: boolean,
+}
+
+local function conn_pump(c: *Conn): void
+  while c.outq:len() > 0 do
+    local n = net.send(c.sock, c.outq:peek(), c.outq:len())
+    if n <= 0 then break end
+    c.outq:consume((@usize)(n))
+  end
+  local buf: [65536]uint8
+  for _ = 1, 64 do
+    local n = net.recv(c.sock, &buf, #buf)
+    if n > 0 then c.inq:push(&buf, (@usize)(n))
+    elseif n == 0 then break
+    else c.closed = true break end
+  end
+  while true do
+    local ok, typ, payload, len = proto.read_frame(&c.inq)
+    if not ok then break end
+    local m: Msg = { typ = typ }
+    m.data:resize(len)
+    if len > 0 then memory.copy(&m.data[0], payload, len) end
+    c.msgs:push(m)
+    proto.frame_consume(&c.inq, len)
+  end
+end
+
+local function send(c: *Conn, typ: uint8, p: *[0]uint8, len: usize): void
+  proto.write_frame(&c.outq, typ, p, len)
+  conn_pump(c)
+end
+
+local function msg_text(m: *Msg, from: usize): string
+  if #m.data <= from then return (@string){} end
+  return string{data=(@*[0]byte)(&m.data[from]), size=#m.data - from}
+end
+
+-- The first message of type `typ` (and, with `sid` ~= 0, whose payload starts
+-- with it), waiting up to `secs`. False on timeout. The caller destroys m.data.
+local function take(c: *Conn, typ: uint8, sid: uint32, secs: number): (boolean, Msg)
+  local tries = (@integer)(secs * 200)
+  for t = 0, tries do
+    for i = 0, < #c.msgs do
+      local m = &c.msgs[i]
+      if m.typ == typ and (sid == 0 or (#m.data >= 4 and proto.get_u32((@*[0]uint8)(&m.data[0])) == sid)) then
+        local got = $m
+        c.msgs:remove(i)
+        return true, got
+      end
+    end
+    if t < tries then usleep(5000) conn_pump(c) end
+  end
+  return false, (@Msg){}
+end
+
+local function count(c: *Conn, typ: uint8, sid: uint32): integer
+  local n = 0
+  for i = 0, < #c.msgs do
+    local m = &c.msgs[i]
+    if m.typ == typ and (sid == 0 or proto.get_u32((@*[0]uint8)(&m.data[0])) == sid) then n = n + 1 end
+  end
+  return n
+end
+
+local function settle(c: *Conn, secs: number): void
+  for _ = 1, (@integer)(secs * 200) do usleep(5000) conn_pump(c) end
+end
+
+local function conn_open_at(at: uint16): Conn
+  local c: Conn
+  local nc = net.connect('127.0.0.1', at)
+  assert(net.is_valid(nc.sock), 'connect')
+  for _ = 1, 400 do
+    if net.connect_poll(&nc) == 1 then break end
+    usleep(5000)
+  end
+  assert(nc.connected, 'connected')
+  c.sock = nc.sock
+  send(&c, PROTO_HELLO, (@*[0]uint8)(token.data), token.size)
+  local ok, m = take(&c, PROTO_OK, 0, 3)
+  assert(ok, 'handshake')
+  assert(msg_text(&m, 0):find('ghostty-agent 4 ', 1, true) == 1, 'a version 4 agent')
+  m.data:destroy()
+  return c
+end
+
+local function conn_open(): Conn return conn_open_at(port) end
+
+local function conn_close(c: *Conn): void
+  net.close(c.sock)
+  for i = 0, < #c.msgs do c.msgs[i].data:destroy() end
+  c.msgs:destroy()
+  c.inq:destroy()
+  c.outq:destroy()
+end
+
+local function wlist(c: *Conn): string
+  send(c, PROTO_WLIST, nilptr, 0)
+  local ok, m = take(c, PROTO_WLISTR, 0, 3)
+  assert(ok, 'WLISTR')
+  local s = msg_text(&m, 0):copy()
+  m.data:destroy()
+  return s
+end
+
+-- WOPEN; returns (req, sid, w, h, title) from its WOPENED
+local next_req: uint32 = 100
+local function wopen(c: *Conn, wid: uint32, max_w: uint16, max_h: uint16, fps: uint8, match: string): (uint32, uint32, integer, integer, string)
+  next_req = next_req + 1
+  local p: [13 + 64]uint8
+  proto.put_u32(&p, next_req)
+  proto.put_u32((@*[0]uint8)(&p[4]), wid)
+  proto.put_u16((@*[0]uint8)(&p[8]), max_w)
+  proto.put_u16((@*[0]uint8)(&p[10]), max_h)
+  p[12] = fps
+  if #match > 0 then memory.copy(&p[13], match.data, match.size) end
+  send(c, PROTO_WOPEN, &p, 13 + match.size)
+  local ok, m = take(c, PROTO_WOPENED, next_req, 3)
+  assert(ok, 'WOPENED for the request')
+  local sid = proto.get_u32((@*[0]uint8)(&m.data[4]))
+  local w = (@integer)(proto.get_u16((@*[0]uint8)(&m.data[8])))
+  local h = (@integer)(proto.get_u16((@*[0]uint8)(&m.data[10])))
+  local title = msg_text(&m, 12):copy()
+  m.data:destroy()
+  return next_req, sid, w, h, title
+end
+
+local function send_sid(c: *Conn, typ: uint8, sid: uint32): void
+  local p: [4]uint8
+  proto.put_u32(&p, sid)
+  send(c, typ, &p, 4)
+end
+
+local function wack(c: *Conn, sid: uint32, seq: uint32): void
+  local p: [8]uint8
+  proto.put_u32(&p, sid)
+  proto.put_u32((@*[0]uint8)(&p[4]), seq)
+  send(c, PROTO_WACK, &p, 8)
+end
+
+local function winput(c: *Conn, sid: uint32, kind: uint8, body: *[0]uint8, n: usize): void
+  local p: [64]uint8
+  proto.put_u32(&p, sid)
+  p[4] = kind
+  if n > 0 then memory.copy(&p[5], body, n) end
+  send(c, PROTO_WINPUT, &p, 5 + n)
+end
+
+-- What a client shows for one stream.
+local Screen = @record{ w: integer, h: integer, px: vector(uint8) }
+
+-- Receive one whole seq of `sid` into `scr`: (seq, key, changed pixel count).
+local function recv_seq(c: *Conn, sid: uint32, scr: *Screen, secs: number): (uint32, boolean, integer)
+  local seq: uint32 = 0
+  local key = false
+  local area = 0
+  while true do
+    local ok, m = take(c, PROTO_WFRAME, sid, secs)
+    assert(ok, 'a WFRAME arrives')
+    local okf, f = wincodec_parse((@*[0]uint8)(&m.data[0]), #m.data)
+    assert(okf and f.sid == sid)
+    if seq == 0 then seq = f.seq else assert(f.seq == seq, 'one seq at a time') end
+    if f.flags & WINCODEC_FLAG_KEY ~= 0 then
+      key = true
+      scr.w, scr.h = f.w, f.h
+      scr.px:resize((@usize)(scr.w * scr.h * 4))
+    end
+    assert(f.w == scr.w and f.h == scr.h, 'a new size comes as a KEY frame')
+    while true do
+      local okr, fr = wincodec_next_rect(&f)
+      if not okr then break end
+      assert(wincodec_apply_rect(&fr, (@*[0]uint8)(&scr.px[0]), (@usize)(scr.w * 4)))
+      area = area + (@integer)(fr.r.w) * (@integer)(fr.r.h)
+    end
+    local ended = f.flags & WINCODEC_FLAG_END ~= 0
+    m.data:destroy()
+    if ended then break end
+  end
+  return seq, key, area
+end
+
+local function same_rgb(a: *[0]uint8, b: *[0]uint8, n: integer): boolean
+  for i = 0, < n do
+    local o = i * 4
+    if a[o] ~= b[o] or a[o+1] ~= b[o+1] or a[o+2] ~= b[o+2] then return false end
+  end
+  return true
+end
+
+-- the screen equals frame `n` of test window `wid` (w x h), scaled to fit max
+local function check_frame(scr: *Screen, wid: uint32, n: integer, w: integer, h: integer, max_w: integer, max_h: integer): boolean
+  local want: vector(uint8)
+  local small: vector(uint8)
+  capture_test_render(wid, n, w, h, &want)
+  local f, sw, sh = wincodec_downscale((@*[0]uint8)(&want[0]), (@usize)(w * 4), w, h, max_w, max_h, &small)
+  local src = f > 1 and (@*[0]uint8)(&small[0]) or (@*[0]uint8)(&want[0])
+  local ok = scr.w == sw and scr.h == sh and same_rgb(src, (@*[0]uint8)(&scr.px[0]), sw * sh)
+  want:destroy()
+  small:destroy()
+  return ok
+end
+
+local function status_line(c: *Conn): string
+  local text = wlist(c)
+  local at = text:find('4\t16\t16\ttest\t', 1, true)
+  assert(at > 0, 'status window listed')
+  local e = text:find('\n', at, true)
+  local tab = text:find('\t', at + 13, true) -- a sid: column when this connection streams it
+  if tab > 0 and tab < e then e = tab end
+  local s = text:sub(at + 13, e - 1)
+  text:destroy()
+  return s
+end
+
+local c1 = conn_open()
+
+-- WLIST
+do
+  local text = wlist(&c1)
+  print('WLISTR:', (text:gsub('\t', ' '):gsub('\n', ' | ')))
+  assert(text == '1\t320\t200\ttest\tpattern one\n2\t64\t48\ttest\tpattern two\n3\t96\t64\ttest\tclosing\n4\t16\t16\ttest\tstatus: 0 open\n',
+    'the test backend\'s windows')
+  text:destroy()
+end
+
+-- WOPEN by id: WOPENED, a KEY frame of frame 1, a delta for frame 2, then flow control
+local sid1: uint32
+do
+  local req, sid, w, h, title = wopen(&c1, 1, 0, 0, 60, '')
+  print('WOPENED', req, sid, w, h, title)
+  assert(sid ~= 0 and w == 320 and h == 200 and title == 'pattern one', 'WOPENED: size and title')
+  sid1 = sid
+  local scr: Screen
+  local seq, key, area = recv_seq(&c1, sid, &scr, 3)
+  assert(seq == 1 and key and area == 320 * 200, 'the first frame is a whole KEY frame')
+  assert(check_frame(&scr, 1, 1, 320, 200, 0, 0), 'KEY frame decodes to the backend\'s pixels')
+  seq, key, area = recv_seq(&c1, sid, &scr, 3)
+  print('delta frame: changed pixels', area)
+  assert(seq == 2 and not key and area < 320 * 200 // 4, 'the second frame is a small delta')
+  assert(check_frame(&scr, 1, 2, 320, 200, 0, 0), 'the delta rebuilds frame 2')
+  settle(&c1, 0.3)
+  assert(count(&c1, PROTO_WFRAME, sid) == 0, 'no third seq without a WACK')
+  wack(&c1, sid, 1)
+  seq, key, area = recv_seq(&c1, sid, &scr, 3)
+  assert(seq == 3 and not key and check_frame(&scr, 1, 3, 320, 200, 0, 0), 'a WACK lets the next frame go')
+  settle(&c1, 0.2)
+  assert(count(&c1, PROTO_WFRAME, sid) == 0, 'two unacknowledged again (2 and 3)')
+  wack(&c1, sid, 3)
+  seq, key, area = recv_seq(&c1, sid, &scr, 3)
+  local seq5
+  seq5, key, area = recv_seq(&c1, sid, &scr, 3)
+  assert(seq == 4 and seq5 == 5 and check_frame(&scr, 1, 5, 320, 200, 0, 0), 'frames 4 and 5 after acknowledging 3')
+  scr.px:destroy()
+  title:destroy()
+end
+
+-- WOPEN by match (wid 0, any case): a still window sends one frame and then nothing
+local sid2: uint32
+do
+  local req, sid, w, h, title = wopen(&c1, 0, 0, 0, 0, 'PATTERN two')
+  assert(sid ~= 0 and sid ~= sid1 and w == 64 and h == 48 and title == 'pattern two', 'WOPEN by match')
+  sid2 = sid
+  local scr: Screen
+  local seq, key, area = recv_seq(&c1, sid, &scr, 3)
+  assert(seq == 1 and key and check_frame(&scr, 2, 1, 64, 48, 0, 0))
+  wack(&c1, sid, 1)
+  settle(&c1, 0.3)
+  assert(count(&c1, PROTO_WFRAME, sid) == 0, 'an unchanged window sends nothing')
+  scr.px:destroy()
+  title:destroy()
+end
+
+-- a size limit: frames arrive scaled, input maps back to window pixels
+do
+  local req, sid, w, h, title = wopen(&c1, 1, 160, 120, 30, '')
+  assert(w == 160 and h == 100, 'WOPENED carries the scaled size')
+  local scr: Screen
+  local seq, key, area = recv_seq(&c1, sid, &scr, 3)
+  assert(seq == 1 and key and check_frame(&scr, 1, 1, 320, 200, 160, 120), 'a scaled KEY frame')
+  local b: [4]uint8
+  proto.put_u16(&b, 10)
+  proto.put_u16((@*[0]uint8)(&b[2]), 20)
+  winput(&c1, sid, WIN_INPUT_MOVE, &b, 4)
+  local text = wlist(&c1)
+  assert(text:find('pattern one: move 21 41', 1, true) > 0, 'a scaled pointer maps back (x2, box centre)')
+  text:destroy()
+  send_sid(&c1, PROTO_WCLOSE, sid)
+  scr.px:destroy()
+  title:destroy()
+end
+
+-- every WINPUT kind reaches the backend
+local function expect_input(c: *Conn, want: string): void
+  local text = wlist(c)
+  -- the title ends the line, or a column follows it (sid: of our stream)
+  local bare = want:subview(1, #want - 1)
+  local at = text:find(bare, 1, true)
+  local next_b = at > 0 and text:byte(at + #bare) or 0
+  if at == 0 or (next_b ~= 10 and next_b ~= 9) then
+    print('WLISTR:', text)
+    error('input not seen: ' .. want)
+  end
+  text:destroy()
+end
+do
+  local b: [16]uint8
+  proto.put_u16(&b, 5) proto.put_u16((@*[0]uint8)(&b[2]), 6)
+  winput(&c1, sid1, WIN_INPUT_MOVE, &b, 4)
+  expect_input(&c1, 'pattern one: move 5 6\n')
+  b[4], b[5] = 1, 1
+  winput(&c1, sid1, WIN_INPUT_BUTTON, &b, 6)
+  expect_input(&c1, 'pattern one: button 1 down 5 6\n')
+  b[4], b[5] = 0, 0
+  winput(&c1, sid1, WIN_INPUT_BUTTON, &b, 6)
+  expect_input(&c1, 'pattern one: button 0 up 5 6\n')
+  proto.put_u16((@*[0]uint8)(&b[4]), (@uint16)(-120 & 0xffff))
+  proto.put_u16((@*[0]uint8)(&b[6]), 240)
+  winput(&c1, sid1, WIN_INPUT_WHEEL, &b, 8)
+  expect_input(&c1, 'pattern one: wheel 5 6 -120 240\n')
+  proto.put_u16(&b, 40) b[2] = 1 b[3] = WIN_MOD_CTRL | WIN_MOD_SHIFT
+  winput(&c1, sid1, WIN_INPUT_KEY, &b, 4)
+  expect_input(&c1, 'pattern one: key 40 down mods 3\n')
+  local typed: string = 'héllo'
+  winput(&c1, sid1, WIN_INPUT_TEXT, (@*[0]uint8)(typed.data), typed.size)
+  expect_input(&c1, 'pattern one: text héllo\n')
+  winput(&c1, sid1, WIN_INPUT_FOCUS, nilptr, 0)
+  expect_input(&c1, 'pattern one: focus\n')
+  -- negative coordinates clamp to the window
+  proto.put_u16(&b, (@uint16)(-7 & 0xffff)) proto.put_u16((@*[0]uint8)(&b[2]), 9999)
+  winput(&c1, sid1, WIN_INPUT_MOVE, &b, 4)
+  expect_input(&c1, 'pattern one: move 0 199\n')
+  -- a short body is ignored
+  winput(&c1, sid1, WIN_INPUT_BUTTON, &b, 3)
+  expect_input(&c1, 'pattern one: move 0 199\n')
+end
+
+-- failures answer WOPENED with sid 0 and why
+do
+  local req, sid, w, h, title = wopen(&c1, 99, 0, 0, 0, '')
+  assert(sid == 0 and title == 'no such window', 'an unknown wid fails')
+  title:destroy()
+  req, sid, w, h, title = wopen(&c1, 0, 0, 0, 0, 'zzz')
+  assert(sid == 0 and title == 'no such window', 'a match without a window fails')
+  title:destroy()
+end
+
+-- a window that goes away: WEND after its last frame
+do
+  local req, sid, w, h, title = wopen(&c1, 3, 0, 0, 60, '')
+  assert(sid ~= 0 and title == 'closing')
+  local scr: Screen
+  for n = 1, 3 do
+    local seq = recv_seq(&c1, sid, &scr, 3)
+    assert(seq == n)
+    wack(&c1, sid, seq)
+  end
+  assert(check_frame(&scr, 3, 3, 96, 64, 0, 0))
+  local ok, m = take(&c1, PROTO_WEND, sid, 3)
+  assert(ok, 'WEND for the closed window')
+  assert(msg_text(&m, 4) == 'window closed', 'WEND says why')
+  m.data:destroy()
+  scr.px:destroy()
+  title:destroy()
+end
+
+-- WCLOSE: the stream stops and its handle closes
+do
+  local before = status_line(&c1)
+  assert(before == 'status: 2 open', 'streams 1 and 2 are open, the rest closed: ' .. before)
+  send_sid(&c1, PROTO_WCLOSE, sid1)
+  local after = status_line(&c1)
+  assert(after == 'status: 1 open', 'WCLOSE closes the capture')
+  -- drop what was in flight, then nothing more
+  settle(&c1, 0.1)
+  for i = #c1.msgs - 1, 0, -1 do c1.msgs[i].data:destroy() c1.msgs:remove(i) end
+  wack(&c1, sid1, 5)
+  settle(&c1, 0.3)
+  assert(count(&c1, PROTO_WFRAME, sid1) == 0, 'no frames after WCLOSE')
+  before:destroy()
+  after:destroy()
+end
+
+-- another connection cannot see or touch the first one's streams
+do
+  local c2 = conn_open()
+  local b: [4]uint8
+  proto.put_u16(&b, 1) b[2] = 1 b[3] = 0
+  winput(&c2, sid2, WIN_INPUT_KEY, &b, 4)
+  send_sid(&c2, PROTO_WCLOSE, sid2)
+  wack(&c2, sid2, 1)
+  local text = wlist(&c2)
+  assert(text:find('\tpattern two\n', 1, true) > 0, 'input to a foreign stream is ignored')
+  text:destroy()
+  local s = status_line(&c2)
+  assert(s == 'status: 1 open', 'WCLOSE of a foreign stream is ignored')
+  s:destroy()
+  winput(&c1, sid2, WIN_INPUT_FOCUS, nilptr, 0)
+  expect_input(&c1, 'pattern two: focus\n')
+  settle(&c2, 0.2)
+  assert(count(&c2, PROTO_WFRAME, 0) == 0, 'no frames for streams it did not open')
+  -- its own streams go when it disconnects
+  local r, sa, w, h, t = wopen(&c2, 1, 0, 0, 0, '')
+  t:destroy()
+  r, sa, w, h, t = wopen(&c2, 4, 0, 0, 0, '')
+  t:destroy()
+  s = status_line(&c1)
+  assert(s == 'status: 3 open', s)
+  s:destroy()
+  conn_close(&c2)
+  local gone = false
+  for _ = 1, 100 do
+    s = status_line(&c1)
+    gone = s == 'status: 1 open'
+    s:destroy()
+    if gone then break end
+    usleep(10000)
+  end
+  assert(gone, 'a disconnect closes that connection\'s streams')
+end
+
+-- stray and malformed frames do not upset the agent
+do
+  send_sid(&c1, PROTO_WCLOSE, 424242)
+  wack(&c1, 424242, 1)
+  local p: [2]uint8 = { 1, 2 }
+  send(&c1, PROTO_WOPEN, &p, 2)
+  local ok, m = take(&c1, PROTO_ERR, 0, 3)
+  assert(ok and msg_text(&m, 0) == 'bad wopen', 'a short WOPEN gets ERR')
+  m.data:destroy()
+  local s = status_line(&c1)
+  assert(s == 'status: 1 open')
+  s:destroy()
+end
+
+conn_close(&c1)
+
+-- links (WOPEN "url:", the test backend's "browser" is window 2): a second
+-- link to a window the connection streams names that stream instead of a
+-- new one; links from a connection that does not watch the list (like
+-- `ghostty-agent --open-url`) put "raise:N" on the window's line for the
+-- watchers, a watcher's own links do not
+local function last_list(c: *Conn, secs: number): string
+  settle(c, secs)
+  local text: string
+  local i: integer = #c.msgs - 1
+  while i >= 0 do
+    if c.msgs[i].typ == PROTO_WLISTR then text = msg_text(&c.msgs[i], 0):copy() break end
+    i = i - 1
+  end
+  return text
+end
+do
+  local w = conn_open()
+  send(&w, PROTO_WLIST, (@*[0]uint8)(('watch').data), 5)
+  local okw, mw = take(&w, PROTO_WLISTR, 0, 3)
+  assert(okw, 'the watch list')
+  mw.data:destroy()
+  local c = conn_open()
+  local _, sa, _, _, ta = wopen(&c, 0, 0, 0, 0, 'url:https://example.org/a')
+  print('link WOPENED', sa, ta)
+  assert(sa ~= 0 and ta:find('pattern two', 1, true) == 1, 'a link opens the browser window')
+  local _, sb2, _, _, tb = wopen(&c, 0, 0, 0, 0, 'url:https://example.org/b')
+  assert(sb2 == sa, 'a second link names the stream that shows the browser already')
+  settle(&c, 0.2)
+  local text = last_list(&w, 0.3)
+  print('watcher list:', (text:gsub('\t', ' '):gsub('\n', ' | ')))
+  local line2 = text:find('2\t64\t48\ttest\tpattern two', 1, true)
+  assert(line2 > 0 and text:find('\traise:2\n', line2, true) > 0 and text:find('\traise:2\n', line2, true) < text:find('\n', line2, true) + 1,
+    'watchers see the window raised, once per link')
+  text:destroy()
+  local okl = wlist(&c)
+  assert(okl:find('\tsid:', okl:find('2\t64\t48\ttest\tpattern two', 1, true), true) > 0 and okl:find('\tsid:', okl:find('\tsid:', 1, true) + 1, true) == 0,
+    'one stream of the link window for that connection')
+  okl:destroy()
+  local _, sw = wopen(&w, 0, 0, 0, 0, 'url:https://example.org/c')
+  assert(sw ~= 0 and sw ~= sa, 'a link of another connection is its own stream')
+  local text2 = last_list(&w, 0.3)
+  assert(text2:find('raise:3', 1, true) == 0 and text2:find('raise:2', 1, true) > 0, 'a watcher\'s own link raises nothing')
+  text2:destroy()
+  ta:destroy() tb:destroy()
+  conn_close(&c)
+  conn_close(&w)
+end
+
+-- without a backend: WLIST gets ERR and WOPEN a failed WOPENED, both saying why
+do
+  local c = conn_open_at(port_off)
+  send(&c, PROTO_WLIST, nilptr, 0)
+  local ok, m = take(&c, PROTO_ERR, 0, 3)
+  assert(ok and msg_text(&m, 0) == 'window capture is off (--windows off)', 'WLIST without a backend')
+  m.data:destroy()
+  local req, sid, w, h, title = wopen(&c, 1, 0, 0, 0, '')
+  assert(sid == 0 and title == 'window capture is off (--windows off)', 'WOPEN without a backend')
+  title:destroy()
+  conn_close(&c)
+end
+
+print('test_agent_windows OK')

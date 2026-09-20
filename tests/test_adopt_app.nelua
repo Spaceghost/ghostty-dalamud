@@ -1,0 +1,723 @@
+-- Flat windows pulled into the world, in an embedded core against a fake
+-- ImGui with fake internals (a context, one plugin window with a draw list,
+-- context hooks) and a fake shim (addons, chat): /window adopt installs the
+-- RenderPre and NewFramePre hooks, RenderPre moves the window's drawing into
+-- a snapshot and empties its list, makes it click-through and keeps it on
+-- screen, the pet draws the snapshot, the pointer is remapped into the window
+-- (queued mouse events rewritten, the core still sees the real pointer),
+-- release gives position and flags back and takes the hooks off, the list is
+-- saved and pulled in again after a reload; the game's chat: lines from
+-- gu_chat, the addons hidden and shown again, typing sent through chat_send;
+-- the pull grip over a flat window.
+require 'core.host'
+require 'string'
+require 'vector'
+require 'arg'
+
+## cinclude '<stdlib.h>'
+local function calloc(n: csize, size: csize): pointer <cimport, nodecl> end
+local function free(p: pointer): void <cimport, nodecl> end
+local WINDOW_SIZE: csize <cimport 'sizeof(ImGuiWindow)', nodecl, const>
+local CONTEXT_SIZE: csize <cimport 'sizeof(ImGuiContext)', nodecl, const>
+local EVENT_SIZE: csize <cimport 'sizeof(ImGuiInputEvent)', nodecl, const>
+
+local function near(a: float32, b: float32, eps: float32): boolean return math.abs(a - b) < eps end
+
+local log_lines: vector(string)
+local function log_cb(level: cint, msg: cstring): void
+  io.write('[log ', level, '] ', msg, '\n')
+  log_lines:push(string.copy(msg))
+end
+local function logged(needle: string): integer
+  local n = 0
+  for i = 0, < #log_lines do
+    if log_lines[i]:find(needle, 1, true) > 0 then n = n + 1 end
+  end
+  return n
+end
+
+-- The game (as tests/test_remotewin.nelua): a player at (10, 0, 20), a camera behind it.
+local function game_player(which: cint, id: uint64, out: *GuObject): cint
+  $out = {}
+  if which == WORLD_PLAYER then
+    $out = { x = 10, y = 0, z = 20, rotation = 0, entity_id = 7, territory = 132, found = 1, height = 1.7, hitbox_radius = 0.5 }
+  end
+  return 1
+end
+local function fake_camera(c: *GuCamera): cint
+  $c = { width = 2560, height = 1440 }
+  local f = 1 / math.tan(0.78 / 2)
+  local a = f * 1440 / 2560
+  c.m[0] = -a
+  c.m[5] = f
+  c.m[11] = 1
+  c.m[12] = 10 * a
+  c.m[13] = -1.7 * f
+  c.m[15] = -15
+  c.m[14] = 0.1
+  return 1
+end
+
+-- The fake shim: the chat addons and the chat box ---------------------------------------------
+local addon_shown: [5]boolean = { true, true, false, false, false } -- ChatLog, ChatLogPanel_0 shown
+local ADDONS: [5]string = { 'ChatLog', 'ChatLogPanel_0', 'ChatLogPanel_1', 'ChatLogPanel_2', 'ChatLogPanel_3' }
+local shows, hides = 0, 0
+local function addon_index(name: cstring): integer
+  local n: string = name
+  for i = 0, < 5 do if ADDONS[i] == n then return i end end
+  return -1
+end
+local function fake_addon_rect(name: cstring, x: *float32, y: *float32, w: *float32, h: *float32): cint
+  local i = addon_index(name)
+  if i < 0 then return 0 end
+  $x, $y, $w, $h = 20, 900, 600, 300
+  return addon_shown[i] and 1 or 2
+end
+local function fake_addon_show(name: cstring, shown: cint): cint
+  local i = addon_index(name)
+  if i < 0 then return 0 end
+  addon_shown[i] = shown ~= 0
+  if shown ~= 0 then shows = shows + 1 else hides = hides + 1 end
+  return 1
+end
+local sent: vector(string)
+local function fake_chat_send(text: cstring): cint
+  sent:push(string.copy(text))
+  return 1
+end
+local function fake_config_uint(name: cstring, out: *uint32): cint
+  local n: string = name
+  if n == 'ColorSay' then $out = 0xFF102030 return 1 end
+  return 0
+end
+
+-- Fake ImGui ----------------------------------------------------------------------------
+local MAX_CMDS <comptime> = 4096
+local MAX_VERTS <comptime> = 400000
+local cmds: [MAX_CMDS]ImDrawCmd
+local verts: [MAX_VERTS]ImDrawVert
+local dl: ImDrawList
+local fg: ImDrawList
+local fg_cmds: [64]ImDrawCmd
+local fg_verts: [4096]ImDrawVert
+local viewport: ImGuiViewport = { Size = { 2560, 1440 } }
+local now: float64 = 300
+local mouse_at: ImVec2 = { -5000, -5000 }
+local frame_count = 0
+local chars: [8]uint16
+local io_state: ImGuiIO
+local function fake_io(): *ImGuiIO return &io_state end
+local enter_pressed = false
+local prim_verts = 0
+local texts: vector(string)
+
+local function reset_list(): void
+  cmds[0] = { ClipRect = { 0, 0, 2560, 1440 } }
+  dl.CmdBuffer = { Size = 1, Capacity = MAX_CMDS, Data = (@*[0]ImDrawCmd)(&cmds) }
+  dl.VtxBuffer = { Size = 0, Capacity = MAX_VERTS, Data = (@*[0]ImDrawVert)(&verts) }
+  fg_cmds[0] = { ClipRect = { 0, 0, 2560, 1440 } }
+  fg.CmdBuffer = { Size = 1, Capacity = 64, Data = (@*[0]ImDrawCmd)(&fg_cmds) }
+  fg.VtxBuffer = { Size = 0, Capacity = 4096, Data = (@*[0]ImDrawVert)(&fg_verts) }
+end
+local function push_vert(l: *ImDrawList, p: ImVec2, col: uint32): void
+  if l.VtxBuffer.Size >= l.VtxBuffer.Capacity then return end
+  l.VtxBuffer.Data[l.VtxBuffer.Size] = { pos = p, col = col }
+  l.VtxBuffer.Size = l.VtxBuffer.Size + 1
+  l.CmdBuffer.Data[l.CmdBuffer.Size - 1].ElemCount = l.CmdBuffer.Data[l.CmdBuffer.Size - 1].ElemCount + 1
+end
+local function quad(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32): void
+  push_vert(l, a, col) push_vert(l, vec2(b.x, a.y), col) push_vert(l, b, col) push_vert(l, vec2(a.x, b.y), col)
+end
+local function fake_rect_filled(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint): void quad(l, a, b, col) end
+local function fake_rect(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint, th: float32): void quad(l, a, b, col) end
+local function fake_line(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, th: float32): void quad(l, a, b, col) end
+local function fake_triangle(l: *ImDrawList, a: ImVec2, b: ImVec2, c: ImVec2, col: uint32): void
+  push_vert(l, a, col) push_vert(l, b, col) push_vert(l, c, col)
+end
+local function fake_text(l: *ImDrawList, font: *ImFont, size: float32, pos: ImVec2, col: uint32, tb: cstring, te: cstring, ww: float32, clip: *ImVec4): void
+  local s: string = tb
+  if te ~= nilptr then s = string{ data = (@*[0]byte)(tb), size = (@usize)((@isize)(te) - (@isize)(tb)) } end
+  texts:push(s:copy())
+  quad(l, pos, vec2(pos.x + 8, pos.y + 16), col)
+end
+local function fake_prim_reserve(l: *ImDrawList, idx: cint, vtx: cint): void end
+local function fake_prim_vtx(l: *ImDrawList, pos: ImVec2, uv: ImVec2, col: uint32): void
+  prim_verts = prim_verts + 1
+  push_vert(l, pos, col)
+end
+local function fake_uv(out: *ImVec2): void $out = vec2(0, 0) end
+local function fake_push_clip(l: *ImDrawList, a: ImVec2, b: ImVec2, intersect: boolean): void end
+local function fake_pop_clip(l: *ImDrawList): void end
+local function fake_calc(pOut: *ImVec2, font: *ImFont, size: float32, mw: float32, ww: float32, tb: cstring, te: cstring, rem: *cstring): void
+  local n: isize = 0
+  if te ~= nilptr then n = (@isize)(te) - (@isize)(tb) end
+  $pOut = vec2((@float32)(n) * 10, 16)
+end
+local function fake_bg(): *ImDrawList return &dl end
+local function fake_fg(): *ImDrawList return &fg end
+local function fake_viewport(): *ImGuiViewport return &viewport end
+local function fake_mouse(out: *ImVec2): void $out = mouse_at end
+local function fake_false_flags(flags: cint): boolean return false end
+local want_mouse = false
+local function fake_want_mouse(want: boolean): void if want then want_mouse = true end end
+local function fake_want_keyboard(want: boolean): void end
+local function fake_font(): *ImFont return nilptr end
+local function fake_font_size(): float32 return 16 end
+local function fake_time(): float64 return now end
+local function fake_clicked(button: cint, rep: boolean): boolean return false end
+local focus_nils = 0
+local function fake_focus_nil(): void focus_nils = focus_nils + 1 end
+local function fake_frame_count(): cint return frame_count end
+local function fake_key_down(key: cint): boolean return false end
+local function fake_key_pressed(key: cint, rep: boolean): boolean return key == ImGuiKey_Enter and enter_pressed end
+local function fake_set_clipboard(text: cstring): void end
+
+-- Fake internals: one context, one plugin window "Chat 2###chat2" --------------------------------
+local ctx = (@*ImGuiContext)(calloc(1, CONTEXT_SIZE))
+local win = (@*ImGuiWindow)(calloc(1, WINDOW_SIZE))
+local win_ptrs: [2]pointer
+local win_dl: ImDrawList
+local wcmds: vector(ImDrawCmd)
+local widx: vector(uint16)
+local wvtx: vector(ImDrawVert)
+local events = (@*[0]ImGuiInputEvent)(calloc(8, EVENT_SIZE))
+local wname: cstring = 'Chat 2###chat2'
+win.Name = wname
+win.Flags = ImGuiWindowFlags_NoCollapse
+win.Pos, win.Size = vec2(100, 50), vec2(400, 200)
+win.SizeFull = win.Size
+win.RootWindow = win
+win.RootWindowPopupTree = win
+win.DrawList = &win_dl
+win_ptrs[0] = win
+ctx.Windows = { Size = 1, Capacity = 2, Data = (@*[0]pointer)(&win_ptrs) }
+ctx.InputEventsQueue = { Size = 0, Capacity = 8, Data = events }
+
+-- The plugin draws its window: one quad and its text-like strip, as a frame's Begin/End would.
+local function plugin_draws(active: boolean): void
+  win.Active = active
+  win.Flags = ImGuiWindowFlags_NoCollapse -- Begin sets the plugin's own flags every frame
+  if win.SizeFull.x >= 1 then win.Size = win.SizeFull end -- Begin takes up the size asked for
+  wcmds:clear() widx:clear() wvtx:clear()
+  local x, y = win.Pos.x, win.Pos.y
+  -- Begin lays it out: the inner area below a 20 px title bar, inside a 1 px border
+  win.InnerRect = { Min = vec2(x + 1, y + 20), Max = vec2(x + win.Size.x - 1, y + win.Size.y - 1) }
+  wvtx:push(ImDrawVert{ pos = vec2(x + 10, y + 10), col = 0xff00ff00 })
+  wvtx:push(ImDrawVert{ pos = vec2(x + 390, y + 10), col = 0xff00ff00 })
+  wvtx:push(ImDrawVert{ pos = vec2(x + 390, y + 190), col = 0xff00ff00 })
+  wvtx:push(ImDrawVert{ pos = vec2(x + 10, y + 190), col = 0xff00ff00 })
+  local ks: [6]uint16 = { 0, 1, 2, 0, 2, 3 }
+  for k = 0, < 6 do widx:push(ks[k]) end
+  wcmds:push(ImDrawCmd{ ClipRect = { x, y, x + 400, y + 200 }, TextureId = (@pointer)(0x77_usize), ElemCount = 6 })
+  win_dl.CmdBuffer = { Size = 1, Capacity = 1, Data = (@*[0]ImDrawCmd)(&wcmds[0]) }
+  win_dl.IdxBuffer = { Size = 6, Capacity = 6, Data = (@*[0]uint16)(&widx[0]) }
+  win_dl.VtxBuffer = { Size = 4, Capacity = 4, Data = (@*[0]ImDrawVert)(&wvtx[0]) }
+end
+
+local HookRec = @record{ id: uint32, typ: cint, cb: pointer, removed: boolean }
+local hooks: vector(HookRec)
+local function fake_current_context(): *ImGuiContext return ctx end
+local win_id: string = 'chat2' -- the id part the fake window answers to
+local function fake_find(name: cstring): *ImGuiWindow
+  local id = adopt_window_id_part(name)
+  if id == win_id then return win end
+  return nilptr
+end
+local function fake_add_hook(c: *ImGuiContext, h: *ImGuiContextHook): uint32
+  hooks:push(HookRec{ id = #hooks + 1, typ = h.Type, cb = h.Callback })
+  return #hooks
+end
+local function fake_remove_hook(c: *ImGuiContext, id: uint32): void
+  for i = 0, < #hooks do if hooks[i].id == id then hooks[i].removed = true end end
+end
+local set_pos: vector(ImVec2)
+local function fake_set_window_pos(w: *ImGuiWindow, p: ImVec2, cond: cint): void
+  set_pos:push(p)
+  w.Pos = p
+end
+local set_size: vector(ImVec2)
+-- as ImGui: the size asked for lands in SizeFull, and Begin takes it up
+local function fake_set_window_size(w: *ImGuiWindow, sz: ImVec2, cond: cint): void
+  set_size:push(sz)
+  w.SizeFull = sz
+end
+-- the game's HUD: a hotbar, the name plates over the whole screen, and one where the test puts it
+local hud_extra: ImVec4 = { 0, 0, 0, 0 }
+local function put_rect(r: *GuHudRect, x: float32, y: float32, w: float32, h: float32, name: string): void
+  r.x, r.y, r.w, r.h = x, y, w, h
+  for i = 0, < #name do r.name[i] = (@cchar)(name.data[i]) end
+  r.name[#name] = 0
+end
+local function fake_hud_rects(out: *[0]GuHudRect, cap: cint): cint
+  assert(cap >= 3)
+  put_rect(&out[0], 900, 1300, 760, 90, '_ActionBar')
+  put_rect(&out[1], 0, 0, 2560, 1440, 'NamePlate')
+  if hud_extra.z <= hud_extra.x then return 2 end
+  put_rect(&out[2], hud_extra.x, hud_extra.y, hud_extra.z - hud_extra.x, hud_extra.w - hud_extra.y, '_PartyList')
+  return 3
+end
+local tex_pushes = 0
+local function fake_push_tex(l: *ImDrawList, t: pointer): void tex_pushes = tex_pushes + 1 end
+local function fake_pop_tex(l: *ImDrawList): void end
+local added_mouse: vector(ImVec2)
+local function fake_add_mouse(io: *ImGuiIO, x: float32, y: float32): void added_mouse:push(vec2(x, y)) end
+
+local function live_hooks(typ: cint): integer
+  local n = 0
+  for i = 0, < #hooks do if hooks[i].typ == typ and not hooks[i].removed then n = n + 1 end end
+  return n
+end
+local function run_hook(typ: cint): void
+  for i = 0, < #hooks do
+    if hooks[i].typ == typ and not hooks[i].removed then
+      local h: ImGuiContextHook
+      local f = (@function(*ImGuiContext, *ImGuiContextHook): void)(hooks[i].cb)
+      f(ctx, &h)
+    end
+  end
+end
+
+local function resolver(name: cstring): pointer
+  local n: string = name
+  if n == 'ImDrawList_AddRectFilled' then return (@pointer)(fake_rect_filled) end
+  if n == 'ImDrawList_AddRect' then return (@pointer)(fake_rect) end
+  if n == 'ImDrawList_AddLine' then return (@pointer)(fake_line) end
+  if n == 'ImDrawList_AddTriangleFilled' then return (@pointer)(fake_triangle) end
+  if n == 'ImDrawList_AddText_FontPtr' then return (@pointer)(fake_text) end
+  if n == 'ImDrawList_PrimReserve' then return (@pointer)(fake_prim_reserve) end
+  if n == 'ImDrawList_PrimVtx' then return (@pointer)(fake_prim_vtx) end
+  if n == 'igGetFontTexUvWhitePixel' then return (@pointer)(fake_uv) end
+  if n == 'ImDrawList_PushClipRect' then return (@pointer)(fake_push_clip) end
+  if n == 'ImDrawList_PopClipRect' then return (@pointer)(fake_pop_clip) end
+  if n == 'ImFont_CalcTextSizeA' then return (@pointer)(fake_calc) end
+  if n == 'igGetBackgroundDrawList_Nil' then return (@pointer)(fake_bg) end
+  if n == 'igGetForegroundDrawList_Nil' then return (@pointer)(fake_fg) end
+  if n == 'igGetMainViewport' then return (@pointer)(fake_viewport) end
+  if n == 'igGetMousePos' then return (@pointer)(fake_mouse) end
+  if n == 'igIsWindowHovered' then return (@pointer)(fake_false_flags) end
+  if n == 'igSetNextFrameWantCaptureMouse' then return (@pointer)(fake_want_mouse) end
+  if n == 'igSetNextFrameWantCaptureKeyboard' then return (@pointer)(fake_want_keyboard) end
+  if n == 'igGetFont' then return (@pointer)(fake_font) end
+  if n == 'igGetFontSize' then return (@pointer)(fake_font_size) end
+  if n == 'igGetTime' then return (@pointer)(fake_time) end
+  if n == 'igGetIO' then return (@pointer)(fake_io) end
+  if n == 'igIsMouseClicked' then return (@pointer)(fake_clicked) end
+  if n == 'igSetWindowFocus_Nil' then return (@pointer)(fake_focus_nil) end
+  if n == 'igGetFrameCount' then return (@pointer)(fake_frame_count) end
+  if n == 'igIsKeyDown' then return (@pointer)(fake_key_down) end
+  if n == 'igIsKeyPressed' then return (@pointer)(fake_key_pressed) end
+  if n == 'igSetClipboardText' then return (@pointer)(fake_set_clipboard) end
+  if n == 'igGetCurrentContext' then return (@pointer)(fake_current_context) end
+  if n == 'igFindWindowByName' then return (@pointer)(fake_find) end
+  if n == 'igAddContextHook' then return (@pointer)(fake_add_hook) end
+  if n == 'igRemoveContextHook' then return (@pointer)(fake_remove_hook) end
+  if n == 'igSetWindowPos_WindowPtr' then return (@pointer)(fake_set_window_pos) end
+  if n == 'igSetWindowSize_WindowPtr' then return (@pointer)(fake_set_window_size) end
+  if n == 'ImDrawList_PushTextureID' then return (@pointer)(fake_push_tex) end
+  if n == 'ImDrawList_PopTextureID' then return (@pointer)(fake_pop_tex) end
+  if n == 'ImGuiIO_AddMousePosEvent' then return (@pointer)(fake_add_mouse) end
+  return nilptr
+end
+
+local api: GuHostApi = {
+  size = #GuHostApi, log = log_cb, get_object = game_player, get_camera = fake_camera, resolve_imgui = resolver,
+  addon_rect = fake_addon_rect, addon_show = fake_addon_show, chat_send = fake_chat_send, config_uint = fake_config_uint,
+  hud_rects = fake_hud_rects,
+}
+local dir: string = arg[1]
+
+-- One frame: ImGui's NewFrame (hooks), the plugin's draw, ghostty's frame, Render (hooks).
+local function frame(press: boolean, plugin_active: boolean): void
+  run_hook(ImGuiContextHookType_NewFramePre)
+  ctx.InputEventsQueue.Size = 0 -- ImGui took them
+  plugin_draws(plugin_active)
+  reset_list()
+  for i = 0, < #texts do texts[i]:destroy() end
+  texts:clear()
+  now = now + 1.0 / 60
+  frame_count = frame_count + 1
+  ctx.FrameCount = frame_count
+  host.last_time = now
+  host.lmb_pressed = press and not host.lmb_down
+  host.lmb_down = press
+  host.click_used = false
+  host.terminal_focused = host.terminal_focused_now
+  host.terminal_focused_now = false
+  want_mouse = false
+  prim_verts = 0
+  panels_tick(now, true, true)
+  draw_world(now)
+  panels_after_world(now)
+  run_hook(ImGuiContextHookType_RenderPre)
+end
+
+-- panel pixel (u, v) of panel `id` on the screen
+local function panel_screen(id: integer, u: float32, v: float32): ImVec2
+  local ok, pl = policy_world_place(id, now, host.world_focus == id)
+  assert(ok)
+  local b = world_basis(pl)
+  local x, y, z = world_point(&b, u, v)
+  local cam: GuCamera
+  fake_camera(&cam)
+  local pok, sx, sy = world_project(&cam, x, y, z)
+  assert(pok)
+  return vec2(sx, sy)
+end
+local function saved(): string
+  local f = io.open(dir .. '/adopted.lua')
+  if not f:isopen() then return '' end
+  local s = f:read('a')
+  f:close()
+  return s
+end
+local function has_text(needle: string): boolean
+  for i = 0, < #texts do if texts[i]:find(needle, 1, true) > 0 then return true end end
+  return false
+end
+
+-- Setup ------------------------------------------------------------------------------------------
+os.remove(dir .. '/adopted.lua')
+assert(gu_init(&api, (@cstring)(dir.data)) == 0, 'init')
+host.agent_last_try = 1e9 -- never dial out
+assert(imgui_bind(resolver, nilptr) > 0)
+assert(luaL_loadstring(policy.L, "CONFIG.world.occlusion = 'off'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+policy_refresh()
+host.world_visible, host.world_rez, host.world_last_time = true, 1, now
+host.last_time = now
+io_state.InputQueueCharacters = { Size = 0, Capacity = #chars, Data = (@*[0]uint16)(&chars) }
+
+-- Adopt --------------------------------------------------------------------------------------------
+local s: *Session
+local aw: *AdoptWin
+do
+  assert(run_command('adopt nosuchwindow###zzz') == 0, 'any title is accepted (and waited for)')
+  local waiting = host.world[0]
+  assert(waiting.kind == TransportKind.Panel, 'a panel of kind Panel')
+  assert(live_hooks(ImGuiContextHookType_RenderPre) == 1 and live_hooks(ImGuiContextHookType_NewFramePre) == 1, 'both hooks on')
+  assert(imgui.GetMousePos ~= fake_mouse, 'the pointer is wrapped while hooks are on')
+  assert(run_command('release nosuchwindow###zzz') == 0)
+  assert(#host.world == 0 and live_hooks(ImGuiContextHookType_RenderPre) == 0 and live_hooks(ImGuiContextHookType_NewFramePre) == 0, 'the last release takes the hooks off')
+  assert(imgui.GetMousePos == fake_mouse and imgui.SetWindowFocusNil == fake_focus_nil, 'wrappers gone')
+
+  win.Pos = vec2(-50, 50) -- sticks out of the screen on the left
+  assert(run_command('adopt chat2') == 0)
+  assert(#host.world == 1)
+  s = host.world[0]
+  aw = adopt_of(s)
+  assert(aw ~= nilptr and aw.title == '###chat2' and aw.entry.state == AdoptState.Waiting, 'waiting for its window')
+  assert(run_command('adopt chat2') == 4 and logged('already in the world') == 1, 'not twice')
+  s.appear = 1
+  -- the first frame: RenderPre finds the window drawn and takes its lists
+  frame(false, true)
+  assert(aw.drawn and win_dl.CmdBuffer.Size == 0, 'the list is emptied: nothing on the screen')
+  assert((win.Flags & ImGuiWindowFlags_NoMouseInputs) ~= 0, 'click-through while the pointer is elsewhere')
+  assert(#aw.snap.lists == 1 and #aw.snap.vtx == 4, 'kept in the snapshot')
+  -- the next frame: taken, moved inside the screen, drawn on the pet
+  frame(false, true)
+  assert(aw.entry.state == AdoptState.Adopted, 'adopted')
+  assert(#set_pos == 1 and set_pos[0].x == 0 and set_pos[0].y == 50, 'moved inside the screen')
+  assert(prim_verts > 0 and tex_pushes > 0, 'its drawing is on the pet, with its texture')
+  assert(has_text('back to UI') and has_text('Chat 2'), 'the title strip: back to UI and the label')
+  local mentions = saved():find('"chat2"', 1, true)
+  assert(mentions > 0, 'the pulled list is saved')
+  print('adopt OK')
+end
+
+-- The pointer ---------------------------------------------------------------------------------------
+do
+  -- let the fly-out finish
+  for _ = 1, 200 do frame(false, true) end
+  assert(not panel_flight_active(s.id), 'landed')
+  -- focused, the pointer over the middle of the window on the pet
+  host.world_focus = s.id
+  local ok, pl = policy_world_place(s.id, now, true)
+  assert(ok)
+  local u, v = pl.width * 0.5, PANEL_TITLE + (pl.height - PANEL_TITLE - PANEL_PAD) * 0.5
+  for _ = 1, 150 do frame(false, true) end -- focused: presented (floats toward you) and settled
+  mouse_at = panel_screen(s.id, u, v)
+  frame(false, true)
+  assert(aw.remap, 'remapped into the window')
+  assert(near(aw.target.x, 0 + 200, 20) and near(aw.target.y, 50 + 100, 20), 'aimed at the window centre')
+  assert(want_mouse, 'the mouse is ours (the window has it)')
+  assert((win.Flags & ImGuiWindowFlags_NoMouseInputs) == 0, 'the window takes the mouse while remapped')
+  -- NewFrame: the backend queued the real pointer; it becomes the window point
+  events[0].Type = ImGuiInputEventType_MousePos
+  events[0].MousePos = { mouse_at.x, mouse_at.y }
+  ctx.InputEventsQueue.Size = 1
+  run_hook(ImGuiContextHookType_NewFramePre)
+  assert(near(events[0].MousePos.PosX, aw.target.x, 0.01) and near(events[0].MousePos.PosY, aw.target.y, 0.01), 'queued position rewritten')
+  assert(adopt_remapping(), 'remapping this frame')
+  local p: ImVec2
+  mouse_at = vec2(1, 1) -- what ImGui now thinks (inside the window, say)
+  imgui.GetMousePos(&p)
+  assert(near(p.x, events[0].MousePos.PosX, 1e9) and not near(p.x, 1, 0.01), 'the core still sees the real pointer')
+  local focus_before = focus_nils
+  imgui.SetWindowFocusNil()
+  assert(focus_nils == focus_before, 'a click on the pet does not take the window\'s keyboard focus')
+  -- the pointer leaves (focus goes): the draw stops the remap, the next NewFrame
+  -- leaves the real position alone
+  host.world_focus = 0
+  mouse_at = vec2(5, 5)
+  local function queue_real(): void
+    events[0].Type = ImGuiInputEventType_MousePos
+    events[0].MousePos = { 5, 5 }
+    ctx.InputEventsQueue.Size = 1
+  end
+  queue_real()
+  frame(false, true)
+  assert(not aw.remap, 'not remapped without focus')
+  assert((win.Flags & ImGuiWindowFlags_NoMouseInputs) ~= 0, 'click-through again')
+  queue_real()
+  frame(false, true)
+  assert(not adopt_remapping() and events[0].MousePos.PosX == 5, 'the real position goes through')
+  imgui.GetMousePos(&p)
+  assert(p.x == 5 and p.y == 5, 'plain pointer again')
+  -- a remap ending while the mouse is still: the real position is queued again
+  host.world_focus = s.id
+  for _ = 1, 150 do frame(false, true) end
+  mouse_at = panel_screen(s.id, u, v)
+  frame(false, true)
+  frame(false, true)
+  assert(adopt_remapping(), 'remapped again')
+  host.world_focus = 0
+  frame(false, true)
+  local added = #added_mouse
+  frame(false, true)
+  assert(not adopt_remapping() and #added_mouse == added + 1, 'the real position queued when nothing else moved it')
+  print('pointer OK')
+end
+
+-- The window stops being drawn, and comes back ----------------------------------------------------------
+do
+  for _ = 1, 40 do frame(false, false) end
+  assert(aw.entry.state == AdoptState.Lost and #aw.snap.lists == 0, 'lost: no old picture')
+  assert(has_text('not drawn'), 'the panel says so')
+  frame(false, true)
+  frame(false, true)
+  assert(aw.entry.state == AdoptState.Adopted, 'drawn again')
+  print('lost and regained OK')
+end
+
+-- Reload: given back, pulled in again -----------------------------------------------------------------
+do
+  assert(run_command('reload') == 0)
+  assert(#host.world == 0 and adopt_count() == 0, 'reload closed it')
+  assert((win.Flags & ImGuiWindowFlags_NoMouseInputs) == 0, 'flags given back')
+  assert(set_pos[#set_pos - 1].x == -50, 'its own position given back')
+  assert(live_hooks(ImGuiContextHookType_RenderPre) == 0, 'hooks off across the reload')
+  assert(saved():find('"chat2"', 1, true) > 0, 'the list survives the reload')
+  host.world_visible, host.world_rez = true, 1
+  io_state.InputQueueCharacters = { Size = 0, Capacity = #chars, Data = (@*[0]uint16)(&chars) }
+  assert(luaL_loadstring(policy.L, "CONFIG.world.occlusion = 'off'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  win.Pos = vec2(100, 50)
+  frame(false, true)
+  assert(adopt_count() == 1 and #host.world == 1, 'pulled in again')
+  s = host.world[0]
+  aw = adopt_of(s)
+  s.appear = 1
+  frame(false, true)
+  frame(false, true)
+  assert(aw.entry.state == AdoptState.Adopted, 'adopted again')
+  print('reload OK')
+end
+
+-- Release ---------------------------------------------------------------------------------------------
+do
+  local n_pos = #set_pos
+  assert(run_command('release') == 0, 'no name: the newest')
+  assert(#host.world == 0 and adopt_count() == 0 and find_session(s.id) == nilptr, 'closed at once')
+  assert((win.Flags & ImGuiWindowFlags_NoMouseInputs) == 0, 'its flags as they were')
+  assert(#set_pos == n_pos, 'on screen from the start: not moved back')
+  assert(live_hooks(ImGuiContextHookType_RenderPre) == 0 and imgui.GetMousePos == fake_mouse, 'hooks off')
+  frame(false, true)
+  assert(win_dl.CmdBuffer.Size == 1, 'drawn on the screen again')
+  assert(saved():find('"chat2"', 1, true) == 0, 'the saved list is empty')
+  print('release OK')
+end
+
+-- Fitting: the window takes the pet's shape; the HUD --------------------------------------------------
+local function lua_run(code: string): void
+  assert(luaL_loadstring(policy.L, (@cstring)(code.data)) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, code)
+end
+local function inner_aspect(): float32
+  return (win.InnerRect.Max.x - win.InnerRect.Min.x) / (win.InnerRect.Max.y - win.InnerRect.Min.y)
+end
+local function box_aspect(id: integer): (float32, float32, float32)
+  local ok, pl = policy_world_place(id, now, host.world_focus == id)
+  assert(ok)
+  local bw, bh = pl.width - 2 * PANEL_PAD, pl.height - PANEL_TITLE - PANEL_PAD
+  return bw / bh, bw, bh
+end
+do
+  win.Pos, win.Size = vec2(100, 50), vec2(400, 200)
+  win.SizeFull = win.Size
+  set_size:clear()
+  assert(run_command('adopt chat2') == 0)
+  s = host.world[0]
+  aw = adopt_of(s)
+  s.appear = 1
+  for _ = 1, 200 do frame(false, true) end
+  assert(aw.fit and aw.entry.state == AdoptState.Adopted, 'adopted, fitting')
+  -- the pet took the window's inner area once; the window keeps the pet's shape
+  local ba, bw, bh = box_aspect(s.id)
+  assert(near(bw, 398 * 1.5, 1) and near(bh, 179 * 1.5, 1), 'the pet is the inner area at CONFIG.adopt.scale')
+  assert(near(inner_aspect(), ba, 0.01), 'the same shape')
+  assert(near(win.Size.x, 400, 1) and near(win.Size.y, 200, 1), 'which is the size it had')
+  -- the pet is resized (as the grips or a policy do: the anchor's width and height)
+  lua_run(string.format("local a = require('world').anchors[%d]; a.width = a.width * 1.6; a.height = a.height * 0.9", s.id))
+  for _ = 1, 3 do frame(false, true) end
+  ba, bw, bh = box_aspect(s.id)
+  assert(#set_size > 0, 'the window was resized')
+  assert(near(inner_aspect(), ba, 0.01), 'the window follows the new shape')
+  assert(near((win.InnerRect.Max.x - win.InnerRect.Min.x) * 1.5, bw, 2), 'at the same scale')
+  local asked = #set_size
+  for _ = 1, 5 do frame(false, true) end
+  assert(#set_size == asked, 'asked once, not every frame')
+  -- the pet's box is covered by the window's inner area
+  local m = adopt_cover(win.InnerRect.Min.x, win.InnerRect.Min.y, win.InnerRect.Max.x - win.InnerRect.Min.x,
+    win.InnerRect.Max.y - win.InnerRect.Min.y, PANEL_PAD, PANEL_TITLE, bw, bh)
+  local cx, cy = adopt_to_window(&m, PANEL_PAD, PANEL_TITLE)
+  local dx, dy = adopt_to_window(&m, PANEL_PAD + bw, PANEL_TITLE + bh)
+  assert(cx >= win.InnerRect.Min.x - 0.5 and cy >= win.InnerRect.Min.y - 0.5 and dx <= win.InnerRect.Max.x + 0.5 and dy <= win.InnerRect.Max.y + 0.5, 'no gap')
+  -- far larger than the screen: a smaller window, scaled up, still on the screen
+  lua_run(string.format("local a = require('world').anchors[%d]; a.width = 5000; a.height = 3000", s.id))
+  for _ = 1, 3 do frame(false, true) end
+  ba = box_aspect(s.id)
+  assert(win.Size.x <= 2560 + 0.5 and win.Size.y <= 1440 + 0.5, 'fits the screen')
+  assert(win.Pos.x >= 0 and win.Pos.y >= 0 and win.Pos.x + win.Size.x <= 2560 + 0.5 and win.Pos.y + win.Size.y <= 1440 + 0.5, 'kept on it')
+  assert(near(inner_aspect(), ba, 0.02), 'same shape')
+  -- the HUD: read from the shim, the full-screen layer left out
+  assert(host.hud_mask.n == 1 and host.hud_mask.r[0].x == 900, 'the hotbar counts, the name plates do not')
+  -- the pointer on the pet but on a HUD element over it: not into the window
+  lua_run(string.format("local a = require('world').anchors[%d]; a.width = 900; a.height = 600", s.id))
+  host.world_focus = s.id
+  for _ = 1, 150 do frame(false, true) end
+  local ok, pl = policy_world_place(s.id, now, true)
+  assert(ok)
+  mouse_at = panel_screen(s.id, pl.width * 0.5, PANEL_TITLE + (pl.height - PANEL_TITLE - PANEL_PAD) * 0.5)
+  frame(false, true)
+  assert(aw.remap, 'into the window')
+  hud_extra = { mouse_at.x - 20, mouse_at.y - 20, mouse_at.x + 20, mouse_at.y + 20 }
+  frame(false, true)
+  frame(false, true)
+  assert(host.hud_mask.n == 2 and not aw.remap, 'the party list over the pet has the pointer')
+  lua_run("CONFIG.world.under_hud = false")
+  for _ = 1, 40 do frame(false, true) end
+  assert(host.hud_mask.n == 0 and aw.remap, 'off: no HUD, the pointer goes in again')
+  lua_run("CONFIG.world.under_hud = true")
+  hud_extra = { 0, 0, 0, 0 }
+  host.world_focus = 0
+  mouse_at = vec2(-5000, -5000)
+  -- release: its own size, place and flags back
+  assert(run_command('release') == 0)
+  assert(near(set_size[#set_size - 1].x, 400, 0.01) and near(set_size[#set_size - 1].y, 200, 0.01), 'its own size given back')
+  assert(near(set_pos[#set_pos - 1].x, 100, 0.01) and near(set_pos[#set_pos - 1].y, 50, 0.01), 'and its place')
+  assert((win.Flags & ImGuiWindowFlags_NoMouseInputs) == 0, 'and its flags')
+  frame(false, true)
+  print('fit and HUD OK')
+end
+
+-- The game's chat ---------------------------------------------------------------------------------------
+do
+  gu_chat(10, 'Aa Bb', 'hello there')
+  gu_chat(57, '', 'system line')
+  frame(false, true)
+  assert(chatlog_count(&chat_ring) == 2 and chatlog_line(&chat_ring, 0).sender == 'Aa Bb', 'lines kept from before the pull')
+  assert(run_command('adopt chat') == 0)
+  assert(#host.world == 1 and chatpanel_open(), 'the chat is a pet')
+  local cs = host.world[0]
+  cs.appear = 1
+  assert(not addon_shown[0] and not addon_shown[1] and hides == 2, 'the shown chat addons are hidden')
+  assert(panel_flight_active(cs.id), 'flies out of the flat chat')
+  frame(false, true)
+  assert(has_text('Aa Bb: hello there') and has_text('system line'), 'the lines on the pet')
+  -- the game shows its chat again: hidden again
+  addon_shown[0] = true
+  for _ = 1, 20 do frame(false, true) end
+  assert(not addon_shown[0], 'hidden again')
+  -- typing: focus, characters, Enter
+  host.world_focus = cs.id
+  frame(false, true) -- the focusing frame types nothing
+  chars[0], chars[1] = 'h'_b, 'i'_b
+  io_state.InputQueueCharacters.Size = 2
+  enter_pressed = true
+  frame(false, true)
+  enter_pressed = false
+  assert(#sent == 1 and sent[0] == 'hi', 'sent through the game\'s chat box')
+  assert(io_state.InputQueueCharacters.Size == 0, 'the characters were ours')
+  assert(saved():find('"chat"', 1, true) > 0, 'saved')
+  -- back to the flat UI
+  assert(run_command('release chat') == 0)
+  assert(not chatpanel_open() and #host.world == 0, 'closed')
+  assert(addon_shown[0] and addon_shown[1] and not addon_shown[2], 'the addons we hid, and only those, shown again')
+  print('chat OK')
+end
+
+-- The pull grip ---------------------------------------------------------------------------------------------
+do
+  -- Alt over the flat window: the grip shows above it; a click on it pulls the window
+  io_state.KeyAlt = true
+  mouse_at = vec2(300, 150)
+  frame(false, true)
+  assert(fg.VtxBuffer.Size > 0 and has_text('pull into world'), 'the grip is drawn on the foreground list')
+  local g = adopt_grip_rect(100, 50, 400, 200, 0)
+  mouse_at = vec2((g.x + g.z) * 0.5, (g.y + g.w) * 0.5)
+  frame(false, true)
+  assert(want_mouse, 'the grip keeps the press from the game')
+  frame(true, true)
+  io_state.KeyAlt = false
+  assert(adopt_count() == 1 and adopt_at(0).title == 'Chat 2###chat2', 'pulled by its full name')
+  assert(panel_flight_active(adopt_at(0).s.id), 'flying out from where it was')
+  -- no modifier: no grip
+  frame(false, true)
+  assert(fg.VtxBuffer.Size == 0, 'no grip without the modifier')
+  assert(run_command('release') == 0)
+  print('grip OK')
+end
+
+-- Mappy: adopted automatically whenever its window is open -----------------------------------------------
+do
+  local mname: cstring = 'Mappy###MappyMapWindow'
+  win.Name = mname
+  win_id = 'MappyMapWindow'
+  for _ = 1, 40 do frame(false, true) end
+  assert(adopt_count() == 1, 'Mappy adopted without a command')
+  local m = adopt_at(0)
+  assert(m.automatic and m.name == 'mappy' and m.title == '###MappyMapWindow' and m.label == 'Mappy', 'as the known mappy window')
+  assert(panel_flight_active(m.s.id), 'flying out from the flat map')
+  for _ = 1, 3 do frame(false, true) end
+  assert(m.entry.state == AdoptState.Adopted and prim_verts > 0, 'the map on the pet')
+  assert(saved():find('mappy', 1, true) == 0, 'automatic windows are not in the saved list')
+  -- its plugin closes the map: the pet goes quietly, and comes back when it opens
+  for _ = 1, 60 do frame(false, false) end
+  assert(adopt_count() == 0 and #host.world == 0, 'gone with its window')
+  for _ = 1, 40 do frame(false, true) end
+  assert(adopt_count() == 1 and adopt_at(0).automatic, 'back when it opens again')
+  -- back to UI by hand: stays flat while it stays open
+  assert(run_command('release mappy') == 0)
+  assert(adopt_count() == 0 and adopt_declined('mappy'), 'given back and remembered')
+  for _ = 1, 60 do frame(false, true) end
+  assert(adopt_count() == 0 and win_dl.CmdBuffer.Size == 1, 'left on the flat UI while open')
+  -- closed and opened again: automatic again
+  for _ = 1, 40 do frame(false, false) end
+  assert(not adopt_declined('mappy'), 'forgotten once closed')
+  for _ = 1, 40 do frame(false, true) end
+  assert(adopt_count() == 1, 'automatic again after reopening')
+  -- the settings switch: off, it stays flat, and /window adopt mappy still pulls it
+  assert(luaL_loadstring(policy.L, "CONFIG.adopt.auto.mappy = false") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  assert(run_command('release') == 0)
+  for _ = 1, 40 do frame(false, false) end
+  for _ = 1, 60 do frame(false, true) end
+  assert(adopt_count() == 0, 'auto off: stays flat')
+  assert(run_command('adopt mappy') == 0 and adopt_count() == 1 and not adopt_at(0).automatic, 'pulled by hand')
+  for _ = 1, 3 do frame(false, true) end
+  assert(adopt_at(0).entry.state == AdoptState.Adopted, 'and drawn')
+  assert(saved():find('"mappy"', 1, true) > 0, 'a hand-pulled one is saved')
+  assert(run_command('release') == 0)
+  print('mappy OK')
+end
+
+gu_shutdown()
+free(win) free(ctx) free(events)
+print('test_adopt_app OK')

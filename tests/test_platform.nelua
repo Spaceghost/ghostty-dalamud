@@ -1,0 +1,89 @@
+-- Platform defaults: tests/test_platform.lua drives lua/platform.lua and the
+-- shipped init.lua per platform; here the core's side: ghostty.platform() on
+-- the host, the fallback choice (policy_open_profile) and an agent terminal
+-- switching to its fallback when the agent is down.
+require 'core.policy'
+require 'core.session'
+require 'core.sys.platform'
+require 'string'
+require 'io'
+require 'os'
+require 'arg'
+
+local root: string = arg[1]
+local scratch: string = arg[2]
+
+assert(not platform_is_wine())
+local pname = platform_name()
+assert(pname == 'linux' or pname == 'macos' or pname == 'posix')
+
+do
+  local L = luaL_newstate()
+  luaL_openlibs(L)
+  world_lua_register(L)
+  fs_lua_register(L)
+  local script = root .. '/tests/test_platform.lua'
+  if luaL_loadfilex(L, (@cstring)(script.data), nilptr) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_pushlstring(L, (@cstring)(root.data), root.size)
+  lua_pushlstring(L, (@cstring)(scratch.data), scratch.size)
+  if lua_pcall(L, 2, 0, 0) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_close(L)
+end
+
+-- policy_open_profile: only agent profiles, only while the agent is down,
+-- only to a conpty profile that exists
+do
+  local dir = scratch .. '/platform'
+  local luadir = dir .. '/lua'
+  assert(fs_mkdir((@cstring)(dir.data)) and fs_mkdir((@cstring)(luadir.data)))
+  local f = io.open(luadir .. '/init.lua', 'wb')
+  f:write([[
+return { profiles = {
+  { name = 'a', transport = 'agent', command = { 'x' }, fallback = 'a (local)' },
+  { name = 'b', transport = 'agent', command = { 'y' } },
+  { name = 'c', transport = 'agent', command = { 'z' }, fallback = 'missing' },
+  { name = 'd', transport = 'agent', command = { 'z' }, fallback = 'b' },
+  { name = 'a (local)', transport = 'conpty', command = { 'cmd.exe' } },
+  { name = 'e', transport = 'conpty', command = { 'cmd.exe' }, fallback = 'a' },
+} }
+]])
+  f:close()
+  assert(policy_load(dir), policy.error)
+  local a = policy_profile(0)
+  assert(a.fallback == 'a (local)' and policy_profile(1).fallback == '')
+  local local_a = policy_profile_named('a (local)')
+  assert(local_a ~= nilptr and local_a.transport == 'conpty')
+  assert(policy_open_profile(a, false) == a, 'agent up: the agent profile')
+  assert(policy_open_profile(a, true) == local_a, 'agent down: its fallback')
+  assert(policy_open_profile(policy_profile(1), true) == policy_profile(1), 'no fallback: unchanged')
+  assert(policy_open_profile(policy_profile(2), true) == policy_profile(2), 'a missing fallback: unchanged')
+  assert(policy_open_profile(policy_profile(3), true) == policy_profile(3), 'an agent fallback: unchanged')
+  assert(policy_open_profile(policy_profile(5), true) == policy_profile(5), 'conpty profiles never fall back')
+  assert(policy_open_profile(nilptr, true) == nilptr)
+  assert(policy_profile_named('') == nilptr and policy_profile_named('nope') == nilptr)
+
+  -- a terminal waiting for the agent switches to the fallback, typed input and all
+  local agent: AgentClient
+  agent:init('127.0.0.1', 1, '')
+  local s: Session
+  assert(s:init(1, a, 80, 24, &agent))
+  assert(s.kind == TransportKind.Agent and s.awaiting_open and s.fallback == 'a (local)')
+  s:write_string('dir\r')
+  assert(s.pending_out:len() == 4)
+  s:use_fallback(local_a)
+  assert(s.kind == TransportKind.ConPty and not s.awaiting_open and s.agent == nilptr)
+  assert(s.label == 'a (local)' and s.pending_out:len() == 0 and #s.open_argv == 0)
+  -- the host build has no ConPTY: the terminal says so and ends
+  assert(s.exited)
+  s:use_fallback(local_a) -- only once
+  s:destroy()
+  agent:destroy()
+  policy_unload()
+end
+print('OK')

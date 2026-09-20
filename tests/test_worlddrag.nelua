@@ -480,6 +480,105 @@ do
   print('drag gesture OK')
 end
 
+-- Dragging one pet onto another: the swap gesture -------------------------------------
+do
+  -- the title strip: the band the buttons sit in, and nothing outside the panel
+  assert(world_title_strip(1800, 900, 0) and world_title_strip(1800, 0, WORLD_BUTTON_PITCH - 1))
+  assert(not world_title_strip(1800, 900, WORLD_BUTTON_PITCH) and not world_title_strip(1800, -1, 10)
+    and not world_title_strip(1800, 1800, 10) and not world_title_strip(1800, 900, -1), 'only the strip')
+
+  local function on_title(): WorldOrderDragInput
+    return WorldOrderDragInput{ enabled = true, hover_id = 7, on_title = true, mx = 100, my = 40,
+      shown = true, threshold = 6 }
+  end
+  local d: WorldOrderDrag
+  local inp = on_title()
+  local st = world_order_drag_step(&d, inp)
+  assert(st.armed and not st.started and d.id == 0, 'hovering a pet\'s title arms it')
+  inp.alt = true
+  st = world_order_drag_step(&d, inp)
+  assert(not st.armed, 'Alt belongs to carrying a panel into the world')
+  inp.alt, inp.on_title = false, false
+  st = world_order_drag_step(&d, inp)
+  assert(not st.armed, 'the grid below the title is for selecting text')
+  inp = on_title()
+  inp.enabled = false
+  st = world_order_drag_step(&d, inp)
+  assert(not st.armed, 'a single pet has nothing to swap with')
+  inp = on_title()
+  inp.over_window = true
+  st = world_order_drag_step(&d, inp)
+  assert(not st.armed, 'not over an ImGui window')
+
+  -- a press that goes nowhere stays a click: nothing is swapped
+  inp = on_title()
+  inp.lmb_pressed, inp.lmb_down = true, true
+  st = world_order_drag_step(&d, inp)
+  assert(st.started and st.dragging and st.id == 7 and d.id == 7 and not d.moved)
+  inp = on_title()
+  inp.lmb_down, inp.hover_id = true, 7
+  inp.mx, inp.my = 102, 41
+  st = world_order_drag_step(&d, inp)
+  assert(st.dragging and not d.moved and st.over == 0, 'a couple of pixels is still a click')
+  inp.lmb_down = false
+  st = world_order_drag_step(&d, inp)
+  assert(not st.swap and st.cancelled and d.id == 0, 'a click swaps nothing')
+
+  -- dragged onto another pet: that one is highlighted and they swap on release
+  inp = on_title()
+  inp.lmb_pressed, inp.lmb_down = true, true
+  world_order_drag_step(&d, inp)
+  inp = on_title()
+  inp.lmb_down, inp.mx, inp.my = true, 400, 300
+  inp.hover_id = 9
+  st = world_order_drag_step(&d, inp)
+  assert(st.dragging and d.moved and st.over == 9 and st.id == 7, 'the pet under the pointer is the drop target')
+  inp.hover_id = 0
+  st = world_order_drag_step(&d, inp)
+  assert(st.over == 0, 'over nothing: no highlight')
+  inp.hover_id = 9
+  world_order_drag_step(&d, inp)
+  inp.lmb_down = false
+  st = world_order_drag_step(&d, inp)
+  assert(st.swap and st.id == 7 and st.over == 9 and not st.cancelled and d.id == 0, 'released on another pet: swap them')
+  st = world_order_drag_step(&d, on_title())
+  assert(not st.swap and st.id == 0, 'swapped once')
+
+  -- dropped on itself, on nothing, on an ImGui window; cancelled by the right
+  -- button, by Alt, and by the pet going away
+  -- Nelua has no closures, so the gesture state is a parameter.
+  local function grab(g: *WorldOrderDrag): void
+    local i2 = on_title()
+    i2.lmb_pressed, i2.lmb_down = true, true
+    world_order_drag_step(g, i2)
+    i2 = on_title()
+    i2.lmb_down, i2.mx, i2.my = true, 400, 300
+    i2.hover_id = 7
+    world_order_drag_step(g, i2)
+  end
+  grab(&d)
+  inp = on_title()
+  inp.lmb_down, inp.hover_id = false, 7
+  st = world_order_drag_step(&d, inp)
+  assert(st.cancelled and not st.swap, 'dropped on itself: nothing')
+  grab(&d)
+  inp = on_title()
+  inp.lmb_down, inp.rmb_down, inp.hover_id = true, true, 9
+  st = world_order_drag_step(&d, inp)
+  assert(st.cancelled and not st.swap and d.id == 0, 'the right button cancels')
+  grab(&d)
+  inp = on_title()
+  inp.lmb_down, inp.alt, inp.hover_id = true, true, 9
+  st = world_order_drag_step(&d, inp)
+  assert(st.cancelled and d.id == 0, 'Alt takes over: cancelled')
+  grab(&d)
+  inp = on_title()
+  inp.lmb_down, inp.shown, inp.hover_id = true, false, 9
+  st = world_order_drag_step(&d, inp)
+  assert(st.cancelled and d.id == 0, 'the pet went away: cancelled')
+  print('order drag gesture OK')
+end
+
 -- The carried pose: the held pixel stays under the cursor -----------------------------
 do
   local rc = look_camera(3, 4, 10, -1, 1, 0)

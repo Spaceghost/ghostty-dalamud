@@ -1,0 +1,171 @@
+-- Randomized stress over the two places this plugin parses bytes it did not
+-- write: VT streams from a shell into libghostty, and wire frames from an
+-- agent into core/protocol.nelua. Neither may crash, read out of bounds or
+-- grow the heap without bound, whatever arrives.
+--
+--   tests/fuzz [seed] [iterations]
+--
+-- Deterministic: the same seed replays the same bytes, so a failure in CI is
+-- reproducible from the seed in its output. tests/run.sh runs a short fixed
+-- pass; the sanitizer job runs a long one, where AddressSanitizer turns a
+-- one-byte overrun into a failure instead of a lucky pass. The heap after the
+-- warm-up iterations must not grow (tests/heapcheck.nelua).
+require 'tests.heapcheck'
+require 'core.ghostty'
+require 'core.protocol'
+require 'agent.logic'
+require 'string'
+require 'vector'
+require 'io'
+require 'os'
+require 'arg'
+
+-- xorshift64*: a PRNG of our own, so the run does not depend on the C library
+local rng_state: uint64 = 0x2545f4914f6cdd1d
+local function srand(seed: uint64): void
+  rng_state = seed | 1_u64
+end
+local function rnd(): uint64
+  local x = rng_state
+  x = x ~ (x >> 12)
+  x = x ~ (x << 25)
+  x = x ~ (x >> 27)
+  rng_state = x
+  return x * 0x2545f4914f6cdd1d_u64
+end
+local function rnd_below(n: usize): usize
+  if n == 0 then return 0 end
+  return (@usize)(rnd() % n)
+end
+
+-- Fragments worth hitting more often than random bytes would: CSI, OSC, DCS,
+-- charset switches, wide characters and the sequences the renderer reads back.
+local SEEDS: []string = {
+  '\27[31m', '\27[0m', '\27[1;5H', '\27[2J', '\27[?1049h', '\27[?1049l',
+  '\27[6n', '\27]0;title\7', '\27]8;;https://example.invalid\27\\', '\27P+q544e\27\\',
+  '\27[?25l', '\27[?25h', '\27#8', '\27(0', '\27)B', '\27[38;2;10;20;30m',
+  '\27[999;999H', '\27[J', '\27[K', '\27[S', '\27[T', '\27[10L', '\27[10M',
+  '\r\n', '\t', '\b', '\x0c', '\x0e', '\x0f', '\x7f',
+  'plain text ', 'ｗｉｄｅ', '👩‍💻', 'é', '\xc3', '\xff\xfe', '\27',
+  '\27[', '\27[;;;;;;;;;;;;;;;;;;;;;;;m', '\27]', '\27]0;', '\27P',
+}
+
+-- A random stream: mostly fragments, some raw bytes, always bounded.
+local function make_stream(out: *vector(uint8), max: usize): void
+  out:clear()
+  local n = 1 + rnd_below(max)
+  while #out < n do
+    if rnd() % 4 == 0 then
+      out:push((@uint8)(rnd_below(256)))
+    else
+      local s = SEEDS[rnd_below(#SEEDS)]
+      for i = 0, < s.size do out:push(s.data[i]) end
+    end
+  end
+end
+
+-- VT bytes into a terminal, read back the way the renderer does ----------------------
+local vt_bytes: usize = 0
+local stream: vector(uint8)
+local function vt_round(iter: integer): void
+  local term: GhosttyTerminal
+  local cols: uint16 = (@uint16)(1 + rnd_below(120))
+  local rows: uint16 = (@uint16)(1 + rnd_below(60))
+  if ghostty_terminal_new(nilptr, &term, cols, rows) ~= GHOSTTY_SUCCESS then return end
+  defer ghostty_terminal_free(term) end
+  ghostty_terminal_resize(term, cols, rows, 8, 16)
+
+  local state: GhosttyRenderState
+  if ghostty_render_state_new(nilptr, &state) ~= GHOSTTY_SUCCESS then return end
+  defer ghostty_render_state_free(state) end
+
+  for _ = 1, 8 do
+    make_stream(&stream, 512)
+    ghostty_terminal_vt_write(term, (@*[0]uint8)(&stream[0]), #stream)
+    vt_bytes = vt_bytes + #stream
+    -- a resize in the middle of a stream is what a real window does
+    if rnd() % 8 == 0 then
+      cols = (@uint16)(1 + rnd_below(200))
+      rows = (@uint16)(1 + rnd_below(80))
+      ghostty_terminal_resize(term, cols, rows, 8, 16)
+    end
+    if ghostty_render_state_update(state, term) ~= GHOSTTY_SUCCESS then continue end
+    local colors: GhosttyRenderStateColors = { size = #GhosttyRenderStateColors }
+    ghostty_render_state_get(state, GHOSTTY_RENDER_STATE_DATA_COLORS, &colors)
+  end
+end
+
+-- Wire frames into the protocol reader ---------------------------------------------
+local frames_read: usize = 0
+local function proto_round(iter: integer): void
+  local q: ByteQueue
+  defer q:destroy() end
+  -- a mix of well-formed frames and raw noise, fed in arbitrary slices the way
+  -- a socket delivers them
+  for _ = 1, 16 do
+    if rnd() % 3 == 0 then
+      make_stream(&stream, 64)
+      q:push((@*[0]uint8)(&stream[0]), #stream)
+    else
+      make_stream(&stream, 48)
+      local typ: uint8 = (@uint8)(rnd_below(24))
+      if rnd() % 4 == 0 then
+        proto.write_frame_id(&q, typ, (@uint32)(rnd()), (@*[0]uint8)(&stream[0]), #stream)
+      else
+        proto.write_frame(&q, typ, (@*[0]uint8)(&stream[0]), #stream)
+      end
+    end
+    while true do
+      local ok, typ, payload, len = proto.read_frame(&q)
+      if not ok then break end
+      frames_read = frames_read + 1
+      -- every byte of the payload must be readable
+      local sum: uint64 = 0
+      for i = 0, < len do sum = sum + payload[i] end
+      if sum == 0xdeadbeef then io.write('') end -- keep the loop
+      proto.frame_consume(&q, len)
+    end
+    -- a truncated frame stays in the queue; drop it now and then
+    if rnd() % 5 == 0 and q:len() > 0 then q:consume(rnd_below(q:len())) end
+  end
+end
+
+-- The agent's own string parsing, on text it never wrote -----------------------------
+local function agent_round(iter: integer): void
+  make_stream(&stream, 96)
+  local raw = string{data = (@*[0]byte)(&stream[0]), size = #stream}
+  local argv, env = agent_split_nul((@*[0]uint8)(&stream[0]), #stream)
+  for i = 0, < #argv do argv[i]:destroy() end
+  for i = 0, < #env do env[i]:destroy() end
+  argv:destroy() env:destroy()
+  local h, p = agent_parse_hostport(raw)
+  h:destroy()
+  local t = agent_trim(raw)
+  t:destroy()
+  local c = agent_crlf(raw)
+  c:destroy()
+  local ok, k, v = agent_env_split(raw)
+  k:destroy() v:destroy()
+  local hex = agent_hex(raw)
+  hex:destroy()
+end
+
+-- Driver -----------------------------------------------------------------------------
+local seed: uint64 = 20260919
+local iters: integer = 64
+if #arg >= 1 then seed = (@uint64)(tointeger(arg[1])) end
+if #arg >= 2 then iters = tointeger(arg[2]) end
+local env_iters = os.getenv('GHOSTTY_FUZZ_ITERS')
+if env_iters.size > 0 then iters = tointeger(env_iters) end
+io.write('fuzz seed=', seed, ' iterations=', iters, '\n')
+
+stream:reserve(4096) -- its growth must not read as a leak
+srand(seed)
+heap_stable('fuzz vt', iters, vt_round)
+srand(seed ~ 0x9e3779b9_u64)
+heap_stable('fuzz protocol', iters, proto_round)
+srand(seed ~ 0x517cc1b7_u64)
+heap_stable('fuzz agent strings', iters, agent_round)
+
+stream:destroy()
+io.write('fuzz OK: ', vt_bytes, ' VT bytes, ', frames_read, ' frames read\n')

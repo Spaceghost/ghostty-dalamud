@@ -1,0 +1,234 @@
+-- The double-click full-screen flight, frame by frame: a terminal drawn
+-- through a fake ImGui into a real vertex buffer, bent by
+-- world_transform_vertices exactly as core/app/worldview.nelua does, flown to
+-- full screen and back. Every frame, everything drawn inside the panel lands
+-- inside the panel's outline on screen, and the terminal grid never changes
+-- (so the shell is never resized mid-flight or at either end).
+require 'core.world'
+require 'core.ghostty'
+require 'core.imgui'
+require 'core.termview'
+require 'core.render'
+require 'string'
+require 'math'
+
+-- Fake ImGui: draw calls push real vertices; clip rects push commands ------------------
+local MAXV <comptime> = 262144
+local verts: [MAXV]ImDrawVert
+local cmds: [4096]ImDrawCmd
+local dl: ImDrawList
+local clip_stack: [16]ImVec4
+local clip_n = 0
+local VIEW_CLIP: ImVec4 = { 0, 0, 1e6, 1e6 } -- the draw list's own rect: the whole view in panel space
+
+local function reset_dl(): void
+  dl.VtxBuffer = { Size = 0, Capacity = MAXV, Data = (@*[0]ImDrawVert)(&verts) }
+  cmds[0] = { ClipRect = VIEW_CLIP }
+  dl.CmdBuffer = { Size = 1, Capacity = 4096, Data = (@*[0]ImDrawCmd)(&cmds) }
+  clip_n = 0
+end
+local function push_vert(x: float32, y: float32): void
+  assert(dl.VtxBuffer.Size < MAXV, 'vertex buffer full')
+  dl.VtxBuffer.Data[dl.VtxBuffer.Size] = { pos = vec2(x, y), col = 0xFFFFFFFF }
+  dl.VtxBuffer.Size = dl.VtxBuffer.Size + 1
+end
+local function new_cmd(r: ImVec4): void
+  dl.CmdBuffer.Data[dl.CmdBuffer.Size] = { ClipRect = r }
+  dl.CmdBuffer.Size = dl.CmdBuffer.Size + 1
+end
+
+local CELL_W: float32 <comptime> = 24
+local CELL_H: float32 <comptime> = 40
+local function fake_calc(out: *ImVec2, font: *ImFont, size: float32, max_width: float32, wrap_width: float32, b: cstring, e: cstring, remaining: *cstring): void
+  out.x, out.y = CELL_W * size / 40, size
+end
+local rect_right: float32 = 0 -- how far right a rect reaches, in panel pixels (the background runs)
+local function fake_rect(d: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint): void
+  rect_right = math.max(rect_right, b.x)
+  push_vert(a.x, a.y) push_vert(b.x, a.y) push_vert(b.x, b.y) push_vert(a.x, b.y)
+end
+local function fake_rect_outline(d: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint, thickness: float32): void
+  fake_rect(d, a, b, col, rounding, flags)
+end
+local function fake_line(d: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, thickness: float32): void
+  push_vert(a.x, a.y) push_vert(b.x, b.y)
+end
+local function fake_text(d: *ImDrawList, font: *ImFont, size: float32, pos: ImVec2, col: uint32, b: cstring, e: cstring, wrap: float32, clip: *ImVec4): void
+  local n = (@isize)(e) - (@isize)(b)
+  push_vert(pos.x, pos.y) push_vert(pos.x + n * CELL_W * size / 40, pos.y + size)
+end
+local function fake_push_clip(d: *ImDrawList, a: ImVec2, b: ImVec2, intersect: boolean): void
+  clip_stack[clip_n] = { a.x, a.y, b.x, b.y }
+  clip_n = clip_n + 1
+  new_cmd(clip_stack[clip_n - 1])
+end
+local function fake_pop_clip(d: *ImDrawList): void
+  clip_n = clip_n - 1
+  new_cmd(clip_n > 0 and clip_stack[clip_n - 1] or VIEW_CLIP)
+end
+local function resolver(name: cstring): pointer
+  local n: string = name
+  if n == 'ImFont_CalcTextSizeA' then return (@pointer)(fake_calc) end
+  if n == 'ImDrawList_AddRectFilled' then return (@pointer)(fake_rect) end
+  if n == 'ImDrawList_AddRect' then return (@pointer)(fake_rect_outline) end
+  if n == 'ImDrawList_AddLine' then return (@pointer)(fake_line) end
+  if n == 'ImDrawList_AddText_FontPtr' then return (@pointer)(fake_text) end
+  if n == 'ImDrawList_PushClipRect' then return (@pointer)(fake_push_clip) end
+  if n == 'ImDrawList_PopClipRect' then return (@pointer)(fake_pop_clip) end
+  return nilptr
+end
+imgui_bind(resolver, nilptr)
+
+-- A camera like the game's (see tests/test_worldhud.nelua) --------------------------------
+local function game_camera(ex: float64, ey: float64, ez: float64, yaw: float64, pitch: float64, fov: float64, w: float64, h: float64): GuCamera
+  local c: GuCamera = { width = w, height = h }
+  local fx, fy, fz = math.sin(yaw) * math.cos(pitch), math.sin(pitch), math.cos(yaw) * math.cos(pitch)
+  local zx, zy, zz = -fx, -fy, -fz
+  local xl = math.sqrt(zz * zz + zx * zx)
+  local xx, xy, xz = zz / xl, 0.0, -zx / xl
+  local yx, yy, yz = zy * xz - zz * xy, zz * xx - zx * xz, zx * xy - zy * xx
+  local v: [16]float64 = {
+    xx, yx, zx, 0, xy, yy, zy, 0, xz, yz, zz, 0,
+    -(ex * xx + ey * xy + ez * xz), -(ex * yx + ey * yy + ez * yz), -(ex * zx + ey * zy + ez * zz), 1,
+  }
+  local f = 1 / math.tan(fov / 2)
+  local p: [16]float64 = { f * h / w, 0, 0, 0, 0, f, 0, 0, 0, 0, 0, -1, 0, 0, 0.1, 0 }
+  for r = 0, < 4 do
+    for k = 0, < 4 do
+      local sum: float64 = 0
+      for j = 0, < 4 do sum = sum + v[r * 4 + j] * p[j * 4 + k] end
+      c.m[r * 4 + k] = sum
+    end
+  end
+  return c
+end
+
+-- The panel's outline on screen at this frame: its edges, sampled, through the
+-- same transform (a column of a curved panel projects to a segment between its
+-- ends, so this box holds everything inside the panel).
+local function outline(cam: *GuCamera, b: *WorldBasis, w: float32, h: float32, ft: float32, to: WorldFlat): ImVec4
+  local save_v, save_c = dl.VtxBuffer.Size, dl.CmdBuffer.Size
+  local first = dl.VtxBuffer.Size
+  local N <comptime> = 64
+  for i = 0, N do
+    local u, v = w * i / N, h * i / N
+    push_vert(u, 0) push_vert(u, h) push_vert(0, v) push_vert(w, v)
+  end
+  world_transform_vertices(&dl, dl.CmdBuffer.Size, first, cam, b, vec2(0, 0), vec2(0, 0), 1, 0, ft, to, nilptr)
+  local r: ImVec4 = { 1e9, 1e9, -1e9, -1e9 }
+  for i = first, < dl.VtxBuffer.Size do
+    local p = dl.VtxBuffer.Data[i].pos
+    r = { math.min(r.x, p.x), math.min(r.y, p.y), math.max(r.z, p.x), math.max(r.w, p.y) }
+  end
+  dl.VtxBuffer.Size, dl.CmdBuffer.Size = save_v, save_c
+  return r
+end
+
+-- One flight to full screen and back for a panel of `w` x `h` pixels, drawn
+-- the way worldview draws a terminal. `flight` (optional) replaces the
+-- full-screen rectangle, as a pulled flat window's fly-out does.
+local function fly(label: string, view_w: float32, view_h: float32, w: float32, h: float32, curve: float32, flight: *ImVec4): void
+  local cam = game_camera(100, 5, -200, 0.6, 0, 0.78, view_w, view_h)
+  local fwx, fwz = math.sin(0.6), math.cos(0.6)
+  local placed: WorldPlacement = { x = 100 + fwx * 5, y = 5, z = -200 + fwz * 5, yaw = 0.6 + math.pi,
+    width = w, height = h, ppm = 640, curve = curve, opacity = 1 }
+  local m = render_measure(nilptr, 40)
+  local cols0, rows0 = render_grid_size(m, w - 32, h - 32)
+  local tv: TermView
+  assert(tv:init(cols0, rows0))
+  -- text rows, and rows of nothing but a white background (a program's output
+  -- with a background colour): those go out as one merged run the width of the
+  -- grid, with no glyphs in them -- what showed outside the panel in game
+  local text_row: string = string.rep('x', cols0 * 2) .. '\r\n'
+  local bg_row: string = '\27[47m' .. string.rep(' ', cols0) .. '\27[0m\r\n'
+  for _ = 1, (rows0 + 4) // 2 do
+    tv:feed((@*[0]uint8)(text_row.data), text_row.size)
+    tv:feed((@*[0]uint8)(bg_row.data), bg_row.size)
+  end
+  text_row:destroy()
+  bg_row:destroy()
+  assert(tv:update())
+  render_world = true
+  local run_right: float32 = 0
+  local ft, fv, target = (@float32)(0), (@float32)(0), (@float32)(1)
+  local frames, flat_frames, overflow = 0, 0, (@float32)(0)
+  local dt: float32 = 1.0 / 60
+  for frame = 0, < 240 do
+    if frame == 120 then target = 0 end -- double-click again: back into the world
+    ft, fv = world_ease(ft, fv, target, dt, 0.6)
+    ft = math.clamp(ft, 0, 1)
+    -- worldview: the rectangle it flies to, the pose it is projected with, the grid it lays out
+    local to = flight ~= nilptr and world_flat_rect($flight, w, h) or world_full_rect(vec2(0, 0), view_w, view_h, 0.62, 36, w, h)
+    local pl = world_flight_pose(placed, ft)
+    assert(pl.width == w and pl.height == h and pl.ppm == placed.ppm, 'the panel keeps its pixels all the way')
+    local cols, rows = render_grid_size(m, pl.width - 32, pl.height - 32)
+    assert(cols == cols0 and rows == rows0, 'the grid never changes: no resize, no reflow')
+    assert(tv:resize(cols, rows, 24, 40) == false, 'nothing to resize')
+    local b = world_basis(pl)
+    reset_dl()
+    local first_cmd = dl.CmdBuffer.Size
+    -- the slab, the grid clipped to its rect (draw_terminal), a title button, the resize grip
+    fake_rect(&dl, vec2(0, 0), vec2(pl.width, pl.height), 0, 0, 0)
+    imgui.DrawListPushClipRect(&dl, vec2(16, 16), vec2(pl.width - 16, pl.height - 16), true)
+    render_max_run_px = pl.width / 24
+    rect_right = 0 -- from here on it is the grid's own rects: the merged background runs
+    render_termview(&dl, &tv, vec2(16, 16), m, true, true, 255, 0)
+    run_right = math.max(run_right, rect_right)
+    imgui.DrawListPopClipRect(&dl)
+    fake_rect(&dl, vec2(pl.width - 30, 4), vec2(pl.width - 4, 30), 0, 5, 0)
+    fake_rect(&dl, vec2(pl.width - 22, pl.height - 22), vec2(pl.width - 4, pl.height - 4), 0, 0, 0)
+    local n = dl.VtxBuffer.Size
+    world_transform_vertices(&dl, first_cmd, 0, &cam, &b, vec2(0, 0), vec2(0, 0), 1, 0, ft, to, nilptr)
+    local box = outline(&cam, &b, pl.width, pl.height, ft, to)
+    for i = 0, < n do
+      local p = dl.VtxBuffer.Data[i].pos
+      local out = math.max(box.x - p.x, p.x - box.z, box.y - p.y, p.y - box.w)
+      overflow = math.max(overflow, out)
+    end
+    if ft >= 1 then
+      flat_frames = flat_frames + 1
+      -- flat: exactly the rectangle, inside the view, its own shape
+      assert(math.abs(box.x - to.at.x) < 0.01 and math.abs(box.z - (to.at.x + w * to.sx)) < 0.01, 'flat: on the rectangle')
+      assert(box.x >= 0 and box.y >= 0 and box.z <= view_w and box.w <= view_h, 'flat: inside the view')
+      if flight == nilptr then assert(to.sx == to.sy, 'full screen keeps the shape') end
+      -- the grid's clip rect comes along, onto the grid's place on the screen
+      local grid_clip = dl.CmdBuffer.Data[first_cmd].ClipRect
+      assert(math.abs(grid_clip.x - (to.at.x + 16 * to.sx)) < 0.01 and math.abs(grid_clip.w - (to.at.y + (h - 16) * to.sy)) < 0.01, 'flat: the grid stays clipped to its place')
+      assert(dl.CmdBuffer.Data[first_cmd + 1].ClipRect.z == view_w, 'the rest: the whole view (glows reach past the panel)')
+    end
+    frames = frames + 1
+  end
+  render_world = false
+  render_max_run_px = 0
+  tv:destroy()
+  print(label, 'grid', cols0, 'x', rows0, 'frames', frames, 'flat', flat_frames, 'worst overflow px', overflow, 'background runs reach', run_right, 'of', w)
+  assert(run_right >= 16 + cols0 * m.cell_w - 0.01, 'the background runs cover the grid to its last column (what showed outside the panel in game)')
+  assert(flat_frames > 20, 'reached full screen')
+  assert(ft <= 0.001, 'back in the world')
+  assert(overflow <= 0.5, 'every frame: drawn inside the panel')
+end
+
+-- the default world panel (1800 x 1040) is bigger than 0.62 of a 1080p or 1440p
+-- view: shrinks on the way; a pet is smaller: grows; a flat window's fly-out
+-- stretches to that window's own rectangle
+fly('world panel at 1080p', 1920, 1080, 1800, 1040, 3, nilptr)
+fly('world panel at 1440p', 2560, 1440, 1800, 1040, 3, nilptr)
+fly('world panel at 4K', 3840, 2160, 1800, 1040, 3, nilptr)
+fly('pet at 1440p', 2560, 1440, 900, 520, 3, nilptr)
+fly('tall panel at 1440p', 2560, 1440, 700, 1300, 0, nilptr)
+local flat_window: ImVec4 = { 300, 200, 1100, 760 }
+fly('pulled flat window', 2560, 1440, 820, 540, 3, &flat_window)
+
+do -- world_full_rect: the shape kept, centred, inside the fraction
+  local r = world_full_rect(vec2(10, 20), 2560, 1440, 0.62, 36, 1800, 1040)
+  assert(r.sx == r.sy, 'one scale')
+  assert(math.abs(1800 * r.sx - 2560 * 0.62) < 0.01 or math.abs(1040 * r.sy - 1440 * 0.62) < 0.01, 'fills one side')
+  assert(1800 * r.sx <= 2560 * 0.62 + 0.01 and 1040 * r.sy <= 1440 * 0.62 + 0.01, 'within the fraction')
+  assert(math.abs(r.at.x - 10 - (2560 - 1800 * r.sx) / 2) < 0.01 and math.abs(r.at.y - 20 - (1440 - 1040 * r.sy) / 2) < 0.01, 'centred in the view')
+  local e = world_full_rect(vec2(0, 0), 2560, 1440, 1, 36, 1800, 1040)
+  assert(1800 * e.sx <= 2560 - 72 + 0.01 and 1040 * e.sy <= 1440 - 72 + 0.01, 'edge to edge less the margin')
+  local u, v = world_flat_uv(r, vec2(r.at.x + 900 * r.sx, r.at.y + 520 * r.sy))
+  assert(math.abs(u - 900) < 0.01 and math.abs(v - 520) < 0.01, 'the pointer maps back to panel pixels')
+  print('full rect OK')
+end
+print('full-screen flight OK')

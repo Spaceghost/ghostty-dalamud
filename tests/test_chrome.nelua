@@ -158,7 +158,7 @@ end
 
 -- Buttons: ids, actions, layout -------------------------------------------------------------
 do
-  local seen: [11]integer
+  local seen: [14]integer
   for i = 0, < CHROME_TAB_BUTTONS do
     local b = chrome_tab_buttons[i]
     assert(#b.tip > 0 and #b.id > 0, 'every button explains itself')
@@ -166,11 +166,12 @@ do
     seen[b.action] = seen[b.action] + 1
     for k = i + 1, < CHROME_TAB_BUTTONS do assert(chrome_tab_buttons[k].id ~= b.id, 'ids are unique') end
   end
-  local wants: [8]ChromeAction = {
+  local wants: [10]ChromeAction = {
     ChromeAction.NewTab, ChromeAction.Profiles, ChromeAction.Window, ChromeAction.Pin,
-    ChromeAction.Pet, ChromeAction.Minimize, ChromeAction.Settings, ChromeAction.Hide,
+    ChromeAction.Pet, ChromeAction.Minimize, ChromeAction.Shot, ChromeAction.Share,
+    ChromeAction.Settings, ChromeAction.Hide,
   }
-  for i = 0, < 8 do assert(seen[wants[i]] == 1, 'each tab bar action has exactly one button') end
+  for i = 0, < 10 do assert(seen[wants[i]] == 1, 'each tab bar action has exactly one button') end
   for i = 0, < CHROME_WINDOW_BUTTONS do
     local b = chrome_window_buttons[i]
     assert(#b.tip > 0 and chrome_action(b.id) == b.action, b.id)
@@ -228,7 +229,7 @@ end
 imgui_bind(resolver, nilptr)
 do
   local dl: ImDrawList
-  for k = ChromeIcon.Plus, ChromeIcon.Close do
+  for k = ChromeIcon.Plus, ChromeIcon.Shutter do
     local icon = (@ChromeIcon)(k)
     prims = 0
     minx, miny, maxx, maxy = 1e9, 1e9, -1e9, -1e9
@@ -298,7 +299,7 @@ do
   print('settings badge OK')
 end
 
-local used: [11]integer
+local used: [14]integer
 local function press(id: string): void
   local a = chrome_action(id)
   assert(a ~= ChromeAction.None, id)
@@ -321,6 +322,8 @@ press('cfg')
 assert(host.settings_open, 'cfg opens settings')
 press('cfg')
 assert(not host.settings_open, 'and closes them')
+press('share') -- the gallery prompt for the latest screenshot; without lua/gallery.lua it only says so
+assert(#host.dropdown_tabs == 3 and host.dropdown_open, 'share leaves the tabs alone')
 
 -- reorder and close keep the same terminal active
 local a_id, b_id, c_id = tab_id(0), tab_id(1), tab_id(2)
@@ -360,6 +363,11 @@ press('new')
 set_world_visible(false)
 press('pin')
 assert(#host.world == 2 and #host.dropdown_tabs == 0 and host.world_visible, 'pin places it in the world and shows it')
+
+-- the shutter takes a screenshot of the frame; nothing about the tabs changes
+local tabs_before = #host.dropdown_tabs
+press('shot')
+assert(#host.dropdown_tabs == tabs_before and #host.world == 2, 'shot leaves the terminals where they are')
 
 press('hide')
 assert(not host.dropdown_open, 'hide')

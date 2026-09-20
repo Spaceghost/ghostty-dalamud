@@ -1,0 +1,237 @@
+-- Themes: tests/test_themes.lua for the Lua side, then the core's: loading
+-- the shipped init.lua gives spaceghost, which is the look the core had
+-- built in (chrome constants and libghostty-vt's own terminal colours);
+-- switching at runtime with /term theme reaches terminals already open,
+-- their palette, cursor and selection, and the chrome; tooltip texts come
+-- from lua/tooltips.lua.
+require 'core.policy'
+require 'core.termview'
+require 'core.render'
+require 'core.selection'
+require 'core.chrome'
+require 'core.tooltip'
+require 'string'
+require 'stringbuilder'
+require 'io'
+require 'os'
+require 'arg'
+
+local root: string = arg[1]
+local scratch: string = arg[2]
+
+-- The Lua side ------------------------------------------------------------------------------
+do
+  local L = luaL_newstate()
+  luaL_openlibs(L)
+  world_lua_register(L)
+  fs_lua_register(L)
+  local script = root .. '/tests/test_themes.lua'
+  if luaL_loadfilex(L, (@cstring)(script.data), nilptr) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_pushlstring(L, (@cstring)(root.data), root.size)
+  lua_pushlstring(L, (@cstring)(scratch.data), scratch.size)
+  if lua_pcall(L, 2, 0, 0) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_close(L)
+end
+
+-- A fake ImGui that records rectangles (terminal backgrounds, cursor) --------------------
+local log: stringbuilder
+local function fake_calc(pOut: *ImVec2, font: *ImFont, size: float32, max_width: float32, wrap_width: float32, text_begin: cstring, text_end: cstring, remaining: *cstring): void
+  pOut.x = 8 pOut.y = 16
+end
+local function fake_rect(dl: *ImDrawList, p_min: ImVec2, p_max: ImVec2, col: uint32, rounding: float32, flags: cint): void
+  log:writef('rect %.0f,%.0f-%.0f,%.0f col=%08x\n', p_min.x, p_min.y, p_max.x, p_max.y, col)
+end
+local function fake_text(dl: *ImDrawList, font: *ImFont, font_size: float32, pos: ImVec2, col: uint32, text_begin: cstring, text_end: cstring, wrap_width: float32, clip: *ImVec4): void
+  local s = string{data=(@*[0]byte)(text_begin), size=(@usize)((@isize)(text_end) - (@isize)(text_begin))}
+  log:writef('text %.0f,%.0f "%s" col=%08x\n', pos.x, pos.y, s, col)
+end
+local function fake_none(): void end
+local function resolver(name: cstring): pointer
+  local n: string = name
+  if n == 'ImFont_CalcTextSizeA' then return (@pointer)(fake_calc) end
+  if n == 'ImDrawList_AddRectFilled' then return (@pointer)(fake_rect) end
+  if n == 'ImDrawList_AddText_FontPtr' then return (@pointer)(fake_text) end
+  if n == 'ImDrawList_AddRect' or n == 'ImDrawList_AddLine' then return (@pointer)(fake_none) end
+  return nilptr
+end
+imgui_bind(resolver, nilptr)
+
+local function col32(rgb: uint32): uint32
+  return ((rgb >> 16) & 0xFF) | (((rgb >> 8) & 0xFF) << 8) | ((rgb & 0xFF) << 16) | 0xFF000000
+end
+local function same(a: GhosttyColorRgb, rgb: uint32): boolean
+  return a.r == (rgb >> 16) & 0xFF and a.g == (rgb >> 8) & 0xFF and a.b == rgb & 0xFF
+end
+local function colors_of(v: *TermView): GhosttyRenderStateColors
+  local c: GhosttyRenderStateColors = { size = #GhosttyRenderStateColors }
+  assert(ghostty_render_state_get(v.state, GHOSTTY_RENDER_STATE_DATA_COLORS, &c) == GHOSTTY_SUCCESS)
+  return c
+end
+
+-- A terminal from before any theme: libghostty-vt's own colours.
+local before: TermView
+assert(before:init(10, 3))
+assert(theme_generation == 0 and before:update())
+local plain = colors_of(&before)
+assert(same(plain.background, 0x000000) and same(plain.foreground, 0xffffff) and not plain.cursor_has_value)
+assert(chrome_col(ChromeColor.Accent, 255) == CHROME_GOLD and chrome_col(ChromeColor.Ink, 255) == CHROME_INK
+  and chrome_col(ChromeColor.InkDim, 255) == CHROME_INK_DIM and chrome_col(ChromeColor.InkFaint, 255) == CHROME_INK_FAINT,
+  'before a theme the chrome is the old constants')
+
+-- spaceghost ----------------------------------------------------------------------------------
+os.remove((@cstring)((root .. '/settings.lua').data))
+if not policy_load(root) then
+  io.stderr:write('policy load failed: ', policy.error, '\n')
+  os.exit(1)
+end
+local gen = theme_generation
+assert(gen == 1, 'the theme was read once at load')
+assert(not chrome_themed(), 'spaceghost is the built-in chrome, colour for colour')
+for i = 0, < CHROME_COLOR_COUNT do assert(chrome_colors[i] == CHROME_SPACEGHOST[i], CHROME_COLOR_KEYS[i]) end
+assert(theme_term.has_background and theme_term.has_foreground and not theme_term.has_cursor and not theme_term.has_cursor_text)
+assert(not theme_term.has_sel_bg and not theme_term.has_sel_fg)
+local v: TermView
+assert(v:init(10, 3))
+local text: string = "ab\27[31mc\27[0m"
+v:feed((@*[0]uint8)(text.data), text.size)
+assert(v:update() and v.theme_gen == gen, 'a terminal takes the theme on its next update')
+do
+  local c = colors_of(&v)
+  assert(same(c.background, 0x000000) and same(c.foreground, 0xffffff) and not c.cursor_has_value, 'spaceghost changes nothing')
+  for i = 0, 255 do
+    assert(c.palette[i].r == plain.palette[i].r and c.palette[i].g == plain.palette[i].g and c.palette[i].b == plain.palette[i].b, 'palette equals the built-in one')
+  end
+end
+policy_refresh()
+assert(theme_generation == gen, 'reading the same theme again changes nothing')
+print('spaceghost OK')
+
+-- Tooltip texts ---------------------------------------------------------------------------------
+do
+  local t = policy_tooltip('tab.new', 'fallback')
+  assert(t == 'New tab', t)
+  t:destroy()
+  t = policy_tooltip('no.such.tip', 'fallback')
+  assert(t == 'fallback')
+  t:destroy()
+  assert(tooltip_delay == 0.45, 'the delay from lua/tooltips.lua')
+  -- the hover delay: nothing at first, the text once the pointer has rested
+  local k = tooltip_key('probe')
+  assert(not tooltip_due(k, true, 10.0) and not tooltip_due(k, true, 10.3) and tooltip_due(k, true, 10.5), 'after the delay')
+  assert(not tooltip_due(k, false, 10.6), 'never while not hovered')
+  assert(not tooltip_due(tooltip_key('other'), true, 10.6), 'a new item waits again')
+  local shown = tooltip_shown
+  tooltip_show('Hello', nilptr, 0)
+  assert(tooltip_shown == shown + 1 and tooltip_last_len == 5, 'shown (drawn only with a full ImGui)')
+  print('tooltips OK')
+end
+
+-- Switching at runtime ----------------------------------------------------------------------------
+do
+  local msg = policy_theme_command('')
+  assert(msg:find('themes: ', 1, true) == 1 and msg:find('spaceghost*', 1, true) > 0, msg)
+  msg:destroy()
+  msg = policy_theme_command('gruvbox-dark')
+  assert(msg == 'theme: gruvbox-dark', msg)
+  msg:destroy()
+  policy_refresh()
+  assert(theme_generation == gen + 1, 'a new theme is a new generation')
+  assert(chrome_themed() and chrome_col(ChromeColor.Accent, 255) == col32(0xfabd2f), 'the chrome follows')
+  local pal = chrome_palette(1, false, chrome_light(1, 1, 1, 0, 0))
+  assert(pal.body_top == col32(0x282828), 'flat glass in its background')
+  assert(pal.glow == col32(0xfe8019))
+  assert(v:update() and v.theme_gen == theme_generation, 'the open terminal takes it')
+  local c = colors_of(&v)
+  assert(same(c.background, 0x282828) and same(c.foreground, 0xebdbb2), 'default colours')
+  assert(c.cursor_has_value and same(c.cursor, 0xebdbb2), 'cursor colour')
+  assert(same(c.palette[1], 0xcc241d) and same(c.palette[15], 0xebdbb2), 'palette')
+  assert(c.palette[100].r == plain.palette[100].r and c.palette[231].b == plain.palette[231].b, 'the cube is untouched')
+
+  -- drawn: the background, red text from the palette, the cursor-text glyph
+  local text2: string = "\r\n"
+  v:feed((@*[0]uint8)(text2.data), text2.size)
+  local back: string = "\27[1;1H"
+  v:feed((@*[0]uint8)(back.data), back.size)
+  assert(v:update())
+  local m = render_measure(nilptr, 16)
+  render_termview(nilptr, &v, vec2(0, 0), m, true, true, 255, 0)
+  local out = log:promote()
+  local want: stringbuilder
+  want:writef('rect 0,0-80,48 col=%08x', col32(0x282828))
+  local w1 = want:promote()
+  assert(out:find(w1, 1, true) > 0, 'the background in the theme\'s colour')
+  want:writef('text 16,0 "c" col=%08x', col32(0xcc241d))
+  local w2 = want:promote()
+  assert(out:find(w2, 1, true) > 0, 'palette red')
+  want:writef('rect 0,0-8,16 col=%08x', col32(0xebdbb2))
+  local w3 = want:promote()
+  want:writef('text 0,0 "a" col=%08x', col32(0x282828))
+  local w4 = want:promote()
+  assert(out:find(w3, 1, true) > 0 and out:find(w4, 1, true) > out:find(w3, 1, true), 'block cursor, then its glyph in cursor-text')
+  out:destroy() w1:destroy() w2:destroy() w3:destroy() w4:destroy()
+
+  -- a selection in selection-background / selection-foreground, not inverted
+  local st: SelectionState
+  selection_press(&v, &st, 0, 0, 1, false)
+  selection_drag(&v, &st, 1, 0)
+  selection_release(&v, &st)
+  assert(v:update())
+  render_termview(nilptr, &v, vec2(0, 0), m, false, true, 255, 0)
+  out = log:promote()
+  want:writef('rect 0,0-16,16 col=%08x', col32(0x665c54))
+  w1 = want:promote()
+  want:writef('text 0,0 "ab" col=%08x', col32(0xebdbb2))
+  w2 = want:promote()
+  assert(out:find(w1, 1, true) > 0 and out:find(w2, 1, true) > 0, 'selection colours:\n' .. out)
+  out:destroy() w1:destroy() w2:destroy()
+  selection_clear(&v, &st)
+
+  -- a terminal opened after the switch starts in the theme
+  local late: TermView
+  assert(late:init(10, 3) and late:update())
+  assert(same(colors_of(&late).background, 0x282828))
+  late:destroy()
+
+  -- and back: everything spaceghost leaves out returns to libghostty's defaults
+  msg = policy_theme_command('spaceghost')
+  msg:destroy()
+  policy_refresh()
+  assert(not chrome_themed())
+  assert(v:update())
+  c = colors_of(&v)
+  assert(same(c.background, 0x000000) and not c.cursor_has_value and same(c.palette[1], 0xcc6666), 'spaceghost again')
+  for i = 0, 255 do assert(c.palette[i].r == plain.palette[i].r and c.palette[i].b == plain.palette[i].b) end
+
+  msg = policy_theme_command('no-such-theme')
+  assert(msg:find('no theme', 1, true) > 0)
+  msg:destroy()
+  policy_refresh()
+  assert(not chrome_themed(), 'an unknown name changes nothing')
+  print('switching OK')
+end
+
+-- Reload: the choice was saved and comes back ------------------------------------------------------
+do
+  local msg = policy_theme_command('catppuccin-latte')
+  msg:destroy()
+  policy_unload()
+  assert(policy_load(root))
+  assert(chrome_col(ChromeColor.Accent, 255) == col32(0x8839ef), 'catppuccin-latte after a reload')
+  assert(theme_term.has_cursor_text and same(theme_term.cursor_text, 0xeff1f5))
+  policy_unload()
+  os.remove((@cstring)((root .. '/settings.lua').data))
+  assert(policy_load(root) and not chrome_themed(), 'without settings.lua: spaceghost')
+  print('reload OK')
+end
+
+v:destroy()
+before:destroy()
+policy_unload()
+os.remove((@cstring)((root .. '/settings.lua').data))
+print('OK')

@@ -69,8 +69,8 @@ c:connect(now)
 for _ = 1, 200 do pump1(&c) if c:ready() then break end end
 assert(c:ready(), 'agent handshake: ' .. c.last_error)
 print('handshake ok:', first_ok, 'version', c.version, 'nonce', c.nonce)
-assert(first_ok:find('ghostty-agent 2 ', 1, true) == 1, 'the greeting carries protocol version 2 and a nonce')
-assert(c.version == 2 and c.nonce ~= 0)
+assert(first_ok:find('ghostty-agent 4 ', 1, true) == 1, 'the greeting carries protocol version 4 and a nonce')
+assert(c.version == 4 and c.nonce ~= 0)
 
 local argv: vector(string)
 argv:push('/bin/sh')
@@ -242,7 +242,10 @@ do
   while i <= #st and (st:byte(i) == 32 or st:byte(i) == 9) do i = i + 1 end
   while i <= #st and st:byte(i) >= 48 and st:byte(i) <= 57 do kb = kb * 10 + (st:byte(i) - 48) i = i + 1 end
   print('agent VmRSS kB after 2 s of unread `yes`:', kb)
-  assert(kb > 0 and kb < 16 * 1024, 'agent memory stays bounded') -- unbounded, 2 s of `yes` took 32 MiB
+  -- a sanitizer's shadow memory and valgrind's own heap are in that number too (tools/sanitize.sh)
+  local limit = 16 * 1024
+  if os.getenv('SAN').size > 0 then limit = 512 * 1024 end
+  assert(kb > 0 and kb < limit, 'agent memory stays bounded') -- unbounded, 2 s of `yes` took 32 MiB
   -- a panel unseen for a moment: DETACH, then ATTACH with what it has read.
   -- The megabytes queued before the DETACH still arrive; none come twice.
   local read_before = opened_bytes

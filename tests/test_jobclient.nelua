@@ -1,0 +1,150 @@
+-- The plugin's side of raw jobs (docs/JOBS.md), against a real ghostty-agent
+-- already running on a loopback port (tests/run.sh starts it). What
+-- tests/test_jobs.nelua does by writing frames by hand, this does through
+-- AgentClient: jopen/jdata/jclose and the JOPENED / JOUT / JEXIT events, which
+-- is the path the /ask panel takes so a long JSON line is never reflowed by a
+-- terminal.
+require 'core.agent_client'
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'io'
+require 'os'
+require 'arg'
+
+## cinclude '<unistd.h>'
+local function usleep(us: cuint): cint <cimport, nodecl> end
+
+local port: uint16 = (@uint16)(tointeger(arg[1]))
+local token: string = arg[2]
+
+local opened_req: uint32 = 0
+local opened_jid: uint32 = 0
+local opened_pid: uint32 = 0
+local opened_err: string -- a copy of the reason JOPENED gave, or empty
+local opened_count = 0
+local out: stringbuilder
+local out_bytes: usize = 0
+local err_stream_bytes: usize = 0
+local exit_jid: uint32 = 0
+local exit_status: int32 = -1
+local exited = false
+
+local function on_event(ctx: pointer, ev: *AgentEvent): void
+  if ev.typ == PROTO_JOPENED then
+    opened_req, opened_jid, opened_pid = ev.req, ev.id, (@uint32)(ev.status)
+    opened_err:destroy()
+    opened_err = string{data=(@*[0]byte)(ev.data), size=ev.len}:copy()
+    opened_count = opened_count + 1
+  elseif ev.typ == PROTO_JOUT then
+    if ev.stream == JOB_ERR then
+      err_stream_bytes = err_stream_bytes + ev.len
+    else
+      out_bytes = out_bytes + ev.len
+      out:write(string{data=(@*[0]byte)(ev.data), size=ev.len})
+    end
+  elseif ev.typ == PROTO_JEXIT then
+    exited = true
+    exit_jid = ev.id
+    exit_status = ev.status
+  end
+end
+
+local now: float64 = 0.0
+local c: AgentClient
+local function pump(): void
+  c:pump(now)
+  now = now + 0.01
+  usleep(10000)
+end
+
+c:init('127.0.0.1', port, token)
+c.on_event = on_event
+c:connect(now)
+for _ = 1, 300 do pump() if c:ready() then break end end
+assert(c:ready(), 'agent handshake: ' .. c.last_error)
+assert(c:jobs_ok(), 'a version 4 agent takes jobs (version ' .. c.version .. ')')
+
+-- a JSON line longer than any console, and one on stderr, then status 7
+do
+  local argv: vector(string)
+  argv:push('/bin/sh')
+  argv:push('-c')
+  argv:push('i=0; printf \'{"type":"text","text":"\'; while [ $i -lt 400 ]; do printf 0123456789; i=$((i+1)); done; printf \'"}\\n\'; printf noise >&2; exit 7')
+  local env: vector(string)
+  local req = c:job_req()
+  assert(req ~= 0 and c:jopen(req, 0, &argv, &env), 'JOPEN was sent')
+  for _ = 1, 500 do pump() if exited then break end end
+  assert(opened_count == 1 and opened_req == req, 'JOPENED answered our req')
+  assert(opened_jid ~= 0 and #opened_err == 0, 'a job id and no error: ' .. opened_err)
+  assert(opened_pid ~= 0, 'JOPENED carries the pid')
+  assert(exited and exit_jid == opened_jid, 'JEXIT for that job')
+  assert(exit_status == 7, 'the exit status is 7, got ' .. exit_status)
+  assert(err_stream_bytes == 5, 'stderr arrives tagged apart (got ' .. err_stream_bytes .. ' bytes)')
+  local text = out:promote()
+  -- 23 bytes of JSON prologue, 4000 digits, '"}' and the newline
+  assert(#text == 4026, 'stdout is the whole line, got ' .. #text .. ' bytes')
+  assert(text:find('\r', 1, true) == 0, 'nothing inserted a CR: a job is not a terminal')
+  assert(text:sub(#text, #text) == '\n' and text:sub(1, 1) == '{', 'one JSON line, whole')
+  text:destroy()
+  argv:destroy()
+  env:destroy()
+end
+
+-- stdin, and JDATA with no bytes as EOF
+do
+  out_bytes, exited, exit_status = 0, false, -1 -- promote() above emptied `out`
+  local argv: vector(string)
+  argv:push('/bin/cat')
+  local env: vector(string)
+  local req = c:job_req()
+  assert(c:jopen(req, 0, &argv, &env))
+  for _ = 1, 300 do pump() if opened_count == 2 then break end end
+  assert(opened_count == 2 and opened_jid ~= 0, 'the second job opened')
+  local msg: string = '{"type":"text","text":"hello"}\n'
+  c:jdata(opened_jid, (@*[0]uint8)(msg.data), msg.size)
+  for _ = 1, 200 do pump() if out_bytes >= msg.size then break end end
+  c:jdata(opened_jid, nilptr, 0) -- no bytes: close its stdin
+  for _ = 1, 300 do pump() if exited then break end end
+  assert(exited and exit_status == 0, 'cat ended at EOF, status ' .. exit_status)
+  local text = out:promote()
+  assert(text == msg, 'what was written came back: [' .. text .. ']')
+  text:destroy()
+  argv:destroy()
+  env:destroy()
+end
+
+-- an empty argv is refused, and the panel's session would fall back to a PTY
+do
+  exited = false
+  local argv: vector(string)
+  local env: vector(string)
+  local req = c:job_req()
+  assert(not c:jopen(req, 0, &argv, &env), 'an empty argv is not even sent')
+  argv:destroy()
+  env:destroy()
+end
+
+-- JCLOSE kills a job that is still running
+do
+  out_bytes, exited, exit_status = 0, false, -1
+  local argv: vector(string)
+  argv:push('/bin/sh')
+  argv:push('-c')
+  argv:push('sleep 30')
+  local env: vector(string)
+  local req = c:job_req()
+  assert(c:jopen(req, 0, &argv, &env))
+  for _ = 1, 300 do pump() if opened_count == 3 then break end end
+  assert(opened_count == 3 and opened_jid ~= 0)
+  c:jclose(opened_jid)
+  for _ = 1, 300 do pump() if exited then break end end
+  assert(exited and exit_status == 137, 'killed: 128 + SIGKILL, got ' .. exit_status)
+  argv:destroy()
+  env:destroy()
+end
+
+out:destroy()
+opened_err:destroy()
+c:destroy()
+print('OK')

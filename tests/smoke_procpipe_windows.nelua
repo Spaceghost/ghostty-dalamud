@@ -1,0 +1,206 @@
+-- Manual smoke test of core/sys/procpipe.nelua on Windows: the transport the
+-- /ask panel uses for a local assistant (a child process on anonymous pipes,
+-- no pseudo console). Not part of tests/run.sh -- it is cross-compiled for
+-- Windows and run on a Windows machine, because that half of procpipe.nelua
+-- (CreateProcessW, PeekNamedPipe, the kill-on-close job object) does not exist
+-- in a host build. tests/test_procpipe.nelua covers the POSIX half on Linux.
+--
+-- Build (on the Linux side, from the checkout):
+--   ZIG=/path/to/zig vendor/nelua-lang/nelua --cc tools/zig-cc-win.sh -P nogc \
+--     --cache-dir build/win/cache -L . -o build/dist/smoke_procpipe.exe \
+--     tests/smoke_procpipe_windows.nelua
+-- Run (on Windows, in a console):
+--   smoke_procpipe.exe
+--
+-- Each step prints PASS or FAIL and the run goes on; the exit code is the
+-- number of failures. What it proves, and nothing else can:
+--   * a line far longer than the console width comes back whole, with no CR
+--     inserted and no escape sequences added (a ConPTY would wrap it)
+--   * stderr arrives merged into the same stream
+--   * the exit status, and that a missing command fails the open
+--   * stdin, and that closing it is EOF for the child
+--   * close() kills the child and, through the job object, its children
+require 'core.sys.procpipe'
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'io'
+require 'os'
+
+## cinclude '<windows.h>'
+local function Sleep(ms: uint32): void <cimport, nodecl> end
+local function OpenProcess(access: uint32, inherit: cint, pid: uint32): pointer <cimport, nodecl> end
+local function GetProcessId(h: pointer): uint32 <cimport, nodecl> end
+local function CloseHandle(h: pointer): cint <cimport, nodecl> end
+local function WaitForSingleObject(h: pointer, ms: uint32): uint32 <cimport, nodecl> end
+local PROCESS_QUERY_LIMITED_INFORMATION: uint32 <cimport, nodecl, const>
+local WAIT_OBJECT_0: uint32 <cimport, nodecl, const>
+
+local fails = 0
+local function step(ok: boolean, what: string): void
+  if ok then
+    print('PASS', what)
+  else
+    fails = fails + 1
+    print('FAIL', what)
+  end
+end
+
+local function argv_of(a: string, b: string, c: string, d: facultative(string)): vector(string)
+  local v: vector(string)
+  v:push(a:copy())
+  if #b > 0 then v:push(b:copy()) end
+  if #c > 0 then v:push(c:copy()) end
+  ## if not d.type.is_niltype then
+  if #d > 0 then v:push(d:copy()) end
+  ## end
+  return v
+end
+
+local function argv_free(v: *vector(string)): void
+  for i = 0, < #$v do ($v)[i]:destroy() end
+  v:destroy()
+end
+
+-- Everything the child writes, until it exits.
+local function run(a: string, b: string, c: string, d: facultative(string)): (string, uint32, boolean)
+  local v = argv_of(a, b, c, d)
+  local p: ProcPipe
+  local started = p:open(&v, (@string){})
+  argv_free(&v)
+  if not started then return (@string){}, 0, false end
+  p:close_stdin()
+  local sb: stringbuilder
+  local buf: [4096]uint8
+  local exited = false
+  for _ = 1, 2000 do -- at most ~20 s
+    local n = p:read(&buf, 4096)
+    if n > 0 then
+      sb:write(string{data = (@*[0]byte)(&buf), size = n})
+    elseif p:poll_exit() then
+      exited = true
+      break
+    else
+      Sleep(10)
+    end
+  end
+  local code = p.exit_code
+  local out = sb:promote()
+  p:close()
+  return out, code, exited
+end
+
+-- 4000 characters on one line: over any console width, so a pseudo console
+-- would hand it back as wrapped rows
+do
+  -- PowerShell writes it in one Write-Output, so the console is the only thing
+  -- that could break the line up
+  local out, code, exited = run('powershell.exe', '-NoProfile', '-Command', "Write-Output ('0123456789' * 400)")
+  local digits = 0
+  for i = 1, #out do
+    local c = out:sub(i, i)
+    if c >= '0' and c <= '9' then digits = digits + 1 end
+  end
+  step(exited and code == 0, 'the child ran and exited')
+  step(digits == 4000, 'all 4000 characters arrived (got ' .. digits .. ')')
+  -- cmd's `echo.` ends the line with CRLF; what must not happen is a CR every
+  -- console width, which is what a wrapped line looks like
+  local crs = 0
+  for i = 1, #out do if out:sub(i, i) == '\r' then crs = crs + 1 end end
+  step(crs <= 1, 'the long line was not wrapped (CR count ' .. crs .. ')')
+  out:destroy()
+end
+
+-- stderr comes back too (the panel shows a stray line as the reason)
+do
+  local out, code, exited = run('cmd.exe', '/c', 'echo out & echo err 1>&2')
+  step(exited and out:find('out', 1, true) ~= 0 and out:find('err', 1, true) ~= 0, 'stdout and stderr both arrive')
+  out:destroy()
+end
+
+-- the exit status
+do
+  local out, code, exited = run('cmd.exe', '/c', 'exit /b 7')
+  step(exited and code == 7, 'the exit status is 7 (got ' .. code .. ')')
+  out:destroy()
+end
+
+-- a command that is not there: CreateProcessW fails, so open() does
+do
+  local v = argv_of('ghostty-no-such-command-xyz.exe', (@string){}, (@string){})
+  local p: ProcPipe
+  local ok = p:open(&v, (@string){})
+  argv_free(&v)
+  step(not ok, 'a missing command fails the open')
+  if ok then p:close() end
+end
+
+-- stdin, and EOF when it is closed
+do
+  local v = argv_of('more.com', (@string){}, (@string){}) -- copies stdin to stdout, ends at EOF
+  local p: ProcPipe
+  local started = p:open(&v, (@string){})
+  argv_free(&v)
+  if not started then
+    step(false, 'more.com started')
+  else
+    local msg: string = '{"type":"text","text":"hello"}\r\n'
+    p:write((@pointer)(msg.data), msg.size)
+    p:close_stdin()
+    local sb: stringbuilder
+    local buf: [4096]uint8
+    local exited = false
+    for _ = 1, 2000 do
+      local n = p:read(&buf, 4096)
+      if n > 0 then
+        sb:write(string{data = (@*[0]byte)(&buf), size = n})
+      elseif p:poll_exit() then
+        exited = true
+        break
+      else
+        Sleep(10)
+      end
+    end
+    local out = sb:promote()
+    step(exited and out:find('hello', 1, true) ~= 0, 'what was written came back, then EOF ended it')
+    out:destroy()
+    p:close()
+  end
+end
+
+-- close() kills the child, and the job object takes what the child started
+do
+  local v = argv_of('cmd.exe', '/c', 'ping -n 30 127.0.0.1 >nul')
+  local p: ProcPipe
+  local started = p:open(&v, (@string){})
+  argv_free(&v)
+  if not started then
+    step(false, 'a long-running child started')
+  else
+    local pid = GetProcessId(p.process)
+    step(pid ~= 0, 'the child has a process id')
+    p:close()
+    -- gone, or at least no longer running: OpenProcess fails once it is reaped
+    local gone = false
+    for _ = 1, 200 do
+      local h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid)
+      if h == nilptr then
+        gone = true
+        break
+      end
+      local signalled = WaitForSingleObject(h, 0) == WAIT_OBJECT_0
+      CloseHandle(h)
+      if signalled then
+        gone = true
+        break
+      end
+      Sleep(10)
+    end
+    step(gone, 'close() ended the child')
+    print('NOTE  also check with tasklist that no ping.exe from this run is left:')
+    print('NOTE  that is the job object taking the child of the child, which only Windows shows')
+  end
+end
+
+print('failures:', fails)
+os.exit(fails)
