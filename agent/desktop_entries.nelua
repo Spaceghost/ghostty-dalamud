@@ -1,0 +1,578 @@
+-- The host's installed apps for the agent's compositor (agent/capture_wayland.nelua):
+-- freedesktop .desktop files from the XDG data directories, parsed into what
+-- a launcher needs (name, command, icon name, categories), a fuzzy match of
+-- a typed name against them (WOPEN "app:NAME"), and the icon files behind
+-- icon names (WLIST "apps"). Parsing, matching and list lines are pure
+-- (tests/test_desktop_entries.nelua); desktop_scan and desktop_find_icon read
+-- directories.
+--
+-- Only the agent-side primitives live here: a launcher's UI (menus, icons,
+-- taskbars) belongs to whatever sits on top of the window protocol.
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'io'
+require 'os'
+require 'math'
+
+global DesktopEntry = @record{
+  id: string,          -- the file name, e.g. org.mozilla.firefox.desktop
+  name: string,
+  exec: string,        -- a shell command: field codes gone, string escapes resolved
+  exec_raw: string,    -- Exec with its field codes, string escapes resolved (browser_expand fills in a URL)
+  icon: string,        -- an icon name (or path) as the file gives it
+  categories: string,  -- as given: "Network;WebBrowser;"
+  terminal: boolean,   -- Terminal=true: needs a terminal to run in
+}
+
+function DesktopEntry:destroy(): void
+  self.id:destroy() self.name:destroy() self.exec:destroy() self.exec_raw:destroy() self.icon:destroy() self.categories:destroy()
+end
+
+local function lower_byte(c: byte): byte
+  if c >= 65 and c <= 90 then return c + 32 end
+  return c
+end
+
+local function trim(s: string): string
+  local i, j = 1, #s
+  while i <= j and (s:byte(i) == 32 or s:byte(i) == 9 or s:byte(i) == 13) do i = i + 1 end
+  while j >= i and (s:byte(j) == 32 or s:byte(j) == 9 or s:byte(j) == 13) do j = j - 1 end
+  return s:subview(i, j)
+end
+
+-- The desktop entry spec's string escapes: \s \n \t \r \\ (others kept).
+local function unescape(v: string): string
+  local sb: stringbuilder
+  local i = 1
+  while i <= #v do
+    local c = v:byte(i)
+    if c == 92 and i < #v then
+      local n = v:byte(i + 1)
+      if n == 115 then sb:writebyte(32) i = i + 2
+      elseif n == 110 then sb:writebyte(10) i = i + 2
+      elseif n == 116 then sb:writebyte(9) i = i + 2
+      elseif n == 114 then sb:writebyte(13) i = i + 2
+      elseif n == 92 then sb:writebyte(92) i = i + 2
+      else sb:writebyte(c) i = i + 1 end
+    else
+      sb:writebyte(c)
+      i = i + 1
+    end
+  end
+  return sb:promote()
+end
+
+-- Exec's field codes: %f %F %u %U (files and URLs: none here), %i (the
+-- icon), %c (the name), %k (the file) go; %% is a percent sign. The result
+-- runs through `sh -c`, whose quoting the spec's own is a subset of.
+global function desktop_exec_command(exec: string, name: string, icon: string): string
+  local sb: stringbuilder
+  local i = 1
+  while i <= #exec do
+    local c = exec:byte(i)
+    if c == 37 and i < #exec then -- '%'
+      local f = exec:byte(i + 1)
+      if f == 37 then sb:writebyte(37)
+      elseif f == 105 and #icon > 0 then sb:write("--icon '", icon, "'") -- %i
+      elseif f == 99 then sb:write("'", name, "'")                        -- %c
+      end
+      i = i + 2
+    else
+      sb:writebyte(c)
+      i = i + 1
+    end
+  end
+  -- what the codes left: blanks at the ends
+  local s = sb:promote()
+  local t = trim(s)
+  local out = string.copy(t)
+  s:destroy()
+  return out
+end
+
+-- One .desktop file's text -> its entry. False (and nothing to free) for
+-- anything a launcher does not show: not an Application, Hidden, NoDisplay,
+-- no Name or no Exec. Keys with a locale ("Name[de]") are skipped.
+global function desktop_parse(id: string, text: string): (boolean, DesktopEntry)
+  local e: DesktopEntry
+  local in_main = false
+  local typ: string, name: string, exec: string, icon: string, cats: string
+  local hidden, terminal = false, false
+  local pos = 1
+  while pos <= #text do
+    local nl = text:find('\n', pos, true)
+    local stop = nl > 0 and nl - 1 or #text
+    local line = trim(text:subview(pos, stop))
+    pos = stop + 2
+    if #line > 0 and line:byte(1) ~= 35 then -- '#'
+      if line:byte(1) == 91 then -- '[': a group header
+        in_main = line == '[Desktop Entry]'
+      elseif in_main then
+        local eq = line:find('=', 1, true)
+        if eq > 1 then
+          local k = trim(line:subview(1, eq - 1))
+          local v = trim(line:subview(eq + 1))
+          if k == 'Type' then typ = v
+          elseif k == 'Name' then name = v
+          elseif k == 'Exec' then exec = v
+          elseif k == 'Icon' then icon = v
+          elseif k == 'Categories' then cats = v
+          elseif k == 'NoDisplay' or k == 'Hidden' then hidden = hidden or v == 'true'
+          elseif k == 'Terminal' then terminal = v == 'true'
+          end
+        end
+      end
+    end
+  end
+  if typ ~= 'Application' or hidden or #name == 0 or #exec == 0 then return false, e end
+  e.id = string.copy(id)
+  e.name = unescape(name)
+  e.icon = unescape(icon)
+  e.categories = unescape(cats)
+  local raw = unescape(exec)
+  e.exec = desktop_exec_command(raw, e.name, e.icon)
+  e.exec_raw = raw
+  e.terminal = terminal
+  if #e.exec == 0 then e:destroy() return false, (@DesktopEntry){} end
+  return true, e
+end
+
+-- ASCII case-insensitive; true when `c` starts a word of `s` at index i.
+local function word_start(s: string, i: integer): boolean
+  if i == 1 then return true end
+  local p = s:byte(i - 1)
+  return p == 32 or p == 45 or p == 46 or p == 95 or p == 47 -- space - . _ /
+end
+
+-- How well typed text `query` names `name`, 0 for not at all: the whole name
+-- (1000), a prefix of it (900), a prefix of one of its words (700), a
+-- substring (500), then its letters in order (up to 300, more when they run
+-- together). Shorter names win ties within a kind.
+global function desktop_fuzzy_score(name: string, query: string): integer
+  if #query == 0 then return 1 end
+  if #name == 0 then return 0 end
+  local n, q = #name, #query
+  -- the whole name, and substrings
+  local first_sub, word_sub = 0, 0
+  for i = 1, n - q + 1 do
+    local all = true
+    for k = 0, < q do
+      if lower_byte(name:byte(i + k)) ~= lower_byte(query:byte(k + 1)) then all = false break end
+    end
+    if all then
+      if first_sub == 0 then first_sub = i end
+      if word_sub == 0 and word_start(name, i) then word_sub = i end
+    end
+  end
+  local short = math.min(n, 99)
+  if first_sub == 1 then
+    if n == q then return 1000 end
+    return 900 - short
+  end
+  if word_sub > 0 then return 700 - short end
+  if first_sub > 0 then return 500 - math.min(first_sub, 99) end
+  -- letters in order
+  local qi, run, best_run, gaps = 1, 0, 0, 0
+  for i = 1, n do
+    if qi <= q and lower_byte(name:byte(i)) == lower_byte(query:byte(qi)) then
+      qi = qi + 1
+      run = run + 1
+      if run > best_run then best_run = run end
+    else
+      if qi > 1 and qi <= q then gaps = gaps + 1 end
+      run = 0
+    end
+  end
+  if qi <= q then return 0 end
+  return math.max(1, 200 + best_run * 10 - math.min(gaps, 99))
+end
+
+-- "org.mozilla.firefox.desktop" -> "firefox"; "foot.desktop" -> "foot".
+local function id_word(id: string): string
+  local s = id
+  if #s > 8 and s:subview(#s - 7) == '.desktop' then s = s:subview(1, #s - 8) end
+  for i = #s, 1, -1 do
+    if s:byte(i) == 46 then return s:subview(i + 1) end
+  end
+  return s
+end
+
+-- The first word of a command, without its directory.
+local function exec_word(exec: string): string
+  local sp = exec:find(' ', 1, true)
+  local w = sp > 0 and exec:subview(1, sp - 1) or exec
+  for i = #w, 1, -1 do
+    if w:byte(i) == 47 then return w:subview(i + 1) end
+  end
+  return w
+end
+
+-- An entry's score for `query`: its name, else its id's last word or its
+-- command's program name a little lower.
+global function desktop_entry_score(e: *DesktopEntry, query: string): integer
+  local s = desktop_fuzzy_score(e.name, query)
+  local s2 = desktop_fuzzy_score(id_word(e.id), query) - 50
+  local s3 = desktop_fuzzy_score(exec_word(e.exec), query) - 60
+  if s2 > s then s = s2 end
+  if s3 > s then s = s3 end
+  return s
+end
+
+-- The best entry for `query`, -1 for none. Ties go to the shorter name, then
+-- the earlier entry.
+global function desktop_best(entries: *vector(DesktopEntry), query: string): integer
+  local best, best_score = -1, 0
+  for i = 0, < #entries do
+    local s = desktop_entry_score(&entries[i], query)
+    if s > best_score or (s == best_score and s > 0 and best >= 0 and #entries[i].name < #entries[best].name) then
+      best, best_score = i, s
+    end
+  end
+  return best
+end
+
+-- A list field: tabs and newlines would break the line format.
+local function write_field(sb: *stringbuilder, s: string): void
+  for i = 1, #s do
+    local b = s:byte(i)
+    if b == 9 or b == 10 or b == 13 then b = 32 end
+    sb:writebyte(b)
+  end
+end
+
+-- The id apps are listed and launched by: the desktop file id without
+-- ".desktop" ("org.gnome.Calculator").
+global function desktop_short_id(id: string): string
+  if #id > 8 and id:subview(#id - 7) == '.desktop' then return id:subview(1, #id - 8) end
+  return id
+end
+
+-- One WLISTR line for an app (WLIST "apps", docs/REMOTE_WINDOWS.md):
+--   app\tID\tNAME\tICON\tCATEGORIES\n            a graphical app
+--   term\tID\tNAME\tICON\tCATEGORIES\tCOMMAND\n  Terminal=true: runs in a terminal
+-- ICON is a PNG path (empty when the app has none).
+global function desktop_list_line(sb: *stringbuilder, e: *DesktopEntry, icon_png: string): void
+  sb:write(e.terminal and 'term' or 'app')
+  sb:writebyte(9) write_field(sb, desktop_short_id(e.id))
+  sb:writebyte(9) write_field(sb, e.name)
+  sb:writebyte(9) write_field(sb, icon_png)
+  sb:writebyte(9) write_field(sb, e.categories)
+  if e.terminal then sb:writebyte(9) write_field(sb, e.exec) end
+  sb:writebyte(10)
+end
+
+-- The entry `query` names: its desktop id (with or without ".desktop",
+-- ASCII case-insensitive), else the best fuzzy match of its name. -1 for none.
+global function desktop_find(entries: *vector(DesktopEntry), query: string): integer
+  local q = query:lower()
+  for i = 0, < #entries do
+    local id = entries[i].id:lower()
+    local same = id == q or desktop_short_id(id) == q
+    id:destroy()
+    if same then q:destroy() return i end
+  end
+  q:destroy()
+  return desktop_best(entries, query)
+end
+
+--------------------------------------------------------------------------------
+-- Scanning (not pure: reads the file system)
+
+## cinclude '<dirent.h>'
+local DIR <cimport, nodecl> = @record{}
+local dirent <cimport, nodecl, ctypedef> = @record{ d_name: [256]cchar }
+local function opendir(path: cstring): *DIR <cimport, nodecl> end
+local function readdir(d: *DIR): *dirent <cimport, nodecl> end
+local function closedir(d: *DIR): cint <cimport, nodecl> end
+
+-- The names in directory `path` (none when it cannot be read).
+global function desktop_list_dir(path: string): vector(string)
+  local out: vector(string)
+  local d = opendir((@cstring)(path.data))
+  if d == nilptr then return out end
+  while true do
+    local ent = readdir(d)
+    if ent == nilptr then break end
+    local nm = (@string)((@cstring)(&ent.d_name[0]))
+    if nm ~= '.' and nm ~= '..' then out:push(string.copy(nm)) end
+  end
+  closedir(d)
+  return out
+end
+
+-- The XDG data directories: $XDG_DATA_HOME (~/.local/share) first, then
+-- $XDG_DATA_DIRS (/usr/local/share:/usr/share), then Flatpak's exports
+-- (user, system) when the list lacks them; each with `sub` appended.
+global function desktop_base_dirs(sub: string): vector(string)
+  local out: vector(string)
+  local home = os.getenv('XDG_DATA_HOME')
+  if #home == 0 then
+    local h = os.getenv('HOME')
+    if #h > 0 then home:destroy() home = h .. '/.local/share' end
+    h:destroy()
+  end
+  if #home > 0 then out:push(home .. sub) end
+  home:destroy()
+  local dirs = os.getenv('XDG_DATA_DIRS')
+  if #dirs == 0 then dirs:destroy() dirs = string.copy('/usr/local/share:/usr/share') end
+  local pos = 1
+  while pos <= #dirs do
+    local c = dirs:find(':', pos, true)
+    local stop = c > 0 and c - 1 or #dirs
+    if stop >= pos then
+      local d = dirs:subview(pos, stop)
+      while #d > 1 and d:byte(#d) == 47 do d = d:subview(1, #d - 1) end -- "/usr/share/" as "/usr/share"
+      out:push(d .. sub)
+    end
+    pos = stop + 2
+  end
+  dirs:destroy()
+  local h = os.getenv('HOME')
+  local extra: [2]string = { #h > 0 and h .. '/.local/share/flatpak/exports/share' or string.copy(''), string.copy('/var/lib/flatpak/exports/share') }
+  for k = 0, < 2 do
+    if #extra[k] > 0 then
+      local d = extra[k] .. sub
+      local have = false
+      for i = 0, < #out do if out[i] == d then have = true end end
+      if have then d:destroy() else out:push(d) end
+    end
+    extra[k]:destroy()
+  end
+  h:destroy()
+  return out
+end
+
+global function desktop_data_dirs(): vector(string)
+  return desktop_base_dirs('/applications')
+end
+
+-- Every shown entry in `dirs`, the first directory's file winning for an id
+-- (the XDG rule); sorted by name. Subdirectories (vendor prefixes) are read
+-- one level deep, their files named "sub-name.desktop" as the spec says.
+-- One file for desktop_scan: the first file of an id wins, hidden or not.
+local function scan_add(out: *vector(DesktopEntry), seen: *vector(string), id: string, path: string): void
+  for i = 0, < #seen do if seen[i] == id then return end end
+  seen:push(string.copy(id)) -- a hidden entry hides the same id further down too
+  local f = io.open(path, 'rb')
+  if not f:isopen() then return end
+  local text = f:read('a')
+  f:close()
+  local ok, e = desktop_parse(id, text)
+  text:destroy()
+  if ok then out:push(e) end
+end
+
+global function desktop_scan(dirs: *vector(string)): vector(DesktopEntry)
+  local out: vector(DesktopEntry)
+  local seen: vector(string)
+  for di = 0, < #dirs do
+    local names = desktop_list_dir(dirs[di])
+    for i = 0, < #names do
+      local nm = names[i]
+      local path = dirs[di] .. '/' .. nm
+      if #nm > 8 and nm:subview(#nm - 7) == '.desktop' then
+        scan_add(&out, &seen, nm, path)
+      else
+        local sub = desktop_list_dir(path)
+        for k = 0, < #sub do
+          local sn = sub[k]
+          if #sn > 8 and sn:subview(#sn - 7) == '.desktop' then
+            local id = nm .. '-' .. sn
+            local sp = path .. '/' .. sn
+            scan_add(&out, &seen, id, sp)
+            id:destroy() sp:destroy()
+          end
+          sn:destroy()
+        end
+        sub:destroy()
+      end
+      path:destroy()
+      nm:destroy()
+    end
+    names:destroy()
+  end
+  for i = 0, < #seen do seen[i]:destroy() end
+  seen:destroy()
+  -- by name, case-insensitively (insertion sort: a few hundred entries)
+  for i = 1, < #out do
+    local k = i
+    while k > 0 do
+      local a, b = out[k - 1].name:lower(), out[k].name:lower()
+      local swap = b < a
+      a:destroy() b:destroy()
+      if not swap then break end
+      out[k - 1], out[k] = out[k], out[k - 1]
+      k = k - 1
+    end
+  end
+  return out
+end
+
+--------------------------------------------------------------------------------
+-- Icons: the file behind an icon name (not pure: looks at the file system)
+
+## cinclude '<unistd.h>'
+local function access(path: cstring, mode: cint): cint <cimport, nodecl> end
+
+local function exists(path: string): boolean
+  return access((@cstring)(path.data), 0) == 0
+end
+
+-- Where icon themes live: $XDG_DATA_HOME/icons, each $XDG_DATA_DIRS/icons,
+-- Flatpak's exports, ~/.icons.
+global function desktop_icon_dirs(): vector(string)
+  local out = desktop_base_dirs('/icons')
+  local h = os.getenv('HOME')
+  if #h > 0 then out:push(h .. '/.icons') end
+  h:destroy()
+  return out
+end
+
+-- Themes looked in, in order: the fallback theme first (apps install there),
+-- then common desktop themes for names only they have.
+global DESKTOP_ICON_THEMES: [4]string = { 'hicolor', 'Adwaita', 'breeze', 'AdwaitaLegacy' }
+-- Sizes looked for, best first: big enough for a panel, small enough to load.
+global DESKTOP_ICON_SIZES: [9]integer = { 128, 256, 96, 64, 512, 48, 32, 24, 16 }
+global DESKTOP_ICON_PX: integer <comptime> = 128 -- what scalable icons render at
+
+-- Contexts looked in, apps first: generic names ("utilities-terminal",
+-- "applications-graphics") live in the others.
+global DESKTOP_ICON_CONTEXTS: [7]string = { 'apps', 'categories', 'legacy', 'devices', 'places', 'status', 'mimetypes' }
+
+-- The file for icon `icon` (a name, or an absolute path as some entries
+-- give) and its pixel size (0: scalable, an SVG). Empty when there is none.
+-- The icon theme spec's lookup, simplified: the themes, sizes and contexts
+-- above, in "SIZExSIZE/CONTEXT" and "scalable/CONTEXT" directories, and in
+-- Breeze's "CONTEXT/SIZE" ones, then /usr/share/pixmaps.
+global function desktop_find_icon(icon: string, dirs: *vector(string)): (string, integer)
+  if #icon == 0 then return (@string){}, 0 end
+  if icon:byte(1) == 47 then
+    if exists(icon) then
+      local ext = icon:subview(math.max(1, #icon - 3)):lower()
+      local svg = ext == '.svg'
+      ext:destroy()
+      return string.copy(icon), svg and 0 or DESKTOP_ICON_PX
+    end
+    return (@string){}, 0
+  end
+  for ci = 0, < #DESKTOP_ICON_CONTEXTS do
+    local ctx = DESKTOP_ICON_CONTEXTS[ci]
+    for ti = 0, < #DESKTOP_ICON_THEMES do
+      for di = 0, < #dirs do
+        local base = dirs[di] .. '/' .. DESKTOP_ICON_THEMES[ti]
+        if exists(base) then
+          for si = 0, < #DESKTOP_ICON_SIZES do
+            local sz = DESKTOP_ICON_SIZES[si]
+            local p = string.format('%s/%dx%d/%s/%s.png', base, sz, sz, ctx, icon)
+            if exists(p) then base:destroy() return p, sz end
+            p:destroy()
+          end
+          local p = string.format('%s/scalable/%s/%s.svg', base, ctx, icon)
+          if exists(p) then base:destroy() return p, 0 end
+          p:destroy()
+          for si = 0, < #DESKTOP_ICON_SIZES do
+            p = string.format('%s/%s/%d/%s.svg', base, ctx, DESKTOP_ICON_SIZES[si], icon)
+            if exists(p) then base:destroy() return p, 0 end
+            p:destroy()
+          end
+        end
+        base:destroy()
+      end
+    end
+  end
+  local exts: [3]string = { '.png', '.svg', '.xpm' }
+  for k = 0, < 3 do
+    local p = '/usr/share/pixmaps/' .. icon .. exts[k]
+    if exists(p) then return p, k == 1 and 0 or DESKTOP_ICON_PX end
+    p:destroy()
+  end
+  return (@string){}, 0
+end
+
+-- $XDG_CACHE_HOME/ghostty-agent/icons (~/.cache/...): under $HOME, so a
+-- sandboxed game (XIVLauncher's Flatpak shares only the home directory) can
+-- read what the agent puts there.
+global function desktop_icon_cache_dir(): string
+  local c = os.getenv('XDG_CACHE_HOME')
+  if #c == 0 then
+    local h = os.getenv('HOME')
+    c:destroy()
+    c = h .. '/.cache'
+    h:destroy()
+  end
+  local out = c .. '/ghostty-agent/icons'
+  c:destroy()
+  return out
+end
+
+-- The cached PNG for entry id `short_id` whose icon is `size` pixels (0:
+-- scalable, rendered at DESKTOP_ICON_PX).
+global function desktop_icon_png(cache: string, short_id: string, size: integer): string
+  return string.format('%s/%s-%d.png', cache, short_id, size == 0 and DESKTOP_ICON_PX or size)
+end
+
+-- `s` in single quotes for sh.
+global function desktop_sh_quote(sb: *stringbuilder, s: string): void
+  sb:writebyte(39)
+  for i = 1, #s do
+    local b = s:byte(i)
+    if b == 39 then sb:write("'\\''") else sb:writebyte(b) end
+  end
+  sb:writebyte(39)
+end
+
+-- `name`'s full path on $PATH (executable), empty when it is not there.
+global function desktop_which(name: string): string
+  local path = os.getenv('PATH')
+  if #path == 0 then path:destroy() path = string.copy('/usr/local/bin:/usr/bin:/bin') end
+  local pos = 1
+  while pos <= #path do
+    local c = path:find(':', pos, true)
+    local stop = c > 0 and c - 1 or #path
+    if stop >= pos then
+      local p = path:subview(pos, stop) .. '/' .. name
+      if access((@cstring)(p.data), 1) == 0 then path:destroy() return p end
+      p:destroy()
+    end
+    pos = stop + 2
+  end
+  path:destroy()
+  return (@string){}
+end
+
+-- The first of rsvg-convert, magick (ImageMagick 7), convert (6) found on
+-- PATH (a full path), empty for none.
+global function desktop_icon_renderer(): string
+  local names: [3]string = { 'rsvg-convert', 'magick', 'convert' }
+  for k = 0, < 3 do
+    local p = desktop_which(names[k])
+    if #p > 0 then return p end
+  end
+  return (@string){}
+end
+
+-- The temporary name carries the job's pid: two jobs never share one.
+local function write_tmp(sb: *stringbuilder, dst: string): void
+  desktop_sh_quote(sb, dst)
+  sb:write('.$$.tmp')
+end
+
+global function desktop_icon_job(sb: *stringbuilder, src: string, dst: string, renderer: string): boolean
+  local png = #src > 4 and src:subview(#src - 3):lower() == '.png'
+  if not png and #renderer == 0 then return false end
+  if png then
+    sb:write('cp -f ') desktop_sh_quote(sb, src) sb:write(' ') write_tmp(sb, dst)
+  else
+    local rsvg = #renderer >= 12 and renderer:subview(#renderer - 11) == 'rsvg-convert'
+    desktop_sh_quote(sb, renderer)
+    if rsvg then
+      sb:writef(' -w %d -h %d -a -o ', DESKTOP_ICON_PX, DESKTOP_ICON_PX) write_tmp(sb, dst) sb:write(' ') desktop_sh_quote(sb, src)
+    else
+      sb:write(' -background none ') desktop_sh_quote(sb, src)
+      sb:writef(' -resize %dx%d png:', DESKTOP_ICON_PX, DESKTOP_ICON_PX) write_tmp(sb, dst)
+    end
+  end
+  sb:write(' && mv -f ') write_tmp(sb, dst) sb:write(' ') desktop_sh_quote(sb, dst) sb:write('\n')
+  return true
+end

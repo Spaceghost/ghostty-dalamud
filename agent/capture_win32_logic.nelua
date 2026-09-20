@@ -1,0 +1,288 @@
+-- The pure parts of the Win32 capture backend (agent/capture_win32.nelua):
+-- no Win32 calls, so tests/test_capture_win32.nelua checks them on the host.
+-- USB HID usage → virtual key, key message lParams, mouse message words,
+-- blank captures, UTF-8 → UTF-16 for WM_CHAR, WLISTR line building and window matching.
+-- Message and VK numbers are spelled out (they are fixed by the Win32 ABI)
+-- because <windows.h> is not available to host builds.
+require 'string'
+require 'vector'
+require 'stringbuilder'
+
+global CW32_WM_KEYDOWN: uint32 <comptime> = 0x0100
+global CW32_WM_KEYUP: uint32 <comptime> = 0x0101
+global CW32_WM_CHAR: uint32 <comptime> = 0x0102
+global CW32_WM_SYSKEYDOWN: uint32 <comptime> = 0x0104
+global CW32_WM_SYSKEYUP: uint32 <comptime> = 0x0105
+global CW32_WM_MOUSEMOVE: uint32 <comptime> = 0x0200
+global CW32_WM_LBUTTONDOWN: uint32 <comptime> = 0x0201
+global CW32_WM_LBUTTONUP: uint32 <comptime> = 0x0202
+global CW32_WM_RBUTTONDOWN: uint32 <comptime> = 0x0204
+global CW32_WM_RBUTTONUP: uint32 <comptime> = 0x0205
+global CW32_WM_MBUTTONDOWN: uint32 <comptime> = 0x0207
+global CW32_WM_MBUTTONUP: uint32 <comptime> = 0x0208
+global CW32_WM_MOUSEWHEEL: uint32 <comptime> = 0x020A
+global CW32_WM_MOUSEHWHEEL: uint32 <comptime> = 0x020E
+
+global CW32_MK_LBUTTON: uint32 <comptime> = 0x0001
+global CW32_MK_RBUTTON: uint32 <comptime> = 0x0002
+global CW32_MK_SHIFT: uint32 <comptime> = 0x0004
+global CW32_MK_CONTROL: uint32 <comptime> = 0x0008
+global CW32_MK_MBUTTON: uint32 <comptime> = 0x0010
+
+global CW32_VK_SHIFT: uint8 <comptime> = 0x10
+global CW32_VK_CONTROL: uint8 <comptime> = 0x11
+global CW32_VK_MENU: uint8 <comptime> = 0x12
+global CW32_VK_LSHIFT: uint8 <comptime> = 0xA0
+global CW32_VK_RSHIFT: uint8 <comptime> = 0xA1
+global CW32_VK_LCONTROL: uint8 <comptime> = 0xA2
+global CW32_VK_RCONTROL: uint8 <comptime> = 0xA3
+global CW32_VK_LMENU: uint8 <comptime> = 0xA4
+global CW32_VK_RMENU: uint8 <comptime> = 0xA5
+global CW32_VK_LWIN: uint8 <comptime> = 0x5B
+
+-- USB HID usage (keyboard page 7) → Windows virtual key, and whether the key
+-- is an "extended" one (lParam bit 24, KEYEVENTF_EXTENDEDKEY): the arrows and
+-- the navigation block, right ctrl/alt, keypad enter and divide, the Windows
+-- and menu keys. 0 when the usage has no key here. Modifiers come back as
+-- their left/right VKs (SendInput wants those); cw32_generic_vk folds them
+-- for window messages.
+global function cw32_hid_key(hid: uint16): (uint8, boolean)
+  if hid >= 0x04 and hid <= 0x1D then return (@uint8)(0x41 + hid - 0x04), false end -- A..Z
+  if hid >= 0x1E and hid <= 0x26 then return (@uint8)(0x31 + hid - 0x1E), false end -- 1..9
+  if hid >= 0x3A and hid <= 0x45 then return (@uint8)(0x70 + hid - 0x3A), false end -- F1..F12
+  if hid >= 0x68 and hid <= 0x73 then return (@uint8)(0x7C + hid - 0x68), false end -- F13..F24
+  if hid >= 0x59 and hid <= 0x61 then return (@uint8)(0x61 + hid - 0x59), false end -- keypad 1..9
+  switch hid do
+  case 0x27 then return 0x30, false -- 0
+  case 0x28 then return 0x0D, false -- enter
+  case 0x29 then return 0x1B, false -- escape
+  case 0x2A then return 0x08, false -- backspace
+  case 0x2B then return 0x09, false -- tab
+  case 0x2C then return 0x20, false -- space
+  case 0x2D then return 0xBD, false -- - VK_OEM_MINUS
+  case 0x2E then return 0xBB, false -- = VK_OEM_PLUS
+  case 0x2F then return 0xDB, false -- [ VK_OEM_4
+  case 0x30 then return 0xDD, false -- ] VK_OEM_6
+  case 0x31, 0x32 then return 0xDC, false -- \ (and non-US #) VK_OEM_5
+  case 0x33 then return 0xBA, false -- ; VK_OEM_1
+  case 0x34 then return 0xDE, false -- ' VK_OEM_7
+  case 0x35 then return 0xC0, false -- ` VK_OEM_3
+  case 0x36 then return 0xBC, false -- , VK_OEM_COMMA
+  case 0x37 then return 0xBE, false -- . VK_OEM_PERIOD
+  case 0x38 then return 0xBF, false -- / VK_OEM_2
+  case 0x39 then return 0x14, false -- caps lock
+  case 0x46 then return 0x2C, true  -- print screen
+  case 0x47 then return 0x91, false -- scroll lock
+  case 0x48 then return 0x13, false -- pause
+  case 0x49 then return 0x2D, true  -- insert
+  case 0x4A then return 0x24, true  -- home
+  case 0x4B then return 0x21, true  -- page up
+  case 0x4C then return 0x2E, true  -- delete
+  case 0x4D then return 0x23, true  -- end
+  case 0x4E then return 0x22, true  -- page down
+  case 0x4F then return 0x27, true  -- right
+  case 0x50 then return 0x25, true  -- left
+  case 0x51 then return 0x28, true  -- down
+  case 0x52 then return 0x26, true  -- up
+  case 0x53 then return 0x90, true  -- num lock
+  case 0x54 then return 0x6F, true  -- keypad /
+  case 0x55 then return 0x6A, false -- keypad *
+  case 0x56 then return 0x6D, false -- keypad -
+  case 0x57 then return 0x6B, false -- keypad +
+  case 0x58 then return 0x0D, true  -- keypad enter
+  case 0x62 then return 0x60, false -- keypad 0
+  case 0x63 then return 0x6E, false -- keypad .
+  case 0x64 then return 0xE2, false -- non-US \ VK_OEM_102
+  case 0x65 then return 0x5D, true  -- menu (application)
+  case 0xE0 then return CW32_VK_LCONTROL, false
+  case 0xE1 then return CW32_VK_LSHIFT, false
+  case 0xE2 then return CW32_VK_LMENU, false
+  case 0xE3 then return CW32_VK_LWIN, true
+  case 0xE4 then return CW32_VK_RCONTROL, true
+  case 0xE5 then return CW32_VK_RSHIFT, false
+  case 0xE6 then return CW32_VK_RMENU, true
+  case 0xE7 then return 0x5C, true  -- right Windows
+  end
+  return 0, false
+end
+
+-- WM_KEYDOWN carries VK_SHIFT / VK_CONTROL / VK_MENU, not the sided VKs.
+global function cw32_generic_vk(vk: uint8): uint8
+  if vk == CW32_VK_LSHIFT or vk == CW32_VK_RSHIFT then return CW32_VK_SHIFT end
+  if vk == CW32_VK_LCONTROL or vk == CW32_VK_RCONTROL then return CW32_VK_CONTROL end
+  if vk == CW32_VK_LMENU or vk == CW32_VK_RMENU then return CW32_VK_MENU end
+  return vk
+end
+
+-- lParam of WM_KEYDOWN/UP (and the SYS variants): repeat count 1 (bits
+-- 0-15), scan code (16-23), extended (24), context code = alt held (29),
+-- previous state (30, set on key up) and transition (31, set on key up).
+global function cw32_key_lparam(scan: uint32, down: boolean, extended: boolean, alt: boolean): uint32
+  local lp: uint32 = 1 | ((scan & 0xFF) << 16)
+  if extended then lp = lp | (1 << 24) end
+  if alt then lp = lp | (1 << 29) end
+  if not down then lp = lp | (1 << 30) | (1 << 31) end
+  return lp
+end
+
+-- The message a key sends: WM_SYSKEY* for alt and alt combinations (what
+-- Windows itself does, so menus' accelerators see them), WM_KEY* otherwise.
+global function cw32_key_msg(vk: uint8, down: boolean, alt: boolean): uint32
+  local sys = alt or cw32_generic_vk(vk) == CW32_VK_MENU
+  if sys then return down and CW32_WM_SYSKEYDOWN or CW32_WM_SYSKEYUP end
+  return down and CW32_WM_KEYDOWN or CW32_WM_KEYUP
+end
+
+-- The WM_CHAR a key stands for when keys go as window messages (nothing
+-- translates them there): enter, tab, backspace and escape give their
+-- control characters, ctrl+letter its control code (ctrl+c = 3), like
+-- TranslateMessage would. Other keys give 0: typed characters come as TEXT.
+global function cw32_key_char(vk: uint8, mods: uint8): uint16
+  if mods & 4 ~= 0 then return 0 end -- WIN_MOD_ALT: menu mnemonics, not characters
+  if vk == 0x0D or vk == 0x09 or vk == 0x08 or vk == 0x1B then
+    if mods & 1 ~= 0 then return vk == 0x0D and 0x0A or 0 end -- ctrl+enter is LF
+    return vk
+  end
+  if mods & 1 ~= 0 and vk >= 0x41 and vk <= 0x5A then return vk - 0x40 end -- WIN_MOD_CTRL
+  return 0
+end
+
+-- MAKELPARAM(x, y): two 16-bit halves, negative coordinates kept as their
+-- two's complement (GET_X_LPARAM sign-extends them back).
+global function cw32_makelparam(x: integer, y: integer): uint32
+  return ((@uint32)(x) & 0xFFFF) | (((@uint32)(y) & 0xFFFF) << 16)
+end
+
+-- WM_MOUSEWHEEL wParam: the key/button state in the low word, the signed
+-- delta in the high word. WHEEL_DELTA (120) positive = rotated away from the
+-- user, the same sign as WINPUT WHEEL's +dy; for WM_MOUSEHWHEEL positive is
+-- to the right.
+global function cw32_wheel_wparam(delta: integer, mk: uint32): uint32
+  if delta > 32767 then delta = 32767 elseif delta < -32768 then delta = -32768 end
+  return (mk & 0xFFFF) | (((@uint32)(delta) & 0xFFFF) << 16)
+end
+
+-- The button message for button 0 left, 1 right, 2 middle; 0 for others.
+global function cw32_button_msg(button: integer, down: boolean): uint32
+  if button == 0 then return down and CW32_WM_LBUTTONDOWN or CW32_WM_LBUTTONUP end
+  if button == 1 then return down and CW32_WM_RBUTTONDOWN or CW32_WM_RBUTTONUP end
+  if button == 2 then return down and CW32_WM_MBUTTONDOWN or CW32_WM_MBUTTONUP end
+  return 0
+end
+
+global function cw32_button_mk(button: integer): uint32
+  if button == 0 then return CW32_MK_LBUTTON end
+  if button == 1 then return CW32_MK_RBUTTON end
+  if button == 2 then return CW32_MK_MBUTTON end
+  return 0
+end
+
+-- SendInput absolute coordinates over the virtual desktop: 0..65535 across
+-- [origin, origin + size - 1] (MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK).
+global function cw32_abs_coord(p: integer, origin: integer, size: integer): integer
+  if size <= 1 then return 0 end
+  local v = ((p - origin) * 65535 + (size - 1) // 2) // (size - 1)
+  if v < 0 then v = 0 elseif v > 65535 then v = 65535 end
+  return v
+end
+
+-- Every pixel of a BGRA buffer black (alpha ignored): PrintWindow drew
+-- nothing into the cleared DIB. Stops at the first coloured pixel.
+global function cw32_all_black(p: *[0]uint8, npixels: integer): boolean
+  for i = 0, < npixels do
+    local o = i * 4
+    if p[o] ~= 0 or p[o+1] ~= 0 or p[o+2] ~= 0 then return false end
+  end
+  return true
+end
+
+-- UTF-8 → UTF-16 code units (what WM_CHAR and KEYEVENTF_UNICODE carry, one
+-- unit each, a surrogate pair as two). Malformed bytes become U+FFFD.
+global function cw32_utf16_units(s: string): vector(uint16)
+  local out: vector(uint16)
+  local i: usize = 0
+  while i < s.size do
+    local b: uint32 = s.data[i]
+    local cp: uint32 = 0xFFFD
+    local n: usize = 1
+    if b < 0x80 then cp = b
+    elseif b >= 0xC2 and b <= 0xDF then n = 2 cp = b & 0x1F
+    elseif b >= 0xE0 and b <= 0xEF then n = 3 cp = b & 0x0F
+    elseif b >= 0xF0 and b <= 0xF4 then n = 4 cp = b & 0x07
+    end
+    if n > 1 then
+      local ok = i + n <= s.size
+      if ok then
+        for k = 1, < n do
+          local c: uint32 = s.data[i + k]
+          if c & 0xC0 ~= 0x80 then ok = false break end
+          cp = (cp << 6) | (c & 0x3F)
+        end
+      end
+      -- overlong, surrogate and out-of-range forms are malformed too
+      if ok and ((n == 3 and cp < 0x800) or (n == 4 and (cp < 0x10000 or cp > 0x10FFFF)) or (cp >= 0xD800 and cp <= 0xDFFF)) then ok = false end
+      if not ok then cp = 0xFFFD n = 1 end
+    end
+    if cp >= 0x10000 then
+      cp = cp - 0x10000
+      out:push((@uint16)(0xD800 + (cp >> 10)))
+      out:push((@uint16)(0xDC00 + (cp & 0x3FF)))
+    else
+      out:push((@uint16)(cp))
+    end
+    i = i + n
+  end
+  return out
+end
+
+-- A copy of `s` fit for one WLISTR field: tabs, CR and LF become spaces.
+global function cw32_sanitize(s: string): string
+  local sb: stringbuilder
+  for i = 0, < s.size do
+    local c = s.data[i]
+    if c == 9 or c == 10 or c == 13 then c = 32 end
+    sb:writebyte(c)
+  end
+  return sb:promote()
+end
+
+-- The exe name of a full image path: after the last \ or /.
+global function cw32_basename(path: string): string
+  local start: usize = 0
+  for i = 0, < path.size do
+    if path.data[i] == 92 or path.data[i] == 47 then start = i + 1 end
+  end
+  return string{data=(@*[0]byte)(&path.data[start]), size=path.size-start}:copy()
+end
+
+local function lower(c: uint8): uint8
+  if c >= 65 and c <= 90 then return c + 32 end
+  return c
+end
+
+-- `hay` contains `needle`, ASCII case-insensitive (non-ASCII bytes compare
+-- as they are). An empty needle never matches: it means "no match given".
+global function cw32_contains_ci(hay: string, needle: string): boolean
+  if needle.size == 0 or needle.size > hay.size then return false end
+  for i = 0, hay.size - needle.size do
+    local ok = true
+    for k = 0, < needle.size do
+      if lower(hay.data[i + k]) ~= lower(needle.data[k]) then ok = false break end
+    end
+    if ok then return true end
+  end
+  return false
+end
+
+global function cw32_window_matches(title: string, app: string, match: string): boolean
+  return cw32_contains_ci(title, match) or cw32_contains_ci(app, match)
+end
+
+-- One WLISTR line, fields sanitised: "wid\tw\th\tapp\ttitle\n".
+global function cw32_list_line(sb: *stringbuilder, wid: uint32, w: integer, h: integer, app: string, title: string): void
+  local a = cw32_sanitize(app)
+  local t = cw32_sanitize(title)
+  sb:writef('%d\t%d\t%d\t%s\t%s\n', wid, w, h, a, t)
+  a:destroy()
+  t:destroy()
+end

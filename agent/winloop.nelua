@@ -1,0 +1,45 @@
+-- The Windows event loop's primitives: one event per socket (WSAEventSelect)
+-- and a wait on those plus the PTYs' process and pipe events, so an idle
+-- agent sleeps instead of polling.
+require 'core.sys.net'
+
+## cinclude '<winsock2.h>'
+## cinclude '<windows.h>'
+## linklib 'ws2_32'
+
+local function WSACreateEvent(): pointer <cimport, nodecl> end
+local function WSACloseEvent(ev: pointer): cint <cimport, nodecl> end
+local function WSAResetEvent(ev: pointer): cint <cimport, nodecl> end
+local function WSAEventSelect(s: NetSocket, ev: pointer, events: clong): cint <cimport, nodecl> end
+local function WaitForMultipleObjects(n: uint32, handles: *[0]pointer, all: cint, ms: uint32): uint32 <cimport, nodecl> end
+local FD_ACCEPT: clong <cimport, nodecl, const>
+local FD_READ: clong <cimport, nodecl, const>
+local FD_WRITE: clong <cimport, nodecl, const>
+local FD_CLOSE: clong <cimport, nodecl, const>
+global WINLOOP_MAX_HANDLES: usize <comptime> = 64 -- MAXIMUM_WAIT_OBJECTS
+
+-- An event signalled when `sock` has something for us: connections for a
+-- listening socket, data, room to send or a close for a connection. A
+-- socket accepted from a listening one starts with the listener's selection,
+-- so every accepted socket gets its own. nilptr on failure.
+global function winloop_watch(sock: NetSocket, listening: boolean): pointer
+  local ev = WSACreateEvent()
+  if ev == nilptr then return nilptr end
+  local what: clong = listening and FD_ACCEPT or (FD_READ | FD_WRITE | FD_CLOSE)
+  if WSAEventSelect(sock, ev, what) ~= 0 then WSACloseEvent(ev) return nilptr end
+  return ev
+end
+
+global function winloop_forget_socket(ev: pointer): void
+  if ev ~= nilptr then WSACloseEvent(ev) end
+end
+
+-- Before a pass over the sockets: whatever happens from now on signals again.
+global function winloop_reset(ev: pointer): void
+  if ev ~= nilptr then WSAResetEvent(ev) end
+end
+
+global function winloop_wait(handles: *[0]pointer, n: usize, ms: uint32): void
+  if n == 0 then return end
+  WaitForMultipleObjects((@uint32)(n), handles, 0, ms)
+end

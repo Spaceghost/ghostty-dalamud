@@ -1,0 +1,209 @@
+-- Links opened in the agent's compositor (docs/REMOTE_WINDOWS.md "Opening
+-- URLs"): WOPEN "url:URL" and `ghostty-agent --open-url URL`. Which browser,
+-- its command line for one URL (Exec field codes, --wayland-browser CMD),
+-- the separate profile of --wayland-browser-profile, and telling a browser's
+-- windows and processes by name. All pure (tests/test_agent_browser.nelua);
+-- agent/capture_wayland.nelua does the launching.
+require 'string'
+require 'stringbuilder'
+require 'math'
+require 'agent.desktop_entries'
+
+local function lower_b(c: byte): byte
+  if c >= 65 and c <= 90 then return c + 32 end
+  return c
+end
+
+-- `s` starts with `prefix` (lower case), ignoring ASCII case.
+local function starts_ci(s: string, prefix: string): boolean
+  if #s < #prefix then return false end
+  for i = 1, #prefix do
+    if lower_b(s:byte(i)) ~= prefix:byte(i) then return false end
+  end
+  return true
+end
+
+-- Whether the compositor's browser may be handed `url`: http, https or
+-- mailto, no blanks or control characters, at most 8 KiB. '' when it may,
+-- else why not (a literal).
+global function browser_url_check(url: string): string
+  if #url == 0 then return 'empty URL' end
+  if #url > 8192 then return 'URL longer than 8 KiB' end
+  for i = 1, #url do
+    local b = url:byte(i)
+    if b <= 32 or b == 127 then return 'URL with blanks or control characters' end
+  end
+  if starts_ci(url, 'https://') or starts_ci(url, 'http://') or starts_ci(url, 'mailto:') then
+    if #url > 8 or starts_ci(url, 'mailto:') then return '' end
+  end
+  return 'only http, https and mailto links open in the compositor'
+end
+
+-- A command line for `url` from a template: Exec of a desktop entry, or
+-- --wayland-browser CMD. The first %u %U %f %F (or %s, as $BROWSER has it)
+-- becomes the URL in single quotes, later ones go; %i is --icon ICON, %c the
+-- name, %k goes, %% is a percent sign. No placeholder: the URL is appended.
+global function browser_expand(template: string, url: string, name: string, icon: string): string
+  local sb: stringbuilder
+  local placed = false
+  local i = 1
+  while i <= #template do
+    local c = template:byte(i)
+    if c == 37 and i < #template then -- '%'
+      local f = template:byte(i + 1)
+      if f == 37 then sb:writebyte(37)
+      elseif f == 117 or f == 85 or f == 102 or f == 70 or f == 115 then -- u U f F s
+        if not placed then desktop_sh_quote(&sb, url) placed = true end
+      elseif f == 105 and #icon > 0 then sb:write('--icon ') desktop_sh_quote(&sb, icon) -- %i
+      elseif f == 99 then desktop_sh_quote(&sb, name)                                  -- %c
+      end
+      i = i + 2
+    else
+      sb:writebyte(c)
+      i = i + 1
+    end
+  end
+  -- trailing blanks the codes left
+  while sb.size > 0 and (sb.data[sb.size - 1] == 32 or sb.data[sb.size - 1] == 9) do sb.size = sb.size - 1 end
+  if not placed then
+    sb:writebyte(32)
+    desktop_sh_quote(&sb, url)
+  end
+  return sb:promote()
+end
+
+-- Word `k` (from 1) of `cmd` split at blanks, as a view; empty past the end.
+-- Also returns where the word ends (an index into cmd).
+local function word_at(cmd: string, k: integer): (string, integer)
+  local i, n, w = 1, #cmd, 0
+  while i <= n do
+    while i <= n and (cmd:byte(i) == 32 or cmd:byte(i) == 9) do i = i + 1 end
+    if i > n then break end
+    local j = i
+    while j <= n and cmd:byte(j) ~= 32 and cmd:byte(j) ~= 9 do j = j + 1 end
+    w = w + 1
+    if w == k then return cmd:subview(i, j - 1), j - 1 end
+    i = j
+  end
+  return (@string){}, 0
+end
+
+-- The program a browser command runs, lower case, and where its word ends
+-- in `cmd`: the first word that is not `env` or VAR=VALUE, without its
+-- directory; for `flatpak run [--options] APP.ID` the app id. Empty when
+-- there is none.
+global function browser_program(cmd: string): (string, integer)
+  local k = 1
+  while true do
+    local w, stop = word_at(cmd, k)
+    if #w == 0 then return (@string){}, 0 end
+    if w ~= 'env' and w:find('=', 1, true) == 0 then
+      local slash = 0
+      for i = 1, #w do if w:byte(i) == 47 then slash = i end end
+      local base = w:subview(slash + 1)
+      if base == 'flatpak' then
+        local r = word_at(cmd, k + 1)
+        if r == 'run' then
+          local m = k + 2
+          while true do
+            local a, astop = word_at(cmd, m)
+            if #a == 0 then break end
+            if a:byte(1) ~= 45 then return a:lower(), astop end -- the first word that is not an --option
+            m = m + 1
+          end
+        end
+      end
+      return base:lower(), stop
+    end
+    k = k + 1
+  end
+  return (@string){}, 0
+end
+
+-- 'firefox' or 'chromium' for a browser of those families by its program,
+-- app id or process name (any case), else ''.
+global function browser_family(prog: string): string
+  local p = prog:lower()
+  local fam: string = ''
+  if p:find('firefox', 1, true) > 0 or p:find('librewolf', 1, true) > 0 or p:find('waterfox', 1, true) > 0
+     or p:find('floorp', 1, true) > 0 or p:find('icecat', 1, true) > 0 or p:find('zen-browser', 1, true) > 0
+     or p:find('zen_browser', 1, true) > 0 or p == 'zen' or p == 'zen-bin' then
+    fam = 'firefox'
+  elseif p:find('chrom', 1, true) > 0 or p:find('brave', 1, true) > 0 or p:find('vivaldi', 1, true) > 0
+     or p:find('microsoft-edge', 1, true) > 0 or p:find('microsoft.edge', 1, true) > 0 or p == 'msedge'
+     or p:find('thorium', 1, true) > 0 or p:find('opera', 1, true) > 0 then
+    fam = 'chromium'
+  end
+  p:destroy()
+  return fam
+end
+
+-- A --wayland-browser-profile name: 1 to 64 of A-Z a-z 0-9 . _ - (it names a directory).
+global function browser_profile_ok(name: string): boolean
+  if #name == 0 or #name > 64 or name == '.' or name == '..' then return false end
+  for i = 1, #name do
+    local b = name:byte(i)
+    local ok = (b >= 48 and b <= 57) or (b >= 65 and b <= 90) or (b >= 97 and b <= 122) or b == 46 or b == 95 or b == 45
+    if not ok then return false end
+  end
+  return true
+end
+
+-- Where the profile of `name` lives: a directory the browser can reach.
+-- A Flatpak browser sees its own ~/.var/app/ID; others use
+-- $XDG_DATA_HOME/ghostty-agent/FAMILY-NAME (data_home: $XDG_DATA_HOME,
+-- else ~/.local/share).
+global function browser_profile_dir(family: string, flatpak_id: string, name: string, home: string, data_home: string): string
+  if #flatpak_id > 0 then return string.format('%s/.var/app/%s/ghostty-agent-%s', home, flatpak_id, name) end
+  if #data_home > 0 then return string.format('%s/ghostty-agent/%s-%s', data_home, family, name) end
+  return string.format('%s/.local/share/ghostty-agent/%s-%s', home, family, name)
+end
+
+-- `cmd` with the separate profile's arguments after its program (after the
+-- app id of a `flatpak run`): Firefox and its forks `--profile DIR`,
+-- Chromium-family browsers `--user-data-dir=DIR`. Either keeps one browser
+-- instance per directory, so the next link opens as a tab in it, and it is
+-- apart from the browser on the desktop. False and why for other browsers.
+global function browser_with_profile(cmd: string, family: string, dir: string): (boolean, string)
+  local prog, stop = browser_program(cmd)
+  if #prog == 0 then return false, string.copy('no browser command') end
+  if family ~= 'firefox' and family ~= 'chromium' then
+    local why = string.format('--wayland-browser-profile works with Firefox and Chromium-family browsers, not %s', prog)
+    prog:destroy()
+    return false, why
+  end
+  prog:destroy()
+  local sb: stringbuilder
+  sb:write(cmd:subview(1, stop))
+  if family == 'firefox' then sb:write(' --profile ') else sb:write(' --user-data-dir=') end
+  desktop_sh_quote(&sb, dir)
+  if stop < #cmd then sb:write(cmd:subview(stop + 1)) end
+  return true, sb:promote()
+end
+
+-- A window whose app id is `app` belongs to the browser `prog` runs (its
+-- program or Flatpak id): one contains the other ("google-chrome" and
+-- "google-chrome-stable"), or both are the same family.
+global function browser_window_matches(app: string, prog: string): boolean
+  if #app == 0 or #prog == 0 then return false end
+  local a = app:lower()
+  local hit = a == prog or (#a >= 4 and (prog:find(a, 1, true) > 0 or a:find(prog, 1, true) > 0))
+  if not hit then
+    local fa, fp = browser_family(a), browser_family(prog)
+    hit = #fa > 0 and fa == fp
+  end
+  a:destroy()
+  return hit
+end
+
+-- A process named `comm` (/proc/PID/comm: at most 15 bytes) runs the
+-- browser `prog`: the name itself cut to 15, its "-bin" (Firefox's
+-- binary), or "chrome" for Google Chrome's wrapper scripts.
+global function browser_comm_matches(comm: string, prog: string): boolean
+  if #comm == 0 or #prog == 0 then return false end
+  local cut = prog:subview(1, math.min(#prog, 15))
+  if comm == cut then return true end
+  if #comm == #prog + 4 and comm:subview(1, #prog) == prog and comm:subview(#prog + 1) == '-bin' then return true end
+  if comm == 'chrome' and prog:find('google-chrome', 1, true) > 0 then return true end
+  return false
+end

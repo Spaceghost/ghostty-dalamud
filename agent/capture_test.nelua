@@ -1,0 +1,177 @@
+-- The synthetic capture backend (`ghostty-agent --windows test`): four fake
+-- windows with deterministic pixels, so tests/test_agent_windows.nelua can
+-- check the whole window path over TCP without a desktop.
+--
+--   1  320x200  "pattern one"  a bar moves 4 px and a counter block changes
+--                              on every frame, so diffs stay small
+--   2   64x48   "pattern two"  never changes: one frame, then nothing to send
+--   3   96x64   "closing"      animates like 1 and ends after 3 frames
+--   4   16x16   "status"       still; listed as "status: N open", the
+--                              handles open right now (tests see closes)
+--
+-- Every frame() call on an animated handle draws the next frame, so the
+-- stream's n-th WFRAME seq is frame n and a test can redraw it with
+-- capture_test_render. Input is not played anywhere: each window remembers
+-- the last event it got and shows it in its WLIST title
+-- ("pattern one: key 40 down mods 1"), which is how tests observe WINPUT.
+-- WOPEN "url:..." opens window 2, the stand-in for a browser that already
+-- has a window (the generic layer's link handling: one stream, raise:N).
+--
+-- Loaded by agent/capture.nelua after the backend types it uses.
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'memory'
+require 'core.protocol'
+
+local CAPTURE_TEST_CLOSING_FRAMES: integer <comptime> = 3
+
+local TestWindow = @record{
+  wid: uint32,
+  w: integer, h: integer,
+  title: string,     -- as listed and matched
+  still: boolean,
+  ends_after: integer, -- frames, 0: never
+  shown: string,     -- title plus the last input, what WLIST and title() say
+}
+
+local TestCapture = @record{
+  win: integer,      -- index into test_windows
+  n: integer,        -- frames drawn
+  pixels: vector(uint8),
+}
+
+local test_windows: vector(TestWindow)
+local test_open_count = 0
+
+-- Frame `n` of window `wid` at w x h, BGRA, stride w * 4, into `out`.
+global function capture_test_render(wid: uint32, n: integer, w: integer, h: integer, out: *vector(uint8)): void
+  out:resize((@usize)(w * h * 4))
+  local bar = (n * 4) % w
+  for y = 0, < h do
+    for x = 0, < w do
+      local i = (y * w + x) * 4
+      local b, g, r = (@uint8)(x * 255 // w), (@uint8)(y * 255 // h), (@uint8)(wid * 60 & 255)
+      if x < 32 and y < 16 then
+        b, g, r = (@uint8)(n * 37 & 255), (@uint8)(n * 11 & 255), (@uint8)(n * 3 & 255)
+      elseif x >= bar and x < bar + 8 then
+        b, g, r = 40, 250, 250
+      end
+      out[i], out[i+1], out[i+2], out[i+3] = b, g, r, 255
+    end
+  end
+end
+
+local function test_init(): void
+  if #test_windows > 0 then return end
+  test_windows:push(TestWindow{ wid = 1, w = 320, h = 200, title = 'pattern one' })
+  test_windows:push(TestWindow{ wid = 2, w = 64, h = 48, title = 'pattern two', still = true })
+  test_windows:push(TestWindow{ wid = 3, w = 96, h = 64, title = 'closing', ends_after = CAPTURE_TEST_CLOSING_FRAMES })
+  test_windows:push(TestWindow{ wid = 4, w = 16, h = 16, title = 'status', still = true })
+  for i = 0, < #test_windows do test_windows[i].shown = string.copy(test_windows[i].title) end
+end
+
+local function test_list(): string
+  local sb: stringbuilder
+  for i = 0, < #test_windows do
+    local win = &test_windows[i]
+    if win.wid == 4 then
+      sb:writef('%d\t%d\t%d\ttest\tstatus: %d open\n', win.wid, win.w, win.h, test_open_count)
+    else
+      sb:writef('%d\t%d\t%d\ttest\t%s\n', win.wid, win.w, win.h, win.shown)
+    end
+  end
+  return sb:promote()
+end
+
+local function contains_nocase(hay: string, needle: string): boolean
+  local a, b = hay:lower(), needle:lower()
+  local at = a:find(b, 1, true)
+  a:destroy()
+  b:destroy()
+  return at > 0
+end
+
+local function test_open(wid: uint32, match: string): (pointer, string)
+  local found = -1
+  if wid == 0 and #match > 4 and match:subview(1, 4) == 'url:' then wid = 2 end -- the "browser"
+  for i = 0, < #test_windows do
+    local win = &test_windows[i]
+    if (wid ~= 0 and win.wid == wid) or (wid == 0 and (#match == 0 or contains_nocase(win.title, match) or contains_nocase('test', match))) then
+      found = i
+      break
+    end
+  end
+  if found < 0 then return nilptr, string.copy('no such window') end
+  local cap = new(@TestCapture)
+  cap.win = found
+  test_open_count = test_open_count + 1
+  return cap, (@string){}
+end
+
+local function test_state(h: pointer): (integer, string)
+  local cap = (@*TestCapture)(h)
+  local win = &test_windows[cap.win]
+  if win.ends_after > 0 and cap.n >= win.ends_after then return CAPTURE_ENDED, 'window closed' end
+  return CAPTURE_LIVE, ''
+end
+
+local function test_title(h: pointer): string
+  return test_windows[(@*TestCapture)(h).win].shown
+end
+
+local function test_frame(h: pointer, out: *CaptureFrame): boolean
+  local cap = (@*TestCapture)(h)
+  local win = &test_windows[cap.win]
+  if win.ends_after > 0 and cap.n >= win.ends_after then return false end
+  if not win.still or cap.n == 0 then
+    cap.n = cap.n + 1
+    capture_test_render(win.wid, cap.n, win.w, win.h, &cap.pixels)
+  end
+  out.pixels = (@*[0]uint8)(&cap.pixels[0])
+  out.w, out.h, out.stride = win.w, win.h, (@usize)(win.w * 4)
+  out.serial = (@uint64)(cap.n)
+  return true
+end
+
+local function test_input(h: pointer, ev: *CaptureInput): void
+  local win = &test_windows[(@*TestCapture)(h).win]
+  local sb: stringbuilder
+  sb:write(win.title, ': ')
+  local kind = ev.kind
+  if kind == WIN_INPUT_MOVE then sb:writef('move %d %d', ev.x, ev.y)
+  elseif kind == WIN_INPUT_BUTTON then sb:writef('button %d %s %d %d', ev.button, ev.down and 'down' or 'up', ev.x, ev.y)
+  elseif kind == WIN_INPUT_WHEEL then sb:writef('wheel %d %d %d %d', ev.x, ev.y, ev.dx, ev.dy)
+  elseif kind == WIN_INPUT_KEY then sb:writef('key %d %s mods %d', ev.hid, ev.down and 'down' or 'up', ev.mods)
+  elseif kind == WIN_INPUT_TEXT then sb:write('text ', ev.text)
+  elseif kind == WIN_INPUT_FOCUS then sb:write('focus')
+  else sb:writef('kind %d', kind) end
+  win.shown:destroy()
+  win.shown = sb:promote()
+end
+
+local function test_close(h: pointer): void
+  local cap = (@*TestCapture)(h)
+  cap.pixels:destroy()
+  delete(cap)
+  test_open_count = test_open_count - 1
+end
+
+local function test_wid_of(h: pointer): uint32
+  return test_windows[(@*TestCapture)(h).win].wid
+end
+local function test_list_serial(): uint64 return 1 end -- pushes to watchers only when a stream changes (relist)
+
+local function test_pump(): void end
+local function test_poll_fds(fds: *[0]cint, max: integer): integer return 0 end
+-- frames are drawn on demand; the generic layer's own schedule wakes the loop
+local function test_wait_ms(): integer return -1 end
+
+global function capture_test_backend(): (boolean, CaptureBackend, string)
+  test_init()
+  return true, CaptureBackend{
+    name = 'test', list = test_list, open = test_open, state = test_state, title = test_title,
+    frame = test_frame, input = test_input, close = test_close, pump = test_pump,
+    poll_fds = test_poll_fds, wait_ms = test_wait_ms, wid_of = test_wid_of, list_serial = test_list_serial,
+  }, ''
+end
