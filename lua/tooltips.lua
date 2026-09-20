@@ -156,6 +156,7 @@ M.settings = {
   ['world.light.enabled'] = 'Screens react to the time of day and weather.',
   ['world.light.backlight_below'] = 'Screens light up from behind when the world gets dimmer than this.',
   ['world.light.rain_dim'] = 'How much rain darkens screens.',
+  ['rain.shelter'] = 'Rain only lands on a screen where the sky can reach it: not under a roof or indoors, and only on the open side of one half under an overhang. Off: every screen gets rain whenever the weather is rainy.',
   ['world.light.cast_light'] = 'Screens shine light on your character and the world around them.',
   ['world.light.light_intensity'] = 'How bright that light is.',
   ['world.light.light_range'] = 'How far that light reaches.',
