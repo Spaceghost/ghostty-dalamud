@@ -51,3 +51,5 @@ jobs:
       - run: tools/build.sh
       - run: vendor/nelua-lang/nelua-lua tests/test_defaults.lua
       - run: tests/run.sh
+      - name: Package (the release path, run on every push)
+        run: tools/package.sh
