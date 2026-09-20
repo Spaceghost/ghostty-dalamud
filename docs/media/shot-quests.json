@@ -1,0 +1,525 @@
+{
+  "title": "Ghostty in Eorzea: media quests",
+  "version": 1,
+  "about": "Shots, GIFs and videos for the README, the plugin listing and the homepage. Every quest names where to stand, when (Eorzea time; 1 Eorzean hour = 2 min 55 s), the weather it wants, what to set up in Ghostty, and what to capture. Locations are reachable from Limsa Lominsa on foot or by ferry at level 10. XivMcp's get_weather_forecast finds the next matching window; set_map_flag marks the spot. Map coordinates are approximate starting points; the in-game quest tracker refines them.",
+  "before_every_shot": [
+    "Capture with /term shot, not the game's screenshot key: the game photographs the frame before Dalamud draws, so the terminals may not be in its file. /term shot panel crops to the terminal in focus and /term shot clean hides the game's UI (docs/CAPTURE.md).",
+  "GIFs and short videos: /term clip [seconds] gif|mp4 records the frames and ghostty-agent encodes them with ffmpeg on the host (6 s at 10 fps, 1280x720 by default). Clips are for these quests; the gallery takes PNG and JPEG only.",
+  "Use /term showcase or fresh terminals: never capture your own shells, tokens or chat.",
+    "Hide your name: Character Configuration > UI Settings > Nameplates > Own name: never (or crop).",
+    "Hide the game HUD with Scroll Lock (Ghostty stays visible when the UI is hidden) unless the quest is about UI.",
+    "Game at 1920x1080 or 2560x1440, FPS capped at 60; GIFs recorded at 30 fps and 960 px wide."
+  ],
+  "quests": [
+    {
+      "id": "hero-costa-night",
+      "name": "A Terminal Under the Stars",
+      "kind": "video+screenshot",
+      "use": [
+        "homepage hero",
+        "README header"
+      ],
+      "zone": "Eastern La Noscea",
+      "territoryId": 137,
+      "spot": "Costa del Sol, the beach below the villa",
+      "map": {
+        "x": 31.0,
+        "y": 30.0
+      },
+      "eorzea_time": "21:00-03:00",
+      "weather": [
+        "Clear Skies",
+        "Fair Skies"
+      ],
+      "setup": [
+        "/term showcase",
+        "Two pets beside you, one screen pinned at the waterline with /term pin here",
+        "Settings > World: backlight on, lighting follows time of day"
+      ],
+      "capture": "Slow 20 s orbit from the showcase camera: screens glow against the night sea and light your face. Then a still from shot 1.",
+      "features": [
+        "world screens",
+        "pets",
+        "backlight",
+        "time-of-day tint",
+        "showcase camera"
+      ]
+    },
+    {
+      "id": "dropdown-limsa",
+      "name": "The Drop from Above",
+      "kind": "gif+screenshot",
+      "use": [
+        "README: the dropdown"
+      ],
+      "zone": "Limsa Lominsa Upper Decks",
+      "territoryId": 128,
+      "spot": "Aftcastle, facing the harbour",
+      "map": {
+        "x": 10.8,
+        "y": 11.4
+      },
+      "eorzea_time": "10:00-15:00",
+      "weather": [
+        "Clear Skies",
+        "Fair Skies"
+      ],
+      "setup": [
+        "Ctrl+` to open and close the dropdown",
+        "Three tabs: showcase banner, btop, fastfetch"
+      ],
+      "capture": "The glass dropdown sliding down, switching tabs with the icon bar, closing again. A still with the tab bar in focus.",
+      "features": [
+        "glass dropdown",
+        "tabs",
+        "icon buttons",
+        "world-lit chrome"
+      ]
+    },
+    {
+      "id": "wench-pets-night",
+      "name": "Last Call at the Drowning Wench",
+      "kind": "screenshot",
+      "use": [
+        "README: pets",
+        "plugin listing image"
+      ],
+      "zone": "Limsa Lominsa Upper Decks",
+      "territoryId": 128,
+      "spot": "The Drowning Wench terrace, lanterns behind you",
+      "map": {
+        "x": 11.0,
+        "y": 11.0
+      },
+      "eorzea_time": "19:00-02:00",
+      "weather": [
+        "any"
+      ],
+      "setup": [
+        "Two pet screens, one showing the palette banner",
+        "Settings > Bell: preset aura"
+      ],
+      "capture": "Over-the-shoulder still: pets glowing among the lanterns. A second still mid bell ripple (/term bell aura).",
+      "features": [
+        "pets",
+        "backlight",
+        "visual bell"
+      ]
+    },
+    {
+      "id": "arcanist-tomestone",
+      "name": "The Arcanist's Tome",
+      "kind": "gif",
+      "use": [
+        "README: character animation"
+      ],
+      "zone": "Limsa Lominsa Lower Decks",
+      "territoryId": 129,
+      "spot": "Arcanists' Guild, by the reading tables",
+      "map": {
+        "x": 5.5,
+        "y": 11.0
+      },
+      "eorzea_time": "any",
+      "weather": [
+        "any"
+      ],
+      "setup": [
+        "/tomestone to bring the terminal out with the device pose",
+        "Type a few lines so the typing animation plays"
+      ],
+      "capture": "Character draws the glowing device, taps while you type, puts it away on close.",
+      "features": [
+        "device pose",
+        "typing animation",
+        "/tomestone"
+      ]
+    },
+    {
+      "id": "drydocks-drag",
+      "name": "Dockside Construction",
+      "kind": "video",
+      "use": [
+        "README: placing screens",
+        "homepage clip 2"
+      ],
+      "zone": "Lower La Noscea",
+      "territoryId": 135,
+      "spot": "Moraby Drydocks, the pier beside the aetheryte",
+      "map": {
+        "x": 25.0,
+        "y": 34.5
+      },
+      "eorzea_time": "16:00-18:00",
+      "weather": [
+        "Clear Skies",
+        "Fair Skies",
+        "Clouds"
+      ],
+      "setup": [
+        "One screen out",
+        "Alt+drag to carry it",
+        "Hold Shift to snap it flat against the crane housing",
+        "Ctrl+drag an edge to fit"
+      ],
+      "capture": "Pick up a screen, carry it through the air, snap it onto the dock wall, resize to fit. 25 s.",
+      "features": [
+        "drag placement",
+        "surface snap",
+        "resize"
+      ]
+    },
+    {
+      "id": "summerford-walkup",
+      "name": "Golden Hour at Summerford",
+      "kind": "gif",
+      "use": [
+        "README: walk-up and pets while moving"
+      ],
+      "zone": "Middle La Noscea",
+      "territoryId": 134,
+      "spot": "Summerford Farms, the path between the fields",
+      "map": {
+        "x": 20.0,
+        "y": 21.0
+      },
+      "eorzea_time": "17:00-18:30",
+      "weather": [
+        "Clear Skies",
+        "Fair Skies"
+      ],
+      "setup": [
+        "Two pets",
+        "One screen pinned by the fence"
+      ],
+      "capture": "Run down the path with pets trailing and settling, then click the pinned screen: the character walks up and it floats out to meet you.",
+      "features": [
+        "pets while moving",
+        "walk-up",
+        "present pose"
+      ]
+    },
+    {
+      "id": "grotto-depth",
+      "name": "Light in the Grotto",
+      "kind": "screenshot+gif",
+      "use": [
+        "README: screens live in the world"
+      ],
+      "zone": "Middle La Noscea",
+      "territoryId": 134,
+      "spot": "Seasong Grotto, inside the cave mouth",
+      "map": {
+        "x": 21.0,
+        "y": 34.0
+      },
+      "eorzea_time": "any",
+      "weather": [
+        "any"
+      ],
+      "setup": [
+        "Pin a screen behind a rock pillar",
+        "Settings > World: screens cast light"
+      ],
+      "capture": "Walk behind the pillar so the screen hides behind the rock and your character stays in front; the screen's light on the cave wall.",
+      "features": [
+        "occlusion",
+        "world light",
+        "sleeping panels wake fade"
+      ]
+    },
+    {
+      "id": "aleport-orbit",
+      "name": "Circling Aleport",
+      "kind": "video",
+      "use": [
+        "homepage clip 3"
+      ],
+      "zone": "Western La Noscea",
+      "territoryId": 138,
+      "spot": "The cliffs above Aleport, sea behind",
+      "map": {
+        "x": 27.0,
+        "y": 26.0
+      },
+      "eorzea_time": "18:00-20:00",
+      "weather": [
+        "Clear Skies",
+        "Fair Skies"
+      ],
+      "setup": [
+        "/term pin orbit 4 0.2 twice"
+      ],
+      "capture": "Two screens orbiting you at sunset while the camera pulls back. 15 s.",
+      "features": [
+        "orbit pins",
+        "sunset tint"
+      ]
+    },
+    {
+      "id": "rain-derez",
+      "name": "Storm Warning",
+      "kind": "gif",
+      "use": [
+        "README: combat and weather"
+      ],
+      "zone": "Lower La Noscea",
+      "territoryId": 135,
+      "spot": "Near the Moraby Bay coast, low-level mobs",
+      "map": {
+        "x": 24.0,
+        "y": 27.0
+      },
+      "eorzea_time": "any",
+      "weather": [
+        "Rain",
+        "Showers"
+      ],
+      "setup": [
+        "Two pets out"
+      ],
+      "capture": "Screens tinted by the rain; pull a mob and the screens derez in scanlines, then return when combat ends.",
+      "features": [
+        "weather tint",
+        "combat derez"
+      ]
+    },
+    {
+      "id": "fullscreen-fly",
+      "name": "Into the Screen",
+      "kind": "gif",
+      "use": [
+        "README: full screen"
+      ],
+      "zone": "Limsa Lominsa Upper Decks",
+      "territoryId": 128,
+      "spot": "Anywhere with a pinned screen at eye height",
+      "map": {
+        "x": 10.5,
+        "y": 11.0
+      },
+      "eorzea_time": "any",
+      "weather": [
+        "any"
+      ],
+      "setup": [
+        "A pinned screen running the showcase banner"
+      ],
+      "capture": "Double-click the screen: it flies to the centre of the view; double-click again to send it back.",
+      "features": [
+        "full screen flight"
+      ]
+    },
+    {
+      "id": "mist-office",
+      "name": "A Home Office in Mist",
+      "kind": "screenshot",
+      "use": [
+        "README: pins in your home",
+        "plugin listing image"
+      ],
+      "zone": "Mist",
+      "territoryId": 339,
+      "spot": "A quiet plot's garden wall (after the quest Where the Heart Is (Mist))",
+      "map": {
+        "x": 11.0,
+        "y": 11.0
+      },
+      "eorzea_time": "20:00-04:00",
+      "weather": [
+        "any"
+      ],
+      "setup": [
+        "Three screens snapped to the wall with Shift+Alt drag",
+        "Optional: Settings > World > Screens cast shadows (experimental)"
+      ],
+      "capture": "A still of a wall of terminals at night; a second with shadows on if they render.",
+      "features": [
+        "surface snap",
+        "persistent layout",
+        "shadows (experimental)"
+      ]
+    },
+    {
+      "id": "bell-presets",
+      "name": "Five Bells",
+      "kind": "gif",
+      "use": [
+        "README: visual bell"
+      ],
+      "zone": "Lower La Noscea",
+      "territoryId": 135,
+      "spot": "Moraby Drydocks plaza at night",
+      "map": {
+        "x": 24.6,
+        "y": 34.9
+      },
+      "eorzea_time": "20:00-04:00",
+      "weather": [
+        "any"
+      ],
+      "setup": [
+        "/term bell demo"
+      ],
+      "capture": "All five bell styles rippling from your character in turn, captions included.",
+      "features": [
+        "visual bell presets"
+      ]
+    },
+    {
+      "id": "taskbar-infobar",
+      "name": "Every Terminal at a Glance",
+      "kind": "screenshot",
+      "use": [
+        "README: taskbar, info bar and Umbra widget"
+      ],
+      "zone": "Limsa Lominsa Lower Decks",
+      "territoryId": 129,
+      "spot": "Aetheryte Plaza (HUD visible)",
+      "map": {
+        "x": 9.5,
+        "y": 11.5
+      },
+      "eorzea_time": "any",
+      "weather": [
+        "any"
+      ],
+      "setup": [
+        "Terminals as tabs, windows, pets and pins",
+        "Open the info bar popup and the Umbra widget popup"
+      ],
+      "capture": "Crop of the toolbar with the popup listing every terminal.",
+      "features": [
+        "info bar popup",
+        "Umbra widget",
+        "taskbar"
+      ]
+    },
+    {
+      "id": "settings-tour",
+      "name": "Make It Yours",
+      "kind": "screenshot",
+      "use": [
+        "README: configuration"
+      ],
+      "zone": "any",
+      "territoryId": null,
+      "spot": "Anywhere calm",
+      "map": null,
+      "eorzea_time": "any",
+      "weather": [
+        "any"
+      ],
+      "setup": [
+        "/term config",
+        "Visit Settings, Bell, World, Assistant, About (vote on features)"
+      ],
+      "capture": "One still per tab, same window size.",
+      "features": [
+        "settings window",
+        "changelog",
+        "vote link"
+      ]
+    },
+    {
+      "id": "assistant-ask",
+      "name": "Ask the Almanac",
+      "kind": "gif",
+      "use": [
+        "README: assistant",
+        "homepage clip 4"
+      ],
+      "zone": "Limsa Lominsa Upper Decks",
+      "territoryId": 128,
+      "spot": "Aftcastle bench",
+      "map": {
+        "x": 10.8,
+        "y": 11.4
+      },
+      "eorzea_time": "any",
+      "weather": [
+        "any"
+      ],
+      "setup": [
+        "/term ask what is the weather at Costa del Sol tonight?",
+        "XivMcp window on the Agents tab"
+      ],
+      "capture": "A pet terminal opens with the question, the answer streams in, the agent board shows progress.",
+      "features": [
+        "/term ask",
+        "XivMcp agent board",
+        "local assistant"
+      ]
+    },
+    {
+      "id": "controller",
+      "name": "Couch Mode",
+      "kind": "gif",
+      "use": [
+        "README: controller"
+      ],
+      "zone": "any",
+      "territoryId": null,
+      "spot": "Anywhere",
+      "map": null,
+      "eorzea_time": "any",
+      "weather": [
+        "any"
+      ],
+      "setup": [
+        "toggle_gamepad_button = 'create'",
+        "Several terminals"
+      ],
+      "capture": "Tap Create to open, hold to step through terminals, double-tap to step back, with a controller overlay if possible.",
+      "features": [
+        "controller gestures",
+        "DualSense Create button"
+      ]
+    }
+  ],
+  "homepage_video": {
+    "length": "about 75 s, 1080p60, music optional, no voice",
+    "cuts": [
+      {
+        "t": "0-8 s",
+        "quest": "hero-costa-night",
+        "note": "Open on the night beach, screens glowing. Title: Ghostty for FFXIV."
+      },
+      {
+        "t": "8-18 s",
+        "quest": "dropdown-limsa",
+        "note": "Ctrl+` drops the glass terminal over Limsa. Caption: Eorzea is a terminal multiplexer."
+      },
+      {
+        "t": "18-30 s",
+        "quest": "drydocks-drag",
+        "note": "Carry a screen and snap it to the dock. Caption: put screens anywhere."
+      },
+      {
+        "t": "30-40 s",
+        "quest": "summerford-walkup",
+        "note": "Pets trail you; click one and walk up to it."
+      },
+      {
+        "t": "40-48 s",
+        "quest": "arcanist-tomestone",
+        "note": "Your character works a glowing device while you type."
+      },
+      {
+        "t": "48-56 s",
+        "quest": "aleport-orbit",
+        "note": "Orbiting screens at sunset."
+      },
+      {
+        "t": "56-66 s",
+        "quest": "assistant-ask",
+        "note": "Ask your local assistant from inside the game."
+      },
+      {
+        "t": "66-75 s",
+        "quest": "hero-costa-night",
+        "note": "Pull back to the beach. End card: github.com/Spaceghost/ghostty-dalamud and the vote link."
+      }
+    ]
+  }
+}
