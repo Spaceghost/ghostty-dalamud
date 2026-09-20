@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
 # Stage the dev build of the GhosttyDalamud plugin where Dalamud loads it.
+# A convenience for building on Linux (it prints the Wine Z:\ path); on
+# Windows, copy build/dist/GhosttyDalamud/ yourself (README, "Windows").
 #
 #   tools/build.sh && tools/install-dev.sh [--widget]
 #
@@ -36,7 +38,7 @@ widget=0
 for a in "$@"; do
   case "$a" in
     --widget) widget=1 ;;
-    -h|--help) sed -n '2,29p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,31p' "$0"; exit 0 ;;
     *) echo "unknown argument: $a" >&2; exit 2 ;;
   esac
 done
@@ -71,6 +73,16 @@ fi
 [[ -d "$DEST/lua" ]] && mv "$DEST/lua" "$DEST/lua.old"
 mv "$DEST/lua.tmp" "$DEST/lua"
 rm -rf "$DEST/lua.old"
+# shipped themes and fallback fonts are replaced whole; your own themes live
+# in the config directory's themes/ (fonts are read when the plugin loads)
+for d in themes fonts; do
+  [[ -d "$SRC/$d" ]] || continue
+  rm -rf "$DEST/$d.tmp" "$DEST/$d.old"
+  cp -r "$SRC/$d" "$DEST/$d.tmp"
+  [[ -d "$DEST/$d" ]] && mv "$DEST/$d" "$DEST/$d.old"
+  mv "$DEST/$d.tmp" "$DEST/$d"
+  rm -rf "$DEST/$d.old"
+done
 
 loader_changed=0
 put_changed "$SRC/ghostty_loader.dll" "$DEST/ghostty_loader.dll" && loader_changed=1

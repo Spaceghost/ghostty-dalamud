@@ -1,0 +1,48 @@
+# Ephemeral self-hosted GitHub Actions runner with everything tools/ci/run.sh
+# needs besides what it fetches itself (Zig, Dalamud reference assemblies,
+# vendor checkouts). Rootless-podman friendly: the runner runs as the
+# unprivileged user "runner". No token or other secret is baked in; see
+# tools/ci/runner/start-runner.sh and docs/CI.md.
+#
+#   podman build -t localhost/ghostty-dalamud-runner -f tools/ci/runner/Containerfile tools/ci/runner
+ARG FEDORA_VERSION=44
+FROM registry.fedoraproject.org/fedora:${FEDORA_VERSION}
+
+# actions/runner release and the sha256 of its linux tarballs (from the release notes)
+ARG RUNNER_VERSION=2.337.0
+ARG RUNNER_SHA256_X64=70920811a4f8ad4328818682bca5c6469c1c942fab52448868071d0063816613
+ARG RUNNER_SHA256_ARM64=9b1dc70626422526e3c94767cf024896beb15da5342a3f4819bf2feac13e0393
+
+RUN dnf -y install --setopt=install_weak_deps=False \
+      bash ca-certificates coreutils curl diffutils file findutils gcc gh git-core \
+      glibc-langpack-en jq make procps-ng python3 tar unzip which xz zstd \
+      dotnet-sdk-10.0 \
+      krb5-libs libicu lttng-ust openssl-libs zlib \
+    && dnf clean all \
+    && useradd --create-home --uid 1000 runner
+
+ENV LANG=C.UTF-8 \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_NOLOGO=1 \
+    DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1 \
+    RUNNER_ALLOW_RUNASROOT=0
+
+WORKDIR /home/runner/actions-runner
+RUN set -eu; \
+    case "$(uname -m)" in \
+      x86_64) arch=x64; sha="$RUNNER_SHA256_X64" ;; \
+      aarch64) arch=arm64; sha="$RUNNER_SHA256_ARM64" ;; \
+      *) echo "unsupported architecture $(uname -m)"; exit 1 ;; \
+    esac; \
+    tarball="actions-runner-linux-$arch-$RUNNER_VERSION.tar.gz"; \
+    curl -fsSL --retry 3 -o "/tmp/$tarball" \
+      "https://github.com/actions/runner/releases/download/v$RUNNER_VERSION/$tarball"; \
+    echo "$sha  /tmp/$tarball" | sha256sum -c -; \
+    tar -xzf "/tmp/$tarball"; \
+    rm -f "/tmp/$tarball"; \
+    mkdir -p /home/runner/.cache /home/runner/_work; \
+    chown -R runner:runner /home/runner
+
+COPY --chmod=0755 entrypoint.sh /usr/local/bin/runner-entrypoint
+USER runner
+ENTRYPOINT ["/usr/local/bin/runner-entrypoint"]

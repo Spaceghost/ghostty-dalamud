@@ -18,7 +18,7 @@ trap 'rm -rf -- "$work"' EXIT
 export PYTHONDONTWRITEBYTECODE=1
 git clone --no-single-branch "$remote" "$work/repo"
 cd "$work/repo"
-git switch main
+git switch master
 git fetch origin '+refs/heads/*:refs/remotes/origin/*'
 git ls-remote --heads --tags origin > "$work/refs"
 python3 tools/rewrite-branches.py "$work/refs"

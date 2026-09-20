@@ -24,8 +24,8 @@ def parse(data: bytes) -> dict[str, str]:
         if ref in refs:
             raise RuntimeError('Duplicate ref in snapshot.')
         refs[ref] = oid
-    if 'refs/heads/main' not in refs:
-        raise RuntimeError('Snapshot has no main branch.')
+    if 'refs/heads/master' not in refs:
+        raise RuntimeError('Snapshot has no master branch.')
     return refs
 
 
@@ -40,8 +40,8 @@ def publish(snapshot: Path) -> str:
     if git('status', '--porcelain').strip():
         raise RuntimeError('Working tree is not clean.')
     head = git('rev-parse', 'HEAD').strip().decode()
-    if head != expected['refs/heads/main']:
-        raise RuntimeError('Checkout does not match the snapshotted main.')
+    if head != expected['refs/heads/master']:
+        raise RuntimeError('Checkout does not match the snapshotted master.')
     source = Path('tools/rewrite-identity.py').resolve()
     spec = importlib.util.spec_from_file_location('identity_rewrite', source)
     module = importlib.util.module_from_spec(spec)
@@ -63,10 +63,10 @@ def publish(snapshot: Path) -> str:
     subprocess.run(command, check=True)
     if remote_refs() != rewritten:
         raise RuntimeError('Refs changed after publication; inspect the remote before proceeding.')
-    new_head = rewritten['refs/heads/main']
-    git('update-ref', 'refs/heads/main', new_head, head)
+    new_head = rewritten['refs/heads/master']
+    git('update-ref', 'refs/heads/master', new_head, head)
     git('reset', '--hard', new_head)
-    print('New main:', new_head)
+    print('New master:', new_head)
     print('External clones and GitHub-managed cached objects/workflow metadata were not purged.')
     return new_head
 

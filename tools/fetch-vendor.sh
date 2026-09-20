@@ -34,6 +34,38 @@ if [[ ! -f "$V/lua/src/lua.h" ]]; then
 fi
 echo "lua $LUA_VERSION"
 
+if [[ ! -f "$V/stb/stb_truetype.h" ]] || ! echo "$STB_TRUETYPE_SHA256  $V/stb/stb_truetype.h" | sha256sum -c --quiet - >/dev/null 2>&1; then
+  mkdir -p "$V/stb"
+  curl -fsSL "$STB_TRUETYPE_URL" -o "$V/stb/stb_truetype.h.tmp"
+  echo "$STB_TRUETYPE_SHA256  $V/stb/stb_truetype.h.tmp" | sha256sum -c --quiet -
+  mv "$V/stb/stb_truetype.h.tmp" "$V/stb/stb_truetype.h"
+fi
+echo "stb_truetype $(grep -m1 -o 'v[0-9.]*' "$V/stb/stb_truetype.h")"
+
+# Wayland SDK headers (Linux only; SKIP_WAYLAND=1 to skip). Needs rpm2cpio and
+# cpio. Without it the agent builds with no Wayland compositor backend.
+if [[ "$(uname -s)" == Linux && "${SKIP_WAYLAND:-0}" != 1 && ! -f "$V/wayland-sdk/.pinned" ]] ||
+   [[ -f "$V/wayland-sdk/.pinned" && "$(cat "$V/wayland-sdk/.pinned")" != "$WAYLAND_SDK_RPMS" ]]; then
+  if command -v rpm2cpio >/dev/null && command -v cpio >/dev/null; then
+    tmp="$(mktemp -d)"
+    mkdir -p "$tmp/root"
+    for pin in $WAYLAND_SDK_RPMS; do
+      rel="${pin%%:*}"; sum="${pin##*:}"; f="$tmp/$(basename "$rel")"
+      curl -fsSL "$WAYLAND_SDK_URL_BASE/$rel" -o "$f"
+      echo "$sum  $f" | sha256sum -c --quiet -
+      ( cd "$tmp/root" && rpm2cpio "$f" | cpio -idm --quiet './usr/include/*' )
+    done
+    rm -rf "$V/wayland-sdk"
+    mkdir -p "$V/wayland-sdk"
+    mv "$tmp/root/usr/include" "$V/wayland-sdk/include"
+    printf '%s' "$WAYLAND_SDK_RPMS" > "$V/wayland-sdk/.pinned"
+    rm -rf "$tmp"
+  else
+    echo "wayland-sdk skipped: rpm2cpio and cpio are needed"
+  fi
+fi
+[[ -f "$V/wayland-sdk/.pinned" ]] && echo "wayland-sdk (wlroots 0.20)"
+
 # The installed runtime and these compile-time reference assemblies are separate.
 if [[ -n "${DALAMUD_LIB_PATH:-}" ]]; then
   [[ -f "$DALAMUD_LIB_PATH/Dalamud.dll" ]] || { echo 'DALAMUD_LIB_PATH lacks Dalamud.dll' >&2; exit 1; }
