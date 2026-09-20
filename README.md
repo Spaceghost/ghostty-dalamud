@@ -793,6 +793,17 @@ is unverified in the entry itself; do not write around it.
 (That workflow ignores Markdown-only pushes, so an edit to `CHANGELOG.md` alone
 starts no run; drift is caught by the next push that touches code.)
 
+## Releasing
+
+```sh
+tools/release.sh test            # the next testing build, from master as it is
+tools/release.sh stable X.Y.Z    # the stable release X.Y.Z
+```
+
+One command: it checks the tree and CI, writes the version everywhere it lives, dates
+the changelog, tags, pushes, waits for the Release workflow, and verifies the published
+files and the live listing. `-n` is a dry run. See [docs/RELEASING.md](docs/RELEASING.md).
+
 ## Limitations and unverified behaviour
 
 Tested on the host (`tests/run.sh`): the libghostty-vt binding, cell renderer,
