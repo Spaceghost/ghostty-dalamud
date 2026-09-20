@@ -1,0 +1,55 @@
+# spaceghost: the plugin's own look, and the default theme.
+#
+# A Ghostty theme file (https://ghostty.org/docs/config/reference): it loads
+# in the Ghostty terminal as it is. The terminal colours are libghostty-vt's
+# built-in defaults; the cursor takes the foreground and a selection inverts
+# its cells, so neither is set here.
+#
+# The "# ffxiv:" lines are the Ghostty-FFXIV extension: comments to Ghostty,
+# the glass UI's colours to the plugin (see the README, Themes).
+
+palette = 0=#1d1f21
+palette = 1=#cc6666
+palette = 2=#b5bd68
+palette = 3=#f0c674
+palette = 4=#81a2be
+palette = 5=#b294bb
+palette = 6=#8abeb7
+palette = 7=#c5c8c6
+palette = 8=#666666
+palette = 9=#d54e53
+palette = 10=#b9ca4a
+palette = 11=#e7c547
+palette = 12=#7aa6da
+palette = 13=#c397d8
+palette = 14=#70c0b1
+palette = 15=#eaeaea
+background = #000000
+foreground = #ffffff
+
+# ffxiv: accent = #c8a05a
+# ffxiv: accent-2 = #78dcff
+# ffxiv: ok = #8cf096
+# ffxiv: ink = #f0e6dc
+# ffxiv: ink-dim = #aaa5a0
+# ffxiv: ink-faint = #787470
+# ffxiv: glass-top = #222732
+# ffxiv: glass-bottom = #0a0c11
+# ffxiv: glass-flat = #101218
+# ffxiv: glow = #5a96dc
+# ffxiv: panel = #0a0d12
+# ffxiv: tooltip = #101218
+# ffxiv: tab = #ffffff
+# ffxiv: close = #be3c32
+# ffxiv: close-idle = #5a2824
+# ffxiv: full = #466ea0
+# ffxiv: full-idle = #283246
+# ffxiv: popin = #78643c
+# ffxiv: popin-idle = #3c3428
+# ffxiv: sleep = #505a82
+# ffxiv: sleep-idle = #2c2e42
+# ffxiv: chip = #322c28
+# ffxiv: chip-hot = #785a32
+# ffxiv: chip-ink = #ebe1d2
+# ffxiv: label = #0c1016
+# ffxiv: label-ink = #e6dec8
