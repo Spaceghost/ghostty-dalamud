@@ -43,7 +43,7 @@ BUILD_REMOTE="${BUILD_REMOTE:-${INCUS_REMOTE:-${BUILD_REMOTE_NAME:-build}}}"
 INCUS="${INCUS:-incus}"
 # The game, the launcher, and the dedicated login session that starts both.
 # Kept as one regex so a site can replace it wholesale from the environment.
-BUILD_GAME_PATTERN="${BUILD_GAME_PATTERN:-(^|/)ffxiv_dx11\.exe([[:space:]]|$)|(^|/)ffxivlauncher\.exe([[:space:]]|$)|(^|/)XIVLauncher(\.Core)?([[:space:]]|$)|(^|/)ffxiv-session([[:space:]]|$)}"
+BUILD_GAME_PATTERN="${BUILD_GAME_PATTERN:-(^|[/\\])ffxiv_dx11\.exe([[:space:]]|$)|(^|[/\\])ffxivlauncher\.exe([[:space:]]|$)|(^|[/\\])XIVLauncher(\.Core)?([[:space:]]|$)|(^|[/\\])ffxiv-session([[:space:]]|$)}"
 
 # The reason for the last wb_* answer, for logs and --why.
 WB_HOST=""
