@@ -1,0 +1,30 @@
+-- Raw jobs on Windows: not implemented. The pipe/fork/exec runner is
+-- agent/job_posix.nelua; this stub keeps the Windows agent building and
+-- answers every JOPEN with the reason (docs/JOBS.md). PTY sessions (OPEN)
+-- and window streams are unaffected.
+require 'string'
+require 'vector'
+
+global AgentJobProc = @record{
+  pid: cint,
+  in_fd: cint,
+  out_fd: cint,
+  err_fd: cint,
+}
+
+function AgentJobProc.spawn(argv: *vector(string), env: *vector(string), cwd: string): (boolean, AgentJobProc, string)
+  return false, (@AgentJobProc){ pid = -1, in_fd = -1, out_fd = -1, err_fd = -1 }, 'jobs are not implemented on Windows'
+end
+
+function AgentJobProc:read_out(buf: *[0]uint8, cap: usize): isize return -1 end
+function AgentJobProc:read_err(buf: *[0]uint8, cap: usize): isize return -1 end
+function AgentJobProc:out_done(): void self.out_fd = -1 end
+function AgentJobProc:err_done(): void self.err_fd = -1 end
+function AgentJobProc:write_in(p: *[0]uint8, n: usize): isize return -1 end
+function AgentJobProc:close_in(): void self.in_fd = -1 end
+function AgentJobProc:signal(sig: cint): void end
+function AgentJobProc:kill(): void end
+function AgentJobProc:poll_exit(): (boolean, int32) return true, 0 end
+function AgentJobProc:close(): void end
+
+global JOB_HAVE_PROCS: boolean <comptime> = false

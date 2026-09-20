@@ -1,0 +1,141 @@
+-- ghostty-agent's PTYs on Linux/macOS: forkpty, a non-blocking master fd,
+-- waitpid. The Windows build uses agent/pty_windows.nelua with the same API.
+require 'string'
+require 'vector'
+require 'agent.logic'
+
+## cinclude '<sys/types.h>'
+## cinclude '<sys/wait.h>'
+## cinclude '<sys/ioctl.h>'
+## cinclude '<signal.h>'
+## cinclude '<unistd.h>'
+## cinclude '<fcntl.h>'
+## cinclude '<errno.h>'
+## cinclude '<stdlib.h>'
+## if not ccinfo.is_apple then
+## cinclude '<pty.h>'
+## end
+## cinclude '<termios.h>'
+## if ccinfo.is_linux and not ccinfo.is_musl then
+## linklib 'util'
+## end
+
+local winsize <cimport, nodecl, ctypedef> = @record{ ws_row: cushort, ws_col: cushort, ws_xpixel: cushort, ws_ypixel: cushort }
+## if ccinfo.is_apple then
+-- macOS keeps forkpty in <util.h> (libSystem, no -lutil); Zig's macOS libc
+-- headers do not ship that header, so the prototype is declared here.
+local function forkpty(amaster: *cint, name: cstring, termp: pointer, winp: pointer): cint <cimport> end
+## else
+local function forkpty(amaster: *cint, name: cstring, termp: pointer, winp: *winsize): cint <cimport, nodecl> end
+## end
+local function execvp(file: cstring, argv: *[0]cstring): cint <cimport, nodecl> end
+local function setenv(name: cstring, value: cstring, overwrite: cint): cint <cimport, nodecl> end
+local function unsetenv(name: cstring): cint <cimport, nodecl> end
+local function chdir(path: cstring): cint <cimport, nodecl> end
+local function _exit(status: cint): void <cimport, nodecl> end
+local function ioctl(fd: cint, req: culong, ...: cvarargs): cint <cimport, nodecl> end
+local function read(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function write(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
+local function close(fd: cint): cint <cimport, nodecl> end
+local function waitpid(pid: cint, status: *cint, options: cint): cint <cimport, nodecl> end
+local function kill(pid: cint, sig: cint): cint <cimport, nodecl> end
+local function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
+local TIOCSWINSZ: culong <cimport, nodecl, const>
+local WNOHANG: cint <cimport, nodecl, const>
+local SIGHUP: cint <cimport, nodecl, const>
+local F_GETFL: cint <cimport, nodecl, const>
+local F_SETFL: cint <cimport, nodecl, const>
+local O_NONBLOCK: cint <cimport, nodecl, const>
+local F_SETFD: cint <cimport, nodecl, const>
+local FD_CLOEXEC: cint <cimport, nodecl, const>
+local errno: cint <cimport, nodecl>
+local EAGAIN: cint <cimport, nodecl, const>
+local EINTR: cint <cimport, nodecl, const>
+
+local function WIFEXITED(s: cint): boolean <cimport, nodecl> end
+local function WEXITSTATUS(s: cint): cint <cimport, nodecl> end
+local function WIFSIGNALED(s: cint): boolean <cimport, nodecl> end
+local function WTERMSIG(s: cint): cint <cimport, nodecl> end
+
+global AgentPty = @record{ pid: cint, fd: cint }
+
+-- Start argv[0] on a new PTY. False (and a reason) when forkpty fails; a
+-- command that cannot be run exits with 127 instead.
+function AgentPty.spawn(term: string, argv: *vector(string), env: *vector(string), cols: uint16, rows: uint16): (boolean, AgentPty, string)
+  local ws: winsize = { ws_row = rows, ws_col = cols }
+  local master: cint = -1
+  local pid = forkpty(&master, nilptr, nilptr, &ws)
+  if pid < 0 then return false, (@AgentPty){ pid = -1, fd = -1 }, 'forkpty failed' end
+  if pid == 0 then
+    -- child
+    setenv('TERM', (@cstring)(term.data), 1)
+    setenv('COLORTERM', 'truecolor', 1)
+    setenv('TERM_PROGRAM', 'ghostty-umbra', 1)
+    unsetenv('TMUX')
+    for i = 0, < #env do
+      local ok, k, v = agent_env_split(env[i])
+      if ok then
+        if k == 'PWD' or k == 'CWD' then
+          chdir((@cstring)(v.data))
+        else
+          setenv((@cstring)(k.data), (@cstring)(v.data), 1)
+        end
+      end
+    end
+    local cargv: [64]cstring
+    local n = #argv
+    if n > 63 then n = 63 end
+    for i = 0, < n do cargv[i] = (@cstring)(argv[i].data) end
+    cargv[n] = nilptr
+    if n > 0 then execvp(cargv[0], &cargv) end
+    _exit(127)
+  end
+  local flags = fcntl(master, F_GETFL, 0)
+  fcntl(master, F_SETFL, flags | O_NONBLOCK)
+  fcntl(master, F_SETFD, FD_CLOEXEC) -- later children must not hold this terminal open
+  return true, (@AgentPty){ pid = pid, fd = master }, (@string){}
+end
+
+-- Output: bytes read (> 0), 0 when none is ready, -1 when the PTY is gone.
+function AgentPty:read(buf: *[0]uint8, cap: usize): isize
+  local n = read(self.fd, buf, cap)
+  if n > 0 then return n end
+  if n < 0 and (errno == EAGAIN or errno == EINTR) then return 0 end
+  return -1 -- EOF or EIO: the slave side closed
+end
+
+-- Input: bytes taken (>= 0; 0 when the PTY's buffer is full), -1 when it is gone.
+function AgentPty:write(p: *[0]uint8, n: usize): isize
+  while true do
+    local w = write(self.fd, p, n)
+    if w >= 0 then return w end
+    if errno == EAGAIN then return 0 end
+    if errno ~= EINTR then return -1 end
+  end
+  return -1
+end
+
+function AgentPty:resize(cols: uint16, rows: uint16): void
+  local ws: winsize = { ws_row = rows, ws_col = cols }
+  ioctl(self.fd, TIOCSWINSZ, &ws)
+end
+
+-- CLOSE: hang the shell up; its exit is seen by poll_exit.
+function AgentPty:hangup(): void
+  kill(self.pid, SIGHUP)
+end
+
+-- True once the process ended, with its status (128 + signal when killed).
+function AgentPty:poll_exit(): (boolean, int32)
+  local status: cint = 0
+  if waitpid(self.pid, &status, WNOHANG) ~= self.pid then return false, 0 end
+  if WIFEXITED(status) then return true, WEXITSTATUS(status) end
+  if WIFSIGNALED(status) then return true, 128 + WTERMSIG(status) end
+  return true, 0
+end
+
+-- After the exit: nothing more comes out of it.
+function AgentPty:close(): void
+  if self.fd >= 0 then close(self.fd) end
+  self.fd = -1
+end

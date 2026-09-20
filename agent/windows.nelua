@@ -1,0 +1,481 @@
+-- Remote window streams in ghostty-agent (docs/REMOTE_WINDOWS.md).
+--
+-- The generic half of window capture: WLIST, WOPEN, WACK, WINPUT and WCLOSE
+-- from clients, WLISTR, WOPENED, WFRAME and WEND back. A backend
+-- (agent/capture.nelua) only finds windows, hands over pixels and plays input;
+-- everything between is here: scaling to the client's limit, the frame rate,
+-- tile diffs against what the client already has, encoding, and flow control
+-- (at most 2 unacknowledged seq, nothing encoded for a client whose output
+-- queue is already over WINDOWS_OUTQ_MAX).
+--
+-- A stream belongs to the connection that opened it: other connections cannot
+-- see or touch it, and it closes when that connection goes. The window
+-- itself may stay (a backend's `release`): the Linux compositor keeps it
+-- and its app for the next connection to open again (WOPEN "key:").
+
+require 'vector'
+require 'stringbuilder'
+require 'memory'
+require 'math'
+require 'string'
+require 'core.protocol'
+require 'core.wincodec'
+require 'agent.capture'
+
+local WINDOWS_OUTQ_MAX: usize <comptime> = 4 * 1024 * 1024 -- skip frames while a client is this far behind
+local WINDOWS_UNACKED_MAX: uint32 <comptime> = 2
+local WINDOWS_WOPEN_HEAD: usize <comptime> = 4 + 4 + 2 + 2 + 1 -- req, wid, max_w, max_h, fps
+
+local WinStream = @record{
+  sid: uint32,
+  client: usize,         -- index of the owning connection
+  req: uint32,           -- the WOPEN it answers
+  h: pointer,            -- the backend's handle
+  max_w: integer, max_h: integer,
+  interval: float64,     -- seconds between frames
+  announced: boolean,    -- WOPENED went out
+  serial: uint64,        -- backend frame serial last looked at
+  seq: uint32,           -- last seq sent
+  acked: uint32,         -- last seq the client presented
+  due: float64,          -- os.now() when the next frame may go
+  factor: integer,       -- downscale of the latest frame (input maps back through it)
+  src_w: integer, src_h: integer, -- the window's own size in the latest frame
+  pw: integer, ph: integer,       -- size of `prev` (0: the client has nothing)
+  prev: vector(uint8),   -- what the client has, pw x ph, stride pw * 4
+  scaled: vector(uint8),
+  rects: vector(WinRect),
+  geom: vector(CaptureBox), -- the WGEOM last sent, in frame pixels as sent
+  scratch: vector(uint8),
+  body: vector(uint8),
+  link: boolean,         -- WOPEN "url:": answered with the stream that already shows its window, if any
+}
+
+-- A window someone outside the game asked to see (`ghostty-agent --open-url`):
+-- watchers get "raise:N" on its list line, N counting up per request.
+local WinRaise = @record{ wid: uint32, n: uint32 }
+
+global AgentWindows = @record{
+  ok: boolean,
+  backend: CaptureBackend,
+  why: string,           -- why there is no backend (a literal)
+  streams: vector(WinStream),
+  next_sid: uint32,
+  -- the output queue of a connection, nilptr when it is gone
+  queue_of: function(ci: usize): *ByteQueue,
+  watchers: vector(usize), -- connections that sent WLIST "watch": the list is pushed to them on change
+  list_seen: uint64,       -- the backend's list_serial when the list last went out to them
+  relist: boolean,         -- a stream opened or closed: push the list (its sid columns) again
+  raises: vector(WinRaise),
+  raise_n: uint32,
+}
+
+-- Pick the backend (`--windows NAME`). False and why when there is none; the
+-- agent keeps running and answers window requests with that reason.
+function AgentWindows:init(name: string, queue_of: function(ci: usize): *ByteQueue): (boolean, string)
+  self.queue_of = queue_of
+  self.next_sid = 1
+  self.ok, self.backend, self.why = capture_select(name)
+  return self.ok, self.why
+end
+
+-- The window list for connection `ci`: each window line that one of its
+-- streams shows gets a "sid:N" column, so a client can tell the windows it
+-- has from new ones (a torn-off tab, a dialog) it may want to open.
+local function list_for(self: *AgentWindows, ci: usize, text: string): string
+  if self.backend.wid_of == nilptr then return text:copy() end
+  local sb: stringbuilder
+  local start: usize = 0
+  for pos: usize = 0, < text.size do
+    if text.data[pos] == 10 then
+      local line = string{data=(@*[0]byte)(&text.data[start]), size=pos-start}
+      sb:write(line)
+      local wid: uint64 = 0
+      local k: usize = 0
+      while k < line.size and line.data[k] >= '0'_b and line.data[k] <= '9'_b do wid = wid * 10 + (line.data[k] - '0'_b) k = k + 1 end
+      if k > 0 and k < line.size and line.data[k] == 9 and wid ~= 0 then
+        for i = 0, < #self.streams do
+          local st = &self.streams[i]
+          if st.client == ci and st.announced and self.backend.wid_of(st.h) == wid then sb:writef('\tsid:%d', st.sid) end
+        end
+        for i = 0, < #self.raises do
+          if self.raises[i].wid == wid then sb:writef('\traise:%d', self.raises[i].n) end
+        end
+      end
+      sb:writebyte(10)
+      start = pos + 1
+    end
+  end
+  if start < text.size then sb:write(string{data=(@*[0]byte)(&text.data[start]), size=text.size-start}) end
+  return sb:promote()
+end
+
+local function send_list(self: *AgentWindows, ci: usize, q: *ByteQueue): void
+  local text = self.backend.list()
+  local mine = list_for(self, ci, text)
+  proto.write_frame(q, PROTO_WLISTR, (@*[0]uint8)(mine.data), mine.size)
+  mine:destroy()
+  text:destroy()
+end
+
+local function find_stream(self: *AgentWindows, ci: usize, sid: uint32): *WinStream
+  for i = 0, < #self.streams do
+    local s = &self.streams[i]
+    if s.sid == sid and s.client == ci then return s end
+  end
+  return nilptr
+end
+
+local function send_opened(q: *ByteQueue, req: uint32, sid: uint32, w: integer, h: integer, text: string): void
+  local hd: [12]uint8
+  proto.put_u32(&hd, req)
+  proto.put_u32((@*[0]uint8)(&hd[4]), sid)
+  proto.put_u16((@*[0]uint8)(&hd[8]), (@uint16)(w))
+  proto.put_u16((@*[0]uint8)(&hd[10]), (@uint16)(h))
+  local fh: [5]uint8
+  fh[0] = PROTO_WOPENED
+  proto.put_u32((@*[0]uint8)(&fh[1]), (@uint32)(12 + text.size))
+  q:push(&fh, 5)
+  q:push(&hd, 12)
+  q:push((@*[0]uint8)(text.data), text.size)
+end
+
+-- Close the backend's handle and forget stream `i`. `gone`: its client went
+-- away (not WCLOSE), so a backend that can keeps the window and its app.
+local function drop(self: *AgentWindows, i: usize, gone: boolean): void
+  local s = &self.streams[i]
+  self.relist = true -- the window lost its sid column
+  if gone and self.backend.release ~= nilptr then self.backend.release(s.h) else self.backend.close(s.h) end
+  s.prev:destroy()
+  s.scaled:destroy()
+  s.rects:destroy()
+  s.geom:destroy()
+  s.scratch:destroy()
+  s.body:destroy()
+  self.streams:remove(i)
+end
+
+-- WGEOM before the first WFRAME of a seq whose boxes differ from the last
+-- ones sent: the window's and its popups' rectangles in the picture, scaled
+-- as the frame is (factor f).
+local function send_geom(s: *WinStream, q: *ByteQueue, fr: *CaptureFrame, f: integer): void
+  local n = math.min(fr.nbox, 64)
+  local same = n == #s.geom
+  local b: [64]CaptureBox
+  for i = 0, < n do
+    local r = fr.boxes[i]
+    b[i] = { x = r.x // f, y = r.y // f, w = (r.w + f - 1) // f, h = (r.h + f - 1) // f }
+    if same and (b[i].x ~= s.geom[i].x or b[i].y ~= s.geom[i].y or b[i].w ~= s.geom[i].w or b[i].h ~= s.geom[i].h) then same = false end
+  end
+  if same then return end
+  s.geom:clear()
+  local body: [4 + 4 + 2 + 64 * 8]uint8
+  proto.put_u32(&body, s.sid)
+  proto.put_u32((@*[0]uint8)(&body[4]), s.seq)
+  proto.put_u16((@*[0]uint8)(&body[8]), (@uint16)(n))
+  for i = 0, < n do
+    s.geom:push(b[i])
+    local o = 10 + i * 8
+    proto.put_u16((@*[0]uint8)(&body[o]), (@uint16)(math.max(0, b[i].x)))
+    proto.put_u16((@*[0]uint8)(&body[o + 2]), (@uint16)(math.max(0, b[i].y)))
+    proto.put_u16((@*[0]uint8)(&body[o + 4]), (@uint16)(math.max(0, b[i].w)))
+    proto.put_u16((@*[0]uint8)(&body[o + 6]), (@uint16)(math.max(0, b[i].h)))
+  end
+  proto.write_frame(q, PROTO_WGEOM, &body, (@usize)(10 + n * 8))
+end
+
+-- One frame: scale, announce the stream if this is its first, diff against
+-- what the client has, encode and queue. Nothing goes out when no pixel the
+-- client can see changed.
+local function stream_send(self: *AgentWindows, s: *WinStream, q: *ByteQueue, fr: *CaptureFrame, now: float64): void
+  s.serial = fr.serial
+  local f, w, h = wincodec_downscale(fr.pixels, fr.stride, fr.w, fr.h, s.max_w, s.max_h, &s.scaled)
+  local src, stride = fr.pixels, fr.stride
+  if f > 1 then src, stride = (@*[0]uint8)(&s.scaled[0]), (@usize)(w * 4) end
+  s.factor, s.src_w, s.src_h = f, fr.w, fr.h
+  if not s.announced then
+    send_opened(q, s.req, s.sid, w, h, self.backend.title(s.h))
+    s.announced = true
+    self.relist = true -- watchers learn the window is streamed (its sid column)
+  end
+  local key = w ~= s.pw or h ~= s.ph -- the first frame, or a new size
+  if key then
+    wincodec_diff(nilptr, 0, src, stride, w, h, &s.rects)
+  else
+    wincodec_diff((@*[0]uint8)(&s.prev[0]), (@usize)(w * 4), src, stride, w, h, &s.rects)
+  end
+  if #s.rects == 0 then return end
+  s.seq = s.seq + 1
+  send_geom(s, q, fr, f)
+  wincodec_write_frames(q, s.sid, s.seq, src, stride, w, h, key, &s.rects, &s.scratch, &s.body)
+  -- keep what the client now shows: all of it, or the rectangles just sent
+  local row = (@usize)(w * 4)
+  if key then
+    s.prev:resize(row * (@usize)(h))
+    for y = 0, < h do memory.copy(&s.prev[(@usize)(y) * row], &src[(@usize)(y) * stride], row) end
+    s.pw, s.ph = w, h
+  else
+    for k = 0, < #s.rects do
+      local r = s.rects[k]
+      for y = (@integer)(r.y), < (@integer)(r.y) + (@integer)(r.h) do
+        memory.copy(&s.prev[(@usize)(y) * row + (@usize)(r.x) * 4], &src[(@usize)(y) * stride + (@usize)(r.x) * 4], (@usize)(r.w) * 4)
+      end
+    end
+  end
+  s.due = now + s.interval
+end
+
+-- A coordinate of the (possibly scaled) frame the client sees, in window pixels.
+local function unscale(v: integer, factor: integer, size: integer): integer
+  if factor > 1 then v = v * factor + factor // 2 end
+  if size > 0 then v = math.clamp(v, 0, size - 1) end
+  return v
+end
+
+local function get_i16(p: *[0]uint8): integer
+  return (@int16)(proto.get_u16(p))
+end
+
+local function handle_input(self: *AgentWindows, s: *WinStream, p: *[0]uint8, len: usize): void
+  local ev: CaptureInput
+  ev.kind = p[0]
+  local b = (@*[0]uint8)(&p[1])
+  local n = len - 1
+  if ev.kind == WIN_INPUT_MOVE or ev.kind == WIN_INPUT_BUTTON or ev.kind == WIN_INPUT_WHEEL then
+    if n < 4 then return end
+    ev.x = unscale(get_i16(b), s.factor, s.src_w)
+    ev.y = unscale(get_i16((@*[0]uint8)(&b[2])), s.factor, s.src_h)
+    if ev.kind == WIN_INPUT_BUTTON then
+      if n < 6 then return end
+      ev.button = b[4]
+      ev.down = b[5] ~= 0
+    elseif ev.kind == WIN_INPUT_WHEEL then
+      if n < 8 then return end
+      ev.dx = get_i16((@*[0]uint8)(&b[4]))
+      ev.dy = get_i16((@*[0]uint8)(&b[6]))
+    end
+  elseif ev.kind == WIN_INPUT_KEY then
+    if n < 4 then return end
+    ev.hid = proto.get_u16(b)
+    ev.down = b[2] ~= 0
+    ev.mods = b[3]
+  elseif ev.kind == WIN_INPUT_TEXT then
+    ev.text = string{data=(@*[0]byte)(b), size=n}
+  elseif ev.kind ~= WIN_INPUT_FOCUS then
+    return -- a kind this agent does not know
+  end
+  self.backend.input(s.h, &ev)
+end
+
+-- A window frame from connection `ci` (answers go to `q`). False: not a window frame.
+function AgentWindows:handle(ci: usize, q: *ByteQueue, typ: uint8, payload: *[0]uint8, len: usize): boolean
+  if typ == PROTO_WLIST then
+    if not self.ok then proto.write_frame(q, PROTO_ERR, (@*[0]uint8)(self.why.data), self.why.size) return true end
+    -- WLIST "apps": the installed apps instead of the windows (none when the
+    -- backend has no list of them)
+    -- WLIST "watch": the window list now and again whenever it changes
+    local arg = string{data=(@*[0]byte)(payload), size=len}
+    if arg == 'apps' then
+      local text: string
+      if self.backend.apps ~= nilptr then text = self.backend.apps() end
+      proto.write_frame(q, PROTO_WLISTR, (@*[0]uint8)(text.data), text.size)
+      text:destroy()
+    else
+      if arg == 'watch' then
+        local known = false
+        for i = 0, < #self.watchers do if self.watchers[i] == ci then known = true end end
+        if not known then self.watchers:push(ci) end
+      end
+      send_list(self, ci, q)
+    end
+  elseif typ == PROTO_WOPEN then
+    if len < WINDOWS_WOPEN_HEAD then
+      local why: string = 'bad wopen'
+      if len >= 4 then send_opened(q, proto.get_u32(payload), 0, 0, 0, why)
+      else proto.write_frame(q, PROTO_ERR, (@*[0]uint8)(why.data), why.size) end
+      return true
+    end
+    local req = proto.get_u32(payload)
+    if not self.ok then send_opened(q, req, 0, 0, 0, self.why) return true end
+    local wid = proto.get_u32((@*[0]uint8)(&payload[4]))
+    local max_w = (@integer)(proto.get_u16((@*[0]uint8)(&payload[8])))
+    local max_h = (@integer)(proto.get_u16((@*[0]uint8)(&payload[10])))
+    local fps = (@integer)(payload[12])
+    if fps == 0 then fps = 30 end
+    fps = math.clamp(fps, 1, 60)
+    local match = string{data=(@*[0]byte)(&payload[WINDOWS_WOPEN_HEAD]), size=len - WINDOWS_WOPEN_HEAD}
+    local h, why = self.backend.open(wid, match)
+    if h == nilptr then
+      send_opened(q, req, 0, 0, 0, #why > 0 and why or 'open failed')
+      why:destroy()
+      return true
+    end
+    why:destroy()
+    self.streams:push(WinStream{
+      sid = self.next_sid, client = ci, req = req, h = h, max_w = max_w, max_h = max_h,
+      interval = 1.0 / fps, factor = 1, link = #match > 4 and match:subview(1, 4) == 'url:',
+    })
+    self.next_sid = self.next_sid + 1
+    if self.next_sid == 0 then self.next_sid = 1 end
+  elseif typ == PROTO_WACK then
+    if len < 8 then return true end
+    local s = find_stream(self, ci, proto.get_u32(payload))
+    if s == nilptr then return true end
+    local seq = proto.get_u32((@*[0]uint8)(&payload[4]))
+    -- only forward, and never past what was sent (u32 arithmetic survives wrapping)
+    if seq - s.acked <= s.seq - s.acked then s.acked = seq end
+  elseif typ == PROTO_WINPUT then
+    if len < 5 then return true end
+    local s = find_stream(self, ci, proto.get_u32(payload))
+    if s == nilptr or not s.announced then return true end
+    handle_input(self, s, (@*[0]uint8)(&payload[4]), len - 4)
+  elseif typ == PROTO_WCLOSE then
+    if len < 4 then return true end
+    local sid = proto.get_u32(payload)
+    for i = 0, < #self.streams do
+      if self.streams[i].sid == sid and self.streams[i].client == ci then drop(self, i, false) break end
+    end
+  else
+    return false
+  end
+  return true
+end
+
+local function is_watcher(self: *AgentWindows, ci: usize): boolean
+  for i = 0, < #self.watchers do if self.watchers[i] == ci then return true end end
+  return false
+end
+
+-- A link from outside the game (a connection that does not watch the list:
+-- `ghostty-agent --open-url`) found or opened window `wid`: watchers see
+-- "raise:N" on its line and bring it into the game.
+local function raise(self: *AgentWindows, ci: usize, wid: uint32): void
+  if wid == 0 or is_watcher(self, ci) then return end
+  self.raise_n = self.raise_n + 1
+  if self.raise_n == 0 then self.raise_n = 1 end
+  for i = 0, < #self.raises do
+    if self.raises[i].wid == wid then self.raises:remove(i) break end
+  end
+  if #self.raises >= 32 then self.raises:remove(0) end
+  self.raises:push(WinRaise{ wid = wid, n = self.raise_n })
+  self.relist = true
+end
+
+-- A link stream whose window connection `ci` already streams: that stream.
+local function streaming_already(self: *AgentWindows, s: *WinStream): *WinStream
+  if not s.link or self.backend.wid_of == nilptr then return nilptr end
+  local wid = self.backend.wid_of(s.h)
+  if wid == 0 then return nilptr end
+  for i = 0, < #self.streams do
+    local o = &self.streams[i]
+    if o ~= s and o.client == s.client and o.announced and self.backend.wid_of(o.h) == wid then return o end
+  end
+  return nilptr
+end
+
+-- Once per main loop turn, after the backend's pump: settle pending opens,
+-- end streams whose window went, and send the frames that are due.
+function AgentWindows:tick(now: float64): void
+  if not self.ok then return end
+  if #self.watchers > 0 and self.backend.list_serial ~= nilptr then
+    local serial = self.backend.list_serial()
+    if serial ~= self.list_seen or self.relist then
+      self.list_seen = serial
+      self.relist = false
+      for w = 0, < #self.watchers do
+        local wq = self.queue_of(self.watchers[w])
+        if wq ~= nilptr then send_list(self, self.watchers[w], wq) end
+      end
+    end
+  end
+  local i: usize = 0
+  while i < #self.streams do
+    local s = &self.streams[i]
+    local q = self.queue_of(s.client)
+    if q == nilptr then i = i + 1 continue end -- going away: the client's reap closes it
+    local st, why = self.backend.state(s.h)
+    local fr: CaptureFrame
+    if not s.announced then
+      if st == CAPTURE_PENDING then i = i + 1 continue end
+      if st == CAPTURE_ENDED then
+        send_opened(q, s.req, 0, 0, 0, #why > 0 and why or 'capture ended')
+        drop(self, i, false)
+        continue
+      end
+      -- live. A link whose window this connection streams already: WOPENED
+      -- names that stream (no second one), the client focuses its panel
+      if s.link and self.backend.wid_of ~= nilptr then raise(self, s.client, self.backend.wid_of(s.h)) end
+      local same = streaming_already(self, s)
+      if same ~= nilptr then
+        send_opened(q, s.req, same.sid, same.pw, same.ph, self.backend.title(same.h))
+        drop(self, i, true) -- the window stays: it is the other stream's
+        continue
+      end
+      -- announce with the first frame when there is one, else without a size
+      if q:len() <= WINDOWS_OUTQ_MAX and self.backend.frame(s.h, &fr) and fr.serial ~= 0 then
+        stream_send(self, s, q, &fr, now)
+      else
+        send_opened(q, s.req, s.sid, 0, 0, self.backend.title(s.h))
+        s.announced = true
+        self.relist = true
+      end
+      i = i + 1
+      continue
+    end
+    if st == CAPTURE_ENDED then
+      local reason = #why > 0 and why or 'capture ended'
+      proto.write_frame_id(q, PROTO_WEND, s.sid, (@*[0]uint8)(reason.data), reason.size)
+      drop(self, i, false)
+      continue
+    end
+    if st == CAPTURE_LIVE and s.seq - s.acked < WINDOWS_UNACKED_MAX and now >= s.due
+       and q:len() <= WINDOWS_OUTQ_MAX and self.backend.frame(s.h, &fr)
+       and fr.serial ~= 0 and fr.serial ~= s.serial then
+      stream_send(self, s, q, &fr, now)
+    end
+    i = i + 1
+  end
+end
+
+-- The longest the main loop may sleep (ms), -1 for no limit: the backend's
+-- own wish, and the next frame time of every stream that may send then.
+-- Streams waiting for a WACK or for their client's queue to drain are woken
+-- by that socket instead.
+function AgentWindows:wait_ms(now: float64): integer
+  if not self.ok or #self.streams == 0 then return -1 end
+  local best = self.backend.wait_ms()
+  for i = 0, < #self.streams do
+    local s = &self.streams[i]
+    if s.announced and s.seq - s.acked < WINDOWS_UNACKED_MAX and s.due > now then
+      local ms = math.max(1, (@integer)(math.ceil((s.due - now) * 1000.0)))
+      if best < 0 or ms < best then best = ms end
+    end
+  end
+  return best
+end
+
+-- POSIX: the backend's descriptors to wake on; returns the count.
+function AgentWindows:poll_fds(fds: *[0]cint, max: integer): integer
+  if not self.ok then return 0 end
+  return self.backend.poll_fds(fds, max)
+end
+
+function AgentWindows:pump(): void
+  if self.ok then self.backend.pump() end
+end
+
+-- Connection `ci` is going away: close its streams, and renumber the streams
+-- of the connections after it (the agent's client vector closes the gap).
+function AgentWindows:client_gone(ci: usize): void
+  local w: integer = #self.watchers - 1
+  while w >= 0 do
+    if self.watchers[w] == ci then self.watchers:remove(w)
+    elseif self.watchers[w] > ci then self.watchers[w] = self.watchers[w] - 1 end
+    w = w - 1
+  end
+  local i: integer = #self.streams - 1
+  while i >= 0 do
+    if self.streams[i].client == ci then drop(self, (@usize)(i), true)
+    elseif self.streams[i].client > ci then self.streams[i].client = self.streams[i].client - 1 end
+    i = i - 1
+  end
+end

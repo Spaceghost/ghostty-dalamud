@@ -1,4 +1,4 @@
--- ghostty-agent: a small PTY server for Linux/macOS hosts.
+-- ghostty-agent: a small PTY server for Linux/macOS and Windows hosts.
 --
 -- The GhosttyDalamud plugin (running inside FFXIV, natively or under Wine/Proton)
 -- connects over TCP and opens shells, ssh clients, or anything else as
@@ -6,8 +6,23 @@
 -- 256 KiB of output is replayed on ATTACH so libghostty on the client can
 -- rebuild the screen, the same way Superlogical streams raw bytes.
 --
+-- Platform code lives beside this file: agent/pty_posix.nelua (forkpty) and
+-- agent/sys_posix.nelua (wl-copy / xclip), or agent/pty_windows.nelua
+-- (ConPTY over overlapped named pipes), agent/sys_windows.nelua (Win32
+-- clipboard, token file under %APPDATA%) and agent/winloop.nelua (one wait
+-- on socket, process and pipe events). agent/logic.nelua holds the pure parts.
+-- Remote desktop windows (protocol version 3) are agent/windows.nelua, over a
+-- capture backend from agent/capture.nelua (--windows). Raw jobs (protocol
+-- version 4, docs/JOBS.md) are agent/jobs.nelua over agent/job_posix.nelua:
+-- a process on pipes whose output a client parses, with the Claude Code
+-- command line built in agent/claude.nelua. Jobs run as this user.
+--
 -- Usage: ghostty-agent [--listen 127.0.0.1:7777] [--token-file PATH]
 --                      [--clipboard-file PATH] [--replay-bytes N] [--term xterm-256color]
+--                      [--windows auto|off|test|wayland|win32|mac]
+--                      [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|none]
+--                      [--wayland-browser CMD] [--wayland-browser-profile NAME]
+--        ghostty-agent [--listen HOST:PORT] [--token-file PATH] --open-url URL
 require 'string'
 require 'vector'
 require 'stringbuilder'
@@ -18,68 +33,23 @@ require 'math'
 require 'memory'
 require 'core.sys.net'
 require 'core.protocol'
-
-## cinclude '<sys/types.h>'
-## cinclude '<sys/wait.h>'
-## cinclude '<sys/ioctl.h>'
-## cinclude '<sys/stat.h>'
-## cinclude '<signal.h>'
-## cinclude '<unistd.h>'
-## cinclude '<fcntl.h>'
+require 'agent.logic'
+require 'agent.windows'
+require 'agent.jobs'
+require 'agent.clips'
+## if ccinfo.is_windows then
+require 'agent.pty_windows'
+require 'agent.sys_windows'
+require 'agent.winloop'
+## else
+require 'agent.pty_posix'
+require 'agent.sys_posix'
 ## cinclude '<poll.h>'
-## cinclude '<errno.h>'
-## cinclude '<stdlib.h>'
-## cinclude '<pty.h>'
-## cinclude '<termios.h>'
-## if ccinfo.is_linux and not ccinfo.is_musl then
-## linklib 'util'
-## end
-
-local winsize <cimport, nodecl, ctypedef> = @record{ ws_row: cushort, ws_col: cushort, ws_xpixel: cushort, ws_ypixel: cushort }
 local pollfd <cimport, nodecl, ctypedef> = @record{ fd: cint, events: cshort, revents: cshort }
-local function forkpty(amaster: *cint, name: cstring, termp: pointer, winp: *winsize): cint <cimport, nodecl> end
-local function execvp(file: cstring, argv: *[0]cstring): cint <cimport, nodecl> end
-local function setenv(name: cstring, value: cstring, overwrite: cint): cint <cimport, nodecl> end
-local function unsetenv(name: cstring): cint <cimport, nodecl> end
-local function chdir(path: cstring): cint <cimport, nodecl> end
-local function _exit(status: cint): void <cimport, nodecl> end
-local function ioctl(fd: cint, req: culong, ...: cvarargs): cint <cimport, nodecl> end
-local function read(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
-local function write(fd: cint, buf: pointer, n: csize): isize <cimport, nodecl> end
-local function close(fd: cint): cint <cimport, nodecl> end
 local function poll(fds: *[0]pollfd, n: culong, timeout: cint): cint <cimport, nodecl> end
-local function waitpid(pid: cint, status: *cint, options: cint): cint <cimport, nodecl> end
-local function kill(pid: cint, sig: cint): cint <cimport, nodecl> end
-local function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
-local function signal(sig: cint, handler: pointer): pointer <cimport, nodecl> end
-local function umask(mask: cuint): cuint <cimport, nodecl> end
-local function getpid(): cint <cimport, nodecl> end
-local function fork(): cint <cimport, nodecl> end
-local function pipe(fds: *[2]cint): cint <cimport, nodecl> end
-local function dup2(oldfd: cint, newfd: cint): cint <cimport, nodecl> end
-local TIOCSWINSZ: culong <cimport, nodecl, const>
 local POLLIN: cshort <cimport, nodecl, const>
 local POLLOUT: cshort <cimport, nodecl, const>
-local POLLHUP: cshort <cimport, nodecl, const>
-local POLLERR: cshort <cimport, nodecl, const>
-local WNOHANG: cint <cimport, nodecl, const>
-local SIGHUP: cint <cimport, nodecl, const>
-local SIGTERM: cint <cimport, nodecl, const>
-local SIGKILL: cint <cimport, nodecl, const>
-local SIGPIPE: cint <cimport, nodecl, const>
-local SIG_IGN: pointer <cimport, nodecl, const>
-local F_GETFL: cint <cimport, nodecl, const>
-local F_SETFL: cint <cimport, nodecl, const>
-local O_NONBLOCK: cint <cimport, nodecl, const>
-local errno: cint <cimport, nodecl>
-local EAGAIN: cint <cimport, nodecl, const>
-local EINTR: cint <cimport, nodecl, const>
-local EIO: cint <cimport, nodecl, const>
-
-local function WIFEXITED(s: cint): boolean <cimport, nodecl> end
-local function WEXITSTATUS(s: cint): cint <cimport, nodecl> end
-local function WIFSIGNALED(s: cint): boolean <cimport, nodecl> end
-local function WTERMSIG(s: cint): cint <cimport, nodecl> end
+## end
 
 -- Output this session had queued for a client when it detached: that much
 -- still reaches the client, so a later ATTACH does not replay it again.
@@ -87,8 +57,7 @@ local DetachMark = @record{ client: usize, total: uint64 }
 
 local Session = @record{
   id: uint32,
-  pid: cint,
-  fd: cint,
+  pty: AgentPty,
   cols: uint16,
   rows: uint16,
   command: string,
@@ -108,6 +77,7 @@ local Client = @record{
   outq: ByteQueue,
   authed: boolean,
   alive: boolean,
+  ev: pointer,             -- Windows: the socket's event for the event loop
 }
 
 local Agent = @record{
@@ -126,6 +96,9 @@ local INBUF_MAX: usize <comptime> = 8 * 1024 * 1024  -- input waiting for a PTY,
 local OUTQ_HIGH: usize <comptime> = 1024 * 1024      -- a client this far behind stops its sessions' reads
 
 local agent: Agent
+local windows: AgentWindows
+local jobs: AgentJobs
+local clips: AgentClips
 
 local function log(msg: string): void
   io.stderr:write('[ghostty-agent] ', msg, '\n')
@@ -172,28 +145,22 @@ end
 -- Send `count` bytes of the ring, starting `start` bytes after its oldest.
 local function send_replay_range(s: *Session, c: *Client, start: usize, count: usize): void
   local size = (@usize)(#s.replay)
-  local first = start
-  if size >= agent.replay_bytes then first = (s.replay_head + start) % size end
+  local first = agent_ring_index(size, agent.replay_bytes, s.replay_head, start)
   local n1 = math.min(count, size - first)
   if n1 > 0 then proto.write_frame_id(&c.outq, PROTO_SDATA, s.id, (@*[0]uint8)(&s.replay[first]), n1) end
   if count > n1 then proto.write_frame_id(&c.outq, PROTO_SDATA, s.id, (@*[0]uint8)(&s.replay[0]), count - n1) end
 end
 
--- A client that says how much output it already has (`fed`) gets only the
--- rest, onto the screen it kept. Otherwise, or when the ring no longer holds
--- the rest, its terminal is reset and gets everything the ring holds.
+-- ATTACH: only what the client misses, or a reset and all the ring holds
+-- (agent_replay_plan).
 local function session_replay_to(s: *Session, c: *Client, has_fed: boolean, fed: uint64): void
-  local size = (@uint64)(#s.replay)
-  if has_fed and fed <= s.total_out and s.total_out - fed <= size then
-    local missed = s.total_out - fed
-    if missed > 0 then send_replay_range(s, c, (@usize)(size - missed), (@usize)(missed)) end
-    return
+  local plan = agent_replay_plan((@uint64)(#s.replay), s.total_out, has_fed, fed)
+  if plan.reset then
+    -- reset the terminal first so stale state from another client doesn't leak
+    local reset: string = '\27c'
+    proto.write_frame_id(&c.outq, PROTO_SDATA, s.id, (@*[0]uint8)(reset.data), reset.size)
   end
-  if size == 0 then return end
-  -- reset the terminal first so stale state from another client doesn't leak
-  local reset: string = '\27c'
-  proto.write_frame_id(&c.outq, PROTO_SDATA, s.id, (@*[0]uint8)(reset.data), reset.size)
-  send_replay_range(s, c, 0, (@usize)(size))
+  if plan.count > 0 then send_replay_range(s, c, plan.start, plan.count) end
 end
 
 -- Input for the PTY: what it cannot take now waits in `inbuf` (the main loop
@@ -212,13 +179,11 @@ end
 
 local function session_drain_input(s: *Session): void
   while s.inbuf:len() > 0 do
-    local w = write(s.fd, s.inbuf:peek(), s.inbuf:len())
+    local w = s.pty:write(s.inbuf:peek(), s.inbuf:len())
     if w > 0 then
       s.inbuf:consume((@usize)(w))
-    elseif w < 0 and errno == EINTR then
-      -- interrupted: try again
-    elseif w == 0 or errno == EAGAIN then
-      break
+    elseif w == 0 then
+      break -- the PTY takes no more now
     else
       s.inbuf:consume(s.inbuf:len()) -- the PTY is gone (EIO): nobody reads this any more
     end
@@ -229,12 +194,10 @@ local function session_write_input(s: *Session, p: *[0]uint8, n: usize): void
   if s.inbuf:len() > 0 then session_queue_input(s, p, n) return end -- behind older input
   local off: usize = 0
   while off < n do
-    local w = write(s.fd, &p[off], n - off)
+    local w = s.pty:write(&p[off], n - off)
     if w > 0 then
       off = off + (@usize)(w)
-    elseif w < 0 and errno == EINTR then
-      -- interrupted: try again
-    elseif w == 0 or errno == EAGAIN then
+    elseif w == 0 then
       session_queue_input(s, &p[off], n - off) -- PTY input buffer full
       return
     else
@@ -287,86 +250,13 @@ end
 local function session_set_size(s: *Session, cols: uint16, rows: uint16): void
   s.cols = cols
   s.rows = rows
-  local ws: winsize = { ws_row = rows, ws_col = cols }
-  ioctl(s.fd, TIOCSWINSZ, &ws)
+  s.pty:resize(cols, rows)
 end
 
-local function split_nul(p: *[0]uint8, len: usize): (vector(string), vector(string))
-  local argv: vector(string)
-  local env: vector(string)
-  local i: usize = 0
-  local start: usize = 0
-  local in_env = false
-  while i < len do
-    if p[i] == 0 then
-      if i == start then
-        -- empty entry marks the argv/env boundary
-        in_env = true
-      else
-        local s = string{data=(@*[0]byte)(&p[start]), size=i-start}:copy()
-        if in_env then env:push(s) else argv:push(s) end
-      end
-      start = i + 1
-    end
-    i = i + 1
-  end
-  if start < len then
-    local s = string{data=(@*[0]byte)(&p[start]), size=len-start}:copy()
-    if in_env then env:push(s) else argv:push(s) end
-  end
-  return argv, env
-end
-
-local function spawn(cols: uint16, rows: uint16, argv: *vector(string), env: *vector(string)): (cint, cint)
-  local ws: winsize = { ws_row = rows, ws_col = cols }
-  local master: cint = -1
-  local pid = forkpty(&master, nilptr, nilptr, &ws)
-  if pid < 0 then return -1, -1 end
-  if pid == 0 then
-    -- child
-    setenv('TERM', (@cstring)(agent.term.data), 1)
-    setenv('COLORTERM', 'truecolor', 1)
-    setenv('TERM_PROGRAM', 'ghostty-umbra', 1)
-    unsetenv('TMUX')
-    for i = 0, < #env do
-      local kv = env[i]
-      local eq = kv:find('=', 1, true)
-      if eq > 1 then
-        local k = kv:sub(1, eq - 1)
-        local v = kv:sub(eq + 1)
-        if k == 'PWD' or k == 'CWD' then
-          chdir((@cstring)(v.data))
-        else
-          setenv((@cstring)(k.data), (@cstring)(v.data), 1)
-        end
-      end
-    end
-    local cargv: [64]cstring
-    local n = #argv
-    if n > 63 then n = 63 end
-    for i = 0, < n do cargv[i] = (@cstring)(argv[i].data) end
-    cargv[n] = nilptr
-    if n > 0 then execvp(cargv[0], &cargv) end
-    _exit(127)
-  end
-  local flags = fcntl(master, F_GETFL, 0)
-  fcntl(master, F_SETFL, flags | O_NONBLOCK)
-  return pid, master
-end
-
--- The host's system clipboard ------------------------------------------------------
--- Copies inside the game land on the desktop clipboard and pastes come from it:
--- wl-copy / wl-paste on Wayland, xclip on X11. Each runs as a short child
--- process with a pipe; the agent waits for it (a clipboard tool exits at once,
--- wl-copy forks its own server).
-local CLIP_MAX: usize <comptime> = 1024 * 1024
-
-local function exec_first(argvs: *[2][4]cstring): void
-  for i = 0, < 2 do
-    if argvs[i][0] ~= nilptr then execvp(argvs[i][0], &argvs[i]) end
-  end
-  _exit(127)
-end
+-- The host's system clipboard -------------------------------------------------
+-- Copies inside the game land on the desktop clipboard and pastes come from
+-- it (agent/sys_*.nelua). --clipboard-file swaps in a plain file for tests.
+local CLIP_MAX: usize <comptime> = AGENT_CLIP_MAX
 
 local function clipboard_set(data: *[0]uint8, len: usize): boolean
   if #agent.clip_file > 0 then
@@ -376,27 +266,7 @@ local function clipboard_set(data: *[0]uint8, len: usize): boolean
     f:close()
     return true
   end
-  local fds: [2]cint
-  if pipe(&fds) ~= 0 then return false end
-  local pid = fork()
-  if pid < 0 then close(fds[0]) close(fds[1]) return false end
-  if pid == 0 then
-    dup2(fds[0], 0)
-    close(fds[0]) close(fds[1])
-    local argvs: [2][4]cstring = { { 'wl-copy', nilptr, nilptr, nilptr }, { 'xclip', '-selection', 'clipboard', nilptr } }
-    exec_first(&argvs)
-  end
-  close(fds[0])
-  local off: usize = 0
-  while off < len do
-    local n = write(fds[1], &data[off], len - off)
-    if n <= 0 then break end
-    off = off + (@usize)(n)
-  end
-  close(fds[1])
-  local status: cint = 0
-  waitpid(pid, &status, 0)
-  return off == len and WIFEXITED(status) and WEXITSTATUS(status) == 0
+  return agent_clipboard_set(data, len)
 end
 
 local function clipboard_get(): (boolean, string)
@@ -407,30 +277,7 @@ local function clipboard_get(): (boolean, string)
     f:close()
     return true, content
   end
-  local fds: [2]cint
-  if pipe(&fds) ~= 0 then return false, '' end
-  local pid = fork()
-  if pid < 0 then close(fds[0]) close(fds[1]) return false, '' end
-  if pid == 0 then
-    dup2(fds[1], 1)
-    close(fds[0]) close(fds[1])
-    local argvs: [2][4]cstring = { { 'wl-paste', '--no-newline', nilptr, nilptr }, { 'xclip', '-o', '-selection', 'clipboard' } }
-    exec_first(&argvs)
-  end
-  close(fds[1])
-  local sb: stringbuilder
-  local buf: [8192]uint8
-  local pf: [1]pollfd = { { fd = fds[0], events = POLLIN } }
-  while #sb < CLIP_MAX do
-    if poll(&pf, 1, 1000) <= 0 then break end -- a stuck clipboard owner must not stall the agent
-    local n = read(fds[0], &buf, 8192)
-    if n <= 0 then break end
-    sb:write(string{data=(@*[0]byte)(&buf), size=(@usize)(n)})
-  end
-  close(fds[0])
-  local status: cint = 0
-  if waitpid(pid, &status, WNOHANG) == 0 then kill(pid, SIGKILL) waitpid(pid, &status, 0) end
-  return true, sb:promote()
+  return agent_clipboard_get()
 end
 
 local function send_opened_error(c: *Client, why: string): void
@@ -461,21 +308,24 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     if len < 5 then send_opened_error(c, 'bad open') return end
     local cols = proto.get_u16(payload)
     local rows = proto.get_u16((@*[0]uint8)(&payload[2]))
-    local argv, env = split_nul((@*[0]uint8)(&payload[4]), len - 4)
+    local argv, env = agent_split_nul((@*[0]uint8)(&payload[4]), len - 4)
     if #argv == 0 then
-      argv:push(string.copy('/bin/sh'))
-      argv:push(string.copy('-l'))
+      argv:destroy()
+      local comspec = os.getenv('COMSPEC')
+      argv = agent_default_argv(#[ccinfo.is_windows and true or false]#, comspec)
+      comspec:destroy()
     end
-    local pid, fd = spawn(cols, rows, &argv, &env)
-    if pid < 0 then
-      send_opened_error(c, 'forkpty failed')
+    local ok, pty, why = AgentPty.spawn(agent.term, &argv, &env, cols, rows)
+    if not ok then
+      send_opened_error(c, why)
+      log('open failed: ' .. why)
       for i = 0, < #argv do argv[i]:destroy() end
       for i = 0, < #env do env[i]:destroy() end
       argv:destroy()
       env:destroy()
       return
     end
-    local s: Session = { id = agent.next_id, pid = pid, fd = fd, cols = cols, rows = rows }
+    local s: Session = { id = agent.next_id, pty = pty, cols = cols, rows = rows }
     agent.next_id = agent.next_id + 1
     local sb: stringbuilder
     for i = 0, < #argv do
@@ -507,7 +357,7 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     if len < 4 then return end
     local s = find_session(proto.get_u32(payload))
     if s == nilptr then return end
-    if not s.exited then kill(s.pid, SIGHUP) end
+    if not s.exited then s.pty:hangup() end
   elseif typ == PROTO_ATTACH then
     if len < 4 then return end
     local id = proto.get_u32(payload)
@@ -550,6 +400,9 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     text:destroy()
   elseif typ == PROTO_CLIP_SET then
     if len <= CLIP_MAX and clipboard_set(payload, len) then
+      ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
+      capture_wayland_clipboard_changed() -- apps in the compositor paste the game's copy
+      ## end
       send_text(c, PROTO_OK, 'clipboard set')
     else
       send_text(c, PROTO_ERR, 'clipboard unavailable')
@@ -560,6 +413,12 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     text:destroy()
   elseif typ == PROTO_HELLO then
     send_text(c, PROTO_OK, 'already authenticated')
+  elseif jobs:handle(ci, &c.outq, typ, payload, len) then
+    -- a raw job frame (agent/jobs.nelua)
+  elseif windows:handle(ci, &c.outq, typ, payload, len) then
+    -- a window frame (agent/windows.nelua)
+  elseif clips:handle(ci, &c.outq, typ, payload, len) then
+    -- a clip frame (agent/clips.nelua)
   else
     send_text(c, PROTO_ERR, 'unknown frame')
   end
@@ -610,28 +469,19 @@ local function pump_session(si: usize): void
   local buf: [32768]uint8
   if not session_blocked(s) then
     for _ = 1, 16 do
-      local n = read(s.fd, &buf, 32768)
-      if n > 0 then
-        session_append_replay(s, &buf, (@usize)(n))
-        broadcast(s, PROTO_SDATA, &buf, (@usize)(n))
-      elseif n == 0 then
-        break
-      else
-        if errno == EAGAIN or errno == EINTR then break end
-        -- EIO: slave closed
-        break
-      end
+      local n = s.pty:read(&buf, 32768)
+      if n <= 0 then break end -- nothing now, or the PTY closed (the exit shows below)
+      session_append_replay(s, &buf, (@usize)(n))
+      broadcast(s, PROTO_SDATA, &buf, (@usize)(n))
     end
   end
-  local status: cint = 0
-  local r = waitpid(s.pid, &status, WNOHANG)
-  if r == s.pid then
+  local done, status = s.pty:poll_exit()
+  if done then
     s.exited = true
-    if WIFEXITED(status) then s.exit_status = WEXITSTATUS(status)
-    elseif WIFSIGNALED(status) then s.exit_status = 128 + WTERMSIG(status) end
+    s.exit_status = status
     -- drain any final output
     while true do
-      local n = read(s.fd, &buf, 32768)
+      local n = s.pty:read(&buf, 32768)
       if n <= 0 then break end
       session_append_replay(s, &buf, (@usize)(n))
       broadcast(s, PROTO_SDATA, &buf, (@usize)(n))
@@ -639,16 +489,20 @@ local function pump_session(si: usize): void
     local st: [4]uint8
     proto.put_u32(&st, (@uint32)(s.exit_status))
     broadcast(s, PROTO_EXIT, &st, 4)
-    close(s.fd)
+    s.pty:close()
     log('session ' .. tostring(s.id) .. ' exited with ' .. tostring(s.exit_status))
   end
 end
 
 local function reap(): void
+  agent_sys_reap()
   -- drop dead clients (from the back so indexes stay valid) and detach them
   local i: integer = #agent.clients - 1
   while i >= 0 do
     if not agent.clients[i].alive then
+      windows:client_gone((@usize)(i))
+      jobs:client_gone((@usize)(i))
+      clips:client_gone((@usize)(i))
       for si = 0, < #agent.sessions do
         session_detach(&agent.sessions[si], (@usize)(i))
         -- shift indexes above i
@@ -661,6 +515,9 @@ local function reap(): void
           if s.detached[k].client > (@usize)(i) then s.detached[k].client = s.detached[k].client - 1 end
         end
       end
+      ## if ccinfo.is_windows then
+        winloop_forget_socket(agent.clients[i].ev)
+      ## end
       net.close(agent.clients[i].sock)
       agent.clients[i].inq:destroy()
       agent.clients[i].outq:destroy()
@@ -688,28 +545,14 @@ local function read_token_file(path: string): string
   if f:isopen() then
     local content = f:read('a')
     f:close()
-    -- trim whitespace
-    local e = #content
-    while e > 0 and (content:byte(e) == 10 or content:byte(e) == 13 or content:byte(e) == 32) do e = e - 1 end
-    return content:sub(1, e)
+    return agent_trim(content)
   end
   -- generate
-  local sb: stringbuilder
-  local rf = io.open('/dev/urandom', 'rb')
-  local raw: string
-  if rf:isopen() then raw = rf:read(24) rf:close() end
-  local hex = '0123456789abcdef'
-  for i = 1, #raw do
-    local b = raw:byte(i)
-    sb:write(hex:sub((b >> 4) + 1, (b >> 4) + 1), hex:sub((b & 15) + 1, (b & 15) + 1))
-  end
-  local tok = sb:promote()
-  local old = umask(0x3f)
-  local wf = io.open(path, 'wb')
-  umask(old)
-  if wf:isopen() then
-    wf:write(tok, '\n')
-    wf:close()
+  local raw = agent_random(24)
+  if #raw < 24 then log('WARNING: no random source for a new token') end
+  local tok = agent_hex(raw)
+  raw:destroy()
+  if agent_write_private(path, tok .. '\n') then
     log('wrote new token to ' .. path)
   else
     log('WARNING: could not write token file ' .. path)
@@ -717,29 +560,157 @@ local function read_token_file(path: string): string
   return tok
 end
 
-local function parse_hostport(s: string): (string, uint16)
-  local colon = s:find(':', 1, true)
-  if colon == 0 then return s:copy(), 7777 end
-  return s:sub(1, colon - 1), (@uint16)(tointeger(s:sub(colon + 1)))
+-- Where agent/windows.nelua queues frames for connection `ci`.
+local function client_queue(ci: usize): *ByteQueue
+  if ci < #agent.clients and agent.clients[ci].alive then return &agent.clients[ci].outq end
+  return nilptr
+end
+
+-- The main loop's sleep, capped by what the window streams and the jobs need (ms).
+local function windows_cap(ms: integer): integer
+  local w = windows:wait_ms(os.now())
+  if w >= 0 and w < ms then ms = w end
+  local j = jobs:wait_ms()
+  if j >= 0 and j < ms then ms = j end
+  return ms
+end
+
+
+-- `ghostty-agent --open-url URL`: ask the running agent (--listen, else
+-- $GHOSTTY_AGENT_LISTEN, else 127.0.0.1:7777; its token file likewise with
+-- $GHOSTTY_AGENT_TOKEN_FILE) to open URL in its compositor's browser
+-- (WOPEN "url:URL"), and wait for the answer. 0 when the browser has it, else
+-- 1 and one line on stderr saying why. $BROWSER of the compositor's apps
+-- (docs/REMOTE_WINDOWS.md "Opening URLs").
+local function open_url_fail(why: string): integer
+  io.stderr:write('ghostty-agent --open-url: ', why, '\n')
+  return 1
+end
+
+local function open_url_client(listen_spec: string, token_path: string, url: string): integer
+  ## if ccinfo.is_windows then
+  return open_url_fail('links open in the Linux compositor only')
+  ## else
+  if #listen_spec == 0 then listen_spec = os.getenv('GHOSTTY_AGENT_LISTEN') end
+  if #listen_spec == 0 then listen_spec = '127.0.0.1:7777' end
+  if #token_path == 0 then token_path = os.getenv('GHOSTTY_AGENT_TOKEN_FILE') end
+  if #token_path == 0 then token_path = agent_default_token_path() end
+  local token: string
+  do
+    local f = io.open(token_path, 'rb')
+    if not f:isopen() then return open_url_fail('no token file ' .. token_path .. ' (is the agent running?)') end
+    token = agent_trim(f:read('a'))
+    f:close()
+  end
+  local host, port = agent_parse_hostport(listen_spec)
+  local conn = net.connect(host, port)
+  if not net.is_valid(conn.sock) then return open_url_fail('cannot connect to ' .. listen_spec) end
+  local fds: [1]pollfd
+  local deadline = os.now() + 5.0
+  while true do
+    local st = net.connect_poll(&conn)
+    if st == 1 then break end
+    if st < 0 or os.now() > deadline then net.close(conn.sock) return open_url_fail('no agent at ' .. listen_spec) end
+    fds[0] = { fd = net.socket_fd(conn.sock), events = POLLOUT }
+    poll(&fds, 1, 100)
+  end
+  local outq: ByteQueue
+  local inq: ByteQueue
+  proto.write_frame(&outq, PROTO_HELLO, (@*[0]uint8)(token.data), token.size)
+  local req: uint32 = 1
+  do
+    local match = 'url:' .. url
+    local body: vector(uint8)
+    body:resize(13 + match.size)
+    local b = (@*[0]uint8)(&body[0])
+    proto.put_u32(b, req)
+    proto.put_u32((@*[0]uint8)(&b[4]), 0)
+    proto.put_u16((@*[0]uint8)(&b[8]), 64) -- a small picture: nobody looks at it
+    proto.put_u16((@*[0]uint8)(&b[10]), 64)
+    body[12] = 1
+    for i = 0, < match.size do body[13 + i] = (@uint8)(match.data[i]) end
+    proto.write_frame(&outq, PROTO_WOPEN, b, #body)
+    body:destroy()
+    match:destroy()
+  end
+  -- a browser that has to start first may take a while to show its window
+  deadline = os.now() + 45.0
+  local buf: [16384]uint8
+  local result: integer = -1
+  while result < 0 do
+    while outq:len() > 0 do
+      local n = net.send(conn.sock, outq:peek(), outq:len())
+      if n < 0 then net.close(conn.sock) return open_url_fail('the agent closed the connection') end
+      if n == 0 then break end
+      outq:consume((@usize)(n))
+    end
+    local n = net.recv(conn.sock, &buf, 16384)
+    if n < 0 then net.close(conn.sock) return open_url_fail('the agent closed the connection') end
+    if n > 0 then inq:push(&buf, (@usize)(n)) end
+    while result < 0 do
+      local ok, typ, payload, len = proto.read_frame(&inq)
+      if not ok then break end
+      if typ == PROTO_ERR then
+        local view = string{data=(@*[0]byte)(payload), size=len}
+        net.close(conn.sock)
+        return open_url_fail(view)
+      elseif typ == PROTO_WOPENED and len >= 12 and proto.get_u32(payload) == req then
+        local sid = proto.get_u32((@*[0]uint8)(&payload[4]))
+        if sid == 0 then
+          local view = string{data=(@*[0]byte)(&payload[12]), size=len - 12}
+          net.close(conn.sock)
+          return open_url_fail(view)
+        end
+        result = 0
+      end
+      proto.frame_consume(&inq, len)
+    end
+    if result >= 0 then break end
+    if os.now() > deadline then net.close(conn.sock) return open_url_fail('the browser showed no window in time') end
+    local ev: cshort = POLLIN
+    if outq:len() > 0 then ev = ev | POLLOUT end
+    fds[0] = { fd = net.socket_fd(conn.sock), events = ev }
+    poll(&fds, 1, 200)
+  end
+  net.close(conn.sock) -- the window stays in the compositor; the game shows it (raise:)
+  return 0
+  ## end
 end
 
 local function main(): integer
-  signal(SIGPIPE, SIG_IGN)
+  agent_sys_init()
   local listen_spec: string = '127.0.0.1:7777'
   local token_path: string = ''
+  local windows_name: string = 'auto'
+  local wayland_socket: string = '' -- empty: GHOSTTY_WAYLAND_SOCKET, else ffxiv-0, ffxiv-1, ...
+  local xkb_layout: string = ''     -- empty: GHOSTTY_XKB_LAYOUT, else us
+  local render_node: string = ''    -- empty: GHOSTTY_WAYLAND_RENDER_NODE, else auto
+  local browser: string = ''        -- empty: GHOSTTY_WAYLAND_BROWSER, else the desktop's default browser
+  local browser_profile: string = '' -- empty: GHOSTTY_WAYLAND_BROWSER_PROFILE, else the browser's own profile
+  local open_url: string = ''       -- --open-url: a client of the running agent, not an agent
+  local has_open_url = false
+  local listen_given = false
   agent.replay_bytes = 256 * 1024
   agent.term = 'xterm-256color'
   agent.next_id = 1
   local i = 1
   while i <= #arg do
     local a = arg[i]
-    if a == '--listen' and i < #arg then listen_spec = arg[i+1] i = i + 1
+    if a == '--listen' and i < #arg then listen_spec = arg[i+1] listen_given = true i = i + 1
+    elseif a == '--open-url' and i < #arg then open_url = arg[i+1] has_open_url = true i = i + 1
+    elseif a == '--wayland-browser' and i < #arg then browser = arg[i+1] i = i + 1
+    elseif a == '--wayland-browser-profile' and i < #arg then browser_profile = arg[i+1] i = i + 1
     elseif a == '--token-file' and i < #arg then token_path = arg[i+1] i = i + 1
     elseif a == '--clipboard-file' and i < #arg then agent.clip_file = arg[i+1] i = i + 1
     elseif a == '--replay-bytes' and i < #arg then agent.replay_bytes = (@usize)(tointeger(arg[i+1])) i = i + 1
     elseif a == '--term' and i < #arg then agent.term = arg[i+1] i = i + 1
+    elseif a == '--windows' and i < #arg then windows_name = arg[i+1] i = i + 1
+    elseif a == '--wayland-socket' and i < #arg then wayland_socket = arg[i+1] i = i + 1 -- Linux compositor only
+    elseif a == '--xkb-layout' and i < #arg then xkb_layout = arg[i+1] i = i + 1
+    elseif a == '--wayland-render-node' and i < #arg then render_node = arg[i+1] i = i + 1 -- PATH, auto or none
     elseif a == '--help' or a == '-h' then
-      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME]\n')
+      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME] [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|none] [--wayland-browser CMD] [--wayland-browser-profile NAME]\n',
+               '       ghostty-agent [--listen HOST:PORT] [--token-file PATH] --open-url URL\n')
       return 0
     else
       io.stderr:write('unknown argument: ', a, '\n')
@@ -747,32 +718,97 @@ local function main(): integer
     end
     i = i + 1
   end
-  if #token_path == 0 then
-    local home = os.getenv('HOME')
-    local dir = home .. '/.config/ghostty-agent'
-    os.execute('mkdir -p "' .. dir .. '"')
-    token_path = dir .. '/token'
-  end
+  if has_open_url then return open_url_client(listen_given and listen_spec or '', token_path, open_url) end
+  if #token_path == 0 then token_path = agent_default_token_path() end
   agent.token = read_token_file(token_path)
-  local host, port = parse_hostport(listen_spec)
+  local host, port = agent_parse_hostport(listen_spec)
   agent.listen_sock = net.listen(host, port)
   if not net.is_valid(agent.listen_sock) then
     log('cannot listen on ' .. listen_spec)
     return 1
   end
-  log('listening on ' .. listen_spec .. ' (pid ' .. tostring(getpid()) .. ')')
+  local pid = agent_pid()
+  log('listening on ' .. listen_spec .. ' (pid ' .. tostring(pid) .. ')')
   -- a different nonce per agent process: a reconnecting client learns whether
   -- its session ids still mean the same shells
-  local nonce: int64 = ((@int64)(os.time()) & 0xffffffff) << 20 | ((@int64)(getpid()) & 0xfffff)
+  local nonce: int64 = ((@int64)(os.time()) & 0xffffffff) << 20 | (pid & 0xfffff)
   if nonce == 0 then nonce = 1 end
   do
     local sb: stringbuilder
     sb:writef('ghostty-agent %d %d', PROTO_VERSION, nonce)
     agent.hello = sb:promote()
   end
+  ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
+  capture_wayland_configure(wayland_socket, xkb_layout)
+  capture_wayland_set_render_node(render_node)
+  capture_wayland_set_browser(browser, browser_profile)
+  capture_wayland_set_agent(listen_spec, token_path)
+  capture_wayland_set_clipboard(clipboard_get, clipboard_set) -- the compositor's apps share the host clipboard
+  ## end
+  do
+    local ok, why = windows:init(windows_name, client_queue)
+    if ok then log('windows: ' .. windows.backend.name) else log('windows unavailable: ' .. why) end
+  end
+  jobs:init(client_queue, log) -- raw jobs (docs/JOBS.md); they run as this user
+  clips.queue_of, clips.log_fn, clips.next_cid = client_queue, log, 1 -- clips of the game (docs/CAPTURE.md)
 
-  local fds: [512]pollfd
+  ## if ccinfo.is_windows then
+  local listen_ev = winloop_watch(agent.listen_sock, true)
+  if listen_ev == nilptr then
+    log('cannot watch the listening socket')
+    return 1
+  end
+  local handles: [WINLOOP_MAX_HANDLES]pointer
+  local overflow_logged = false
   while true do
+    local n: usize = 0
+    local wanted: usize = 1
+    handles[0] = listen_ev
+    n = 1
+    for ci = 0, < #agent.clients do
+      wanted = wanted + 1
+      if n < WINLOOP_MAX_HANDLES and agent.clients[ci].ev ~= nilptr then handles[n] = agent.clients[ci].ev n = n + 1 end
+    end
+    local exiting = false
+    for si = 0, < #agent.sessions do
+      local s = &agent.sessions[si]
+      if not s.exited then
+        wanted = wanted + s.pty:wait_handles(&handles, &n, WINLOOP_MAX_HANDLES, not session_blocked(s))
+        if s.pty:exiting() then exiting = true end
+      end
+    end
+    if wanted > WINLOOP_MAX_HANDLES and not overflow_logged then
+      overflow_logged = true
+      log('more handles than one wait takes; polling every 50 ms while that lasts')
+    end
+    winloop_wait(&handles, n, (@uint32)(windows_cap((@integer)(agent_wait_ms(wanted, WINLOOP_MAX_HANDLES, exiting)))))
+    -- everything is pumped below: events from now on signal again
+    winloop_reset(listen_ev)
+    for ci = 0, < #agent.clients do winloop_reset(agent.clients[ci].ev) end
+
+    local c = net.accept(agent.listen_sock)
+    while net.is_valid(c) do
+      local cl: Client = { sock = c, alive = true, ev = winloop_watch(c, false) }
+      if cl.ev == nilptr then
+        log('cannot watch a new connection; closing it')
+        net.close(c)
+      else
+        agent.clients:push(cl)
+      end
+      c = net.accept(agent.listen_sock)
+    end
+    for ci = 0, < #agent.clients do pump_client(ci) end
+    for si = 0, < #agent.sessions do pump_session(si) end
+    windows:pump()
+    windows:tick(os.now())
+    jobs:pump(os.now())
+    clips:tick(os.now())
+    for ci = 0, < #agent.clients do flush_client(ci) end
+    reap()
+  end
+  ## else
+  local fds: [512]pollfd
+  while not agent_stop_requested() do
     local n: usize = 0
     fds[n] = { fd = net.socket_fd(agent.listen_sock), events = POLLIN }
     n = n + 1
@@ -786,9 +822,23 @@ local function main(): integer
       local ev: cshort = 0
       if not s.exited and not session_blocked(s) then ev = POLLIN end
       if not s.exited and s.inbuf:len() > 0 then ev = ev | POLLOUT end
-      if n < 512 and ev ~= 0 then fds[n] = { fd = s.fd, events = ev } n = n + 1 end
+      if n < 512 and ev ~= 0 then fds[n] = { fd = s.pty.fd, events = ev } n = n + 1 end
     end
-    poll(&fds, n, 250)
+    do -- the capture backend's descriptors (D-Bus, PipeWire, a compositor)
+      local wfds: [16]cint
+      local wn = windows:poll_fds(&wfds, 16)
+      for k = 0, < wn do
+        if n < 512 then fds[n] = { fd = wfds[k], events = POLLIN } n = n + 1 end
+      end
+    end
+    do -- the jobs' stdout and stderr pipes (agent/jobs.nelua)
+      local jfds: [128]cint
+      local jn = jobs:poll_fds(&jfds, 128)
+      for k = 0, < jn do
+        if n < 512 then fds[n] = { fd = jfds[k], events = POLLIN } n = n + 1 end
+      end
+    end
+    poll(&fds, n, windows_cap(250))
 
     local c = net.accept(agent.listen_sock)
     while net.is_valid(c) do
@@ -798,9 +848,19 @@ local function main(): integer
     end
     for ci = 0, < #agent.clients do pump_client(ci) end
     for si = 0, < #agent.sessions do pump_session(si) end
+    windows:pump()
+    windows:tick(os.now())
+    jobs:pump(os.now())
+    clips:tick(os.now())
     for ci = 0, < #agent.clients do flush_client(ci) end
     reap()
   end
+  log('stopping')
+  jobs:shutdown() -- jobs are not orphaned behind the agent, kept or not
+  ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
+  capture_wayland_shutdown() -- apps launched into the compositor are ended, not orphaned
+  ## end
+  ## end
   return 0
 end
 

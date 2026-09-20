@@ -1,0 +1,210 @@
+-- Running one encoder process for a clip (docs/CAPTURE.md): ffmpeg, with its
+-- stderr in a file and nothing on its stdin or stdout.
+--
+-- Why not agent/jobs.nelua's runner: a job is a conversation on three pipes
+-- that someone has to keep draining, and it is not implemented on Windows at
+-- all. A clip's encoder needs neither - the frames are already in a file when
+-- it starts - so this is a plain spawn whose only channel is an exit status,
+-- which both platforms can do.
+require 'string'
+require 'vector'
+
+global ClipProc = @record{
+  pid: int64,        -- POSIX: the child; Windows: unused
+  handle: pointer,   -- Windows: the process handle
+  live: boolean,
+  status: int32,
+  exited: boolean,
+}
+
+global CLIP_ARGV_MAX: usize <comptime> = 64
+
+## if not ccinfo.is_windows then
+## cinclude '<sys/types.h>'
+## cinclude '<sys/wait.h>'
+## cinclude '<signal.h>'
+## cinclude '<unistd.h>'
+## cinclude '<fcntl.h>'
+
+local function fork(): cint <cimport, nodecl> end
+local function dup2(oldfd: cint, newfd: cint): cint <cimport, nodecl> end
+local function execvp(file: cstring, argv: *[0]cstring): cint <cimport, nodecl> end
+local function open(path: cstring, flags: cint, ...: cvarargs): cint <cimport, nodecl> end
+local function close(fd: cint): cint <cimport, nodecl> end
+local function setsid(): cint <cimport, nodecl> end
+local function _exit(status: cint): void <cimport, nodecl> end
+local function waitpid(pid: cint, status: *cint, options: cint): cint <cimport, nodecl> end
+local function kill(pid: cint, sig: cint): cint <cimport, nodecl> end
+local WNOHANG: cint <cimport, nodecl, const>
+local SIGKILL: cint <cimport, nodecl, const>
+local O_WRONLY: cint <cimport, nodecl, const>
+local O_CREAT: cint <cimport, nodecl, const>
+local O_TRUNC: cint <cimport, nodecl, const>
+local O_RDONLY: cint <cimport, nodecl, const>
+local function WIFEXITED(s: cint): boolean <cimport, nodecl> end
+local function WEXITSTATUS(s: cint): cint <cimport, nodecl> end
+local function WIFSIGNALED(s: cint): boolean <cimport, nodecl> end
+local function WTERMSIG(s: cint): cint <cimport, nodecl> end
+
+function ClipProc.start(argv: *vector(string), err_path: string): (boolean, ClipProc, string)
+  local none: ClipProc = { pid = -1 }
+  if #argv == 0 then return false, none, 'no command' end
+  local pid = fork()
+  if pid < 0 then return false, none, 'fork failed' end
+  if pid == 0 then
+    setsid()
+    local devnull = open('/dev/null', O_RDONLY)
+    if devnull >= 0 then dup2(devnull, 0) end
+    local errfd = open((@cstring)(err_path.data), O_WRONLY | O_CREAT | O_TRUNC, (@cint)(0x1a4)) -- 0644
+    if errfd >= 0 then
+      dup2(errfd, 1)
+      dup2(errfd, 2)
+      close(errfd)
+    end
+    if devnull >= 0 then close(devnull) end
+    local cargv: [CLIP_ARGV_MAX]cstring
+    local n = (@usize)(#argv)
+    if n > CLIP_ARGV_MAX - 1 then n = CLIP_ARGV_MAX - 1 end
+    for i: usize = 0, < n do cargv[i] = (@cstring)(argv[i].data) end
+    cargv[n] = nilptr
+    execvp(cargv[0], &cargv)
+    _exit(127)
+  end
+  return true, (@ClipProc){ pid = (@int64)(pid), live = true }, (@string){}
+end
+
+function ClipProc:poll(): (boolean, int32)
+  if self.exited then return true, self.status end
+  if not self.live then return true, -1 end
+  local st: cint = 0
+  local r = waitpid((@cint)(self.pid), &st, WNOHANG)
+  if r == 0 then return false, 0 end
+  if r < 0 then
+    self.live, self.exited, self.status = false, true, -1
+    return true, -1
+  end
+  local code: int32 = -1
+  if WIFEXITED(st) then code = (@int32)(WEXITSTATUS(st))
+  elseif WIFSIGNALED(st) then code = (@int32)(128 + WTERMSIG(st)) end
+  self.live, self.exited, self.status = false, true, code
+  return true, code
+end
+
+function ClipProc:kill(): void
+  if self.live then kill((@cint)(self.pid), SIGKILL) end
+end
+
+## else
+-- Windows: CreateProcessA with the encoder's output redirected into the error
+-- file (inherited), no console window and nothing on its stdin. Written for
+-- the Windows agent and never run on the host tests, which are POSIX.
+## cinclude '<windows.h>'
+
+local ClipStartupInfo = @record{
+  cb: uint32,
+  lpReserved: pointer, lpDesktop: pointer, lpTitle: pointer,
+  dwX: uint32, dwY: uint32, dwXSize: uint32, dwYSize: uint32,
+  dwXCountChars: uint32, dwYCountChars: uint32, dwFillAttribute: uint32, dwFlags: uint32,
+  wShowWindow: uint16, cbReserved2: uint16,
+  lpReserved2: pointer,
+  hStdInput: pointer, hStdOutput: pointer, hStdError: pointer,
+}
+local ClipProcessInfo = @record{ hProcess: pointer, hThread: pointer, dwProcessId: uint32, dwThreadId: uint32 }
+local ClipSecurityAttributes = @record{ nLength: uint32, lpSecurityDescriptor: pointer, bInheritHandle: cint }
+
+local function CreateProcessA(app: cstring, cmd: cstring, pa: pointer, ta: pointer, inherit: cint, flags: uint32,
+                             env: pointer, cwd: cstring, si: pointer, pi: *ClipProcessInfo): cint <cimport, nodecl> end
+local function CreateFileA(name: cstring, access: uint32, share: uint32, sa: *ClipSecurityAttributes,
+                          disp: uint32, flags: uint32, tmpl: pointer): pointer <cimport, nodecl> end
+local function CloseHandle(h: pointer): cint <cimport, nodecl> end
+local function WaitForSingleObject(h: pointer, ms: uint32): uint32 <cimport, nodecl> end
+local function GetExitCodeProcess(h: pointer, code: *uint32): cint <cimport, nodecl> end
+local function TerminateProcess(h: pointer, code: uint32): cint <cimport, nodecl> end
+
+local INVALID_HANDLE: pointer <comptime> = (@pointer)((@usize)(0xffffffffffffffff))
+local GENERIC_WRITE: uint32 <comptime> = 0x40000000
+local FILE_SHARE_READ: uint32 <comptime> = 1
+local CREATE_ALWAYS: uint32 <comptime> = 2
+local FILE_ATTRIBUTE_NORMAL: uint32 <comptime> = 0x80
+local CREATE_NO_WINDOW: uint32 <comptime> = 0x08000000
+local STARTF_USESTDHANDLES: uint32 <comptime> = 0x00000100
+local WAIT_TIMEOUT: uint32 <comptime> = 258
+local STILL_ACTIVE: uint32 <comptime> = 259
+
+-- argv as one command line: every word quoted, inner quotes and backslashes
+-- escaped the way the C runtime parses them back.
+local function command_line(argv: *vector(string)): string
+  local sb: stringbuilder
+  for i = 0, < #argv do
+    if i > 0 then sb:write(' ') end
+    sb:write('"')
+    local a = argv[i]
+    local slashes = 0
+    for k = 0, < #a do
+      local c = a.data[k]
+      if c == '\\'_b then
+        slashes = slashes + 1
+        sb:writebyte(c)
+      elseif c == '"'_b then
+        for _ = 1, slashes + 1 do sb:write('\\') end
+        slashes = 0
+        sb:write('"')
+      else
+        slashes = 0
+        sb:writebyte(c)
+      end
+    end
+    for _ = 1, slashes do sb:write('\\') end
+    sb:write('"')
+  end
+  sb:write('\0')
+  return sb:promote()
+end
+
+function ClipProc.start(argv: *vector(string), err_path: string): (boolean, ClipProc, string)
+  local none: ClipProc = { pid = -1 }
+  if #argv == 0 then return false, none, 'no command' end
+  local zerr = err_path .. '\0'
+  defer zerr:destroy() end
+  local sa: ClipSecurityAttributes = { nLength = #ClipSecurityAttributes, bInheritHandle = 1 }
+  local errh = CreateFileA((@cstring)(zerr.data), GENERIC_WRITE, FILE_SHARE_READ, &sa, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nilptr)
+  local si: ClipStartupInfo = { cb = #ClipStartupInfo }
+  if errh ~= INVALID_HANDLE and errh ~= nilptr then
+    si.dwFlags = STARTF_USESTDHANDLES
+    si.hStdError = errh
+    si.hStdOutput = errh
+    si.hStdInput = nilptr
+  end
+  local cmd = command_line(argv)
+  defer cmd:destroy() end
+  local pi: ClipProcessInfo
+  local ok = CreateProcessA(nilptr, (@cstring)(cmd.data), nilptr, nilptr, 1, CREATE_NO_WINDOW, nilptr, nilptr, &si, &pi)
+  if errh ~= INVALID_HANDLE and errh ~= nilptr then CloseHandle(errh) end
+  if ok == 0 then return false, none, 'the encoder could not be started (is ffmpeg on PATH?)' end
+  CloseHandle(pi.hThread)
+  return true, (@ClipProc){ pid = (@int64)(pi.dwProcessId), handle = pi.hProcess, live = true }, (@string){}
+end
+
+function ClipProc:poll(): (boolean, int32)
+  if self.exited then return true, self.status end
+  if not self.live or self.handle == nilptr then return true, -1 end
+  if WaitForSingleObject(self.handle, 0) == WAIT_TIMEOUT then return false, 0 end
+  local code: uint32 = 0
+  local got = GetExitCodeProcess(self.handle, &code) ~= 0
+  CloseHandle(self.handle)
+  self.handle = nilptr
+  self.live = false
+  self.exited = true
+  self.status = (got and code ~= STILL_ACTIVE) and (@int32)(code) or -1
+  return true, self.status
+end
+
+function ClipProc:kill(): void
+  if self.live and self.handle ~= nilptr then
+    TerminateProcess(self.handle, 1)
+    CloseHandle(self.handle)
+    self.handle = nilptr
+    self.live = false
+  end
+end
+## end

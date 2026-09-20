@@ -1,0 +1,520 @@
+-- Clips of the game, encoded on the host (docs/CAPTURE.md).
+--
+-- The plugin captures the game's own frames (it is the only side that can see
+-- them) and sends them here, reduced in size and rate, as QOI or raw BGRA.
+-- This module writes them to one raw file and, when the clip ends, runs ffmpeg
+-- over it: GIF through palettegen/paletteuse, MP4 through libx264. Nothing is
+-- encoded in the game process, which is the point - a 6 second clip would
+-- otherwise cost the player their frame rate.
+--
+-- No ffmpeg on the host means the clip is refused before a single frame is
+-- captured, with a line that says so; the plugin never starts recording into
+-- nothing. GIF and MP4 are for the owner's own media; the gallery on
+-- spacegho.st takes PNG and JPEG only, so nothing from here is ever uploaded.
+require 'string'
+require 'vector'
+require 'stringbuilder'
+require 'memory'
+require 'os'
+require 'C.stdio'
+require 'core.protocol'
+require 'core.wincodec'
+require 'core.sys.fsbase'
+require 'agent.clip_run'
+
+global CLIPS_KIND_GIF: uint8 <comptime> = 0
+global CLIPS_KIND_MP4: uint8 <comptime> = 1
+-- What the agent accepts, whatever the plugin asks for.
+global CLIPS_MAX_W: integer <comptime> = 1920
+global CLIPS_MAX_H: integer <comptime> = 1080
+global CLIPS_MAX_FPS: integer <comptime> = 30
+global CLIPS_MAX_FRAMES: integer <comptime> = 600
+global CLIPS_MAX_BYTES: usize <comptime> = 1024 * 1024 * 1024
+global CLIPS_MAX_OPEN: integer <comptime> = 2      -- clips recording at once
+global CLIPS_ERR_TAIL: usize <comptime> = 400      -- of ffmpeg's output, for the message
+
+global AgentClip = @record{
+  cid: uint32,
+  client: usize,
+  kind: uint8,
+  w: integer, h: integer, fps: integer,
+  raw_path: string,
+  out_path: string,
+  err_path: string,
+  file: *C.FILE,          -- the raw frames, nilptr once closed
+  frames: integer,
+  bytes: usize,
+  bad: integer,           -- frames dropped because they did not decode
+  encoding: boolean,
+  proc: ClipProc,
+  started: float64,
+  frame: vector(uint8),   -- one decoded frame, reused
+}
+
+global AgentClips = @record{
+  clips: vector(AgentClip),
+  next_cid: uint32,
+  queue_of: function(ci: usize): *ByteQueue,
+  log_fn: function(msg: string): void,
+  dir: string,            -- where raw frames and finished clips are written
+  ffmpeg: string,         -- the encoder found on the host ('' when there is none)
+  looked: boolean,
+}
+
+local function say(self: *AgentClips, msg: string): void
+  if self.log_fn ~= nilptr then self.log_fn(msg) end
+end
+
+local function sayf(self: *AgentClips, fmt: string, a: uint32, extra: string): void
+  local sb: stringbuilder
+  sb:writef(fmt, a, extra)
+  local msg = sb:promote()
+  say(self, msg)
+  msg:destroy()
+end
+
+-- Where ffmpeg is ---------------------------------------------------------------
+
+local function file_exists(path: string): boolean
+  local z = path .. '\0'
+  defer z:destroy() end
+  local f = C.fopen((@cstring)(z.data), 'rb')
+  if f == nilptr then return false end
+  C.fclose(f)
+  return true
+end
+
+local function env_or(name: string, fallback: string): string
+  local v = os.getenv(name)
+  if #v > 0 then return v end
+  v:destroy()
+  return string.copy(fallback)
+end
+
+-- GHOSTTY_FFMPEG, else the first ffmpeg on PATH. Empty when there is none.
+local function find_ffmpeg(): string
+  local set = os.getenv('GHOSTTY_FFMPEG')
+  if #set > 0 then
+    if file_exists(set) then return set end
+    set:destroy()
+    return (@string){}
+  end
+  set:destroy()
+  local path = os.getenv('PATH')
+  defer path:destroy() end
+  ## if ccinfo.is_windows then
+  local sep: byte <comptime> = ';'_b
+  local exe: string <comptime> = 'ffmpeg.exe'
+  local slash: string <comptime> = '\\'
+  ## else
+  local sep: byte <comptime> = ':'_b
+  local exe: string <comptime> = 'ffmpeg'
+  local slash: string <comptime> = '/'
+  ## end
+  local start: usize = 0
+  for i: usize = 0, #path do
+    if i == #path or path.data[i] == sep then
+      if i > start then
+        local dir = path:subview(start + 1, i)
+        local sb: stringbuilder
+        sb:write(dir)
+        if dir.data[dir.size - 1] ~= '/'_b and dir.data[dir.size - 1] ~= '\\'_b then sb:write(slash) end
+        sb:write(exe)
+        local cand = sb:promote()
+        if file_exists(cand) then return cand end
+        cand:destroy()
+      end
+      start = i + 1
+    end
+  end
+  return (@string){}
+end
+
+-- GHOSTTY_CLIP_DIR, else a ghostty-clips folder in the system's temp folder.
+local function clips_dir(): string
+  local set = os.getenv('GHOSTTY_CLIP_DIR')
+  if #set > 0 then
+    local z = set .. '\0'
+    fs_mkdir((@cstring)(z.data))
+    z:destroy()
+    return set
+  end
+  set:destroy()
+  ## if ccinfo.is_windows then
+  local tmp = env_or('TEMP', 'C:\\Windows\\Temp')
+  local sep: string <comptime> = '\\'
+  ## else
+  local tmp = env_or('TMPDIR', '/tmp')
+  local sep: string <comptime> = '/'
+  ## end
+  defer tmp:destroy() end
+  local sb: stringbuilder
+  sb:write(tmp)
+  if #tmp > 0 and tmp.data[tmp.size - 1] ~= '/'_b and tmp.data[tmp.size - 1] ~= '\\'_b then sb:write(sep) end
+  sb:write('ghostty-clips')
+  local dir = sb:promote()
+  local z = dir .. '\0'
+  fs_mkdir((@cstring)(z.data))
+  z:destroy()
+  return dir
+end
+
+local function path_in(dir: string, name: string): string
+  local sb: stringbuilder
+  sb:write(dir)
+  if #dir > 0 and dir.data[dir.size - 1] ~= '/'_b and dir.data[dir.size - 1] ~= '\\'_b then
+    ## if ccinfo.is_windows then
+    sb:write('\\')
+    ## else
+    sb:write('/')
+    ## end
+  end
+  sb:write(name)
+  return sb:promote()
+end
+
+-- Frames ------------------------------------------------------------------------
+
+local function find_clip(self: *AgentClips, cid: uint32): *AgentClip
+  for i = 0, < #self.clips do
+    if self.clips[i].cid == cid then return &self.clips[i] end
+  end
+  return nilptr
+end
+
+local function clip_destroy(c: *AgentClip): void
+  if c.file ~= nilptr then C.fclose(c.file) c.file = nilptr end
+  c.raw_path:destroy()
+  c.out_path:destroy()
+  c.err_path:destroy()
+  c.frame:destroy()
+end
+
+local function drop(self: *AgentClips, i: usize): void
+  clip_destroy(&self.clips[i])
+  self.clips:remove(i)
+end
+
+local function send_copened(q: *ByteQueue, req: uint32, cid: uint32, text: string): void
+  local hd: [8]uint8
+  proto.put_u32(&hd, req)
+  proto.put_u32((@*[0]uint8)(&hd[4]), cid)
+  local fh: [5]uint8
+  fh[0] = PROTO_COPENED
+  proto.put_u32((@*[0]uint8)(&fh[1]), (@uint32)(8 + text.size))
+  q:push(&fh, 5)
+  q:push(&hd, 8)
+  if text.size > 0 then q:push((@*[0]uint8)(text.data), text.size) end
+end
+
+local function send_cdone(q: *ByteQueue, cid: uint32, status: int32, text: string): void
+  local hd: [8]uint8
+  proto.put_u32(&hd, cid)
+  proto.put_u32((@*[0]uint8)(&hd[4]), (@uint32)(status))
+  local fh: [5]uint8
+  fh[0] = PROTO_CDONE
+  proto.put_u32((@*[0]uint8)(&fh[1]), (@uint32)(8 + text.size))
+  q:push(&fh, 5)
+  q:push(&hd, 8)
+  if text.size > 0 then q:push((@*[0]uint8)(text.data), text.size) end
+end
+
+-- The argv ffmpeg is run with. Frames are raw BGRA at a fixed rate, so the
+-- input needs no probing; GIF builds its own palette, MP4 goes through x264 at
+-- even dimensions (yuv420p cannot do odd ones).
+local function ffmpeg_argv(self: *AgentClips, c: *AgentClip, argv: *vector(string)): void
+  local size: stringbuilder
+  size:writef('%dx%d', c.w, c.h)
+  local fps: stringbuilder
+  fps:writef('%d', c.fps)
+  argv:push(self.ffmpeg:copy())
+  argv:push(string.copy('-y'))
+  argv:push(string.copy('-loglevel'))
+  argv:push(string.copy('error'))
+  argv:push(string.copy('-nostdin'))
+  argv:push(string.copy('-f'))
+  argv:push(string.copy('rawvideo'))
+  argv:push(string.copy('-pixel_format'))
+  argv:push(string.copy('bgra'))
+  argv:push(string.copy('-video_size'))
+  argv:push(size:promote())
+  argv:push(string.copy('-framerate'))
+  argv:push(fps:promote())
+  argv:push(string.copy('-i'))
+  argv:push(c.raw_path:copy())
+  if c.kind == CLIPS_KIND_MP4 then
+    argv:push(string.copy('-vf'))
+    argv:push(string.copy('scale=trunc(iw/2)*2:trunc(ih/2)*2'))
+    argv:push(string.copy('-c:v'))
+    argv:push(string.copy('libx264'))
+    argv:push(string.copy('-preset'))
+    argv:push(string.copy('veryfast'))
+    argv:push(string.copy('-pix_fmt'))
+    argv:push(string.copy('yuv420p'))
+    argv:push(string.copy('-movflags'))
+    argv:push(string.copy('+faststart'))
+  else
+    argv:push(string.copy('-filter_complex'))
+    argv:push(string.copy('[0:v] split [a][b];[a] palettegen=stats_mode=diff [p];[b][p] paletteuse=dither=bayer:bayer_scale=3'))
+  end
+  argv:push(c.out_path:copy())
+end
+
+local function argv_destroy(argv: *vector(string)): void
+  for i = 0, < #argv do argv[i]:destroy() end
+  argv:destroy()
+end
+
+-- The tail of what the encoder printed, for the message that goes back.
+local function err_tail(path: string): string
+  local z = path .. '\0'
+  defer z:destroy() end
+  local f = C.fopen((@cstring)(z.data), 'rb')
+  if f == nilptr then return (@string){} end
+  defer C.fclose(f) end
+  C.fseek(f, 0, C.SEEK_END)
+  local n = (@usize)(C.ftell(f))
+  local at: usize = 0
+  if n > CLIPS_ERR_TAIL then at = n - CLIPS_ERR_TAIL end
+  C.fseek(f, (@clong)(at), C.SEEK_SET)
+  local buf: [CLIPS_ERR_TAIL + 1]uint8
+  local got = C.fread(&buf, 1, CLIPS_ERR_TAIL, f)
+  local out: stringbuilder
+  local any = false
+  for i: usize = 0, < got do
+    local ch = buf[i]
+    if ch == '\n'_b or ch == '\r'_b then
+      if any then out:write(' ') any = false end
+    elseif ch >= 32 then
+      out:writebyte(ch)
+      any = true
+    end
+  end
+  return out:promote()
+end
+
+local function handle_copen(self: *AgentClips, ci: usize, q: *ByteQueue, payload: *[0]uint8, len: usize): void
+  local req: uint32 = 0
+  if len >= 4 then req = proto.get_u32(payload) end
+  if len < 10 then
+    send_copened(q, req, 0, 'bad copen')
+    return
+  end
+  local kind = payload[4]
+  local w = (@integer)(proto.get_u16((@*[0]uint8)(&payload[5])))
+  local h = (@integer)(proto.get_u16((@*[0]uint8)(&payload[7])))
+  local fps = (@integer)(payload[9])
+  if w < 16 or h < 16 or w > CLIPS_MAX_W or h > CLIPS_MAX_H then
+    send_copened(q, req, 0, 'that frame size is not one the host records')
+    return
+  end
+  if fps < 1 or fps > CLIPS_MAX_FPS then
+    send_copened(q, req, 0, 'that frame rate is not one the host records')
+    return
+  end
+  if kind ~= CLIPS_KIND_GIF and kind ~= CLIPS_KIND_MP4 then
+    send_copened(q, req, 0, 'unknown clip kind')
+    return
+  end
+  local open = 0
+  for i = 0, < #self.clips do if not self.clips[i].encoding then open = open + 1 end end
+  if open >= CLIPS_MAX_OPEN then
+    send_copened(q, req, 0, 'the host is already recording as many clips as it will')
+    return
+  end
+  if not self.looked then
+    self.looked = true
+    self.ffmpeg = find_ffmpeg()
+    self.dir = clips_dir()
+    if #self.ffmpeg > 0 then
+      say(self, 'clips: ffmpeg is ' .. self.ffmpeg)
+    end
+  end
+  if #self.ffmpeg == 0 then
+    send_copened(q, req, 0, 'no ffmpeg on this host: install it (or point GHOSTTY_FFMPEG at it) and clips will work')
+    return
+  end
+  if #self.dir == 0 then
+    send_copened(q, req, 0, 'the host has nowhere to write clips (set GHOSTTY_CLIP_DIR)')
+    return
+  end
+  local cid = self.next_cid
+  self.next_cid = self.next_cid + 1
+  if self.next_cid == 0 then self.next_cid = 1 end
+  local stamp = os.date('%Y%m%d_%H%M%S')
+  defer stamp:destroy() end
+  local raw_name: stringbuilder
+  raw_name:writef('ghostty_%d.bgra', (@integer)(cid))
+  local out_name: stringbuilder
+  out_name:write('ghostty_', stamp, kind == CLIPS_KIND_MP4 and '.mp4' or '.gif')
+  local err_name: stringbuilder
+  err_name:writef('ghostty_%d.log', (@integer)(cid))
+  local c: AgentClip = {
+    cid = cid, client = ci, kind = kind, w = w, h = h, fps = fps,
+  }
+  local rn = raw_name:promote()
+  local on = out_name:promote()
+  local en = err_name:promote()
+  c.raw_path = path_in(self.dir, rn)
+  c.out_path = path_in(self.dir, on)
+  c.err_path = path_in(self.dir, en)
+  rn:destroy() on:destroy() en:destroy()
+  local z = c.raw_path .. '\0'
+  c.file = C.fopen((@cstring)(z.data), 'wb')
+  z:destroy()
+  if c.file == nilptr then
+    clip_destroy(&c)
+    send_copened(q, req, 0, 'the host could not open a file for the frames')
+    return
+  end
+  c.frame:resize((@usize)(w) * (@usize)(h) * 4)
+  self.clips:push(c)
+  send_copened(q, req, cid, (@string){})
+  sayf(self, 'clip %d: recording %s', cid, self.clips[#self.clips - 1].out_path)
+end
+
+local function handle_cframe(self: *AgentClips, ci: usize, payload: *[0]uint8, len: usize): void
+  if len < 9 then return end
+  local cid = proto.get_u32(payload)
+  local c = find_clip(self, cid)
+  if c == nilptr or c.client ~= ci or c.encoding or c.file == nilptr then return end
+  if c.frames >= CLIPS_MAX_FRAMES or c.bytes >= CLIPS_MAX_BYTES then return end
+  local enc = payload[8]
+  local data = (@*[0]uint8)(&payload[9])
+  local dlen = len - 9
+  local stride = (@usize)(c.w) * 4
+  local need = stride * (@usize)(c.h)
+  local dst = (@*[0]uint8)(&c.frame[0])
+  if enc == WINCODEC_ENC_RAW then
+    if dlen ~= need then c.bad = c.bad + 1 return end
+    memory.copy(dst, data, need)
+  elseif enc == WINCODEC_ENC_QOI then
+    if not wincodec_qoi_decode(data, dlen, dst, stride, 0, 0, c.w, c.h) then
+      c.bad = c.bad + 1
+      return
+    end
+  else
+    c.bad = c.bad + 1
+    return
+  end
+  local wrote = C.fwrite(dst, 1, need, c.file)
+  if wrote ~= need then
+    C.fclose(c.file)
+    c.file = nilptr
+    return
+  end
+  c.frames = c.frames + 1
+  c.bytes = c.bytes + need
+end
+
+local function handle_cend(self: *AgentClips, ci: usize, q: *ByteQueue, payload: *[0]uint8, len: usize): void
+  if len < 4 then return end
+  local cid = proto.get_u32(payload)
+  local cancel = len >= 5 and payload[4] ~= 0
+  for i = 0, < #self.clips do
+    local c = &self.clips[i]
+    if c.cid == cid and c.client == ci then
+      if c.encoding then return end
+      if c.file ~= nilptr then C.fclose(c.file) c.file = nilptr end
+      if cancel or c.frames == 0 then
+        os.remove(c.raw_path)
+        if not cancel then send_cdone(q, cid, -1, 'no frames arrived, so there was nothing to encode') end
+        drop(self, i)
+        return
+      end
+      local argv: vector(string)
+      ffmpeg_argv(self, c, &argv)
+      local ok, proc, why = ClipProc.start(&argv, c.err_path)
+      argv_destroy(&argv)
+      if not ok then
+        send_cdone(q, cid, -1, why)
+        os.remove(c.raw_path)
+        drop(self, i)
+        return
+      end
+      c.proc = proc
+      c.encoding = true
+      c.started = os.now()
+      sayf(self, 'clip %d: encoding %s', cid, c.out_path)
+      return
+    end
+  end
+end
+
+-- One frame of the agent's loop: finished encoders answer their clip.
+function AgentClips:tick(now: float64): void
+  local i: usize = 0
+  while i < #self.clips do
+    local c = &self.clips[i]
+    if c.encoding then
+      local exited, status = c.proc:poll()
+      if exited then
+        local q = self.queue_of ~= nilptr and self.queue_of(c.client) or nilptr
+        os.remove(c.raw_path) -- the raw frames are large; the clip is what is wanted
+        if status == 0 and file_exists(c.out_path) then
+          os.remove(c.err_path)
+          if q ~= nilptr then send_cdone(q, c.cid, 0, c.out_path) end
+          sayf(self, 'clip %d: wrote %s', c.cid, c.out_path)
+        else
+          local tail = err_tail(c.err_path)
+          local sb: stringbuilder
+          sb:write('the host could not encode it')
+          if #tail > 0 then sb:write(': ', tail) end
+          local msg = sb:promote()
+          if q ~= nilptr then send_cdone(q, c.cid, -1, msg) end
+          say(self, msg)
+          msg:destroy()
+          tail:destroy()
+        end
+        drop(self, i)
+      else
+        i = i + 1
+      end
+    else
+      i = i + 1
+    end
+  end
+end
+
+-- A connection went away: its recordings go with it, but an encoder already
+-- running is left to finish (the file is what matters, not the reply).
+function AgentClips:client_gone(ci: usize): void
+  local i: usize = 0
+  while i < #self.clips do
+    local c = &self.clips[i]
+    if c.client == ci and not c.encoding then
+      if c.file ~= nilptr then C.fclose(c.file) c.file = nilptr end
+      os.remove(c.raw_path)
+      drop(self, i)
+    else
+      i = i + 1
+    end
+  end
+end
+
+function AgentClips:handle(ci: usize, q: *ByteQueue, typ: uint8, payload: *[0]uint8, len: usize): boolean
+  if typ == PROTO_COPEN then
+    handle_copen(self, ci, q, payload, len)
+  elseif typ == PROTO_CFRAME then
+    handle_cframe(self, ci, payload, len)
+  elseif typ == PROTO_CEND then
+    handle_cend(self, ci, q, payload, len)
+  else
+    return false
+  end
+  return true
+end
+
+function AgentClips:destroy(): void
+  for i = 0, < #self.clips do
+    local c = &self.clips[i]
+    if not c.encoding then
+      if c.file ~= nilptr then C.fclose(c.file) c.file = nilptr end
+      os.remove(c.raw_path)
+    end
+    clip_destroy(c)
+  end
+  self.clips:destroy()
+  self.dir:destroy()
+  self.ffmpeg:destroy()
+end

@@ -1,0 +1,293 @@
+-- A Claude Code session as a ghostty-agent job (docs/JOBS.md).
+--
+-- The client opens a job whose argv is ["@claude", "<json opts>"]; this file
+-- turns those options into the real command line, so XivDesktop never has to
+-- hardcode `claude`'s flags. The base is a structured, non-interactive
+-- session speaking JSON in both directions:
+--
+--   claude -p --output-format stream-json --input-format stream-json \
+--          --include-partial-messages --verbose
+--
+-- Flags checked against `claude --help` of the installed CLI (2.1.278). Note
+-- that it has no `--permission-prompt-tool`: who answers permission prompts
+-- under --print is `--permission-prompts host|none` there, and that is what
+-- the "permission_prompts" option emits.
+--
+-- Everything here is pure: strings in, argv out, no processes and no
+-- platform calls, so tests/test_jobs.nelua can check it on its own.
+require 'string'
+require 'vector'
+require 'stringbuilder'
+
+global ClaudeOpts = @record{
+  exe: string,                 -- "claude" unless the options name another one
+  model: string,
+  permission_prompts: string,  -- host | none
+  permission_mode: string,     -- acceptEdits | auto | bypassPermissions | manual | dontAsk | plan
+  resume: string,              -- a session id to continue
+  session_id: string,          -- a session id to start under
+  input_format: string,        -- stream-json (default) or text
+  prompt: string,              -- the positional prompt, usually empty: stdin carries the turns
+  cwd: string,                 -- the job's working directory
+  mcp_config: vector(string),
+  add_dir: vector(string),
+  extra: vector(string),       -- appended verbatim
+  partial: boolean,            -- --include-partial-messages (default true)
+}
+
+function ClaudeOpts:destroy(): void
+  self.exe:destroy()
+  self.model:destroy()
+  self.permission_prompts:destroy()
+  self.permission_mode:destroy()
+  self.resume:destroy()
+  self.session_id:destroy()
+  self.input_format:destroy()
+  self.prompt:destroy()
+  self.cwd:destroy()
+  for i = 0, < #self.mcp_config do self.mcp_config[i]:destroy() end
+  for i = 0, < #self.add_dir do self.add_dir[i]:destroy() end
+  for i = 0, < #self.extra do self.extra[i]:destroy() end
+  self.mcp_config:destroy()
+  self.add_dir:destroy()
+  self.extra:destroy()
+end
+
+-- A tiny JSON reader: flat objects whose values are strings, booleans or
+-- arrays of strings. That is all the options need, and a real parser would
+-- be a dependency the agent does not otherwise have.
+local function skip_ws(s: string, i: integer): integer
+  while i <= #s do
+    local c = s:byte(i)
+    if c ~= 32 and c ~= 9 and c ~= 10 and c ~= 13 then return i end
+    i = i + 1
+  end
+  return i
+end
+
+local function put_utf8(sb: *stringbuilder, cp: uint32): void
+  if cp < 0x80 then
+    sb:writebyte((@uint8)(cp))
+  elseif cp < 0x800 then
+    sb:writebyte((@uint8)(0xC0 | (cp >> 6)))
+    sb:writebyte((@uint8)(0x80 | (cp & 0x3F)))
+  elseif cp < 0x10000 then
+    sb:writebyte((@uint8)(0xE0 | (cp >> 12)))
+    sb:writebyte((@uint8)(0x80 | ((cp >> 6) & 0x3F)))
+    sb:writebyte((@uint8)(0x80 | (cp & 0x3F)))
+  else
+    sb:writebyte((@uint8)(0xF0 | (cp >> 18)))
+    sb:writebyte((@uint8)(0x80 | ((cp >> 12) & 0x3F)))
+    sb:writebyte((@uint8)(0x80 | ((cp >> 6) & 0x3F)))
+    sb:writebyte((@uint8)(0x80 | (cp & 0x3F)))
+  end
+end
+
+local function hex4(s: string, i: integer): (boolean, uint32)
+  local v: uint32 = 0
+  for k = 0, < 4 do
+    if i + k > #s then return false, 0 end
+    local c = s:byte(i + k)
+    local d: uint32 = 0
+    if c >= 48 and c <= 57 then d = (@uint32)(c - 48)
+    elseif c >= 97 and c <= 102 then d = (@uint32)(c - 87)
+    elseif c >= 65 and c <= 70 then d = (@uint32)(c - 55)
+    else return false, 0 end
+    v = v * 16 + d
+  end
+  return true, v
+end
+
+-- A JSON string starting at s[i] (which must be '"'). Returns the unescaped
+-- text and the position after the closing quote.
+local function json_string(s: string, i: integer): (boolean, string, integer)
+  if i > #s or s:byte(i) ~= 34 then return false, (@string){}, i end
+  i = i + 1
+  local sb: stringbuilder
+  while i <= #s do
+    local c = s:byte(i)
+    if c == 34 then return true, sb:promote(), i + 1 end
+    if c == 92 then
+      i = i + 1
+      if i > #s then break end
+      local e = s:byte(i)
+      if e == 110 then sb:writebyte(10)
+      elseif e == 116 then sb:writebyte(9)
+      elseif e == 114 then sb:writebyte(13)
+      elseif e == 98 then sb:writebyte(8)
+      elseif e == 102 then sb:writebyte(12)
+      elseif e == 117 then
+        local ok, cp = hex4(s, i + 1)
+        if not ok then break end
+        i = i + 4
+        if cp >= 0xD800 and cp <= 0xDBFF and i + 6 <= #s and s:byte(i + 1) == 92 and s:byte(i + 2) == 117 then
+          local ok2, lo = hex4(s, i + 3)
+          if ok2 and lo >= 0xDC00 and lo <= 0xDFFF then
+            cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+            i = i + 6
+          end
+        end
+        put_utf8(&sb, cp)
+      else sb:writebyte(e) end
+    else
+      sb:writebyte(c)
+    end
+    i = i + 1
+  end
+  sb:destroy()
+  return false, (@string){}, i
+end
+
+local function json_strings(s: string, i: integer, out: *vector(string)): (boolean, integer)
+  i = skip_ws(s, i)
+  if i > #s or s:byte(i) ~= 91 then return false, i end -- '['
+  i = skip_ws(s, i + 1)
+  if i <= #s and s:byte(i) == 93 then return true, i + 1 end
+  while true do
+    local ok, item, ni = json_string(s, skip_ws(s, i))
+    if not ok then return false, ni end
+    out:push(item)
+    i = skip_ws(s, ni)
+    if i <= #s and s:byte(i) == 44 then i = i + 1 continue end
+    if i <= #s and s:byte(i) == 93 then return true, i + 1 end
+    return false, i
+  end
+  return false, i
+end
+
+local function set_str(dst: *string, v: string): void
+  dst:destroy()
+  $dst = v
+end
+
+-- Parse the JOPEN "@claude" options. False and a reason for anything the
+-- agent does not know: a typo must not silently start the wrong session.
+global function claude_parse_opts(text: string): (boolean, ClaudeOpts, string)
+  local o: ClaudeOpts = { partial = true }
+  local i = skip_ws(text, 1)
+  if #text == 0 then return true, o, (@string){} end
+  if i > #text or text:byte(i) ~= 123 then -- '{'
+    o:destroy()
+    return false, (@ClaudeOpts){}, string.copy('claude options are not a JSON object')
+  end
+  i = skip_ws(text, i + 1)
+  if i <= #text and text:byte(i) == 125 then return true, o, (@string){} end
+  while true do
+    local ok, key, ni = json_string(text, skip_ws(text, i))
+    if not ok then
+      o:destroy()
+      key:destroy()
+      return false, (@ClaudeOpts){}, string.copy('claude options: expected a key')
+    end
+    i = skip_ws(text, ni)
+    if i > #text or text:byte(i) ~= 58 then -- ':'
+      o:destroy()
+      key:destroy()
+      return false, (@ClaudeOpts){}, string.copy('claude options: expected ":" after ' .. key)
+    end
+    i = skip_ws(text, i + 1)
+    local bad = false
+    if key == 'mcp_config' or key == 'add_dir' or key == 'args' then
+      local target: *vector(string) = &o.extra
+      if key == 'mcp_config' then target = &o.mcp_config
+      elseif key == 'add_dir' then target = &o.add_dir end
+      local aok, ai = json_strings(text, i, target)
+      if not aok then bad = true else i = ai end
+    elseif key == 'partial' then
+      if text:subview(i, i + 3) == 'true' then o.partial = true i = i + 4
+      elseif text:subview(i, i + 4) == 'false' then o.partial = false i = i + 5
+      else bad = true end
+    elseif key == 'claude' or key == 'model' or key == 'permission_prompts'
+        or key == 'permission_mode' or key == 'resume' or key == 'session_id'
+        or key == 'input_format' or key == 'prompt' or key == 'cwd' then
+      local sok, val, si = json_string(text, i)
+      if not sok then
+        val:destroy()
+        bad = true
+      else
+        i = si
+        if key == 'claude' then set_str(&o.exe, val)
+        elseif key == 'model' then set_str(&o.model, val)
+        elseif key == 'permission_prompts' then set_str(&o.permission_prompts, val)
+        elseif key == 'permission_mode' then set_str(&o.permission_mode, val)
+        elseif key == 'resume' then set_str(&o.resume, val)
+        elseif key == 'session_id' then set_str(&o.session_id, val)
+        elseif key == 'input_format' then set_str(&o.input_format, val)
+        elseif key == 'prompt' then set_str(&o.prompt, val)
+        else set_str(&o.cwd, val) end
+      end
+    else
+      local why = 'claude options: unknown key ' .. key
+      o:destroy()
+      key:destroy()
+      return false, (@ClaudeOpts){}, why
+    end
+    key:destroy()
+    if bad then
+      o:destroy()
+      return false, (@ClaudeOpts){}, string.copy('claude options: bad value')
+    end
+    i = skip_ws(text, i)
+    if i <= #text and text:byte(i) == 44 then i = skip_ws(text, i + 1) continue end
+    if i <= #text and text:byte(i) == 125 then return true, o, (@string){} end
+    o:destroy()
+    return false, (@ClaudeOpts){}, string.copy('claude options: expected "," or "}"')
+  end
+  o:destroy()
+  return false, (@ClaudeOpts){}, string.copy('claude options: unterminated object')
+end
+
+-- The command line for a structured Claude Code session, and the working
+-- directory it should run in ('' for the agent's own). The caller owns the
+-- strings. False and a reason when the options do not parse or say nothing
+-- the CLI understands.
+global function claude_job_argv(opts: string): (boolean, vector(string), string, string)
+  local ok, o, why = claude_parse_opts(opts)
+  if not ok then return false, (@vector(string)){}, (@string){}, why end
+  local argv: vector(string)
+  argv:push(#o.exe > 0 and o.exe:copy() or string.copy('claude'))
+  argv:push(string.copy('-p'))
+  argv:push(string.copy('--output-format'))
+  argv:push(string.copy('stream-json'))
+  local input_format: string = 'stream-json'
+  if #o.input_format > 0 then input_format = o.input_format end
+  if input_format ~= 'text' then
+    argv:push(string.copy('--input-format'))
+    argv:push(input_format:copy())
+  end
+  if o.partial then argv:push(string.copy('--include-partial-messages')) end
+  argv:push(string.copy('--verbose'))
+  if #o.model > 0 then
+    argv:push(string.copy('--model'))
+    argv:push(o.model:copy())
+  end
+  if #o.permission_prompts > 0 then
+    argv:push(string.copy('--permission-prompts'))
+    argv:push(o.permission_prompts:copy())
+  end
+  if #o.permission_mode > 0 then
+    argv:push(string.copy('--permission-mode'))
+    argv:push(o.permission_mode:copy())
+  end
+  if #o.mcp_config > 0 then
+    argv:push(string.copy('--mcp-config'))
+    for i = 0, < #o.mcp_config do argv:push(o.mcp_config[i]:copy()) end
+  end
+  if #o.add_dir > 0 then
+    argv:push(string.copy('--add-dir'))
+    for i = 0, < #o.add_dir do argv:push(o.add_dir[i]:copy()) end
+  end
+  if #o.session_id > 0 then
+    argv:push(string.copy('--session-id'))
+    argv:push(o.session_id:copy())
+  end
+  if #o.resume > 0 then
+    argv:push(string.copy('--resume'))
+    argv:push(o.resume:copy())
+  end
+  for i = 0, < #o.extra do argv:push(o.extra[i]:copy()) end
+  if #o.prompt > 0 then argv:push(o.prompt:copy()) end
+  local cwd = o.cwd:copy()
+  o:destroy()
+  return true, argv, cwd, (@string){}
+end
