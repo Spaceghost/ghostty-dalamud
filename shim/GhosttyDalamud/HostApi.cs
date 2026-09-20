@@ -1,13 +1,19 @@
 // GuHostApi callbacks: Dalamud and game facilities handed to the core. Each
 // one only reads, writes or calls; anything that can throw returns 0 instead.
 using System;
+using System.IO;
 using System.Linq;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Dalamud.Game.ClientState.GamePad;
 using Dalamud.Game.ClientState.Keys;
 using Dalamud.Game.Command;
 using Dalamud.Game.Gui.Dtr;
+using Dalamud.Interface;
 using Dalamud.Interface.ManagedFontAtlas;
 using RenderLightFlags = FFXIVClientStructs.FFXIV.Client.Graphics.Render.LightFlags;
 using SceneLight = FFXIVClientStructs.FFXIV.Client.Graphics.Scene.Light;
@@ -20,14 +26,15 @@ internal static unsafe class HostApi
     public static GuHostApi* Api { get; private set; }
 
     private static IDisposable? _fontScope;
+    private static IFontHandle? _monoFont;
     private static IFontHandle? _worldFont;
     private static IDtrBarEntry? _dtr;
 
     public static void Create()
     {
+        _monoFont = TerminalFont(UiBuilder.DefaultFontSizePx);
         // a large mono font for world panels: glyphs get minified instead of magnified
-        _worldFont = Plugin.Pi.UiBuilder.FontAtlas.NewDelegateFontHandle(e => e.OnPreBuild(tk =>
-            tk.AddDalamudAssetFont(Dalamud.DalamudAsset.InconsolataRegular, new SafeFontConfig { SizePx = 40 })));
+        _worldFont = TerminalFont(40);
 
         Api = (GuHostApi*)NativeMemory.AllocZeroed((nuint)sizeof(GuHostApi));
         Api->Size           = (nuint)sizeof(GuHostApi);
@@ -73,6 +80,18 @@ internal static unsafe class HostApi
         Api->BgSetTransform = &BgSetTransform;
         Api->BgSetTransparency = &BgSetTransparency;
         Api->BgDestroy      = &BgDestroy;
+        Api->CommandAddTagged = &CommandAddTagged;
+        Api->ChatPrint      = &ChatPrint;
+        Api->AddonRect      = &AddonRect;
+        Api->AddonShow      = &AddonShow;
+        Api->ChatSend       = &ChatSend;
+        Api->ConfigUInt     = &ConfigUInt;
+        Api->TextureFile    = &TextureFile;
+        Api->SceneFlags     = &SceneFlags;
+        Api->HttpUpload     = &HttpUpload;
+        Api->GameString     = &GameString;
+        Api->HudRects       = &HudRects;
+        Api->HttpPost       = &HttpPost;
     }
 
     public static void Free()
@@ -81,6 +100,8 @@ internal static unsafe class HostApi
         Api = null;
         _worldFont?.Dispose();
         _worldFont = null;
+        _monoFont?.Dispose();
+        _monoFont = null;
     }
 
     private static string Str(byte* s) => Marshal.PtrToStringUTF8((nint)s) ?? string.Empty;
@@ -104,6 +125,16 @@ internal static unsafe class HostApi
     private static int CommandAdd(byte* name, byte* help)
     {
         try { return Plugin.Commands.AddHandler(Str(name), new CommandInfo(OnCommand) { HelpMessage = Str(help) }) ? 1 : 0; }
+        catch { return 0; }
+    }
+
+    // a command of its own (/window, /ask): the core knows it by `tag`
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int CommandAddTagged(byte* name, byte* help, int tag)
+    {
+        try {
+            return Plugin.Commands.AddHandler(Str(name), new CommandInfo((_, args) => Native.Post(GuEvent.Chat, tag, 0, 0, 0, args)) { HelpMessage = Str(help) }) ? 1 : 0;
+        }
         catch { return 0; }
     }
 
@@ -168,6 +199,29 @@ internal static unsafe class HostApi
         try { GhosttyIpc.Unregister(); } catch { /* the core is shutting down either way */ }
     }
 
+    // a line in the game chat; what to say and when is the core's
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int ChatPrint(byte* text)
+    {
+        if (text == null) return 0;
+        try { Plugin.Chat.Print(Str(text)); return 1; } catch { return 0; }
+    }
+
+    // an image file (the Windows picker's app icons) as an ImTextureID, 0 until
+    // Dalamud has loaded it; asked again every frame it is drawn (a shared
+    // texture Dalamud keeps while it is used). Which file, and when, is the core's.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static nint TextureFile(byte* path, uint* w, uint* h)
+    {
+        if (path == null) return 0;
+        try {
+            if (!Plugin.Textures.GetFromFile(Str(path)).TryGetWrap(out var wrap, out _) || wrap == null) return 0;
+            if (w != null) *w = (uint)wrap.Width;
+            if (h != null) *h = (uint)wrap.Height;
+            return (nint)wrap.Handle.Handle;
+        } catch { return 0; }
+    }
+
     // the core only passes https links; opening one is Dalamud's job
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static int OpenUrl(byte* url)
@@ -176,12 +230,218 @@ internal static unsafe class HostApi
         try { Dalamud.Utility.Util.OpenLink(Str(url)); return 1; } catch { return 0; }
     }
 
+    // Flat windows pulled into the world (docs/ADOPT.md) ------------------------------------------
+
+    // A game addon's rectangle on the screen: 1 shown, 2 loaded but hidden, 0 not loaded.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int AddonRect(byte* name, float* x, float* y, float* w, float* h)
+    {
+        try {
+            var a = Plugin.GameGui.GetAddonByName(Str(name), 1);
+            if (a.IsNull) return 0;
+            *x = a.X; *y = a.Y; *w = a.ScaledWidth; *h = a.ScaledHeight;
+            return a.IsVisible ? 1 : 2;
+        } catch { return 0; }
+    }
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int AddonShow(byte* name, int shown)
+    {
+        try {
+            var a = Plugin.GameGui.GetAddonByName(Str(name), 1);
+            if (a.IsNull) return 0;
+            ((FFXIVClientStructs.FFXIV.Component.GUI.AtkUnitBase*)a.Address)->IsVisible = shown != 0;
+            return 1;
+        } catch { return 0; }
+    }
+
+    // What the chat input itself allows (xiv-mcp's ChatInput): anything the game
+    // would strip makes the line differ after sanitising, and it is refused.
+    private const FFXIVClientStructs.FFXIV.Client.System.String.AllowedEntities ChatAllowed =
+        (FFXIVClientStructs.FFXIV.Client.System.String.AllowedEntities)0x27F;
+
+    // A line through the game's chat box, as if typed and sent with Enter; on
+    // the framework thread. 1 = queued (a refusal is logged there).
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int ChatSend(byte* text)
+    {
+        try {
+            string line = Str(text);
+            if (line.Length == 0 || System.Text.Encoding.UTF8.GetByteCount(line) > 500) return 0;
+            Plugin.GameFramework.RunOnFrameworkThread(() => SubmitChat(line));
+            return 1;
+        } catch { return 0; }
+    }
+
+    private static void SubmitChat(string line)
+    {
+        var ui = FFXIVClientStructs.FFXIV.Client.UI.UIModule.Instance();
+        if (ui == null) { Plugin.Log.Warning("[Ghostty] chat: the game UI is not ready"); return; }
+        var str = FFXIVClientStructs.FFXIV.Client.System.String.Utf8String.FromString(line);
+        if (str == null) return;
+        try {
+            str->SanitizeString(ChatAllowed, null);
+            if (!string.Equals(str->ToString(), line, StringComparison.Ordinal)) {
+                Plugin.Log.Warning("[Ghostty] chat: the line has characters the game's chat box does not accept; not sent");
+                return;
+            }
+            ui->ProcessChatBoxEntry(str, 0, false);
+        } finally {
+            str->Dtor(true);
+        }
+    }
+
+    // A UiConfig option as a number (the chat log colours: ColorSay, ...).
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int ConfigUInt(byte* name, uint* value)
+    {
+        try {
+            if (!Plugin.GameConfig.UiConfig.TryGetUInt(Str(name), out uint v)) return 0;
+            *value = v;
+            return 1;
+        } catch { return 0; }
+    }
+
+    // A game or Dalamud string the core asks for by name, as UTF-8 into buf (NUL
+    // terminated, cut to cap). Returns its length; 0 when there is none.
+    //   screenshot_dir  the game's own screenshot folder setting (empty: the default)
+    //   user_path       the game's user folder (FFXIV.cfg, and screenshots\ by default)
+    //   player          "Name@World" of the logged-in character
+    //   cjk_font        Dalamud's Noto Sans CJK file, for the core's fallback
+    //                   glyph chain (core/glyphfb.nelua); empty when it is not there
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static nuint GameString(byte* name, byte* buf, nuint cap)
+    {
+        if (buf == null || cap == 0) return 0;
+        try {
+            string v = Str(name) switch {
+                "screenshot_dir" => Plugin.GameConfig.System.TryGetString("ScreenShotDir", out string d) ? d : string.Empty,
+                "user_path" => FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance()->UserPathString,
+                "player" => Plugin.Objects.LocalPlayer is { } p ? p.Name.TextValue + "@" + p.HomeWorld.Value.Name.ToString() : string.Empty,
+                "cjk_font" => CjkFontPath(),
+                _ => string.Empty,
+            };
+            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(v);
+            int n = (int)Math.Min((nuint)bytes.Length, cap - 1);
+            for (int i = 0; i < n; i++) buf[i] = bytes[i];
+            buf[n] = 0;
+            return (nuint)n;
+        } catch { buf[0] = 0; return 0; }
+    }
+
+    // The game's HUD (core/hudmask.nelua): the rectangle and name of every
+    // loaded addon that is shown, in AtkStage's order, at most `cap`. The core
+    // decides which ones count. Returns how many were written.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int HudRects(GuHudRect* rects, int cap)
+    {
+        if (rects == null || cap <= 0) return 0;
+        try {
+            var stage = FFXIVClientStructs.FFXIV.Component.GUI.AtkStage.Instance();
+            if (stage == null || stage->RaptureAtkUnitManager == null) return 0;
+            ref var list = ref stage->RaptureAtkUnitManager->AllLoadedUnitsList;
+            int n = 0;
+            for (int i = 0; i < list.Count && n < cap; i++) {
+                var unit = list.Entries[i].Value;
+                if (unit == null) continue;
+                var a = new Dalamud.Game.NativeWrapper.AtkUnitBasePtr((nint)unit);
+                if (!a.IsVisible) continue;
+                GuHudRect* r = &rects[n++];
+                r->X = a.X; r->Y = a.Y; r->W = a.ScaledWidth; r->H = a.ScaledHeight;
+                string name = a.Name ?? string.Empty; // addon names are ASCII
+                int len = Math.Min(name.Length, 31);
+                for (int k = 0; k < len; k++) r->Name[k] = (byte)name[k];
+                r->Name[len] = 0;
+            }
+            return n;
+        } catch { return 0; }
+    }
+
+    // The Noto Sans CJK file in Dalamud's asset folder, the same one the
+    // terminal font merges kana and CJK punctuation from. The core reads it
+    // with stb_truetype for the ideographs the merged ranges leave out (they
+    // would cost tens of megabytes in ImGui's atlas: docs/GLYPHS.md). First
+    // match wins; empty when Dalamud has not downloaded them.
+    private static readonly string[] CjkAssets = [
+        "NotoSansCJK-Regular.ttc", "NotoSansCJKjp-Medium.otf", "NotoSansKR-Regular.otf"];
+
+    private static string CjkFontPath()
+    {
+        string dir = Path.Combine(Plugin.Pi.DalamudAssetDirectory.FullName, "UIRes");
+        foreach (string f in CjkAssets) {
+            string p = Path.Combine(dir, f);
+            if (File.Exists(p)) return p;
+        }
+        return string.Empty;
+    }
+
+    // Uploads (the screenshot gallery, lua/gallery.lua): see GalleryUpload below.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int HttpUpload(int id, byte* url, byte* path, byte* contentType)
+    {
+        if (url == null || path == null || contentType == null) return 0;
+        try { GalleryUpload.Start(id, Str(url), Str(path), Str(contentType)); return 1; } catch { return 0; }
+    }
+
+    // The gallery's sign-in and its signed upload: extra headers ("Name: value" lines), and
+    // the file at `path` or else `bodyLen` bytes at `body`. The headers and the body carry
+    // the player's sign-in: they are copied here and never logged.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int HttpPost(int id, byte* url, byte* headers, byte* contentType, byte* path, byte* body, nuint bodyLen)
+    {
+        if (url == null || contentType == null || (path == null && body == null)) return 0;
+        try {
+            byte[]? bytes = null;
+            if (path == null) bytes = new ReadOnlySpan<byte>(body, checked((int)bodyLen)).ToArray();
+            GalleryUpload.Start(id, Str(url), path == null ? null : Str(path), Str(contentType),
+                headers == null ? null : Str(headers), bytes);
+            return 1;
+        } catch { return 0; }
+    }
+
+    // Before the core goes away: no upload may call into it afterwards.
+    public static void StopHttp() => GalleryUpload.Stop();
+
     // Fonts and keys -----------------------------------------------------------------------------
+
+    // Glyph ranges (inclusive pairs, zero-terminated). Inconsolata is asked for
+    // everything a terminal commonly shows and gives what it has; each merged
+    // font then fills only glyphs still missing.
+    private static readonly ushort[] TextRanges = [
+        0x0020, 0x024F, 0x0370, 0x03FF, 0x0400, 0x04FF, 0x2000, 0x2BFF, 0xFFFD, 0xFFFD, 0];
+    private static readonly ushort[] NerdRanges = [
+        0x23FB, 0x23FE, 0x2665, 0x2665, 0x26A1, 0x26A1, 0x2B58, 0x2B58, 0xE000, 0xF8FF, 0];
+    private static readonly ushort[] SymbolRanges = [0x2000, 0x2BFF, 0];
+    // CJK punctuation, kana and fullwidth forms only: about 800 glyphs. The
+    // 21,000 unified ideographs would need a 4096-wide ImGui atlas per font
+    // size, so they are rasterized on demand into the core's own 1024x1024
+    // atlas instead, from the same file (core/glyphfb.nelua, docs/GLYPHS.md).
+    private static readonly ushort[] CjkRanges = [
+        0x2000, 0x2BFF, 0x3000, 0x30FF, 0xFF00, 0xFFEF, 0];
+
+    // Inconsolata, then Nerd Font icons and Noto symbols from fonts/, then the
+    // punctuation and kana of Dalamud's Noto Sans CJK.
+    private static IFontHandle TerminalFont(float sizePx) =>
+        Plugin.Pi.UiBuilder.FontAtlas.NewDelegateFontHandle(e => e.OnPreBuild(tk =>
+        {
+            var font = tk.AddDalamudAssetFont(Dalamud.DalamudAsset.InconsolataRegular,
+                new SafeFontConfig { SizePx = sizePx, GlyphRanges = TextRanges });
+            string dir = Path.Combine(Plugin.Pi.AssemblyLocation.DirectoryName!, "fonts");
+            foreach (var (file, ranges) in new[] {
+                ("SymbolsNerdFontMono-Regular.ttf", NerdRanges), ("NotoSansSymbols2-Regular.ttf", SymbolRanges) })
+            {
+                string path = Path.Combine(dir, file);
+                if (File.Exists(path))
+                    tk.AddFontFromFile(path, new SafeFontConfig { SizePx = sizePx, GlyphRanges = ranges, MergeFont = font });
+            }
+            tk.AddDalamudAssetFont(Dalamud.DalamudAsset.NotoSansCjkRegular,
+                new SafeFontConfig { SizePx = sizePx, GlyphRanges = CjkRanges, MergeFont = font });
+        }));
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static void PushMonoFont()
     {
-        _fontScope = Plugin.Pi.UiBuilder.MonoFontHandle.Push();
+        _fontScope = _monoFont is { Available: true } ? _monoFont.Push() : Plugin.Pi.UiBuilder.MonoFontHandle.Push();
     }
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
@@ -397,6 +657,27 @@ internal static unsafe class HostApi
         } catch { return 0; }
     }
 
+    // What the game is busy with, for props that must not stay in a scene they
+    // do not belong to (the desk scene): 1 cutscene, 2 group pose, 4 between
+    // areas, 8 bound by an event (talking to an NPC, a quest event).
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int SceneFlags()
+    {
+        try {
+            var c = Plugin.Condition;
+            int f = 0;
+            if (c[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedInCutSceneEvent]
+                || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.WatchingCutscene]
+                || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.WatchingCutscene78]) f |= 1;
+            if (Plugin.Client.IsGPosing) f |= 2;
+            if (c[Dalamud.Game.ClientState.Conditions.ConditionFlag.BetweenAreas]
+                || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.BetweenAreas51]) f |= 4;
+            if (c[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedInEvent]
+                || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedInQuestEvent]) f |= 8;
+            return f;
+        } catch { return 0; }
+    }
+
     // Time of day (seconds), rain amount and weather id, for light-reactive panels.
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static int GetEnvironment(float* dayTimeSeconds, float* rain, byte* weather)
@@ -553,5 +834,64 @@ internal static unsafe class HostApi
             *hx = hit.Point.X; *hy = hit.Point.Y; *hz = hit.Point.Z;
             return 1;
         } catch { return 0; }
+    }
+}
+
+// POST the file at `path` (or, without one, `bytes`) to `url` (the core only passes https
+// links) as `contentType`, with `headers` ("Name: value" lines) when given, off the game's
+// threads. The answer comes back as GuEvent.HttpDone: a = id, b = the HTTP
+// status (0: no answer, -1: the file could not be read), text = the start of the body or
+// the error. Nothing is posted once the plugin is unloading. (Outside HostApi, which is
+// unsafe: async code cannot run in an unsafe context.)
+internal static class GalleryUpload
+{
+    private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(90) };
+    private static readonly object Gate = new();
+    private static readonly CancellationTokenSource StopSource = new();
+    private static bool _open = true;
+
+    // What the core keeps of an answer: its event text holds 1023 bytes (255 before the
+    // sign-in, where a longer answer is only cut shorter).
+    private const int AnswerMax = 1000;
+
+    public static void Start(int id, string url, string? path, string contentType,
+        string? headers = null, byte[]? bytes = null)
+    {
+        CancellationToken stop = StopSource.Token;
+        _ = Task.Run(async () => {
+            int status;
+            string text;
+            try {
+                byte[] body = path != null ? await File.ReadAllBytesAsync(path, stop) : bytes ?? Array.Empty<byte>();
+                using var content = new ByteArrayContent(body);
+                content.Headers.ContentType = new MediaTypeHeaderValue(contentType);
+                using var req = new HttpRequestMessage(HttpMethod.Post, url) { Content = content };
+                req.Headers.TryAddWithoutValidation("X-Ghostty-Client", "GhosttyDalamud");
+                foreach (string line in (headers ?? string.Empty).Split('\n', StringSplitOptions.RemoveEmptyEntries))
+                {
+                    int colon = line.IndexOf(':');
+                    if (colon > 0) req.Headers.TryAddWithoutValidation(line[..colon].Trim(), line[(colon + 1)..].Trim());
+                }
+                using var res = await Http.SendAsync(req, stop);
+                status = (int)res.StatusCode;
+                text = await res.Content.ReadAsStringAsync(stop);
+            } catch (OperationCanceledException) when (stop.IsCancellationRequested) {
+                return;
+            } catch (Exception e) when (e is IOException or UnauthorizedAccessException) {
+                status = -1; // the screenshot could not be read
+                text = e.Message;
+            } catch (Exception e) {
+                status = 0; // no answer: offline, DNS, TLS, timeout
+                text = e.Message;
+            }
+            if (text.Length > AnswerMax) text = text[..AnswerMax];
+            lock (Gate) { if (_open) Native.Post(GuEvent.HttpDone, id, status, 0, 0, text); }
+        });
+    }
+
+    public static void Stop()
+    {
+        lock (Gate) _open = false;
+        try { StopSource.Cancel(); } catch { /* already stopped */ }
     }
 }
