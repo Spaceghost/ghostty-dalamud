@@ -95,6 +95,8 @@ S.schema = {
     { 'world.light.backlight_below', 'slider', 0.5, 1.2, 'Backlight when dimmer than' },
     { 'world.light.rain_dim', 'slider', 0, 0.5, 'Rain darkening' },
     { 'rain.shelter', 'checkbox', 'Rain follows shelter (screens under a roof stay dry)' },
+    { 'rain.shake', 'checkbox', 'Rough movement shakes the water off screens' },
+    { 'rain.shake_accel', 'slider', 10, 150, 'Shake-off: how rough (yalms/s²)' },
     { 'world.light.cast_light', 'checkbox', 'Panels light up your character and the world' },
     { 'world.light.light_intensity', 'slider', 0, 4, 'Cast light intensity' },
     { 'world.light.light_range', 'slider', 1, 20, 'Cast light range (yalms)' },

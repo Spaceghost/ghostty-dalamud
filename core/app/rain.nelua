@@ -19,6 +19,10 @@ local RAIN_FORGET: float64 <comptime> = 30 -- seconds unseen before a panel's dr
 global RAIN_RAYS_FRAME <comptime> = 12
 global rain_rays_frame: integer = 0         -- shelter rays cast this frame
 global rain_rays_total: integer = 0         -- ... and since the last reset (tests)
+-- Ground rays (one per droplet leaving the glass): past this many a frame a
+-- droplet takes the ground its panel found last.
+global RAIN_GROUND_RAYS_FRAME <comptime> = 32
+global rain_ground_rays: integer = 0
 local RAIN_SHELTER_STALE: float64 <comptime> = 2 -- seconds uncast (dry weather, unseen) before the next answer is taken as it is
 
 -- One frame's geometry: triangles with per-vertex colour in a fixed buffer,
@@ -142,6 +146,16 @@ global function policy_rain_frame(): (boolean, RainParams)
     prm.gravity = (@float32)(lua_field_number(L, t, 'gravity', 12))
     prm.fling_speed = (@float32)(lua_field_number(L, t, 'fling_speed', 2.5))
     prm.max_particles = (@integer)(math.floor(lua_field_number(L, t, 'max_particles', 256)))
+    prm.shake_slide = (@float32)(lua_field_number(L, t, 'shake_slide', 10))
+    prm.shake_accel = (@float32)(lua_field_number(L, t, 'shake_accel', 30))
+    prm.shake_per = (@float32)(lua_field_number(L, t, 'shake_per', 0.15))
+    prm.shake_slide_speed = (@float32)(lua_field_number(L, t, 'shake_slide_speed', 260))
+    prm.shake_jump = (@float32)(lua_field_number(L, t, 'shake_jump', 3))
+    prm.shake_max_speed = (@float32)(lua_field_number(L, t, 'shake_max_speed', 40))
+    prm.shake_max = (@integer)(math.floor(lua_field_number(L, t, 'shake_max', 12)))
+    lua_getfield(L, t, 'shake')
+    prm.shake = lua_type(L, -1) == LUA_TNIL or lua_toboolean(L, -1) ~= 0
+    lua_pop(L, 1)
     lua_getfield(L, t, 'shelter')
     prm.shelter = lua_type(L, -1) == LUA_TNIL or lua_toboolean(L, -1) ~= 0 -- an older lua/rain.lua: on
     lua_pop(L, 1)
@@ -197,7 +211,7 @@ local function rain_frame(now: float64): void
   if now == rain_prm_at then return end
   rain_prm_at = now
   rain_prm_ok, rain_prm = policy_rain_frame()
-  rain_rays_frame = 0
+  rain_rays_frame, rain_ground_rays = 0, 0
   -- a place the game itself calls indoors never gets rain, whatever the weather says
   if rain_prm_ok and rain_prm.shelter and rain_prm.intensity > 0 and host.api.indoor ~= nilptr and host.api.indoor() ~= 0 then
     rain_prm.intensity = 0
@@ -251,10 +265,15 @@ end
 
 -- Ground under a world point: the game's collision straight down, else the
 -- player's feet, else a character's height below.
-local function rain_ground(x: float32, y: float32, z: float32): float32
+local function rain_ground(p: *RainPanel, x: float32, y: float32, z: float32): float32
   if host.api.raycast ~= nilptr then
+    if rain_ground_rays >= RAIN_GROUND_RAYS_FRAME and p.ground_known and p.ground < y then return p.ground end
+    rain_ground_rays = rain_ground_rays + 1
     local hx: float32, hy: float32, hz: float32 = 0, 0, 0
-    if host.api.raycast(x, y, z, 0, -1, 0, 40, &hx, &hy, &hz) ~= 0 then return hy end
+    if host.api.raycast(x, y, z, 0, -1, 0, 40, &hx, &hy, &hz) ~= 0 then
+      p.ground, p.ground_known = hy, true
+      return hy
+    end
   end
   local pc: GuObject
   if host.api.get_object ~= nilptr and host.api.get_object(WORLD_PLAYER, 0, &pc) ~= 0 and pc.found ~= 0 and pc.y < y then return pc.y end
@@ -290,11 +309,18 @@ local function rain_panel_shelter(p: *RainPanel, pl: *WorldPlacement, now: float
 end
 
 -- The drops that left panel `p`'s glass this step become world droplets.
-local function rain_panel_shed(p: *RainPanel, pl: *WorldPlacement, prm: *RainParams): void
+-- Run-off and the wiper's fling only while it rains on the panel (`raining`);
+-- water shaken off leaves whenever there is water.
+local function rain_panel_shed(p: *RainPanel, pl: *WorldPlacement, prm: *RainParams, raining: boolean): void
   local b = world_basis($pl)
   for i = 0, < p.nemit do
     local e = &p.emit[i]
+    if not e.world and not raining then continue end
     local x, y, z = world_point(&b, e.u, e.v)
+    if e.world then
+      rain_pool:emit(prm.max_particles, x, y, z, e.wx, e.wy, e.wz, rain_ground(p, x, y, z), true)
+      continue
+    end
     -- panel direction (pixels) in the world: right is +u, up is -v
     local vx = b.rx * e.du * b.ypp - b.ux * e.dv
     local vy = b.ry * e.du * b.ypp - b.uy * e.dv
@@ -308,9 +334,28 @@ local function rain_panel_shed(p: *RainPanel, pl: *WorldPlacement, prm: *RainPar
     else
       vx, vy, vz = vx * e.speed, vy * e.speed, vz * e.speed
     end
-    rain_pool:emit(prm.max_particles, x, y, z, vx, vy, vz, rain_ground(x, y, z), e.fling)
+    rain_pool:emit(prm.max_particles, x, y, z, vx, vy, vz, rain_ground(p, x, y, z), e.fling)
   end
   p.nemit = 0
+end
+
+-- The panel's own motion on its water: the pose about to be drawn goes into the
+-- panel's RainMotion -- whatever moved it -- and RainPanel:shake slides the
+-- drops or knocks them off.
+local function rain_panel_shake(p: *RainPanel, pl: *WorldPlacement, prm: *RainParams, dt: float32): void
+  local b = world_basis($pl)
+  local half = b.hw * b.ypp
+  local bulge: float32 = b.curve > 0.01 and b.curve * (1 - math.cos(math.min(half / b.curve, 1.5))) or 0
+  if not p.motion:track(pl.x, pl.y, pl.z, pl.yaw, pl.roll, bulge, half, dt, prm.shake_jump, prm.shake_max_speed) then return end
+  local inv = 1 / math.max(b.ypp, 1e-6)
+  local ux, uy, uz = b.ux * inv, b.uy * inv, b.uz * inv
+  local ax: RainAxes = {
+    rx = b.rx, ry = b.ry, rz = b.rz, ux = ux, uy = uy, uz = uz,
+    -- the front normal, tilted with the panel: right x up
+    fx = b.ry * uz - b.rz * uy, fy = b.rz * ux - b.rx * uz, fz = b.rx * uy - b.ry * ux,
+    ypp = b.ypp,
+  }
+  p:shake(prm, &ax, pl.width, pl.height, dt)
 end
 
 -- Behind the content, after the panel's background: step the panel's rain and
@@ -327,11 +372,16 @@ global function rain_panel_back(dl: *ImDrawList, o: ImVec2, pl: *WorldPlacement,
     -- a panel still waiting for its first rays (the frame's budget) stays dry meanwhile
     prm.intensity = p.shelter.known and prm.intensity * p.shelter:exposure() or 0
   end
+  if pl.hud or (p.level <= 0 and prm.intensity <= 0) then p.motion:reset() end
   if p.level <= 0 and prm.intensity <= 0 then p.last = now p.vis = 0 return end
-  p:step(&prm, pl.width, pl.height, (@float32)(now - p.last))
+  local dt = (@float32)(now - p.last)
+  p:step(&prm, pl.width, pl.height, dt)
+  if not pl.hud then rain_panel_shake(p, pl, &prm, dt) end
   p.last = now
   p.vis = math.clamp(fade, 0, 1) * math.clamp(prm.opacity, 0, 1)
-  if p.nemit > 0 and fade >= 0.999 and prm.intensity > 0 then rain_panel_shed(p, pl, &prm) end
+  -- in the full-screen flight the panel is leaving the world: its water just goes
+  if p.nemit > 0 and fade >= 0.5 then rain_panel_shed(p, pl, &prm, fade >= 0.999 and prm.intensity > 0) end
+  p.nemit = 0
   if prm.wiper == RainWiper.Back and p.wiping then
     local a = p.vis * math.min(p.level * 3, 1) * math.clamp(pl.opacity + 0.3, 0, 1)
     draw_wiper(o, pl.width, pl.height, p.angle, a, false)

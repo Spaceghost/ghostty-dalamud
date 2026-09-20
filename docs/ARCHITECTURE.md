@@ -362,6 +362,24 @@ it, and `lua/rain.lua` decides whether it rains and holds the tunables.
   front of the content as triangle fans (a translucent body with a darker
   rim, plus a specular dot toward the top left) in one reserved batch per
   pass, from a fixed vertex buffer.
+* **Shaking it off.** There was no shake-off before this; it is driven by the
+  panel's own motion and by nothing else. `rain_panel_shake` hands the pose
+  about to be drawn (after `CONFIG.world.place`, the drag pose, the presented
+  pose and the flight pose) to the panel's `RainMotion`, which takes velocity
+  and acceleration as finite differences, low-passed over 0.05 s, plus a
+  `spin` term for yaw, roll and curve changes at the panel's edge. So every
+  way a panel moves is covered by construction. From `shake_slide` the drops
+  slide against the in-plane acceleration (outward for spin) and streak; past
+  `shake_accel` they come off at `shake_per` of the drops per yalm/s of
+  velocity change beyond it, at most `shake_max` a step, as world droplets
+  with the velocity the glass had 0.15 s earlier at that point — a hard stop
+  sheds forward, a sudden start leaves the water behind, a spin sheds along
+  the tangent. They use the run-off's falling path and ground ray (32 ground
+  rays a frame, then the panel's last ground). A move of more than
+  `shake_jump` yalms in a frame, faster than `shake_max_speed`, a turn of
+  more than 1.5 rad in a frame, a quarter second without frames, or a HUD
+  dock starts the history over without shedding. Resizing alone sheds
+  nothing. Not yet observed in game.
 * **Wiper.** An arm pivots from the middle of the bottom edge and rests along
   it. While it rains, it makes one eased sweep out and back every
   `wiper_period_light` to `wiper_period_heavy` seconds. From

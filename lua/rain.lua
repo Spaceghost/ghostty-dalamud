@@ -34,6 +34,25 @@ local M = {
   -- only on its exposed side, and indoors nothing is. false: the weather alone
   -- decides, as before. /term rain on ignores shelter (it is for testing).
   shelter = true,
+  -- shaking the water off: the core measures each screen's own motion in the
+  -- world from the pose it draws (so it holds however the screen is moved: a
+  -- pet on its springs, the lineup, a drag, a pin, an orbit, the presented
+  -- float, ...). Gentle acceleration makes the drops slide and streak; a rough
+  -- one -- a run that stops dead, a sharp turn, a fling with Alt-drag, a quick
+  -- spin -- knocks them off, and they fall to the ground as the run-off does.
+  -- Measured on the pets' own springs (tests/test_worldpanel): a pet behind a
+  -- character that starts or stops walking peaks near 20 yalms/s^2 (it swings
+  -- into and out of its trailing place), behind a run near 50, a sprint near
+  -- 100, a mount well over 200.
+  shake = true,
+  shake_slide = 10,         -- yalms/s^2 from which drops slide on the glass
+  shake_accel = 30,         -- ... and from which they come off
+  shake_per = 0.15,         -- share of the drops that comes off per yalm/s of velocity change past that
+  shake_slide_speed = 260,  -- pixels per second a drop slides at the come-off threshold
+  shake_jump = 3,           -- yalms in one frame that is a teleport, not a shake: nothing sheds
+  shake_max_speed = 40,     -- yalms/s no screen really moves at: a teleport as well
+  shake_max = 12,           -- drops shaken off one screen per frame (the core holds at most 24);
+                            -- max_particles above caps what is in the air
   -- territory ids that never get rain whatever the weather and the rays say
   -- (add your own: [id] = true). Housing interiors are known from the game.
   indoor_zones = {},
@@ -85,6 +104,14 @@ function M.frame()
   frame.fling_speed = M.fling_speed
   frame.max_particles = M.max_particles
   frame.shelter = M.shelter ~= false and M.mode ~= 'on'
+  frame.shake = M.shake ~= false
+  frame.shake_slide = M.shake_slide
+  frame.shake_accel = M.shake_accel
+  frame.shake_per = M.shake_per
+  frame.shake_slide_speed = M.shake_slide_speed
+  frame.shake_jump = M.shake_jump
+  frame.shake_max_speed = M.shake_max_speed
+  frame.shake_max = M.shake_max
   return frame
 end
 

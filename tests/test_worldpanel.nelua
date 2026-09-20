@@ -382,6 +382,77 @@ do
   print('world place garbage OK')
 end
 
+-- Shaking the rain off, end to end for pets: the real lua/world.lua springs
+-- behind a character that walks, runs, sprints, rides and turns on its heel,
+-- measured the way the core measures every panel (RainMotion on the placed
+-- pose). A walk never reaches the come-off threshold; a run that starts or
+-- stops, and anything rougher, does.
+local shake_px: float32, shake_pz: float32, shake_rot: float32 = 0, 0, 0
+local function shake_player(which: cint, id: uint64, out: *GuObject): cint
+  $out = { x = shake_px, y = 0, z = shake_pz, rotation = shake_rot, entity_id = 7, territory = 132, found = 1, height = 1.7 }
+  return 1
+end
+local shake_now: float64 = 2000
+local shake_prm: RainParams
+-- speed (yalms/s) for 3 s along the heading, then stand for 2 s; `turn`: run
+-- back the way it came instead of stopping. The peak jolt of each phase.
+local Shook = @record{ jolt: float32, shed: integer, left: integer }
+local function peak(speed: float32, turn: boolean, fps: float32): Shook
+  local p: RainPanel
+  p:init(9, 1234)
+  local wet = shake_prm
+  wet.intensity, wet.wiper = 1, RainWiper.None
+  for i = 1, 60 * 12 do p:step(&wet, 800, 500, 1 / 60) end
+  shake_px, shake_pz, shake_rot = 0, 0, 0
+  local dt: float32 = 1 / fps
+  for i = 1, (@integer)(2 * fps) do local okp = policy_world_place(301, shake_now, false) shake_now = shake_now + dt end -- settle
+  local out: Shook
+  for i = 1, (@integer)(6 * fps) do
+    local t = i * dt
+    if t <= 3 then shake_pz = shake_pz + speed * dt
+    elseif turn and t <= 4.5 then shake_rot = math.pi shake_pz = shake_pz - speed * dt end
+    local okp, pl = policy_world_place(301, shake_now, false)
+    assert(okp, 'placed')
+    local b = world_basis(pl)
+    local inv = 1 / b.ypp
+    local ax: RainAxes = { rx = b.rx, ry = b.ry, rz = b.rz, ux = b.ux * inv, uy = b.uy * inv, uz = b.uz * inv, fx = b.fx, fy = 0, fz = b.fz, ypp = b.ypp }
+    p.nemit = 0
+    if p.motion:track(pl.x, pl.y, pl.z, pl.yaw, pl.roll, 0, b.hw * b.ypp, dt, shake_prm.shake_jump, shake_prm.shake_max_speed) then
+      out.jolt = math.max(out.jolt, p.motion:jolt())
+      p:shake(&shake_prm, &ax, pl.width, pl.height, dt)
+    end
+    shake_now = shake_now + dt
+  end
+  assert(p.motion.resets == 0, 'a pet following its character never reads as a teleport')
+  out.shed, out.left = p.shaken, p.live
+  return out
+end
+do
+  local saved = world_host.get_object
+  world_host.get_object = shake_player
+  assert(luaL_loadstring(policy.L, "assert(CONFIG.world.command(301, 'pet') == nil)") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  local ok, prm = policy_rain_frame()
+  assert(ok and prm.shake and prm.shake_accel > prm.shake_slide and prm.shake_max > 0, 'shake tunables from lua/rain.lua')
+  shake_prm = prm
+  local walk, run, sprint, mount, heel = peak(2.4, false, 60), peak(6, false, 60), peak(7.8, false, 60), peak(14, false, 60), peak(6, true, 60)
+  print('pet jolt (yalms/s^2): walk, run, sprint, mount, run and turn back', walk.jolt, run.jolt, sprint.jolt, mount.jolt, heel.jolt)
+  print('pet drops shed:       walk, run, sprint, mount, run and turn back', walk.shed, run.shed, sprint.shed, mount.shed, heel.shed)
+  -- below the come-off threshold: the drops only slide, and a few near an edge slide off it
+  assert(walk.jolt < prm.shake_accel and walk.shed <= 8 and walk.left > 75, 'a walk does not strip the glass')
+  assert(run.shed > 0 and run.left > 0, 'a run that starts and stops knocks some off, not all')
+  assert(sprint.shed >= run.shed and mount.shed >= sprint.shed and heel.shed >= run.shed, 'rougher, more')
+  local run30, run144 = peak(6, false, 30), peak(6, false, 144)
+  print('run at 30 and 144 fps: jolt', run30.jolt, run144.jolt, 'shed', run30.shed, run144.shed)
+  -- the measure itself is frame-rate independent (tests/test_rain: the same
+  -- track sheds the same at 30, 60 and 144 fps); lua/world.lua's pet path is
+  -- rougher at 30 fps than at 60, so more comes off there -- only 60 against
+  -- 144 is held to a tolerance
+  assert(math.abs(run144.shed - run.shed) <= math.max(run.shed * 0.4, 5) and run30.shed >= run.shed, 'about the same at 60 and 144 fps')
+  assert(luaL_loadstring(policy.L, "CONFIG.world.forget(301)") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  world_host.get_object = saved
+  print('pet shake OK')
+end
+
 -- lua/world.lua persistence: written only when changed, through a swap, and
 -- without a pet's spring position or values that would not load back.
 do
