@@ -6,10 +6,12 @@ require 'math'
 require 'string'
 require 'core.imgui'
 require 'core.world'
+require 'core.theme'
 
 -- Colours ------------------------------------------------------------------------
 
--- The panels' gold accent and ink (core/app/worldview.nelua).
+-- spaceghost's gold accent and ink, as ImGui colours. What is drawn follows
+-- the theme: chrome_col(ChromeColor.Accent, a) and friends (core/theme.nelua).
 global CHROME_GOLD: uint32 <comptime> = 0xFF5AA0C8   -- im_col32(200, 160, 90, 255)
 global CHROME_INK: uint32 <comptime> = 0xFFDCE6F0    -- im_col32(240, 230, 220, 255)
 global CHROME_INK_DIM: uint32 <comptime> = 0xFFA0A5AA -- im_col32(170, 165, 160, 255)
@@ -67,14 +69,15 @@ global function chrome_palette(opacity: float32, glass: boolean, light: ChromeLi
   local bl = light.backlight
   local lr, lg, lb = 16 * bl, 18 * bl, 24 * bl
   local p: ChromePalette
+  local C = ChromeColor
   if glass then
-    p.body_top = chrome_rgba(34 + lr, 39 + lg, 50 + lb, a * 0.88)
-    p.body_bottom = chrome_rgba(10 + lr, 12 + lg, 17 + lb, a)
+    p.body_top = chrome_rgba(chrome_channel(C.GlassTop, 0) + lr, chrome_channel(C.GlassTop, 1) + lg, chrome_channel(C.GlassTop, 2) + lb, a * 0.88)
+    p.body_bottom = chrome_rgba(chrome_channel(C.GlassBottom, 0) + lr, chrome_channel(C.GlassBottom, 1) + lg, chrome_channel(C.GlassBottom, 2) + lb, a)
     p.edge_top = chrome_rgba(255, 255, 255, 64)
     p.edge_bottom = chrome_rgba(255, 255, 255, 8)
     p.sheen = chrome_rgba(255, 255, 255, 16)
   else
-    p.body_top = chrome_rgba(16 + lr, 18 + lg, 24 + lb, a)
+    p.body_top = chrome_rgba(chrome_channel(C.GlassFlat, 0) + lr, chrome_channel(C.GlassFlat, 1) + lg, chrome_channel(C.GlassFlat, 2) + lb, a)
     p.body_bottom = p.body_top
     p.edge_top = chrome_rgba(255, 255, 255, 14)
     p.edge_bottom = p.edge_top
@@ -86,9 +89,9 @@ global function chrome_palette(opacity: float32, glass: boolean, light: ChromeLi
   p.edge_bottom = chrome_tint(p.edge_bottom, light.r, light.g, light.b)
   p.sheen = chrome_tint(p.sheen, light.r, light.g, light.b)
   p.rim = chrome_rgba(0, 0, 0, a * 0.45)
-  p.glow = chrome_rgba(90, 150, 220, 255) -- the panels' backlight blue
-  p.pill = chrome_tint(chrome_rgba(255, 255, 255, 26), light.r, light.g, light.b)
-  p.pill_hover = chrome_tint(chrome_rgba(255, 255, 255, 14), light.r, light.g, light.b)
+  p.glow = chrome_col(C.Glow, 255) -- the panels' backlight
+  p.pill = chrome_tint(chrome_col(C.Tab, 26), light.r, light.g, light.b)
+  p.pill_hover = chrome_tint(chrome_col(C.Tab, 14), light.r, light.g, light.b)
   return p
 end
 
@@ -194,10 +197,12 @@ end
 global ChromeAction = @enum{
   None = 0,
   NewTab, Profiles, Window, Pin, Pet, Minimize, Settings, Hide, -- the tab bar
+  Share,                                                        -- the tab bar: a screenshot to the gallery
+  Shot,                                                         -- the tab bar: take one now, terminals included
   Dock, Close,                                                  -- a floating window's header
 }
 
-global ChromeIcon = @enum{ Plus = 0, Chevron, Window, Pin, Paw, Minimize, Gear, Hide, Dock, Close }
+global ChromeIcon = @enum{ Plus = 0, Chevron, Window, Pin, Paw, Minimize, Gear, Hide, Dock, Close, Camera, Shutter }
 
 global ChromeButton = @record{
   id: string,
@@ -207,7 +212,7 @@ global ChromeButton = @record{
   tip: string,
 }
 
-global CHROME_TAB_BUTTONS <comptime> = 8
+global CHROME_TAB_BUTTONS <comptime> = 10
 global chrome_tab_buttons: [CHROME_TAB_BUTTONS]ChromeButton = {
   { id = 'new', action = ChromeAction.NewTab, icon = ChromeIcon.Plus, group = 0, tip = 'New tab' },
   { id = 'profiles', action = ChromeAction.Profiles, icon = ChromeIcon.Chevron, group = 0, tip = 'New tab from a profile' },
@@ -215,6 +220,8 @@ global chrome_tab_buttons: [CHROME_TAB_BUTTONS]ChromeButton = {
   { id = 'pin', action = ChromeAction.Pin, icon = ChromeIcon.Pin, group = 1, tip = 'Pin this tab into the world where you stand' },
   { id = 'pet', action = ChromeAction.Pet, icon = ChromeIcon.Paw, group = 1, tip = 'Let this tab float beside you as a pet' },
   { id = 'min', action = ChromeAction.Minimize, icon = ChromeIcon.Minimize, group = 1, tip = 'Minimize this tab to the toolbar' },
+  { id = 'shot', action = ChromeAction.Shot, icon = ChromeIcon.Shutter, group = 2, tip = 'Take a screenshot with the terminals in it' },
+  { id = 'share', action = ChromeAction.Share, icon = ChromeIcon.Camera, group = 2, tip = 'Share your latest screenshot to the gallery' },
   { id = 'cfg', action = ChromeAction.Settings, icon = ChromeIcon.Gear, group = 2, tip = 'Settings' },
   { id = 'hide', action = ChromeAction.Hide, icon = ChromeIcon.Hide, group = 2, tip = 'Hide the dropdown' },
 }
@@ -266,7 +273,7 @@ global function chrome_draw_badge(dl: *ImDrawList, x: float32, y: float32, size:
   local r: float32 = 3
   local cx, cy = x + size - r - 2, y + r + 2
   imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r + 1.5, ring, 12)
-  imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r, CHROME_GOLD, 12)
+  imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r, chrome_col(ChromeColor.Accent, 255), 12)
 end
 
 -- Icons ---------------------------------------------------------------------------
@@ -311,6 +318,20 @@ global function chrome_draw_icon(dl: *ImDrawList, icon: ChromeIcon, cx: float32,
     imgui.DrawListAddLine(dl, vec2(cx - r, cy - r * 0.85), vec2(cx + r, cy - r * 0.85), col, t)
     imgui.DrawListAddLine(dl, vec2(cx, cy + r), vec2(cx, cy - r * 0.1), col, t)
     imgui.DrawListAddTriangleFilled(dl, vec2(cx - r * 0.5, cy + r * 0.05), vec2(cx + r * 0.5, cy + r * 0.05), vec2(cx, cy - r * 0.5), col)
+  elseif icon == ChromeIcon.Camera then
+    -- a camera body with its lens and the shutter bump
+    imgui.DrawListAddRect(dl, vec2(cx - r, cy - r * 0.55), vec2(cx + r, cy + r * 0.8), col, r * 0.25, 0, t * 0.85)
+    imgui.DrawListAddRectFilled(dl, vec2(cx - r * 0.35, cy - r * 0.85), vec2(cx + r * 0.3, cy - r * 0.55), col, 1, 0)
+    imgui.DrawListAddCircle(dl, vec2(cx, cy + r * 0.12), r * 0.38, col, 16, t * 0.85)
+  elseif icon == ChromeIcon.Shutter then
+    -- an open shutter: a ring of blades around a bright centre
+    imgui.DrawListAddCircle(dl, vec2(cx, cy), r * 0.95, col, 18, t * 0.85)
+    for k = 0, < 6 do
+      local a = (@float32)(k) * (@float32)(math.pi) / 3
+      local ux, uy = (@float32)(math.cos(a)), (@float32)(math.sin(a))
+      imgui.DrawListAddLine(dl, vec2(cx + ux * r * 0.3, cy + uy * r * 0.3), vec2(cx + ux * r * 0.9, cy + uy * r * 0.9), col, t * 0.8)
+    end
+    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r * 0.26, col, 12)
   elseif icon == ChromeIcon.Close then
     imgui.DrawListAddLine(dl, vec2(cx - r * 0.7, cy - r * 0.7), vec2(cx + r * 0.7, cy + r * 0.7), col, t)
     imgui.DrawListAddLine(dl, vec2(cx + r * 0.7, cy - r * 0.7), vec2(cx - r * 0.7, cy + r * 0.7), col, t)

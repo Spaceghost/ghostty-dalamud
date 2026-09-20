@@ -2,6 +2,9 @@
 
 -- Chat / hotbar commands (/term ...), shared by the shim and keymap actions.
 require 'core.app.popup'
+require 'core.app.selftest'
+require 'core.app.rain'
+require 'core.app.capture'
 local strconv: type = require 'detail.strconv'
 
 -- A terminal or profile number, optionally written "#3". False for anything
@@ -60,6 +63,7 @@ global function bell_demo_tick(now: float64): void
       host.bell_demo_step = 0
     end
   end
+  if host.bell_demo_label_until < 0 then host.bell_demo_label_until = now + 2.4 end -- a caption set outside a frame
   if now < host.bell_demo_label_until and #host.bell_demo_label > 0 then
     local vp = imgui.GetMainViewport()
     local dl = imgui.GetForegroundDrawList()
@@ -69,9 +73,22 @@ global function bell_demo_tick(now: float64): void
     local x = vp.Pos.x + (vp.Size.x - tsz.x) * 0.5
     local y = vp.Pos.y + vp.Size.y * 0.18
     local a = (@uint8)(math.clamp((host.bell_demo_label_until - now) / 0.4, 0, 1) * 230)
-    imgui.DrawListAddRectFilled(dl, vec2(x - 16, y - 10), vec2(x + tsz.x + 16, y + tsz.y + 10), im_col32(12, 16, 22, a), 10, 0)
-    imgui.DrawListAddText(dl, imgui.GetFont(), size, vec2(x, y), im_col32(230, 222, 200, a), (@cstring)(host.bell_demo_label.data), nilptr, 0, nilptr)
+    imgui.DrawListAddRectFilled(dl, vec2(x - 16, y - 10), vec2(x + tsz.x + 16, y + tsz.y + 10), chrome_col(ChromeColor.Label, a), 10, 0)
+    imgui.DrawListAddText(dl, imgui.GetFont(), size, vec2(x, y), chrome_col(ChromeColor.LabelInk, a), (@cstring)(host.bell_demo_label.data), nilptr, 0, nilptr)
   end
+end
+
+-- /term theme [name]: list the themes (log and caption), or switch to one
+-- at once (saved like a choice in the settings window).
+global function theme_command(args: string): cint
+  local msg = policy_theme_command(args)
+  policy_refresh()
+  if #msg == 0 then return 4 end
+  logf(LOG_INFO, '%s', msg)
+  host.bell_demo_label:destroy()
+  host.bell_demo_label = msg
+  host.bell_demo_label_until = -1
+  return 0
 end
 
 -- /term showcase off: close the demo terminals and show the player's own again.
@@ -134,6 +151,44 @@ local function showcase_start(): cint
   return 0
 end
 
+-- /term ask [question]: the /ask panel (lua/ask.lua, core/app/ask.nelua)
+-- when CONFIG.assistant.ui is 'panel'; otherwise, or for `/ask term ...`, a
+-- terminal running the assistant (lua/assistant.lua), the question as one argv element. Opens as a pet (a tab while no character
+-- is loaded), a tab or a window, as CONFIG.assistant.view says.
+global function assistant_command(asked: string): cint
+  -- the panel (lua/ask.lua) first; it hands back what the terminal should get
+  local handled, question = policy_ask_command(asked)
+  if handled then question:destroy() return 0 end
+  defer question:destroy() end
+  local ok, spec, err = policy_assistant_open(question)
+  if not ok then
+    logf(LOG_WARN, 'ask: %s', err)
+    spec:destroy()
+    err:destroy()
+    return 4
+  end
+  err:destroy()
+  local s = session_new_assistant(&spec, 80, 24)
+  if s == nilptr then spec:destroy() return 2 end
+  local placed = false
+  if spec.view == 'pet' and player_loaded() then placed = make_pet(s) end
+  if not placed and spec.view == 'window' then
+    host.windows:push(s)
+    set_visible(true)
+    placed = true
+  end
+  if not placed then
+    host.dropdown_tabs:push(s)
+    host.dropdown_active = #host.dropdown_tabs - 1
+    set_visible(true)
+    host.dropdown_focus_next = true
+  end
+  spec:destroy()
+  return 0
+end
+
+local window_hint_shown = false -- `/term window pull|list|close` points at /window once
+
 global function run_command(cmd: string): cint
   -- "verb arg...": verbs match whole words ("minimize" is not "min")
   local verb: string = cmd
@@ -147,6 +202,8 @@ global function run_command(cmd: string): cint
     -- the same teardown as gu_shutdown: nothing may keep steering the game
     showcase_stop()
     teardown_effects()
+    panels_shutdown() -- pulled windows back to the flat UI; the new policy pulls them in again
+    ask_shutdown() -- /ask's hidden sessions end; the reloaded Lua knows nothing of them
     -- DETACH, never CLOSE: the shells survive, and a reload that fails before
     -- agent_setup must not leave CLOSE frames queued for every one of them
     for i = 0, < #host.sessions do host.sessions[i].keep_on_agent = true end
@@ -158,6 +215,7 @@ global function run_command(cmd: string): cint
     host.cam_restore = host.cam_saved_d > 0 -- give the camera its zoom back
     host.world_drag_id = 0
     host.drag.id = 0
+    host.order_drag = {}
     host.dropdown_tabs:clear()
     host.windows:clear()
     host.minimized:clear()
@@ -179,6 +237,31 @@ global function run_command(cmd: string): cint
     toggle_visible()
     return 0
   elseif verb == 'pin' then
+    -- /term pin toggle: the focused world panel, pin <-> pet where it is (its title button)
+    local focused = world_panel(host.world_focus)
+    if arg == 'toggle' then
+      if focused == nilptr then sayf(LOG_WARN, 'pin toggle: no focused world panel') return 4 end
+      local e = world_toggle_pet(focused)
+      local rc: cint = 0
+      if #e > 0 then sayf(LOG_WARN, 'pin: %s', e) rc = 4 end
+      e:destroy()
+      return rc
+    end
+    -- a focused window panel moves (core/app/remotewin.nelua)
+    local on_window, wrc = remotewin_pin(arg)
+    if on_window then return wrc end
+    local on_panel, prc = panels_pin(arg) -- a focused pulled window moves the same way (core/app/panels.nelua)
+    if on_panel then return prc end
+    -- so does a focused world terminal (hide: out of sight and asleep)
+    if focused ~= nilptr then
+      local e: string
+      if arg == 'hide' or arg == 'hide off' then e = world_panel_hide(focused, arg == 'hide')
+      else e = policy_world_command(focused.id, arg) end
+      local rc: cint = 0
+      if #e > 0 then sayf(LOG_WARN, 'pin: %s', e) rc = 4 end
+      e:destroy()
+      return rc
+    end
     -- pin the active dropdown tab (or a new session) into the world
     local s: *Session = nilptr
     local from_tab = host.dropdown_active >= 0 and host.dropdown_active < #host.dropdown_tabs
@@ -265,6 +348,16 @@ global function run_command(cmd: string): cint
     if s == nilptr then return 5 end
     bring_forward(s)
     return 0
+  elseif verb == 'order' then
+    -- /term order left|right|first|last|N|swap ID: the focused pet's place in
+    -- the pet order (swap is what dragging one pet onto another does)
+    local s = find_session(host.world_focus)
+    if s == nilptr then sayf(LOG_WARN, 'order: no focused world panel') return 5 end
+    local e = policy_world_command(s.id, cmd)
+    local rc: cint = 0
+    if #e > 0 then sayf(LOG_WARN, 'order: %s', e) rc = 4 end
+    e:destroy()
+    return rc
   elseif verb == 'occluded' then
     -- /term occluded on|off: whether the focused world screen keeps running unseen
     local s = find_session(host.world_focus)
@@ -272,9 +365,30 @@ global function run_command(cmd: string): cint
     local e = policy_world_command(s.id, cmd)
     e:destroy()
     return 0
+  elseif verb == 'ask' then
+    -- /term ask [question]: the rest of the line, untouched, is the question
+    return assistant_command(arg)
+  elseif verb == 'theme' or verb == 'themes' then
+    -- /term theme [name]: list or switch
+    return theme_command(arg)
+  elseif verb == 'share' then
+    -- /term share [on|off|gallery|path]: offer the latest screenshot to the gallery (lua/gallery.lua)
+    return gallery_command(arg)
+  elseif verb == 'shot' then
+    -- /term shot [panel|full] [clean]: a PNG of this frame, terminals included
+    return shot_command(arg)
+  elseif verb == 'clip' then
+    -- /term clip [seconds] [gif|mp4] [panel] [clean]: the host encodes it
+    return clip_command(arg)
+  elseif verb == 'selftest' then
+    -- /term selftest [list | all | suite...]: checks inside the live game (core/app/selftest.nelua)
+    return selftest_command(arg)
   elseif verb == 'bell' then
     -- /term bell [ripple|sonar|burst|aura|calm|custom|demo]
     return bell_command(arg)
+  elseif verb == 'rain' then
+    -- /term rain on|off|auto: force rain on world panels, or follow the weather
+    return rain_command(arg)
   elseif cmd == 'depth' or cmd == 'depth retry' or cmd == 'depth show' then
     -- /term depth [retry|show]: how world panels are occluded, and why (retry
     -- forgets a latched failure; show toggles colouring panels by the test)
@@ -301,6 +415,17 @@ global function run_command(cmd: string): cint
     restore(s)
     return 0
   elseif verb == 'window' then
+    -- /term window list | pull ... | close: remote desktop windows
+    local sub = arg
+    local ssp = arg:find(' ', 1, true)
+    if ssp > 0 then sub = arg:subview(1, ssp - 1) end
+    if sub == 'list' or sub == 'pull' or sub == 'close' then
+      if not window_hint_shown then
+        window_hint_shown = true
+        logf(LOG_INFO, 'hint: /window %s does the same (/window pull | run CMD | list | close)', arg)
+      end
+      return remotewin_command(arg)
+    end
     local n = policy.default_profile
     if #arg > 0 then
       local ok, id = parse_id(arg)
@@ -313,6 +438,8 @@ global function run_command(cmd: string): cint
       set_visible(true)
     end
     return 0
+  elseif verb == 'adopt' or verb == 'release' or verb == 'adopted' then
+    return panels_command(verb, arg) -- flat windows into the world and back (docs/ADOPT.md)
   elseif verb == 'new' then
     local n = policy.default_profile
     if #arg > 0 then
@@ -330,4 +457,37 @@ global function run_command(cmd: string): cint
     return 0
   end
   return 3
+end
+
+-- A command of its own (CONFIG.host.verb_commands) standing for one /term
+-- verb, with its arguments: /window -> window_command, /ask -> the
+-- assistant, /agent ask -> the assistant too. 0 on success, like run_command.
+global function run_verb_command(verb: string, args: string): cint
+  local a: string = args
+  while #a > 0 and a.data[0] == ' '_b do a = a:subview(2) end
+  if verb == 'window' then
+    -- /window adopt NAME | release [NAME] | adopted: flat windows (core/app/panels.nelua)
+    local sub: string = a
+    local rest: string
+    local sp = a:find(' ', 1, true)
+    if sp > 0 then sub, rest = a:subview(1, sp - 1), a:subview(sp + 1) end
+    local prc = panels_command(sub, rest)
+    if prc ~= 3 then return prc end
+    return window_command(a)
+  elseif verb == 'ask' then
+    return assistant_command(a)
+  elseif verb == 'agent' then
+    if a == 'ask' then return assistant_command('') end
+    if #a > 4 and a:subview(1, 4) == 'ask ' then return assistant_command(a:subview(5)) end
+    logf(LOG_WARN, 'usage: /agent ask [question]')
+    return 4
+  end
+  -- any other verb: the /term line it stands for
+  local sb: stringbuilder
+  sb:write(verb, ' ', a)
+  local line = sb:promote()
+  local rc = run_command(line)
+  if rc == 3 then logf(LOG_WARN, 'unknown command: %s', line) end
+  line:destroy()
+  return rc
 end

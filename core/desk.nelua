@@ -1,0 +1,115 @@
+-- The desk scene's props as Lua asks for them (lua/desk.lua): up to
+-- DESK_MAX_PROPS furniture models, each at a world position, turned about +Y
+-- and uniformly scaled. Lua decides what and where; core/app/deskprops.nelua
+-- makes the client-side objects and frees them. Everything here is plain
+-- data, so the host tests drive it without a game.
+--
+--   ghostty.desk_props({ { model = 'bgcommon/...mdl', x =, y =, z =, yaw =, scale = }, ... })
+--   ghostty.desk_props(nil)           -- or {}: no props
+--   ghostty.desk_blocked() -> flags   -- DESK_BLOCK_* bits, 0 while props may show
+require 'core.lua'
+require 'math'
+require 'string'
+
+global DESK_MAX_PROPS <comptime> = 4
+
+-- Why no props may show right now (core/app/deskprops.nelua sets these every
+-- frame; the first four are the shim's scene flags).
+global DESK_BLOCK_CUTSCENE <comptime> = 1
+global DESK_BLOCK_GPOSE <comptime> = 2
+global DESK_BLOCK_BETWEEN_AREAS <comptime> = 4
+global DESK_BLOCK_EVENT <comptime> = 8
+global DESK_BLOCK_COMBAT <comptime> = 16
+global DESK_BLOCK_NO_CHARACTER <comptime> = 32
+global DESK_BLOCK_MOUNTED <comptime> = 64
+global DESK_BLOCK_ZONE <comptime> = 128   -- the zone changed under the props
+
+global DeskProp = @record{
+  model: [256]cchar,
+  x: float32, y: float32, z: float32,
+  yaw: float32,     -- radians about +Y (the game's rotation: facing (sin, 0, cos))
+  scale: float32,   -- uniform
+}
+
+global DeskWant = @record{
+  count: integer,
+  props: [DESK_MAX_PROPS]DeskProp,
+  serial: uint32,   -- bumped on every change
+}
+
+global desk_want: DeskWant
+global desk_block: cint = 0
+
+-- The rotation about +Y by `yaw` as a quaternion's (qy, qw); qx = qz = 0.
+global function desk_yaw_quat(yaw: float32): (float32, float32)
+  return (@float32)(math.sin(yaw * 0.5)), (@float32)(math.cos(yaw * 0.5))
+end
+
+global function desk_want_clear(): void
+  if desk_want.count == 0 then return end
+  desk_want.count = 0
+  desk_want.serial = desk_want.serial + 1
+end
+
+local function l_desk_props(L: *lua_State): cint
+  local n: integer = 0
+  local next: DeskWant
+  if lua_type(L, 1) == LUA_TTABLE then
+    local len = (@integer)(lua_rawlen(L, 1))
+    for i = 1, len do
+      if n >= DESK_MAX_PROPS then break end
+      lua_rawgeti(L, 1, i)
+      if lua_type(L, -1) == LUA_TTABLE then
+        local model = lua_field_string(L, -1, 'model', '')
+        local scale = lua_field_number(L, -1, 'scale', 1)
+        if #model > 0 and #model < 256 and scale > 0 then
+          local p = &next.props[n]
+          for k = 0, < #model do p.model[k] = (@cchar)(model.data[k]) end
+          p.model[#model] = 0
+          p.x = (@float32)(lua_field_number(L, -1, 'x', 0))
+          p.y = (@float32)(lua_field_number(L, -1, 'y', 0))
+          p.z = (@float32)(lua_field_number(L, -1, 'z', 0))
+          p.yaw = (@float32)(lua_field_number(L, -1, 'yaw', 0))
+          p.scale = (@float32)(scale)
+          n = n + 1
+        end
+        model:destroy()
+      end
+      lua_pop(L, 1)
+    end
+  end
+  -- unchanged: keep the serial, so the objects are not touched
+  local same = n == desk_want.count
+  for i = 0, < n do
+    if not same then break end
+    local a, b = &next.props[i], &desk_want.props[i]
+    if a.x ~= b.x or a.y ~= b.y or a.z ~= b.z or a.yaw ~= b.yaw or a.scale ~= b.scale then same = false break end
+    for k = 0, < 256 do
+      if a.model[k] ~= b.model[k] then same = false break end
+      if a.model[k] == 0 then break end
+    end
+  end
+  if not same then
+    next.count = n
+    next.serial = desk_want.serial + 1
+    desk_want = next
+  end
+  lua_pushboolean(L, desk_block == 0 and 1 or 0)
+  return 1
+end
+
+local function l_desk_blocked(L: *lua_State): cint
+  lua_pushinteger(L, desk_block)
+  return 1
+end
+
+-- Adds desk_props/desk_blocked to the `ghostty` table (world_lua_register
+-- makes it). A fresh Lua state asks for nothing yet.
+global function desk_lua_register(L: *lua_State): void
+  desk_want_clear()
+  lua_getglobal(L, 'ghostty')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return end
+  lua_pushcclosure(L, l_desk_props, 0) lua_setfield(L, -2, 'desk_props')
+  lua_pushcclosure(L, l_desk_blocked, 0) lua_setfield(L, -2, 'desk_blocked')
+  lua_pop(L, 1)
+end

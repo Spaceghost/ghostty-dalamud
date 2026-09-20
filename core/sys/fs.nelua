@@ -1,89 +1,63 @@
--- The file operations plain Lua lacks, for lua/migrate.lua:
--- ghostty.mkdir(path), ghostty.listdir(path) and ghostty.make_private(path).
+-- The file operations plain Lua lacks, for lua/migrate.lua and lua/gallery.lua:
+-- ghostty.mkdir(path), ghostty.listdir(path), ghostty.make_private(path),
+-- ghostty.known_folder(which) and ghostty.file_size(path), plus
+-- ghostty.platform() for lua/platform.lua.
+--
+-- Every path here is UTF-8, both ways: on Windows the wide APIs are used with
+-- core/sys/winpath.nelua doing the conversion, because a player whose user
+-- name is not spellable in the active code page would otherwise get no
+-- screenshot folder at all. That is also why Lua's own os.getenv and io.open
+-- are not enough for lua/gallery.lua: the CRT's are ANSI.
 require 'string'
 require 'core.lua'
+require 'core.sys.fsbase'
+require 'core.sys.platform'
+require 'core.sys.winpath'
 
 ## if ccinfo.is_windows then
 ## cinclude '<windows.h>'
-local WIN32_FIND_DATAA <cimport, nodecl> = @record{ dwFileAttributes: uint32, cFileName: [260]cchar }
-local function CreateDirectoryA(path: cstring, sa: pointer): cint <cimport, nodecl> end
-local function GetLastError(): uint32 <cimport, nodecl> end
-local function FindFirstFileA(pattern: cstring, data: *WIN32_FIND_DATAA): pointer <cimport, nodecl> end
-local function FindNextFileA(h: pointer, data: *WIN32_FIND_DATAA): cint <cimport, nodecl> end
+## cinclude '<shlobj.h>'
+## linklib 'shell32'
+## linklib 'ole32'
+local WIN32_FIND_DATAW <cimport, nodecl> = @record{ dwFileAttributes: uint32, cFileName: [260]uint16 }
+local function FindFirstFileW(pattern: pointer, data: *WIN32_FIND_DATAW): pointer <cimport, nodecl> end
+local function FindNextFileW(h: pointer, data: *WIN32_FIND_DATAW): cint <cimport, nodecl> end
 local function FindClose(h: pointer): cint <cimport, nodecl> end
-local ERROR_ALREADY_EXISTS: uint32 <cimport, nodecl, const>
 local INVALID_HANDLE_VALUE: pointer <cimport, nodecl, const>
-## linklib 'advapi32'
-local function GetCurrentProcess(): pointer <cimport, nodecl> end
-local function OpenProcessToken(process: pointer, access: uint32, token: *pointer): cint <cimport, nodecl> end
-local function GetTokenInformation(token: pointer, class: cint, info: pointer, len: uint32, retlen: *uint32): cint <cimport, nodecl> end
-local function CloseHandle(h: pointer): cint <cimport, nodecl> end
-local function InitializeAcl(acl: pointer, len: uint32, revision: uint32): cint <cimport, nodecl> end
-local function AddAccessAllowedAce(acl: pointer, revision: uint32, mask: uint32, sid: pointer): cint <cimport, nodecl> end
-local function InitializeSecurityDescriptor(sd: pointer, revision: uint32): cint <cimport, nodecl> end
-local function SetSecurityDescriptorDacl(sd: pointer, present: cint, acl: pointer, defaulted: cint): cint <cimport, nodecl> end
-local function SetSecurityDescriptorControl(sd: pointer, mask: uint16, bits: uint16): cint <cimport, nodecl> end
-local function SetFileSecurityA(path: cstring, info: uint32, sd: pointer): cint <cimport, nodecl> end
-local TOKEN_QUERY: uint32 <cimport, nodecl, const>
-local TokenUser: cint <cimport, nodecl, const>
-local ACL_REVISION: uint32 <cimport, nodecl, const>
-local FILE_ALL_ACCESS: uint32 <cimport, nodecl, const>
-local SECURITY_DESCRIPTOR_REVISION: uint32 <cimport, nodecl, const>
-local SE_DACL_PROTECTED: uint16 <cimport, nodecl, const>
-local DACL_SECURITY_INFORMATION: uint32 <cimport, nodecl, const>
+local FILETIME <cimport, nodecl> = @record{ dwLowDateTime: uint32, dwHighDateTime: uint32 }
+local WIN32_FILE_ATTRIBUTE_DATA <cimport, nodecl> = @record{
+  dwFileAttributes: uint32,
+  ftCreationTime: FILETIME, ftLastAccessTime: FILETIME, ftLastWriteTime: FILETIME,
+  nFileSizeHigh: uint32, nFileSizeLow: uint32,
+}
+local function GetFileAttributesExW(path: pointer, level: cint, info: pointer): cint <cimport, nodecl> end
+-- the known folders, by value rather than by the FOLDERID_* symbols, which
+-- would pull in libuuid at link time for three constants
+local GUID <cimport, nodecl> = @record{ Data1: uint32, Data2: uint16, Data3: uint16, Data4: [8]uint8 }
+local KF_PROFILE: GUID = { Data1 = 0x5E6C858F, Data2 = 0x0E22, Data3 = 0x4760, Data4 = {0x9A,0xFE,0xEA,0x33,0x17,0xB6,0x71,0x73} }
+local KF_DOCUMENTS: GUID = { Data1 = 0xFDD39AD0, Data2 = 0x238F, Data3 = 0x46AF, Data4 = {0xAD,0xB4,0x6C,0x85,0x48,0x03,0x69,0xC7} }
+local KF_PICTURES: GUID = { Data1 = 0x33E28130, Data2 = 0x4E1E, Data3 = 0x4676, Data4 = {0x83,0x5A,0x98,0x39,0x5C,0x3B,0xC3,0xBB} }
+local function SHGetKnownFolderPath(rfid: pointer, flags: uint32, token: pointer, out: *pointer): clong <cimport, nodecl> end
+local function CoTaskMemFree(p: pointer): void <cimport, nodecl> end
+local FILE_ATTRIBUTE_DIRECTORY: uint32 <comptime> = 0x10
 ## else
-## cinclude '<sys/stat.h>'
 ## cinclude '<dirent.h>'
-## cinclude '<errno.h>'
+## cinclude '<sys/stat.h>'
+## cinclude '<stdlib.h>'
 local dirent <cimport, nodecl, ctypedef> = @record{ d_name: [256]cchar }
 local DIR <cimport, nodecl> = @record{}
-local function c_mkdir(path: cstring, mode: cuint): cint <cimport 'mkdir', nodecl> end
-local function chmod(path: cstring, mode: cuint): cint <cimport, nodecl> end
 local function opendir(path: cstring): *DIR <cimport, nodecl> end
 local function readdir(d: *DIR): *dirent <cimport, nodecl> end
 local function closedir(d: *DIR): cint <cimport, nodecl> end
-local errno: cint <cimport, nodecl>
-local EEXIST: cint <cimport, nodecl, const>
+local stat_t <cimport 'struct stat', nodecl> = @record{ st_mode: uint32, st_size: int64 }
+local function c_stat(path: cstring, st: *stat_t): cint <cimport 'stat', nodecl> end
+local function getenv(name: cstring): cstring <cimport, nodecl> end
 ## end
 
--- true when the directory now exists (created or already there)
-global function fs_mkdir(path: cstring): boolean
-  ## if ccinfo.is_windows then
-    return CreateDirectoryA(path, nilptr) ~= 0 or GetLastError() == ERROR_ALREADY_EXISTS
-  ## else
-    return c_mkdir(path, 493) == 0 or errno == EEXIST -- 0755
-  ## end
-end
-
--- true when only the current user can open the file: mode 0600, or on Windows
--- a protected DACL naming just the user, which Wine maps onto the unix mode
-global function fs_make_private(path: cstring): boolean
-  ## if ccinfo.is_windows then
-    local token: pointer
-    if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token) == 0 then return false end
-    local user: [64]usize -- TOKEN_USER: the SID pointer first, then the SID itself
-    local len: uint32 = 0
-    local got = GetTokenInformation(token, TokenUser, &user, #user * #usize, &len)
-    CloseHandle(token)
-    if got == 0 then return false end
-    local acl: [32]usize
-    local sd: [8]usize
-    return InitializeAcl(&acl, #acl * #usize, ACL_REVISION) ~= 0
-      and AddAccessAllowedAce(&acl, ACL_REVISION, FILE_ALL_ACCESS, (@pointer)(user[0])) ~= 0
-      and InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION) ~= 0
-      and SetSecurityDescriptorDacl(&sd, 1, &acl, 0) ~= 0
-      and SetSecurityDescriptorControl(&sd, SE_DACL_PROTECTED, SE_DACL_PROTECTED) ~= 0
-      and SetFileSecurityA(path, DACL_SECURITY_INFORMATION, &sd) ~= 0
-  ## else
-    return chmod(path, 384) == 0 -- 0600
-  ## end
-end
-
-local function push_name(L: *lua_State, name: cstring, n: *integer): void
-  local s: string = name
-  if s == '.' or s == '..' then return end
+local function push_name(L: *lua_State, s: string, n: *integer): void
+  if s.size == 0 or s == '.' or s == '..' then return end
   $n = $n + 1
-  lua_pushstring(L, name)
+  lua_pushlstring(L, (@cstring)(s.data), s.size)
   lua_rawseti(L, -2, $n)
 end
 
@@ -101,21 +75,33 @@ local function l_make_private(L: *lua_State): cint
   return 1
 end
 
+-- ghostty.platform() -> 'windows' | 'wine' | 'linux' | 'macos' | 'posix'
+local function l_platform(L: *lua_State): cint
+  local name = platform_name()
+  lua_pushlstring(L, (@cstring)(name.data), name.size)
+  return 1
+end
+
 -- ghostty.listdir(path) -> { entry names, unsorted }, or nil when unreadable
 local function l_listdir(L: *lua_State): cint
   local p = lua_tolstring(L, 1, nilptr)
   if p == nilptr then lua_pushnil(L) return 1 end
   local n: integer = 0
   ## if ccinfo.is_windows then
-    local pattern = (@string)(p) .. '\\*\0'
-    local fd: WIN32_FIND_DATAA
-    local h = FindFirstFileA((@cstring)(pattern.data), &fd)
+    local pattern = (@string)(p) .. '\\*'
+    local wpat: [WINPATH_MAX]uint16
+    local wide_ok = winpath_wide(pattern, (@*[0]uint16)(&wpat), WINPATH_MAX) >= 0
     pattern:destroy()
+    if not wide_ok then lua_pushnil(L) return 1 end
+    local fd: WIN32_FIND_DATAW
+    local h = FindFirstFileW((@pointer)(&wpat), &fd)
     if h == INVALID_HANDLE_VALUE then lua_pushnil(L) return 1 end
     lua_createtable(L, 8, 0)
     repeat
-      push_name(L, (@cstring)(&fd.cFileName), &n)
-    until FindNextFileA(h, &fd) == 0
+      local name = winpath_utf8((@*[0]uint16)(&fd.cFileName))
+      push_name(L, name, &n)
+      name:destroy()
+    until FindNextFileW(h, &fd) == 0
     FindClose(h)
   ## else
     local d = opendir(p)
@@ -124,19 +110,85 @@ local function l_listdir(L: *lua_State): cint
     while true do
       local e = readdir(d)
       if e == nilptr then break end
-      push_name(L, (@cstring)(&e.d_name), &n)
+      push_name(L, (@string)((@cstring)(&e.d_name)), &n)
     end
     closedir(d)
   ## end
   return 1
 end
 
--- Adds mkdir/listdir/make_private to the global `ghostty` table (world_lua_register makes it).
+-- ghostty.known_folder('profile'|'documents'|'pictures') -> UTF-8 path, or nil.
+-- Windows answers from the shell, which knows a relocated Documents and gives
+-- the name in full even when the code page cannot spell it; on POSIX it is
+-- $HOME and the usual two folders under it, which is what the host tests use.
+local function l_known_folder(L: *lua_State): cint
+  local p = lua_tolstring(L, 1, nilptr)
+  if p == nilptr then lua_pushnil(L) return 1 end
+  local which: string = p
+  ## if ccinfo.is_windows then
+    local id: *GUID = nilptr
+    if which == 'profile' then id = &KF_PROFILE
+    elseif which == 'documents' then id = &KF_DOCUMENTS
+    elseif which == 'pictures' then id = &KF_PICTURES end
+    if id == nilptr then lua_pushnil(L) return 1 end
+    local wp: pointer = nilptr
+    if SHGetKnownFolderPath((@pointer)(id), 0, nilptr, &wp) < 0 or wp == nilptr then lua_pushnil(L) return 1 end
+    local s = winpath_utf8((@*[0]uint16)(wp))
+    CoTaskMemFree(wp)
+    if s.size == 0 then lua_pushnil(L) s:destroy() return 1 end
+    lua_pushlstring(L, (@cstring)(s.data), s.size)
+    s:destroy()
+  ## else
+    local home = getenv('HOME')
+    if home == nilptr then lua_pushnil(L) return 1 end
+    local base: string = home
+    if which == 'profile' then
+      lua_pushlstring(L, (@cstring)(base.data), base.size)
+    elseif which == 'documents' or which == 'pictures' then
+      local sub: string = 'Documents'
+      if which == 'pictures' then sub = 'Pictures' end
+      local full = string.format('%s/%s', base, sub)
+      lua_pushlstring(L, (@cstring)(full.data), full.size)
+      full:destroy()
+    else
+      lua_pushnil(L)
+    end
+  ## end
+  return 1
+end
+
+-- ghostty.file_size(path) -> bytes, or nil when there is nothing to read
+-- (missing, a directory, or a name the platform call refused).
+local function l_file_size(L: *lua_State): cint
+  local p = lua_tolstring(L, 1, nilptr)
+  if p == nilptr then lua_pushnil(L) return 1 end
+  ## if ccinfo.is_windows then
+    local w: [WINPATH_MAX]uint16
+    if winpath_wide((@string)(p), (@*[0]uint16)(&w), WINPATH_MAX) < 0 then lua_pushnil(L) return 1 end
+    local data: WIN32_FILE_ATTRIBUTE_DATA
+    if GetFileAttributesExW((@pointer)(&w), 0, &data) == 0 then lua_pushnil(L) return 1 end
+    if data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY ~= 0 then lua_pushnil(L) return 1 end
+    local n: uint64 = ((@uint64)(data.nFileSizeHigh) << 32) | (@uint64)(data.nFileSizeLow)
+    lua_pushnumber(L, (@number)(n))
+  ## else
+    local st: stat_t
+    if c_stat(p, &st) ~= 0 then lua_pushnil(L) return 1 end
+    if st.st_mode & 0xF000 == 0x4000 then lua_pushnil(L) return 1 end -- S_IFDIR
+    lua_pushnumber(L, (@number)(st.st_size))
+  ## end
+  return 1
+end
+
+-- Adds mkdir/listdir/make_private/known_folder/file_size/platform to the global
+-- `ghostty` table (world_lua_register makes it).
 global function fs_lua_register(L: *lua_State): void
   lua_getglobal(L, 'ghostty')
   if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return end
   lua_pushcclosure(L, l_mkdir, 0) lua_setfield(L, -2, 'mkdir')
   lua_pushcclosure(L, l_listdir, 0) lua_setfield(L, -2, 'listdir')
   lua_pushcclosure(L, l_make_private, 0) lua_setfield(L, -2, 'make_private')
+  lua_pushcclosure(L, l_known_folder, 0) lua_setfield(L, -2, 'known_folder')
+  lua_pushcclosure(L, l_file_size, 0) lua_setfield(L, -2, 'file_size')
+  lua_pushcclosure(L, l_platform, 0) lua_setfield(L, -2, 'platform')
   lua_pop(L, 1)
 end

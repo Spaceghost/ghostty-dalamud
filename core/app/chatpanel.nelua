@@ -1,0 +1,375 @@
+-- The game's own chat log pulled into the world (docs/ADOPT.md; the pure
+-- parts are core/chatlog.nelua). Not yet observed in game.
+--
+-- The native ChatLog addon cannot be moved into ImGui, so the pet draws the
+-- chat itself: the shim forwards every chat message (IChatGui, type, sender
+-- and text as plain UTF-8) to gu_chat, from the framework thread; the lines
+-- wait in a small locked queue until the frame moves them into the ring of
+-- the last 500 (kept whether or not the chat is pulled, so a pull shows the
+-- recent history). While the chat is pulled the ChatLog addons are hidden
+-- through the shim (addon_show) and shown again on release; typing on the
+-- focused pet goes through the game's chat box (chat_send, the way xiv-mcp
+-- sends: sanitised, then UIModule.ProcessChatBoxEntry on the framework thread).
+require 'core.app.panelkit'
+require 'core.chatlog'
+require 'core.sys.procguard'
+
+local PENDING_MAX <comptime> = 256
+local HIDE_EVERY <comptime> = 0.25   -- seconds between re-hiding the addons the game shows again
+local ESC_TWICE <comptime> = 0.5
+local INPUT_H: float32 <comptime> = 44
+
+local Pending = @record{ kind: integer, sender: string, text: string }
+
+global ChatPanel = @record{
+  s: *Session,
+  input: ChatInput,
+  scroll: integer,          -- rows scrolled up from the newest
+  hidden: vector(string),   -- addons hidden by us, shown again on release
+  hide_at: float64,
+  colours: [128]uint32,     -- IM_COL32 per channel, 0 = not looked up yet
+  last_esc: float64,
+  keyboard_last: boolean,
+  send_warned: boolean,
+}
+
+global chat_ring: ChatRing
+local pending: vector(Pending)
+local pending_dropped = 0
+local chat: *ChatPanel = nilptr
+
+-- A chat message from the shim (gu_chat), on any thread.
+global function chatpanel_post(kind: cint, sender: cstring, text: cstring): void
+  local se: string
+  local te: string
+  if sender ~= nilptr then se = string.copy(sender) end
+  if text ~= nilptr then te = string.copy(text) end
+  procguard_lock()
+  if #pending >= PENDING_MAX then
+    local old = pending[0]
+    old.sender:destroy()
+    old.text:destroy()
+    pending:remove(0)
+    pending_dropped = pending_dropped + 1
+  end
+  pending:push(Pending{ kind = kind, sender = se, text = te })
+  procguard_unlock()
+end
+
+-- The frame moves the queued lines into the ring.
+local function drain(): void
+  procguard_lock()
+  for i = 0, < #pending do
+    chatlog_push(&chat_ring, pending[i].kind, pending[i].sender, pending[i].text)
+    pending[i].sender:destroy()
+    pending[i].text:destroy()
+    if chat ~= nilptr and chat.scroll > 0 then chat.scroll = chat.scroll + 1 end -- a scrolled-up view stays put
+  end
+  pending:clear()
+  procguard_unlock()
+end
+
+global function chatpanel_of(s: *Session): *ChatPanel
+  if chat ~= nilptr and chat.s == s then return chat end
+  return nilptr
+end
+
+global function chatpanel_open(): boolean return chat ~= nilptr end
+
+-- Addons ------------------------------------------------------------------------------------
+
+-- The flat chat's rectangle on the screen (ChatLog), or an empty one.
+global function chatpanel_flat_rect(): (boolean, ImVec4)
+  local r: ImVec4
+  if host.api.addon_rect == nilptr then return false, r end
+  local x: float32, y: float32, w: float32, h: float32 = 0, 0, 0, 0
+  if host.api.addon_rect('ChatLog', &x, &y, &w, &h) ~= 1 or w < 8 or h < 8 then return false, r end
+  return true, ImVec4{ x, y, x + w, y + h }
+end
+
+-- Hide every configured chat addon the game shows (again).
+local function hide_addons(cp: *ChatPanel): void
+  if host.api.addon_rect == nilptr or host.api.addon_show == nilptr then return end
+  local names = adopt_lua_chat_addons()
+  local start = 0
+  for i = 0, < #names do
+    if names.data[i] == '\n'_b then
+      local name = names:subview(start + 1, i)
+      local z = name .. '\0'
+      local x: float32, y: float32, w: float32, h: float32 = 0, 0, 0, 0
+      if host.api.addon_rect((@cstring)(z.data), &x, &y, &w, &h) == 1 and host.api.addon_show((@cstring)(z.data), 0) == 1 then
+        local known = false
+        for k = 0, < #cp.hidden do
+          if cp.hidden[k] == name then known = true break end
+        end
+        if not known then cp.hidden:push(name:copy()) end
+      end
+      z:destroy()
+      start = i + 1
+    end
+  end
+  names:destroy()
+end
+
+local function show_addons(cp: *ChatPanel): void
+  for k = 0, < #cp.hidden do
+    if host.api.addon_show ~= nilptr then
+      local z = cp.hidden[k] .. '\0'
+      host.api.addon_show((@cstring)(z.data), 1)
+      z:destroy()
+    end
+    cp.hidden[k]:destroy()
+  end
+  cp.hidden:clear()
+end
+
+-- Open and close ------------------------------------------------------------------------------
+
+local function free_chat(cp: *ChatPanel): void
+  show_addons(cp)
+  cp.hidden:destroy()
+  chatinput_destroy(&cp.input)
+  delete(cp)
+end
+
+local function chat_closed(s: *Session): void
+  if chat == nilptr or chat.s ~= s then return end
+  local cp = chat
+  chat = nilptr
+  free_chat(cp)
+  log(LOG_INFO, 'chat: given back to the flat UI')
+  panels_dirty = true
+end
+
+-- Pull the game's chat into the world (flying out of the flat chat when its
+-- rectangle is known). The panel's id, or 0 and why.
+global function chatpanel_pull(): (integer, string)
+  if chat ~= nilptr then return 0, 'the chat is already in the world' end
+  if not player_loaded() then return 0, 'no player (log in first)' end
+  local s = session_new_local('chat', 20, 4)
+  if s == nilptr then return 0, 'no session' end
+  s.kind = TransportKind.Panel
+  s.window_close = chat_closed
+  s.appear = 0
+  if not make_pet(s) then
+    session_remove(s)
+    return 0, 'the pet could not be placed'
+  end
+  s.title:destroy()
+  s.title = string.copy('Chat')
+  local cp = new(@ChatPanel)
+  cp.s = s
+  chat = cp
+  local have, flat = chatpanel_flat_rect()
+  if have then
+    adopt_lua_size(s.id, flat.z - flat.x, flat.w - flat.y + INPUT_H, 2 * PANEL_PAD, PANEL_TITLE + PANEL_PAD)
+    panel_flight_start(s.id, ImVec4{ flat.x, flat.y - PANEL_TITLE, flat.z, flat.w + INPUT_H })
+  else
+    local w = adopt_lua_chat_number('width', 1300)
+    local h = adopt_lua_chat_number('height', 760)
+    adopt_lua_size(s.id, 1, 1, w - 1, h - 1) -- CONFIG.adopt.chat's own size
+  end
+  hide_addons(cp)
+  cp.hide_at = host.last_time
+  if host.api.addon_show == nilptr then log(LOG_WARN, 'chat: the plugin shim cannot hide the game\'s chat (needs a newer shim)') end
+  logf(LOG_INFO, 'chat: pulled into the world as panel %d', s.id)
+  panels_dirty = true
+  return s.id, ''
+end
+
+global function chatpanel_release(): (boolean, string)
+  if chat == nilptr then return false, 'the chat is not in the world' end
+  close_terminal(chat.s) -- Session:close -> chat_closed shows the flat chat again
+  return true, ''
+end
+
+-- Per frame -------------------------------------------------------------------------------------
+
+global function chatpanel_tick(now: float64, in_world: boolean): void
+  drain()
+  if chat == nilptr then return end
+  local cp = chat
+  if now - cp.hide_at > HIDE_EVERY then
+    cp.hide_at = now
+    hide_addons(cp)
+  end
+  local in_list = false
+  for k = 0, < #host.world do
+    if host.world[k] == cp.s then in_list = true break end
+  end
+  if not in_list and not cp.s.leaving and in_world then close_terminal(cp.s) end -- popped in: back to the flat UI
+end
+
+local function colour_of(cp: *ChatPanel, kind: integer): uint32
+  local k = kind & 0x7F
+  if cp.colours[k] ~= 0 then return cp.colours[k] end
+  local key, rgb = adopt_lua_chat_colour(k)
+  local col = im_col32((@uint8)((rgb >> 16) & 0xFF), (@uint8)((rgb >> 8) & 0xFF), (@uint8)(rgb & 0xFF), 255)
+  if #key > 0 and host.api.config_uint ~= nilptr then
+    local z = key .. '\0'
+    local v: uint32 = 0
+    if host.api.config_uint((@cstring)(z.data), &v) == 1 then col = chatlog_game_colour(v) end
+    z:destroy()
+  end
+  key:destroy()
+  cp.colours[k] = col
+  return col
+end
+
+local measure_font: *ImFont = nilptr
+local measure_size: float32 = 0
+local function measure(s: string, start: integer, len: integer): float32
+  if len <= 0 then return 0 end
+  local out: ImVec2
+  local p = (@cstring)(&s.data[start])
+  imgui.FontCalcTextSizeA(&out, measure_font, measure_size, 1e9, 0, p, (@cstring)(&s.data[start + len]), nilptr)
+  return out.x
+end
+
+local function send_line(cp: *ChatPanel): void
+  local line = chatinput_take(&cp.input)
+  if #line == 0 then line:destroy() return end
+  if host.api.chat_send == nilptr then
+    if not cp.send_warned then
+      cp.send_warned = true
+      log(LOG_WARN, 'chat: this plugin shim cannot send chat (needs a newer shim)')
+    end
+  else
+    local z = line .. '\0'
+    if host.api.chat_send((@cstring)(z.data)) ~= 1 then log(LOG_WARN, 'chat: the game refused the line') end
+    z:destroy()
+  end
+  line:destroy()
+  cp.scroll = 0
+end
+
+-- Keys of a focused chat pet: typed characters, Enter sends, Backspace, Esc
+-- clears the line (twice: the keyboard goes back to the game).
+local function poll_keys(cp: *ChatPanel, now: float64): void
+  local io = imgui.GetIO()
+  local q = &io.InputQueueCharacters
+  for i = 0, < q.Size do chatinput_insert(&cp.input, (@uint32)(q.Data[i])) end
+  q.Size = 0 -- consumed
+  if imgui.IsKeyPressed(ImGuiKey_Enter, false) then send_line(cp) end
+  if imgui.IsKeyPressed(ImGuiKey_Backspace, true) then chatinput_backspace(&cp.input) end
+  if imgui.IsKeyPressed(ImGuiKey_PageUp, true) then cp.scroll = cp.scroll + 5 end
+  if imgui.IsKeyPressed(ImGuiKey_PageDown, true) then cp.scroll = math.max(cp.scroll - 5, 0) end
+  if imgui.IsKeyPressed(ImGuiKey_Escape, false) then
+    if now - cp.last_esc < ESC_TWICE then
+      host.world_focus = 0
+      cp.last_esc = 0
+    else
+      cp.last_esc = now
+      cp.input.buf:clear()
+    end
+  end
+end
+
+-- The content of the chat pet (worldview, where a terminal would be drawn).
+global function chatpanel_panel(s: *Session, dl: *ImDrawList, vp: ImVec2, width: float32, height: float32,
+                                focused: boolean, on_content: boolean, mu: float32, mv: float32, click: boolean): void
+  local cp = chatpanel_of(s)
+  if cp == nilptr then return end
+  local now = host.last_time
+  if panel_title_strip(dl, vp, width, 'Chat', mu, mv, click, imgui.IsWindowHovered(ImGuiHoveredFlags_AnyWindow)) then host.world_close_id = s.id end
+  if host.api.push_world_font ~= nilptr then host.api.push_world_font() end
+  local font = imgui.GetFont()
+  local size = imgui.GetFontSize() * 0.55
+  local row_h = size * 1.2
+  measure_font, measure_size = font, size
+  local x0, y0 = vp.x + PANEL_PAD, vp.y + PANEL_TITLE
+  local x1, y1 = vp.x + width - PANEL_PAD, vp.y + height - PANEL_PAD - INPUT_H
+  local clip: ImVec4 = { x0, y0, x1, y1 }
+  -- the wheel over a focused pet scrolls (it claims the mouse there)
+  if focused and on_content then
+    local wheel = imgui.GetIO().MouseWheel
+    if wheel > 0 then cp.scroll = cp.scroll + 3 elseif wheel < 0 then cp.scroll = math.max(cp.scroll - 3, 0) end
+  end
+  -- newest at the bottom: wrap lines from the newest back until the area is full
+  local spans: vector(ChatSpan)
+  local y = y1
+  local skip = cp.scroll
+  local n = chatlog_count(&chat_ring)
+  local li = n - 1
+  while li >= 0 and y > y0 do
+    local line = chatlog_line(&chat_ring, li)
+    local sb: stringbuilder
+    if #line.sender > 0 then sb:write(line.sender, ': ') end
+    sb:write(line.text)
+    local text = sb:promote()
+    chatlog_wrap(text, x1 - x0, measure, &spans)
+    local col = colour_of(cp, line.kind)
+    for r = #spans - 1, 0, -1 do
+      if skip > 0 then
+        skip = skip - 1
+      else
+        y = y - row_h
+        if y + row_h <= y0 then break end
+        local sp = spans[r]
+        if sp.len > 0 then
+          imgui.DrawListAddText(dl, font, size, vec2(x0, y), col, (@cstring)(&text.data[sp.start]),
+            (@cstring)(&text.data[sp.start + sp.len]), 0, &clip)
+        end
+      end
+    end
+    text:destroy()
+    li = li - 1
+  end
+  if li < 0 and skip > 0 then cp.scroll = cp.scroll - skip end -- scrolled past the oldest line
+  spans:destroy()
+  if n == 0 then
+    imgui.DrawListAddText(dl, font, size, vec2(x0, y1 - row_h), chrome_col(ChromeColor.InkDim, 200),
+      'no chat yet (lines arrive while ghostty runs)', nilptr, 0, &clip)
+  end
+  -- the input line
+  local iy0 = vp.y + height - PANEL_PAD - INPUT_H + 6
+  local iy1 = vp.y + height - PANEL_PAD
+  imgui.DrawListAddRectFilled(dl, vec2(x0, iy0), vec2(x1, iy1), chrome_col(ChromeColor.GlassFlat, focused and 200 or 120), 6, 0)
+  if focused then imgui.DrawListAddRect(dl, vec2(x0, iy0), vec2(x1, iy1), chrome_col(ChromeColor.Accent, 200), 6, 0, 2) end
+  local iclip: ImVec4 = { x0 + 8, iy0, x1 - 8, iy1 }
+  local typed = chatinput_text(&cp.input)
+  local ty = iy0 + (iy1 - iy0 - size) * 0.5
+  if #typed > 0 then
+    -- the end of a long line stays in view
+    local w = measure(typed, 0, #typed)
+    local tx = x0 + 10 - math.max(w - (x1 - x0 - 30), 0)
+    imgui.DrawListAddText(dl, font, size, vec2(tx, ty), chrome_col(ChromeColor.Ink, 255), (@cstring)(&typed.data[0]),
+      (@cstring)(&typed.data[#typed]), 0, &iclip)
+    if focused and math.fmod(now, 1.0) < 0.6 then
+      imgui.DrawListAddRectFilled(dl, vec2(tx + w + 2, ty), vec2(tx + w + 4, ty + size), chrome_col(ChromeColor.Accent, 255), 0, 0)
+    end
+  else
+    local hint: cstring = focused and 'type to chat, Enter sends, Esc twice gives the keyboard back' or 'click to chat'
+    imgui.DrawListAddText(dl, font, size, vec2(x0 + 10, ty), chrome_col(ChromeColor.InkFaint, 200), hint, nilptr, 0, &iclip)
+  end
+  if host.api.pop_font ~= nilptr then host.api.pop_font() end
+  -- the keyboard: only one terminal or panel types per frame
+  local keyboard = terminal_claim_keyboard(focused)
+  if keyboard then
+    imgui.SetNextFrameWantCaptureKeyboard(true)
+    input_claim_keyboard(imgui.GetIO())
+    if cp.keyboard_last then poll_keys(cp, now) else imgui.GetIO().InputQueueCharacters.Size = 0 end -- the focusing frame types nothing
+  end
+  cp.keyboard_last = keyboard
+end
+
+-- Shutdown and /term reload: the flat chat comes back.
+global function chatpanel_shutdown(): void
+  if chat ~= nilptr then
+    chat.s.window_close = nilptr
+    free_chat(chat)
+    chat = nilptr
+  end
+  procguard_lock()
+  for i = 0, < #pending do
+    pending[i].sender:destroy()
+    pending[i].text:destroy()
+  end
+  pending:destroy()
+  procguard_unlock()
+end
+
+-- The core goes away (gu_shutdown): the ring too.
+global function chatpanel_forget_log(): void
+  chatlog_destroy(&chat_ring)
+end

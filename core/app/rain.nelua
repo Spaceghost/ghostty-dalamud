@@ -1,0 +1,381 @@
+-- Rain on world panels: drops on the glass in front of the content and a wiper
+-- behind it. The simulation is core/rain.nelua and the weather and tunables
+-- lua/rain.lua; core/app/worldview.nelua calls the two panel passes below
+-- beside the bell's, in panel pixels at the viewport origin, so everything
+-- bends and takes on the panel's light with it.
+require 'core.app.state'
+require 'core.rain'
+
+local rain_panels: vector(RainPanel)
+global rain_pool: RainPool                  -- drops fallen or flung off the glass, in the world
+local rain_pool_last: float64 = -1
+local rain_prm: RainParams
+local rain_prm_at: float64 = -1
+local rain_prm_ok = false
+local RAIN_SEED: uint32 <comptime> = 0x5EED1234
+local RAIN_FORGET: float64 <comptime> = 30 -- seconds unseen before a panel's drops are dropped
+
+-- One frame's geometry: triangles with per-vertex colour in a fixed buffer,
+-- sent as a single reserve per pass.
+local RainVtx = @record{ pos: ImVec2, col: uint32 }
+local RAIN_MAX_VTX <comptime> = 12288
+local rain_vtx: [RAIN_MAX_VTX]RainVtx
+local rain_nvtx: integer = 0
+
+local function rcol(r: float32, g: float32, b: float32, a: float32): uint32
+  return im_col32((@uint8)(math.clamp(r, 0, 1) * 255), (@uint8)(math.clamp(g, 0, 1) * 255),
+    (@uint8)(math.clamp(b, 0, 1) * 255), (@uint8)(math.clamp(a, 0, 1) * 255))
+end
+
+local function tri(a: ImVec2, ca: uint32, b: ImVec2, cb: uint32, c: ImVec2, cc: uint32): void
+  if rain_nvtx + 3 > RAIN_MAX_VTX then return end
+  rain_vtx[rain_nvtx] = { a, ca }
+  rain_vtx[rain_nvtx + 1] = { b, cb }
+  rain_vtx[rain_nvtx + 2] = { c, cc }
+  rain_nvtx = rain_nvtx + 3
+end
+
+local function lerp_col(ca: uint32, cb: uint32, t: float32): uint32
+  local out: uint32 = 0
+  for sh = 0, 24, 8 do
+    local a, b = (@float32)((ca >> sh) & 0xFF), (@float32)((cb >> sh) & 0xFF)
+    out = out | ((@uint32)(a + (b - a) * t + 0.5) << sh)
+  end
+  return out
+end
+
+-- A strip from p to q, `thick` wide, colour ca at p and cb at q, cut into
+-- `seg` pieces so it follows the panel's curve.
+local function strip(px: float32, py: float32, qx: float32, qy: float32, thick: float32, ca: uint32, cb: uint32, seg: integer): void
+  local dx, dy = qx - px, qy - py
+  local len = math.sqrt(dx * dx + dy * dy)
+  if len < 1e-3 then return end
+  local nx, ny = -dy / len * thick * 0.5, dx / len * thick * 0.5
+  for k = 0, < seg do
+    local t0, t1 = (@float32)(k) / seg, (@float32)(k + 1) / seg
+    local x0, y0, x1, y1 = px + dx * t0, py + dy * t0, px + dx * t1, py + dy * t1
+    local c0, c1 = lerp_col(ca, cb, t0), lerp_col(ca, cb, t1)
+    local a, b = vec2(x0 + nx, y0 + ny), vec2(x0 - nx, y0 - ny)
+    local c, d = vec2(x1 - nx, y1 - ny), vec2(x1 + nx, y1 + ny)
+    tri(a, c0, b, c0, c, c1)
+    tri(a, c0, c, c1, d, c1)
+  end
+end
+
+-- A filled disc as a fan: `cc` at the centre, `ce` at the edge.
+local function disc(x: float32, y: float32, r: float32, cc: uint32, ce: uint32, n: integer): void
+  local c = vec2(x, y)
+  for k = 0, < n do
+    local a0, a1 = k * 6.2832 / n, (k + 1) * 6.2832 / n
+    tri(c, cc, vec2(x + r * math.cos(a0), y + r * math.sin(a0)), ce, vec2(x + r * math.cos(a1), y + r * math.sin(a1)), ce)
+  end
+end
+
+local function ring(x: float32, y: float32, r: float32, thick: float32, col: uint32, n: integer): void
+  for k = 0, < n do
+    local a0, a1 = k * 6.2832 / n, (k + 1) * 6.2832 / n
+    local c0, s0, c1, s1 = math.cos(a0), math.sin(a0), math.cos(a1), math.sin(a1)
+    local ri, ro = r - thick * 0.5, r + thick * 0.5
+    tri(vec2(x + ri * c0, y + ri * s0), col, vec2(x + ro * c0, y + ro * s0), col, vec2(x + ro * c1, y + ro * s1), col)
+    tri(vec2(x + ri * c0, y + ri * s0), col, vec2(x + ro * c1, y + ro * s1), col, vec2(x + ri * c1, y + ri * s1), col)
+  end
+end
+
+local function flush(dl: *ImDrawList): void
+  if rain_nvtx == 0 then return end
+  local uv: ImVec2
+  imgui.GetFontTexUvWhitePixel(&uv)
+  imgui.DrawListPrimReserve(dl, (@cint)(rain_nvtx), (@cint)(rain_nvtx))
+  for i = 0, < rain_nvtx do imgui.DrawListPrimVtx(dl, rain_vtx[i].pos, uv, rain_vtx[i].col) end
+  rain_nvtx = 0
+end
+
+-- Lua ---------------------------------------------------------------------------
+
+local rain_required_for: *lua_State = nilptr
+
+local function push_rain_fn(L: *lua_State, name: cstring): boolean
+  -- an init.lua from before rain existed (the user's copy is never replaced)
+  -- gets the shipped module, once per Lua state
+  if rain_required_for ~= L then
+    rain_required_for = L
+    if luaL_loadstring(L, "if type(CONFIG) == 'table' and CONFIG.rain == nil then local ok, m = pcall(require, 'rain') if ok then CONFIG.rain = m end end") == LUA_OK then
+      if lua_pcall(L, 0, 0, 0) ~= LUA_OK then lua_pop(L, 1) end
+    else
+      lua_pop(L, 1)
+    end
+  end
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'rain')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, name)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  return true -- stack: CONFIG, rain, fn
+end
+
+-- CONFIG.rain.frame(): the weather's intensity and the tunables; false when
+-- the module is missing or fails.
+global function policy_rain_frame(): (boolean, RainParams)
+  local prm: RainParams
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_rain_fn(L, 'frame') then return false, prm end
+  local ok = false
+  if lua_pcall(L, 0, 1, 0) == LUA_OK and lua_type(L, -1) == LUA_TTABLE then
+    local t: cint = lua_gettop(L)
+    prm.intensity = (@float32)(lua_field_number(L, t, 'intensity', 0))
+    prm.max_drops = (@integer)(math.floor(lua_field_number(L, t, 'max_drops', 90)))
+    prm.size_min = (@float32)(lua_field_number(L, t, 'size_min', 2.5))
+    prm.size_max = (@float32)(lua_field_number(L, t, 'size_max', 7))
+    prm.trickle_speed = (@float32)(lua_field_number(L, t, 'trickle_speed', 70))
+    prm.period_light = (@float32)(lua_field_number(L, t, 'period_light', 12))
+    prm.period_heavy = (@float32)(lua_field_number(L, t, 'period_heavy', 6))
+    prm.continuous_at = (@float32)(lua_field_number(L, t, 'continuous_at', 0.85))
+    prm.opacity = (@float32)(lua_field_number(L, t, 'opacity', 0.85))
+    prm.fade = (@float32)(lua_field_number(L, t, 'fade', 3))
+    prm.gravity = (@float32)(lua_field_number(L, t, 'gravity', 12))
+    prm.fling_speed = (@float32)(lua_field_number(L, t, 'fling_speed', 2.5))
+    prm.max_particles = (@integer)(math.floor(lua_field_number(L, t, 'max_particles', 256)))
+    local w = lua_field_string(L, t, 'wiper', 'back')
+    prm.wiper = RainWiper.Back
+    if w == 'front' then prm.wiper = RainWiper.Front elseif w == 'none' then prm.wiper = RainWiper.None end
+    w:destroy()
+    ok = true
+  end
+  lua_pop(L, 3)
+  return ok, prm
+end
+
+-- CONFIG.rain.panel(id): false keeps a panel dry (docked on the HUD).
+global function policy_rain_panel(id: integer): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_rain_fn(L, 'panel') then return false end
+  lua_pushinteger(L, id)
+  local ok = lua_pcall(L, 1, 1, 0) == LUA_OK and lua_toboolean(L, -1) ~= 0
+  lua_pop(L, 3)
+  return ok
+end
+
+-- CONFIG.rain.command(args) -> error text, or empty.
+global function policy_rain_command(args: string): string
+  local err: string
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_rain_fn(L, 'command') then return string.copy('rain: lua/rain.lua is not loaded') end
+  lua_pushlstring(L, (@cstring)(args.data), args.size)
+  if lua_pcall(L, 1, 1, 0) == LUA_OK and lua_type(L, -1) == LUA_TSTRING then
+    local len: usize = 0
+    local p = lua_tolstring(L, -1, &len)
+    err = string.copy(string{data=(@*[0]byte)(p), size=len})
+  end
+  lua_pop(L, 3)
+  return err
+end
+
+-- /term rain on|off|auto
+global function rain_command(args: string): cint
+  local err = policy_rain_command(args)
+  if #err > 0 then
+    logf(LOG_WARN, '%s', err)
+    err:destroy()
+    return 4
+  end
+  return 0
+end
+
+-- Panels ------------------------------------------------------------------------
+
+local function rain_frame(now: float64): void
+  if now == rain_prm_at then return end
+  rain_prm_at = now
+  rain_prm_ok, rain_prm = policy_rain_frame()
+  local i: integer = #rain_panels - 1
+  while i >= 0 do
+    if now - rain_panels[i].last > RAIN_FORGET or rain_panels[i].last > now then rain_panels:remove(i) end
+    i = i - 1
+  end
+end
+
+local function rain_panel(id: integer, now: float64): *RainPanel
+  for i = 0, < #rain_panels do
+    if rain_panels[i].id == id then return &rain_panels[i] end
+  end
+  local p: RainPanel
+  p:init(id, RAIN_SEED)
+  p.last = now
+  rain_panels:push(p)
+  return &rain_panels[#rain_panels - 1]
+end
+
+-- The wiper: an arm from the pivot, the blade along its outer part with its
+-- rubber edge, and a cap over the pivot. `front` draws it pale on the glass
+-- instead of as a dark shape behind it.
+local function draw_wiper(o: ImVec2, w: float32, h: float32, angle: float32, a: float32, front: boolean): void
+  if a <= 0.004 then return end
+  local px, py, len = rain_wiper_geom(w, h)
+  px, py = px + o.x, py + o.y
+  local s = math.clamp(len / 300, 0.6, 2)
+  local dx, dy = math.cos(angle), -math.sin(angle)
+  local nx, ny = -dy, dx -- toward the side the blade trails
+  local body = front and rcol(0.16, 0.18, 0.2, a * 0.8) or rcol(0.02, 0.025, 0.035, a * 0.55)
+  local rubber = front and rcol(0.05, 0.05, 0.06, a * 0.9) or rcol(0, 0, 0, a * 0.75)
+  local seg = 10
+  strip(px, py, px + dx * len * 0.97, py + dy * len * 0.97, 4 * s, body, body, seg)
+  local b0, b1 = len * RAIN_BLADE_FROM, len
+  local ox, oy = nx * 3 * s, ny * 3 * s
+  strip(px + dx * b0 + ox, py + dy * b0 + oy, px + dx * b1 + ox, py + dy * b1 + oy, 6 * s, body, body, seg)
+  strip(px + dx * b0 + ox * 2.2, py + dy * b0 + oy * 2.2, px + dx * b1 + ox * 2.2, py + dy * b1 + oy * 2.2, 2 * s, rubber, rubber, seg)
+  disc(px, py, 7 * s, body, body, 8)
+end
+
+-- Ground under a world point: the game's collision straight down, else the
+-- player's feet, else a character's height below.
+local function rain_ground(x: float32, y: float32, z: float32): float32
+  if host.api.raycast ~= nilptr then
+    local hx: float32, hy: float32, hz: float32 = 0, 0, 0
+    if host.api.raycast(x, y, z, 0, -1, 0, 40, &hx, &hy, &hz) ~= 0 then return hy end
+  end
+  local pc: GuObject
+  if host.api.get_object ~= nilptr and host.api.get_object(WORLD_PLAYER, 0, &pc) ~= 0 and pc.found ~= 0 and pc.y < y then return pc.y end
+  return y - 1.7
+end
+
+-- The drops that left panel `p`'s glass this step become world droplets.
+local function rain_panel_shed(p: *RainPanel, pl: *WorldPlacement, prm: *RainParams): void
+  local b = world_basis($pl)
+  for i = 0, < p.nemit do
+    local e = &p.emit[i]
+    local x, y, z = world_point(&b, e.u, e.v)
+    -- panel direction (pixels) in the world: right is +u, up is -v
+    local vx = b.rx * e.du * b.ypp - b.ux * e.dv
+    local vy = b.ry * e.du * b.ypp - b.uy * e.dv
+    local vz = b.rz * e.du * b.ypp - b.uz * e.dv
+    if e.fling then
+      local l = math.max(math.sqrt(vx * vx + vy * vy + vz * vz), 1e-6)
+      local sp = prm.fling_speed * e.speed
+      -- off the glass a little: toward the viewer in front, away from it behind
+      local off: float32 = prm.wiper == RainWiper.Front and 0.3 or -0.3
+      vx, vy, vz = vx / l * sp + b.fx * sp * off, vy / l * sp, vz / l * sp + b.fz * sp * off
+    else
+      vx, vy, vz = vx * e.speed, vy * e.speed, vz * e.speed
+    end
+    rain_pool:emit(prm.max_particles, x, y, z, vx, vy, vz, rain_ground(x, y, z), e.fling)
+  end
+  p.nemit = 0
+end
+
+-- Behind the content, after the panel's background: step the panel's rain and
+-- draw the wiper at the back of the glass. `fade` hides it (full-screen flight).
+global function rain_panel_back(dl: *ImDrawList, o: ImVec2, pl: *WorldPlacement, id: integer, now: float64, fade: float32): void
+  rain_frame(now)
+  if not rain_prm_ok then return end
+  local p = rain_panel(id, now)
+  local prm = rain_prm
+  if pl.hud or not policy_rain_panel(id) then prm.intensity = 0 end
+  if p.level <= 0 and prm.intensity <= 0 then p.last = now p.vis = 0 return end
+  p:step(&prm, pl.width, pl.height, (@float32)(now - p.last))
+  p.last = now
+  p.vis = math.clamp(fade, 0, 1) * math.clamp(prm.opacity, 0, 1)
+  if p.nemit > 0 and fade >= 0.999 and prm.intensity > 0 then rain_panel_shed(p, pl, &prm) end
+  if prm.wiper == RainWiper.Back and p.wiping then
+    local a = p.vis * math.min(p.level * 3, 1) * math.clamp(pl.opacity + 0.3, 0, 1)
+    draw_wiper(o, pl.width, pl.height, p.angle, a, false)
+    flush(dl)
+  end
+end
+
+-- In front of the content: the drops, their trails and splashes, the smears
+-- the wiper leaves, and a wiper in front when the style asks for it.
+global function rain_panel_front(dl: *ImDrawList, o: ImVec2, pl: *WorldPlacement, id: integer): void
+  if not rain_prm_ok then return end
+  local p: *RainPanel = nilptr
+  for i = 0, < #rain_panels do
+    if rain_panels[i].id == id then p = &rain_panels[i] break end
+  end
+  if p == nilptr or p.level <= 0 or p.vis <= 0.004 then return end
+  -- night dims the glints as well as the tint the panel applies to everything
+  local lum = math.clamp((pl.tint_r + pl.tint_g + pl.tint_b) / 3, 0.35, 1)
+  if pl.tint_r <= 0 then lum = 1 end
+  local a = p.vis * math.min(p.level * 2, 1)
+  for i = 0, < RAIN_MAX_DROPS do
+    local d = &p.drops[i]
+    local x, y = d.x + o.x, d.y + o.y
+    if d.kind == 1 then
+      local fa = a * math.min(d.age / 0.08, 1) -- a breath of landing
+      if d.moving and d.y > d.trail_y + 1 then
+        local top = math.max(d.trail_y, d.y - d.r * 14)
+        local tw = math.max(d.r * 0.35, 1)
+        strip(x, top + o.y, x, y, tw, rcol(0.85, 0.9, 1, 0), rcol(0.85, 0.9, 1, fa * 0.22), 3)
+      end
+      disc(x, y, d.r, rcol(0.8, 0.86, 0.95, fa * 0.1), rcol(0.05, 0.07, 0.1, fa * 0.42), 6)
+      local sr = math.max(d.r * 0.28, 0.8)
+      disc(x - d.r * 0.35, y - d.r * 0.4, sr, rcol(1, 1, 1, fa * 0.85 * lum), rcol(1, 1, 1, 0), 4)
+      if d.age < RAIN_SPLASH then
+        local k = d.age / RAIN_SPLASH
+        ring(x, y, d.r * (1.1 + 1.8 * k), 1.2, rcol(0.85, 0.9, 1, a * 0.45 * (1 - k)), 8)
+      end
+    elseif d.kind == 2 then
+      local k = 1 - d.age / RAIN_SMEAR
+      -- a short streak across the arm, the way the blade dragged it
+      local tx, ty = math.sin(d.smear_ang), math.cos(d.smear_ang)
+      local len = d.r * 2.5
+      strip(x - tx * len, y - ty * len, x + tx * len, y + ty * len, math.max(d.r * 0.6, 1),
+        rcol(0.85, 0.9, 1, a * 0.05 * k), rcol(0.85, 0.9, 1, a * 0.22 * k), 2)
+    end
+  end
+  if rain_prm.wiper == RainWiper.Front and p.wiping then
+    draw_wiper(o, pl.width, pl.height, p.angle, p.vis * math.min(p.level * 3, 1), true)
+  end
+  flush(dl)
+end
+
+global function rain_reset(): void
+  rain_panels:destroy()
+  rain_pool:clear()
+  rain_pool_last = -1
+  rain_prm_at = -1
+  rain_prm_ok = false
+end
+
+-- Once per frame, before the world panels: the droplets that fell or were
+-- flung off the glass, as short streaks and then small splash rings on the
+-- ground, on the background list behind the panels (not depth-tested).
+global function draw_rain_world(now: float64): void
+  local dt = rain_pool_last < 0 and 0 or (@float32)(now - rain_pool_last)
+  rain_pool_last = now
+  if rain_pool.live == 0 then return end
+  local g: float32 = rain_prm_ok and rain_prm.gravity or 12
+  rain_pool:step(dt, g)
+  if rain_pool.live == 0 or host.api.get_camera == nilptr or imgui.GetBackgroundDrawList == nilptr then return end
+  local cam: GuCamera
+  if host.api.get_camera(&cam) == 0 or cam.width < 1 or cam.height < 1 then return end
+  local vp = imgui.GetMainViewport().Pos
+  local col_r, col_g, col_b: float32 = 0.8, 0.86, 0.95
+  for i = 0, < RAIN_MAX_FALL do
+    local f = &rain_pool.p[i]
+    if f.live and world_depth(&cam, f.x, f.y, f.z) > 0.2 then
+      if not f.landed then
+        local a: float32 = 0.55
+        if f.fling then a = a * math.max(1 - f.t / 1.2, 0.2) end
+        local ok0, x0, y0 = world_project(&cam, f.x, f.y, f.z)
+        local ok1, x1, y1 = world_project(&cam, f.x - f.vx * 0.03, f.y - f.vy * 0.03, f.z - f.vz * 0.03)
+        if ok0 and ok1 then
+          if (x1 - x0) ^ 2 + (y1 - y0) ^ 2 < 1 then y1 = y0 - 1 end
+          strip(x1 + vp.x, y1 + vp.y, x0 + vp.x, y0 + vp.y, 1.5, rcol(col_r, col_g, col_b, a * 0.2), rcol(col_r, col_g, col_b, a), 1)
+        end
+      else
+        local k = f.t / RAIN_FALL_SPLASH
+        local rr = 0.04 + 0.18 * k
+        local col = rcol(col_r, col_g, col_b, 0.5 * (1 - k))
+        local SEG <comptime> = 8
+        local okp, px, py = world_project(&cam, f.x + rr, f.y, f.z)
+        for s = 1, SEG do
+          local ang = s * 6.2832 / SEG
+          local okq, qx, qy = world_project(&cam, f.x + rr * math.cos(ang), f.y, f.z + rr * math.sin(ang))
+          if okp and okq then strip(px + vp.x, py + vp.y, qx + vp.x, qy + vp.y, 1.2, col, col, 1) end
+          okp, px, py = okq, qx, qy
+        end
+      end
+    end
+  end
+  flush(imgui.GetBackgroundDrawList())
+end

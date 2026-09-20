@@ -1,0 +1,104 @@
+-- imgui_internal.h pieces, for adopting another plugin's window
+-- (core/app/adopt.nelua, docs/ADOPT.md). Kept apart from core/imgui.nelua:
+-- these are Dear ImGui internals that can change between versions, so they
+-- are optional exports bound on first use and every caller copes with nil.
+--
+-- As in core/imgui.nelua the vendored cimgui.h owns every layout; only the
+-- fields read or written here are declared.
+require 'core.imgui'
+
+global ImRect <cimport, nodecl> = @record{ Min: ImVec2, Max: ImVec2 }
+global ImVector_ImGuiWindowPtr <cimport, nodecl> = @record{ Size: cint, Capacity: cint, Data: *[0]pointer }
+global ImGuiWindowTempData <cimport, nodecl> = @record{ ChildWindows: ImVector_ImGuiWindowPtr }
+-- Window pointers stay `pointer` inside the vectors and are cast where used.
+global ImGuiWindow <cimport, nodecl> = @record{
+  Name: cstring,
+  ID: uint32,
+  Flags: cint,
+  Pos: ImVec2,
+  Size: ImVec2,
+  SizeFull: ImVec2,          -- the size asked for (Size may still be animating toward it)
+  InnerRect: ImRect,         -- inside the title bar, menu bar and scrollbars (screen pixels)
+  Active: boolean,
+  WasActive: boolean,
+  Hidden: boolean,
+  IsFallbackWindow: boolean,
+  DC: ImGuiWindowTempData,
+  LastFrameActive: cint,
+  DrawList: *ImDrawList,
+  ParentWindow: pointer,
+  RootWindow: pointer,
+  RootWindowPopupTree: pointer,
+}
+global ImGuiInputEventMousePos <cimport, nodecl> = @record{ PosX: float32, PosY: float32 }
+-- MousePos is a member of an anonymous union in C
+global ImGuiInputEvent <cimport, nodecl> = @record{ Type: cint, Source: cint, MousePos: ImGuiInputEventMousePos }
+global ImVector_ImGuiInputEvent <cimport, nodecl> = @record{ Size: cint, Capacity: cint, Data: *[0]ImGuiInputEvent }
+global ImGuiContext <cimport, nodecl> = @record{
+  IO: ImGuiIO,
+  InputEventsQueue: ImVector_ImGuiInputEvent,
+  FrameCount: cint,
+  Windows: ImVector_ImGuiWindowPtr,
+  HoveredWindow: pointer,
+  MovingWindow: pointer,
+  ActiveIdWindow: pointer,
+  NavWindow: pointer,
+}
+-- The callback field is typed `pointer`: a record cannot name itself here.
+global ImGuiContextHook <cimport, nodecl> = @record{
+  HookId: uint32, Type: cint, Owner: uint32, Callback: pointer, UserData: pointer,
+}
+
+global ImGuiWindowFlags_NoMouseInputs: cint <cimport, nodecl, const>
+global ImGuiWindowFlags_ChildWindow: cint <cimport, nodecl, const>
+global ImGuiWindowFlags_Tooltip: cint <cimport, nodecl, const>
+global ImGuiWindowFlags_Popup: cint <cimport, nodecl, const>
+global ImGuiWindowFlags_Modal: cint <cimport, nodecl, const>
+global ImGuiInputEventType_MousePos: cint <cimport, nodecl, const>
+global ImGuiContextHookType_NewFramePre: cint <cimport, nodecl, const>
+global ImGuiContextHookType_RenderPre: cint <cimport, nodecl, const>
+
+global ImGuiInternalApi = @record{
+  GetCurrentContext: function(): *ImGuiContext,
+  FindWindowByName: function(name: cstring): *ImGuiWindow,
+  AddContextHook: function(ctx: *ImGuiContext, hook: *ImGuiContextHook): uint32,
+  RemoveContextHook: function(ctx: *ImGuiContext, id: uint32): void,
+  SetWindowPos: function(w: *ImGuiWindow, pos: ImVec2, cond: cint): void,
+  SetWindowSize: function(w: *ImGuiWindow, size: ImVec2, cond: cint): void,
+  DrawListPushTextureID: function(dl: *ImDrawList, tex: pointer): void,
+  DrawListPopTextureID: function(dl: *ImDrawList): void,
+  IOAddMousePosEvent: function(io: *ImGuiIO, x: float32, y: float32): void,
+}
+
+global imgui_int: ImGuiInternalApi
+global imgui_int_bound: boolean = false
+
+## local internal_exports = {
+##  {'GetCurrentContext','igGetCurrentContext'},{'FindWindowByName','igFindWindowByName'},
+##  {'AddContextHook','igAddContextHook'},{'RemoveContextHook','igRemoveContextHook'},
+##  {'SetWindowPos','igSetWindowPos_WindowPtr'},{'SetWindowSize','igSetWindowSize_WindowPtr'},
+##  {'DrawListPushTextureID','ImDrawList_PushTextureID'},{'DrawListPopTextureID','ImDrawList_PopTextureID'},
+##  {'IOAddMousePosEvent','ImGuiIO_AddMousePosEvent'},
+## }
+
+-- Bind the internal exports once (tests fill `imgui_int` themselves and set
+-- imgui_int_bound). Returns how many are missing; each missing one stays nil.
+global function imgui_internal_bind(resolve: ImGuiResolver): integer
+  imgui_int_bound = true
+  local missing = 0
+  ## for _, e in ipairs(internal_exports) do
+  do
+    local p: pointer = resolve(#[e[2]]#)
+    if p == nilptr then missing = missing + 1 end
+    imgui_int.#|e[1]|# = (@#[ImGuiInternalApi.value.fields[e[1]].type]#)(p)
+  end
+  ## end
+  return missing
+end
+
+-- Everything adopting a window needs.
+global function imgui_internal_ready(): boolean
+  return imgui_int.GetCurrentContext ~= nilptr and imgui_int.FindWindowByName ~= nilptr
+    and imgui_int.AddContextHook ~= nilptr and imgui_int.RemoveContextHook ~= nilptr
+    and imgui_int.DrawListPushTextureID ~= nilptr and imgui_int.DrawListPopTextureID ~= nilptr
+end

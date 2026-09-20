@@ -1,0 +1,104 @@
+-- Shell integration marks in a terminal's output, for the character's
+-- reactions (lua/animation.lua): OSC 133;C (a command started) and
+-- OSC 133;D[;exit] (it finished, with its exit status). libghostty-vt keeps
+-- the semantic prompt state per cell but does not hand the exit status out,
+-- so the core looks for the two marks itself: a byte-at-a-time scanner that
+-- survives a mark split across reads and costs one compare per byte outside
+-- one. Nothing is buffered; everything but the mark letter and the exit
+-- digits is skipped.
+
+global CmdWatch = @record{
+  st: uint8,        -- scanner state (below)
+  mark: uint8,      -- the mark letter of the sequence being read
+  neg: boolean,
+  digits: integer,
+  code: int32,
+  starts: integer,  -- 133;C seen
+  dones: integer,   -- 133;D seen
+  last_exit: int32, -- exit status of the last 133;D (0 when it gave none)
+  seen: boolean,    -- any 133 mark: the shell has integration
+  bytes: uint64,    -- output bytes scanned
+}
+
+local ESC <comptime> = 0x1b
+local BEL <comptime> = 0x07
+-- states: 0 text, 1 ESC, 2 ESC ], 3 '1', 4 '13', 5 '133', 6 '133;',
+-- 7 after the mark letter, 8 exit digits, 9 skipping to the terminator
+local S_TEXT <comptime> = 0
+local S_ESC <comptime> = 1
+local S_MARK <comptime> = 6
+local S_AFTER <comptime> = 7
+local S_CODE <comptime> = 8
+local S_SKIP <comptime> = 9
+
+local function finish(w: *CmdWatch): void
+  w.seen = true
+  defer w.mark = 0 end
+  if w.mark == 'C'_b then
+    w.starts = w.starts + 1
+  elseif w.mark == 'D'_b then
+    w.dones = w.dones + 1
+    local c = w.digits > 0 and w.code or 0
+    w.last_exit = w.neg and -c or c
+  end
+end
+
+function CmdWatch:scan(data: *[0]uint8, len: usize): void
+  self.bytes = self.bytes + len
+  local st = self.st
+  for i: usize = 0, < len do
+    local c = data[i]
+    if st == S_TEXT then
+      if c == ESC then st = S_ESC end
+    elseif st == S_ESC then
+      st = c == ']'_b and 2 or (c == ESC and S_ESC or S_TEXT)
+    elseif st == 2 then
+      st = c == '1'_b and 3 or (c == ESC and S_ESC or S_SKIP)
+    elseif st == 3 or st == 4 then
+      st = c == '3'_b and st + 1 or (c == ESC and S_ESC or S_SKIP)
+    elseif st == 5 then
+      st = c == ';'_b and S_MARK or (c == ESC and S_ESC or S_SKIP)
+    elseif st == S_MARK then
+      if c == ESC then st = S_ESC
+      elseif c == BEL then st = S_TEXT
+      else
+        self.mark, self.neg, self.digits, self.code = c, false, 0, 0
+        st = S_AFTER
+      end
+    elseif st == S_AFTER then
+      if c == BEL or c == ESC then
+        finish(self)
+        st = c == ESC and S_ESC or S_TEXT
+      elseif c == ';'_b and self.mark == 'D'_b then
+        st = S_CODE
+      else
+        st = S_SKIP
+        -- the letter was the first byte of something longer ("133;Dx"): not a mark
+        if c ~= ';'_b then self.mark = 0 end
+      end
+    elseif st == S_CODE then
+      if c >= '0'_b and c <= '9'_b then
+        if self.digits < 9 then self.code = self.code * 10 + (c - '0'_b) end
+        self.digits = self.digits + 1
+      elseif c == '-'_b and self.digits == 0 and not self.neg then
+        self.neg = true
+      elseif c == BEL or c == ESC then
+        finish(self)
+        st = c == ESC and S_ESC or S_TEXT
+      else
+        st = S_SKIP -- ";aid=..." and friends: the status is already read
+      end
+    else -- S_SKIP: an OSC we do not read, or the rest of ours
+      if c == BEL or c == ESC then
+        if self.mark ~= 0 then finish(self) end
+        st = c == ESC and S_ESC or S_TEXT
+      end
+    end
+  end
+  self.st = st
+end
+
+-- Replayed output (a reattach) is old news: forget a half-read mark.
+function CmdWatch:reset_scan(): void
+  self.st, self.mark = S_TEXT, 0
+end

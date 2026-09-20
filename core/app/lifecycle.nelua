@@ -3,6 +3,10 @@
 -- Status text, the settings window and (re)loading lua/init.lua.
 require 'core.app.hotkeys'
 require 'core.app.boot'
+require 'core.app.ipc'
+require 'core.app.winpicker'
+require 'core.app.gallery'
+require 'core.app.ask'
 
 global function update_status(): void
   local sb: stringbuilder
@@ -32,6 +36,14 @@ global function draw_settings(): void
   if not host.settings_open then return end
   imgui.SetNextWindowSize(vec2(560, 680), ImGuiCond_FirstUseEver)
   local open = true
+  -- a theme other than spaceghost lends the window its accent; spaceghost
+  -- keeps Dalamud's own look
+  local themed = chrome_themed()
+  if themed then
+    imgui.PushStyleColorU32(ImGuiCol_CheckMark, chrome_col(ChromeColor.Accent, 255))
+    imgui.PushStyleColorU32(ImGuiCol_SliderGrab, chrome_col(ChromeColor.Accent, 200))
+    imgui.PushStyleColorU32(ImGuiCol_SliderGrabActive, chrome_col(ChromeColor.Accent, 255))
+  end
   if imgui.Begin('Ghostty settings###ghostty_settings', &open, ImGuiWindowFlags_NoDocking) then
     if policy_settings_draw() then
       policy_refresh()
@@ -42,6 +54,7 @@ global function draw_settings(): void
     settings_badge_refresh()
   end
   imgui.End()
+  if themed then imgui.PopStyleColor(3) end
   host.settings_open = open
 end
 
@@ -53,7 +66,26 @@ global function load_policy(): boolean
     logf(LOG_ERROR, 'lua config failed: %s', policy.error)
     return false
   end
+  do -- fallback glyphs come from the shipped fonts/ (core/glyphfb.nelua)
+    local fonts = string.format('%s/fonts', install)
+    glyphfb_set_dir(fonts)
+    fonts:destroy()
+    -- and, behind them, the host's own CJK font: the ideographs the terminal
+    -- font's merged ranges leave out come from there (docs/GLYPHS.md). An
+    -- older shim has no "cjk_font" and simply answers nothing.
+    if host.api.game_string ~= nilptr then
+      local buf: [512]cchar
+      local n = host.api.game_string('cjk_font', (@*[0]cchar)(&buf), 512)
+      if n > 0 and n < 512 then
+        glyphfb_add_font((@string){ data = (@*[0]byte)(&buf), size = n })
+      end
+    end
+  end
   boot_lua_register(policy.L)
+  gallery_lua_register(policy.L) -- ghostty.http_upload / game_string for lua/gallery.lua
+  ask_lua_register(policy.L) -- ghostty.ask_spawn / ask_cancel / ask_echo / ask_pin for lua/ask.lua
+  ipc_lua_register(policy.L) -- ghostty.window_* for lua/ipc.lua
+  ipc_load(install, host.dir) -- GhosttyDalamud.v1.Call's own Lua state (docs/IPC.md)
   settings_badge_refresh()
   host.dropdown_font_size = policy.dropdown.font_size
   host.popup_font_size = policy.popup_font_size

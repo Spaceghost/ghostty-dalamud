@@ -1,0 +1,448 @@
+-- Frame grabs that actually contain the terminals (docs/CAPTURE.md).
+--
+-- The game's own screenshot key photographs the scene before Dalamud's ImGui
+-- render, so a terminal drawn by this plugin is not in the file it writes.
+-- This module takes the picture one step later instead: a draw-list callback
+-- appended to ImGui's foreground list, which is the last thing the renderer
+-- runs, copies whatever is bound as render target 0 at that moment - the
+-- back buffer, with the game frame and every ImGui window already in it -
+-- into a staging texture. Nothing is hooked, exactly as core/depthpass.nelua
+-- binds the depth shader from a callback of its own.
+--
+-- The copy is read back a frame later, never in the frame it was made: Map
+-- with DO_NOT_WAIT returns "still drawing" while the GPU has not caught up,
+-- and the state machine simply waits another frame rather than stalling the
+-- pipeline. A capture already in flight makes the next request a skip, so a
+-- clip that asks faster than the GPU answers drops frames instead of piling up.
+--
+-- The D3D11 calls sit behind `capture_fake`: tests put a recording table there
+-- and drive the whole state machine on the host without a GPU, the same split
+-- core/wintex.nelua keeps.
+require 'vector'
+require 'memory'
+require 'math'
+require 'string'
+
+-- DXGI formats a frame may arrive in (anything else is refused with a reason).
+global CAPTURE_FMT_B8G8R8A8: cint <comptime> = 87
+global CAPTURE_FMT_B8G8R8A8_SRGB: cint <comptime> = 91
+global CAPTURE_FMT_B8G8R8A8_TYPELESS: cint <comptime> = 90
+global CAPTURE_FMT_R8G8B8A8: cint <comptime> = 28
+global CAPTURE_FMT_R8G8B8A8_SRGB: cint <comptime> = 29
+global CAPTURE_FMT_R8G8B8A8_TYPELESS: cint <comptime> = 27
+
+-- Blue first (the byte order this module hands out), red first, or neither.
+global function capture_fmt_bgr(fmt: cint): (boolean, boolean)
+  if fmt == CAPTURE_FMT_B8G8R8A8 or fmt == CAPTURE_FMT_B8G8R8A8_SRGB or fmt == CAPTURE_FMT_B8G8R8A8_TYPELESS then
+    return true, true
+  end
+  if fmt == CAPTURE_FMT_R8G8B8A8 or fmt == CAPTURE_FMT_R8G8B8A8_SRGB or fmt == CAPTURE_FMT_R8G8B8A8_TYPELESS then
+    return true, false
+  end
+  return false, false
+end
+
+global CaptureApi = @record{
+  -- The texture bound as render target 0 right now, with its size and DXGI
+  -- format; 1 when there is one. The reference belongs to the caller.
+  target: function(tex: *pointer, w: *uint32, h: *uint32, fmt: *cint): cint,
+  -- A CPU-readable staging texture of w x h in `fmt`; an HRESULT (< 0 failed).
+  stage: function(device: pointer, w: uint32, h: uint32, fmt: cint, tex: *pointer): clong,
+  -- Copy the rectangle (x, y, w, h) of `src` into the top left of `dst`.
+  copy: function(src: pointer, dst: pointer, x: uint32, y: uint32, w: uint32, h: uint32): void,
+  -- Map for reading without waiting: 1 mapped, 0 not ready yet, -1 failed.
+  map: function(tex: pointer, data: *pointer, pitch: *uint32): cint,
+  unmap: function(tex: pointer): void,
+  release: function(tex: pointer): void,
+}
+
+global capture_fake: *CaptureApi = nilptr
+
+global CaptureState = @enum{
+  Idle = 0,   -- nothing asked for
+  Armed,      -- waiting for the renderer to run our callback
+  Staged,     -- the copy was made; waiting for the GPU to finish it
+  Ready,      -- `pixels` holds the frame
+  Failed,     -- `reason` says why
+}
+
+global Capture = @record{
+  state: CaptureState,
+  x: uint32, y: uint32, w: uint32, h: uint32,  -- the crop asked for, in frame pixels
+  device: pointer,                             -- Dalamud's ID3D11Device (borrowed)
+  stage_tex: pointer,
+  stage_w: uint32, stage_h: uint32, stage_fmt: cint,
+  fmt: cint,                                   -- format of the frame copied
+  bgr: boolean,                                -- `pixels` is BGRA (always true once read)
+  pixels: vector(uint8),                       -- w * h * 4, stride w * 4
+  frame_w: uint32, frame_h: uint32,            -- the whole frame the last copy came from
+  waited: integer,                             -- frames spent in Armed or Staged
+  reason: string,                              -- static text; why it failed
+  taken: uinteger,                             -- frames read back since the core started
+  skipped: uinteger,                           -- requests refused because one was in flight
+  misses: uinteger,                            -- captures given up on because no callback ran
+}
+
+global capture: Capture
+
+-- How long the state machine waits before it gives up (frames). A renderer
+-- that never runs draw-list callbacks would otherwise leave a capture armed
+-- for good; core/depthpass.nelua latches the same way.
+global CAPTURE_ARM_LIMIT: integer <comptime> = 240
+global CAPTURE_MAP_LIMIT: integer <comptime> = 240
+-- Nothing larger is ever read back (an 8K frame would be 132 MB a copy).
+global CAPTURE_MAX_SIDE: uint32 <comptime> = 7680
+
+-- Crop maths ------------------------------------------------------------------
+
+-- A panel's rectangle in screen coordinates clamped to a `fw` x `fh` frame:
+-- rounded outwards so no edge pixel is lost, and refused when what is left is
+-- empty or off screen. Pure: tests/test_capture.nelua drives it directly.
+global function capture_crop(px: float32, py: float32, pw: float32, ph: float32,
+                            fw: uint32, fh: uint32): (boolean, uint32, uint32, uint32, uint32)
+  if fw == 0 or fh == 0 then return false, 0, 0, 0, 0 end
+  local x0 = math.floor(px)
+  local y0 = math.floor(py)
+  local x1 = math.ceil(px + pw)
+  local y1 = math.ceil(py + ph)
+  if x0 < 0 then x0 = 0 end
+  if y0 < 0 then y0 = 0 end
+  if x1 > (@integer)(fw) then x1 = (@integer)(fw) end
+  if y1 > (@integer)(fh) then y1 = (@integer)(fh) end
+  if x1 - x0 < 1 or y1 - y0 < 1 then return false, 0, 0, 0, 0 end
+  return true, (@uint32)(x0), (@uint32)(y0), (@uint32)(x1 - x0), (@uint32)(y1 - y0)
+end
+
+-- D3D11 ----------------------------------------------------------------------
+
+## if ccinfo.is_windows then
+## cdefine 'COBJMACROS'
+## cinclude '<d3d11.h>'
+
+local HRESULT <cimport, nodecl> = @clong
+local GUID <cimport, nodecl> = @record{ Data1: uint32, Data2: uint16, Data3: uint16, Data4: [8]uint8 }
+local ID3D11Device <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11DeviceContext <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11Resource <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11Texture2D <cimport, nodecl, forwarddecl> = @record{}
+local ID3D11RenderTargetView <cimport, nodecl, forwarddecl> = @record{}
+local DXGI_SAMPLE_DESC <cimport, nodecl> = @record{ Count: cuint, Quality: cuint }
+local D3D11_TEXTURE2D_DESC <cimport, nodecl> = @record{
+  Width: cuint, Height: cuint, MipLevels: cuint, ArraySize: cuint, Format: cint, SampleDesc: DXGI_SAMPLE_DESC,
+  Usage: cint, BindFlags: cuint, CPUAccessFlags: cuint, MiscFlags: cuint,
+}
+local D3D11_BOX <cimport, nodecl> = @record{ left: cuint, top: cuint, front: cuint, right: cuint, bottom: cuint, back: cuint }
+local D3D11_MAPPED_SUBRESOURCE <cimport, nodecl> = @record{ pData: pointer, RowPitch: cuint, DepthPitch: cuint }
+
+local function ID3D11Device_CreateTexture2D(this: *ID3D11Device, desc: *D3D11_TEXTURE2D_DESC, data: pointer, out: **ID3D11Texture2D): HRESULT <cimport, nodecl> end
+local function ID3D11Device_GetImmediateContext(this: *ID3D11Device, out: **ID3D11DeviceContext): void <cimport, nodecl> end
+local function ID3D11DeviceContext_OMGetRenderTargets(this: *ID3D11DeviceContext, n: cuint, rtvs: **ID3D11RenderTargetView, dsv: pointer): void <cimport, nodecl> end
+local function ID3D11DeviceContext_CopySubresourceRegion(this: *ID3D11DeviceContext, dst: *ID3D11Resource, dsub: cuint, dx: cuint, dy: cuint, dz: cuint, src: *ID3D11Resource, ssub: cuint, box: *D3D11_BOX): void <cimport, nodecl> end
+local function ID3D11DeviceContext_Map(this: *ID3D11DeviceContext, res: *ID3D11Resource, sub: cuint, maptype: cint, flags: cuint, out: *D3D11_MAPPED_SUBRESOURCE): HRESULT <cimport, nodecl> end
+local function ID3D11DeviceContext_Unmap(this: *ID3D11DeviceContext, res: *ID3D11Resource, sub: cuint): void <cimport, nodecl> end
+local function ID3D11DeviceContext_Release(this: *ID3D11DeviceContext): culong <cimport, nodecl> end
+local function ID3D11RenderTargetView_GetResource(this: *ID3D11RenderTargetView, out: **ID3D11Resource): void <cimport, nodecl> end
+local function ID3D11RenderTargetView_Release(this: *ID3D11RenderTargetView): culong <cimport, nodecl> end
+local function ID3D11Resource_QueryInterface(this: *ID3D11Resource, iid: *GUID, out: *pointer): HRESULT <cimport, nodecl> end
+local function ID3D11Resource_Release(this: *ID3D11Resource): culong <cimport, nodecl> end
+local function ID3D11Texture2D_GetDesc(this: *ID3D11Texture2D, desc: *D3D11_TEXTURE2D_DESC): void <cimport, nodecl> end
+local function ID3D11Texture2D_Release(this: *ID3D11Texture2D): culong <cimport, nodecl> end
+
+local D3D11_USAGE_STAGING: cint <comptime> = 3
+local D3D11_CPU_ACCESS_READ: cuint <comptime> = 0x20000
+local D3D11_MAP_READ: cint <comptime> = 1
+local D3D11_MAP_FLAG_DO_NOT_WAIT: cuint <comptime> = 0x100000
+local DXGI_ERROR_WAS_STILL_DRAWING: HRESULT <comptime> = (@HRESULT)(0x887A000A_u32)
+
+local IID_ID3D11Texture2D: GUID <const> = {
+  Data1 = 0x6f15aaf2, Data2 = 0xd208, Data3 = 0x4e89,
+  Data4 = { 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c },
+}
+
+local ctx_device: *ID3D11Device
+local ctx: *ID3D11DeviceContext
+
+local function context_for(dev: *ID3D11Device): *ID3D11DeviceContext
+  if dev ~= ctx_device then
+    if ctx ~= nilptr then ID3D11DeviceContext_Release(ctx) ctx = nilptr end
+    ctx_device = dev
+    ID3D11Device_GetImmediateContext(dev, &ctx)
+  end
+  return ctx
+end
+
+-- Inside the draw-list callback: what the renderer has bound as target 0.
+local function d3d_target(tex: *pointer, w: *uint32, h: *uint32, fmt: *cint): cint
+  if ctx == nilptr then return 0 end
+  local rtv: *ID3D11RenderTargetView = nilptr
+  ID3D11DeviceContext_OMGetRenderTargets(ctx, 1, &rtv, nilptr)
+  if rtv == nilptr then return 0 end
+  local res: *ID3D11Resource = nilptr
+  ID3D11RenderTargetView_GetResource(rtv, &res)
+  ID3D11RenderTargetView_Release(rtv)
+  if res == nilptr then return 0 end
+  local t: pointer = nilptr
+  local hr = ID3D11Resource_QueryInterface(res, &IID_ID3D11Texture2D, &t)
+  ID3D11Resource_Release(res)
+  if hr < 0 or t == nilptr then return 0 end
+  local desc: D3D11_TEXTURE2D_DESC
+  ID3D11Texture2D_GetDesc((@*ID3D11Texture2D)(t), &desc)
+  if desc.SampleDesc.Count > 1 then
+    ID3D11Texture2D_Release((@*ID3D11Texture2D)(t))
+    return 0
+  end
+  $tex, $w, $h, $fmt = t, (@uint32)(desc.Width), (@uint32)(desc.Height), desc.Format
+  return 1
+end
+
+local function d3d_stage(device: pointer, w: uint32, h: uint32, fmt: cint, tex: *pointer): clong
+  local dev = (@*ID3D11Device)(device)
+  if dev == nilptr then return -1 end
+  context_for(dev) -- the copy and the map both need it, and the callback cannot make one
+  local desc: D3D11_TEXTURE2D_DESC = {
+    Width = w, Height = h, MipLevels = 1, ArraySize = 1, Format = fmt,
+    SampleDesc = { Count = 1, Quality = 0 }, Usage = D3D11_USAGE_STAGING,
+    BindFlags = 0, CPUAccessFlags = D3D11_CPU_ACCESS_READ, MiscFlags = 0,
+  }
+  local t: *ID3D11Texture2D = nilptr
+  local hr = ID3D11Device_CreateTexture2D(dev, &desc, nilptr, &t)
+  if hr < 0 then return hr end
+  $tex = t
+  return 0
+end
+
+local function d3d_copy(src: pointer, dst: pointer, x: uint32, y: uint32, w: uint32, h: uint32): void
+  if ctx == nilptr or src == nilptr or dst == nilptr then return end
+  local box: D3D11_BOX = { left = x, top = y, front = 0, right = x + w, bottom = y + h, back = 1 }
+  ID3D11DeviceContext_CopySubresourceRegion(ctx, (@*ID3D11Resource)(dst), 0, 0, 0, 0, (@*ID3D11Resource)(src), 0, &box)
+end
+
+local function d3d_map(tex: pointer, data: *pointer, pitch: *uint32): cint
+  if ctx == nilptr or tex == nilptr then return -1 end
+  local m: D3D11_MAPPED_SUBRESOURCE
+  local hr = ID3D11DeviceContext_Map(ctx, (@*ID3D11Resource)(tex), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &m)
+  if hr == DXGI_ERROR_WAS_STILL_DRAWING then return 0 end
+  if hr < 0 then return -1 end
+  $data, $pitch = m.pData, (@uint32)(m.RowPitch)
+  return 1
+end
+
+local function d3d_unmap(tex: pointer): void
+  if ctx == nilptr or tex == nilptr then return end
+  ID3D11DeviceContext_Unmap(ctx, (@*ID3D11Resource)(tex), 0)
+end
+
+local function d3d_release(tex: pointer): void
+  ID3D11Texture2D_Release((@*ID3D11Texture2D)(tex))
+end
+## end
+
+local function api_target(tex: *pointer, w: *uint32, h: *uint32, fmt: *cint): cint
+  if capture_fake ~= nilptr then return capture_fake.target(tex, w, h, fmt) end
+  ## if ccinfo.is_windows then
+    return d3d_target(tex, w, h, fmt)
+  ## else
+    return 0
+  ## end
+end
+
+local function api_stage(device: pointer, w: uint32, h: uint32, fmt: cint, tex: *pointer): clong
+  if capture_fake ~= nilptr then return capture_fake.stage(device, w, h, fmt, tex) end
+  ## if ccinfo.is_windows then
+    return d3d_stage(device, w, h, fmt, tex)
+  ## else
+    return -1
+  ## end
+end
+
+local function api_copy(src: pointer, dst: pointer, x: uint32, y: uint32, w: uint32, h: uint32): void
+  if capture_fake ~= nilptr then capture_fake.copy(src, dst, x, y, w, h) return end
+  ## if ccinfo.is_windows then
+    d3d_copy(src, dst, x, y, w, h)
+  ## end
+end
+
+local function api_map(tex: pointer, data: *pointer, pitch: *uint32): cint
+  if capture_fake ~= nilptr then return capture_fake.map(tex, data, pitch) end
+  ## if ccinfo.is_windows then
+    return d3d_map(tex, data, pitch)
+  ## else
+    return -1
+  ## end
+end
+
+local function api_unmap(tex: pointer): void
+  if capture_fake ~= nilptr then capture_fake.unmap(tex) return end
+  ## if ccinfo.is_windows then
+    d3d_unmap(tex)
+  ## end
+end
+
+local function api_release(tex: pointer): void
+  if tex == nilptr then return end
+  if capture_fake ~= nilptr then capture_fake.release(tex) return end
+  ## if ccinfo.is_windows then
+    d3d_release(tex)
+  ## end
+end
+
+
+-- State machine ---------------------------------------------------------------
+
+local function fail(why: string): boolean
+  capture.state = CaptureState.Failed
+  capture.reason = why
+  return false
+end
+
+-- Let the staging texture go (a size, format or device change, and shutdown).
+global function capture_release(): void
+  if capture.stage_tex ~= nilptr then api_release(capture.stage_tex) end
+  capture.stage_tex = nilptr
+  capture.stage_w, capture.stage_h, capture.stage_fmt = 0, 0, 0
+end
+
+-- Back to Idle, keeping the staging texture for the next frame of a clip.
+global function capture_reset(): void
+  capture.state = CaptureState.Idle
+  capture.waited = 0
+  capture.reason = ''
+end
+
+global function capture_shutdown(): void
+  capture_release()
+  capture.pixels:destroy()
+  capture = {}
+  ## if ccinfo.is_windows then
+    if ctx ~= nilptr then ID3D11DeviceContext_Release(ctx) ctx = nilptr end
+    ctx_device = nilptr
+  ## end
+end
+
+global function capture_busy(): boolean
+  return capture.state == CaptureState.Armed or capture.state == CaptureState.Staged
+end
+
+-- Ask for the next rendered frame. `w`/`h` of 0 means the whole frame, whose
+-- size is only known inside the callback; a crop must give all four. False
+-- when nothing was armed: `reason` says why, and a capture already in flight
+-- counts as a skip (a clip drops that frame rather than queueing it).
+global function capture_arm(device: pointer, x: uint32, y: uint32, w: uint32, h: uint32): boolean
+  if capture_busy() then
+    capture.skipped = capture.skipped + 1
+    return false
+  end
+  capture_reset()
+  if device == nilptr then return fail('Dalamud reports no D3D11 device') end
+  if w > CAPTURE_MAX_SIDE or h > CAPTURE_MAX_SIDE then return fail('the frame is too large to read back') end
+  capture.device = device
+  capture.x, capture.y, capture.w, capture.h = x, y, w, h
+  capture.state = CaptureState.Armed
+  capture.waited = 0
+  return true
+end
+
+-- The staging texture for `w` x `h` in `fmt`, made when there is none or the
+-- one there does not fit. Runs inside the callback: creating a texture there is
+-- a device call, not an allocation of ours, and only happens when the size or
+-- the format changed.
+local function stage_ensure(w: uint32, h: uint32, fmt: cint): boolean
+  if capture.stage_tex ~= nilptr and capture.stage_w == w and capture.stage_h == h and capture.stage_fmt == fmt then
+    return true
+  end
+  capture_release()
+  local t: pointer = nilptr
+  if api_stage(capture.device, w, h, fmt, &t) < 0 or t == nilptr then return false end
+  capture.stage_tex, capture.stage_w, capture.stage_h, capture.stage_fmt = t, w, h, fmt
+  return true
+end
+
+-- The draw-list callback the renderer runs (C ABI). It is appended to ImGui's
+-- foreground list, which the renderer draws last, so the target holds the game
+-- frame with every ImGui window on top of it. No allocation and no shim calls:
+-- this runs inside Present.
+global function capture_render_cb(list: pointer, cmd: pointer): void
+  if capture.state ~= CaptureState.Armed then return end
+  local tex: pointer = nilptr
+  local fw: uint32, fh: uint32, fmt: cint = 0, 0, 0
+  if api_target(&tex, &fw, &fh, &fmt) == 0 or tex == nilptr then
+    fail('the renderer has no single-sampled render target bound')
+    return
+  end
+  defer api_release(tex) end
+  local ok, _ = capture_fmt_bgr(fmt)
+  if not ok then
+    capture.fmt = fmt
+    fail('the frame is in a pixel format this build cannot read (not 8-bit BGRA or RGBA)')
+    return
+  end
+  local x, y, w, h = capture.x, capture.y, capture.w, capture.h
+  if w == 0 or h == 0 then x, y, w, h = 0, 0, fw, fh end
+  if x >= fw or y >= fh then
+    fail('the crop is outside the frame')
+    return
+  end
+  if x + w > fw then w = fw - x end
+  if y + h > fh then h = fh - y end
+  if w > CAPTURE_MAX_SIDE or h > CAPTURE_MAX_SIDE then
+    fail('the frame is too large to read back')
+    return
+  end
+  if not stage_ensure(w, h, fmt) then
+    fail('a staging texture for the frame could not be created')
+    return
+  end
+  api_copy(tex, capture.stage_tex, x, y, w, h)
+  capture.x, capture.y, capture.w, capture.h = x, y, w, h
+  capture.frame_w, capture.frame_h = fw, fh
+  capture.fmt = fmt
+  capture.state = CaptureState.Staged
+end
+
+-- Per frame, from the frame thread. Reads the copy back once the GPU is done
+-- with it; the state it returns is the state afterwards.
+global function capture_poll(): CaptureState
+  if capture.state == CaptureState.Armed then
+    capture.waited = capture.waited + 1
+    if capture.waited > CAPTURE_ARM_LIMIT then
+      capture.misses = capture.misses + 1
+      fail('the renderer does not run draw-list callbacks, so no frame can be captured')
+    end
+    return capture.state
+  end
+  if capture.state ~= CaptureState.Staged then return capture.state end
+  capture.waited = capture.waited + 1
+  local data: pointer = nilptr
+  local pitch: uint32 = 0
+  local r = api_map(capture.stage_tex, &data, &pitch)
+  if r == 0 then
+    if capture.waited > CAPTURE_MAP_LIMIT then fail('the frame never became readable') end
+    return capture.state
+  end
+  if r < 0 or data == nilptr then
+    fail('the captured frame could not be read back')
+    return capture.state
+  end
+  local w, h = (@usize)(capture.w), (@usize)(capture.h)
+  capture.pixels:resize(w * h * 4)
+  local _, bgr = capture_fmt_bgr(capture.fmt)
+  local src = (@*[0]uint8)(data)
+  local dst = (@*[0]uint8)(&capture.pixels[0])
+  for row: usize = 0, < h do
+    local s = (@*[0]uint8)(&src[row * (@usize)(pitch)])
+    local d = (@*[0]uint8)(&dst[row * w * 4])
+    if bgr then
+      memory.copy(d, s, w * 4)
+      for i: usize = 3, < w * 4, 4 do d[i] = 255 end
+    else
+      for i: usize = 0, < w do
+        d[i*4], d[i*4+1], d[i*4+2], d[i*4+3] = s[i*4+2], s[i*4+1], s[i*4], 255
+      end
+    end
+  end
+  api_unmap(capture.stage_tex)
+  capture.bgr = true
+  capture.taken = capture.taken + 1
+  capture.state = CaptureState.Ready
+  return capture.state
+end

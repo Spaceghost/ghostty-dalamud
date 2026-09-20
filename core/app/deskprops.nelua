@@ -1,0 +1,158 @@
+-- The desk scene's furniture (CONFIG.animation.style = 'desk', lua/desk.lua):
+-- client-side background objects like the panel shadow boards
+-- (core/app/occluders.nelua), with the same rules. Created lazily when Lua
+-- asks for them, transformed only once their model has loaded, a model that
+-- never loads given up on with one warning, and freed when Lua lets them go,
+-- when anything blocks the scene (a cutscene, group pose, a zone change or
+-- loading screen, an event, combat, a mount, no character), whenever no
+-- character is loaded and in teardown_effects. Only this client sees them
+-- and they have no collision.
+require 'core.desk'
+require 'core.app.state'
+
+local CREATE_RETRY_FRAMES: uint64 <comptime> = 300  -- after a failed create or transform
+local LOAD_TIMEOUT_FRAMES: uint64 <comptime> = 600  -- a model that never loads (wrong path)
+local LOAD_RETRY_FRAMES: uint64 <comptime> = 1800
+
+local Prop = @record{
+  obj: pointer,
+  model: [256]cchar,   -- what `obj` was made from ("" = empty slot)
+  born: uint64,
+  ready: boolean,
+  placed: boolean,     -- the wanted pose was sent
+  retry_at: uint64,
+}
+
+local props: [DESK_MAX_PROPS]Prop
+local frame: uint64 = 1
+local seen_serial: uint32 = 0
+local territory: uint32 = 0   -- zone the props were made in (0 = none)
+local warned = false
+
+local function available(): boolean
+  return host.api.bg_create ~= nilptr and host.api.bg_ready ~= nilptr
+    and host.api.bg_set_transform ~= nilptr and host.api.bg_destroy ~= nilptr
+end
+
+local function warn_once(msg: string): void
+  if warned then return end
+  warned = true
+  log(LOG_WARN, msg)
+end
+
+local function same_model(a: *[256]cchar, b: *[256]cchar): boolean
+  for i = 0, < 256 do
+    if a[i] ~= b[i] then return false end
+    if a[i] == 0 then return true end
+  end
+  return true
+end
+
+local function prop_free(p: *Prop): void
+  if p.obj ~= nilptr and host.api.bg_destroy ~= nilptr then host.api.bg_destroy(p.obj) end
+  p.obj, p.ready, p.placed = nilptr, false, false
+end
+
+local function live_count(): integer
+  local n = 0
+  for i = 0, < DESK_MAX_PROPS do if props[i].obj ~= nilptr then n = n + 1 end end
+  return n
+end
+
+-- Free every prop (teardown, no character, blocked, switched off).
+global function desk_props_destroy_all(): void
+  for i = 0, < DESK_MAX_PROPS do
+    prop_free(&props[i])
+    props[i] = {}
+  end
+  territory = 0
+end
+
+-- Teardown: the props go and Lua's wish with them (a reloaded Lua asks again).
+global function desk_props_teardown(): void
+  desk_props_destroy_all()
+  desk_want_clear()
+  desk_block = 0
+  warned = false
+end
+
+-- Why the scene may not show now (DESK_BLOCK_* bits).
+local function blocked(pc: *GuObject, have_pc: boolean): cint
+  local f: cint = 0
+  if host.api.scene_flags ~= nilptr then f = host.api.scene_flags() & 15 end
+  if not have_pc then return f | DESK_BLOCK_NO_CHARACTER end
+  if pc.in_combat ~= 0 then f = f | DESK_BLOCK_COMBAT end
+  if pc.mounted ~= 0 then f = f | DESK_BLOCK_MOUNTED end
+  if territory ~= 0 and pc.territory ~= territory then f = f | DESK_BLOCK_ZONE end
+  return f
+end
+
+-- Once per frame while a character is in the world.
+global function desk_props_sync(): void
+  defer frame = frame + 1 end
+  local pc: GuObject
+  local have_pc = host.api.get_object ~= nilptr and host.api.get_object(WORLD_PLAYER, 0, &pc) ~= 0 and pc.found ~= 0
+  desk_block = blocked(&pc, have_pc)
+  if desk_block ~= 0 then
+    -- the props never come back by themselves: Lua ends the scene and asks again
+    if desk_want.count > 0 then logf(LOG_INFO, 'desk: scene blocked (%d), props freed', desk_block) end
+    desk_want_clear()
+    desk_props_destroy_all()
+    return
+  end
+  if desk_want.count == 0 or not available() then
+    if live_count() > 0 then desk_props_destroy_all() end
+    return
+  end
+  if desk_want.serial ~= seen_serial then
+    seen_serial = desk_want.serial
+    for i = 0, < DESK_MAX_PROPS do
+      local p = &props[i]
+      if i >= desk_want.count then
+        prop_free(p)
+        props[i] = {}
+      elseif not same_model(&p.model, &desk_want.props[i].model) then
+        prop_free(p)
+        props[i] = { model = desk_want.props[i].model }
+      else
+        p.placed = false -- moved or rescaled: send the pose again
+      end
+    end
+  end
+  territory = pc.territory
+  for i = 0, < desk_want.count do
+    local p, w = &props[i], &desk_want.props[i]
+    if p.obj == nilptr then
+      if frame < p.retry_at then continue end
+      p.obj = host.api.bg_create((@cstring)(&w.model[0]))
+      if p.obj == nilptr then
+        p.retry_at = frame + CREATE_RETRY_FRAMES
+        warn_once('desk: could not create a prop (CONFIG.animation.desk)')
+        continue
+      end
+      p.born, p.ready, p.placed = frame, false, false
+    end
+    if not p.ready then
+      if host.api.bg_ready(p.obj) == 0 then
+        if frame - p.born >= LOAD_TIMEOUT_FRAMES then
+          warn_once('desk: a prop model did not load (CONFIG.animation.desk.models)')
+          prop_free(p)
+          p.retry_at = frame + LOAD_RETRY_FRAMES
+        end
+        continue
+      end
+      p.ready = true
+      warned = false
+    end
+    if not p.placed then
+      local qy, qw = desk_yaw_quat(w.yaw)
+      if host.api.bg_set_transform(p.obj, w.x, w.y, w.z, 0, qy, 0, qw, w.scale, w.scale, w.scale) == 0 then
+        warn_once('desk: could not place a prop')
+        prop_free(p)
+        p.retry_at = frame + CREATE_RETRY_FRAMES
+        continue
+      end
+      p.placed = true
+    end
+  end
+end

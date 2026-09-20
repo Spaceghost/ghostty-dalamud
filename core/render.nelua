@@ -1,7 +1,10 @@
 -- Draw a TermView into an ImGui draw list.
 require 'core.ghostty'
 require 'core.imgui'
+require 'core.boxdraw'
+require 'core.glyphfb'
 require 'core.termview'
+require 'core.theme'
 require 'memory'
 
 global RenderMetrics = @record{
@@ -58,6 +61,13 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
   local iter = v.iter
   if ghostty_render_state_get(v.state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &iter) ~= GHOSTTY_SUCCESS then return end
 
+  -- the cursor's cell, so a theme's cursor-text can redraw its glyph on the block
+  local cur: GhosttyRenderStateCursor = { size = #GhosttyRenderStateCursor }
+  local has_cur = ghostty_render_state_get(v.state, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cur) == GHOSTTY_SUCCESS and cur.visible and cur.viewport_has_value
+  local want_cur_glyph = has_cur and theme_term.has_cursor_text
+  local cur_glyph: [64]uint8
+  local cur_glyph_len: usize = 0
+
   local text: [64]uint8
   local y: float32 = origin.y
   -- Same-colour ASCII glyphs in adjacent cells go out as one AddText. ImGui
@@ -105,9 +115,16 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
         end
         local selected: boolean = has_sel and col >= sel.start_x and col <= sel.end_x
         if selected then
-          local t = fg
-          fg = bg
-          bg = t
+          -- the theme's selection colours, else the cell inverted (as Ghostty)
+          if theme_term.has_sel_bg then
+            bg = theme_term.sel_bg
+            if theme_term.has_sel_fg then fg = theme_term.sel_fg end
+          else
+            local t = fg
+            fg = bg
+            bg = t
+            if theme_term.has_sel_fg then fg = theme_term.sel_fg end
+          end
           has_bg = true
         end
 
@@ -133,6 +150,10 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
         if glen > 0 and not (styled and style.invisible) then
           local buf: GhosttyBuffer = { ptr = &text, cap = 63, len = 0 }
           if ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_GRAPHEMES_UTF8, &buf) == GHOSTTY_SUCCESS and buf.len > 0 then
+            if want_cur_glyph and row_index == cur.viewport_y and col == cur.viewport_x then
+              memory.copy(&cur_glyph, &text, buf.len)
+              cur_glyph_len = buf.len
+            end
             local underline = styled and style.underline ~= GHOSTTY_SGR_UNDERLINE_NONE
             local strike = styled and style.strikethrough
             local bold = styled and style.bold
@@ -142,8 +163,36 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
               -- a written space draws nothing
             else
               local mergeable = merge_text and plain and buf.len == 1 and text[0] > 32 and text[0] < 127
+              local cp = boxdraw_codepoint(&text, buf.len)
+              if not boxdraw_handles(cp) then cp = 0 end
+              -- a glyph the ImGui font cannot draw (above U+FFFF, or missing): core/glyphfb.nelua
+              local fbcp: uint32 = 0
+              local span: integer = 1
+              if cp == 0 and text[0] >= 0x80 then
+                fbcp = glyphfb_codepoint(&text, buf.len)
+                if glyphfb_wants(m.font, fbcp) then
+                  local raw: GhosttyCell = 0
+                  local wide: cint = 0
+                  if ghostty_render_state_row_cells_get(cells, GHOSTTY_RENDER_STATE_ROW_CELLS_DATA_RAW, &raw) == GHOSTTY_SUCCESS and
+                     ghostty_cell_get(raw, GHOSTTY_CELL_DATA_WIDE, &wide) == GHOSTTY_SUCCESS and wide == GHOSTTY_CELL_WIDE_WIDE then
+                    span = 2
+                  end
+                  -- no glyphfb_has here: a code point no fallback font holds
+                  -- draws as the tofu box below, never as the ImGui font's
+                  -- U+FFFD (core/glyphfb.nelua, glyphfb_tofu)
+                else
+                  fbcp = 0
+                end
+              end
               local n = #v.glyphs
-              if mergeable and text_next_col == col and n > 0 and v.glyphs[n - 1].col == fgcol and v.glyphs[n - 1].bold == bold then
+              if cp ~= 0 then
+                v.glyphs:push(GlyphDraw{ x = x, col = fgcol, off = #v.glyph_bytes, len = 0, underline = underline, strike = strike, cp = cp })
+              elseif fbcp ~= 0 then
+                local off = #v.glyph_bytes
+                v.glyph_bytes:resize(off + buf.len)
+                memory.copy(&v.glyph_bytes[off], &text, buf.len)
+                v.glyphs:push(GlyphDraw{ x = x, col = fgcol, off = off, len = buf.len, underline = underline, strike = strike, cp = fbcp, fb = true, span = (@uint8)(span) })
+              elseif mergeable and text_next_col == col and n > 0 and v.glyphs[n - 1].col == fgcol and v.glyphs[n - 1].bold == bold then
                 -- the run's bytes are the last ones queued
                 v.glyph_bytes:push(text[0])
                 v.glyphs[n - 1].len = v.glyphs[n - 1].len + 1
@@ -170,8 +219,16 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
           local g = v.glyphs[gi]
           local b = (@cstring)(&bytes[g.off])
           local e = (@cstring)(&bytes[g.off + g.len])
-          imgui.DrawListAddText(dl, m.font, m.font_size, vec2(g.x, y), g.col, b, e, 0.0, nilptr)
-          if g.bold then
+          if g.fb then
+            if not glyphfb_draw(dl, g.cp, g.x, y, m.cell_w, m.cell_h, g.span, g.col, not render_world) then
+              glyphfb_tofu(dl, g.cp, g.x, y, m.cell_w, m.cell_h, g.span, g.col, not render_world, m.font, m.font_size)
+            end
+          elseif g.cp ~= 0 then
+            boxdraw_draw(dl, g.cp, g.x, y, m.cell_w, m.cell_h, g.col, not render_world)
+          else
+            imgui.DrawListAddText(dl, m.font, m.font_size, vec2(g.x, y), g.col, b, e, 0.0, nilptr)
+          end
+          if g.bold and g.cp == 0 then
             imgui.DrawListAddText(dl, m.font, m.font_size, vec2(g.x + 0.7, y), g.col, b, e, 0.0, nilptr)
           end
           if g.underline then
@@ -192,8 +249,7 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
   end
 
   -- Cursor.
-  local cur: GhosttyRenderStateCursor = { size = #GhosttyRenderStateCursor }
-  if ghostty_render_state_get(v.state, GHOSTTY_RENDER_STATE_DATA_CURSOR, &cur) == GHOSTTY_SUCCESS and cur.visible and cur.viewport_has_value then
+  if has_cur then
     if not cur.blinking or blink_on or not focused then
       local cx = origin.x + m.cell_w * cur.viewport_x
       local cy = origin.y + m.cell_h * cur.viewport_y
@@ -209,9 +265,22 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
         imgui.DrawListAddRect(dl, vec2(cx, cy), vec2(cx + m.cell_w, cy + m.cell_h), ccol, 0.0, 0, 1.0)
       else
         imgui.DrawListAddRectFilled(dl, vec2(cx, cy), vec2(cx + m.cell_w, cy + m.cell_h), ccol, 0.0, 0)
-        -- Re-draw the glyph under a block cursor in the background color so it stays readable.
-        -- (Cheap approach: the terminal foreground/background swap is handled by the next frame's
-        -- selection logic; here we only paint the block.)
+        -- a theme with cursor-text redraws the glyph under the block in that colour
+        local ccp = cur_glyph_len > 0 and boxdraw_codepoint(&cur_glyph, cur_glyph_len) or 0
+        local fcp = cur_glyph_len > 0 and glyphfb_codepoint(&cur_glyph, cur_glyph_len) or 0
+        if boxdraw_handles(ccp) then
+          boxdraw_draw(dl, ccp, cx, cy, m.cell_w, m.cell_h, rgb(theme_term.cursor_text, 255), not render_world)
+        elseif glyphfb_wants(m.font, fcp) then
+          -- a fallback glyph, or the tofu box when no font has it
+          local ct = rgb(theme_term.cursor_text, 255)
+          if not glyphfb_draw(dl, fcp, cx, cy, m.cell_w, m.cell_h, 1, ct, not render_world) then
+            glyphfb_tofu(dl, fcp, cx, cy, m.cell_w, m.cell_h, 1, ct, not render_world, m.font, m.font_size)
+          end
+        elseif cur_glyph_len > 0 then
+          local b = (@cstring)(&cur_glyph[0])
+          local e = (@cstring)(&cur_glyph[cur_glyph_len])
+          imgui.DrawListAddText(dl, m.font, m.font_size, vec2(cx, cy), rgb(theme_term.cursor_text, 255), b, e, 0.0, nilptr)
+        end
       end
     end
   end

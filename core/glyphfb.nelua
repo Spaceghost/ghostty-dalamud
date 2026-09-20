@@ -1,0 +1,449 @@
+-- Fallback glyphs, drawn by the core itself as Ghostty does for glyphs its
+-- primary font lacks. Dalamud's ImGui keeps 16-bit ImWchar, so a code point
+-- above U+FFFF never comes out of the ImGui font atlas (ImGui decodes it to
+-- U+FFFD), and a BMP glyph the merged terminal font misses would draw as
+-- U+FFFD too. Such a glyph is rasterized here with stb_truetype from a chain
+-- of fallback fonts (the plugin's fonts/ folder), put into a texture of our
+-- own on Dalamud's D3D11 device (core/wintex.nelua, the same path remote
+-- windows take) and drawn with DrawListAddImage: a white glyph whose alpha is
+-- the coverage, tinted by the cell's foreground colour.
+--
+-- The atlas is one ATLAS x ATLAS texture packed in shelves, cached by code
+-- point and pixel box. When it is full the glyph that did not fit falls back
+-- to the ImGui font for that frame and the whole cache starts over on the
+-- next one (glyphs already queued this frame keep their pixels until then).
+-- A device change or a missing device (an older shim, the host tests without
+-- a fake) drops the cache: nothing is rasterized, and a glyph the ImGui font
+-- cannot draw either gets the tofu box (glyphfb_tofu) rather than U+FFFD.
+require 'core.imgui'
+require 'core.wintex'
+require 'core.sys.winpath'
+require 'vector'
+require 'hashmap'
+require 'string'
+require 'math'
+require 'memory'
+require 'io'
+
+## cdefine 'STB_TRUETYPE_IMPLEMENTATION'
+## cdefine 'STBTT_STATIC'
+## cinclude '<stb_truetype.h>'
+## cemitdecl 'static void *glyphfb_info_new(void) { return calloc(1, sizeof(stbtt_fontinfo)); }'
+
+local stbtt_fontinfo <cimport, nodecl, forwarddecl> = @record{}
+local function glyphfb_info_new(): *stbtt_fontinfo <cimport, nodecl> end
+local function stbtt_InitFont(info: *stbtt_fontinfo, data: *[0]uint8, offset: cint): cint <cimport, nodecl> end
+local function stbtt_GetFontOffsetForIndex(data: *[0]uint8, index: cint): cint <cimport, nodecl> end
+local function stbtt_FindGlyphIndex(info: *stbtt_fontinfo, cp: cint): cint <cimport, nodecl> end
+local function stbtt_ScaleForPixelHeight(info: *stbtt_fontinfo, h: float32): float32 <cimport, nodecl> end
+local function stbtt_GetFontVMetrics(info: *stbtt_fontinfo, asc: *cint, desc: *cint, gap: *cint): void <cimport, nodecl> end
+local function stbtt_GetGlyphBox(info: *stbtt_fontinfo, g: cint, x0: *cint, y0: *cint, x1: *cint, y1: *cint): cint <cimport, nodecl> end
+local function stbtt_GetGlyphBitmapBoxSubpixel(info: *stbtt_fontinfo, g: cint, sx: float32, sy: float32, shx: float32, shy: float32, x0: *cint, y0: *cint, x1: *cint, y1: *cint): void <cimport, nodecl> end
+local function stbtt_MakeGlyphBitmapSubpixel(info: *stbtt_fontinfo, out: *[0]uint8, w: cint, h: cint, stride: cint, sx: float32, sy: float32, shx: float32, shy: float32, g: cint): void <cimport, nodecl> end
+local function free(p: pointer): void <cimport, cinclude '<stdlib.h>', nodecl> end
+
+global GLYPHFB_ATLAS <comptime> = 1024
+local MAX_BOX <comptime> = 256 -- the largest glyph box in pixels (a two-cell glyph of a big world font fits)
+
+-- The fallback chain, in order, from the fonts directory (fonts/README.md). A
+-- missing file is skipped. Fonts a host adds with glyphfb_add_font (the CJK
+-- font Dalamud ships, core/app/lifecycle.nelua) come after these, so the
+-- bundled symbol fonts keep the icons they are here for.
+local CHAIN: [3]string = { 'SymbolsNerdFontMono-Regular.ttf', 'NotoSansSymbols2-Regular.ttf', 'NotoEmoji[wght].ttf' }
+
+-- One font of the chain. Its file is read on the first glyph the fonts before
+-- it do not have (`tried`), never sooner: the chain is 25 MB with the CJK font
+-- in it and a session that shows no CJK never pays for it.
+local FbFont = @record{ path: string, data: string, info: *stbtt_fontinfo, tried: boolean }
+
+local FbEntry = @record{
+  found: boolean,   -- false: no fallback font has the glyph (cached so it is not looked up again)
+  u0: float32, v0: float32, u1: float32, v1: float32,
+}
+
+local Shelf = @record{ y: uint16, h: uint16, x: uint16 }
+
+-- Counters the tests (and a curious log) read.
+global GlyphFbStats = @record{ rasterized: integer, uploads: integer, resets: integer, fonts: integer }
+
+local fb: record{
+  dir: string,
+  extra: vector(string), -- absolute paths a host added, after the bundled chain
+  fonts: vector(FbFont),
+  chain_built: boolean,
+  cache: hashmap(uint64, FbEntry),
+  shelves: vector(Shelf),
+  next_y: uint16,
+  reset_pending: boolean,
+  device: pointer,
+  tex: WinTex,
+  alpha: vector(uint8),  -- scratch: the glyph's coverage
+  pixels: vector(uint8), -- scratch: the glyph as BGRA, with a transparent border
+}
+
+global glyphfb_stats: GlyphFbStats
+
+local function drop_cache(): void
+  fb.cache:clear()
+  fb.shelves:clear()
+  fb.next_y = 0
+  fb.reset_pending = false
+end
+
+local function unload_fonts(): void
+  for i = 0, < #fb.fonts do
+    free(fb.fonts[i].info)
+    fb.fonts[i].data:destroy()
+    fb.fonts[i].path:destroy()
+  end
+  fb.fonts:clear()
+  fb.chain_built = false
+  glyphfb_stats.fonts = 0
+end
+
+-- The directory the fallback fonts are read from (the plugin's fonts/).
+-- Fonts are opened on the first glyph that needs one.
+global function glyphfb_set_dir(dir: string): void
+  if dir == fb.dir then return end
+  unload_fonts()
+  drop_cache()
+  fb.dir:destroy()
+  fb.dir = dir:copy()
+end
+
+-- One more font file, by absolute path, behind the bundled chain: the host's
+-- own CJK font, which is far too big to ship and far too big to merge into
+-- ImGui's atlas (docs/GLYPHS.md). Adding the same path twice does nothing, so
+-- a config reload may call this again.
+global function glyphfb_add_font(path: string): void
+  if #path == 0 then return end
+  for i = 0, < #fb.extra do
+    if fb.extra[i] == path then return end
+  end
+  fb.extra:push(path:copy())
+  unload_fonts() -- rebuilt, with the new file at the end, on the next glyph
+  drop_cache()
+end
+
+-- The chain's paths, bundled first. No file is read here.
+local function build_chain(): void
+  fb.chain_built = true
+  if #fb.dir > 0 then
+    for i = 0, < #CHAIN do
+      fb.fonts:push(FbFont{ path = string.format('%s/%s', fb.dir, CHAIN[i]) })
+    end
+  end
+  for i = 0, < #fb.extra do
+    fb.fonts:push(FbFont{ path = fb.extra[i]:copy() })
+  end
+end
+
+-- Read font `i` of the chain if it has not been read yet. False when its file
+-- is missing or stb_truetype cannot use it (it is then never tried again).
+local function ensure_font(i: integer): boolean
+  local f = &fb.fonts[i]
+  if f.tried then return f.info ~= nilptr end
+  f.tried = true
+  -- not io.open: the CRT's open is ANSI on Windows, so a plugin folder the
+  -- active code page cannot spell (a user name with non-ASCII characters)
+  -- would silently open none of these fonts (core/sys/winpath.nelua)
+  local data = winpath_read_file(f.path)
+  if #data == 0 then
+    data:destroy()
+    return false
+  end
+  local bytes = (@*[0]uint8)(data.data)
+  local info = glyphfb_info_new()
+  if #data > 0 and info ~= nilptr and stbtt_InitFont(info, bytes, stbtt_GetFontOffsetForIndex(bytes, 0)) ~= 0 then
+    f.data, f.info = data, info
+    glyphfb_stats.fonts = glyphfb_stats.fonts + 1
+    return true
+  end
+  free(info)
+  data:destroy()
+  return false
+end
+
+-- A code point no built ImGui font can have a glyph for: ImGui builds from
+-- U+0020 up, so ImFont_FindGlyph gives the font's own fallback glyph for it.
+local MISSING_PROBE <comptime> = 0x0001
+
+-- Whether the ImGui font `font` cannot draw `cp`, so a fallback glyph should.
+-- Everything above U+FFFF (ImWchar is 16-bit, so no such glyph is ever in the
+-- atlas); in the BMP, what the font lacks. ASCII never, and U+FFFD never
+-- (whatever draws it, it is already the "no glyph" mark).
+--
+-- Dalamud's cimgui.dll exports ImFont_FindGlyphNoFallback, which answers this
+-- directly. Should a build not export it, ImFont_FindGlyph does: it returns
+-- the font's fallback glyph for a code point the font lacks, so a glyph that
+-- is the same pointer as the fallback glyph of MISSING_PROBE is missing.
+global function glyphfb_wants(font: *ImFont, cp: uint32): boolean
+  if cp < 0x80 then return false end
+  if cp > 0xFFFF then return cp <= 0x10FFFF end
+  if cp == 0xFFFD or font == nilptr then return false end
+  if imgui.FontFindGlyphNoFallback ~= nilptr then
+    return imgui.FontFindGlyphNoFallback(font, (@uint16)(cp)) == nilptr
+  end
+  if imgui.FontFindGlyph ~= nilptr then
+    local g = imgui.FontFindGlyph(font, (@uint16)(cp))
+    if g == nilptr then return true end
+    return g == imgui.FontFindGlyph(font, MISSING_PROBE)
+  end
+  return false -- neither export: the ImGui font draws it, as before
+end
+
+-- The first code point of a UTF-8 grapheme (0 when it is not valid UTF-8).
+global function glyphfb_codepoint(p: *[0]uint8, len: usize): uint32
+  if len == 0 then return 0 end
+  local b0 = p[0]
+  if b0 < 0x80 then return b0 end
+  local n: usize, cp: uint32 = 0, 0
+  if b0 & 0xE0 == 0xC0 then n, cp = 2, b0 & 0x1F
+  elseif b0 & 0xF0 == 0xE0 then n, cp = 3, b0 & 0x0F
+  elseif b0 & 0xF8 == 0xF0 then n, cp = 4, b0 & 0x07
+  else return 0 end
+  if len < n then return 0 end
+  for i: usize = 1, < n do
+    if p[i] & 0xC0 ~= 0x80 then return 0 end
+    cp = (cp << 6) | (p[i] & 0x3F)
+  end
+  return cp
+end
+
+local function box_px(cell_w: float32, cell_h: float32, span: integer): (integer, integer)
+  local w = (@integer)(math.floor(cell_w * span + 0.5))
+  local h = (@integer)(math.floor(cell_h + 0.5))
+  if w < 1 then w = 1 end
+  if h < 1 then h = 1 end
+  if w > MAX_BOX then w = MAX_BOX end
+  if h > MAX_BOX then h = MAX_BOX end
+  return w, h
+end
+
+local function key_of(cp: uint32, w: integer, h: integer): uint64
+  return (@uint64)(cp) | ((@uint64)(w) << 24) | ((@uint64)(h) << 40)
+end
+
+-- A (w+2) x (h+2) place in the atlas (the border keeps linear filtering from
+-- bleeding in a neighbour). False when the atlas is full.
+local function alloc(w: integer, h: integer): (boolean, integer, integer)
+  local pw, ph = w + 2, h + 2
+  for i = 0, < #fb.shelves do
+    local s = &fb.shelves[i]
+    if s.h == ph and s.x + pw <= GLYPHFB_ATLAS then
+      local x = s.x
+      s.x = s.x + pw
+      return true, x, s.y
+    end
+  end
+  if fb.next_y + ph > GLYPHFB_ATLAS or pw > GLYPHFB_ATLAS then return false, 0, 0 end
+  local y = fb.next_y
+  fb.shelves:push(Shelf{ y = y, h = ph, x = pw })
+  fb.next_y = fb.next_y + ph
+  return true, 0, y
+end
+
+-- Rasterize glyph `g` of `f` into the w x h coverage box: the font's own
+-- line (ascent to descent) scaled to the box height, shrunk to fit when the
+-- glyph is wider or taller than the box, centred across, on the baseline when
+-- it fits there and centred up and down otherwise.
+local function rasterize(f: *FbFont, g: cint, w: integer, h: integer, out: *[0]uint8): void
+  local info = f.info
+  local asc: cint, desc: cint, gap: cint = 0, 0, 0
+  stbtt_GetFontVMetrics(info, &asc, &desc, &gap)
+  local x0: cint, y0: cint, x1: cint, y1: cint = 0, 0, 0, 0
+  if stbtt_GetGlyphBox(info, g, &x0, &y0, &x1, &y1) == 0 then return end -- no outline (a space)
+  local base = stbtt_ScaleForPixelHeight(info, (@float32)(h))
+  local s = base
+  local gw, gh = (@float32)(x1 - x0), (@float32)(y1 - y0)
+  if gw <= 0 or gh <= 0 then return end
+  if gw * s > w then s = w / gw end
+  if gh * s > h then s = h / gh end
+  local ox: float32 = (w - gw * s) * 0.5 - x0 * s
+  local oy: float32 = asc * base -- the baseline, from the top of the box
+  local top, bottom = oy - y1 * s, oy - y0 * s
+  if s < base or top < 0 or bottom > h then oy = (h - gh * s) * 0.5 + y1 * s end
+  local fx, fy = math.floor(ox), math.floor(oy)
+  local shx, shy = ox - fx, oy - fy
+  local bx0: cint, by0: cint, bx1: cint, by1: cint = 0, 0, 0, 0
+  stbtt_GetGlyphBitmapBoxSubpixel(info, g, s, s, shx, shy, &bx0, &by0, &bx1, &by1)
+  local bw, bh = bx1 - bx0, by1 - by0
+  if bw <= 0 or bh <= 0 then return end
+  local tmp: vector(uint8)
+  tmp:resize(bw * bh)
+  stbtt_MakeGlyphBitmapSubpixel(info, (@*[0]uint8)(&tmp[0]), bw, bh, bw, s, s, shx, shy, g)
+  local dx, dy = (@integer)(fx) + bx0, (@integer)(fy) + by0
+  for yy = 0, < bh do
+    local ty = dy + yy
+    if ty >= 0 and ty < h then
+      for xx = 0, < bw do
+        local tx = dx + xx
+        if tx >= 0 and tx < w then
+          local a = tmp[yy * bw + xx]
+          if a > out[ty * w + tx] then out[ty * w + tx] = a end
+        end
+      end
+    end
+  end
+  tmp:destroy()
+end
+
+-- The cached (or freshly made) entry for `cp` in a w x h box; nilptr when
+-- nothing can be drawn from here this frame.
+local function entry_for(cp: uint32, w: integer, h: integer): *FbEntry
+  if fb.tex.srv == nilptr then return nilptr end
+  local key = key_of(cp, w, h)
+  local e = fb.cache:peek(key)
+  if e ~= nilptr then return e end
+  if fb.reset_pending then return nilptr end -- the atlas filled up this frame
+  if not fb.chain_built then build_chain() end
+  local font: *FbFont = nilptr
+  local g: cint = 0
+  for i = 0, < #fb.fonts do
+    if ensure_font(i) then
+      g = stbtt_FindGlyphIndex(fb.fonts[i].info, (@cint)(cp))
+      if g ~= 0 then font = &fb.fonts[i] break end
+    end
+  end
+  if font == nilptr then
+    fb.cache[key] = FbEntry{ found = false }
+    return fb.cache:peek(key)
+  end
+  local ok, ax, ay = alloc(w, h)
+  if not ok then
+    fb.reset_pending = true -- start over next frame; this glyph uses the ImGui font until then
+    return nilptr
+  end
+  fb.alpha:resize(w * h)
+  memory.zero(&fb.alpha[0], (@usize)(w * h))
+  rasterize(font, g, w, h, (@*[0]uint8)(&fb.alpha[0]))
+  local pw, ph = w + 2, h + 2
+  fb.pixels:resize(pw * ph * 4)
+  -- white everywhere, the border too: filtering then only fades alpha, with no dark fringe
+  memory.set(&fb.pixels[0], 255, (@usize)(pw * ph * 4))
+  for yy = 0, < ph do
+    for xx = 0, < pw do
+      local a: uint8 = 0
+      if yy >= 1 and yy <= h and xx >= 1 and xx <= w then a = fb.alpha[(yy - 1) * w + xx - 1] end
+      fb.pixels[(yy * pw + xx) * 4 + 3] = a
+    end
+  end
+  wintex_upload_from(&fb.tex, WinRect{ x = (@uint16)(ax), y = (@uint16)(ay), w = (@uint16)(pw), h = (@uint16)(ph) },
+    &fb.pixels[0], (@usize)(pw * 4))
+  glyphfb_stats.rasterized = glyphfb_stats.rasterized + 1
+  glyphfb_stats.uploads = glyphfb_stats.uploads + 1
+  local inv: float32 = 1.0 / GLYPHFB_ATLAS
+  fb.cache[key] = FbEntry{
+    found = true,
+    u0 = (ax + 1) * inv, v0 = (ay + 1) * inv, u1 = (ax + 1 + w) * inv, v1 = (ay + 1 + h) * inv,
+  }
+  return fb.cache:peek(key)
+end
+
+-- Once a frame, before anything draws: the D3D11 device to draw with. A
+-- full atlas starts over here. nilptr (the shim could not say this frame, as
+-- before the game's render targets exist) keeps what the last device made;
+-- with no device ever, fallback glyphs stay off.
+global function glyphfb_frame(device: pointer): void
+  if device == nilptr then device = fb.device end
+  if device ~= fb.device then
+    wintex_release(&fb.tex)
+    drop_cache()
+    fb.device = device
+  end
+  if fb.reset_pending then
+    drop_cache()
+    glyphfb_stats.resets = glyphfb_stats.resets + 1
+  end
+  if device == nilptr or imgui.DrawListAddImage == nilptr then return end
+  local ok, fresh = wintex_ensure(&fb.tex, device, GLYPHFB_ATLAS, GLYPHFB_ATLAS)
+  if not ok then
+    drop_cache()
+  elseif fresh then
+    drop_cache() -- a new texture holds nothing yet
+  end
+end
+
+-- Whether `cp` can be drawn from here in a cell of this size, `span` cells
+-- wide (rasterizing and uploading it on first use).
+global function glyphfb_has(cp: uint32, cell_w: float32, cell_h: float32, span: integer): boolean
+  local w, h = box_px(cell_w, cell_h, span)
+  local e = entry_for(cp, w, h)
+  return e ~= nilptr and e.found
+end
+
+-- Draw `cp` at the cell whose top-left is (x, y), tinted `col`. `snap` puts
+-- it on whole pixels (2D; a world panel is projected afterwards and is not).
+-- False when it cannot be drawn from here (the caller uses the ImGui font).
+global function glyphfb_draw(dl: *ImDrawList, cp: uint32, x: float32, y: float32, cell_w: float32, cell_h: float32, span: integer, col: uint32, snap: boolean): boolean
+  local w, h = box_px(cell_w, cell_h, span)
+  local e = entry_for(cp, w, h)
+  if e == nilptr or not e.found then return false end
+  local p0, p1: ImVec2
+  if snap then
+    p0 = vec2(math.floor(x + 0.5), math.floor(y + 0.5))
+    p1 = vec2(p0.x + w, p0.y + h)
+  else
+    p0 = vec2(x, y)
+    p1 = vec2(x + cell_w * span, y + cell_h)
+  end
+  imgui.DrawListAddImage(dl, fb.tex.srv, p0, p1, vec2(e.u0, e.v0), vec2(e.u1, e.v1), col)
+  return true
+end
+
+-- The last resort: `cp` is in no font at all (not the terminal font, not the
+-- fallback chain), or the atlas had no room for it this frame. Draw the "tofu"
+-- every well-behaved terminal draws -- a hollow box -- so an unknown glyph
+-- always looks the same instead of sometimes U+FFFD, sometimes a blank and
+-- sometimes whatever the ImGui font's fallback glyph happens to be.
+--
+-- The code point's hex digits go in the box, two to a row (two rows in the
+-- BMP, three above it), but only where they would be legible: at 6 pixels a
+-- digit or more, which a terminal cell of a world panel or a large font size
+-- reaches and an 8x16 cell does not. Below that the box stands alone rather
+-- than turning into a grey smudge.
+global function glyphfb_tofu(dl: *ImDrawList, cp: uint32, x: float32, y: float32, cell_w: float32, cell_h: float32, span: integer, col: uint32, snap: boolean, font: *ImFont, font_size: float32): void
+  if imgui.DrawListAddRect == nilptr then return end
+  local x0, y0 = x, y
+  if snap then x0, y0 = math.floor(x + 0.5), math.floor(y + 0.5) end
+  local x1, y1 = x0 + cell_w * span - 1.0, y0 + cell_h - 1.0
+  x0, y0 = x0 + 1.0, y0 + 1.0
+  if x1 - x0 < 3.0 or y1 - y0 < 3.0 then return end
+  imgui.DrawListAddRect(dl, vec2(x0, y0), vec2(x1, y1), col, 0.0, 0, 1.0)
+  if font == nilptr or font_size <= 0.0 or imgui.DrawListAddText == nilptr then return end
+  local n: integer = cp > 0xFFFF and 6 or 4
+  local digits: [8]uint8 -- six digits and a one-past-the-end pointer
+  for i = 0, < n do
+    local nib = (cp >> (@uint32)(4 * (n - 1 - i))) & 0xF
+    digits[i] = nib < 10 and (@uint8)(48 + nib) or (@uint8)(55 + nib)
+  end
+  local rows: float32 = (@float32)(n // 2)
+  local iw, ih = x1 - x0 - 2.0, y1 - y0 - 2.0
+  local ratio = cell_w / font_size -- the font's advance per pixel of size
+  local s = ih / rows
+  if ratio > 0.0 and s * ratio * 2.0 > iw then s = iw / (ratio * 2.0) end
+  if s < 6.0 then return end -- the box alone: digits this small are unreadable
+  local tw = s * ratio * 2.0
+  local row_h = ih / rows
+  for r = 0, < n // 2 do
+    local b = (@cstring)(&digits[r * 2])
+    local e = (@cstring)(&digits[r * 2 + 2])
+    imgui.DrawListAddText(dl, font, s, vec2(x0 + 1.0 + (iw - tw) * 0.5, y0 + 1.0 + row_h * r + (row_h - s) * 0.5), col, b, e, 0.0, nilptr)
+  end
+end
+
+-- Module unload: the texture, the fonts and the cache go.
+global function glyphfb_shutdown(): void
+  wintex_release(&fb.tex)
+  unload_fonts()
+  fb.cache:destroy()
+  fb.shelves:destroy()
+  fb.fonts:destroy()
+  for i = 0, < #fb.extra do fb.extra[i]:destroy() end
+  fb.extra:destroy()
+  fb.alpha:destroy()
+  fb.pixels:destroy()
+  fb.dir:destroy()
+  fb = {}
+  glyphfb_stats = {}
+end

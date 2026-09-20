@@ -1,0 +1,72 @@
+-- Things in the terminals the character can react to (lua/animation.lua
+-- chooses the reaction): a BEL, a command finishing (OSC 133;D with its exit
+-- status and how long it ran since its 133;C, or a shell exiting when the
+-- shell has no integration) and output arriving. Counters are compared once
+-- a frame; a terminal met for the first time (a reattach replaying its
+-- scrollback) starts from what it already has, so old output is not news.
+require 'core.app.state'
+
+local Track = @record{
+  id: integer,
+  bells: integer,
+  starts: integer,
+  dones: integer,
+  bytes: uint64,
+  started_at: float64,  -- host time of the last 133;C (0 = none)
+  exited: boolean,
+}
+
+local tracks: vector(Track)
+
+local function track(s: *Session): (*Track, boolean)
+  for i = 0, < #tracks do
+    if tracks[i].id == s.id then return &tracks[i], false end
+  end
+  tracks:push(Track{ id = s.id, bells = s.bells, starts = s.cmd.starts, dones = s.cmd.dones,
+                     bytes = s.cmd.bytes, exited = s.exited })
+  return &tracks[#tracks - 1], true
+end
+
+global function reactions_reset(): void
+  tracks:destroy()
+end
+
+-- Once per frame while the character is in the world. Events go out only
+-- while the character animation is out (host.anim_out); the counters follow
+-- either way, so nothing queues up for later.
+global function reactions_tick(now: float64): void
+  local i: integer = #tracks - 1
+  while i >= 0 do
+    local alive = false
+    for k = 0, < #host.sessions do
+      if host.sessions[k].id == tracks[i].id then alive = true break end
+    end
+    if not alive then tracks:remove(i) end
+    i = i - 1
+  end
+  local out: uint64 = 0
+  for k = 0, < #host.sessions do
+    local s = host.sessions[k]
+    local tr, fresh = track(s)
+    if fresh then continue end
+    local w = &s.cmd
+    if s.bells > tr.bells and host.anim_out then policy_anim_event('bell', now, s.bells - tr.bells, 0) end
+    tr.bells = s.bells
+    if w.starts > tr.starts then tr.started_at = now end
+    tr.starts = w.starts
+    if w.dones > tr.dones then
+      local ran = tr.started_at > 0 and now - tr.started_at or -1
+      if host.anim_out then policy_anim_event('done', now, w.last_exit, ran) end
+      tr.started_at = 0
+    end
+    tr.dones = w.dones
+    -- a shell without integration: its own exit is the only status there is
+    if s.exited and not tr.exited and not w.seen and s.process_exited and host.anim_out then
+      policy_anim_event('done', now, s.exit_status, -1)
+    end
+    tr.exited = s.exited
+    if w.bytes > tr.bytes then out = out + (w.bytes - tr.bytes) end
+    tr.bytes = w.bytes
+  end
+  if out > 0 and host.anim_out then policy_anim_event('output', now, (@float64)(out), 0) end
+end

@@ -15,6 +15,7 @@ require 'core.session'
 require 'core.agent_client'
 require 'core.world'
 require 'core.depthpass'
+require 'core.hudmask'
 require 'core.sendtext'
 require 'core.sys.dualsense_reader'
 require 'allocators.default'
@@ -81,6 +82,41 @@ global GuHostApi = @record{
                              sx: float32, sy: float32, sz: float32): cint,
   bg_set_transparency: function(obj: pointer, transparency: float32): cint, -- 0 drawn .. 1 gone
   bg_destroy: function(obj: pointer): cint,
+  -- a chat command of its own (CONFIG.host.verb_commands): its handler posts
+  -- GuEventKind.Chat with `a` = tag and the arguments as text; 1 = ok
+  command_add_tagged: function(name: cstring, help: cstring, tag: cint): cint,
+  -- a line in the game's chat for the person (short results: a window refused,
+  -- a command that failed); nilptr in older shims: the log only
+  chat_print: function(text: cstring): cint,
+  -- flat windows pulled into the world (core/app/chatpanel.nelua, docs/ADOPT.md)
+  addon_rect: function(name: cstring, x: *float32, y: *float32, w: *float32, h: *float32): cint, -- 1 shown, 2 loaded but hidden, 0 none
+  addon_show: function(name: cstring, shown: cint): cint, -- a game addon (AtkUnitBase) shown or hidden; 1 = ok
+  chat_send: function(text: cstring): cint,              -- a line through the game's chat box; 1 = queued
+  config_uint: function(name: cstring, out: *uint32): cint, -- a UiConfig option (log colours); 1 = found
+  -- an image file as an ImTextureID (Dalamud's ITextureProvider.GetFromFile),
+  -- nilptr until it has loaded; asked again each frame it is drawn. nilptr in
+  -- older shims: the Windows picker shows letters instead of app icons
+  texture_file: function(path: cstring, w: *uint32, h: *uint32): pointer,
+  -- what the game is busy with (SCENE_* bits: cutscene, group pose, between
+  -- areas, an event); nilptr in older shims: never busy (core/app/deskprops.nelua)
+  scene_flags: function(): cint,
+  -- the screenshot gallery (core/app/gallery.nelua): POST the file at `path` to
+  -- an https `url`; 1 = started, the answer comes back as GuEventKind.HttpDone
+  http_upload: function(id: cint, url: cstring, path: cstring, content_type: cstring): cint,
+  -- a game string by name (screenshot_dir, user_path, player) into buf; its length, 0 = none
+  game_string: function(name: cstring, buf: *[0]cchar, cap: usize): usize,
+  -- the game's HUD: the screen rectangles and names of the shown addons
+  -- (AtkStage's loaded units that are visible), at most `cap`; how many were
+  -- written. nilptr in older shims: panels are not cut under the HUD
+  -- (core/hudmask.nelua, CONFIG.world.under_hud)
+  hud_rects: function(out: *[0]GuHudRect, cap: cint): cint,
+  -- the gallery's sign-in and its signed upload (lua/gallery.lua): POST to an
+  -- https `url` with extra `headers` ("Name: value" lines, may be nilptr) either
+  -- the file at `path` or, when `path` is nilptr, the `body_len` bytes at `body`;
+  -- 1 = started, the answer comes back as GuEventKind.HttpDone like http_upload's.
+  -- nilptr in older shims: the gallery page opens instead
+  http_post: function(id: cint, url: cstring, headers: cstring, content_type: cstring,
+                      path: cstring, body: cstring, body_len: usize): cint,
 }
 
 global LOG_INFO: cint <comptime> = 1
@@ -103,6 +139,7 @@ global Host = @record{
   agent_seen: boolean,              -- some connection reached Ready: agent_nonce says which agent that was
   agent_nonce: uint64,              -- the agent process last seen Ready (0 unknown: a version 1 agent)
   agent_error_shown: string,        -- connection error already shown in the waiting terminals
+  agent_down: boolean,              -- the last connection attempt failed (profiles with a fallback use it)
   sessions: vector(*Session),
   pending_open: vector(*Session),   -- FIFO awaiting agent OPENED; nilptr = closed while waiting
   next_session_id: integer,
@@ -128,7 +165,7 @@ global Host = @record{
   world: vector(*Session),
   world_focus: integer,             -- session id with keyboard focus, 0 = none
   world_visible: boolean,           -- world/pet terminals shown (own toggle)
-  -- mouse resize of a world panel: 0 none, 1 right edge, 2 bottom edge, 3 corner
+  -- mouse resize of a world panel (core/app/resize.nelua): its id, 0 none; the mode is WORLD_GRIP_* bits
   world_drag_id: integer,
   world_close_id: integer,
   world_popin_id: integer,
@@ -145,7 +182,16 @@ global Host = @record{
   cam_saved_d: float32,             -- zoom to restore afterwards
   cam_restore: boolean,
   world_occluded_toggle_id: integer, -- title button: keep running when unseen
+  world_pet_toggle_id: integer,      -- title button: pin <-> pet where the panel is
+  world_order_id: integer,           -- a pet's edge arrow: moves it in the pet order
+  world_order_next: boolean,         -- which way: after its neighbour (else before)
+  order_drag: WorldOrderDrag,        -- a pet dragged by its title onto another (swap places)
+  world_pets: integer,               -- pets drawn last frame (a swap needs two)
+  world_order_swap_id: integer,      -- applied after the panel loop: these two swap places
+  world_order_swap_with: integer,
+  window_picker_open: boolean,       -- the Windows picker (/window, core/app/winpicker.nelua)
   world_tuning: WorldTuning,        -- CONFIG.world.present / walk, read each frame
+  hud_mask: HudMask,                -- the game's HUD this frame (core/hudmask.nelua; empty when off)
   walk: WorldWalk,                  -- walking up to the clicked panel
   walk_time: float64,
   walk_user_moved: boolean,         -- the game's walk input saw the player steering
@@ -224,6 +270,26 @@ global function logf(level: cint, fmt: string, ...: varargs): void
   sb:writef(fmt, ...)
   local s = sb:promote()
   log(level, s)
+  s:destroy()
+end
+
+-- A short result the person should see, not only the log (/xllog): logged,
+-- and printed to the game chat where the shim can (chat_print).
+global function say(level: cint, msg: string): void
+  log(level, msg)
+  if host.api.chat_print == nilptr then return end
+  local sb: stringbuilder
+  sb:write('[ghostty] ', msg, '\0')
+  local z = sb:promote()
+  host.api.chat_print((@cstring)(z.data))
+  z:destroy()
+end
+
+global function sayf(level: cint, fmt: string, ...: varargs): void
+  local sb: stringbuilder
+  sb:writef(fmt, ...)
+  local s = sb:promote()
+  say(level, s)
   s:destroy()
 end
 

@@ -3,6 +3,9 @@
 require 'string'
 require 'core.lua'
 require 'core.imgui'
+require 'core.tooltip'
+require 'core.theme'
+require 'stringbuilder'
 
 local function arg_string(L: *lua_State, idx: cint): cstring
   local s: cstring = lua_tolstring(L, idx, nilptr)
@@ -58,11 +61,14 @@ local function l_checkbox(L: *lua_State): cint
   return 2
 end
 
--- ui.combo(label, current, { options }) -> changed, value
+-- ui.combo(label, current, { options }) -> changed, value, hovered
+-- `hovered` is the index of the option under the pointer while the list is
+-- open (nil otherwise), so a caller can preview it.
 local function l_combo(L: *lua_State): cint
   local current = arg_string(L, 2)
   local changed = false
   local chosen_idx: lua_Integer = 0
+  local hovered_idx: lua_Integer = 0
   if imgui.BeginCombo(arg_string(L, 1), current, 0) then
     if lua_type(L, 3) == LUA_TTABLE then
       local n = (@lua_Integer)(lua_rawlen(L, 3))
@@ -73,6 +79,7 @@ local function l_combo(L: *lua_State): cint
           changed = true
           chosen_idx = i
         end
+        if imgui.IsItemHovered(0) then hovered_idx = i end
         lua_pop(L, 1)
       end
     end
@@ -80,7 +87,39 @@ local function l_combo(L: *lua_State): cint
   end
   lua_pushboolean(L, changed and 1 or 0)
   if changed then lua_rawgeti(L, 3, chosen_idx) else lua_pushvalue(L, 2) end
-  return 2
+  if hovered_idx > 0 then lua_pushinteger(L, hovered_idx) else lua_pushnil(L) end
+  return 3
+end
+
+-- ui.tip(text[, swatch[, now]]): the tooltip of the item just drawn, once the
+-- pointer has rested on it; `swatch` adds a row of 0xRRGGBB squares; `now`
+-- true shows it at once without asking ImGui (an option inside an open combo).
+local function l_tip(L: *lua_State): cint
+  if lua_type(L, 1) ~= LUA_TSTRING then return 0 end
+  local len: usize = 0
+  local p = lua_tolstring(L, 1, &len)
+  local text = string{data = (@*[0]byte)(p), size = len}
+  local immediate = lua_toboolean(L, 3) ~= 0
+  if not immediate then
+    local t: float64 = 0
+    if imgui.GetTime ~= nilptr then t = imgui.GetTime() end
+    if not tooltip_due(tooltip_key(text), imgui.IsItemHovered(0), t) then return 0 end
+  end
+  local sw: [16]uint32
+  local n: integer = 0
+  if lua_type(L, 2) == LUA_TTABLE then
+    local count = math.min((@integer)(lua_rawlen(L, 2)), 16)
+    for i = 1, count do
+      lua_rawgeti(L, 2, i)
+      if lua_type(L, -1) == LUA_TNUMBER then
+        sw[n] = (@uint32)(lua_tointegerx(L, -1, nilptr) & 0xFFFFFF)
+        n = n + 1
+      end
+      lua_pop(L, 1)
+    end
+  end
+  tooltip_show(text, (@*[0]uint32)(&sw), n)
+  return 0
 end
 
 local function l_text(L: *lua_State): cint
@@ -98,6 +137,32 @@ end
 local function l_button(L: *lua_State): cint
   lua_pushboolean(L, imgui.Button(arg_string(L, 1), vec2(0, 0)) and 1 or 0)
   return 1
+end
+
+-- ui.input(label, text) -> changed, text, entered: a one-line text box
+-- (at most 255 bytes); `entered` when Enter was pressed in it. Without the
+-- export (an older Dalamud): nothing drawn, unchanged.
+local function l_input(L: *lua_State): cint
+  local len: usize = 0
+  local cur = (@*[0]cchar)(lua_tolstring(L, 2, &len))
+  if cur == nilptr then len = 0 end
+  local buf: [256]cchar
+  local n = math.min(len, #buf - 1)
+  for i: usize = 0, < n do buf[i] = cur[i] end
+  buf[n] = 0
+  local entered = false
+  if imgui.InputText ~= nilptr then
+    entered = imgui.InputText(arg_string(L, 1), (@cstring)(&buf), #buf, ImGuiInputTextFlags_EnterReturnsTrue, nilptr, nilptr)
+  end
+  local out: cstring = (@cstring)(&buf)
+  local changed = (@usize)(#out) ~= n
+  if not changed then
+    for i: usize = 0, < n do if buf[i] ~= cur[i] then changed = true break end end
+  end
+  lua_pushboolean(L, changed and 1 or 0)
+  lua_pushstring(L, out)
+  lua_pushboolean(L, entered and 1 or 0)
+  return 3
 end
 
 local function l_same_line(L: *lua_State): cint
@@ -136,9 +201,207 @@ end
 
 local function l_spacing(L: *lua_State): cint imgui.Spacing() return 0 end
 
+-- The /ask panel (lua/ask.lua) ------------------------------------------------------------
+-- Chat bubbles, links, a scrolled conversation and a multi-line input box, in
+-- the chrome's colours (core/theme.nelua).
+
+-- The monospace font for code blocks; the app sets these (host.api), nil
+-- draws code in the current font.
+global ui_push_mono: function(): void
+global ui_pop_font: function(): void
+
+local function arg_lstring(L: *lua_State, idx: cint): string
+  local len: usize = 0
+  local p = lua_tolstring(L, idx, &len)
+  if p == nilptr then return (@string){} end
+  return string{data = (@*[0]byte)(p), size = len}
+end
+
+-- ui.bubble(text, role): one chat bubble, as wide as its text (at most most
+-- of the row). role: 'user' (right, accent), 'assistant', 'code' (monospace),
+-- 'note' (dim, no bubble), 'error'.
+local function l_bubble(L: *lua_State): cint
+  local text = arg_lstring(L, 1)
+  local role: string = arg_string(L, 2)
+  if #text == 0 or imgui.FontCalcTextSizeA == nilptr then return 0 end
+  local mono = role == 'code' and ui_push_mono ~= nilptr and ui_pop_font ~= nilptr
+  if mono then ui_push_mono() end
+  local avail: ImVec2
+  imgui.GetContentRegionAvail(&avail)
+  local pad: float32 = role == 'note' and 2 or 9
+  local right = role == 'user'
+  local frac: float32 = 0.86
+  if role == 'code' or role == 'note' then frac = 1 end
+  local maxw = math.max(avail.x * frac, 40)
+  local font = imgui.GetFont()
+  local size = imgui.GetFontSize()
+  local sz: ImVec2
+  local b = (@cstring)(&text.data[0])
+  local e = (@cstring)(&text.data[#text])
+  imgui.FontCalcTextSizeA(&sz, font, size, 1e9, maxw - 2 * pad, b, e, nilptr)
+  local w, h = sz.x + 2 * pad, sz.y + 2 * pad
+  local at: ImVec2
+  imgui.GetCursorScreenPos(&at)
+  local x = at.x
+  if right then x = at.x + avail.x - w end
+  local dl = imgui.GetWindowDrawList()
+  local ink = chrome_col(ChromeColor.Ink, 255)
+  if role == 'user' then
+    imgui.DrawListAddRectFilled(dl, vec2(x, at.y), vec2(x + w, at.y + h), chrome_col(ChromeColor.Accent, 70), 9, 0)
+    imgui.DrawListAddRect(dl, vec2(x, at.y), vec2(x + w, at.y + h), chrome_col(ChromeColor.Accent, 150), 9, 0, 1)
+  elseif role == 'code' then
+    imgui.DrawListAddRectFilled(dl, vec2(x, at.y), vec2(x + w, at.y + h), chrome_col(ChromeColor.Panel, 235), 5, 0)
+    imgui.DrawListAddRect(dl, vec2(x, at.y), vec2(x + w, at.y + h), chrome_col(ChromeColor.InkFaint, 90), 5, 0, 1)
+    ink = chrome_col(ChromeColor.Accent2, 255)
+  elseif role == 'error' then
+    imgui.DrawListAddRectFilled(dl, vec2(x, at.y), vec2(x + w, at.y + h), chrome_col(ChromeColor.Close, 70), 9, 0)
+    imgui.DrawListAddRect(dl, vec2(x, at.y), vec2(x + w, at.y + h), chrome_col(ChromeColor.Close, 170), 9, 0, 1)
+  elseif role == 'note' then
+    ink = chrome_col(ChromeColor.InkDim, 230)
+  else
+    imgui.DrawListAddRectFilled(dl, vec2(x, at.y), vec2(x + w, at.y + h), chrome_col(ChromeColor.GlassTop, 230), 9, 0)
+    imgui.DrawListAddRect(dl, vec2(x, at.y), vec2(x + w, at.y + h), chrome_col(ChromeColor.Accent2, 60), 9, 0, 1)
+  end
+  imgui.DrawListAddText(dl, font, size, vec2(x + pad, at.y + pad), ink, b, e, maxw - 2 * pad, nilptr)
+  if mono then ui_pop_font() end
+  imgui.Dummy(vec2(math.max(avail.x, 1), h))
+  return 0
+end
+
+-- ui.link(label, url) -> clicked: accent text, underlined under the pointer,
+-- the link in a tooltip. Opening it is the caller's (ghostty.open_url).
+local function l_link(L: *lua_State): cint
+  local label = arg_lstring(L, 1)
+  local url = arg_lstring(L, 2)
+  if #label == 0 or imgui.FontCalcTextSizeA == nilptr then lua_pushboolean(L, 0) return 1 end
+  local font = imgui.GetFont()
+  local size = imgui.GetFontSize()
+  local sz: ImVec2
+  local b = (@cstring)(&label.data[0])
+  local e = (@cstring)(&label.data[#label])
+  imgui.FontCalcTextSizeA(&sz, font, size, 1e9, 0, b, e, nilptr)
+  local at: ImVec2
+  imgui.GetCursorScreenPos(&at)
+  local sb: stringbuilder
+  sb:write(label, '##link', url, '\0')
+  local id = sb:promote()
+  local clicked = imgui.InvisibleButton((@cstring)(id.data), vec2(math.max(sz.x, 1), math.max(sz.y, 1)), 0)
+  id:destroy()
+  local hot = imgui.IsItemHovered(0)
+  local dl = imgui.GetWindowDrawList()
+  local col = chrome_col(ChromeColor.Accent2, hot and 255 or 225)
+  imgui.DrawListAddText(dl, font, size, at, col, b, e, 0, nilptr)
+  if hot then
+    imgui.DrawListAddLine(dl, vec2(at.x, at.y + sz.y), vec2(at.x + sz.x, at.y + sz.y), col, 1)
+    if #url > 0 then tooltip_show(url, nilptr, 0) end
+  end
+  lua_pushboolean(L, clicked and 1 or 0)
+  return 1
+end
+
+-- ui.child(id, reserve) -> visible: a scrolled region filling the window
+-- but `reserve` pixels at the bottom. Always close it with ui.end_child.
+local function l_child(L: *lua_State): cint
+  local reserve = (@float32)(lua_tonumberx(L, 2, nilptr))
+  lua_pushboolean(L, imgui.BeginChild(arg_string(L, 1), vec2(0, -math.max(reserve, 0)), false, 0) and 1 or 0)
+  return 1
+end
+
+-- ui.end_child([follow]): `follow` scrolls it to the bottom first.
+local function l_end_child(L: *lua_State): cint
+  if lua_toboolean(L, 1) ~= 0 and imgui.SetScrollHereY ~= nilptr then imgui.SetScrollHereY(1.0) end
+  imgui.EndChild()
+  return 0
+end
+
+-- ui.at_bottom() -> whether the current region is scrolled to its end
+-- (true without the exports).
+local function l_at_bottom(L: *lua_State): cint
+  local at = true
+  if imgui.GetScrollY ~= nilptr and imgui.GetScrollMaxY ~= nilptr then
+    at = imgui.GetScrollY() >= imgui.GetScrollMaxY() - 2
+  end
+  lua_pushboolean(L, at and 1 or 0)
+  return 1
+end
+
+-- ui.input_multiline(label, text, height) -> changed, text, entered, shift:
+-- up to 4095 bytes; Enter gives `entered` (and ends the edit), Ctrl+Enter a
+-- new line; `shift` says whether Shift was down with that Enter. Without the
+-- export, a one-line box.
+local ASK_INPUT_MAX <comptime> = 4096
+local function l_input_multiline(L: *lua_State): cint
+  local len: usize = 0
+  local cur = (@*[0]cchar)(lua_tolstring(L, 2, &len))
+  if cur == nilptr then len = 0 end
+  local height = (@float32)(lua_tonumberx(L, 3, nilptr))
+  local buf: [ASK_INPUT_MAX]cchar
+  local n = math.min(len, #buf - 1)
+  for i: usize = 0, < n do buf[i] = cur[i] end
+  buf[n] = 0
+  local entered = false
+  local flags = ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_CtrlEnterForNewLine
+  if imgui.InputTextMultiline ~= nilptr then
+    entered = imgui.InputTextMultiline(arg_string(L, 1), (@cstring)(&buf), #buf, vec2(-1, math.max(height, 20)), flags, nilptr, nilptr)
+  elseif imgui.InputText ~= nilptr then
+    entered = imgui.InputText(arg_string(L, 1), (@cstring)(&buf), #buf, ImGuiInputTextFlags_EnterReturnsTrue, nilptr, nilptr)
+  end
+  local out: cstring = (@cstring)(&buf)
+  local changed = (@usize)(#out) ~= n
+  if not changed then
+    for i: usize = 0, < n do if buf[i] ~= cur[i] then changed = true break end end
+  end
+  lua_pushboolean(L, changed and 1 or 0)
+  lua_pushstring(L, out)
+  lua_pushboolean(L, entered and 1 or 0)
+  lua_pushboolean(L, (entered and imgui.GetIO().KeyShift) and 1 or 0)
+  return 4
+end
+
+-- ui.key_pressed(name) -> pressed this frame: 'escape' | 'enter'.
+local function l_key_pressed(L: *lua_State): cint
+  local name: string = arg_string(L, 1)
+  local key: cint = ImGuiKey_None
+  if name == 'escape' then key = ImGuiKey_Escape elseif name == 'enter' then key = ImGuiKey_Enter end
+  lua_pushboolean(L, (key ~= ImGuiKey_None and imgui.IsKeyPressed(key, false)) and 1 or 0)
+  return 1
+end
+
+-- ui.focus_next(): the next widget (the input box) takes the keyboard.
+local function l_focus_next(L: *lua_State): cint
+  imgui.SetKeyboardFocusHere(0)
+  return 0
+end
+
+-- ui.focused() -> the current window (or one of its children) has focus.
+local function l_focused(L: *lua_State): cint
+  lua_pushboolean(L, imgui.IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) and 1 or 0)
+  return 1
+end
+
+-- ui.selectable(label, selected) -> clicked: a full-width row.
+local function l_selectable(L: *lua_State): cint
+  lua_pushboolean(L, imgui.Selectable(arg_string(L, 1), lua_toboolean(L, 2) ~= 0, 0, vec2(0, 0)) and 1 or 0)
+  return 1
+end
+
+-- ui.small_button(label) -> clicked.
+local function l_small_button(L: *lua_State): cint
+  lua_pushboolean(L, imgui.SmallButton(arg_string(L, 1)) and 1 or 0)
+  return 1
+end
+
+-- ui.width() -> the width left on this row.
+local function l_width(L: *lua_State): cint
+  local avail: ImVec2
+  imgui.GetContentRegionAvail(&avail)
+  lua_pushnumber(L, avail.x)
+  return 1
+end
+
 -- Adds `ui` to the table on top of the stack.
 global function ui_lua_register(L: *lua_State): void
-  lua_createtable(L, 0, 15)
+  lua_createtable(L, 0, 32)
   lua_pushcclosure(L, l_tabs, 0) lua_setfield(L, -2, 'tabs')
   lua_pushcclosure(L, l_tab, 0) lua_setfield(L, -2, 'tab')
   lua_pushcclosure(L, l_end_tab, 0) lua_setfield(L, -2, 'end_tab')
@@ -154,5 +417,19 @@ global function ui_lua_register(L: *lua_State): void
   lua_pushcclosure(L, l_separator, 0) lua_setfield(L, -2, 'separator')
   lua_pushcclosure(L, l_button, 0) lua_setfield(L, -2, 'button')
   lua_pushcclosure(L, l_same_line, 0) lua_setfield(L, -2, 'same_line')
+  lua_pushcclosure(L, l_input, 0) lua_setfield(L, -2, 'input')
+  lua_pushcclosure(L, l_tip, 0) lua_setfield(L, -2, 'tip')
+  lua_pushcclosure(L, l_bubble, 0) lua_setfield(L, -2, 'bubble')
+  lua_pushcclosure(L, l_link, 0) lua_setfield(L, -2, 'link')
+  lua_pushcclosure(L, l_child, 0) lua_setfield(L, -2, 'child')
+  lua_pushcclosure(L, l_end_child, 0) lua_setfield(L, -2, 'end_child')
+  lua_pushcclosure(L, l_at_bottom, 0) lua_setfield(L, -2, 'at_bottom')
+  lua_pushcclosure(L, l_input_multiline, 0) lua_setfield(L, -2, 'input_multiline')
+  lua_pushcclosure(L, l_key_pressed, 0) lua_setfield(L, -2, 'key_pressed')
+  lua_pushcclosure(L, l_focus_next, 0) lua_setfield(L, -2, 'focus_next')
+  lua_pushcclosure(L, l_focused, 0) lua_setfield(L, -2, 'focused')
+  lua_pushcclosure(L, l_selectable, 0) lua_setfield(L, -2, 'selectable')
+  lua_pushcclosure(L, l_small_button, 0) lua_setfield(L, -2, 'small_button')
+  lua_pushcclosure(L, l_width, 0) lua_setfield(L, -2, 'width')
   lua_setfield(L, -2, 'ui')
 end

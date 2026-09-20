@@ -1,0 +1,66 @@
+-- The game's own cursor over ghostty: while the pointer is over any ghostty UI
+-- (the dropdown and its windows, the popup, settings, the window picker, the
+-- gallery prompt, a hovered world, HUD or adopted panel), ImGui's
+-- NoMouseCursorChange flag keeps Dalamud's backend from swapping the in-game
+-- cursor for an OS one. Anywhere else the flag goes back to how it was, so
+-- other plugins keep their behaviour. The backend reads the flag at the next
+-- NewFrame, so gu_frame (core/host.nelua) calls cursor_frame last, with this
+-- frame's hover.
+require 'core.imgui'
+require 'core.imgui_internal'
+require 'core.app.state'
+
+-- Set by draw_world (core/app/worldview.nelua) when the pointer is over a
+-- world panel or its grips this frame; cursor_frame clears it.
+global cursor_over_world: boolean = false
+
+local we_set = false -- the flag is set because of us (not by someone else before)
+
+-- Is `name` one of ours? Every ghostty window's id has "ghostty" in it.
+local function ours(name: cstring): boolean
+  if name == nilptr then return false end
+  local n: string = name
+  return n:find('ghostty', 1, true) > 0
+end
+
+-- The ImGui window under the pointer is one of ours (its popup tree's root,
+-- so a combo or menu opened from our window counts too). Needs the internal
+-- exports; without them only world panels count.
+global function cursor_over_our_window(): boolean
+  if not imgui_int_bound then imgui_internal_bind(resolve_imgui) end
+  if imgui_int.GetCurrentContext == nilptr then return false end
+  local ctx = imgui_int.GetCurrentContext()
+  if ctx == nilptr or ctx.HoveredWindow == nilptr then return false end
+  local w = (@*ImGuiWindow)(ctx.HoveredWindow)
+  local root = w.RootWindowPopupTree ~= nilptr and (@*ImGuiWindow)(w.RootWindowPopupTree)
+    or (w.RootWindow ~= nilptr and (@*ImGuiWindow)(w.RootWindow) or w)
+  return ours(root.Name) or ours(w.Name)
+end
+
+-- Anything of ours under the pointer this frame.
+global function cursor_over_ours(): boolean
+  return cursor_over_world or cursor_over_our_window()
+end
+
+-- Set or clear the flag for the next frame from whether the pointer is over
+-- ghostty UI now.
+global function cursor_frame(over: boolean): void
+  cursor_over_world = false
+  local io = imgui.GetIO()
+  if io == nilptr then return end
+  local has = (io.ConfigFlags & ImGuiConfigFlags_NoMouseCursorChange) ~= 0
+  if over then
+    if not has then
+      io.ConfigFlags = io.ConfigFlags | ImGuiConfigFlags_NoMouseCursorChange
+      we_set = true
+    end
+  elseif we_set then
+    if has then io.ConfigFlags = io.ConfigFlags & ~ImGuiConfigFlags_NoMouseCursorChange end
+    we_set = false
+  end
+end
+
+-- Give the flag back (kill switch, shutdown).
+global function cursor_release(): void
+  if imgui.GetIO ~= nilptr then cursor_frame(false) end
+end

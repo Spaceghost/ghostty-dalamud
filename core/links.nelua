@@ -1,0 +1,76 @@
+-- Links in terminal text: a URL under a Ctrl+click, when the cell carries no
+-- OSC 8 hyperlink (core/selection.nelua selection_link_at reads the grid),
+-- and which links go to a browser at all. Pure (tests/test_selection.nelua).
+require 'string'
+
+local function lower_b(c: byte): byte
+  if c >= 65 and c <= 90 then return c + 32 end
+  return c
+end
+
+local function starts_ci_at(s: string, i: integer, prefix: string): boolean
+  if i + #prefix - 1 > #s then return false end
+  for k = 1, #prefix do
+    if lower_b(s:byte(i + k - 1)) ~= prefix:byte(k) then return false end
+  end
+  return true
+end
+
+-- A web or mail link (http://, https://, mailto:, any case): the ones a
+-- browser opens. file:// and other schemes are not.
+global function link_is_web(url: string): boolean
+  return (starts_ci_at(url, 1, 'https://') and #url > 8) or (starts_ci_at(url, 1, 'http://') and #url > 7)
+      or (starts_ci_at(url, 1, 'mailto:') and #url > 7)
+end
+
+-- A byte that may be part of a URL in plain text: printable ASCII except
+-- blanks, quotes and the brackets that usually surround one.
+local function url_byte(b: byte): boolean
+  return b > 32 and b < 127 and b ~= 34 and b ~= 39 and b ~= 60 and b ~= 62 and b ~= 96
+     and b ~= 123 and b ~= 125 and b ~= 124 and b ~= 92 and b ~= 94
+end
+
+-- The URL (http://, https://, mailto:) in one terminal row that covers
+-- column `col` (from 0). `row` holds one byte per cell, anything that is not
+-- ASCII (wide characters, their spacer cells) as a byte that ends a URL.
+-- Trailing sentence punctuation is not part of it, nor a closing bracket
+-- without its opening one inside. Returns the first and last index (from 1)
+-- into `row`, or 0, 0.
+global function link_in_row(row: string, col: integer): (integer, integer)
+  local at = col + 1
+  if at < 1 or at > #row or not url_byte(row:byte(at)) then return 0, 0 end
+  -- the run of URL bytes around the column
+  local a, b = at, at
+  while a > 1 and url_byte(row:byte(a - 1)) do a = a - 1 end
+  while b < #row and url_byte(row:byte(b + 1)) do b = b + 1 end
+  -- the scheme starts the link: the last one at or before the column
+  local start = 0
+  for i = a, at do
+    if starts_ci_at(row, i, 'https://') or starts_ci_at(row, i, 'http://') or starts_ci_at(row, i, 'mailto:') then start = i end
+  end
+  if start == 0 then return 0, 0 end
+  -- a second link glued on after this one ends it
+  for i = start + 1, b do
+    if starts_ci_at(row, i, 'https://') or starts_ci_at(row, i, 'http://') then b = i - 1 break end
+  end
+  -- trailing punctuation that belongs to the sentence, unbalanced closers
+  while b > start do
+    local c = row:byte(b)
+    if c == 46 or c == 44 or c == 59 or c == 58 or c == 33 or c == 63 then -- . , ; : ! ?
+      b = b - 1
+    elseif c == 41 or c == 93 then -- ) ]
+      local open_b: byte = c == 41 and 40 or 91
+      local opens, closes = 0, 0
+      for i = start, b do
+        if row:byte(i) == open_b then opens = opens + 1 elseif row:byte(i) == c then closes = closes + 1 end
+      end
+      if closes > opens then b = b - 1 else break end
+    else
+      break
+    end
+  end
+  if at > b then return 0, 0 end -- the click was on the punctuation after it
+  local link = row:subview(start, b)
+  if not link_is_web(link) then return 0, 0 end
+  return start, b
+end

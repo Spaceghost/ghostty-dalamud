@@ -12,6 +12,7 @@ require 'stringbuilder'
 require 'os'
 require 'io'
 require 'core.reload_watch'
+require 'core.sys.winpath'
 
 local LOG_INFO: cint <comptime> = 1
 local LOG_WARN: cint <comptime> = 2
@@ -57,12 +58,15 @@ local CoreFns = @record{
   shutdown: function(): void,
   version: function(): cstring,
   walk_input: function(left: *float32, forward: *float32, allowed: cint, legacy: cint): void,
+  call: function(request: cstring, out: *[0]cchar, cap: usize): usize,
+  chat: function(kind: cint, sender: cstring, text: cstring): void,
 }
 ## local core_exports = {
 ##   {'init_ex', 'gu_init_ex'}, {'init', 'gu_init'}, {'event', 'gu_event'}, {'frame', 'gu_frame'},
 ##   {'popup_draw', 'gu_popup_draw'}, {'popup_reset', 'gu_popup_reset'}, {'popup_size', 'gu_popup_size'},
 ##   {'toggle', 'gu_toggle'}, {'command', 'gu_command'}, {'status', 'gu_status'},
 ##   {'shutdown', 'gu_shutdown'}, {'version', 'gu_version'}, {'walk_input', 'gu_walk_input'},
+##   {'call', 'gu_call'}, {'chat', 'gu_chat'},
 ## }
 
 local Loader = @record{
@@ -98,14 +102,14 @@ local WIN32_FILE_ATTRIBUTE_DATA <cimport, nodecl> = @record{
   ftCreationTime: FILETIME, ftLastAccessTime: FILETIME, ftLastWriteTime: FILETIME,
   nFileSizeHigh: uint32, nFileSizeLow: uint32,
 }
-local function LoadLibraryA(path: cstring): pointer <cimport, nodecl> end
+local function LoadLibraryW(path: pointer): pointer <cimport, nodecl> end
 local function FreeLibrary(lib: pointer): cint <cimport, nodecl> end
 local function GetProcAddress(lib: pointer, name: cstring): pointer <cimport, nodecl> end
 local function GetModuleHandleExA(flags: uint32, addr: pointer, out: pointer): cint <cimport, nodecl> end
-local function GetModuleFileNameA(mod: pointer, buf: pointer, cap: uint32): uint32 <cimport, nodecl> end
-local function GetFileAttributesExA(path: cstring, level: cint, info: pointer): cint <cimport, nodecl> end
-local function CopyFileA(src: cstring, dst: cstring, fail_if_exists: cint): cint <cimport, nodecl> end
-local function DeleteFileA(path: cstring): cint <cimport, nodecl> end
+local function GetModuleFileNameW(mod: pointer, buf: pointer, cap: uint32): uint32 <cimport, nodecl> end
+local function GetFileAttributesExW(path: pointer, level: cint, info: pointer): cint <cimport, nodecl> end
+local function CopyFileW(src: pointer, dst: pointer, fail_if_exists: cint): cint <cimport, nodecl> end
+local function DeleteFileW(path: pointer): cint <cimport, nodecl> end
 local function GetLastError(): uint32 <cimport, nodecl> end
 local function Sleep(ms: uint32): void <cimport, nodecl> end
 local function InterlockedIncrement(v: pointer): clong <cimport, nodecl> end
@@ -130,7 +134,9 @@ local function stat(path: cstring, st: *stat_t): cint <cimport, cinclude '<sys/s
 
 local function lib_open(path: string): pointer
   ## if ccinfo.is_windows then
-    return LoadLibraryA((@cstring)(path.data))
+    local w: [WINPATH_MAX]uint16
+    if winpath_wide(path, (@*[0]uint16)(&w), WINPATH_MAX) < 0 then return nilptr end
+    return LoadLibraryW((@pointer)(&w))
   ## else
     return dlopen((@cstring)(path.data), RTLD_NOW)
   ## end
@@ -167,7 +173,9 @@ end
 local function file_stamp(path: string): uint64
   ## if ccinfo.is_windows then
     local data: WIN32_FILE_ATTRIBUTE_DATA
-    if GetFileAttributesExA((@cstring)(path.data), 0, &data) == 0 then return 0 end
+    local w: [WINPATH_MAX]uint16
+    if winpath_wide(path, (@*[0]uint16)(&w), WINPATH_MAX) < 0 then return 0 end
+    if GetFileAttributesExW((@pointer)(&w), 0, &data) == 0 then return 0 end
     local t = ((@uint64)(data.ftLastWriteTime.dwHighDateTime) << 32) | data.ftLastWriteTime.dwLowDateTime
   ## else
     local st: stat_t
@@ -180,7 +188,11 @@ end
 
 local function file_copy(src: string, dst: string): boolean
   ## if ccinfo.is_windows then
-    return CopyFileA((@cstring)(src.data), (@cstring)(dst.data), 0) ~= 0
+    local ws: [WINPATH_MAX]uint16
+    local wd: [WINPATH_MAX]uint16
+    if winpath_wide(src, (@*[0]uint16)(&ws), WINPATH_MAX) < 0 then return false end
+    if winpath_wide(dst, (@*[0]uint16)(&wd), WINPATH_MAX) < 0 then return false end
+    return CopyFileW((@pointer)(&ws), (@pointer)(&wd), 0) ~= 0
   ## else
     local fin = io.open(src, 'rb')
     if not fin:isopen() then return false end
@@ -196,7 +208,9 @@ end
 
 local function file_delete(path: string): boolean
   ## if ccinfo.is_windows then
-    return DeleteFileA((@cstring)(path.data)) ~= 0
+    local w: [WINPATH_MAX]uint16
+    if winpath_wide(path, (@*[0]uint16)(&w), WINPATH_MAX) < 0 then return false end
+    return DeleteFileW((@pointer)(&w)) ~= 0
   ## else
     local ok = os.remove(path)
     return ok
@@ -209,11 +223,14 @@ local function module_dir(): string
   ## if ccinfo.is_windows then
     local mod: pointer = nilptr
     local flags = GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT
-    local buf: [1024]byte
+    local buf: [WINPATH_MAX]uint16
     if GetModuleHandleExA(flags, (@pointer)(&loader), (@pointer)(&mod)) == 0 then return path end
-    local n = GetModuleFileNameA(mod, &buf, 1024)
-    if n == 0 or n >= 1024 then return path end
-    path = string{data=(@*[0]byte)(&buf), size=n}
+    local n = GetModuleFileNameW(mod, &buf, (@uint32)(WINPATH_MAX))
+    if n == 0 or (@usize)(n) >= WINPATH_MAX then return path end
+    -- the name comes back as UTF-16; everything downstream (and the copy and
+    -- open above) works in UTF-8, so a non-ASCII plugin folder survives
+    path = winpath_utf8((@*[0]uint16)(&buf))
+    if path.size == 0 then return path end
   ## else
     local info: Dl_info
     if dladdr((@pointer)(&loader), &info) == 0 or info.dli_fname == nilptr then return path end
@@ -223,7 +240,11 @@ local function module_dir(): string
   for i: usize = 0, < path.size do
     if path.data[i] == 92 or path.data[i] == 47 then cut = i + 1 end -- '\' or '/'
   end
-  return string.copy(string{data=path.data, size=cut})
+  local dir = string.copy(string{data=path.data, size=cut})
+  ## if ccinfo.is_windows then
+    path:destroy() -- winpath_utf8 allocated it, unlike the POSIX dli_fname view
+  ## end
+  return dir
 end
 
 -- Calls arrive from several threads (the draw loop, the framework tick
@@ -592,6 +613,42 @@ global function gu_walk_input(left: *float32, forward: *float32, allowed: cint, 
     if loader.fns.walk_input ~= nilptr then loader.fns.walk_input(left, forward, allowed, legacy) end
     leave()
   end
+end
+
+-- A chat message for the chat pet (core/app/chatpanel.nelua), from any thread;
+-- dropped while no core (or one without gu_chat) is loaded.
+global function gu_chat(kind: cint, sender: cstring, text: cstring): void <cexport, codename 'gu_chat'>
+  if enter() then
+    if loader.fns.chat ~= nilptr then loader.fns.chat(kind, sender, text) end
+    leave()
+  end
+end
+
+-- GhosttyDalamud.v1.Call from any thread (docs/IPC.md); a JSON refusal while
+-- no core (or one without gu_call) is loaded.
+global function gu_call(request: cstring, out: *[0]cchar, cap: usize): usize <cexport, codename 'gu_call'>
+  local reason: cstring = 'ghostty is not running'
+  if enter() then
+    if loader.fns.call ~= nilptr then
+      local n = loader.fns.call(request, out, cap)
+      leave()
+      return n
+    end
+    leave()
+    reason = 'this ghostty core has no IPC calls'
+  end
+  if out == nilptr or cap == 0 then return 0 end
+  local sb: stringbuilder
+  sb:write('{"ok":false,"error":"', reason, '"}')
+  local text = sb:promote()
+  local n: usize = 0
+  if #text + 1 <= cap then
+    for i: usize = 0, < #text do out[i] = (@cchar)(text.data[i]) end
+    n = #text
+  end
+  out[n] = 0
+  text:destroy()
+  return n
 end
 
 -- Nelua runtime errors inside the game: built like the core (`-P

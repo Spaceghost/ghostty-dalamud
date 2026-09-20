@@ -1,0 +1,93 @@
+-- The colour theme as the core applies it. lua/themes.lua reads the theme
+-- files and resolves one (CONFIG.theme); policy.nelua reads the result
+-- (policy_theme_read) into:
+--   theme_term    the terminal's default colours and palette (applied to each
+--                 libghostty terminal by TermView:apply_theme), plus the
+--                 selection and cursor-text colours the renderer uses;
+--   chrome_colors the glass UI's colours (core/chrome.nelua, core/app/*).
+-- Before any theme is read, and for whatever a theme leaves out, the values
+-- are spaceghost's: exactly the colours the core had built in.
+require 'memory'
+require 'core.ghostty'
+
+-- Chrome colours, in lua/themes.lua's M.CHROME_KEYS order.
+global ChromeColor = @enum{
+  Accent = 0, Accent2, Ok, Ink, InkDim, InkFaint,
+  GlassTop, GlassBottom, GlassFlat, Glow, Panel, Tooltip, Tab,
+  Close, CloseIdle, Full, FullIdle, Popin, PopinIdle, Sleep, SleepIdle,
+  Chip, ChipHot, ChipInk, Label, LabelInk,
+}
+global CHROME_COLOR_COUNT <comptime> = 26
+
+global CHROME_COLOR_KEYS: [CHROME_COLOR_COUNT]string = {
+  'accent', 'accent-2', 'ok', 'ink', 'ink-dim', 'ink-faint',
+  'glass-top', 'glass-bottom', 'glass-flat', 'glow', 'panel', 'tooltip', 'tab',
+  'close', 'close-idle', 'full', 'full-idle', 'popin', 'popin-idle', 'sleep', 'sleep-idle',
+  'chip', 'chip-hot', 'chip-ink', 'label', 'label-ink',
+}
+
+-- spaceghost, 0xRRGGBB: the colours the chrome was drawn in before themes.
+global CHROME_SPACEGHOST: [CHROME_COLOR_COUNT]uint32 = {
+  0xc8a05a, 0x78dcff, 0x8cf096, 0xf0e6dc, 0xaaa5a0, 0x787470,
+  0x222732, 0x0a0c11, 0x101218, 0x5a96dc, 0x0a0d12, 0x101218, 0xffffff,
+  0xbe3c32, 0x5a2824, 0x466ea0, 0x283246, 0x78643c, 0x3c3428, 0x505a82, 0x2c2e42,
+  0x322c28, 0x785a32, 0xebe1d2, 0x0c1016, 0xe6dec8,
+}
+
+global chrome_colors: [CHROME_COLOR_COUNT]uint32 = CHROME_SPACEGHOST
+
+-- ImGui's packed colour (as im_col32) of chrome colour `c` at alpha `a`.
+global function chrome_col(c: ChromeColor, a: uint8): uint32
+  local rgb = chrome_colors[(@integer)(c)]
+  return ((rgb >> 16) & 0xFF) | (((rgb >> 8) & 0xFF) << 8) | ((rgb & 0xFF) << 16) | ((@uint32)(a) << 24)
+end
+
+-- One channel (0 red, 1 green, 2 blue) of chrome colour `c`.
+global function chrome_channel(c: ChromeColor, i: integer): float32
+  return (@float32)((chrome_colors[(@integer)(c)] >> (16 - 8 * i)) & 0xFF)
+end
+
+-- Whether the chrome differs from spaceghost's (the settings window only
+-- takes on a theme's accent then, so the default look stays untouched).
+global function chrome_themed(): boolean
+  return not memory.equals(&chrome_colors, &CHROME_SPACEGHOST, #@[CHROME_COLOR_COUNT]uint32)
+end
+
+global TermTheme = @record{
+  has_background: boolean, background: GhosttyColorRgb,
+  has_foreground: boolean, foreground: GhosttyColorRgb,
+  has_cursor: boolean, cursor: GhosttyColorRgb,
+  has_cursor_text: boolean, cursor_text: GhosttyColorRgb,
+  has_sel_bg: boolean, sel_bg: GhosttyColorRgb,
+  has_sel_fg: boolean, sel_fg: GhosttyColorRgb,
+  palette_set: [256]boolean,     -- entries the theme sets; the rest keep libghostty's defaults
+  palette: [256]GhosttyColorRgb,
+}
+
+global theme_term: TermTheme
+-- Bumped whenever theme_term or chrome_colors change; each terminal
+-- re-applies its colours when its TermView.theme_gen falls behind.
+global theme_generation: integer = 0
+
+global function theme_rgb(v: integer): GhosttyColorRgb
+  return GhosttyColorRgb{ r = (@uint8)((v >> 16) & 0xFF), g = (@uint8)((v >> 8) & 0xFF), b = (@uint8)(v & 0xFF) }
+end
+
+-- Make `t` and `chrome` current; true (and a new generation) when they differ.
+global function theme_install(t: *TermTheme, chrome: *[CHROME_COLOR_COUNT]uint32): boolean
+  local same = memory.equals(t, &theme_term, #TermTheme) and memory.equals(chrome, &chrome_colors, #@[CHROME_COLOR_COUNT]uint32)
+  if same then return false end
+  memory.copy(&theme_term, t, #TermTheme)
+  memory.copy(&chrome_colors, chrome, #@[CHROME_COLOR_COUNT]uint32)
+  theme_generation = theme_generation + 1
+  return true
+end
+
+-- Back to the built-in look (spaceghost, libghostty's own terminal colours).
+global function theme_reset(): boolean
+  local t: TermTheme
+  memory.zero(&t, #TermTheme)
+  local chrome: [CHROME_COLOR_COUNT]uint32 = CHROME_SPACEGHOST
+  return theme_install(&t, &chrome)
+end
+

@@ -1,0 +1,201 @@
+-- Every terminal in one list: the server info bar entry's left click
+-- (CONFIG.host.dtr.on_click -> 'list'). Pets, pins, floating windows,
+-- dropdown tabs and minimized terminals, each a row with its kind's icon; a
+-- click brings that one forward (bring_forward: shows the world screens,
+-- the dropdown or the window, or restores it) and closes the list. Our own
+-- ImGui window in the dropdown's glass, anchored where the entry was
+-- clicked (anchored_popup_place); closes on a second click, Escape, or when
+-- it loses focus.
+require 'core.app.anchored_popup'
+require 'core.app.popup'
+require 'core.app.dropdown'
+
+global InventoryKind = @enum{ Pet = 0, Pin, Docked, Window, Tab, Minimized }
+
+global InventoryRow = @record{
+  s: *Session,
+  kind: InventoryKind,
+}
+
+local INV_WIDTH: float32 <comptime> = 340
+local INV_ROW: float32 <comptime> = 28
+local INV_HEAD: float32 <comptime> = 34
+local INV_PAD: float32 <comptime> = 8
+
+local KIND_NAMES: [6]string = { 'pet', 'pin', 'docked', 'window', 'tab', 'minimized' }
+local KIND_ICONS: [6]ChromeIcon = { ChromeIcon.Paw, ChromeIcon.Pin, ChromeIcon.Dock, ChromeIcon.Window, ChromeIcon.Chevron, ChromeIcon.Minimize }
+
+global function inventory_kind_name(k: InventoryKind): string
+  return KIND_NAMES[(@integer)(k)]
+end
+
+-- A world panel's row kind from its anchor (lua/world.lua M.kind): pets, the
+-- screen-docked, and every other anchor (pinned in place, following someone,
+-- orbiting) as a pin.
+global function inventory_world_kind(anchor: string): InventoryKind
+  if anchor == 'pet' then return InventoryKind.Pet end
+  if anchor == 'hud' then return InventoryKind.Docked end
+  return InventoryKind.Pin
+end
+
+-- The rows in list order: pets, pins, windows, tabs, minimized.
+global function inventory_collect(rows: *vector(InventoryRow)): void
+  rows:clear()
+  local pins: vector(InventoryRow)
+  for i = 0, < #host.world do
+    local s = host.world[i]
+    local anchor = policy_world_kind(s.id)
+    local k = inventory_world_kind(anchor)
+    anchor:destroy()
+    if k == InventoryKind.Pet then rows:push(InventoryRow{ s = s, kind = k }) else pins:push(InventoryRow{ s = s, kind = k }) end
+  end
+  for i = 0, < #pins do rows:push(pins[i]) end
+  pins:destroy()
+  for i = 0, < #host.windows do rows:push(InventoryRow{ s = host.windows[i], kind = InventoryKind.Window }) end
+  for i = 0, < #host.dropdown_tabs do rows:push(InventoryRow{ s = host.dropdown_tabs[i], kind = InventoryKind.Tab }) end
+  for i = 0, < #host.minimized do rows:push(InventoryRow{ s = host.minimized[i], kind = InventoryKind.Minimized }) end
+end
+
+global function inventory_toggle(x: float32, y: float32): void
+  surface.list_open = not surface.list_open
+  surface.list_x, surface.list_y = x, y
+  surface.list_frames = 0
+end
+
+-- The terminal a click picked, applied after the rows are drawn: bringing a
+-- minimized one back changes the vectors they came from.
+local list_click_id: integer = 0
+
+global function inventory_pick(id: integer): void
+  list_click_id = id
+end
+
+-- Apply a pick: that terminal forward, the list closed. False when it is gone.
+global function inventory_apply_pick(): boolean
+  local id = list_click_id
+  list_click_id = 0
+  if id == 0 then return false end
+  local s = find_session(id)
+  if s == nilptr then return false end
+  surface.list_open = false
+  bring_forward(s)
+  return true
+end
+
+-- The list's height for `n` rows, at most `max_h`.
+global function inventory_height(n: integer, max_h: float32): float32
+  local rows = math.max(n, 1)
+  return math.min(INV_HEAD + rows * INV_ROW + INV_PAD, math.max(max_h, INV_HEAD + INV_ROW + INV_PAD))
+end
+
+local function draw_row(dl: *ImDrawList, x1: float32, y: float32, x2: float32, mouse: ImVec2, r: InventoryRow): void
+  local hot = mouse.x >= x1 and mouse.x < x2 and mouse.y >= y and mouse.y < y + INV_ROW
+  if hot then
+    imgui.DrawListAddRectFilled(dl, vec2(x1 + 4, y + 1), vec2(x2 - 4, y + INV_ROW - 1), chrome_col(ChromeColor.ChipHot, 200), 6, 0)
+  end
+  local s = r.s
+  local ink = s.exited and chrome_col(ChromeColor.InkDim, 255) or chrome_col(ChromeColor.Ink, 255)
+  local icon_col = r.kind == InventoryKind.Pet and chrome_col(ChromeColor.Accent, 255) or chrome_col(ChromeColor.Accent2, 255)
+  chrome_draw_icon(dl, KIND_ICONS[(@integer)(r.kind)], x1 + 20, y + INV_ROW * 0.5, 20, icon_col, chrome_col(ChromeColor.GlassBottom, 255))
+  bell_chip_glow(dl, vec2(x1 + 4, y + 1), vec2(x2 - 4, y + INV_ROW - 1), s.id)
+  local fs = imgui.GetFontSize()
+  local ty = y + (INV_ROW - fs) * 0.5
+  -- the kind at the right, dim; the name clipped before it
+  local kind = inventory_kind_name(r.kind)
+  local ksz: ImVec2
+  imgui.FontCalcTextSizeA(&ksz, imgui.GetFont(), fs, 3.4e38, 0, (@cstring)(kind.data), nilptr, nilptr)
+  local kx = x2 - 12 - ksz.x
+  imgui.DrawListAddText(dl, imgui.GetFont(), fs, vec2(kx, ty), chrome_col(ChromeColor.InkFaint, 255), (@cstring)(kind.data), nilptr, 0, nilptr)
+  local sb: stringbuilder
+  sb:writef('#%d  %s', s.id, s:display_name())
+  if s.exited then sb:write('  (exited)') elseif s.sleeping then sb:write('  (asleep)') end
+  local label = sb:promote()
+  imgui.DrawListPushClipRect(dl, vec2(x1 + 36, y), vec2(kx - 8, y + INV_ROW), true)
+  imgui.DrawListAddText(dl, imgui.GetFont(), fs, vec2(x1 + 36, ty), ink, (@cstring)(label.data), nilptr, 0, nilptr)
+  imgui.DrawListPopClipRect(dl)
+  if hot and host.lmb_pressed then
+    host.click_used = true
+    list_click_id = s.id
+  end
+  if hot and imgui.GetTime ~= nilptr and tooltip_due(0x7c1c0000_u64 + (@uint64)(s.id), true, imgui.GetTime()) then
+    local key: string = 'list.'
+    local k = key .. kind
+    local text = policy_tooltip(k, '')
+    tooltip_show(text, nilptr, 0)
+    text:destroy()
+    k:destroy()
+  end
+  label:destroy()
+end
+
+global function draw_inventory(): void
+  if not surface.list_open then return end
+  local rows: vector(InventoryRow)
+  inventory_collect(&rows)
+  local vp = imgui.GetMainViewport()
+  local w = INV_WIDTH
+  local h = inventory_height(#rows, vp.WorkSize.y * 0.8)
+  local ax, ay = surface.list_x, surface.list_y
+  if ax == 0 and ay == 0 then -- a click without a position: the mouse
+    local m: ImVec2
+    imgui.GetMousePos(&m)
+    ax, ay = m.x, m.y
+  end
+  local x, y = anchored_popup_place(ax, ay, w, h, vp)
+  imgui.SetNextWindowPos(vec2(x, y), ImGuiCond_Always, vec2(0, 0))
+  imgui.SetNextWindowSize(vec2(w, h), ImGuiCond_Always)
+  if surface.list_frames == 0 then imgui.SetNextWindowFocus() end
+  local flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove |
+    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse |
+    ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoDocking | ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoBackground
+  imgui.PushStyleVarVec2(ImGuiStyleVar_WindowPadding, vec2(0, 0))
+  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowBorderSize, 0)
+  if imgui.Begin('##ghostty-list', nilptr, flags) then
+    local pos: ImVec2
+    local size: ImVec2
+    imgui.GetWindowPos(&pos)
+    imgui.GetWindowSize(&size)
+    local x1, y1, x2, y2 = pos.x, pos.y, pos.x + size.x, pos.y + size.y
+    local dl = imgui.GetWindowDrawList()
+    dropdown_glass(dl, x1, y1, x2, y2, (@float32)(policy.dropdown.rounding), INV_HEAD)
+    local fs = imgui.GetFontSize()
+    local head: stringbuilder
+    head:writef('Terminals  %d', #rows)
+    local title = head:promote()
+    imgui.DrawListAddText(dl, imgui.GetFont(), fs, vec2(x1 + 12, y1 + (INV_HEAD - fs) * 0.5), chrome_col(ChromeColor.Ink, 255), (@cstring)(title.data), nilptr, 0, nilptr)
+    title:destroy()
+    imgui.DrawListAddLine(dl, vec2(x1 + 8, y1 + INV_HEAD - 1), vec2(x2 - 8, y1 + INV_HEAD - 1), chrome_col(ChromeColor.InkFaint, 90), 1)
+    local mouse: ImVec2
+    imgui.GetMousePos(&mouse)
+    if imgui.IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows) and host.lmb_pressed then host.click_used = true end
+    local ry = y1 + INV_HEAD + 2
+    if #rows == 0 then
+      imgui.DrawListAddText(dl, imgui.GetFont(), fs, vec2(x1 + 12, ry + (INV_ROW - fs) * 0.5), chrome_col(ChromeColor.InkDim, 255),
+        'No terminals yet: click again for the dropdown, or /term new', nilptr, 0, nilptr)
+    end
+    local shown = 0
+    for i = 0, < #rows do
+      if ry + INV_ROW > y2 - INV_PAD + 1 then break end
+      draw_row(dl, x1, ry, x2, mouse, rows[i])
+      ry = ry + INV_ROW
+      shown = shown + 1
+    end
+    if shown < #rows then
+      local more: stringbuilder
+      more:writef('+%d more', #rows - shown)
+      local m = more:promote()
+      imgui.DrawListAddText(dl, imgui.GetFont(), fs, vec2(x2 - 90, y1 + (INV_HEAD - fs) * 0.5), chrome_col(ChromeColor.InkDim, 255), (@cstring)(m.data), nilptr, 0, nilptr)
+      m:destroy()
+    end
+    inventory_apply_pick()
+    if imgui.IsKeyPressed ~= nilptr and imgui.IsKeyPressed(ImGuiKey_Escape, false) then surface.list_open = false end
+    -- focus lands during the first Begin; judge blur from the next frame on
+    if surface.cfg.close_on_blur and surface.list_frames > 1 and not imgui.IsWindowFocused(ImGuiFocusedFlags_RootAndChildWindows) then
+      surface.list_open = false
+    end
+  end
+  imgui.End()
+  imgui.PopStyleVar(2)
+  surface.list_frames = surface.list_frames + 1
+  rows:destroy()
+end

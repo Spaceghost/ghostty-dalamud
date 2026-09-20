@@ -17,22 +17,22 @@ struct PS_INPUT { float4 pos : SV_POSITION; float4 col : COLOR0; float2 uv : TEX
 
 Texture2D FontTexture : register(t0);
 SamplerState FontSampler : register(s0);
-Texture2D<float> SceneDepth : register(t1);           // the game's depth, reversed Z, infinite far plane
-SamplerComparisonState SceneCompare : register(s1);  // linear, GREATER_EQUAL (visible where the panel is nearer), clamp
+Texture2D<float> SceneDepth : register(t1);           // the game's depth: ndc z = test.x / depth + bas1.w
+SamplerComparisonState SceneCompare : register(s1);  // linear, clamp; GREATER_EQUAL with reversed Z, LESS_EQUAL otherwise (visible where the panel is nearer), chosen in core/depthpass.nelua
 
 cbuffer PanelDepth : register(b0) {
   float4 inv0, inv1, inv2, inv3; // rows of inverse(view-projection) with the camera at the origin (row vectors)
-  float4 bas0, bas1, bas2;       // rows of inverse([R F U]): offset -> (lateral, forward, dv); bas0.w = half arc length, yalms
+  float4 bas0, bas1, bas2;       // rows of inverse([R F U]): offset -> (lateral, forward, dv); bas0.w = half arc length, yalms; bas1.w = the depth mapping's offset
   float4 centre;                 // panel centre minus camera (xyz); curve radius in yalms (w, <= 0.01 = flat)
   float4 view;                   // viewport width, height; depth texels per pixel x, y
-  float4 test;                   // near plane, base tolerance (yalms), edge width (pixels), strength (0 = no test, < 0 = show it)
+  float4 test;                   // the depth mapping's scale (near with an infinite far plane), base tolerance (yalms), edge width (pixels), strength (0 = no test, < 0 = show it)
   float4 depth;                  // depth texture allocated width, height; rendered width, height
 };
 
 // One comparison `off` pixels from the centre: the panel's depth is carried
 // along its screen slope to the tap, then pulled nearer by the tolerance.
 float tap(float2 pos, float2 off, float t, float dtdx, float dtdy, float tol) {
-  float ref = test.x / max(t + dtdx * off.x + dtdy * off.y - tol, 1e-3);
+  float ref = bas1.w + test.x / max(t + dtdx * off.x + dtdy * off.y - tol, 1e-3);
   float2 uv = clamp((pos + off) * view.zw, 0.5, depth.zw - 0.5) / depth.xy;
   return SceneDepth.SampleCmpLevelZero(SceneCompare, uv, ref);
 }
@@ -43,11 +43,12 @@ float4 main(PS_INPUT i) : SV_Target {
   // No early returns: the slope below needs t from every pixel of the 2x2
   // quad, so each degenerate case clears `valid` instead.
 
-  // the pixel's ray: its point on the near plane (ndc z = 1 in reversed Z),
-  // scaled so that clip w (view depth) is 1 at t = 1 along it
+  // the pixel's ray: unprojected through a view-projection whose z column is
+  // (0, 0, 0, 1) (world_depth_vp), so clip z = 1 where clip w (the view depth)
+  // is 1 and one step along the ray is one yalm of depth
   float2 ndc = float2(i.pos.x / view.x * 2.0 - 1.0, 1.0 - i.pos.y / view.y * 2.0);
   float4 h = ndc.x * inv0 + ndc.y * inv1 + inv2 + inv3;
-  float hw = h.w * test.x;
+  float hw = h.w;
   bool ray_ok = abs(hw) >= 1e-6;
   float3 d = h.xyz / (ray_ok ? hw : 1.0);
 
@@ -92,7 +93,8 @@ float4 main(PS_INPUT i) : SV_Target {
     // `/term depth show`: red where the scene is in front of the panel, green
     // where the panel is in front, blue where the pixel has no ray
     float scene = SceneDepth.Load(int3(min(i.pos.xy * view.zw, depth.zw - 1.0), 0));
-    float scene_w = test.x / max(scene, 1e-6);
+    float rel = scene - bas1.w;
+    float scene_w = test.x / (abs(rel) < 1e-6 ? (rel < 0.0 ? -1e-6 : 1e-6) : rel);
     float4 show = valid ? float4(saturate((t - scene_w) * 4.0), saturate((scene_w - t) * 4.0), 0.0, 0.6)
                         : float4(0.0, 0.0, 1.0, 0.6);
     return c.a > 0.0 ? show : float4(0.0, 0.0, 0.0, 0.0);

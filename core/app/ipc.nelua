@@ -1,0 +1,694 @@
+-- GhosttyDalamud.v1.Call: the IPC channel other Dalamud plugins call to
+-- list, open, close, focus and place window panels (docs/IPC.md). JSON in,
+-- JSON out; lua/ipc.lua decides, core/app/remotewin.nelua's window_* do.
+--
+-- Threads. A plugin calls from its own thread (its Draw, its framework tick,
+-- a task), never ours to choose, while the core and its Lua state belong to
+-- the frame (gu_frame). So a call never touches either. It runs in a second,
+-- small Lua state (`vm`: lua/json.lua + lua/ipc.lua and three functions) under
+-- `lock`, and sees only what the frame left under the same lock:
+--
+--   * reads (window.list, agent.status, status) answer from `snapshot`, the
+--     JSON the frame publishes at its end (ipc_frame);
+--   * changes (window.open/close/focus/place) are checked, given a request
+--     id and queued; the next frame runs them in the core's own Lua state
+--     (ipc.run) and their results show in the snapshot (window.list's
+--     `requests`, and `rev` moves).
+--
+-- The lock is held only to swap the queue, publish the snapshot, or run one
+-- call in `vm` (decode, check, encode: microseconds), never across a frame.
+-- Host builds (the tests) are single threaded and the lock is a no-op there,
+-- like procguard_lock.
+require 'os'
+require 'core.app.remotewin'
+require 'core.app.worldview'
+
+## if ccinfo.is_windows then
+local SRWLOCK <cimport, nodecl> = @record{ Ptr: pointer }
+local function AcquireSRWLockExclusive(l: *SRWLOCK): void <cimport, nodecl> end
+local function ReleaseSRWLockExclusive(l: *SRWLOCK): void <cimport, nodecl> end
+local lock: SRWLOCK -- zeroed = SRWLOCK_INIT
+local function ipc_lock(): void AcquireSRWLockExclusive(&lock) end
+local function ipc_unlock(): void ReleaseSRWLockExclusive(&lock) end
+## else
+local function ipc_lock(): void end
+local function ipc_unlock(): void end
+## end
+
+local QUEUE_MAX <comptime> = 64
+
+-- Under `lock`:
+local vm: *lua_State             -- lua/ipc.lua for calls from any thread
+local snapshot: string           -- the frame's last JSON (window.list, agent.status, status)
+local queue: vector(string)      -- request JSON waiting for the frame
+local next_request: int64 = 0    -- the last request id handed out (kept across /term reload)
+-- The frame's only:
+local last_error: string         -- the last error logged (each distinct text logs once)
+
+local function log_once(what: string, msg: string): void
+  if msg == last_error then return end
+  last_error:destroy()
+  last_error = msg:copy()
+  logf(LOG_WARN, 'ipc: %s: %s', what, msg)
+end
+
+local function lua_text(L: *lua_State, idx: cint): string
+  local len: usize = 0
+  local p = lua_tolstring(L, idx, &len)
+  if p == nilptr then return string.copy('(not text)') end
+  return string.copy(string{data=(@*[0]byte)(p), size=len})
+end
+
+-- The call-side Lua state ----------------------------------------------------------
+
+-- ghostty.ipc_snapshot() -> the frame's last JSON, or nil before the first
+local function l_ipc_snapshot(L: *lua_State): cint
+  if #snapshot == 0 then lua_pushnil(L) return 1 end
+  lua_pushlstring(L, (@cstring)(snapshot.data), snapshot.size)
+  return 1
+end
+
+-- ghostty.ipc_enqueue(json) -> true, or false when QUEUE_MAX wait already
+local function l_ipc_enqueue(L: *lua_State): cint
+  local len: usize = 0
+  local p = lua_tolstring(L, 1, &len)
+  if p == nilptr or #queue >= QUEUE_MAX then lua_pushboolean(L, 0) return 1 end
+  queue:push(string.copy(string{data=(@*[0]byte)(p), size=len}))
+  lua_pushboolean(L, 1)
+  return 1
+end
+
+-- ghostty.ipc_request_id() -> a new request id: increasing for the life of
+-- this core, starting from the clock so a reloaded core's ids do not repeat
+-- earlier ones either (unless it hands out more than 1000 a second).
+local function l_ipc_request_id(L: *lua_State): cint
+  if next_request == 0 then next_request = (@int64)(os.time()) * 1000 end
+  next_request = next_request + 1
+  lua_pushinteger(L, next_request)
+  return 1
+end
+
+-- (Re)create the call-side state for lua/ipc.lua from `install` (the shipped
+-- modules) and `config` (the user's, first). load_policy calls this, so
+-- `/term reload` picks up an edited lua/ipc.lua too.
+global function ipc_load(install: string, config: string): boolean
+  local L = luaL_newstate()
+  if L == nilptr then log(LOG_ERROR, 'ipc: luaL_newstate failed') return false end
+  luaL_openlibs(L)
+  lua_createtable(L, 0, 3)
+  lua_pushcclosure(L, l_ipc_snapshot, 0) lua_setfield(L, -2, 'ipc_snapshot')
+  lua_pushcclosure(L, l_ipc_request_id, 0) lua_setfield(L, -2, 'ipc_request_id')
+  lua_pushcclosure(L, l_ipc_enqueue, 0) lua_setfield(L, -2, 'ipc_enqueue')
+  lua_setglobal(L, 'ghostty')
+  local sb: stringbuilder
+  sb:write('package.path = [==[', config, ']==] .. "/lua/?.lua;" .. [==[', install, ']==] .. "/lua/?.lua;" .. package.path\n')
+  sb:write("IPC = require('ipc')\n")
+  local boot = sb:promote()
+  local ok = luaL_loadstring(L, (@cstring)(boot.data)) == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK
+  boot:destroy()
+  if not ok then
+    local err = lua_text(L, -1)
+    logf(LOG_ERROR, 'ipc: loading lua/ipc.lua failed: %s', err)
+    err:destroy()
+    lua_close(L)
+    L = nilptr
+  end
+  ipc_lock()
+  if vm ~= nilptr then lua_close(vm) end
+  vm = L
+  ipc_unlock()
+  return ok
+end
+
+-- Copy `text` (NUL-terminated) into the caller's buffer; its length, or 0 when
+-- even that does not fit.
+local function put(out: *[0]cchar, cap: usize, text: string): usize
+  if out == nilptr or cap == 0 then return 0 end
+  if #text + 1 > cap then
+    local too: string = '{"ok":false,"error":"response too large"}'
+    if #too + 1 > cap then out[0] = 0 return 0 end
+    text = too
+  end
+  for i: usize = 0, < #text do out[i] = (@cchar)(text.data[i]) end
+  out[#text] = 0
+  return #text
+end
+
+-- One call from any thread: `request` JSON in, the response JSON copied to
+-- `out` (at most `cap` bytes with its NUL). Returns the response's length.
+global function ipc_call(request: cstring, out: *[0]cchar, cap: usize): usize
+  ipc_lock()
+  local n: usize = 0
+  if vm == nilptr then
+    n = put(out, cap, '{"ok":false,"error":"ghostty is not running"}')
+  else
+    local L = vm
+    local top = lua_gettop(L)
+    lua_getglobal(L, 'IPC')
+    lua_getfield(L, -1, 'call')
+    if request ~= nilptr then lua_pushstring(L, request) else lua_pushstring(L, '') end
+    if lua_pcall(L, 1, 1, 0) == LUA_OK and lua_type(L, -1) == LUA_TSTRING then
+      local len: usize = 0
+      local p = lua_tolstring(L, -1, &len)
+      n = put(out, cap, string{data=(@*[0]byte)(p), size=len})
+    else
+      n = put(out, cap, '{"ok":false,"error":"internal error in lua/ipc.lua"}')
+    end
+    lua_settop(L, top)
+  end
+  ipc_unlock()
+  return n
+end
+
+-- The frame's side ------------------------------------------------------------------
+
+-- require('ipc')[fn] of the core's Lua state on the stack (plus the module).
+local function push_ipc_fn(L: *lua_State, fn: cstring): boolean
+  lua_getglobal(L, 'require')
+  lua_pushstring(L, 'ipc')
+  if lua_pcall(L, 1, 1, 0) ~= LUA_OK or lua_type(L, -1) ~= LUA_TTABLE then
+    local err = lua_text(L, -1)
+    log_once('require', err)
+    err:destroy()
+    lua_pop(L, 1)
+    return false
+  end
+  lua_getfield(L, -1, fn)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 2) return false end
+  return true
+end
+
+-- Once per frame, at its end: run the queued changes, then publish what the
+-- calls read.
+global function ipc_frame(): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return end
+  local work: vector(string)
+  ipc_lock()
+  work, queue = queue, work
+  ipc_unlock()
+  local top = lua_gettop(L)
+  for i = 0, < #work do
+    if push_ipc_fn(L, 'run') then
+      lua_pushlstring(L, (@cstring)(work[i].data), work[i].size)
+      if lua_pcall(L, 1, 0, 0) ~= LUA_OK then
+        local err = lua_text(L, -1)
+        log_once('ipc.run', err)
+        err:destroy()
+      end
+    end
+    lua_settop(L, top)
+    work[i]:destroy()
+  end
+  work:destroy()
+  if push_ipc_fn(L, 'snapshot') then
+    if lua_pcall(L, 0, 1, 0) == LUA_OK and lua_type(L, -1) == LUA_TSTRING then
+      local text = lua_text(L, -1)
+      ipc_lock()
+      snapshot:destroy()
+      snapshot = text
+      ipc_unlock()
+    else
+      local err = lua_text(L, -1)
+      log_once('ipc.snapshot', err)
+      err:destroy()
+    end
+  end
+  lua_settop(L, top)
+end
+
+-- Shutdown: the call-side state, the queue and the snapshot go. The shim has
+-- unregistered the channel already (surface_shutdown).
+global function ipc_shutdown(): void
+  ipc_lock()
+  if vm ~= nilptr then lua_close(vm) end
+  vm = nilptr
+  for i = 0, < #queue do queue[i]:destroy() end
+  queue:destroy()
+  snapshot:destroy()
+  ipc_unlock()
+  last_error:destroy()
+end
+
+-- ghostty.window_* in the core's Lua state -----------------------------------------------
+-- What lua/ipc.lua (and anything else in the config) calls. Frame thread only.
+-- Each returns its result, or nil and the reason.
+
+local function push_fail(L: *lua_State, reason: string): cint
+  lua_pushnil(L)
+  lua_pushlstring(L, (@cstring)(reason.data), reason.size)
+  return 2
+end
+
+local function push_str(L: *lua_State, s: string, k: cstring): void
+  lua_pushlstring(L, (@cstring)(s.data), s.size)
+  lua_setfield(L, -2, k)
+end
+
+-- ghostty.window_list() -> { {id, sid, title, app, w, h, state, view, focused, agent, key}, ... }
+-- state: 'pending' | 'live' | 'ended'; view: 'world' | 'tab' | 'full'.
+local function l_window_list(L: *lua_State): cint
+  local list: vector(WindowInfo)
+  window_list(&list)
+  lua_createtable(L, (@cint)(#list), 0)
+  for i = 0, < #list do
+    local w = list[i]
+    lua_createtable(L, 0, 9)
+    lua_pushinteger(L, w.id) lua_setfield(L, -2, 'id')
+    lua_pushinteger(L, w.sid) lua_setfield(L, -2, 'sid')
+    push_str(L, w.title, 'title')
+    push_str(L, w.app, 'app')
+    lua_pushinteger(L, w.w) lua_setfield(L, -2, 'w')
+    lua_pushinteger(L, w.h) lua_setfield(L, -2, 'h')
+    local state: cstring = 'pending'
+    if w.state == RemoteWinState.Live then state = 'live' elseif w.state == RemoteWinState.Ended then state = 'ended' end
+    lua_pushstring(L, state) lua_setfield(L, -2, 'state')
+    local view: cstring = 'world'
+    if w.view == WindowView.Tab then view = 'tab' elseif w.view == WindowView.Full then view = 'full' end
+    lua_pushstring(L, view) lua_setfield(L, -2, 'view')
+    lua_pushboolean(L, w.focused and 1 or 0) lua_setfield(L, -2, 'focused')
+    push_str(L, w.agent, 'agent')
+    push_str(L, w.key, 'key')
+    lua_rawseti(L, -2, i + 1)
+  end
+  list:destroy()
+  return 1
+end
+
+-- ghostty.window_open{run=, match=, wid=, pin=, agent=, caller=} -> panel id
+local function l_window_open(L: *lua_State): cint
+  if lua_type(L, 1) ~= LUA_TTABLE then return push_fail(L, 'window_open takes a table') end
+  local spec: WindowOpenSpec = {
+    run = lua_field_string(L, 1, 'run', ''), match = lua_field_string(L, 1, 'match', ''),
+    agent = lua_field_string(L, 1, 'agent', ''), pin = lua_field_string(L, 1, 'pin', ''),
+    caller = lua_field_string(L, 1, 'caller', ''),
+  }
+  local wid = lua_field_integer(L, 1, 'wid', 0)
+  local rc: cint
+  if wid < 0 or wid > 0xffffffff then
+    rc = push_fail(L, 'wid out of range')
+  else
+    spec.wid = (@uint32)(wid)
+    local id, err = window_open(spec)
+    if id ~= 0 then lua_pushinteger(L, id) rc = 1 else rc = push_fail(L, err) end
+  end
+  spec.run:destroy() spec.match:destroy() spec.agent:destroy() spec.pin:destroy() spec.caller:destroy()
+  return rc
+end
+
+-- The panel id argument: a positive whole number, else -1 (no panel has it).
+local function arg_id(L: *lua_State): integer
+  local isnum: cint = 0
+  local id = lua_tointegerx(L, 1, &isnum)
+  if isnum == 0 or id < 1 then return -1 end
+  return id
+end
+
+-- ghostty.window_close(id) / window_focus(id) -> true
+local function l_window_close(L: *lua_State): cint
+  local id = arg_id(L)
+  if id < 1 then return push_fail(L, 'no such window panel') end
+  local ok, err = window_close(id)
+  if not ok then return push_fail(L, err) end
+  lua_pushboolean(L, 1)
+  return 1
+end
+
+local function l_window_focus(L: *lua_State): cint
+  local ok, err = window_focus(arg_id(L))
+  if not ok then return push_fail(L, err) end
+  lua_pushboolean(L, 1)
+  return 1
+end
+
+-- ghostty.window_place(id, pin_args) -> true
+local function l_window_place(L: *lua_State): cint
+  local len: usize = 0
+  local p = lua_tolstring(L, 2, &len)
+  if p == nilptr then return push_fail(L, 'window_place takes pin arguments') end
+  local id = arg_id(L)
+  if id < 1 then return push_fail(L, 'no such window panel') end
+  local ok, err = window_place(id, string{data=(@*[0]byte)(p), size=len})
+  if not ok then return push_fail(L, err) end
+  lua_pushboolean(L, 1)
+  return 1
+end
+
+-- ghostty.agent_status() -> {connected, version, windows_ok, agent = 'host:port'}
+local function l_agent_status(L: *lua_State): cint
+  lua_createtable(L, 0, 4)
+  local ready = host.agent_enabled and host.agent:ready()
+  lua_pushboolean(L, ready and 1 or 0) lua_setfield(L, -2, 'connected')
+  lua_pushinteger(L, ready and host.agent.version or 0) lua_setfield(L, -2, 'version')
+  lua_pushboolean(L, (ready and host.agent:windows_ok()) and 1 or 0) lua_setfield(L, -2, 'windows_ok')
+  local sb: stringbuilder
+  if host.agent_enabled then sb:write(host.agent.host, ':', host.agent.port) end
+  local where = sb:promote()
+  push_str(L, where, 'agent')
+  where:destroy()
+  lua_pushinteger(L, winlist.answers) lua_setfield(L, -2, 'window_lists')
+  return 1
+end
+
+-- World panels (terminals and windows) ----------------------------------------------------
+
+-- ghostty.world_panels() -> { {id, window, focused}, ... } in host.world order,
+-- without panels already glitching out
+local function l_world_panels(L: *lua_State): cint
+  lua_createtable(L, (@cint)(#host.world), 0)
+  local n: cint = 0
+  for i = 0, < #host.world do
+    local s = host.world[i]
+    if not s.leaving then
+      lua_createtable(L, 0, 3)
+      lua_pushinteger(L, s.id) lua_setfield(L, -2, 'id')
+      lua_pushboolean(L, s.kind == TransportKind.Window and 1 or 0) lua_setfield(L, -2, 'window')
+      lua_pushboolean(L, host.world_focus == s.id and 1 or 0) lua_setfield(L, -2, 'focused')
+      n = n + 1
+      lua_rawseti(L, -2, n)
+    end
+  end
+  return 1
+end
+
+-- The world panel of argument 1, or nilptr.
+local function arg_panel(L: *lua_State): *Session
+  local isnum: cint = 0
+  local id = lua_tointegerx(L, 1, &isnum)
+  if isnum == 0 or id < 1 then return nilptr end
+  return world_panel(id)
+end
+
+-- '' -> true; a reason -> nil, reason (the string is destroyed either way)
+local function push_result(L: *lua_State, err: string): cint
+  local rc: cint = 1
+  if #err > 0 then rc = push_fail(L, err) else lua_pushboolean(L, 1) end
+  err:destroy()
+  return rc
+end
+
+-- ghostty.panel_focus(id) -> true: the keyboard, as a click (no walk-up, no camera turn)
+local function l_panel_focus(L: *lua_State): cint
+  local s = arg_panel(L)
+  if s == nilptr then return push_fail(L, 'no such world panel') end
+  return push_result(L, world_panel_focus(s))
+end
+
+-- ghostty.panel_hide(id, hidden) -> true
+local function l_panel_hide(L: *lua_State): cint
+  local s = arg_panel(L)
+  if s == nilptr then return push_fail(L, 'no such world panel') end
+  return push_result(L, world_panel_hide(s, lua_toboolean(L, 2) ~= 0))
+end
+
+-- ghostty.panel_toggle_pet(id) -> true: pin <-> pet where it is (the title button)
+local function l_panel_toggle_pet(L: *lua_State): cint
+  local s = arg_panel(L)
+  if s == nilptr then return push_fail(L, 'no such world panel') end
+  return push_result(L, world_toggle_pet(s))
+end
+
+-- ghostty.terminal_new{profile=, pin=} -> panel id
+local function l_terminal_new(L: *lua_State): cint
+  if lua_type(L, 1) ~= LUA_TTABLE then return push_fail(L, 'terminal_new takes a table') end
+  local profile = lua_field_string(L, 1, 'profile', '')
+  local pin = lua_field_string(L, 1, 'pin', '')
+  local id, err = world_terminal_new(profile, pin)
+  profile:destroy() pin:destroy()
+  if id == 0 then return push_result(L, err) end
+  err:destroy()
+  lua_pushinteger(L, id)
+  return 1
+end
+
+-- Every panel (panel.*): terminals wherever they live, windows, adopted windows, chat ---------
+
+-- Where session `s` lives: 'tab' (the dropdown), 'float' (a floating
+-- window), 'min' (minimized), 'world' (a world panel) or 'none'.
+local function panel_place_of(s: *Session): cstring
+  for i = 0, < #host.world do if host.world[i] == s then return 'world' end end
+  for i = 0, < #host.dropdown_tabs do if host.dropdown_tabs[i] == s then return 'tab' end end
+  for i = 0, < #host.windows do if host.windows[i] == s then return 'float' end end
+  for i = 0, < #host.minimized do if host.minimized[i] == s then return 'min' end end
+  return 'none'
+end
+
+-- ghostty.panels() -> { {id, kind, title, place, full, focused, profile?, running?, app?}, ... }
+-- in host.sessions order (oldest first), without panels glitching out.
+-- kind: 'terminal' | 'window' | 'adopted' | 'chat'.
+local function l_panels(L: *lua_State): cint
+  lua_createtable(L, (@cint)(#host.sessions), 0)
+  local n: cint = 0
+  for i = 0, < #host.sessions do
+    local s = host.sessions[i]
+    if s.leaving then continue end
+    local place = panel_place_of(s)
+    lua_createtable(L, 0, 9)
+    lua_pushinteger(L, s.id) lua_setfield(L, -2, 'id')
+    local kind: cstring = 'terminal'
+    if s.kind == TransportKind.Window then
+      kind = 'window'
+    elseif s.kind == TransportKind.Panel then
+      local aw = adopt_of(s)
+      if aw ~= nilptr then
+        kind = 'adopted'
+        if #aw.plugin > 0 then push_str(L, aw.plugin, 'app') else push_str(L, aw.name, 'app') end
+      elseif chatpanel_of(s) ~= nilptr then
+        kind = 'chat'
+      else
+        kind = 'adopted'
+      end
+    else
+      push_str(L, s.label, 'profile')
+      lua_pushboolean(L, s.exited and 0 or 1) lua_setfield(L, -2, 'running')
+    end
+    lua_pushstring(L, kind) lua_setfield(L, -2, 'kind')
+    push_str(L, s:display_name(), 'title')
+    lua_pushstring(L, place) lua_setfield(L, -2, 'place')
+    local in_world = place == 'world'
+    lua_pushboolean(L, (in_world and host.world_full_id == s.id) and 1 or 0) lua_setfield(L, -2, 'full')
+    -- the keyboard: a world panel's focus, else the dropdown's active tab while it is out
+    local focused = host.world_focus == s.id
+    if not focused and host.world_focus == 0 and host.dropdown_open and place == 'tab' then
+      focused = host.dropdown_active >= 0 and host.dropdown_active < #host.dropdown_tabs and host.dropdown_tabs[host.dropdown_active] == s
+    end
+    lua_pushboolean(L, focused and 1 or 0) lua_setfield(L, -2, 'focused')
+    n = n + 1
+    lua_rawseti(L, -2, n)
+  end
+  return 1
+end
+
+-- The panel of argument 1 wherever it lives, or nilptr.
+local function arg_session(L: *lua_State): *Session
+  local isnum: cint = 0
+  local id = lua_tointegerx(L, 1, &isnum)
+  if isnum == 0 or id < 1 then return nilptr end
+  local s = find_session(id)
+  if s ~= nilptr and s.leaving then return nilptr end
+  return s
+end
+
+-- ghostty.panel_show(id, fly) -> true: what a click does, and hidden things
+-- come forward: a world panel gets the keyboard (with fly, the click's camera
+-- turn and walk-up, worldview's world_fly_id); a tab opens the dropdown with
+-- it active; a floating window shows with the dropdown; a minimized terminal
+-- is restored into the dropdown. (A hidden world panel: lua/ipc.lua shows it first.)
+local function l_panel_show(L: *lua_State): cint
+  local s = arg_session(L)
+  if s == nilptr then return push_fail(L, 'no such panel') end
+  local fly = lua_toboolean(L, 2) ~= 0
+  if world_panel(s.id) ~= nilptr then
+    local err = world_panel_focus(s)
+    if #err == 0 then world_fly_id = fly and s.id or 0 end
+    return push_result(L, err)
+  end
+  host.world_focus = 0
+  bring_forward(s)
+  host.dropdown_focus_next = true -- the keyboard goes to the dropdown, also when it was out already
+  lua_pushboolean(L, 1)
+  return 1
+end
+
+-- ghostty.panel_close(id) -> true: as its close button (a world panel glitches out;
+-- a window's stream closes; an adopted window goes back to its plugin)
+local function l_panel_close(L: *lua_State): cint
+  local s = arg_session(L)
+  if s == nilptr then return push_fail(L, 'no such panel') end
+  if s.kind == TransportKind.Window then
+    local ok, err = window_close(s.id)
+    if not ok then return push_fail(L, err) end
+  else
+    dismiss_terminal(s)
+  end
+  lua_pushboolean(L, 1)
+  return 1
+end
+
+-- ghostty.panel_minimize(id) -> true: a terminal into the minimized list (/term min)
+local function l_panel_minimize(L: *lua_State): cint
+  local s = arg_session(L)
+  if s == nilptr then return push_fail(L, 'no such panel') end
+  if s.kind == TransportKind.Window or s.kind == TransportKind.Panel then return push_fail(L, 'only terminals are minimized') end
+  minimize(s)
+  if #host.dropdown_tabs == 0 then set_visible(false) end
+  lua_pushboolean(L, 1)
+  return 1
+end
+
+-- ghostty.panel_place(id, pin_args) -> true: as /term pin ARGS on it. A window
+-- or adopted panel keeps its size; a terminal in the dropdown, a floating
+-- window or minimized goes into the world.
+local function l_panel_place(L: *lua_State): cint
+  local s = arg_session(L)
+  if s == nilptr then return push_fail(L, 'no such panel') end
+  local len: usize = 0
+  local p = lua_tolstring(L, 2, &len)
+  if p == nilptr then return push_fail(L, 'panel_place takes pin arguments') end
+  local args = string{data=(@*[0]byte)(p), size=len}
+  local in_world = world_panel(s.id) ~= nilptr
+  if in_world and (args == 'hide' or args == 'hide off') then return push_result(L, world_panel_hide(s, args == 'hide')) end
+  if in_world and (s.kind == TransportKind.Window or s.kind == TransportKind.Panel) then
+    return push_result(L, policy_windows_pin(s.id, args))
+  end
+  local err = policy_world_command(s.id, args)
+  if #err == 0 and not in_world then
+    take_out_of_views(s)
+    host.world:push(s)
+    set_world_visible(true)
+  end
+  return push_result(L, err)
+end
+
+-- ghostty.world_command(id, args) -> nil, or why not: CONFIG.world.command
+-- (lua/world.lua: /term pin's anchors, order, hide)
+local function l_world_command(L: *lua_State): cint
+  local isnum: cint = 0
+  local id = lua_tointegerx(L, 1, &isnum)
+  local len: usize = 0
+  local p = lua_tolstring(L, 2, &len)
+  if isnum == 0 or p == nilptr then lua_pushstring(L, 'world_command takes an id and arguments') return 1 end
+  local err = policy_world_command(id, string{data=(@*[0]byte)(p), size=len})
+  if #err == 0 then lua_pushnil(L) else lua_pushlstring(L, (@cstring)(err.data), err.size) end
+  err:destroy()
+  return 1
+end
+
+-- The agent's last WLISTR ---------------------------------------------------------------
+
+-- ghostty.agent_windows() -> { windows = {{wid, w, h, app, title, key, extra = {...}}, ...},
+--                              apps = {{id, name, icon, categories}, ...}, answers = n }
+local function l_agent_windows(L: *lua_State): cint
+  lua_createtable(L, 0, 3)
+  lua_createtable(L, (@cint)(#winlist.windows), 0)
+  local nw = 0
+  for i = 0, < #winlist.windows do
+    local e = &winlist.windows[i]
+    if winlist_entry_never(e) then continue end -- CONFIG.windows.never: not shown to other plugins either
+    lua_createtable(L, 0, 7)
+    lua_pushinteger(L, e.wid) lua_setfield(L, -2, 'wid')
+    lua_pushinteger(L, e.w) lua_setfield(L, -2, 'w')
+    lua_pushinteger(L, e.h) lua_setfield(L, -2, 'h')
+    push_str(L, e.app, 'app')
+    push_str(L, e.title, 'title')
+    push_str(L, e.key, 'key')
+    lua_createtable(L, (@cint)(#e.extra), 0)
+    for k = 0, < #e.extra do
+      lua_pushlstring(L, (@cstring)(e.extra[k].data), e.extra[k].size)
+      lua_rawseti(L, -2, k + 1)
+    end
+    lua_setfield(L, -2, 'extra')
+    nw = nw + 1
+    lua_rawseti(L, -2, nw)
+  end
+  lua_setfield(L, -2, 'windows')
+  lua_createtable(L, (@cint)(#winlist.apps), 0)
+  local na = 0
+  for i = 0, < #winlist.apps do
+    local a = &winlist.apps[i]
+    if winlist_app_never(a) then continue end
+    lua_createtable(L, 0, 4)
+    push_str(L, a.id, 'id')
+    push_str(L, a.name, 'name')
+    push_str(L, a.icon, 'icon')
+    push_str(L, a.categories, 'categories')
+    na = na + 1
+    lua_rawseti(L, -2, na)
+  end
+  lua_setfield(L, -2, 'apps')
+  lua_pushinteger(L, winlist.answers) lua_setfield(L, -2, 'answers')
+  return 1
+end
+
+-- ghostty.agent_windows_refresh() -> true: WLIST sent (the answer lands in agent_windows)
+local function l_agent_windows_refresh(L: *lua_State): cint
+  local ok, err = window_agent_list('')
+  if not ok then return push_fail(L, err) end
+  lua_pushboolean(L, 1)
+  return 1
+end
+
+-- ghostty.keys_reserve(caller, {chord, ...}) -> how many chords the caller
+-- now holds: they replace its earlier ones (core/keychords.nelua)
+local function l_keys_reserve(L: *lua_State): cint
+  local len: usize = 0
+  local c = lua_tolstring(L, 1, &len)
+  if c == nilptr then return push_fail(L, 'keys_reserve takes the caller') end
+  if lua_type(L, 2) ~= LUA_TTABLE then return push_fail(L, 'keys_reserve takes a list of chords') end
+  local caller = string.copy(string{data=(@*[0]byte)(c), size=len})
+  local chords: vector(string)
+  local n = (@integer)(lua_rawlen(L, 2))
+  for i = 1, n do
+    lua_rawgeti(L, 2, i)
+    local l: usize = 0
+    local p = lua_tolstring(L, -1, &l)
+    if p ~= nilptr then chords:push(string.copy(string{data=(@*[0]byte)(p), size=l})) end
+    lua_pop(L, 1)
+  end
+  local err = keychords_reserve(caller, &chords)
+  for i = 0, < #chords do chords[i]:destroy() end
+  chords:destroy()
+  local rc: cint
+  if #err > 0 then
+    rc = push_fail(L, err)
+  else
+    lua_pushinteger(L, keychords_count(caller, false))
+    rc = 1
+  end
+  err:destroy()
+  caller:destroy()
+  return rc
+end
+
+-- ghostty.status() -> the info bar / Umbra widget label (GhosttyDalamud.v1.Status)
+local function l_status(L: *lua_State): cint
+  lua_pushlstring(L, (@cstring)(host.status.data), host.status.size)
+  return 1
+end
+
+global function ipc_lua_register(L: *lua_State): void
+  lua_getglobal(L, 'ghostty')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return end
+  lua_pushcclosure(L, l_window_list, 0) lua_setfield(L, -2, 'window_list')
+  lua_pushcclosure(L, l_window_open, 0) lua_setfield(L, -2, 'window_open')
+  lua_pushcclosure(L, l_window_close, 0) lua_setfield(L, -2, 'window_close')
+  lua_pushcclosure(L, l_window_focus, 0) lua_setfield(L, -2, 'window_focus')
+  lua_pushcclosure(L, l_window_place, 0) lua_setfield(L, -2, 'window_place')
+  lua_pushcclosure(L, l_agent_status, 0) lua_setfield(L, -2, 'agent_status')
+  lua_pushcclosure(L, l_status, 0) lua_setfield(L, -2, 'status')
+  lua_pushcclosure(L, l_world_panels, 0) lua_setfield(L, -2, 'world_panels')
+  lua_pushcclosure(L, l_panel_focus, 0) lua_setfield(L, -2, 'panel_focus')
+  lua_pushcclosure(L, l_panel_hide, 0) lua_setfield(L, -2, 'panel_hide')
+  lua_pushcclosure(L, l_panel_toggle_pet, 0) lua_setfield(L, -2, 'panel_toggle_pet')
+  lua_pushcclosure(L, l_terminal_new, 0) lua_setfield(L, -2, 'terminal_new')
+  lua_pushcclosure(L, l_agent_windows, 0) lua_setfield(L, -2, 'agent_windows')
+  lua_pushcclosure(L, l_agent_windows_refresh, 0) lua_setfield(L, -2, 'agent_windows_refresh')
+  lua_pushcclosure(L, l_keys_reserve, 0) lua_setfield(L, -2, 'keys_reserve')
+  lua_pushcclosure(L, l_panels, 0) lua_setfield(L, -2, 'panels')
+  lua_pushcclosure(L, l_panel_show, 0) lua_setfield(L, -2, 'panel_show')
+  lua_pushcclosure(L, l_panel_close, 0) lua_setfield(L, -2, 'panel_close')
+  lua_pushcclosure(L, l_panel_minimize, 0) lua_setfield(L, -2, 'panel_minimize')
+  lua_pushcclosure(L, l_panel_place, 0) lua_setfield(L, -2, 'panel_place')
+  lua_pushcclosure(L, l_world_command, 0) lua_setfield(L, -2, 'world_command')
+  lua_pop(L, 1)
+end

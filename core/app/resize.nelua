@@ -1,0 +1,240 @@
+-- Resizing world panels by their edges and corners (core/app/worldview.nelua
+-- drives it). The grips are sized in screen pixels, converted through the
+-- panel's projection, so they stay usable however far away the panel is. A
+-- press on one resizes at once (no focus needed); the grabbed edge follows
+-- the cursor 1:1 while the opposite edge stays where it is (pins and HUD
+-- panels; pets, placed by the pet logic, grow about their centre at twice the
+-- rate so the grabbed edge still tracks). lua/world.lua resize() clamps the
+-- size and moves the anchor.
+require 'math'
+require 'C.stdio'
+require 'core.imgui'
+require 'core.world'
+require 'core.policy'
+require 'core.theme'
+
+-- which edges a grip moves (bits)
+global WORLD_GRIP_LEFT: integer <comptime> = 1
+global WORLD_GRIP_RIGHT: integer <comptime> = 2
+global WORLD_GRIP_TOP: integer <comptime> = 4
+global WORLD_GRIP_BOTTOM: integer <comptime> = 8
+local GRIP_H <comptime> = 3  -- left | right
+local GRIP_V <comptime> = 12 -- top | bottom
+
+-- Grip sizes in screen pixels (tunable here): `band` thick across each edge,
+-- `outside` of it beyond the edge; corners reach `corner` along both edges.
+-- Inside the panel a band never takes more than a quarter of its size.
+global WorldGripTuning = @record{ band: float32, outside: float32, corner: float32 }
+global world_grip: WorldGripTuning = { band = 14, outside = 6, corner = 28 }
+
+-- Screen pixels per panel pixel at panel pixel (u, v), stepping (du, dv).
+local function screen_step(cam: *GuCamera, b: *WorldBasis, u: float32, v: float32, du: float32, dv: float32): float32
+  local STEP: float32 <comptime> = 8
+  local x0, y0, z0 = world_point(b, u, v)
+  local x1, y1, z1 = world_point(b, u + du * STEP, v + dv * STEP)
+  local ok0, sx0, sy0 = world_project(cam, x0, y0, z0)
+  local ok1, sx1, sy1 = world_project(cam, x1, y1, z1)
+  if not ok0 or not ok1 then return 0 end
+  return math.sqrt((sx1 - sx0) ^ 2 + (sy1 - sy0) ^ 2) / STEP
+end
+
+-- Panel pixels that `px` screen pixels make at a scale of `k` screen pixels per panel pixel.
+local function panel_px(px: float32, k: float32): float32
+  if k <= 1e-6 then return 0 end
+  return px / k
+end
+
+-- The grip under panel pixel (mu, mv) of a `w` x `h` panel (extrapolated off
+-- it, as world_hit gives it): WORLD_GRIP_* bits, 0 for none.
+global function world_grip_at(cam: *GuCamera, b: *WorldBasis, w: float32, h: float32, mu: float32, mv: float32): integer
+  local g = &world_grip
+  local cu, cv = math.clamp(mu, 0, w), math.clamp(mv, 0, h)
+  -- the scale across each edge, where the cursor is along it
+  local kl, kr = screen_step(cam, b, 0, cv, 1, 0), screen_step(cam, b, w, cv, -1, 0)
+  local kt, kb = screen_step(cam, b, cu, 0, 0, 1), screen_step(cam, b, cu, h, 0, -1)
+  if kl <= 0 or kr <= 0 or kt <= 0 or kb <= 0 then return 0 end
+  local inside = math.max(g.band - g.outside, 0)
+  if mu < -panel_px(g.outside, kl) or mu > w + panel_px(g.outside, kr)
+     or mv < -panel_px(g.outside, kt) or mv > h + panel_px(g.outside, kb) then
+    return 0
+  end
+  local mode = 0
+  if mu < math.min(panel_px(inside, kl), w * 0.25) then mode = WORLD_GRIP_LEFT
+  elseif mu > w - math.min(panel_px(inside, kr), w * 0.25) then mode = WORLD_GRIP_RIGHT end
+  if mv < math.min(panel_px(inside, kt), h * 0.25) then mode = mode | WORLD_GRIP_TOP
+  elseif mv > h - math.min(panel_px(inside, kb), h * 0.25) then mode = mode | WORLD_GRIP_BOTTOM end
+  -- corners reach further along both edges
+  if mode ~= 0 and (mode & GRIP_H == 0 or mode & GRIP_V == 0) then
+    if mode & GRIP_H ~= 0 then
+      if mv < math.min(panel_px(g.corner, kt), h * 0.3) then mode = mode | WORLD_GRIP_TOP
+      elseif mv > h - math.min(panel_px(g.corner, kb), h * 0.3) then mode = mode | WORLD_GRIP_BOTTOM end
+    else
+      if mu < math.min(panel_px(g.corner, kl), w * 0.3) then mode = mode | WORLD_GRIP_LEFT
+      elseif mu > w - math.min(panel_px(g.corner, kr), w * 0.3) then mode = mode | WORLD_GRIP_RIGHT end
+    end
+  end
+  return mode
+end
+
+-- Thickness in screen pixels of the grip band across the edges `mode` names,
+-- at the middle of that edge (for tests and the glow).
+global function world_grip_scale(cam: *GuCamera, b: *WorldBasis, w: float32, h: float32, mode: integer): float32
+  if mode & WORLD_GRIP_LEFT ~= 0 then return screen_step(cam, b, 0, h * 0.5, 1, 0) end
+  if mode & WORLD_GRIP_RIGHT ~= 0 then return screen_step(cam, b, w, h * 0.5, -1, 0) end
+  if mode & WORLD_GRIP_TOP ~= 0 then return screen_step(cam, b, w * 0.5, 0, 0, 1) end
+  return screen_step(cam, b, w * 0.5, h, 0, -1)
+end
+
+-- One resize gesture.
+global WorldResize = @record{
+  id: integer,          -- panel being resized, 0 = none
+  mode: integer,        -- WORLD_GRIP_* bits
+  gu: float32,          -- cursor minus the grabbed edge at the press, panel pixels outward
+  gv: float32,
+  aspect: float32,      -- width / height kept (window panels), 0 = free
+  anchored: boolean,    -- the opposite edge stays put (else about the centre)
+}
+
+global function world_resize_begin(r: *WorldResize, id: integer, mode: integer, w: float32, h: float32,
+                                   mu: float32, mv: float32, aspect: float32, anchored: boolean): void
+  $r = { id = id, mode = mode, aspect = aspect, anchored = anchored }
+  if mode & WORLD_GRIP_RIGHT ~= 0 then r.gu = mu - w elseif mode & WORLD_GRIP_LEFT ~= 0 then r.gu = -mu end
+  if mode & WORLD_GRIP_BOTTOM ~= 0 then r.gv = mv - h elseif mode & WORLD_GRIP_TOP ~= 0 then r.gv = -mv end
+end
+
+-- The size that puts the grabbed edge back under the cursor at (mu, mv) of
+-- the panel as it is now (w x h), and which way its centre moves per pixel
+-- of growth: su = 1 the right edge moves (the left stays), -1 the left, 0
+-- about the centre; sv likewise for bottom (1) and top (-1). `free` (Shift)
+-- lets a window panel leave its aspect.
+global function world_resize_size(r: *WorldResize, w: float32, h: float32, mu: float32, mv: float32,
+                                  free: boolean): (float32, float32, integer, integer)
+  local nw, nh = w, h
+  local su, sv = 0, 0
+  local horiz, vert = r.mode & GRIP_H ~= 0, r.mode & GRIP_V ~= 0
+  if horiz then
+    local right = r.mode & WORLD_GRIP_RIGHT ~= 0
+    local e = (right and mu - w * 0.5 or w * 0.5 - mu) - r.gu -- where the edge goes, out from the centre
+    if r.anchored then nw, su = e + w * 0.5, right and 1 or -1 else nw = 2 * e end
+  end
+  if vert then
+    local bottom = r.mode & WORLD_GRIP_BOTTOM ~= 0
+    local e = (bottom and mv - h * 0.5 or h * 0.5 - mv) - r.gv
+    if r.anchored then nh, sv = e + h * 0.5, bottom and 1 or -1 else nh = 2 * e end
+  end
+  nw, nh = math.max(nw, 1), math.max(nh, 1)
+  if r.aspect > 0 and not free then
+    if horiz and vert then
+      if nw / r.aspect >= nh then nh = nw / r.aspect else nw = nh * r.aspect end
+    elseif horiz then
+      nh, sv = nw / r.aspect, 0 -- the other axis grows about the middle of the edge
+    else
+      nw, su = nh * r.aspect, 0
+    end
+  end
+  return nw, nh, su, sv
+end
+
+-- CONFIG.world.resize(id): true when the panel keeps its opposite edge (a pin
+-- or a HUD panel), false when it resizes about its centre.
+global function world_resize_anchored(id: integer): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return false end
+  local top = lua_gettop(L)
+  defer lua_settop(L, top) end
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then return false end
+  lua_getfield(L, -1, 'world')
+  if lua_type(L, -1) ~= LUA_TTABLE then return false end
+  lua_getfield(L, -1, 'resize')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then return false end
+  lua_pushinteger(L, id)
+  if lua_pcall(L, 1, 1, 0) ~= LUA_OK then return false end
+  return lua_toboolean(L, -1) ~= 0
+end
+
+-- CONFIG.world.resize(id, w, h, keep, su, sv, rx, ry, rz, ux, uy, uz): the new
+-- size (clamped there, keeping the aspect when `keep`), and the centre moved
+-- by half the growth along (rx, ry, rz) per pixel of width and -(ux, uy, uz)
+-- per pixel of height, signed by su and sv (world units per panel pixel; a
+-- HUD panel converts to its screen fractions instead). False when it failed.
+global function world_resize_apply(id: integer, w: float32, h: float32, keep: boolean, su: integer, sv: integer,
+                                   b: *WorldBasis): boolean
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return false end
+  local top = lua_gettop(L)
+  defer lua_settop(L, top) end
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then return false end
+  lua_getfield(L, -1, 'world')
+  if lua_type(L, -1) ~= LUA_TTABLE then return false end
+  lua_getfield(L, -1, 'resize')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then return false end
+  -- panel u runs along -right on a panel seen from behind (drawn mirrored)
+  local flip: float32 = b.mirror and -1 or 1
+  lua_pushinteger(L, id)
+  lua_pushnumber(L, w)
+  lua_pushnumber(L, h)
+  lua_pushboolean(L, keep and 1 or 0)
+  lua_pushinteger(L, su)
+  lua_pushinteger(L, sv)
+  lua_pushnumber(L, b.rx * b.ypp * flip)
+  lua_pushnumber(L, b.ry * b.ypp * flip)
+  lua_pushnumber(L, b.rz * b.ypp * flip)
+  lua_pushnumber(L, b.ux)
+  lua_pushnumber(L, b.uy)
+  lua_pushnumber(L, b.uz)
+  return lua_pcall(L, 12, 0, 0) == LUA_OK
+end
+
+-- A glow along the grabbed or hovered edges, in panel pixels (drawn before
+-- the panel is bent onto the world, so it follows the curve). `k` is screen
+-- pixels per panel pixel, so the glow keeps its screen size.
+global function world_grip_glow(dl: *ImDrawList, o: ImVec2, w: float32, h: float32, mode: integer, k: float32, active: boolean): void
+  if mode == 0 then return end
+  local px = k > 1e-4 and 1 / k or 1 -- panel pixels per screen pixel
+  local SEG <comptime> = 24
+  local corner = mode & GRIP_H ~= 0 and mode & GRIP_V ~= 0
+  -- a corner lights both edges near it; an edge lights its whole length
+  local reach_u = corner and math.min(world_grip.corner * 3 * px, w * 0.5) or w
+  local reach_v = corner and math.min(world_grip.corner * 3 * px, h * 0.5) or h
+  for pass = 0, 2 do
+    local t = (@float32)((3 - pass) * 2.5) * px
+    local a: uint8 = active and (@uint8)(70 + pass * 70) or (@uint8)(45 + pass * 60)
+    local col = chrome_col(pass == 2 and ChromeColor.Accent2 or ChromeColor.Glow, a)
+    if mode & GRIP_V ~= 0 then
+      local y = (mode & WORLD_GRIP_TOP ~= 0) and o.y + t * 0.5 or o.y + h - t * 0.5
+      local u0 = (mode & WORLD_GRIP_RIGHT ~= 0) and w - reach_u or 0
+      for s = 0, < SEG do
+        local xa, xb = o.x + u0 + reach_u * s / SEG, o.x + u0 + reach_u * (s + 1) / SEG
+        imgui.DrawListAddLine(dl, vec2(xa, y), vec2(xb, y), col, t)
+      end
+    end
+    if mode & GRIP_H ~= 0 then
+      local x = (mode & WORLD_GRIP_LEFT ~= 0) and o.x + t * 0.5 or o.x + w - t * 0.5
+      local v0 = (mode & WORLD_GRIP_BOTTOM ~= 0) and h - reach_v or 0
+      for s = 0, < SEG do
+        local ya, yb = o.y + v0 + reach_v * s / SEG, o.y + v0 + reach_v * (s + 1) / SEG
+        imgui.DrawListAddLine(dl, vec2(x, ya), vec2(x, yb), col, t)
+      end
+    end
+  end
+end
+
+-- The size while resizing, flat on the screen beside the cursor: panel
+-- pixels, or columns x rows for a terminal (cols > 0).
+global function world_resize_label(dl: *ImDrawList, at: ImVec2, w: float32, h: float32, cols: integer, rows: integer): void
+  local buf: [48]cchar
+  local n: cint
+  if cols > 0 and rows > 0 then
+    n = C.snprintf(&buf[0], #buf, '%d x %d', (@cint)(cols), (@cint)(rows))
+  else
+    n = C.snprintf(&buf[0], #buf, '%.0f x %.0f', (@float64)(w), (@float64)(h))
+  end
+  if n <= 0 then return end
+  local size: float32 = 16
+  local tw: float32 = size * 0.55 * n
+  local p = vec2(at.x + 18, at.y + 18)
+  imgui.DrawListAddRectFilled(dl, vec2(p.x - 6, p.y - 3), vec2(p.x + tw + 6, p.y + size + 3), im_col32(0, 12, 20, 210), 4, 0)
+  imgui.DrawListAddText(dl, imgui.GetFont(), size, p, chrome_col(ChromeColor.Ink, 255), &buf[0], nilptr, 0, nilptr)
+end

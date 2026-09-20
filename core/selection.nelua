@@ -6,6 +6,8 @@ require 'string'
 require 'math'
 require 'core.ghostty'
 require 'core.termview'
+require 'core.links'
+require 'stringbuilder'
 
 -- libghostty selection API (vt/point.h, grid_ref.h, selection.h) ------------------
 global GhosttyPointCoordinate <cimport, nodecl> = @record{ x: uint16, y: uint32 }
@@ -50,6 +52,8 @@ global function ghostty_terminal_grid_ref(terminal: GhosttyTerminal, point: Ghos
 global function ghostty_terminal_point_from_grid_ref(terminal: GhosttyTerminal, ref: *GhosttyGridRef, tag: cint, out: *GhosttyPointCoordinate): GhosttyResult <cimport, nodecl> end
 global function ghostty_terminal_select_word(terminal: GhosttyTerminal, options: *GhosttyTerminalSelectWordOptions, out_selection: *GhosttySelection): GhosttyResult <cimport, nodecl> end
 global function ghostty_terminal_select_line(terminal: GhosttyTerminal, options: *GhosttyTerminalSelectLineOptions, out_selection: *GhosttySelection): GhosttyResult <cimport, nodecl> end
+global function ghostty_grid_ref_hyperlink_uri(ref: *GhosttyGridRef, buf: *[0]uint8, buf_len: usize, out_len: *usize): GhosttyResult <cimport, nodecl> end
+global function ghostty_grid_ref_graphemes(ref: *GhosttyGridRef, buf: *[0]uint32, buf_len: usize, out_len: *usize): GhosttyResult <cimport, nodecl> end
 global function ghostty_terminal_selection_format_buf(terminal: GhosttyTerminal, options: GhosttyTerminalSelectionFormatOptions, buf: *[0]uint8, buf_len: usize, out_written: *usize): GhosttyResult <cimport, nodecl> end
 
 -- Pure logic ----------------------------------------------------------------------
@@ -264,4 +268,46 @@ global function selection_text(v: *TermView): string
   out.data[written] = 0 -- stays usable as a cstring for the clipboard
   out.size = written
   return out
+end
+
+-- The link under viewport cell (col, row) of a `cols` wide terminal: the
+-- cell's OSC 8 hyperlink, else a web or mail URL in the row's text around
+-- it (link_in_row; one row: a URL wrapped onto the next is cut there).
+-- Empty when there is none.
+global function selection_link_at(v: *TermView, col: integer, row: integer, cols: integer): string
+  local ref: GhosttyGridRef
+  if not grid_ref(v, GHOSTTY_POINT_TAG_VIEWPORT, col, row, &ref) then return (@string){} end
+  local need: usize = 0
+  if ghostty_grid_ref_hyperlink_uri(&ref, nilptr, 0, &need) == GHOSTTY_OUT_OF_SPACE and need > 0 and need <= 8192 then
+    local out = string.create(need)
+    local got: usize = 0
+    if ghostty_grid_ref_hyperlink_uri(&ref, (@*[0]uint8)(out.data), need, &got) == GHOSTTY_SUCCESS and got > 0 then
+      out.data[got] = 0
+      out.size = got
+      return out
+    end
+    out:destroy()
+  end
+  -- the row as one byte a cell: ASCII as it is, blanks for empty cells,
+  -- 1 (never part of a URL) for anything else
+  local sb: stringbuilder
+  for c = 0, < cols do
+    local b: byte = 1
+    local cr: GhosttyGridRef
+    if grid_ref(v, GHOSTTY_POINT_TAG_VIEWPORT, c, row, &cr) then
+      local cps: [4]uint32
+      local n: usize = 0
+      if ghostty_grid_ref_graphemes(&cr, &cps, 4, &n) == GHOSTTY_SUCCESS then
+        if n == 0 then b = 32
+        elseif n == 1 and cps[0] >= 32 and cps[0] < 127 then b = (@byte)(cps[0]) end
+      end
+    end
+    sb:writebyte(b)
+  end
+  local text = sb:promote()
+  local a, z = link_in_row(text, col)
+  local url: string
+  if a > 0 then url = text:sub(a, z) end
+  text:destroy()
+  return url
 end
