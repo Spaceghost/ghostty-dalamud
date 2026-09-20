@@ -70,7 +70,10 @@ wb_game_running() {
     local skip=0 m
     for m in "${mine[@]}"; do [[ "$pid" == "$m" ]] && skip=1; done
     [[ "$skip" == 1 ]] && continue
-    WB_GAME_MATCH="$line"
+    # pid and program only: the game's command line carries its session token, and
+    # this string ends up in status output and in logs
+    m="$(grep -oiE 'ffxiv_dx11\.exe|ffxivlauncher\.exe|XIVLauncher(\.Core)?|ffxiv-session' <<<"$line" | head -n1)"
+    WB_GAME_MATCH="$pid ${m:-game}"
     return 0
   done < <(pgrep -af -- "$BUILD_GAME_PATTERN" 2>/dev/null || true)
   return 1
