@@ -581,8 +581,8 @@ with the depth test on.
 
 ## Themes
 
-**New and untested in game**: only the host tests (`tests/test_themes.*`)
-have run it.
+Run in game: `/term theme catppuccin-latte` recoloured the terminals and the
+glass around them in one frame, and `/term theme spaceghost` put them back.
 
 <!-- screenshots TODO: the dropdown and a world screen in spaceghost, gruvbox-dark, catppuccin and catppuccin-latte -->
 
@@ -710,9 +710,15 @@ the terminal.
 
 ## Ask panel (`/ask`)
 
-**New and untested in game**: only the host tests (`tests/test_ask.*`, with a
+**Still untested in game**: only the host tests (`tests/test_ask.*`, with a
 scripted ImGui) have run it. It needs an almanac with threads
 (`almanac ask --stream-json`, `almanac threads`).
+
+The first in-game `/ask` ended the game process: the panel popped one more style
+colour than it pushed, and the ImGui Dalamud ships does not check the depth
+(fixed in 68728c9; `tests/test_imgui_stack.py` now guards every core draw
+function). The panel has not been drawn in game since the fix, so it stays
+untested here rather than verified.
 
 `/ask <question>` (or `/term ask`, `/agent ask`) answers in a Ghostty glass
 panel instead of a terminal: your question and the answer as chat bubbles,
@@ -925,11 +931,14 @@ Tested on the host (`tests/run.sh`): the libghostty-vt binding, cell renderer,
 key encoding, DualSense report parsing, Lua policy, agent protocol and server,
 the plugin's activation state machine, its command / info bar / IPC registration and the config
 migration (`tests/test_hostsurface.nelua`, `tests/test_migrate.*`), the
-per-platform defaults and local fallbacks (`tests/test_platform.*`), `/term ask` (`tests/test_assistant.*`; untested in game), the `/ask` panel (`tests/test_ask.*`; untested in game), themes and tooltips (`tests/test_themes.*`; untested in game) and the
+per-platform defaults and local fallbacks (`tests/test_platform.*`), `/term ask` (`tests/test_assistant.*`; untested in game), the `/ask` panel (`tests/test_ask.*`; untested in game), themes (`tests/test_themes.*`; run in game) and tooltips (untested in game: they need a pointer resting on a control, which nothing here can drive) and the
 agent's shared pure logic (`tests/test_agent_logic.nelua`) and glyph coverage
 -- emoji, wide characters, the fallback font chain and the tofu box for a code
 point no font has ([`docs/GLYPHS.md`](docs/GLYPHS.md),
-`tests/test_glyphfb.nelua`; untested in game). Both C#
+`tests/test_glyphfb.nelua`). Box drawing, block elements, braille, CJK and
+emoji have since been checked in game and render; powerline separators and Nerd
+Font glyphs came out blank, because the fallback chain has no font that carries
+that private-use range. Both C#
 projects, the Windows DLLs and `ghostty-agent.exe` compile.
 
 **The standalone plugin, its info bar entry and the IPC-only Umbra widget have
@@ -1029,6 +1038,32 @@ separately running agent. Neither path is certified by Linux host tests.
 For the optional Umbra widget, stage it with `tools/install-dev.sh --widget`,
 add `Umbra.Ghostty.dll` in Umbra's plugin settings, and add its toolbar widget.
 The standalone plugin is designed not to require Umbra.
+
+### Keeping the game up
+
+`tools/crash-restart.sh` answers the crash dialog, which covers a crash Dalamud
+catches. It cannot help with a crash that takes the process down without a
+dialog, a machine that has rebooted, or a game nobody has started yet.
+
+`tools/ffxiv-session.sh` covers those:
+
+```sh
+tools/ffxiv-session.sh status      # game, launcher, whether XivMcp answers
+tools/ffxiv-session.sh start       # launch it, and wait until XivMcp answers
+tools/ffxiv-session.sh install     # a systemd --user unit that keeps it up
+```
+
+`start` finishes when XivMcp answers on its port, not when the process exists,
+because the game is not usable for a while after that.
+
+Logging in stays XIVLauncher's own saved login: tick **Auto-login** in
+XIVLauncher once, by hand, and the credentials live in your keyring. The script
+never sees them, and `start` refuses with an explanation when auto-login is off
+rather than typing into a login box. A machine that must be logged into by hand
+cannot be brought back unattended, which is the point of the script.
+
+**Untested:** written against XIVLauncher.Core as a flatpak, but not yet run on
+a machine that has one.
 
 ## Configuration and transports
 
