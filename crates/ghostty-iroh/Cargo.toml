@@ -1,0 +1,46 @@
+[package]
+name = "ghostty-iroh"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "iroh transport behind the ghostty-multiagent net.nelua seam, exposed as a C ABI"
+license = "MIT"
+
+[lib]
+name = "ghostty_iroh"
+# staticlib for the zig cc link lines (host agent + windows-gnu core/agent.exe),
+# cdylib only so the crate can be loaded from a test harness without relinking.
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[dependencies]
+# Exact pins: docs/IROH.md requires the tree to be vendored and built
+# --offline --locked, so nothing here may float.
+iroh = "=0.35.0"
+tokio = { version = "1.44", features = [
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "io-util",
+    "macros",
+] }
+rand = "=0.8.5"
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.172"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.59.0", features = [
+    "Win32_Foundation",
+    # CreateEventW takes a SECURITY_ATTRIBUTES, so Threading alone does not
+    # bring the symbol in.
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+opt-level = 2
+# The staticlib is linked into a PE DLL by zig cc; keep unwinding out of the
+# cross-module path entirely (docs/IROH.md: no callbacks, no unwinding, across
+# the boundary).
+panic = "abort"

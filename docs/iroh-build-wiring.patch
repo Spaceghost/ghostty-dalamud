@@ -1,0 +1,310 @@
+diff --git a/tests/run.sh b/tests/run.sh
+index 0083c96..12f9be5 100755
+--- a/tests/run.sh
++++ b/tests/run.sh
+@@ -47,6 +47,12 @@ fi
+ NCACHE="build/nelua-cache$SAN_SUFFIX"
+ INC="-I$ROOT/vendor/ghostty/include -I$ROOT/vendor/gc-cimgui -I$ROOT/vendor/lua/src -I$ROOT/vendor/stb"
+ LIBS="-L$ROOT/build/ghostty-vt-linux/lib -L$ROOT/build/lua-linux -lm"
++# The optional iroh staticlib (docs/IROH.md). Every host link here shares $LIBS,
++# including core/host.nelua below, so this is the only place it is named. The
++# guard is the built artifact: no crate, no build/lib, no change.
++if [[ "${IROH:-0}" == 1 && -f "$ROOT/build/lib/libghostty_iroh.a" ]]; then
++  LIBS="$LIBS -L$ROOT/build/lib -lghostty_iroh -lpthread -ldl"
++fi
+ export LD_LIBRARY_PATH="$ROOT/build/ghostty-vt-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+ # wait for an agent to listen (valgrind takes seconds to get there), or for it to die
+ wait_port() { # port pid
+diff --git a/toolchain.env b/toolchain.env
+index dd46699..6863823 100644
+--- a/toolchain.env
++++ b/toolchain.env
+@@ -52,6 +52,39 @@ libdrm/2.4.134/1.fc44/x86_64/libdrm-devel-2.4.134-1.fc44.x86_64.rpm:af3967fcd6a2
+ libxcb/1.17.0/7.fc44/x86_64/libxcb-devel-1.17.0-7.fc44.x86_64.rpm:6093175589a520aa46fdb9416730f1e24d875b2d96663afcbc9f9c825dcbb2d0 \
+ xcb-util-wm/0.4.2/9.fc44/x86_64/xcb-util-wm-devel-0.4.2-9.fc44.x86_64.rpm:6637cfe71c31ac0d4d75f473607b05dfc0ebfdaed5fc7f71b077632325d82f08"
+ 
++# ---------------------------------------------------------------------------
++# Rust staticlib crates/ghostty-iroh (docs/IROH.md). OPTIONAL: nothing here is
++# used unless IROH=1 and the crate is present, and nothing below has been built
++# or run -- these are the pins the crate is to be built with, not evidence that
++# it builds. docs/iroh-build-wiring.md.
++# ---------------------------------------------------------------------------
++# Fedora 44 packages, pinned by exact NEVR like BUILD_PKGS_PINNED and installed
++# into the build container by the same install_pinned. Fedora ships the
++# cross std (rust-std-static-x86_64-pc-windows-gnu), so no rustup is needed.
++# Observed available via `dnf repoquery` in fedora:ghostty-build on 2026-09-22;
++# not installed there yet.
++RUST_VERSION=1.98.1
++RUST_PKGS_PINNED="\
++rust-1.98.1-1.fc44 \
++cargo-1.98.1-1.fc44 \
++rust-std-static-x86_64-pc-windows-gnu-1.98.1-1.fc44"
++RUST_WINDOWS_TARGET=x86_64-pc-windows-gnu
++# The crate's own pin, for a reader who expects every revision to be in this
++# file. The authority is crates/ghostty-iroh/Cargo.lock, which the build uses
++# with --locked; this records which iroh release that lock is built around.
++# Empty until the crate lands.
++IROH_VERSION=
++# The dependency tree, `cargo vendor`-ed once and published as a single
++# sha256-pinned tarball -- the LUA_URL/LUA_SHA256 idiom, for the same reason:
++# the build must not reach the network. tools/fetch-vendor.sh unpacks it into
++# vendor/cargo, which is the shared Incus cache volume inside the build
++# container and is deliberately NOT part of the rsynced source
++# (tools/build-remote.sh push_source), so the large tree never crosses the
++# wire on every build. Empty = not published yet; fetch-vendor.sh skips it and
++# a cargo build would resolve online and say so.
++CARGO_VENDOR_URL=
++CARGO_VENDOR_SHA256=
++
+ # ---------------------------------------------------------------------------
+ # Incus build container (tools/build-container.sh, tools/build-remote.sh).
+ # Heavy builds run in a container, never on the gaming PC. docs/BUILDING.md.
+diff --git a/tools/build-agent.sh b/tools/build-agent.sh
+index 3cd2417..97a1edb 100755
+--- a/tools/build-agent.sh
++++ b/tools/build-agent.sh
+@@ -9,4 +9,9 @@ source "$ROOT/tools/build-common.sh"
+ [[ -d vendor/nelua-lang && -d vendor/ghostty ]] || { echo 'Fetch the pinned dependencies before building.' >&2; exit 1; }
+ build_nelua
+ mkdir -p build/dist build/nelua-cache
+-"$ROOT/vendor/nelua-lang/nelua" --cc "$CC" -P nogc --cflags="-I\"$ROOT/compat\"" --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
++# Optional iroh staticlib (docs/IROH.md). iroh_probe leaves everything empty
++# unless IROH=1 and crates/ghostty-iroh exists, so the flags below are unchanged
++# in a checkout without the crate. Host only: this script never builds Windows.
++SKIP_WIN=1 iroh_probe
++build_iroh
++"$ROOT/vendor/nelua-lang/nelua" --cc "$CC" -P nogc --cflags="-I\"$ROOT/compat\"$(iroh_host_ldflags)" --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
+diff --git a/tools/build-common.sh b/tools/build-common.sh
+index 4f58ebf..3a07d05 100755
+--- a/tools/build-common.sh
++++ b/tools/build-common.sh
+@@ -21,3 +21,81 @@ build_nelua() {
+     echo 'Nelua build did not produce nelua-lua.' >&2; return 1;
+   }
+ }
++
++# --- crates/ghostty-iroh (docs/IROH.md) --------------------------------------
++# An optional Rust staticlib, off by default. IROH=1 turns it on. Without that,
++# without the crate, or without cargo, every function below is a no-op and the
++# build is the build it was before -- the crate is not a dependency until it
++# works. Nothing here has been built or run; see docs/iroh-build-wiring.md.
++IROH_CRATE_DIR="${IROH_CRATE_DIR:-$ROOT/crates/ghostty-iroh}"
++IROH_WIN_TARGET="${RUST_WINDOWS_TARGET:-x86_64-pc-windows-gnu}"
++# Windows system libraries the crate's objects need, named AFTER -lghostty_iroh
++# because the MinGW link is single pass (docs/IROH.md, "The two risks").
++IROH_WIN_SYSLIBS="-lws2_32 -lbcrypt -lntdll -luserenv -ladvapi32 -liphlpapi -lsecur32 -lcrypt32"
++# Resolved by iroh_probe; empty means "no iroh in this build".
++IROH_HOST_LIBDIR=""
++IROH_WIN_LIBDIR=""
++
++# Decide once whether this build has iroh, and say why when it does not.
++iroh_probe() {
++  IROH_HOST_LIBDIR=""; IROH_WIN_LIBDIR=""
++  [[ "${IROH:-0}" == 1 ]] || return 0
++  if [[ ! -f "$IROH_CRATE_DIR/Cargo.toml" ]]; then
++    echo "IROH=1 but $IROH_CRATE_DIR/Cargo.toml is missing: building without iroh" >&2
++    return 0
++  fi
++  if ! command -v "${CARGO:-cargo}" >/dev/null; then
++    echo "IROH=1 but cargo is not on PATH: building without iroh (tools/build-container.sh update installs it)" >&2
++    return 0
++  fi
++  IROH_HOST_LIBDIR="$ROOT/build/lib"
++  [[ "${SKIP_WIN:-0}" == 1 ]] || IROH_WIN_LIBDIR="$ROOT/build/win/lib"
++  return 0
++}
++
++# Linker flags to splice into a Nelua --cflags string. Both print nothing at all
++# when iroh is off, so an unconditional "$(iroh_host_ldflags)" is the no-op it
++# looks like.
++iroh_host_ldflags() {
++  [[ -n "$IROH_HOST_LIBDIR" ]] && printf ' -L"%s" -lghostty_iroh -lpthread -ldl -lm' "$IROH_HOST_LIBDIR"
++  return 0
++}
++iroh_win_ldflags() {
++  [[ -n "$IROH_WIN_LIBDIR" ]] && printf ' -L"%s" -lghostty_iroh %s' "$IROH_WIN_LIBDIR" "$IROH_WIN_SYSLIBS"
++  return 0
++}
++
++# Build the staticlib for whichever targets iroh_probe enabled. Offline and
++# --locked: the dependency tree comes from vendor/cargo (tools/fetch-vendor.sh),
++# so this step never reaches crates.io, like every other dependency here.
++build_iroh() {
++  [[ -n "$IROH_HOST_LIBDIR" || -n "$IROH_WIN_LIBDIR" ]] || return 0
++  local cargo="${CARGO:-cargo}"
++  local flags=(--locked --release --manifest-path "$IROH_CRATE_DIR/Cargo.toml")
++  # A fixed absolute target dir: it is part of every sccache key, so the build
++  # container sets CARGO_TARGET_DIR in its profile and this keeps it.
++  export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/build/cargo}"
++  if [[ -f "$ROOT/vendor/cargo/config.toml" ]]; then
++    export CARGO_HOME="$ROOT/vendor/cargo"
++    flags+=(--offline)
++  else
++    echo "warning: vendor/cargo is missing (tools/fetch-vendor.sh); cargo will resolve online" >&2
++  fi
++  mkdir -p "$CARGO_TARGET_DIR"
++  if [[ -n "$IROH_HOST_LIBDIR" ]]; then
++    echo '== ghostty-iroh (host)'
++    "$cargo" build "${flags[@]}"
++    mkdir -p "$IROH_HOST_LIBDIR"
++    cp "$CARGO_TARGET_DIR/release/libghostty_iroh.a" "$IROH_HOST_LIBDIR/"
++  fi
++  if [[ -n "$IROH_WIN_LIBDIR" ]]; then
++    echo "== ghostty-iroh ($IROH_WIN_TARGET)"
++    # One toolchain across the Windows link: cargo compiles, tools/zig-cc-win.sh
++    # links, so the mingw-w64 in the archive is the one every other Windows
++    # object here was built against. Untested (docs/IROH.md, "The two risks").
++    CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$BUILD_COMMON_DIR/zig-cc-win.sh" \
++      "$cargo" build "${flags[@]}" --target "$IROH_WIN_TARGET"
++    mkdir -p "$IROH_WIN_LIBDIR"
++    cp "$CARGO_TARGET_DIR/$IROH_WIN_TARGET/release/libghostty_iroh.a" "$IROH_WIN_LIBDIR/"
++  fi
++}
+diff --git a/tools/build-container.sh b/tools/build-container.sh
+index 4c0e91d..8314e0e 100755
+--- a/tools/build-container.sh
++++ b/tools/build-container.sh
+@@ -141,7 +141,9 @@ start_if_stopped() {
+ # bare name and warn, so a fresh create never dead-ends.
+ install_pinned() {
+   local missing=() nevr name
+-  for nevr in $BUILD_PKGS_PINNED; do
++  # RUST_PKGS_PINNED is optional (docs/IROH.md): empty in a toolchain.env that
++  # does not pin Rust, and the loop then behaves exactly as it did.
++  for nevr in $BUILD_PKGS_PINNED ${RUST_PKGS_PINNED:-}; do
+     name="${nevr%%-[0-9]*}"
+     if inside rpm -q --quiet "$nevr" 2>/dev/null; then continue; fi
+     missing+=("$nevr")
+@@ -194,6 +196,7 @@ cmd_update() {
+     "$BUILD_CONTAINER_CACHE/ghostty-vt-windows" "$BUILD_CONTAINER_CACHE/lua-linux" \
+     "$BUILD_CONTAINER_CACHE/lua-win" "$BUILD_CONTAINER_CACHE/nuget" \
+     "$BUILD_CONTAINER_CACHE/ci" "$BUILD_CONTAINER_CACHE/vendor" \
++    "$BUILD_CONTAINER_CACHE/cargo-target" \
+     "$BUILD_CONTAINER_DIR"
+ 
+   write_profile
+@@ -220,6 +223,13 @@ export CI_CACHE_DIR=\$CACHE/ci
+ export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
+ # sccache: local disk cache on the shared Incus volume by default; a
+ # SCCACHE_BUCKET/SCCACHE_WEBDAV_ENDPOINT in BUILD_CACHE_ENV overrides it.
++# cargo (crates/ghostty-iroh, docs/IROH.md): a fixed absolute target dir on the
++# shared volume, for the same reason everything else has one -- absolute paths
++# are part of every sccache key. RUSTC_WRAPPER only matters once the crate
++# exists; it is harmless before then.
++export CARGO_TARGET_DIR=\$CACHE/cargo-target
++export RUSTC_WRAPPER=sccache
++export CARGO_NET_OFFLINE=true
+ export SCCACHE_DIR=\$CACHE/sccache
+ export SCCACHE_CACHE_SIZE=\${SCCACHE_CACHE_SIZE:-20G}
+ export SCCACHE_IDLE_TIMEOUT=0
+@@ -239,6 +249,8 @@ cmd_status() {
+     echo "dotnet:   $(dotnet --version 2>/dev/null || echo MISSING) sdk=$(dotnet --list-sdks 2>/dev/null | tr "\n" " ")"
+     echo "gcc:      $(gcc -dumpfullversion 2>/dev/null || echo MISSING)"
+     echo "sccache:  $(sccache --version 2>/dev/null || echo MISSING)"
++    echo "cargo:    $(cargo --version 2>/dev/null || echo MISSING) rustc=$(rustc --version 2>/dev/null || echo MISSING)"
++    echo "rust-std: $(rpm -q rust-std-static-x86_64-pc-windows-gnu 2>/dev/null || echo MISSING)"
+     echo "wayland:  $(rpm -q wlroots libwayland-server libxkbcommon pixman 2>&1 | tr "\n" " ")"
+     echo "libwlroots-0.20.so: $(ls -l /usr/lib64/libwlroots-0.20.so 2>&1 | head -1)"
+     echo "cache:    $(du -sh $CACHE 2>/dev/null | cut -f1) at $CACHE"
+diff --git a/tools/build.sh b/tools/build.sh
+index 008092b..c038fc8 100755
+--- a/tools/build.sh
++++ b/tools/build.sh
+@@ -29,7 +29,10 @@
+ # build/dist/GhosttyDalamud), SKIP_UMBRA=1 (no widget), SKIP_WIN=1 (no
+ # Windows core, loader or agent), SKIP_DEPS=1 (reuse the Nelua,
+ # libghostty-vt and Lua builds already in build/), MAC=1 (also cross-compile
+-# ghostty-agent for macOS arm64 and x86_64; untested on a Mac).
++# ghostty-agent for macOS arm64 and x86_64; untested on a Mac),
++# IROH=1 (also build and link the optional Rust staticlib crates/ghostty-iroh;
++# off by default, and a checkout without that crate is unaffected either way --
++# docs/IROH.md, docs/iroh-build-wiring.md).
+ set -euo pipefail
+ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ source "$ROOT/toolchain.env"
+@@ -53,6 +56,9 @@ DOTNET="${DOTNET:-dotnet}"
+ NELUA="$ROOT/vendor/nelua-lang/nelua"
+ export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig-global}"
+ mkdir -p build/dist build/win/lib build/win/cache build/lua-win build/lua-linux build/nelua-cache
++# Optional Rust transport staticlib. Leaves every variable below empty, and so
++# every flag it contributes empty, unless IROH=1 and the crate is present.
++iroh_probe
+ 
+ # GHOSTTY_SCCACHE=1 (the Incus build container, docs/BUILDING.md) routes every
+ # plain -c compile through the shared sccache: tools/zig-cc*.sh re-exec
+@@ -88,6 +94,8 @@ if [[ "${SKIP_DEPS:-0}" != 1 ]]; then
+         case $b in lua|luac) continue;; esac; "$ROOT/tools/zig-cc-win.sh" -O2 -c "$f" -o "$b.o"; done
+       "$ZIG" ar rcs liblua.a ./*.o )
+   fi
++  # No-op unless iroh_probe enabled it; respects SKIP_WIN the same way.
++  build_iroh
+ fi
+ 
+ # Build stamp: which commit this core is, and which build (docs/CI.md, "In-game tests")
+@@ -112,7 +120,10 @@ echo "== ghostty-agent (host)"
+ # shellcheck source=tools/wayland-flags.sh
+ source "$ROOT/tools/wayland-flags.sh" # the Wayland compositor backend when its SDK is there
+ [[ ${#WAYLAND_NELUA[@]} -gt 0 ]] && echo "with the Wayland compositor (wlroots 0.20)"
+-"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${WAYLAND_NELUA[@]}" --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
++# This link passes no --cflags when iroh is off, exactly as it did before.
++IROH_NELUA_HOST=()
++[[ -n "$(iroh_host_ldflags)" ]] && IROH_NELUA_HOST=(--cflags="$(iroh_host_ldflags)")
++"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${WAYLAND_NELUA[@]}" "${IROH_NELUA_HOST[@]}" --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
+ mkdir -p build/dist/lua && cp lua/*.lua build/dist/lua/
+ mkdir -p build/dist/themes && cp themes/*.theme build/dist/themes/
+ 
+@@ -120,15 +131,15 @@ if [[ "${SKIP_WIN:-0}" != 1 ]]; then
+   echo "== ghostty_core.dll (windows x64)"
+   rm -f build/dist/ghostty_umbra.dll build/dist/ghostty_umbra.pdb # the name before the standalone plugin
+   ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc -P noentrypoint -P "writestderr='hooked'" -P "abort='hooked'" "${STAMP[@]}" \
+-    --cflags="-O2 $INC -L\"$ROOT/build/win/lib\" -L\"$ROOT/build/lua-win\"" \
++    --cflags="-O2 $INC -L\"$ROOT/build/win/lib\" -L\"$ROOT/build/lua-win\"$(iroh_win_ldflags)" \
+     --cache-dir build/win/cache -L . -H -o build/dist/ghostty_core.dll core/host.nelua
+   printf '{"commit":"%s","build_id":"%s"}\n' "$BUILD_COMMIT" "$BUILD_ID" >build/dist/build-info.json
+   echo "== ghostty_loader.dll (windows x64)"
+   ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc -P noentrypoint -P "writestderr='hooked'" -P "abort='hooked'" \
+-    --cflags="-O2 $INC -L\"$ROOT/build/win/lib\" -L\"$ROOT/build/lua-win\"" \
++    --cflags="-O2 $INC -L\"$ROOT/build/win/lib\" -L\"$ROOT/build/lua-win\"$(iroh_win_ldflags)" \
+     --cache-dir build/win/cache -L . -H -o build/dist/ghostty_loader.dll core/loader.nelua
+   echo "== ghostty-agent.exe (windows x64)"
+-  ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc --cflags="-O2" \
++  ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc --cflags="-O2$(iroh_win_ldflags)" \
+     --cache-dir build/win/cache-agent -L . -o build/dist/ghostty-agent.exe agent/agent.nelua
+ fi
+ 
+diff --git a/tools/fetch-vendor.sh b/tools/fetch-vendor.sh
+index 8ab5569..797d9c9 100755
+--- a/tools/fetch-vendor.sh
++++ b/tools/fetch-vendor.sh
+@@ -42,6 +42,31 @@ if [[ ! -f "$V/stb/stb_truetype.h" ]] || ! echo "$STB_TRUETYPE_SHA256  $V/stb/st
+ fi
+ echo "stb_truetype $(grep -m1 -o 'v[0-9.]*' "$V/stb/stb_truetype.h")"
+ 
++# The cargo vendor tree for crates/ghostty-iroh (docs/IROH.md). Optional: a
++# toolchain.env with no CARGO_VENDOR_URL, or a checkout with no crate, skips it
++# and nothing else changes. vendor/cargo doubles as CARGO_HOME, so the
++# replace-with stanza below is the one cargo config the build needs.
++if [[ -n "${CARGO_VENDOR_URL:-}" ]]; then
++  if [[ ! -f "$V/cargo/.pinned" || "$(cat "$V/cargo/.pinned")" != "$CARGO_VENDOR_SHA256" ]]; then
++    tmp="$(mktemp -d)"
++    curl -fsSL "$CARGO_VENDOR_URL" -o "$tmp/cargo-vendor.tar.gz"
++    echo "$CARGO_VENDOR_SHA256  $tmp/cargo-vendor.tar.gz" | sha256sum -c -
++    rm -rf "$V/cargo"
++    mkdir -p "$V/cargo/registry-vendor"
++    tar -xzf "$tmp/cargo-vendor.tar.gz" -C "$V/cargo/registry-vendor" --strip-components=1
++    cat >"$V/cargo/config.toml" <<CARGOEOF
++[source.crates-io]
++replace-with = "vendored-sources"
++
++[source.vendored-sources]
++directory = "$V/cargo/registry-vendor"
++CARGOEOF
++    printf '%s' "$CARGO_VENDOR_SHA256" > "$V/cargo/.pinned"
++    rm -rf "$tmp"
++  fi
++  echo "cargo vendor ${IROH_VERSION:-unpinned} (${CARGO_VENDOR_SHA256:0:12})"
++fi
++
+ # Wayland SDK headers (Linux only; SKIP_WAYLAND=1 to skip). Needs rpm2cpio and
+ # cpio. Without it the agent builds with no Wayland compositor backend.
+ if [[ "$(uname -s)" == Linux && "${SKIP_WAYLAND:-0}" != 1 && ! -f "$V/wayland-sdk/.pinned" ]] ||
