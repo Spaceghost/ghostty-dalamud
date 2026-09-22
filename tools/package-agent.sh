@@ -69,7 +69,7 @@ while IFS= read -r -d '' f; do
   cp -p "$f" "$DST/$f"
 done < <(git ls-files -z -- agent core compat \
   tools/build-agent.sh tools/build-common.sh tools/wayland-flags.sh tools/zig-cc.sh \
-  packaging/ghostty-agent.service packaging/README-agent.md)
+  packaging/ghostty-agent.service packaging/README-agent.md packaging/ghostty-agent.1)
 
 # git archive emits tracked files only, so a host-built nelua-lua never travels:
 # `make` would then say "up to date" and the foreign-libc interpreter would fail
