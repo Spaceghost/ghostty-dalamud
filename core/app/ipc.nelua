@@ -352,6 +352,36 @@ end
 
 -- World panels (terminals and windows) ----------------------------------------------------
 
+-- ghostty.raycast(ox, oy, oz, dx, dy, dz, max) -> distance, hx, hy, hz
+-- The game's own collision (WorldRaycast) along a direction that need not be
+-- normalised: the distance to the first hit within `max` yalms and where it
+-- is, or nil when nothing is hit (and when the shim is too old to have it).
+-- Rays are not free: the callers budget them per frame, as core/app/rain.nelua
+-- does. Used by lua/world.lua so a panel stops at a wall instead of passing
+-- through it.
+local function l_raycast(L: *lua_State): cint
+  if host.api.raycast == nilptr then lua_pushnil(L) return 1 end
+  local n: [7]float32
+  for i = 1, 7 do
+    local isnum: cint = 0
+    local v = lua_tonumberx(L, (@cint)(i), &isnum)
+    if isnum == 0 then lua_pushnil(L) return 1 end
+    n[i - 1] = (@float32)(v)
+  end
+  local ox, oy, oz = n[0], n[1], n[2]
+  local dx, dy, dz = n[3], n[4], n[5]
+  local max = n[6]
+  local len = math.sqrt(dx * dx + dy * dy + dz * dz)
+  if len < 1e-6 or max <= 0 then lua_pushnil(L) return 1 end
+  dx, dy, dz = dx / len, dy / len, dz / len
+  local hx: float32, hy: float32, hz: float32 = 0, 0, 0
+  if host.api.raycast(ox, oy, oz, dx, dy, dz, max, &hx, &hy, &hz) == 0 then lua_pushnil(L) return 1 end
+  local ddx, ddy, ddz = hx - ox, hy - oy, hz - oz
+  lua_pushnumber(L, math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz))
+  lua_pushnumber(L, hx) lua_pushnumber(L, hy) lua_pushnumber(L, hz)
+  return 4
+end
+
 -- ghostty.world_panels() -> { {id, window, focused}, ... } in host.world order,
 -- without panels already glitching out
 local function l_world_panels(L: *lua_State): cint
@@ -681,6 +711,7 @@ global function ipc_lua_register(L: *lua_State): void
   lua_pushcclosure(L, l_agent_status, 0) lua_setfield(L, -2, 'agent_status')
   lua_pushcclosure(L, l_status, 0) lua_setfield(L, -2, 'status')
   lua_pushcclosure(L, l_world_panels, 0) lua_setfield(L, -2, 'world_panels')
+  lua_pushcclosure(L, l_raycast, 0) lua_setfield(L, -2, 'raycast')
   lua_pushcclosure(L, l_panel_focus, 0) lua_setfield(L, -2, 'panel_focus')
   lua_pushcclosure(L, l_panel_hide, 0) lua_setfield(L, -2, 'panel_hide')
   lua_pushcclosure(L, l_panel_toggle_pet, 0) lua_setfield(L, -2, 'panel_toggle_pet')
