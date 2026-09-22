@@ -799,19 +799,34 @@ end
 
 -- Agents ----------------------------------------------------------------------------
 
--- The agent a request goes to. Only the CONFIG.agent connection streams
--- windows so far: '' or 'default' names it.
+-- agent_for returns a borrowed message; this keeps the one it builds alive
+-- until the next call, so the caller may print it without owning it.
+local last_agent_error: string
+
+-- The agent a request goes to: '' or 'default' or 'local' is the CONFIG.agent
+-- connection, any other name is a CONFIG.agents link. A call's own @name wins
+-- over CONFIG.windows.agent (docs/MULTI_AGENT.md).
 local function agent_for(name: string): (*AgentClient, string)
-  if #name > 0 and name ~= 'default' then
-    return nilptr, 'only the CONFIG.agent connection streams windows so far'
+  local want: string = name
+  if #want == 0 then want = policy.windows.agent end
+  local link: *AgentLink = nilptr
+  if #want == 0 or want == 'default' or want == 'local' then
+    link = &host.local_agent
+  else
+    link = agent_by_name(want)
+    if link == nilptr then
+      local sb: stringbuilder
+      sb:write('no agent named "', want, '": add it to CONFIG.agents')
+      local msg = sb:promote()
+      last_agent_error:destroy()
+      last_agent_error = msg
+      return nilptr, last_agent_error
+    end
   end
-  if #policy.windows.agent > 0 and policy.windows.agent ~= 'default' then
-    return nilptr, 'CONFIG.windows.agent: only the CONFIG.agent connection streams windows so far'
-  end
-  if not host.local_agent.enabled or not host.local_agent.client:ready() then return nilptr, 'the agent is not connected' end
-  if not host.local_agent.client:windows_ok() then return nilptr, AGENT_WINDOWS_TOO_OLD end
+  if not link.enabled or not link.client:ready() then return nilptr, 'the agent is not connected' end
+  if not link.client:windows_ok() then return nilptr, AGENT_WINDOWS_TOO_OLD end
   agent_window_event = remotewin_event
-  return &host.local_agent.client, ''
+  return &link.client, ''
 end
 
 -- A trailing "@name" picks the agent; the rest is the command's own text.
@@ -2025,6 +2040,8 @@ global function remotewin_shutdown(): void
     free_stream(streams[i])
   end
   streams:destroy()
+  last_agent_error:destroy()
+  last_agent_error = (@string){}
   restore_done = false
   loud_lists = 0
   watching, watch_baseline, auto_dirty, auto_wait = false, false, false, false
