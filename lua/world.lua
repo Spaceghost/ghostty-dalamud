@@ -1174,6 +1174,10 @@ spread = function(t, p)
   if not boxes then boxes = {} M._sp_boxes = boxes end
   local n = 0
 
+  -- the one you are looking at never gives ground: it is the pet in question,
+  -- the row is laid out around it, and moving it would move the row with it
+  local keep = focus.cur or focus.prev
+
   for i, id in ipairs(ids) do
     local a = M.anchors[id]
     if a and a.kind == 'pet' and a.lu_t ~= t then
@@ -1214,8 +1218,12 @@ spread = function(t, p)
       end
 
       local off, lift = a.sp or 0, a.sp_y or 0
+      if id == keep then off, lift = 0, 0 end
       local worst = worst_at(off, lift)
-      if worst > (cfg.overlap or 0.12) then
+      if id == keep then
+        -- nothing to decide: its box still goes in, so the others keep off it
+        worst = 0
+      elseif worst > (cfg.overlap or 0.12) then
         -- Rising first, and as little as will do: a tier up is the move that
         -- survives everything downstream, and it reads as a shelf rather than
         -- as a pet wandering off. Sideways is tried too, but it is second and
