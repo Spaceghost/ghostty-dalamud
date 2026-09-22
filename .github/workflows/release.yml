@@ -79,6 +79,15 @@ jobs:
           TESTING: ${{ contains(github.ref_name, '-') && '1' || '0' }}
         run: tools/ci/run.sh all
 
+      - name: Build the Linux agent packages in a Fedora 44 container
+        env:
+          IN_FEDORA_PKGS: 'gcc make git rpm-build systemd-rpm-macros pkgconf-pkg-config wlroots-devel wayland-devel wayland-protocols-devel libxkbcommon-devel pixman-devel tar gzip cpio diffutils findutils which'
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
+          HOST_UID=$(id -u) HOST_GID=$(id -g) \
+          tools/ci/in-fedora.sh tools/ci/agent-rpm.sh --out build/release
+
       - name: Check the release files, and write SHA256SUMS
         env:
           TAG: ${{ github.ref_name }}
@@ -87,6 +96,13 @@ jobs:
           cd build/release
           for f in latest.zip ${{ contains(github.ref_name, '-') && 'pluginmaster-testing.json' || 'pluginmaster.json' }}; do
             [[ -s "$f" ]] || { echo "::error::build/release/$f is missing"; exit 1; }
+          done
+          for g in 'ghostty-agent-*-src.tar.gz' 'ghostty-agent-src.tar.gz' \
+                   'ghostty-agent-*-linux-x86_64.tar.gz' 'ghostty-agent-linux-x86_64.tar.gz' \
+                   'ghostty-agent-*-windows-x64.zip' \
+                   'ghostty-agent-*-1.fc44.x86_64.rpm' 'ghostty-agent.fc44.x86_64.rpm' \
+                   'ghostty-agent-*-1.fc43.x86_64.rpm' 'ghostty-agent.fc43.x86_64.rpm'; do
+            compgen -G "$g" >/dev/null || { echo "::error::build/release/$g is missing"; exit 1; }
           done
           python3 -c 'import json,sys; json.load(open(sys.argv[1]))' pluginmaster*.json
           rm -f SHA256SUMS
