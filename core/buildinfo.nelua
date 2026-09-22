@@ -10,13 +10,13 @@
 ## end
 ## BUILDINFO_COMMIT = stamp(pragmas.build_commit, 'unknown')
 ## BUILDINFO_ID = stamp(pragmas.build_id, 'unstamped')
-## BUILDINFO_VERSION = 'ghostty-dalamud 0.3.0'
+## BUILDINFO_VERSION = 'ghostty-dalamud 0.3.1'
 
 global BUILD_COMMIT: string <comptime> = #[BUILDINFO_COMMIT]#
 global BUILD_ID: string <comptime> = #[BUILDINFO_ID]#
 global BUILD_VERSION: string <comptime> = #[BUILDINFO_VERSION]#
 
--- gu_version's text: 'ghostty-dalamud 0.3.0 (<commit>, build <id>)'; the
+-- gu_version's text: 'ghostty-dalamud 0.3.1 (<commit>, build <id>)'; the
 -- loader logs it for every core it loads.
 global function build_version_cstr(): cstring
   return #[BUILDINFO_VERSION .. ' (' .. BUILDINFO_COMMIT .. ', build ' .. BUILDINFO_ID .. ')']#
