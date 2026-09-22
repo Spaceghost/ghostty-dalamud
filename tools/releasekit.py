@@ -223,6 +223,26 @@ def notes(c: dict[str, str], v: Version, assets: Path | None, rel: dict | None =
     else:
         out.append(f"2. Open `/xlplugins`, search for **{name}** and install it. Dalamud updates it from then on.")
     out.append(f"\nStep by step, with pictures: <{LISTING_PAGE}>\n")
+    have = {a.name for a in assets.iterdir()} if assets and assets.is_dir() else set()
+    if have & {"ghostty-agent.fc44.x86_64.rpm", "ghostty-agent-linux-x86_64.tar.gz"}:
+        version = manifest_version(c)
+        out.append("\n**The agent.** The plugin talks to `ghostty-agent` on the machine whose shells "
+                   "you want. It is the one piece you fetch yourself.\n")
+        if "ghostty-agent.fc44.x86_64.rpm" in have:
+            out.append("Fedora 44 or newer, with remote desktop windows:\n")
+            out.append("```sh\n"
+                       f"sudo dnf install https://github.com/{repo}/releases/download/{v.tag}/ghostty-agent.fc44.x86_64.rpm\n"
+                       "systemctl --user enable --now ghostty-agent\n```\n")
+        if "ghostty-agent.fc43.x86_64.rpm" in have:
+            out.append("* Fedora 43, and any other rpm distribution with glibc 2.36 or newer: the same with "
+                       "`ghostty-agent.fc43.x86_64.rpm` \u2014 terminals, jobs and clips, no compositor.")
+        if "ghostty-agent-linux-x86_64.tar.gz" in have:
+            out.append(f"* Any other Linux: `ghostty-agent-{version}-linux-x86_64.tar.gz`, or build a package of "
+                       f"your own from `ghostty-agent-{version}-src.tar.gz` with `rpmbuild -tb`.")
+        if f"ghostty-agent-{version}-windows-x64.zip" in have:
+            out.append(f"* Windows: `ghostty-agent-{version}-windows-x64.zip`.")
+        out.append("\nEach carries its own README. The repository's README, under \u201cLinux\u201d, has the rest.\n")
+
     sums = assets / "SHA256SUMS" if assets else None
     if sums and sums.is_file():
         out.append("## Checksums\n")
@@ -307,7 +327,12 @@ def verify(c: dict[str, str], v: Version, version4: str | None, wait: bool = Tru
     entry = json.loads(fetch(base_url + listing_name))[0]
     version4 = version4 or entry["AssemblyVersion"]
     have = {a["name"] for a in info["assets"]}
-    want = {"latest.zip", f"{internal}-{version4}.zip", listing_name, "SHA256SUMS"}
+    want = {"latest.zip", f"{internal}-{version4}.zip", listing_name, "SHA256SUMS",
+            f"ghostty-agent-{version4}-windows-x64.zip",
+            f"ghostty-agent-{version4}-src.tar.gz", "ghostty-agent-src.tar.gz",
+            f"ghostty-agent-{version4}-linux-x86_64.tar.gz", "ghostty-agent-linux-x86_64.tar.gz",
+            f"ghostty-agent-{version4}-1.fc44.x86_64.rpm", "ghostty-agent.fc44.x86_64.rpm",
+            f"ghostty-agent-{version4}-1.fc43.x86_64.rpm", "ghostty-agent.fc43.x86_64.rpm"}
     if want - have:
         raise Fail(f"release {v.tag} is missing " + ", ".join(sorted(want - have)))
     print(f"   release   {info['name']}: " + ", ".join(sorted(have)))

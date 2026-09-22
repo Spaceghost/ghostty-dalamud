@@ -132,7 +132,7 @@ and is not tested. None of it has been tried in game yet.
   closing; reattaching replays the recent raw output and libghostty rebuilds
   the screen, which is the same model Superlogical uses. This is the transport
   to use when the game runs under Wine/Proton on Linux, and on native Windows
-  with `ghostty-agent.exe` (see [Windows](#windows)).
+  with `ghostty-agent.exe` (see [Linux](#linux) and [Windows](#windows)).
 * **conpty** – a Windows pseudo console inside the game process (PowerShell,
   cmd, `ssh.exe`, …). Needs no agent, but its shells end when the game
   closes. On native Windows the default profiles fall back to it while no
@@ -276,7 +276,8 @@ Updates arrive like any other plugin's, and ticking **testing** on its entry opt
 into test builds (and nothing else) ahead of a release. The page at
 <https://spacegho.st/mods/ffxiv/plugins/> explains it with a section per mod. It is a
 third-party repository: Dalamud will say nobody but the author reviewed these plugins,
-which is true. You still run the agent yourself (step 1 below).
+which is true. You still run the agent yourself — on Linux it is a package or a
+tarball ([Linux](#linux)), on Windows the `windows-x64` zip ([Windows](#windows)).
 
 **Or build it yourself** — the path the rest of this section describes, and the one the
 author develops on. Nothing here depends on the repository above.
@@ -311,6 +312,110 @@ author develops on. Nothing here depends on the repository above.
    **Ghostty** and tick load on boot. If Dalamud says the location does not
    exist and your home directory is reached through a symlink, try the path
    with the symlink resolved (`readlink -f`), or the other way round.
+
+## Linux
+
+Nothing a Linux player needs involves Zig, the .NET SDK or a checkout of this
+repository: the plugin installs from the repository above in one click, and the
+agent is the one file you fetch yourself.
+
+The packages below are built, installed and run inside a Fedora container on
+every push, and **nobody has yet installed one from a published release on their
+own machine**.
+
+### Get the agent
+
+* **Fedora 44 or newer.** This build carries the Wayland compositor that remote
+  desktop windows and the browser integration need.
+
+  ```sh
+  sudo dnf install https://github.com/Spaceghost/ghostty-dalamud/releases/latest/download/ghostty-agent.fc44.x86_64.rpm
+  systemctl --user enable --now ghostty-agent
+  ```
+
+  The package is unsigned, so dnf says it skipped the OpenPGP check and carries on.
+
+* **Fedora 43, and any other rpm distribution with glibc 2.36 or newer.** The
+  same, with `ghostty-agent.fc43.x86_64.rpm`. Fedora 43 ships wlroots 0.19 and
+  the compositor needs 0.20, so dnf refuses the Fedora 44 package there and
+  names the library it cannot provide. Terminals, jobs and clips work; remote
+  desktop windows are not in this build.
+
+* **Any other Linux.**
+
+  ```sh
+  tar -xzf ghostty-agent-<version>-linux-x86_64.tar.gz
+  cd ghostty-agent-<version>-linux-x86_64
+  install -Dm0755 ghostty-agent ~/.local/bin/ghostty-agent
+  ```
+
+Check what you downloaded against the release's own `SHA256SUMS`
+(`sha256sum -c SHA256SUMS`).
+
+| Asset | What |
+|---|---|
+| `ghostty-agent.fc44.x86_64.rpm` | Fedora 44 and newer, with the Wayland compositor |
+| `ghostty-agent.fc43.x86_64.rpm` | any rpm distribution with glibc 2.36+, no compositor |
+| `ghostty-agent-linux-x86_64.tar.gz` | the same binary as the `.fc43` package, its unit and its README |
+| `ghostty-agent-src.tar.gz` | the agent's own source; `rpmbuild -tb` builds a package from it offline |
+
+`BUILD-INFO.txt` inside the tarball names the machine it was built on, the
+glibc it needs and whether the compositor is in it.
+
+### Run the agent
+
+```sh
+ghostty-agent --listen 127.0.0.1:7777
+```
+
+The first start writes a token to `~/.config/ghostty-agent/token`, readable only
+by you; the plugin reads that same file, so there is nothing to configure when
+the game and the agent are on one machine. Other flags: `--token-file PATH`,
+`--clipboard-file PATH`, `--replay-bytes N`, `--term NAME`, `--windows NAME`.
+
+When the game is on another machine, forward the port and copy the token over:
+`ssh -L 7777:127.0.0.1:7777 …`. The token authenticates the connection but the
+stream is not encrypted, so keep it on loopback, in that tunnel, or on a private
+network. `journalctl --user -u ghostty-agent -f` is its log.
+
+### Start it with your session
+
+The package ships a systemd **user** unit:
+
+```sh
+systemctl --user enable --now ghostty-agent
+```
+
+From the tarball, install the unit it carries:
+
+```sh
+install -Dm0644 ghostty-agent.service ~/.config/systemd/user/ghostty-agent.service
+systemctl --user daemon-reload
+systemctl --user enable --now ghostty-agent
+```
+
+`loginctl enable-linger "$USER"` keeps your shells alive between logins.
+`systemctl --user import-environment WAYLAND_DISPLAY DISPLAY` hands the
+clipboard helpers your session when they cannot find it themselves.
+
+None of this needs root: the agent is a normal user process, and it is a user
+service on purpose. A system service has no session, and would quietly lose the
+clipboard and every remote window.
+
+### Build it yourself
+
+A C compiler, `make` and `git`. No Zig, no .NET SDK, no Dalamud reference
+assemblies, no `vendor/ghostty`.
+
+```sh
+tools/fetch-vendor.sh agent     # only what the agent needs
+tools/build-agent.sh            # build/dist/ghostty-agent
+```
+
+`tools/build-agent.sh --wayland` builds the compositor in on any host that has
+wlroots 0.20 headers, which is how you get remote desktop windows outside the
+Fedora 44 package. For a package of your own,
+`tools/package-agent.sh && rpmbuild -tb build/dist/ghostty-agent-<version>-src.tar.gz`.
 
 ## Windows
 
