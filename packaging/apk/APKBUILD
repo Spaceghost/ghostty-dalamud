@@ -54,6 +54,7 @@ package() {
 	install -Dm0644 packaging/README-agent.md \
 		"$pkgdir"/usr/share/doc/$pkgname/README-agent.md
 	install -Dm0644 LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
+	install -Dm0644 packaging/ghostty-agent.1 "$pkgdir"/usr/share/man/man1/ghostty-agent.1
 	# The systemd unit ships as documentation: it is what a systemd machine
 	# needs and what the tarball installs, and it is inert here.
 	install -Dm0644 packaging/ghostty-agent.service \

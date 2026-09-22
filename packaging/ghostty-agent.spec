@@ -25,7 +25,7 @@
 #
 # No %changelog section: the project's changelog is CHANGELOG.md, generated from
 # lua/changelog.lua, and a second one would be a second thing to bump. rpmlint's
-# no-changelogname-tag, no-manual-page-for-binary and empty-%postun are accepted
+# no-changelogname-tag and empty-%postun are accepted
 # for a package this pipeline builds rather than submits to Fedora.
 %if 0%{?fedora} >= 44
 %bcond_without wayland
@@ -120,6 +120,7 @@ readelf -d build/dist/ghostty-agent | grep -q 'libwlroots-0.20\.so'
 %install
 install -Dpm0755 build/dist/ghostty-agent %{buildroot}%{_bindir}/ghostty-agent
 install -Dpm0644 packaging/ghostty-agent.service %{buildroot}%{_userunitdir}/ghostty-agent.service
+install -Dpm0644 packaging/ghostty-agent.1 %{buildroot}%{_mandir}/man1/ghostty-agent.1
 
 %check
 # --help needs no network, no X and no game.
@@ -153,3 +154,4 @@ wait "$agent" || true
 %doc README-agent.md
 %{_bindir}/ghostty-agent
 %{_userunitdir}/ghostty-agent.service
+%{_mandir}/man1/ghostty-agent.1*
