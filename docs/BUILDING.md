@@ -259,6 +259,50 @@ library sonames have to match this machine. Both are Fedora 44 and the container
 pins the same wlroots, wayland, xkbcommon and pixman builds; after a build,
 `ldd build/dist/ghostty-agent` here is the check that it does.
 
+The same match is stated for other people's machines by
+`packaging/ghostty-agent.spec`: rpmbuild generates the package's `Requires` from
+the sonames of the binary it just linked, so nothing is claimed by hand, and dnf
+refuses the compositor build on a Fedora whose wlroots is older — naming the
+library it cannot provide instead of letting the binary die at exec.
+
+## Building only the agent
+
+A player who is not building the plugin needs a C compiler, `make` and `git`,
+and nothing else: no Zig, no .NET SDK, no Dalamud reference assemblies, no
+`vendor/ghostty`.
+
+```sh
+tools/fetch-vendor.sh agent     # the pinned Nelua compiler, and nothing more
+tools/build-agent.sh            # build/dist/ghostty-agent
+```
+
+It takes about ten seconds: nine to build the Nelua compiler, two to compile the
+agent. `--wayland` builds the compositor backend in, which needs wlroots 0.20
+headers — the pinned `vendor/wayland-sdk`, or the distribution's own `-devel`
+packages through `pkg-config`, whichever is there. `--no-wayland` leaves it out,
+`-o PATH` puts the binary somewhere else, and `CFLAGS`/`LDFLAGS` are appended
+last so a distribution's hardening flags reach the generated C.
+
+Packages are built from the agent's own source tarball, which carries the pinned
+Nelua compiler so the build needs no network:
+
+```sh
+tools/package-agent.sh                    # build/dist/ghostty-agent-<version>-src.tar.gz
+tools/ci/agent-rpm.sh --check             # both Fedora packages and the portable tarball
+tools/ci/agent-apk.sh --check             # the Alpine package
+```
+
+Each must run where its packaging tools are — `rpmbuild` on Fedora, `abuild` on
+Alpine — which is what `tools/ci/in-fedora.sh` is for on a runner. The release
+workflow builds the Fedora packages in a `registry.fedoraproject.org/fedora:44`
+container for exactly this reason: `ubuntu-latest` has no wlroots 0.20, and
+`%{_userunitdir}` does not exist outside Fedora.
+
+`tools/package-bundle.sh` packs the plugin together with an agent for people who
+would rather not install a package at all. The plugin repository never serves
+those: `latest.zip` stays free of the agent, which `tests/test_release.py`
+enforces as an unapproved payload.
+
 ## Observed
 
 On 2026-09-19, against a build host with 8 cores and 62 GB, container `ghostty-build`
