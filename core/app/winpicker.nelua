@@ -97,6 +97,42 @@ local function set_note(ok: boolean, what: string, err: string): void
 end
 
 -- One pick: a window by id (0: the desktop chooses), a match text, or a command to run.
+-- A row's agent, as the user may name it: the local one answers to both '' and
+-- 'local', since that is what the commands and CONFIG.agents accept.
+local function agent_is(row: string, want: string): boolean
+  if row == want then return true end
+  if #row == 0 and want == 'local' then return true end
+  if row == 'local' and #want == 0 then return true end
+  return false
+end
+
+-- Case-insensitive substring, for narrowing the list as you type.
+local function has_text(hay: string, needle: string): boolean
+  if #needle == 0 then return true end
+  if #needle > #hay then return false end
+  for i = 0, <= #hay - #needle do
+    local same = true
+    for k = 0, < #needle do
+      local a, b = hay.data[i + k], needle.data[k]
+      if a >= 'A'_b and a <= 'Z'_b then a = a + 32 end
+      if b >= 'A'_b and b <= 'Z'_b then b = b + 32 end
+      if a ~= b then same = false break end
+    end
+    if same then return true end
+  end
+  return false
+end
+
+-- What the Run: box says right now, split the way the commands split it: the
+-- text to match, and the machine to match it on. Typing narrows the list, so
+-- "foot @fedora" shows fedora's rows that mention foot.
+local function picker_query(): (string, string)
+  local n: usize = 0
+  while n < #run_buf and run_buf[n] ~= 0 do n = n + 1 end
+  local typed: string = { data = (@*[0]byte)(&run_buf[0]), size = n }
+  return window_split_agent(typed)
+end
+
 -- Which machine a row is on. The local agent is the common case and says
 -- nothing; anything else is named, so one list can hold several machines.
 local function picker_agent_tag(agent: string): void
@@ -189,6 +225,7 @@ global function draw_window_picker(): void
     end
 
     -- the agent's windows (and apps), scrolled when many
+    local q_text, q_agent = picker_query()
     local list_h = math.max(wsz.y - 190, 80)
     if imgui.BeginChild('##ghostty_picker_list', vec2(0, list_h), false, 0) then
       local shown = 0
@@ -196,6 +233,8 @@ global function draw_window_picker(): void
         local e = &winlist.windows[i]
         if e.wid == 0 then continue end -- "what WOPEN with wid 0 does": the button below
         if winlist_entry_never(e) then continue end -- CONFIG.windows.never
+        if #q_agent > 0 and not agent_is(e.agent, q_agent) then continue end
+        if #q_text > 0 and not (has_text(e.title, q_text) or has_text(e.app, q_text)) then continue end
         imgui.PushIDInt((@cint)(i))
         local size: [32]cchar
         C.snprintf((@cstring)(&size), #size, '  %dx%d', (@cint)(e.w), (@cint)(e.h))
@@ -232,6 +271,8 @@ global function draw_window_picker(): void
         for i = 0, < #winlist.apps do
           local a = &winlist.apps[i]
           if winlist_app_never(a) then continue end -- CONFIG.windows.never
+          if #q_agent > 0 and not agent_is(a.agent, q_agent) then continue end
+          if #q_text > 0 and not (has_text(a.name, q_text) or has_text(a.id, q_text)) then continue end
           imgui.PushIDInt((@cint)(10000 + i))
           draw_icon(a, imgui.GetFontSize() + 4, host.last_time)
           if imgui.Selectable(label(&buf, a.name, #a.categories > 0 and '   ' or '', a.categories), false, 0, vec2(0, 0)) then

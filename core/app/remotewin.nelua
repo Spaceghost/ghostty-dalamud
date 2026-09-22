@@ -858,7 +858,8 @@ local function agent_for(name: string): (*AgentClient, string)
 end
 
 -- A trailing "@name" picks the agent; the rest is the command's own text.
-local function split_agent(args: string): (string, string)
+-- Global so the picker can narrow its list the same way while you type.
+global function window_split_agent(args: string): (string, string)
   local rest: string = args
   local name: string
   local at = 0
@@ -1227,7 +1228,7 @@ end
 
 -- `/term window pull [match|#wid|run CMD...] [@agent]` arguments to window_open.
 global function remotewin_pull(args: string): (boolean, string)
-  local rest, name = split_agent(args)
+  local rest, name = window_split_agent(args)
   local spec: WindowOpenSpec = { agent = name }
   if #rest > 1 and rest.data[0] == '#'_b then
     local digits = rest:subview(2)
@@ -1296,7 +1297,7 @@ global function window_command(args: string): cint
   local sp = args:find(' ', 1, true)
   if sp > 0 then verb, rest = args:subview(1, sp - 1), args:subview(sp + 1) end
   if verb == 'run' then
-    local cmd, _ = split_agent(rest)
+    local cmd, _ = window_split_agent(rest)
     if #cmd == 0 then sayf(LOG_WARN, 'usage: /window run CMD... [@agent]') return 4 end
     local sb: stringbuilder
     sb:write('run ', rest)
@@ -1512,7 +1513,7 @@ end
 
 -- A CONFIG.windows.auto entry whose window a restored panel already shows.
 local function pulled_already(args: string): boolean
-  local rest, _ = split_agent(args)
+  local rest, _ = window_split_agent(args)
   local m: string = rest
   local owned: string
   if #rest > 4 and rest:subview(1, 4) == 'run ' then
