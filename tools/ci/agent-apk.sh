@@ -92,6 +92,17 @@ APK=$(find "$REPODEST" -name "ghostty-agent-$VERSION-r0.apk" | head -n1)
 [ -n "$APK" ] || die "abuild produced no ghostty-agent-$VERSION-r0.apk"
 cp "$APK" "$OUT/"
 cp "$APK" "$OUT/ghostty-agent.apk"
+# The man page and the READMEs live in the -doc subpackage, because abuild
+# refuses a man page in the program package. Ship it beside the main one so an
+# Alpine user can have `man ghostty-agent`; it is not required of a release, so
+# its absence can never hold one up.
+DOC=$(find "$REPODEST" -name "ghostty-agent-doc-$VERSION-r0.apk" | head -n1)
+if [ -n "$DOC" ]; then
+  cp "$DOC" "$OUT/"
+  cp "$DOC" "$OUT/ghostty-agent-doc.apk"
+else
+  log 'note: no -doc subpackage was built'
+fi
 
 log 'what the package claims'
 tar -tzf "$APK" 2>/dev/null | grep -q 'usr/bin/ghostty-agent' || die 'the package has no /usr/bin/ghostty-agent'
