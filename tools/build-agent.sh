@@ -9,4 +9,9 @@ source "$ROOT/tools/build-common.sh"
 [[ -d vendor/nelua-lang && -d vendor/ghostty ]] || { echo 'Fetch the pinned dependencies before building.' >&2; exit 1; }
 build_nelua
 mkdir -p build/dist build/nelua-cache
-"$ROOT/vendor/nelua-lang/nelua" --cc "$CC" -P nogc --cflags="-I\"$ROOT/compat\"" --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
+# Optional iroh staticlib (docs/IROH.md). iroh_probe leaves everything empty
+# unless IROH=1 and crates/ghostty-iroh exists, so the flags below are unchanged
+# in a checkout without the crate. Host only: this script never builds Windows.
+SKIP_WIN=1 iroh_probe
+build_iroh
+"$ROOT/vendor/nelua-lang/nelua" --cc "$CC" -P nogc --cflags="-I\"$ROOT/compat\"$(iroh_host_ldflags)" --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
