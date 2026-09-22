@@ -303,13 +303,24 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   host.world_covers:destroy()
   host.pending_open:destroy()
   bell_reset()
-  host.agent:destroy()
+  host.local_agent.client:destroy()
   net.shutdown()
   -- ghostty_loader unloads this module and starts a fresh copy: free the Lua
   -- state and every string, and leave no pointers for the next start.
   policy_unload()
   host.world_diag:destroy()
-  host.agent_error_shown:destroy()
+  host.local_agent.error_shown:destroy()
+  -- every link but the local one, whose client was destroyed above. The local
+  -- link is static storage and stays; clearing the vector makes the next start
+  -- push it again (core/app/state.nelua agent_local).
+  for i = 1, < #host.agents do
+    local link = host.agents[i]
+    link.client:destroy()
+    link.error_shown:destroy()
+    link.name:destroy()
+    delete(link)
+  end
+  host.agents:clear()
   host.bell_demo_label:destroy()
   host.showcase_ids:destroy()
   host.showcase_hidden:destroy()

@@ -378,7 +378,7 @@ end
 -- Setup ------------------------------------------------------------------------------------------
 os.remove(dir .. '/adopted.lua')
 assert(gu_init(&api, (@cstring)(dir.data)) == 0, 'init')
-host.agent_last_try = 1e9 -- never dial out
+host.local_agent.last_try = 1e9 -- never dial out
 assert(imgui_bind(resolver, nilptr) > 0)
 assert(luaL_loadstring(policy.L, "CONFIG.world.occlusion = 'off'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
 policy_refresh()

@@ -217,11 +217,11 @@ local function fake_connect(greeting: string): void
   fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK)
   fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL, 0) | O_NONBLOCK)
   if peer >= 0 then close(peer) end
-  net.close(host.agent.sock)
-  host.agent.sock = fds[0]
-  host.agent.inq:destroy()
-  host.agent.outq:destroy()
-  host.agent.state = AgentState.Handshake
+  net.close(host.local_agent.client.sock)
+  host.local_agent.client.sock = fds[0]
+  host.local_agent.client.inq:destroy()
+  host.local_agent.client.outq:destroy()
+  host.local_agent.client.state = AgentState.Handshake
   peer = fds[1]
   peer_q:destroy()
   local q: ByteQueue
@@ -245,7 +245,7 @@ end
 
 -- Read what the client sent; each frame's payload kept.
 local function peer_collect(): void
-  host.agent:flush()
+  host.local_agent.client:flush()
   local buf: [65536]uint8
   while true do
     local n = read(peer, &buf, 65536)
@@ -382,7 +382,7 @@ end
 
 -- Setup --------------------------------------------------------------------------------------
 assert(gu_init(&api, (@cstring)(dir.data)) == 0, 'init')
-host.agent_last_try = 1e9 -- never dial out
+host.local_agent.last_try = 1e9 -- never dial out
 assert(imgui_bind(resolver, nilptr) > 0 and imgui.DrawListAddImage ~= nilptr)
 assert(luaL_loadstring(policy.L, "CONFIG.world.occlusion = 'off'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
 policy_refresh()
@@ -394,26 +394,26 @@ io_state.InputQueueCharacters = { Size = 0, Capacity = #chars, Data = (@*[0]uint
 do
   fake_connect('ghostty-agent 2 5')
   pump()
-  assert(host.agent:ready() and host.agent.version == 2)
+  assert(host.local_agent.client:ready() and host.local_agent.client.version == 2)
   forget()
   assert(remotewin_command('pull Firefox') == 4, 'refused')
   assert(logged('agent too old for windows: update ghostty-agent') >= 1, 'says why')
   assert(#host.sessions == 0 and #host.world == 0, 'no panel')
-  assert(not host.agent:wopen(1, 0, 100, 100, 30, 'x') and not host.agent:wlist(), 'the client refuses too')
-  host.agent:flush()
+  assert(not host.local_agent.client:wopen(1, 0, 100, 100, 30, 'x') and not host.local_agent.client:wlist(), 'the client refuses too')
+  host.local_agent.client:flush()
   assert(count(PROTO_WOPEN) == 0 and count(PROTO_WLIST) == 0, 'nothing sent to an old agent')
   print('version 2 refused OK')
 end
 
 fake_connect('ghostty-agent 3 42')
 pump()
-assert(host.agent:windows_ok())
+assert(host.local_agent.client:windows_ok())
 forget()
 
 -- List -----------------------------------------------------------------------------------------
 do
   assert(remotewin_command('list') == 0)
-  host.agent:flush()
+  host.local_agent.client:flush()
   assert(count(PROTO_WLIST) == 2 and host.window_picker_open, 'list: the picker, a fresh window list and the app list')
   host.window_picker_open = false
   assert(remotewin_command('pull') == 0 and host.window_picker_open, 'pull with nothing after it: the picker')
@@ -440,7 +440,7 @@ local SID: uint32 <comptime> = 9
 do
   forget()
   assert(remotewin_command('pull Firefox') == 0)
-  host.agent:flush()
+  host.local_agent.client:flush()
   local p = last(PROTO_WOPEN)
   assert(p ~= nilptr, 'WOPEN sent')
   req = proto.get_u32(p)
@@ -455,7 +455,7 @@ do
   -- `run CMD` asks the agent to start it
   forget()
   assert(remotewin_command('pull run foot -e htop') == 0)
-  host.agent:flush()
+  host.local_agent.client:flush()
   p = last(PROTO_WOPEN)
   local frame_len = frames[#frames - 1].data.size
   assert(string{data=(@*[0]byte)(&p[13]), size=frame_len - 13} == 'run:foot -e htop', 'run: prefix')
@@ -474,7 +474,7 @@ do
   peer_send(&q)
   q:destroy()
   pump()
-  host.agent:flush()
+  host.local_agent.client:flush()
   local c = last(PROTO_WCLOSE)
   assert(c ~= nilptr and proto.get_u32(c) == 55, 'an unwanted stream is closed')
   -- the one we keep: pinned in front of the player, keeping its size
@@ -509,7 +509,7 @@ do
   pump()
   assert(rw.w == W and rw.h == H and rw.frames == 1, 'KEY frame decoded')
   assert(memory.equals(&rw.pixels[0], &f1[0], W * H * 4), 'the CPU copy matches the window')
-  host.agent:flush()
+  host.local_agent.client:flush()
   local a = last(PROTO_WACK)
   assert(a ~= nilptr and proto.get_u32(a) == SID and proto.get_u32((@*[0]uint8)(&a[4])) == 1, 'WACK after END')
   local ok, pl = policy_world_place(s.id, now, false)
@@ -543,7 +543,7 @@ do
   send_frame(SID, 2, &f2, &f1)
   pump()
   assert(memory.equals(&rw.pixels[0], &f2[0], W * H * 4), 'delta applied')
-  host.agent:flush()
+  host.local_agent.client:flush()
   a = last(PROTO_WACK)
   assert(a ~= nilptr and proto.get_u32((@*[0]uint8)(&a[4])) == 2, 'WACK for seq 2')
   uploads:clear()
@@ -562,7 +562,7 @@ do
   pump()
   assert(count(PROTO_WACK) == 0, 'asleep: no WACK')
   world_frame(false) -- seen: wakes and acknowledges
-  host.agent:flush()
+  host.local_agent.client:flush()
   a = last(PROTO_WACK)
   assert(not s.sleeping and a ~= nilptr and proto.get_u32((@*[0]uint8)(&a[4])) == 3, 'woken: the held WACK goes out')
   print('window frames OK')
@@ -873,7 +873,7 @@ do
   assert(window_open(WindowOpenSpec{}) ~= 0) -- the desktop chooses
   local s3 = host.world[0]
   local rw3 = remotewin_of(s3)
-  host.agent:flush()
+  host.local_agent.client:flush()
   local p = last(PROTO_WOPEN)
   local ob: [12]uint8
   proto.put_u32(&ob, proto.get_u32(p))
@@ -886,13 +886,13 @@ do
   assert(rw3.state == RemoteWinState.Live)
   forget()
   close_terminal(s3)
-  host.agent:flush()
+  host.local_agent.client:flush()
   local c = last(PROTO_WCLOSE)
   assert(c ~= nilptr and proto.get_u32(c) == 21 and #host.sessions == 0, 'closing the panel closes the stream')
   assert(window_open(WindowOpenSpec{}) ~= 0)
   local s4 = host.world[0]
-  host.agent:disconnect()
-  host.agent.state = AgentState.Failed
+  host.local_agent.client:disconnect()
+  host.local_agent.client.state = AgentState.Failed
   remotewin_tick(now, true)
   assert(remotewin_of(s4).state == RemoteWinState.Ended, 'connection lost: ended')
   close_terminal(s4)
@@ -977,10 +977,10 @@ do
   -- /term reload: no WCLOSE (the agent keeps the windows); both asked for by key after it
   forget()
   assert(run_command('reload') == 0)
-  host.agent:flush()
+  host.local_agent.client:flush()
   assert(count(PROTO_WCLOSE) == 0, 'a reload does not close the windows')
   assert(#host.world == 0)
-  host.agent_last_try = 1e9
+  host.local_agent.last_try = 1e9
   world_frame(false) -- not connected yet
   fake_connect('ghostty-agent 3 43')
   pump()
@@ -1007,8 +1007,8 @@ do
   pump()
   assert(r1.state == RemoteWinState.Live and r1.key == 'key:7bb.1', 'the new key')
   -- the connection goes: panels wait and ask again by key when it is back
-  host.agent:disconnect()
-  host.agent.state = AgentState.Failed
+  host.local_agent.client:disconnect()
+  host.local_agent.client.state = AgentState.Failed
   world_frame(false)
   assert(r1.state == RemoteWinState.Opening and r1.reopen and #host.world == 2, 'waiting, not closed')
   for _ = 1, 200 do world_frame(false) end
@@ -1029,7 +1029,7 @@ do
   forget()
   assert(window_close(host.world[0].id))
   for _ = 1, 120 do world_frame(false) end
-  host.agent:flush()
+  host.local_agent.client:flush()
   local c = last(PROTO_WCLOSE)
   assert(c ~= nilptr and proto.get_u32(c) == 50, 'closed by its ×: WCLOSE')
   save_world_state()
@@ -1120,8 +1120,8 @@ local function stream_of_wid(wid: uint32): *RemoteWin
   return nilptr
 end
 do
-  host.agent:disconnect()
-  host.agent.state = AgentState.Failed
+  host.local_agent.client:disconnect()
+  host.local_agent.client.state = AgentState.Failed
   world_frame(false)
   fake_connect('ghostty-agent 3 44')
   pump()
@@ -1243,7 +1243,7 @@ do
   send_list(LAUNCH .. '23\t400\t300\tyad\tSecret plans\t\tsid:80\n')
   pump()
   for _ = 1, 120 do world_frame(false) end
-  host.agent:flush()
+  host.local_agent.client:flush()
   assert(#host.world == 0 and count(PROTO_WCLOSE) == 1, 'closed when its title came to match')
   -- apps: the picker and agent.apps leave them out
   local ap: WinAppEntry = { id = '1password', name = '1Password' }
@@ -1309,7 +1309,7 @@ do
   -- file:// and other schemes are not opened at all
   forget()
   remotewin_open_link('file:///etc/passwd')
-  host.agent:flush()
+  host.local_agent.client:flush()
   assert(count(PROTO_WOPEN) == 0 and #opened_urls == 1 and logged('link not opened: file:///etc/passwd') == 1, 'file: stays shut')
   -- an app in the compositor opened a link (raise:N): a window without a panel becomes one
   forget()
@@ -1337,7 +1337,7 @@ do
   forget()
   local said = logged('link opened in your desktop browser')
   remotewin_open_link('http://example.org/d')
-  host.agent:flush()
+  host.local_agent.client:flush()
   assert(count(PROTO_WOPEN) == 0 and #opened_urls == 2 and opened_urls[1] == 'http://example.org/d' and logged('link opened in your desktop browser') == said, "'host'")
   assert(luaL_loadstring(policy.L, "CONFIG.windows.links = 'game'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
   policy_refresh()
@@ -1347,11 +1347,11 @@ do
   world_frame(false)
   forget()
   remotewin_open_link('https://example.org/e')
-  host.agent:flush()
+  host.local_agent.client:flush()
   assert(count(PROTO_WOPEN) == 0 and #opened_urls == 3 and logged('link opened in your desktop browser: the agent has no compositor') == 1, 'no compositor')
   -- no agent: the desktop's browser
-  host.agent:disconnect()
-  host.agent.state = AgentState.Failed
+  host.local_agent.client:disconnect()
+  host.local_agent.client.state = AgentState.Failed
   world_frame(false)
   remotewin_open_link('mailto:someone@example.org')
   assert(#opened_urls == 4 and opened_urls[3] == 'mailto:someone@example.org' and logged('link opened in your desktop browser: the agent is not connected') == 1, 'no agent')

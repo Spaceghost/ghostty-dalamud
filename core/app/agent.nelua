@@ -90,7 +90,7 @@ global function agent_event(ctx: pointer, ev: *AgentEvent): void
     end
     if s == nilptr then
       -- nobody wants this shell any more: don't leave it running
-      if ev.id ~= 0 then host.agent:close_session(ev.id) end
+      if ev.id ~= 0 then host.local_agent.client:close_session(ev.id) end
     elseif ev.id == 0 then
       local sb: stringbuilder -- no `..` chain: its intermediate strings would leak
       sb:write('\r\n[ghostty] agent refused: ', string{data=(@*[0]byte)(ev.data), size=ev.len}, '\r\n')
@@ -125,7 +125,7 @@ global function agent_event(ctx: pointer, ev: *AgentEvent): void
     end
     if s == nilptr then
       -- nobody waits for it any more: do not leave the process running
-      if ev.id ~= 0 then host.agent:jclose(ev.id) end
+      if ev.id ~= 0 then host.local_agent.client:jclose(ev.id) end
     elseif ev.id == 0 then
       -- The agent would not run it as a job: this one has no job runner (the
       -- Windows agent's stub refuses every JOPEN), or the command itself
@@ -183,7 +183,7 @@ global function agent_event(ctx: pointer, ev: *AgentEvent): void
       local e = entries[i]
       if e.attached == 0 and e.id ~= 0 and find_agent_session(e.id) == nilptr then
         local s = new(@Session)
-        if s:init_attach(host.next_session_id, e.command, e.cols, e.rows, &host.agent, e.id) then
+        if s:init_attach(host.next_session_id, e.command, e.cols, e.rows, &host.local_agent.client, e.id) then
           host.next_session_id = host.next_session_id + 1
           host.sessions:push(s)
           -- put it back where it was: world (with its anchor), window, minimized or tab
@@ -235,31 +235,31 @@ global function read_token(): string
 end
 
 global function agent_setup(): void
-  host.agent:destroy()
+  host.local_agent.client:destroy()
   local tok = read_token()
-  host.agent:init(policy.agent.host, (@uint16)(policy.agent.port), tok)
+  host.local_agent.client:init(policy.agent.host, (@uint16)(policy.agent.port), tok)
   tok:destroy()
-  host.agent.on_event = agent_event
-  host.agent.ctx = nilptr
-  host.agent_enabled = true
-  host.agent_last_try = -100.0
-  host.agent_prev_state = AgentState.Disconnected -- a fresh client: its first Ready is a (re)connect
+  host.local_agent.client.on_event = agent_event
+  host.local_agent.client.ctx = nilptr
+  host.local_agent.enabled = true
+  host.local_agent.last_try = -100.0
+  host.local_agent.prev_state = AgentState.Disconnected -- a fresh client: its first Ready is a (re)connect
   host.layout_restored = false -- until LISTR: the terminals on screen are not the whole layout
 end
 
 -- The connection became Ready (first connect or a reconnect).
 global function agent_on_ready(): void
-  local nonce = host.agent.nonce
+  local nonce = host.local_agent.client.nonce
   -- a different agent process: its session ids mean other shells (or none).
   -- That includes a version 1 agent (nonce 0) replaced by a version 2 one:
   -- the new agent numbers its shells from 1 again.
-  local restarted = host.agent_seen and nonce ~= host.agent_nonce
+  local restarted = host.local_agent.seen and nonce ~= host.local_agent.nonce
   -- the same agent: the shells still run, subscribe again. Two agents without
   -- a nonce (version 1) cannot be told apart; their terminals stay as they are.
-  local same = nonce ~= 0 and nonce == host.agent_nonce
+  local same = nonce ~= 0 and nonce == host.local_agent.nonce
   for i = 0, < #host.sessions do
     local s = host.sessions[i]
-    if s.kind == TransportKind.Agent and s.agent == &host.agent then
+    if s.kind == TransportKind.Agent and s.agent == &host.local_agent.client then
       s:connection_lost() -- an ATTACHED of the old connection never comes
       if not s.awaiting_open and not s.exited then
         if s.job then
@@ -278,8 +278,8 @@ global function agent_on_ready(): void
       end
     end
   end
-  host.agent_seen = true
-  host.agent_nonce = nonce
+  host.local_agent.seen = true
+  host.local_agent.nonce = nonce
   -- OPENs of the old connection got no answer: forget closed terminals, ask again
   local j = 0
   for i = 0, < #host.pending_open do
@@ -291,7 +291,7 @@ global function agent_on_ready(): void
   end
   host.pending_open:resize(j)
   for i = 0, < #host.pending_open do host.pending_open[i]:reopen() end
-  host.agent_error_shown:destroy() -- the next failure is news again
+  host.local_agent.error_shown:destroy() -- the next failure is news again
 end
 
 -- The agent is down: terminals still waiting for their shell whose profile
@@ -329,41 +329,41 @@ local function agent_use_fallbacks(): void
 end
 
 global function agent_pump(now: float64): void
-  if not host.agent_enabled then return end
-  local st = host.agent.state
+  if not host.local_agent.enabled then return end
+  local st = host.local_agent.client.state
   if st == AgentState.Disconnected or st == AgentState.Failed then
-    if now - host.agent_last_try > 3.0 then
-      host.agent_last_try = now
-      host.agent:connect(now)
+    if now - host.local_agent.last_try > 3.0 then
+      host.local_agent.last_try = now
+      host.local_agent.client:connect(now)
     end
   end
-  host.agent:pump(now)
-  st = host.agent.state
-  if st == AgentState.Ready then host.agent_down = false end
-  if st == AgentState.Failed and not host.agent_down then
-    host.agent_down = true
+  host.local_agent.client:pump(now)
+  st = host.local_agent.client.state
+  if st == AgentState.Ready then host.local_agent.down = false end
+  if st == AgentState.Failed and not host.local_agent.down then
+    host.local_agent.down = true
     agent_use_fallbacks()
   end
-  if st == AgentState.Ready and host.agent_prev_state ~= AgentState.Ready then agent_on_ready() end
-  host.agent_prev_state = st
-  if st == AgentState.Ready and not host.agent_listed then
-    host.agent_listed = true
+  if st == AgentState.Ready and host.local_agent.prev_state ~= AgentState.Ready then agent_on_ready() end
+  host.local_agent.prev_state = st
+  if st == AgentState.Ready and not host.local_agent.listed then
+    host.local_agent.listed = true
     host.layout_restored = false
-    host.agent:list()
+    host.local_agent.client:list()
   elseif st == AgentState.Failed then
     host.reattach_done = true -- don't hold the first tab back forever
-    if host.agent.last_error ~= host.agent_error_shown then
+    if host.local_agent.client.last_error ~= host.local_agent.error_shown then
       -- surface the failure in the waiting tabs, once per distinct error
       local sb: stringbuilder -- no `..` chain: its intermediate strings would leak
-      sb:write('[ghostty] ', host.agent.last_error, ' (retrying)\r\n')
+      sb:write('[ghostty] ', host.local_agent.client.last_error, ' (retrying)\r\n')
       local msg = sb:promote()
       for i = 0, < #host.pending_open do
         local s = host.pending_open[i]
         if s ~= nilptr then s:feed_text(msg) end
       end
       msg:destroy()
-      host.agent_error_shown:destroy()
-      host.agent_error_shown = host.agent.last_error:copy()
+      host.local_agent.error_shown:destroy()
+      host.local_agent.error_shown = host.local_agent.client.last_error:copy()
     end
   end
 end
@@ -372,15 +372,15 @@ end
 -- reading every shell whose output this client leaves unread (a build in a
 -- tab would freeze). Detach the streaming shells instead; they keep running.
 global function agent_hold_sessions(): void
-  if not host.agent_enabled then return end
+  if not host.local_agent.enabled then return end
   for i = 0, < #host.sessions do
     local s = host.sessions[i]
-    if s.kind == TransportKind.Agent and s.agent == &host.agent and not s.sleeping then
+    if s.kind == TransportKind.Agent and s.agent == &host.local_agent.client and not s.sleeping then
       s:sleep()
       s.held = s.sleeping
     end
   end
-  host.agent:flush() -- the DETACHes: no pump runs until the switch is off
+  host.local_agent.client:flush() -- the DETACHes: no pump runs until the switch is off
 end
 
 -- Kill switch off: the held shells stream again; the agent sends what they missed.
@@ -398,8 +398,8 @@ end
 -- that arrives now reaches agent_event: a LISTR would create sessions after
 -- the session list is gone.
 global function agent_final_flush(): void
-  host.agent.on_event = nilptr
-  if host.agent_enabled then host.agent:pump(0.0) end
+  host.local_agent.client.on_event = nilptr
+  if host.local_agent.enabled then host.local_agent.client:pump(0.0) end
 end
 
 -- Sessions -------------------------------------------------------------------
@@ -407,7 +407,7 @@ end
 global function session_open(p: *Profile, cols: uint16, rows: uint16): *Session
   local s = new(@Session)
   local agent: *AgentClient = nilptr
-  if host.agent_enabled then agent = &host.agent end
+  if host.local_agent.enabled then agent = &host.local_agent.client end
   if not s:init(host.next_session_id, p, cols, rows, agent) then
     s:destroy()
     delete(s)
@@ -427,7 +427,7 @@ global function session_new(profile_index: integer, cols: uint16, rows: uint16):
     p = policy_profile(0)
   end
   -- no agent answered the last attempt: a profile with a local fallback opens that
-  p = policy_open_profile(p, not host.agent_enabled or host.agent_down)
+  p = policy_open_profile(p, not host.local_agent.enabled or host.local_agent.down)
   return session_open(p, cols, rows)
 end
 
@@ -436,7 +436,7 @@ end
 -- the same argv runs over ConPTY instead.
 global function session_new_assistant(spec: *AssistantOpen, cols: uint16, rows: uint16): *Session
   local p: Profile = { name = spec.label, transport = spec.transport }
-  if spec.transport == 'agent' and spec.local_fallback and (not host.agent_enabled or host.agent_down) then
+  if spec.transport == 'agent' and spec.local_fallback and (not host.local_agent.enabled or host.local_agent.down) then
     p.transport = 'conpty'
   end
   p.argv = spec.argv -- borrowed: Session:init copies what it keeps
@@ -463,7 +463,7 @@ end
 global function session_remove(s: *Session): void
   for i = 0, < #host.pending_open do
     if host.pending_open[i] == s then
-      if host.agent.state == AgentState.Ready then
+      if host.local_agent.client.state == AgentState.Ready then
         host.pending_open[i] = nilptr -- its OPEN is on the way: keep its place for the answer
       else
         host.pending_open:remove(i) -- nothing on the way; Ready sends the others again

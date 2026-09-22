@@ -224,7 +224,7 @@ global function run_command(cmd: string): cint
     host.world_pins_done = false
     host.popup_session = nilptr
     host.dropdown_active = -1
-    host.agent_listed = false
+    host.local_agent.listed = false
     host.reattach_done = false
     host.layout_restored = false -- the layout is gone until the next LISTR
     return load_policy() and 0 or 2

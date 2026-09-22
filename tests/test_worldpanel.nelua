@@ -1232,7 +1232,7 @@ do
 
   -- Sleeping unseen ------------------------------------------------------------------
   s.kind = TransportKind.Agent
-  s.agent = &host.agent
+  s.agent = &host.local_agent.client
   s.agent_id = 77
   s.exited, s.awaiting_open, s.run_occluded = false, false, false
   s.last_seen = now - 5

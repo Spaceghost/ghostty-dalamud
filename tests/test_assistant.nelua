@@ -216,15 +216,15 @@ do
   spec.local_fallback = true
   spec.view = string.copy('tab')
   spec.label = string.copy('assistant')
-  local down = host.agent_down
-  host.agent_down = true
+  local down = host.local_agent.down
+  host.local_agent.down = true
   local s = session_new_assistant(&spec, 80, 24)
   assert(s ~= nilptr and s.kind == TransportKind.ConPty and s.assistant and s.exited)
-  host.agent_down = false
+  host.local_agent.down = false
   local s2 = session_new_assistant(&spec, 80, 24)
   assert(s2.kind == TransportKind.Agent and s2.local_fallback and s2.awaiting_open)
   assert(argv_is(s2, 'almanac\x1fchat'))
-  host.agent_down = down
+  host.local_agent.down = down
   spec:destroy()
 end
 

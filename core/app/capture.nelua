@@ -344,7 +344,7 @@ global function clip_command(args: string): cint
     sayf(LOG_INFO, 'clip: %d seconds is the most a clip records', (@integer)(CLIP_SECONDS_MAX))
     seconds = CLIP_SECONDS_MAX
   end
-  if not host.agent:ready() then
+  if not host.local_agent.client:ready() then
     say(LOG_WARN, 'clip: no ghostty-agent connection; clips are encoded on the host, so one is needed')
     return 4
   end
@@ -440,7 +440,7 @@ local function shot_tick(now: float64): void
 end
 
 local function clip_finish(cancel: boolean): void
-  if clip.cid ~= 0 then host.agent:cend(clip.cid, cancel) end
+  if clip.cid ~= 0 then host.local_agent.client:cend(clip.cid, cancel) end
   hud_restore()
   clip.stage = cancel and ClipStage.None or ClipStage.Ending
   clip.asked_at = host.last_time
@@ -475,9 +475,9 @@ local function clip_send_frame(): void
   if n >= raw then enc, n = WINCODEC_ENC_RAW, raw end
   clip.seq = clip.seq + 1
   if enc == WINCODEC_ENC_QOI then
-    host.agent:cframe(clip.cid, clip.seq, enc, (@*[0]uint8)(&clip_qoi[0]), n)
+    host.local_agent.client:cframe(clip.cid, clip.seq, enc, (@*[0]uint8)(&clip_qoi[0]), n)
   else
-    host.agent:cframe_rows(clip.cid, clip.seq, fsrc, fstride, sw, sh)
+    host.local_agent.client:cframe_rows(clip.cid, clip.seq, fsrc, fstride, sw, sh)
   end
   clip.sent = clip.sent + 1
   clip.bytes = clip.bytes + n
@@ -501,7 +501,7 @@ local function clip_tick(now: float64): void
       clip.w, clip.h, clip.factor = sw, sh, f
       clip.req = clip.req + 1
       if clip.req == 0 then clip.req = 1 end
-      if not host.agent:copen(clip.req, clip.kind, (@uint16)(sw), (@uint16)(sh), (@uint8)(clip.fps)) then
+      if not host.local_agent.client:copen(clip.req, clip.kind, (@uint16)(sw), (@uint16)(sh), (@uint8)(clip.fps)) then
         say(LOG_WARN, 'clip: the agent connection went away')
         hud_restore()
         clip = {}
@@ -579,7 +579,7 @@ end
 global function capture_event(ev: *AgentEvent): void
   if ev.typ == PROTO_COPENED then
     if clip.stage ~= ClipStage.Opening or ev.req ~= clip.req then
-      if ev.id ~= 0 then host.agent:cend(ev.id, true) end -- nobody is waiting for it
+      if ev.id ~= 0 then host.local_agent.client:cend(ev.id, true) end -- nobody is waiting for it
       return
     end
     if ev.id == 0 then
@@ -624,7 +624,7 @@ end
 
 global function capture_app_shutdown(): void
   hud_restore()
-  if clip.cid ~= 0 then host.agent:cend(clip.cid, true) end
+  if clip.cid ~= 0 then host.local_agent.client:cend(clip.cid, true) end
   shot.path:destroy()
   png_enc_destroy(&shot.enc)
   shot = {}
