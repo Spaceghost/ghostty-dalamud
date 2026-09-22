@@ -259,6 +259,11 @@ local function draw_panel(focus: boolean): void
     dropdown_glass(imgui.GetWindowDrawList(), wp.x, wp.y, wp.x + wsz.x, wp.y + wsz.y, rounding, 36)
     ui_push_mono, ui_pop_font = host.api.push_mono_font, host.api.pop_font
     policy_ask_draw()
+    -- ask.draw ran under lua_pcall, which unwinds Lua without unwinding ImGui.
+    -- If it failed part way through, a child region is still open and the End()
+    -- below would take the game down; close whatever it left. policy_ask_draw
+    -- has already logged the Lua error itself.
+    ui_close_children()
   end
   imgui.End()
   pop_cols()
