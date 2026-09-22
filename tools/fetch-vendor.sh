@@ -42,6 +42,31 @@ if [[ ! -f "$V/stb/stb_truetype.h" ]] || ! echo "$STB_TRUETYPE_SHA256  $V/stb/st
 fi
 echo "stb_truetype $(grep -m1 -o 'v[0-9.]*' "$V/stb/stb_truetype.h")"
 
+# The cargo vendor tree for crates/ghostty-iroh (docs/IROH.md). Optional: a
+# toolchain.env with no CARGO_VENDOR_URL, or a checkout with no crate, skips it
+# and nothing else changes. vendor/cargo doubles as CARGO_HOME, so the
+# replace-with stanza below is the one cargo config the build needs.
+if [[ -n "${CARGO_VENDOR_URL:-}" ]]; then
+  if [[ ! -f "$V/cargo/.pinned" || "$(cat "$V/cargo/.pinned")" != "$CARGO_VENDOR_SHA256" ]]; then
+    tmp="$(mktemp -d)"
+    curl -fsSL "$CARGO_VENDOR_URL" -o "$tmp/cargo-vendor.tar.gz"
+    echo "$CARGO_VENDOR_SHA256  $tmp/cargo-vendor.tar.gz" | sha256sum -c -
+    rm -rf "$V/cargo"
+    mkdir -p "$V/cargo/registry-vendor"
+    tar -xzf "$tmp/cargo-vendor.tar.gz" -C "$V/cargo/registry-vendor" --strip-components=1
+    cat >"$V/cargo/config.toml" <<CARGOEOF
+[source.crates-io]
+replace-with = "vendored-sources"
+
+[source.vendored-sources]
+directory = "$V/cargo/registry-vendor"
+CARGOEOF
+    printf '%s' "$CARGO_VENDOR_SHA256" > "$V/cargo/.pinned"
+    rm -rf "$tmp"
+  fi
+  echo "cargo vendor ${IROH_VERSION:-unpinned} (${CARGO_VENDOR_SHA256:0:12})"
+fi
+
 # Wayland SDK headers (Linux only; SKIP_WAYLAND=1 to skip). Needs rpm2cpio and
 # cpio. Without it the agent builds with no Wayland compositor backend.
 if [[ "$(uname -s)" == Linux && "${SKIP_WAYLAND:-0}" != 1 && ! -f "$V/wayland-sdk/.pinned" ]] ||
