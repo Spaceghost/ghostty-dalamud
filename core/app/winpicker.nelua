@@ -97,6 +97,18 @@ local function set_note(ok: boolean, what: string, err: string): void
 end
 
 -- One pick: a window by id (0: the desktop chooses), a match text, or a command to run.
+-- Which machine a row is on. The local agent is the common case and says
+-- nothing; anything else is named, so one list can hold several machines.
+local function picker_agent_tag(agent: string): void
+  if #agent == 0 or agent == 'local' then return end
+  imgui.SameLine(0, -1)
+  imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkDim, 255))
+  local tag: [64]cchar
+  C.snprintf((@cstring)(&tag), #tag, '  @%.*s', (@cint)(#agent), (@cstring)(agent.data))
+  imgui.TextUnformatted((@cstring)(&tag), nilptr)
+  imgui.PopStyleColor(1)
+end
+
 local function pick(spec: WindowOpenSpec, what: string): void
   local id, err = window_open(spec)
   if id ~= 0 then
@@ -196,13 +208,14 @@ global function draw_window_picker(): void
             sb:write(name)
             what = sb:promote()
           end
-          pick(WindowOpenSpec{ wid = e.wid }, what)
+          pick(WindowOpenSpec{ wid = e.wid, agent = e.agent }, what)
           what:destroy()
         end
         imgui.SameLine(0, -1)
         imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkFaint, 255))
         imgui.TextUnformatted((@cstring)(&size), nilptr)
         imgui.PopStyleColor(1)
+        picker_agent_tag(e.agent)
         imgui.PopID()
         shown = shown + 1
         if not host.window_picker_open then break end -- picked: winlist may change under us next frame only, but stop here
@@ -228,9 +241,10 @@ global function draw_window_picker(): void
             local sb2: stringbuilder
             sb2:write('started ', a.name)
             local what = sb2:promote()
-            pick(WindowOpenSpec{ match = m }, what)
+            pick(WindowOpenSpec{ match = m, agent = a.agent }, what)
             m:destroy() what:destroy()
           end
+          picker_agent_tag(a.agent)
           imgui.PopID()
           if not host.window_picker_open then break end
         end

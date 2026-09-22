@@ -311,6 +311,8 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   host.world_diag:destroy()
   host.local_agent.error_shown:destroy()
   agent_extras_teardown() -- the CONFIG.agents links; the local one is a field of host
+  host.local_agent.name:destroy()
+  host.local_agent.name = (@string){}
   host.agents:destroy()   -- the loader starts a fresh core: leave no allocation behind
   host.bell_demo_label:destroy()
   host.showcase_ids:destroy()
