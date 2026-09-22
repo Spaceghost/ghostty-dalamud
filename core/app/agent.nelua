@@ -215,11 +215,12 @@ global function agent_event(ctx: pointer, ev: *AgentEvent): void
   end
 end
 
-global function read_token(): string
-  if #policy.agent.token > 0 then return policy.agent.token:copy() end
-  if #policy.agent.token_file > 0 then
+-- The token for one agent: the inline one, else the file, else empty.
+global function read_token_of(token: string, token_file: string): string
+  if #token > 0 then return token:copy() end
+  if #token_file > 0 then
     require 'io'
-    local f = io.open(policy.agent.token_file, 'rb')
+    local f = io.open(token_file, 'rb')
     if f:isopen() then
       local content = f:read('a')
       f:destroy() -- close() alone keeps the stream record allocated (no GC)
@@ -229,9 +230,83 @@ global function read_token(): string
       content:destroy()
       return tok
     end
-    logf(LOG_WARN, 'agent token file not readable: %s', policy.agent.token_file)
+    logf(LOG_WARN, 'agent token file not readable: %s', token_file)
   end
   return string.copy('')
+end
+
+global function read_token(): string
+  return read_token_of(policy.agent.token, policy.agent.token_file)
+end
+
+-- The links from CONFIG.agents. They stream windows and nothing else: no
+-- shells, no saved layout and no fallbacks, because a terminal always runs on
+-- the local agent (docs/MULTI_AGENT.md).
+global function agent_extras_teardown(): void
+  for i = 0, < #host.agents do
+    local link = host.agents[i]
+    link.client:destroy()
+    link.error_shown:destroy()
+    link.name:destroy()
+    delete(link)
+  end
+  host.agents:clear()
+end
+
+global function agent_extras_setup(): void
+  agent_extras_teardown()
+  for i = 0, < #policy.agents do
+    local cfg: *NamedAgentCfg = &policy.agents[i]
+    local link: *AgentLink = new(@AgentLink)
+    link.name = string.copy(cfg.name)
+    local tok = read_token_of(cfg.cfg.token, cfg.cfg.token_file)
+    link.client:init(cfg.cfg.host, (@uint16)(cfg.cfg.port), tok)
+    tok:destroy()
+    link.client.on_event = agent_event
+    link.client.ctx = link -- which link an event came from
+    link.enabled = true
+    link.last_try = -100.0
+    link.prev_state = AgentState.Disconnected
+    host.agents:push(link)
+    logf(LOG_INFO, 'agent link "%s": %s:%d', link.name, cfg.cfg.host, cfg.cfg.port)
+  end
+end
+
+-- Connect and read the extra links. Only the parts an agent needs to serve
+-- windows: the session, fallback and layout handling stays with the local one.
+local function agent_extras_pump(now: float64): void
+  for i = 0, < #host.agents do
+    local link = host.agents[i]
+    if link.enabled then
+      local st = link.client.state
+      if st == AgentState.Disconnected or st == AgentState.Failed then
+        if now - link.last_try > 3.0 then
+          link.last_try = now
+          link.client:connect(now)
+        end
+      end
+      link.client:pump(now)
+      st = link.client.state
+      if st == AgentState.Ready then
+        link.down = false
+        if not link.listed then
+          link.listed = true
+          link.client:wlist()
+        end
+      elseif st == AgentState.Failed then
+        link.listed = false
+        if not link.down then
+          link.down = true
+          if link.client.last_error ~= link.error_shown then
+            link.error_shown:destroy()
+            link.error_shown = link.client.last_error:copy()
+            logf(LOG_WARN, 'agent link "%s": %s', link.name, link.client.last_error)
+          end
+        end
+      end
+      link.prev_state = st
+    end
+  end
 end
 
 global function agent_setup(): void
@@ -245,6 +320,7 @@ global function agent_setup(): void
   host.local_agent.last_try = -100.0
   host.local_agent.prev_state = AgentState.Disconnected -- a fresh client: its first Ready is a (re)connect
   host.layout_restored = false -- until LISTR: the terminals on screen are not the whole layout
+  agent_extras_setup()
 end
 
 -- The connection became Ready (first connect or a reconnect).
@@ -329,6 +405,7 @@ local function agent_use_fallbacks(): void
 end
 
 global function agent_pump(now: float64): void
+  agent_extras_pump(now)
   if not host.local_agent.enabled then return end
   local st = host.local_agent.client.state
   if st == AgentState.Disconnected or st == AgentState.Failed then

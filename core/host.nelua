@@ -310,17 +310,8 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   policy_unload()
   host.world_diag:destroy()
   host.local_agent.error_shown:destroy()
-  -- every link but the local one, whose client was destroyed above. The local
-  -- link is static storage and stays; clearing the vector makes the next start
-  -- push it again (core/app/state.nelua agent_local).
-  for i = 1, < #host.agents do
-    local link = host.agents[i]
-    link.client:destroy()
-    link.error_shown:destroy()
-    link.name:destroy()
-    delete(link)
-  end
-  host.agents:clear()
+  agent_extras_teardown() -- the CONFIG.agents links; the local one is a field of host
+  host.agents:destroy()   -- the loader starts a fresh core: leave no allocation behind
   host.bell_demo_label:destroy()
   host.showcase_ids:destroy()
   host.showcase_hidden:destroy()
