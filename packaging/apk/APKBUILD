@@ -22,7 +22,11 @@ pkgdesc="PTY server and desktop-window compositor for the Ghostty Dalamud plugin
 url="https://github.com/Spaceghost/ghostty-dalamud"
 arch="x86_64"
 license="MIT"
-makedepends="gcc make musl-dev"
+# bash: tools/build-agent.sh is a bash script, and an Alpine builder has no
+# bash unless something asks for it. Without this the build fails with
+# "env: can't execute 'bash'" after unpacking, which is a long way from
+# the cause.
+makedepends="gcc make musl-dev bash"
 [ "${SKIP_WAYLAND:-0}" = 1 ] || makedepends="$makedepends wlroots0.20-dev wayland-dev
 	wayland-protocols libxkbcommon-dev pixman-dev"
 source="$pkgname-$pkgver-src.tar.gz"
