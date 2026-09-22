@@ -167,10 +167,10 @@ global function draw_window_picker(): void
     if imgui.SmallButton('Close') then host.window_picker_open = false end
     imgui.Separator()
 
-    local agent_ok = host.agent_enabled and host.agent:ready() and host.agent:windows_ok()
+    local agent_ok = host.local_agent.enabled and host.local_agent.client:ready() and host.local_agent.client:windows_ok()
     if not agent_ok then
       local why: string = 'the agent is not connected'
-      if host.agent_enabled and host.agent:ready() then why = AGENT_WINDOWS_TOO_OLD end
+      if host.local_agent.enabled and host.local_agent.client:ready() then why = AGENT_WINDOWS_TOO_OLD end
       imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkDim, 255))
       imgui.TextUnformatted(label(&buf, why, '', ''), nilptr)
       imgui.PopStyleColor(1)

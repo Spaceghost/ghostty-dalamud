@@ -85,11 +85,11 @@ local function fake_connect(): void
   fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK)
   fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL, 0) | O_NONBLOCK)
   if peer >= 0 then close(peer) end
-  net.close(host.agent.sock)
-  host.agent.sock = fds[0]
-  host.agent.inq:destroy()
-  host.agent.outq:destroy()
-  host.agent.state = AgentState.Handshake
+  net.close(host.local_agent.client.sock)
+  host.local_agent.client.sock = fds[0]
+  host.local_agent.client.inq:destroy()
+  host.local_agent.client.outq:destroy()
+  host.local_agent.client.state = AgentState.Handshake
   peer = fds[1]
   peer_q:destroy()
   frames:clear()
@@ -170,11 +170,11 @@ end
 -- The kill switch lets go of what the game shows or does for us, once --------------
 do
   assert(gu_init(&api, (@cstring)(dir.data)) == 0, 'init')
-  host.agent_last_try = 1e9 -- never dial out
+  host.local_agent.last_try = 1e9 -- never dial out
   fake_connect()
   peer_text(PROTO_OK, 'ghostty-agent 2 42')
   pump()
-  assert(host.agent:ready())
+  assert(host.local_agent.client:ready())
   local streaming = session_new(0, 80, 24)
   local asleep = session_new(0, 80, 24)
   pump()
@@ -244,7 +244,7 @@ do
     host.bell_demo_label = string.copy('bell style: glow')
     host.showcase_ids:push(41)
     host.showcase_hidden:push(42)
-    host.agent_error_shown = string.copy('agent unreachable')
+    host.local_agent.error_shown = string.copy('agent unreachable')
     gu_shutdown()
     local used = heap_in_use()
     print('cycle', n, 'heap in use', used)
@@ -261,13 +261,13 @@ host.api.log = log_cb
 policy.agent.token:destroy()
 policy.agent.token = string.copy('test-token') -- never the real token file
 agent_setup()
-host.agent_last_try = 1e9 -- agent_pump must never dial out: the agent here is a socketpair
+host.local_agent.last_try = 1e9 -- agent_pump must never dial out: the agent here is a socketpair
 
 -- connection 1: a version 1 agent (this core loaded against one still running) -------
 fake_connect()
 peer_text(PROTO_OK, 'ghostty-agent 1')
 pump()
-assert(host.agent:ready() and host.agent.version == 1 and host.agent.nonce == 0, 'version 1 greeting')
+assert(host.local_agent.client:ready() and host.local_agent.client.version == 1 and host.local_agent.client.nonce == 0, 'version 1 greeting')
 pump()
 assert(sent_any(PROTO_LIST) == 1 and not host.layout_restored, 'LIST sent, layout not restored yet')
 peer_text(PROTO_LISTR, '')
@@ -288,7 +288,7 @@ pump()
 fake_connect()
 peer_text(PROTO_OK, 'ghostty-agent 2 5')
 pump()
-assert(host.agent:ready() and host.agent.nonce == 5)
+assert(host.local_agent.client:ready() and host.local_agent.client.nonce == 5)
 assert(s0.exited and s0.agent == nilptr and s0.agent_id == 0, 'no nonce, then a nonce: a restart')
 forget()
 session_remove(s0)
@@ -302,7 +302,7 @@ pump()
 fake_connect()
 peer_text(PROTO_OK, 'ghostty-agent 2 42')
 pump()
-assert(host.agent:ready() and host.agent.version == 2 and host.agent.nonce == 42, 'version 2 greeting')
+assert(host.local_agent.client:ready() and host.local_agent.client.version == 2 and host.local_agent.client.nonce == 42, 'version 2 greeting')
 forget()
 
 -- S2: a terminal closed before its OPENED keeps its place in the queue
@@ -378,7 +378,7 @@ local y0 = cursor_y(s4)
 close(peer)
 peer = -1
 pump() pump() pump()
-assert(host.agent.state == AgentState.Failed and host.agent_error_shown == 'connection closed', 'failure noted')
+assert(host.local_agent.client.state == AgentState.Failed and host.local_agent.error_shown == 'connection closed', 'failure noted')
 assert(cursor_y(s4) == y0 + 1, 'the failure is shown once, not every frame')
 local s6 = session_new(0, 80, 24) -- no connection: nothing goes out for it
 session_remove(s6)
@@ -389,9 +389,9 @@ assert(#host.pending_open == 2, 'no tombstone for an OPEN that never went out')
 fake_connect()
 peer_text(PROTO_OK, 'ghostty-agent 2 42')
 pump()
-assert(host.agent:ready(), 'reconnected')
+assert(host.local_agent.client:ready(), 'reconnected')
 assert(#host.pending_open == 1 and host.pending_open[0] == s4, 'tombstones dropped')
-assert(s2.replaying and #host.agent_error_shown == 0, 'replaying until ATTACHED; the next failure shows again')
+assert(s2.replaying and #host.local_agent.error_shown == 0, 'replaying until ATTACHED; the next failure shows again')
 pump()
 assert(sent(PROTO_ATTACH, 8) == 1 and attach_fed(8) == 5000, 'reattached from where it was')
 assert(sent(PROTO_ATTACH, 10) == 1 and attach_fed(10) == FED_UNKNOWN, 'a replay the drop cut short: reattached with a reset')
@@ -423,7 +423,7 @@ pump()
 fake_connect()
 peer_text(PROTO_OK, 'ghostty-agent 1')
 pump()
-assert(host.agent:ready() and host.agent.version == 1 and host.agent.nonce == 0, 'version 1 greeting accepted')
+assert(host.local_agent.client:ready() and host.local_agent.client.version == 1 and host.local_agent.client.nonce == 0, 'version 1 greeting accepted')
 peer_id(PROTO_OPENED, 3, '')
 pump()
 assert(not s4.awaiting_open and s4.agent_id == 3, 'opened on the version 1 agent')
@@ -449,20 +449,20 @@ assert(s8.agent_id == 4)
 
 -- clipboard frames the agent does not know: said once, then not sent again
 forget()
-host.agent:clip_set('copied')
+host.local_agent.client:clip_set('copied')
 host.paste_target = s8.id
-host.agent:clip_get()
+host.local_agent.client:clip_get()
 pump()
 assert(sent_any(PROTO_CLIP_SET) == 1 and sent_any(PROTO_CLIP_GET) == 1)
 peer_text(PROTO_ERR, 'unknown frame')
 peer_text(PROTO_ERR, 'unknown frame')
 pump()
-assert(host.agent.clip_off and logged('clipboard sync off') == 1, 'logged once')
+assert(host.local_agent.client.clip_off and logged('clipboard sync off') == 1, 'logged once')
 assert(host.paste_target == 0, 'the paste got its (empty) answer')
 forget()
-host.agent:clip_set('copied again')
+host.local_agent.client:clip_set('copied again')
 host.paste_target = s8.id
-host.agent:clip_get()
+host.local_agent.client:clip_get()
 pump()
 assert(sent_any(PROTO_CLIP_SET) == 0 and sent_any(PROTO_CLIP_GET) == 0, 'no more clipboard frames')
 assert(host.paste_target == 0 and logged('clipboard sync off') == 1, 'answered at once, not logged again')
@@ -474,14 +474,14 @@ pump()
 fake_connect()
 peer_text(PROTO_ERR, 'bad token')
 pump()
-assert(host.agent.state == AgentState.Failed and host.agent.last_error == 'bad token', 'refused')
-assert(not net.is_valid(host.agent.sock), 'socket closed')
+assert(host.local_agent.client.state == AgentState.Failed and host.local_agent.client.last_error == 'bad token', 'refused')
+assert(not net.is_valid(host.local_agent.client.sock), 'socket closed')
 
 -- S11: the shutdown flush delivers nothing
 fake_connect()
 peer_text(PROTO_OK, 'ghostty-agent 2 43')
 pump()
-assert(host.agent:ready())
+assert(host.local_agent.client:ready())
 local n1 = #host.sessions
 peer_text(PROTO_LISTR, '77\t80\t24\t0\tsh\n')
 agent_final_flush()

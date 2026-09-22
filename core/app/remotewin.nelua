@@ -198,7 +198,7 @@ local function remotewin_closed(s: *Session): void
       if s.keep_on_agent then
         restore_done = false -- the layout is being taken down: the next one restores it
       else
-        if rw.state == RemoteWinState.Live and rw.sid ~= 0 then host.agent:wclose(rw.sid) end
+        if rw.state == RemoteWinState.Live and rw.sid ~= 0 then host.local_agent.client:wclose(rw.sid) end
         closing_children = true
       end
       -- still Opening: its WOPENED finds no stream and is closed then
@@ -242,7 +242,7 @@ end
 local function ack(rw: *RemoteWin): void
   if not rw.ack_pending or rw.state ~= RemoteWinState.Live then return end
   if rw.s.sleeping or host.last_time - rw.drawn_at > UNDRAWN_HOLD then return end
-  host.agent:wack(rw.sid, rw.ack_seq)
+  host.local_agent.client:wack(rw.sid, rw.ack_seq)
   rw.ack_pending = false
 end
 
@@ -692,7 +692,7 @@ local function ask_agent(rw: *RemoteWin): boolean
     rw.fallback = rw.match:copy()
   end
   local wid: uint32 = #rw.key > 0 and 0 or rw.wid
-  return host.agent:wopen(rw.req, wid, (@uint16)(rw.max_w), (@uint16)(rw.max_h), (@uint8)(policy.windows.fps), text)
+  return host.local_agent.client:wopen(rw.req, wid, (@uint16)(rw.max_w), (@uint16)(rw.max_h), (@uint8)(policy.windows.fps), text)
 end
 
 -- A link panel: asked for with WOPEN "url:" (remotewin_open_link).
@@ -729,7 +729,7 @@ global function remotewin_event(ev: *AgentEvent): void
     local rw = find_req(ev.req)
     if rw == nilptr then
       -- its panel closed while the desktop was choosing: nobody wants the stream
-      if ev.id ~= 0 then host.agent:wclose(ev.id) end
+      if ev.id ~= 0 then host.local_agent.client:wclose(ev.id) end
       return
     end
     local text = string{data=(@*[0]byte)(ev.data), size=ev.len}
@@ -787,7 +787,7 @@ global function remotewin_event(ev: *AgentEvent): void
     -- its key comes from the agent's list (learn_keys); new windows wait for
     -- that list too (in it the window carries our sid)
     auto_wait = watching
-    host.agent:wlist()
+    host.local_agent.client:wlist()
   elseif ev.typ == PROTO_WFRAME then
     local rw = find_sid(ev.id)
     if rw ~= nilptr then on_frame(rw, ev.data, ev.len) end
@@ -808,10 +808,10 @@ local function agent_for(name: string): (*AgentClient, string)
   if #policy.windows.agent > 0 and policy.windows.agent ~= 'default' then
     return nilptr, 'CONFIG.windows.agent: only the CONFIG.agent connection streams windows so far'
   end
-  if not host.agent_enabled or not host.agent:ready() then return nilptr, 'the agent is not connected' end
-  if not host.agent:windows_ok() then return nilptr, AGENT_WINDOWS_TOO_OLD end
+  if not host.local_agent.enabled or not host.local_agent.client:ready() then return nilptr, 'the agent is not connected' end
+  if not host.local_agent.client:windows_ok() then return nilptr, AGENT_WINDOWS_TOO_OLD end
   agent_window_event = remotewin_event
-  return &host.agent, ''
+  return &host.local_agent.client, ''
 end
 
 -- A trailing "@name" picks the agent; the rest is the command's own text.
@@ -1478,8 +1478,8 @@ end
 -- panels, the auto pulls, and the read budget.
 global function remotewin_tick(now: float64, in_world: boolean): void
   agent_window_event = remotewin_event
-  local ready = host.agent_enabled and host.agent:ready()
-  local windows_ok = ready and host.agent:windows_ok()
+  local ready = host.local_agent.enabled and host.local_agent.client:ready()
+  local windows_ok = ready and host.local_agent.client:windows_ok()
   if not ready then
     loud_lists = 0 -- a new connection answers only what is asked of it
     watching = false
@@ -1534,7 +1534,7 @@ global function remotewin_tick(now: float64, in_world: boolean): void
     i = i - 1
     if i >= #streams then i = #streams - 1 end
   end
-  if host.agent_enabled then host.agent.read_chunks = live > 0 and 64 or 0 end -- up to 1 MiB a frame while streaming
+  if host.local_agent.enabled then host.local_agent.client.read_chunks = live > 0 and 64 or 0 end -- up to 1 MiB a frame while streaming
   -- the window panels saved with the layout, once per layout (start, /term reload)
   if not restore_done and in_world and windows_ok and player_loaded() then
     restore_done = true
@@ -1542,7 +1542,7 @@ global function remotewin_tick(now: float64, in_world: boolean): void
   end
   -- the window list pushed on every change; new windows become panels
   if windows_ok and not watching then
-    watching = host.agent:wlist_watch()
+    watching = host.local_agent.client:wlist_watch()
     watch_baseline, auto_dirty, auto_wait = true, false, false
     raise_baseline, raise_dirty = true, false
   end
@@ -1556,7 +1556,7 @@ global function remotewin_tick(now: float64, in_world: boolean): void
   if not auto_done and in_world and ready then
     auto_done = true
     if #policy.windows.autopull > 0 then
-      if not host.agent:windows_ok() then
+      if not host.local_agent.client:windows_ok() then
         logf(LOG_WARN, 'windows.auto: %s', AGENT_WINDOWS_TOO_OLD)
       else
         for k = 0, < #policy.windows.autopull do
@@ -1598,7 +1598,7 @@ end
 
 local function send_input(rw: *RemoteWin, kind: uint8, body: *[0]uint8, len: usize): void
   if rw.state ~= RemoteWinState.Live then return end
-  host.agent:winput(rw.sid, kind, body, len)
+  host.local_agent.client:winput(rw.sid, kind, body, len)
 end
 
 local function send_pointer(rw: *RemoteWin, kind: uint8, x: integer, y: integer, a: integer, b: integer): void

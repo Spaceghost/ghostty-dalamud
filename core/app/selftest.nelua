@@ -448,11 +448,11 @@ end
 local function suite_agent(): boolean
   local now = now_ms()
   if R.phase == 0 then
-    if not host.agent_enabled then
+    if not host.local_agent.enabled then
       add(SUITE_AGENT, 'echo', SelftestStatus.Skip, 0, 'the agent is off in lua/init.lua')
       return true
     end
-    if host.agent.state ~= AgentState.Ready then
+    if host.local_agent.client.state ~= AgentState.Ready then
       add(SUITE_AGENT, 'echo', SelftestStatus.Skip, 0, 'no agent answered (start ghostty-agent to run this suite)')
       return true
     end
@@ -586,7 +586,7 @@ local function suite_loader(): boolean
       add(SUITE_LOADER, 'swap', SelftestStatus.Skip, 0, 'not loaded through ghostty_loader.dll')
       return true
     end
-    if host.agent_enabled and not host.reattach_done and now - R.suite_ms < REATTACH_WAIT_MS then
+    if host.local_agent.enabled and not host.reattach_done and now - R.suite_ms < REATTACH_WAIT_MS then
       return false -- the layout is still coming back from the agent: compare once it is
     end
     local fp, other = fingerprint()
@@ -618,7 +618,7 @@ local function suite_loader(): boolean
     return false
   end
   -- phase 2: a fresh core carrying on; wait for the layout, then compare
-  if host.agent_enabled and not host.reattach_done and now - R.phase_ms < REATTACH_WAIT_MS then return false end
+  if host.local_agent.enabled and not host.reattach_done and now - R.phase_ms < REATTACH_WAIT_MS then return false end
   local fp, other = fingerprint()
   local same = fp == R.st.fp
   local name: string = R.st.step == 1 and 'swap' or 'swap back'

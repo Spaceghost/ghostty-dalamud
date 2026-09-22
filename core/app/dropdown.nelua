@@ -569,7 +569,7 @@ global function draw_dropdown(now: float64, dt: float64): void
   bell_dropdown_glow()
 
   -- make sure there is a tab (after existing agent shells had a chance to reattach)
-  if #host.dropdown_tabs == 0 and (host.reattach_done or not host.agent_enabled) then
+  if #host.dropdown_tabs == 0 and (host.reattach_done or not host.local_agent.enabled) then
     dropdown_new_tab(policy.default_profile - 1)
   end
 

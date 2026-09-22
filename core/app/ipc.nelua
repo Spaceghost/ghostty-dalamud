@@ -337,12 +337,12 @@ end
 -- ghostty.agent_status() -> {connected, version, windows_ok, agent = 'host:port'}
 local function l_agent_status(L: *lua_State): cint
   lua_createtable(L, 0, 4)
-  local ready = host.agent_enabled and host.agent:ready()
+  local ready = host.local_agent.enabled and host.local_agent.client:ready()
   lua_pushboolean(L, ready and 1 or 0) lua_setfield(L, -2, 'connected')
-  lua_pushinteger(L, ready and host.agent.version or 0) lua_setfield(L, -2, 'version')
-  lua_pushboolean(L, (ready and host.agent:windows_ok()) and 1 or 0) lua_setfield(L, -2, 'windows_ok')
+  lua_pushinteger(L, ready and host.local_agent.client.version or 0) lua_setfield(L, -2, 'version')
+  lua_pushboolean(L, (ready and host.local_agent.client:windows_ok()) and 1 or 0) lua_setfield(L, -2, 'windows_ok')
   local sb: stringbuilder
-  if host.agent_enabled then sb:write(host.agent.host, ':', host.agent.port) end
+  if host.local_agent.enabled then sb:write(host.local_agent.client.host, ':', host.local_agent.client.port) end
   local where = sb:promote()
   push_str(L, where, 'agent')
   where:destroy()
