@@ -160,6 +160,9 @@ rm -f "$OUT/$TARNAME.tar.gz"
 cp -p "$FC44" "$OUT/ghostty-agent.fc44.x86_64.rpm"
 cp -p "$FC43" "$OUT/ghostty-agent.fc43.x86_64.rpm"
 cp -p "$OUT/$TARNAME.tar.gz" "$OUT/ghostty-agent-linux-x86_64.tar.gz"
+# both names for the source too: the versioned one is what the release notes
+# name, the stable one is what a URL can point at forever.
+[[ "$(cd "$(dirname "$SRC")" && pwd)" == "$OUT" ]] || cp -p "$SRC" "$OUT/"
 cp -p "$SRC" "$OUT/ghostty-agent-src.tar.gz"
 
 if [[ "$CHECK" == 1 ]]; then
@@ -180,11 +183,17 @@ if [[ "$CHECK" == 1 ]]; then
   rm -rf "$home"
   cmp "$STAGE/$TARNAME/ghostty-agent" /usr/bin/ghostty-agent ||
     die 'the tarball binary and the packaged binary differ'
-  log 'packing the source tarball twice to prove it is deterministic'
-  "$ROOT/tools/package-agent.sh" --version "$VERSION" --out "$ROOT/build/agent-det" >/dev/null
-  cmp "$SRC" "$ROOT/build/agent-det/ghostty-agent-$VERSION-src.tar.gz" ||
-    die 'two packs of the same source differ'
-  rm -rf "$ROOT/build/agent-det"
+  # Only where the checkout is: tools/package-agent.sh packs out of git, and a
+  # container that was handed a finished tarball has no index to pack from.
+  if [[ -d "$ROOT/.git" && -d "$ROOT/vendor/nelua-lang/.git" ]]; then
+    log 'packing the source tarball twice to prove it is deterministic'
+    "$ROOT/tools/package-agent.sh" --version "$VERSION" --out "$ROOT/build/agent-det" >/dev/null
+    cmp "$SRC" "$ROOT/build/agent-det/ghostty-agent-$VERSION-src.tar.gz" ||
+      die 'two packs of the same source differ'
+    rm -rf "$ROOT/build/agent-det"
+  else
+    log 'skipping the determinism re-pack: no checkout here, only the tarball'
+  fi
   log 'check passed'
 fi
 

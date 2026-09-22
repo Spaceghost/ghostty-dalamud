@@ -83,7 +83,7 @@ fi
 
 if [[ "$MODE" == agent ]]; then
   echo 'agent: the Nelua compiler is all tools/build-agent.sh needs'
-  return 0 2>/dev/null || exit 0
+  exit 0
 fi
 
 # The installed runtime and these compile-time reference assemblies are separate.

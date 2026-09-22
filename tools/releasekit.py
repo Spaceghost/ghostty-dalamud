@@ -236,6 +236,8 @@ def notes(c: dict[str, str], v: Version, assets: Path | None, rel: dict | None =
         if "ghostty-agent.fc43.x86_64.rpm" in have:
             out.append("* Fedora 43, and any other rpm distribution with glibc 2.36 or newer: the same with "
                        "`ghostty-agent.fc43.x86_64.rpm` \u2014 terminals, jobs and clips, no compositor.")
+        if "ghostty-agent.apk" in have:
+            out.append("* Alpine: `apk add --allow-untrusted ghostty-agent.apk` \u2014 it carries the compositor too.")
         if "ghostty-agent-linux-x86_64.tar.gz" in have:
             out.append(f"* Any other Linux: `ghostty-agent-{version}-linux-x86_64.tar.gz`, or build a package of "
                        f"your own from `ghostty-agent-{version}-src.tar.gz` with `rpmbuild -tb`.")
@@ -332,7 +334,8 @@ def verify(c: dict[str, str], v: Version, version4: str | None, wait: bool = Tru
             f"ghostty-agent-{version4}-src.tar.gz", "ghostty-agent-src.tar.gz",
             f"ghostty-agent-{version4}-linux-x86_64.tar.gz", "ghostty-agent-linux-x86_64.tar.gz",
             f"ghostty-agent-{version4}-1.fc44.x86_64.rpm", "ghostty-agent.fc44.x86_64.rpm",
-            f"ghostty-agent-{version4}-1.fc43.x86_64.rpm", "ghostty-agent.fc43.x86_64.rpm"}
+            f"ghostty-agent-{version4}-1.fc43.x86_64.rpm", "ghostty-agent.fc43.x86_64.rpm",
+            f"ghostty-agent-{version4}-r0.apk", "ghostty-agent.apk"}
     if want - have:
         raise Fail(f"release {v.tag} is missing " + ", ".join(sorted(want - have)))
     print(f"   release   {info['name']}: " + ", ".join(sorted(have)))

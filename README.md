@@ -341,6 +341,15 @@ own machine**.
   names the library it cannot provide. Terminals, jobs and clips work; remote
   desktop windows are not in this build.
 
+* **Alpine.** Alpine has wlroots 0.20, so its package carries the compositor too.
+
+  ```sh
+  doas apk add --allow-untrusted ghostty-agent.apk
+  ```
+
+  There is no service file: OpenRC has no per-user service manager to hang a
+  program that holds one person's terminals on, so you start it yourself.
+
 * **Any other Linux.**
 
   ```sh
@@ -356,6 +365,7 @@ Check what you downloaded against the release's own `SHA256SUMS`
 |---|---|
 | `ghostty-agent.fc44.x86_64.rpm` | Fedora 44 and newer, with the Wayland compositor |
 | `ghostty-agent.fc43.x86_64.rpm` | any rpm distribution with glibc 2.36+, no compositor |
+| `ghostty-agent.apk` | Alpine, musl, with the Wayland compositor |
 | `ghostty-agent-linux-x86_64.tar.gz` | the same binary as the `.fc43` package, its unit and its README |
 | `ghostty-agent-src.tar.gz` | the agent's own source; `rpmbuild -tb` builds a package from it offline |
 
