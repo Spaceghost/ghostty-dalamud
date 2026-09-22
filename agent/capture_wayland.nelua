@@ -1910,12 +1910,43 @@ local function type_keys(text: string): void
   end
 end
 
--- TEXT: committed as strings through the focused client's enabled text
--- input (any character), newlines and tabs as the Enter and Tab keys; a
--- client without one gets keys through the keymap.
+-- TEXT: keys through the keymap when the keymap can type the whole string,
+-- the focused client's text input otherwise.
+--
+-- It used to prefer the text input whenever the client had one, and that lost
+-- every keystroke in Firefox: it binds text-input-v3 and enables it on a
+-- focused field, so `ti_active` answered, `commit_string` went out, and
+-- nothing arrived. Typing in the address bar did nothing while Ctrl+T and
+-- Ctrl+W worked, because chords are KEY and never come through here.
+--
+-- The choice is per string, not per character. Mixing the two within one
+-- string loses characters: committing "e" through the text input and then
+-- pressing the next key made GTK's input method swallow that key, so
+-- "e" + "hello" arrived as "hllo" (tests/test_wayland_compositor).
 local function type_text(text: string): void
   local ti = ti_active(wc.kb_surface)
-  if ti == nilptr then type_keys(text) return end
+  -- can the keymap type every character? newline and tab are keys either way
+  local typable = true
+  do
+    local i = 1
+    while i <= #text do
+      local b = text:byte(i)
+      local cp: uint32 = b
+      local n = 1
+      if b >= 0xF0 then cp, n = b & 0x07, 4
+      elseif b >= 0xE0 then cp, n = b & 0x0F, 3
+      elseif b >= 0xC0 then cp, n = b & 0x1F, 2 end
+      for k = 1, n - 1 do
+        if i + k <= #text then cp = (cp << 6) | (text:byte(i + k) & 0x3F) end
+      end
+      i = i + n
+      if cp ~= 10 and cp ~= 13 and cp ~= 9 then
+        local ok, _, _ = wayland_key_for_codepoint(wc.keymap, cp)
+        if not ok then typable = false break end
+      end
+    end
+  end
+  if ti == nilptr or typable then type_keys(text) return end
   local start = 1
   for i = 1, #text + 1 do
     local b: uint8 = i <= #text and text:byte(i) or 0
