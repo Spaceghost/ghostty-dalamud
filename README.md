@@ -935,10 +935,13 @@ per-platform defaults and local fallbacks (`tests/test_platform.*`), `/term ask`
 agent's shared pure logic (`tests/test_agent_logic.nelua`) and glyph coverage
 -- emoji, wide characters, the fallback font chain and the tofu box for a code
 point no font has ([`docs/GLYPHS.md`](docs/GLYPHS.md),
-`tests/test_glyphfb.nelua`). Box drawing, block elements, braille, CJK and
-emoji have since been checked in game and render; powerline separators and Nerd
-Font glyphs came out blank, because the fallback chain has no font that carries
-that private-use range. Both C#
+`tests/test_glyphfb.nelua`). Checked in game and rendering: box drawing, block
+elements, braille, CJK, emoji, the powerline separators (U+E0B0..E0BF, drawn as
+shapes by `core/boxdraw.nelua`), Nerd Font icons in the BMP private-use area and
+Nerd Font icons above U+FFFF (U+F05A0, U+F0A0F), which can only come from
+`core/glyphfb.nelua` because Dalamud's ImGui stores 16-bit code points. An
+unassigned code point (U+10FFFD) drew the tofu box with its hex digits, which is
+what makes the rest of that list mean something. Both C#
 projects, the Windows DLLs and `ghostty-agent.exe` compile.
 
 **The standalone plugin, its info bar entry and the IPC-only Umbra widget have
