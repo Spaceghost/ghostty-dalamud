@@ -20,7 +20,7 @@
 -- Usage: ghostty-agent [--listen 127.0.0.1:7777] [--token-file PATH]
 --                      [--clipboard-file PATH] [--replay-bytes N] [--term xterm-256color]
 --                      [--windows auto|off|test|wayland|win32|mac]
---                      [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|none]
+--                      [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|gpu|none]
 --                      [--wayland-browser CMD] [--wayland-browser-profile NAME]
 --        ghostty-agent [--listen HOST:PORT] [--token-file PATH] --open-url URL
 require 'string'
@@ -707,9 +707,9 @@ local function main(): integer
     elseif a == '--windows' and i < #arg then windows_name = arg[i+1] i = i + 1
     elseif a == '--wayland-socket' and i < #arg then wayland_socket = arg[i+1] i = i + 1 -- Linux compositor only
     elseif a == '--xkb-layout' and i < #arg then xkb_layout = arg[i+1] i = i + 1
-    elseif a == '--wayland-render-node' and i < #arg then render_node = arg[i+1] i = i + 1 -- PATH, auto or none
+    elseif a == '--wayland-render-node' and i < #arg then render_node = arg[i+1] i = i + 1 -- PATH, auto, gpu or none
     elseif a == '--help' or a == '-h' then
-      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME] [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|none] [--wayland-browser CMD] [--wayland-browser-profile NAME]\n',
+      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME] [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|gpu|none] [--wayland-browser CMD] [--wayland-browser-profile NAME]\n',
                '       ghostty-agent [--listen HOST:PORT] [--token-file PATH] --open-url URL\n')
       return 0
     else
