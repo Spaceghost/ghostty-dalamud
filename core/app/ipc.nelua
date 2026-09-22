@@ -576,8 +576,10 @@ end
 
 -- The agent's last WLISTR ---------------------------------------------------------------
 
--- ghostty.agent_windows() -> { windows = {{wid, w, h, app, title, key, extra = {...}}, ...},
---                              apps = {{id, name, icon, categories}, ...}, answers = n }
+-- ghostty.agent_windows() -> { windows = {{wid, w, h, agent, app, title, key, extra = {...}}, ...},
+--                              apps = {{agent, id, name, icon, categories}, ...}, answers = n }
+-- `agent` is the machine the row is on ('' for this one), so a plugin drawing
+-- a launcher can show every linked machine and say which to open it on.
 local function l_agent_windows(L: *lua_State): cint
   lua_createtable(L, 0, 3)
   lua_createtable(L, (@cint)(#winlist.windows), 0)
@@ -585,8 +587,9 @@ local function l_agent_windows(L: *lua_State): cint
   for i = 0, < #winlist.windows do
     local e = &winlist.windows[i]
     if winlist_entry_never(e) then continue end -- CONFIG.windows.never: not shown to other plugins either
-    lua_createtable(L, 0, 7)
+    lua_createtable(L, 0, 8)
     lua_pushinteger(L, e.wid) lua_setfield(L, -2, 'wid')
+    push_str(L, e.agent, 'agent')
     lua_pushinteger(L, e.w) lua_setfield(L, -2, 'w')
     lua_pushinteger(L, e.h) lua_setfield(L, -2, 'h')
     push_str(L, e.app, 'app')
@@ -607,7 +610,8 @@ local function l_agent_windows(L: *lua_State): cint
   for i = 0, < #winlist.apps do
     local a = &winlist.apps[i]
     if winlist_app_never(a) then continue end
-    lua_createtable(L, 0, 4)
+    lua_createtable(L, 0, 5)
+    push_str(L, a.agent, 'agent')
     push_str(L, a.id, 'id')
     push_str(L, a.name, 'name')
     push_str(L, a.icon, 'icon')
