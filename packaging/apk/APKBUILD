@@ -32,6 +32,12 @@ makedepends="gcc make musl-dev bash"
 source="$pkgname-$pkgver-src.tar.gz"
 builddir="$srcdir/$pkgname-$pkgver"
 options="!check"  # check() runs the binary; see below
+# Alpine keeps man pages, READMEs and licences out of the program package, and
+# abuild enforces it: leave the man page in the root package and the build dies
+# with "Found uncompressed man pages" during prepare_subpackages. rpm compresses
+# man pages by itself, so the same packaging/ghostty-agent.1 is fine there and
+# only fails here.
+subpackages="$pkgname-doc"
 
 build() {
 	if [ "${SKIP_WAYLAND:-0}" = 1 ]; then
@@ -55,6 +61,9 @@ package() {
 		"$pkgdir"/usr/share/doc/$pkgname/README-agent.md
 	install -Dm0644 LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
 	install -Dm0644 packaging/ghostty-agent.1 "$pkgdir"/usr/share/man/man1/ghostty-agent.1
+	# Compress it here rather than leaving it to default_doc, so this does not
+	# depend on which abuild version does the compressing.
+	gzip -9n "$pkgdir"/usr/share/man/man1/ghostty-agent.1
 	# The systemd unit ships as documentation: it is what a systemd machine
 	# needs and what the tarball installs, and it is inert here.
 	install -Dm0644 packaging/ghostty-agent.service \
