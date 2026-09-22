@@ -263,7 +263,22 @@ global function agent_extras_setup(): void
     local cfg: *NamedAgentCfg = &policy.agents[i]
     local link: *AgentLink = new(@AgentLink)
     link.name = string.copy(cfg.name)
+    -- A link with no token of its own uses the CONFIG.agent one. These are the
+    -- owner's machines on one tailnet sharing one secret, and making every
+    -- entry repeat it means pasting a secret into config per machine. It is
+    -- also what happens in practice when token_file does not resolve: under
+    -- Wine `home` in init.lua points inside the prefix, not at the Linux home,
+    -- so the file is not there and the link would otherwise send nothing and
+    -- be refused with 'bad token'. Per-peer keys replace all of this
+    -- (docs/MULTI_AGENT.md, "Other people's machines").
     local tok = read_token_of(cfg.cfg.token, cfg.cfg.token_file)
+    if #tok == 0 then
+      tok:destroy()
+      tok = read_token()
+      if #tok > 0 then
+        logf(LOG_INFO, 'agent link "%s": no token of its own, using the CONFIG.agent one', cfg.name)
+      end
+    end
     link.client:init(cfg.cfg.host, (@uint16)(cfg.cfg.port), tok)
     tok:destroy()
     link.client.on_event = agent_event
