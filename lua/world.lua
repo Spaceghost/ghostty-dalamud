@@ -571,7 +571,11 @@ end
 -- reload (or game restart) reattaches them into the world, not the dropdown.
 
 local TRANSIENT = { t = true, placed_at = true, px = true, pz = true, phw = true, ls = true,
-  lu_t = true, lu_ang = true, lu_dist = true, lu_y = true, lu_scale = true }
+  lu_t = true, lu_ang = true, lu_dist = true, lu_y = true, lu_scale = true,
+  -- how far a pet has stepped aside and risen to keep off the others on screen
+  -- (M.pet.spread): worked out from where the camera is now, so saving it would
+  -- restore an answer to a question nobody asked any more
+  sp = true, sp_y = true }
 
 local function state_path()
   return (GHOSTTY_PLUGIN_DIR or '.') .. '/world-state.lua'

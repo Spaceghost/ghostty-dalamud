@@ -1,18 +1,37 @@
 # ghostty-agent, built from the agent's own source tarball.
 #
-#   rpmbuild -tb ghostty-agent-<version>-src.tar.gz                    # Fedora 44+, with the compositor
-#   rpmbuild -tb --without wayland ghostty-agent-<version>-src.tar.gz  # anywhere with rpm and glibc 2.36+
+#   rpmbuild -tb ghostty-agent-<version>-src.tar.gz
 #
-# tools/package-agent.sh writes that tarball and tools/ci/agent-rpm.sh builds
-# both flavours inside a Fedora container, so the packaged path and the
+# One command, on whatever you are building for. The spec decides for itself
+# whether the Wayland compositor goes in, because that depends on the
+# distribution and not on the person typing:
+#
+#   Fedora 44+   wlroots 0.20  -> compositor in, remote desktop windows work
+#   Fedora 43    wlroots 0.19  -> compositor out, terminals/jobs/clips
+#   Fedora 42    wlroots 0.19  -> compositor out
+#   anything else with rpm     -> compositor out
+#
+# Deciding here rather than at the command line is the point: the two builds
+# are not "a normal one and a cut-down one" that a person picks between, they
+# are what each distribution can actually support, and getting it wrong gives
+# either a package that will not install or one quietly missing the feature the
+# project is for. `--with wayland` and `--without wayland` still override, for
+# a distribution this list has not learned about yet.
+#
+# tools/package-agent.sh writes that tarball and tools/ci/agent-rpm.sh builds it
+# on each release in that release's own container, so the packaged path and the
 # documented path are one path. The tarball carries the pinned Nelua compiler,
-# so the build needs no network: it works in mock.
+# so the build needs no network: it works in mock, and so in COPR.
 #
 # No %changelog section: the project's changelog is CHANGELOG.md, generated from
 # lua/changelog.lua, and a second one would be a second thing to bump. rpmlint's
 # no-changelogname-tag, no-manual-page-for-binary and empty-%postun are accepted
 # for a package this pipeline builds rather than submits to Fedora.
+%if 0%{?fedora} >= 44
 %bcond_without wayland
+%else
+%bcond_with wayland
+%endif
 
 # Two builds of the same source agree: the build time comes from
 # SOURCE_DATE_EPOCH and tools/ci/agent-rpm.sh pins _buildhost.
