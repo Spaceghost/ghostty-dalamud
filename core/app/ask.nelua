@@ -246,7 +246,11 @@ local function draw_panel(focus: boolean): void
     policy_ask_draw()
   end
   imgui.End()
-  imgui.PopStyleColor(13)
+  -- 12, one per PushStyleColorU32 above. ImGui's PopStyleColor does not
+  -- check the depth in the build Dalamud ships: popping one too many reads
+  -- an empty ColorStack and writes Style.Colors at a junk index, which took
+  -- the game down the first frame /ask drew.
+  imgui.PopStyleColor(12)
 end
 
 -- Per frame: the jobs' output to Lua (always, so answers keep arriving while
