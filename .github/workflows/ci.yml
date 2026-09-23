@@ -3,12 +3,17 @@
 # Three jobs, and which of them exist is decided by repository variables, not
 # by editing this file:
 #
-#   hosted      GitHub-hosted runner (or whatever CI_RUNS_ON names). Always on,
-#               unless CI_HOSTED is set to the string "false".
-#   self-hosted the build host's runner, label from CI_SELF_HOSTED_LABELS
-#               (default `ghostty-dalamud`). Off unless CI_SELF_HOSTED is the
-#               string "true". Stages from CI_SELF_HOSTED_STAGES, so a small
-#               runner can be given `test` alone without editing this file.
+#   self-hosted this repository's own pushes and manual runs, on the fedora
+#               build host: ci-dispatchd boots a one-shot container from the
+#               ci-runner-ghostty image (Zig 0.16.0, the .NET 10 SDK, warm Zig
+#               and download caches) for the one job. Labels from
+#               CI_SELF_HOSTED_RUNS_ON (default self-hosted, ghostty-dalamud,
+#               fedora-ghostty). On unless CI_SELF_HOSTED is the string
+#               "false". It uploads the build artifact that ingame.yml uses.
+#               Stages from CI_SELF_HOSTED_STAGES.
+#   hosted      GitHub-hosted runner (or whatever CI_RUNS_ON names) for pull
+#               requests from forks, runs inside a fork, and every run while
+#               CI_SELF_HOSTED is "false". Off entirely if CI_HOSTED is "false".
 #   ingame-dryrun  the in-game path against a stand-in for XivMcp and the game.
 #               Costs seconds, needs no toolchain and no secret, and is the only
 #               thing that keeps tools/ci/ingame.sh honest between the rare runs
@@ -20,8 +25,9 @@
 #
 #   * the workflow has no `pull_request_target` trigger and no secret, so a
 #     fork's pull request runs with a read-only token and its own fork context;
-#   * the self-hosted job's `if` requires the pull request's head repository to
-#     be this repository, and that the repository is not a fork;
+#   * the self-hosted job's `if` never runs for a pull_request event, nor in a
+#     fork; the dispatcher also refuses any pull request whose head repository
+#     is not this one, before it mints a runner;
 #   * the runner labels are not GitHub's, so a fork of this repository has no
 #     runner to land on even if it edits this file;
 #   * and Settings -> Actions -> "require approval for all external
@@ -82,8 +88,10 @@ jobs:
   hosted:
     if: >-
       ${{ vars.CI_HOSTED != 'false'
-          && (github.event_name != 'pull_request'
-              || github.event.pull_request.head.repo.full_name != github.repository) }}
+          && ((github.event_name == 'pull_request'
+               && github.event.pull_request.head.repo.full_name != github.repository)
+              || (github.event_name != 'pull_request'
+                  && (github.event.repository.fork || vars.CI_SELF_HOSTED == 'false'))) }}
     permissions:
       contents: read
     uses: ./.github/workflows/build-test.yml
@@ -93,28 +101,27 @@ jobs:
       cache: true
       stages: test build
 
-  # The build host. Never a fork, never a fork's pull request: see the header.
+  # The build host. Never a fork, never a pull request (a branch of this
+  # repository was already built by its push): see the header.
   self-hosted:
     if: >-
-      ${{ vars.CI_SELF_HOSTED == 'true'
+      ${{ vars.CI_SELF_HOSTED != 'false'
           && !github.event.repository.fork
-          && (github.event_name != 'pull_request'
-              || github.event.pull_request.head.repo.full_name == github.repository) }}
+          && github.event_name != 'pull_request' }}
     permissions:
       contents: read
     uses: ./.github/workflows/build-test.yml
     with:
-      # a JSON array of labels; the runner carries self-hosted, Linux and X64
-      runs_on: >-
-        ${{ vars.CI_SELF_HOSTED_RUNS_ON
-            || format('["self-hosted","Linux","X64",{0}]', toJSON(vars.CI_SELF_HOSTED_LABELS || 'ghostty-dalamud')) }}
-      # the container keeps its own warm cache volume; the Actions cache would
-      # only duplicate it, and a self-hosted run has no minutes to save
-      cache: false
-      artifact: ''
-      # The dispatched container is small (2 CPUs, 4 GB by default). If a full
-      # build does not fit, set CI_SELF_HOSTED_STAGES to `test` and let the
-      # hosted job do the building. docs/CI.md.
+      # a JSON array of labels: ghostty-dalamud is this repository's
+      # registration with ci-dispatchd, fedora-ghostty picks the warm image
+      runs_on: ${{ vars.CI_SELF_HOSTED_RUNS_ON || '["self-hosted","ghostty-dalamud","fedora-ghostty"]' }}
+      # the image carries the toolchains, the pinned downloads and a warm Zig
+      # global cache; vendor/ and build/zig-cache-* live in the checkout, so the
+      # Actions cache still pays
+      cache: true
+      # this job, not hosted, produces the artifact ingame.yml installs
+      artifact: ghostty-dalamud-${{ github.sha }}
+      # The dispatcher gives fedora-ghostty containers 6 CPUs and 12 GB.
       stages: ${{ vars.CI_SELF_HOSTED_STAGES || 'test build' }}
       timeout: ${{ fromJSON(vars.CI_SELF_HOSTED_TIMEOUT || '120') }}
 

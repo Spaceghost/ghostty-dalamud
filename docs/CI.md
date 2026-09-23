@@ -9,8 +9,8 @@ set up .NET, restore caches and call it.
 | Trigger | Workflow, job | Runs | Output |
 | --- | --- | --- | --- |
 | every push and pull request | `ci.yml` → `source-checks` | `python3 -m unittest discover -s tests` (portability, identity tooling) | pass/fail in seconds; needs no toolchain |
-| push to any branch, pull request from a fork, manual | `ci.yml` → `hosted` | `tools/ci/run.sh test build` on a GitHub-hosted runner | artifact `ghostty-dalamud-<sha>` = `build/dist/` (kept 14 days) |
-| the same, when `CI_SELF_HOSTED` is `true`; never a fork | `ci.yml` → `self-hosted` | the same stages on the self-hosted runner | nothing uploaded; it is a second opinion, not the artifact |
+| push to any branch, manual; never in a fork | `ci.yml` → `self-hosted` | `tools/ci/run.sh test build` in a one-shot container on the fedora build host (image `ci-runner-ghostty`) | artifact `ghostty-dalamud-<sha>` = `build/dist/` (kept 14 days) |
+| pull request from a fork, any run inside a fork, and everything while `CI_SELF_HOSTED` is `false` | `ci.yml` → `hosted` | the same stages on a GitHub-hosted runner | artifact `ghostty-dalamud-<sha>` |
 | every push and pull request | `ci.yml` → `ingame-dryrun` | `tools/ci/run.sh ingame-dryrun` | pass/fail only; see [The dry run](#the-dry-run) |
 | tag `v*` | `release.yml` | `tools/ci/run.sh all` | GitHub Release for the tag with `build/release/*` (plugin zip, pluginmaster JSON, `SHA256SUMS`) and notes from the changelog |
 | push to `master`, manual; never pull requests or forks | `ingame.yml` → `ingame` | ci.yml's artifact of the commit, then `tools/ci/run.sh ingame` on the gaming PC after the owner approves | artifact `ingame-report-<sha>-<attempt>` (kept 30 days); see [In-game tests](#in-game-tests) |
@@ -116,30 +116,29 @@ a podman volume (below).
 
 ## Choosing the runner
 
-Nothing about where CI runs is spelled out in the YAML: it comes from
-repository variables (Settings → Secrets and variables → Actions → Variables),
-so adding or removing a machine is a `gh variable set`, not a commit.
+The default is in the YAML: this repository's own runs build on the fedora
+build host, and fork pull requests on GitHub's runners. Everything else comes
+from repository variables (Settings → Secrets and variables → Actions →
+Variables), so moving a run is a `gh variable set`, not a commit.
 
 | Variable | Default | What it does |
 | --- | --- | --- |
 | `CI_RUNS_ON` | `"ubuntu-latest"` | `runs-on` for the hosted job, as JSON: a string, or an array of labels |
-| `CI_HOSTED` | on | set to `false` to stop running the hosted job at all |
-| `CI_SELF_HOSTED` | off | set to `true` to add the self-hosted job |
-| `CI_SELF_HOSTED_LABELS` | `ghostty-dalamud` | the one custom label the self-hosted job asks for; it is always joined with `self-hosted`, `Linux`, `X64` |
-| `CI_SELF_HOSTED_RUNS_ON` | derived from the above | the whole `runs-on` array as JSON, when the derived one is not what you want |
+| `CI_HOSTED` | on | set to `false` to stop running the hosted job at all (fork pull requests then get no build) |
+| `CI_SELF_HOSTED` | on | set to `false` to send this repository's own runs to the hosted job too (the build host is down, say) |
+| `CI_SELF_HOSTED_RUNS_ON` | `["self-hosted","ghostty-dalamud","fedora-ghostty"]` | the self-hosted job's `runs-on` array as JSON. `ghostty-dalamud` is this repository's registration with `ci-dispatchd`; `fedora-ghostty` picks the warm `ci-runner-ghostty` image |
 | `CI_SELF_HOSTED_STAGES` | `test build` | stages for the self-hosted job; `test` alone for a small runner |
 | `CI_SELF_HOSTED_TIMEOUT` | `120` | its timeout in minutes |
 
 ```sh
-gh variable set CI_SELF_HOSTED --body true        # add the self-hosted job
+gh variable set CI_SELF_HOSTED --body false       # GitHub-hosted only
+gh variable delete CI_SELF_HOSTED                 # back to the build host
 gh variable set CI_SELF_HOSTED_STAGES --body test # only run the tests there
-gh variable delete CI_SELF_HOSTED                 # GitHub-hosted only again
 ```
 
-Both jobs run when both are enabled: GitHub's runner is the one that produces
-the artifact the release and the in-game run use, and the self-hosted one is a
-free second opinion on hardware you control. Nothing downstream depends on the
-self-hosted job.
+For a given run exactly one of the two jobs builds, and that job uploads the
+artifact `ghostty-dalamud-<sha>` that `ingame.yml` installs. The release is
+built by `release.yml` on a GitHub-hosted runner either way.
 
 ### Fork safety
 
@@ -149,9 +148,8 @@ self-hosted runners, and the design assumes any one of them may be wrong:
 
 1. **No `pull_request_target`, no secrets in `ci.yml`.** A fork's pull request
    runs with a read-only token in the fork's own context.
-2. **The job's `if`.** `self-hosted` requires
-   `github.event.pull_request.head.repo.full_name == github.repository` and
-   `!github.event.repository.fork`.
+2. **The job's `if`.** `self-hosted` never runs for a `pull_request` event and
+   requires `!github.event.repository.fork`.
 3. **The labels.** They are this fleet's labels, not GitHub's, so a fork of
    this repository has nothing to run on even with an edited workflow.
 4. **The dispatcher.** `ci-dispatchd`, which mints the runner, refuses any run
@@ -163,10 +161,9 @@ And Settings → Actions → General → *Approval for running fork pull request
 workflows*: **require approval for all external contributors**, which holds a
 new contributor's first run for a human.
 
-The repository is private: GitHub-hosted runs count against the account's
-monthly Actions minutes and cache storage quota. A full build compiles
-libghostty-vt twice with Zig and is the expensive part; the Zig caches make
-repeat runs much cheaper. Self-hosted runs cost no minutes.
+A full build compiles libghostty-vt twice with Zig and is the expensive part;
+the Zig caches make repeat runs much cheaper, and the build host's image starts
+with them warm.
 
 On GitHub-hosted runners the workflow installs the .NET 10 SDK with
 `actions/setup-dotnet`; the runner image below already has it, so that step is
@@ -249,10 +246,15 @@ configuration, not part of this repository. With the dispatcher in place,
 `tools/ci/runner/register.sh` is not needed on that machine at all — only on
 the gaming PC.
 
-A self-hosted runner executes whatever a workflow in this repository asks for.
-That is acceptable for a private repository whose collaborators are trusted;
-`ci.yml` never runs fork pull requests with secrets, but fork pull requests do
-run on the runner, so do not point a public fork's CI at it.
+The labels a job asks for also choose the image: `fedora-ghostty` boots
+`ci-runner-ghostty` (Zig 0.16.0 from `toolchain.env`'s pin, the .NET 10 SDK,
+the pinned Dalamud zip and a Zig global cache warmed by `tools/ci/run.sh deps
+test`), with 6 CPUs and 12 GB. The image recipe and the label table live with
+the host configuration, not in this repository.
+
+A self-hosted runner executes whatever a workflow in this repository asks for,
+so a fork's pull request must never reach it; see [Fork safety](#fork-safety).
+The container has no route to the LAN, the tailnet or the host.
 
 ## The dry run
 
