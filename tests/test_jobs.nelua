@@ -372,17 +372,13 @@ do -- 8 MiB of output while the client stops reading: flow control, nothing lost
   while i <= #st and (st:byte(i) == 32 or st:byte(i) == 9) do i = i + 1 end
   while i <= #st and st:byte(i) >= 48 and st:byte(i) <= 57 do kb = kb * 10 + (st:byte(i) - 48) i = i + 1 end
   print('agent VmRSS kB while 8 MiB of job output goes unread:', kb)
-  -- The agent under test is the sanitizer build when SAN is set (tests/run.sh):
-  -- AddressSanitizer's shadow memory and quarantine, ThreadSanitizer's shadow
-  -- and valgrind's own heap are in that number too, and put an ASan agent at
-  -- about 29 MiB with flow control working. The 24 MiB bound is the plain
-  -- build's; UBSan adds no shadow and keeps it. test_agent does the same.
+  -- The agent under test is the sanitizer build when SAN is set (tests/run.sh),
+  -- and a sanitizer's runtime, shadow memory and quarantine are in that number
+  -- too: an ASan or a UBSan agent sits at about 29 MiB here with flow control
+  -- working. The 24 MiB bound is the plain build's, as in test_agent.
   local limit = 24 * 1024
   local san = os.getenv('SAN')
-  if san:find('asan', 1, true) > 0 or san:find('tsan', 1, true) > 0 or san:find('valgrind', 1, true) > 0
-     or san:find('helgrind', 1, true) > 0 or san:find('drd', 1, true) > 0 or san == '1' then
-    limit = 512 * 1024
-  end
+  if san.size > 0 then limit = 512 * 1024 end
   san:destroy()
   assert(kb > 0 and kb < limit, 'the agent stops reading the job instead of buffering it all')
   c.paused = false
