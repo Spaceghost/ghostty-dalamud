@@ -457,7 +457,13 @@ local function suite_agent(): boolean
       return true
     end
     local p: Profile = { name = 'selftest', transport = 'agent' }
-    if platform_name() == 'windows' then
+    -- The agent's platform, not this plugin's. Under Wine the plugin is
+    -- Windows and the agent is the Linux host, and picking cmd.exe from
+    -- platform_name() made this case fail with status 127 on every Linux
+    -- agent. An agent too old to say falls back to what we are.
+    local agent_plat: string = host.local_agent.client.platform
+    if #agent_plat == 0 then agent_plat = platform_name() end
+    if agent_plat == 'windows' then
       p.argv:push('cmd.exe') p.argv:push('/c') p.argv:push('echo ' .. MARKER)
     else
       -- an absolute path, not `sh`: this runs on the agent's host, and the
