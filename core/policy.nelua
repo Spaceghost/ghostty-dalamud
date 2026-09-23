@@ -8,6 +8,7 @@ require 'core.world'
 require 'core.sys.fs'
 require 'core.sys.winpath'
 require 'core.desk'
+require 'core.lakitu'
 require 'core.theme'
 require 'core.tooltip'
 require 'io'
@@ -510,6 +511,7 @@ global function policy_load_dirs(install: string, config: string, configs_root: 
   world_lua_register(L)
   fs_lua_register(L)
   desk_lua_register(L)
+  lakitu_lua_register(L)
   policy.L = L
 
   local sb: stringbuilder
