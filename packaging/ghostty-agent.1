@@ -12,6 +12,27 @@ ghostty\-agent \- terminal and desktop-window server for the Ghostty plugin for 
 .IR PATH ]
 .B \-\-open\-url
 .I URL
+.br
+.B ghostty\-agent wg
+.RB [ \-\-config
+.IR PATH ]
+.B add
+.I NAME
+.RB [ \-\-endpoint
+.IR HOST [ :PORT ]]
+.RB [ \-\-no\-qr ]
+.br
+.B ghostty\-agent wg
+.RB [ \-\-config
+.IR PATH ]
+.BR list " | " show " | " remove
+.I NAME
+.RB "| " forward " | " unforward
+.RB [ tcp
+.IR PORT " | "
+.B udp
+.IR PORT [ \-PORT "] | "
+.BR sunshine ]
 .SH DESCRIPTION
 .B ghostty\-agent
 holds the terminal sessions that the Ghostty plugin shows inside Final Fantasy
@@ -35,11 +56,43 @@ says which it is when it starts.
 Address to listen on. Default
 .BR 127.0.0.1:7777 .
 The connection is authenticated by a token but is
-.B not encrypted:
-listen on loopback, on a private network such as Tailscale or WireGuard, or
-inside an
+.B not encrypted,
+so only loopback is accepted, or a tailnet address while Tailscale runs on this
+machine; anything else is refused (exit status 2). Reach the agent from
+another machine through its own WireGuard
+.RB ( "ghostty\-agent wg add" ),
+through Tailscale, or inside an
 .B ssh \-L
 tunnel.
+.TP
+.B \-\-allow\-insecure\-listen
+Listen on the
+.B \-\-listen
+address even when it is on the network, in the clear. The agent says so when it
+starts and logs every connection it accepts: anyone who can reach the port and
+read the token has a shell as you.
+.TP
+.BI \-\-wireguard " auto|on|off|always"
+The embedded WireGuard: a userspace WireGuard peer, no root or driver needed,
+that the ordinary WireGuard apps connect to, and whose tunnel address reaches
+this agent (and any ports
+.B ghostty\-agent wg forward
+allowed, on loopback only).
+.B auto
+(the default) starts it when
+.I wireguard.conf
+has a peer and Tailscale is not running here;
+.B on
+also when it has none, making the key if needed;
+.B always
+even with Tailscale;
+.B off
+never.
+.TP
+.BI \-\-wireguard\-config " PATH"
+The WireGuard file, instead of
+.I wireguard.conf
+beside the token. Naming it turns WireGuard on.
 .TP
 .BI \-\-token\-file " PATH"
 Where the shared token lives. Default
@@ -117,11 +170,48 @@ and exit, rather than starting a server.
 .TP
 .BR \-h ", " \-\-help
 Print usage and exit.
+.SH COMMANDS
+.TP
+.BI "wg add " NAME
+A new peer: prints the config for its WireGuard app (and a QR code for the
+phone apps) and the plugin's
+.B agent
+line. The peer's private key is shown once and kept nowhere.
+.B \-\-endpoint
+names how the peer reaches this machine (UDP 51820 unless given; forward it on
+your router);
+.B \-\-agent\-port
+the port the plugin line names.
+.TP
+.BR "wg list" ", " "wg show" ", " "wg remove " \fINAME\fR
+The peers with their tunnel addresses and last handshakes; this end's public
+key, port, addresses and forwards; dropping a peer, whose keys a running agent
+wipes within seconds.
+.TP
+.BR "wg forward" ", " "wg unforward"
+Let tunnel peers reach a port on this machine's loopback:
+.BI "tcp " PORT\fR,
+.BI "udp " PORT\fR[\fB\-\fIPORT\fR],
+or
+.B sunshine
+for Sunshine's TCP and UDP ports. A running agent follows the file.
 .SH FILES
 .TP
 .I ~/.config/ghostty\-agent/token
 The shared token, mode 0600, written on first start. The plugin reads the same
 file when the game and the agent are on one machine.
+.TP
+.I ~/.config/ghostty\-agent/wireguard.conf
+The embedded WireGuard: this end's private key, its port, the tunnel
+addresses, the forwards and the peers, in wg\-quick's format with
+.B Name
+and
+.B Forward
+added. Mode 0600. The running agent reads it again every two seconds.
+.I wireguard.conf.status
+beside it is what
+.B wg list
+shows.
 .TP
 .I /usr/lib/systemd/user/ghostty\-agent.service
 A systemd
@@ -160,11 +250,13 @@ Run it for a game on the same machine:
 .B ghostty\-agent \-\-listen 127.0.0.1:7777
 .RE
 .PP
-Run it on another machine, reachable over a private network, using whichever GPU
-it has:
+Run it on another machine, using whichever GPU it has, and let a gaming PC reach
+it through the built-in WireGuard:
 .PP
 .RS
-.B ghostty\-agent \-\-listen 0.0.0.0:7777 \-\-wayland\-render\-node gpu
+.B ghostty\-agent \-\-wayland\-render\-node gpu
+.br
+.B ghostty\-agent wg add gaming\-pc \-\-endpoint my\-home.example.org
 .RE
 .PP
 Reach an agent on another machine without exposing it:
@@ -181,11 +273,16 @@ Asked to print usage, or stopped cleanly.
 Could not listen on the given address.
 .TP
 .B 2
-A bad argument.
+A bad argument, a
+.B \-\-listen
+address on the network without
+.BR \-\-allow\-insecure\-listen ,
+or a WireGuard file that cannot be used.
 .SH SEE ALSO
 .BR systemctl (1),
 .BR loginctl (1),
-.BR ssh (1)
+.BR ssh (1),
+.BR wg (8)
 .PP
 The project, and the rest of the documentation:
 .UR https://github.com/Spaceghost/ghostty\-dalamud

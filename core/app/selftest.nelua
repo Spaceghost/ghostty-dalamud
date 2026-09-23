@@ -45,6 +45,7 @@ local Runner = @record{
   phase_ms: uint64,       -- when the phase began
   suite_ms: uint64,       -- when the current suite began
   session_id: integer,    -- the agent suite's terminal
+  typed: boolean,         -- the echo command has been written into that terminal
 }
 local R: Runner
 
@@ -456,23 +457,24 @@ local function suite_agent(): boolean
       add(SUITE_AGENT, 'echo', SelftestStatus.Skip, 0, 'no agent answered (start ghostty-agent to run this suite)')
       return true
     end
+    -- No argv: the agent opens its own default shell. It is the only party
+    -- that knows what that is, and every attempt to choose from this side has
+    -- been wrong -- platform_name() is the PLUGIN's platform, which under Wine
+    -- says windows while the agent is a Linux host, so this case ran cmd.exe
+    -- there and failed with status 127. The agent announces its platform now
+    -- (core/agent_client.nelua), but an agent too old to say still left the
+    -- guess wrong in exactly the case the guess exists for.
+    --
+    -- The command is typed into the terminal instead, in phase 1.
     local p: Profile = { name = 'selftest', transport = 'agent' }
-    if platform_name() == 'windows' then
-      p.argv:push('cmd.exe') p.argv:push('/c') p.argv:push('echo ' .. MARKER)
-    else
-      -- an absolute path, not `sh`: this runs on the agent's host, and the
-      -- agent's own PATH is whatever started it, which need not have one.
-      -- A session opened with no argv already falls back to /bin/sh.
-      p.argv:push('/bin/sh') p.argv:push('-c') p.argv:push('echo ' .. MARKER)
-    end
     local s = session_open(&p, 40, 4)
-    p.argv[2]:destroy()
     p.argv:destroy()
     if s == nilptr then
       add(SUITE_AGENT, 'open', SelftestStatus.Fail, 0, 'session_open failed')
       return true
     end
     R.session_id = s.id
+    R.typed = false
     R.phase, R.phase_ms, R.suite_ms = 1, now, now
     return false
   end
@@ -482,11 +484,19 @@ local function suite_agent(): boolean
       add(SUITE_AGENT, 'echo', SelftestStatus.Fail, now - R.phase_ms, 'the terminal went away before its output arrived')
       return true
     end
+    if not R.typed and not s.awaiting_open then
+      -- The shell echoes what is typed, so a command containing the marker
+      -- would be found in the grid whether or not it ever ran. The quotes are
+      -- removed by the shell: it prints the marker, while the echoed input
+      -- line does not contain it.
+      s:write_string('echo ghostty-sel\'\'ftest\n')
+      R.typed = true
+    end
     local out = selftest_record_termview(&s.view)
     local seen = out:find(MARKER_QUOTED, 1, true) > 0
     out:destroy()
     if seen then
-      add(SUITE_AGENT, 'echo', SelftestStatus.Pass, now - R.phase_ms, 'sh -c \'echo ghostty-selftest\' read back from the grid')
+      add(SUITE_AGENT, 'echo', SelftestStatus.Pass, now - R.phase_ms, 'the agent\'s own shell printed the marker, typed into the terminal')
       R.phase, R.phase_ms = 2, now
     elseif s.exited then
       local m = string.format('the shell ended (status %d) without printing %s', s.exit_status, MARKER)

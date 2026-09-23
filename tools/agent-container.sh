@@ -25,6 +25,11 @@
 #
 # Environment:
 #   GHOSTTY_AGENT_PORT   the port to listen on and forward (default 7777)
+#   GHOSTTY_AGENT_PROXY_ADDR  the host address the proxy listens on (default
+#                        0.0.0.0). The agent itself listens on loopback inside
+#                        the container (it refuses the network in the clear,
+#                        docs/WIREGUARD.md); the proxy is what reaches the host,
+#                        so give it the host's tailnet address where you can.
 #   GHOSTTY_AGENT_IMAGE  the image (default images:fedora/44)
 #   GHOSTTY_AGENT_RPM    a .rpm to install instead of the one in build/release
 #   INCUS                the incus binary (default: incus on PATH)
@@ -103,7 +108,7 @@ Type=simple
 Environment=HOME=/root
 Environment=XDG_RUNTIME_DIR=/run/user/0
 ExecStartPre=/usr/bin/mkdir -p /run/user/0
-ExecStart=/usr/bin/ghostty-agent --listen 0.0.0.0:$PORT --wayland-render-node gpu
+ExecStart=/usr/bin/ghostty-agent --listen 127.0.0.1:$PORT --wayland-render-node gpu
 Restart=on-failure
 RestartSec=5
 
@@ -116,7 +121,7 @@ systemctl enable --now ghostty-agent"
   log "forwarding the host's :$PORT into the container"
   "$INCUS" config device remove "$c" agentport >/dev/null 2>&1 || true
   "$INCUS" config device add "$c" agentport proxy \
-    "listen=tcp:0.0.0.0:$PORT" "connect=tcp:127.0.0.1:$PORT" >/dev/null
+    "listen=tcp:${GHOSTTY_AGENT_PROXY_ADDR:-0.0.0.0}:$PORT" "connect=tcp:127.0.0.1:$PORT" >/dev/null
 
   sleep 3
   exec_in "$c" sh -c 'systemctl is-active ghostty-agent >/dev/null' ||
@@ -127,8 +132,9 @@ systemctl enable --now ghostty-agent"
   log 'put this in lua/init.lua on the machine running the game:'
   printf '\n  agent = {\n    host = %s,\n    port = %s,\n    token = %s,\n  },\n\n' \
     "'<this machine on your private network>'" "$PORT" "'$(cmd_token "$c")'"
-  log 'then /term reload in game. The stream is authenticated but not encrypted:'
-  log 'keep it on a private network (Tailscale, WireGuard) or inside ssh -L.'
+  log 'then /term reload in game. The stream is authenticated but not encrypted, and the'
+  log "proxy listens on ${GHOSTTY_AGENT_PROXY_ADDR:-0.0.0.0}:$PORT of this host: keep that on a private network"
+  log '(GHOSTTY_AGENT_PROXY_ADDR=<tailnet address>), or use the agent'"'"'s own WireGuard (ghostty-agent wg).'
 }
 
 cmd_token() { exec_in "$1" cat /root/.config/ghostty-agent/token; }

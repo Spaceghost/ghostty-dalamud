@@ -10,6 +10,7 @@
 -- NOTHING BELOW HAS BEEN COMPILED OR RUN. No build, no cargo, no test suite was
 -- executed for this file; the unverified list is in the worker's report.
 require 'string'
+require 'stringbuilder'
 
 -- Is the iroh backend compiled into this build?
 --
@@ -101,6 +102,14 @@ local function listen(s: CSocket, backlog: cint): cint <cimport, nodecl> end
 local function accept(s: CSocket, addr: *sockaddr, len: *cint): CSocket <cimport, nodecl> end
 local function send(s: CSocket, buf: pointer, len: csize, flags: cint): isize <cimport, nodecl> end
 local function recv(s: CSocket, buf: pointer, len: csize, flags: cint): isize <cimport, nodecl> end
+local function shutdown(s: CSocket, how: cint): cint <cimport, nodecl> end
+## if ccinfo.is_windows then
+local peerlen_t = @cint
+## else
+local peerlen_t <cimport 'socklen_t', nodecl> = @cuint
+## end
+local function getpeername(s: CSocket, addr: *sockaddr, len: *peerlen_t): cint <cimport, nodecl> end
+local function ntohs(v: uint16): uint16 <cimport, nodecl> end
 local function setsockopt(s: CSocket, level: cint, name: cint, val: pointer, len: cint): cint <cimport, nodecl> end
 local function getaddrinfo(node: cstring, service: cstring, hints: *addrinfo, res: **addrinfo): cint <cimport, nodecl> end
 local function freeaddrinfo(res: *addrinfo): void <cimport, nodecl> end
@@ -135,6 +144,7 @@ local TCP_NODELAY: cint <cimport, nodecl, const>
 ## cemitdecl [[gi_handle gi_listen(const char *allowlist_path);]]
 ## cemitdecl [[gi_handle gi_accept(gi_handle listener);]]
 ## cemitdecl [[int32_t   gi_peer_id(gi_handle h, char *out, size_t cap);]]
+## cemitdecl [[int32_t   gi_peer_caps(gi_handle h);]]
 ## cemitdecl [[int32_t   gi_recv(gi_handle h, void *buf, size_t cap);]]
 ## cemitdecl [[int32_t   gi_send(gi_handle h, const void *buf, size_t len);]]
 ## cemitdecl [[void      gi_close(gi_handle h);]]
@@ -153,6 +163,7 @@ local function gi_connect_poll(h: gi_handle): int32 <cimport, nodecl> end
 local function gi_listen(allowlist_path: cstring): gi_handle <cimport, nodecl> end
 local function gi_accept(listener: gi_handle): gi_handle <cimport, nodecl> end
 local function gi_peer_id(h: gi_handle, out: cstring, cap: csize): int32 <cimport, nodecl> end
+local function gi_peer_caps(h: gi_handle): int32 <cimport, nodecl> end
 local function gi_recv(h: gi_handle, buf: pointer, cap: csize): int32 <cimport, nodecl> end
 local function gi_send(h: gi_handle, buf: pointer, len: csize): int32 <cimport, nodecl> end
 local function gi_close(h: gi_handle): void <cimport, nodecl> end
@@ -318,9 +329,22 @@ local iroh_started: boolean = false
 -- gi_init starts a tokio runtime and an endpoint, and a build that only ever
 -- speaks TCP (every test today) must not pay for that.
 --
--- The secret key path comes from GHOSTTY_IROH_KEY; unset means an ephemeral key
--- and therefore a NodeId that changes on every restart, which is fine for a
--- client and wrong for an agent that peers pin.
+-- The secret key path is net.iroh_set_key_path's, else GHOSTTY_IROH_KEY, else
+-- none -- and none means an ephemeral key, so the NodeId changes on every
+-- restart. That is not "fine for a client": once an agent keeps an allowlist
+-- it pins the CLIENT's key, and a key that rotates every launch cannot be
+-- allowlisted at all. core/app/agent.nelua points this at the plugin's config
+-- directory so the core keeps one identity.
+local iroh_key_path: string
+
+-- Call before the first iroh connection; later calls are ignored, since the
+-- endpoint is built once and its key with it.
+function net.iroh_set_key_path(path: string): void
+  if iroh_started then return end
+  iroh_key_path:destroy()
+  iroh_key_path = path:copy()
+end
+
 local function iroh_ensure(): boolean
   ## if NET_IROH then
     if iroh_started then return true end
@@ -329,8 +353,14 @@ local function iroh_ensure(): boolean
       err_buf[0] = 0
       return false
     end
-    local key = getenv('GHOSTTY_IROH_KEY')
+    local key: cstring = getenv('GHOSTTY_IROH_KEY')
+    local keyz: string
+    if #iroh_key_path > 0 then
+      keyz = iroh_key_path .. '\0'
+      key = (@cstring)(keyz.data)
+    end
     local rc = gi_init(key)
+    keyz:destroy()
     if rc ~= 0 then
       iroh_fail(rc)
       return false
@@ -641,6 +671,36 @@ function net.send(s: NetSocket, buf: pointer, len: usize): integer
   return -1
 end
 
+-- Where an accepted IPv4 connection comes from, "a.b.c.d:port"; '' when that
+-- is not known.
+function net.peer_address(s: NetSocket): string
+  -- An iroh peer has no IPv4 address to give: it is identified by its public
+  -- key, which net.peer_id answers. '' is already this function's word for
+  -- "not known", so there is nothing to invent here.
+  if is_iroh(s) then return (@string){} end
+  local a: sockaddr_in
+  local len: peerlen_t = #sockaddr_in
+  if getpeername(csock_of(s), (@*sockaddr)(&a), &len) ~= 0 or a.sin_family ~= (@cushort)(AF_INET) then return (@string){} end
+  local b = (@*[4]uint8)(&a.sin_addr)
+  local sb: stringbuilder
+  sb:writef('%d.%d.%d.%d:%d', (@integer)(b[0]), (@integer)(b[1]), (@integer)(b[2]), (@integer)(b[3]), (@integer)(ntohs(a.sin_port)))
+  return sb:promote()
+end
+
+-- Half-close: no more sends (the peer reads EOF), receiving goes on.
+function net.shutdown_write(s: NetSocket): void
+  -- Over iroh this is a no-op: the crate closes the send side when the
+  -- connection closes and exposes no half-close of its own, so a peer there
+  -- reads EOF at close rather than here. Callers that use the half-close as a
+  -- protocol signal need another one over iroh (docs/IROH.md).
+  if is_iroh(s) then return end
+  ## if ccinfo.is_windows then
+    shutdown(csock_of(s), 1) -- SD_SEND
+  ## else
+    shutdown(csock_of(s), 1) -- SHUT_WR
+  ## end
+end
+
 -- The pollable fd for a TCP connection, unchanged.
 --
 -- For an iroh handle the honest answer is "there isn't one", and this returns
@@ -707,22 +767,40 @@ end
 function net.node_id(): string
   ## if NET_IROH then
     if not iroh_ensure() then return string.copy('') end
-    local buf: [64]cchar
+    -- 80, not 64: the id is 64 characters and needs room for the NUL, and
+    -- gi_node_id refuses a buffer that cannot hold both. Passing #buf rather
+    -- than a literal is what stops the two drifting apart again -- this bug
+    -- was fixed in agent/agent.nelua and left here, which is how the Agents
+    -- window came to report "no iroh endpoint yet" on a core that had one.
+    local buf: [80]cchar
     buf[0] = 0
-    if gi_node_id((@cstring)(&buf), 64) < 0 then return string.copy('') end
+    if gi_node_id((@cstring)(&buf), #buf) < 0 then return string.copy('') end
     return string.copy((@string)((@cstring)(&buf)))
   ## else
     return string.copy('')
   ## end
 end
 
+-- What the allowlist grants an iroh peer (GI_CAP_*), or <0 when it cannot be
+-- told -- which callers must treat as "no capabilities", not "all of them".
+-- A TCP socket has no allowlist behind it and answers -1 for the same reason:
+-- the caller decides what a connection with no grants means, and for the
+-- socket path the token is still the whole authorisation.
+function net.peer_caps(s: NetSocket): int32
+  ## if NET_IROH then
+    if is_iroh(s) then return gi_peer_caps(iroh_of(s)) end
+  ## end
+  return -1
+end
+
 -- The peer's z-base-32 NodeId for an iroh connection, empty for a TCP one.
 function net.peer_id(s: NetSocket): string
   ## if NET_IROH then
     if is_iroh(s) then
-      local buf: [64]cchar
+      -- 80 and #buf, for the same reason as net.node_id above.
+      local buf: [80]cchar
       buf[0] = 0
-      if gi_peer_id(iroh_of(s), (@cstring)(&buf), 64) < 0 then return string.copy('') end
+      if gi_peer_id(iroh_of(s), (@cstring)(&buf), #buf) < 0 then return string.copy('') end
       return string.copy((@string)((@cstring)(&buf)))
     end
   ## end

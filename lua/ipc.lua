@@ -74,6 +74,47 @@ changes['window.open'] = function(p)
   return out
 end
 
+-- A photograph from the hovering camera (docs/CAMERA.md). The pose is
+-- optional: given, the camera moves there first; left out, it shoots from
+-- wherever it already is. The view goes back where it was found afterwards,
+-- so a caller can take a picture of the player without taking their camera
+-- away from them for more than the few frames it needs.
+changes['cam.shoot'] = function(p)
+  local out = {}
+  for _, k in ipairs({ 'distance', 'height', 'yaw', 'ease' }) do
+    local v = p[k]
+    if v ~= nil and v ~= json.null then
+      if type(v) ~= 'number' then return false, k .. ' must be a number' end
+      out[k] = v
+    end
+  end
+  if p.shot ~= nil and p.shot ~= json.null then
+    return false, 'cam.shoot takes the picture itself; use cam.set for the live view'
+  end
+  return out
+end
+
+-- Move the camera, or put it away, without taking a picture.
+changes['cam.set'] = function(p)
+  local out = {}
+  for _, k in ipairs({ 'distance', 'height', 'yaw', 'ease', 'orbit' }) do
+    local v = p[k]
+    if v ~= nil and v ~= json.null then
+      if type(v) ~= 'number' then return false, k .. ' must be a number' end
+      out[k] = v
+    end
+  end
+  for _, k in ipairs({ 'on', 'shot' }) do
+    local v = p[k]
+    if v ~= nil and v ~= json.null then
+      if type(v) ~= 'boolean' then return false, k .. ' must be true or false' end
+      out[k] = v
+    end
+  end
+  if next(out) == nil then return false, 'cam.set needs something to set' end
+  return out
+end
+
 changes['window.close'] = function(p)
   local id, err = panel_id(p)
   if not id then return false, err end
@@ -196,6 +237,7 @@ local reads = {
   ['agent.apps'] = function(s) return s.agent_apps end,
   ['focus.get'] = function(s) return s.focus end,
   ['status'] = function(s) return s.status end,
+  ['cam.state'] = function(s) return s.cam end,
 }
 
 function M.call(text)
@@ -355,6 +397,15 @@ function M.run(text)
     result, err = ghostty.window_place(p.id, p.pin)
   elseif req.method:sub(1, 6) == 'panel.' then
     result, err = run_panel(req.method, p)
+  elseif req.method == 'cam.shoot' then
+    if next(p) ~= nil then ghostty.cam(p) end
+    local ok, why = ghostty.cam_shoot(req.request)
+    -- The picture is not ready yet: this only says the shot was started, and
+    -- the file shows up in cam.state's `shots` against this request id.
+    if ok then result = { taking = true } else err = why end
+  elseif req.method == 'cam.set' then
+    ghostty.cam(p)
+    result = ghostty.cam_state()
   elseif req.method == 'keys.reserve' then
     local n
     n, err = ghostty.keys_reserve(caller or '', p.chords)
@@ -469,10 +520,17 @@ function M.snapshot()
   for _, p in ipairs(ghostty.world_panels and ghostty.world_panels() or {}) do
     if p.focused then focus = { id = p.id, kind = p.window and 'window' or 'terminal' } end
   end
+  local cam = ghostty.cam_state and ghostty.cam_state() or nil
+  if cam and ghostty.cam_shots then
+    local shots_rev, shots = ghostty.cam_shots()
+    local out = json.array()
+    for i, r in ipairs(shots) do out[i] = r end
+    cam.shots, cam.shots_rev = out, shots_rev
+  end
   return json.encode({
     rev = rev, windows = windows, requests = requests, panels = panels,
     agent = ghostty.agent_status(), status = ghostty.status(),
-    agent_windows = wins, agent_apps = apps, focus = focus,
+    agent_windows = wins, agent_apps = apps, focus = focus, cam = cam,
   })
 end
 

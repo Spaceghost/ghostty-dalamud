@@ -1,0 +1,77 @@
+-- A QR code in the terminal, for `ghostty-agent wg add` (docs/WIREGUARD.md
+-- "Files and the CLI"): the phone and tablet WireGuard apps import a config
+-- by scanning it. Nayuki's QR Code generator (vendored C, toolchain.env) does
+-- the encoding; this draws it two modules per character with half blocks, in
+-- black on white whatever the terminal's own colours, with the quiet zone
+-- scanners need.
+require 'string'
+require 'stringbuilder'
+require 'vector'
+
+##[[
+local fs = require 'nelua.utils.fs'
+local dir = fs.abspath(fs.join(context:get_visiting_directory(), '..', 'vendor', 'qrcodegen'))
+cincdir(dir)
+cfile(fs.join(dir, 'qrcodegen.c'))
+]]
+## cinclude '<qrcodegen.h>'
+
+local function qrcodegen_encodeText(text: cstring, temp: *[0]uint8, qr: *[0]uint8, ecl: cint,
+                                    minv: cint, maxv: cint, mask: cint, boost: boolean): boolean <cimport, nodecl> end
+local function qrcodegen_getSize(qr: *[0]uint8): cint <cimport, nodecl> end
+local function qrcodegen_getModule(qr: *[0]uint8, x: cint, y: cint): boolean <cimport, nodecl> end
+local qrcodegen_Ecc_LOW: cint <cimport, nodecl, const>
+local qrcodegen_Mask_AUTO: cint <cimport, nodecl, const>
+local qrcodegen_VERSION_MIN: cint <cimport, nodecl, const>
+local qrcodegen_VERSION_MAX: cint <cimport, nodecl, const>
+local QR_BUFFER: usize <comptime> = 3918 -- qrcodegen_BUFFER_LEN_MAX
+
+local QUIET: integer <comptime> = 2 -- modules of white around the code (the standard asks 4; terminals frame it anyway)
+
+-- The modules of `text` as a size x size grid (true: dark), or size 0 when
+-- it does not fit a QR code.
+global function wg_qr_modules(text: string, out: *vector(boolean)): integer
+  local temp: [QR_BUFFER]uint8
+  local qr: [QR_BUFFER]uint8
+  local z = text .. '\0'
+  local ok = qrcodegen_encodeText((@cstring)(z.data), &temp, &qr, qrcodegen_Ecc_LOW,
+                                  qrcodegen_VERSION_MIN, qrcodegen_VERSION_MAX, qrcodegen_Mask_AUTO, true)
+  z:destroy()
+  if not ok then return 0 end
+  local n = (@integer)(qrcodegen_getSize(&qr))
+  out:resize((@usize)(n * n))
+  for y = 0, < n do
+    for x = 0, < n do out[y * n + x] = qrcodegen_getModule(&qr, (@cint)(x), (@cint)(y)) end
+  end
+  return n
+end
+
+local function dark(mods: *vector(boolean), n: integer, x: integer, y: integer): boolean
+  x, y = x - QUIET, y - QUIET
+  return x >= 0 and y >= 0 and x < n and y < n and mods[y * n + x]
+end
+
+-- The code as lines of text: '█' both modules dark, '▀' the upper, '▄' the
+-- lower, ' ' neither, black on a white background.
+global function wg_qr_text(text: string): string
+  local mods: vector(boolean)
+  local n = wg_qr_modules(text, &mods)
+  if n == 0 then mods:destroy() return (@string){} end
+  local total = n + 2 * QUIET
+  local sb: stringbuilder
+  local y = 0
+  while y < total do
+    sb:write('\27[30;47m')
+    for x = 0, < total do
+      local top, bottom = dark(&mods, n, x, y), y + 1 < total and dark(&mods, n, x, y + 1)
+      if top and bottom then sb:write('█')
+      elseif top then sb:write('▀')
+      elseif bottom then sb:write('▄')
+      else sb:write(' ') end
+    end
+    sb:write('\27[0m\n')
+    y = y + 2
+  end
+  mods:destroy()
+  return sb:promote()
+end

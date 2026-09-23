@@ -23,6 +23,12 @@ cd "$ROOT" || exit 1
 OUT="$ROOT/build/static"; GEN="$OUT/c"; mkdir -p "$GEN"
 NELUA="$ROOT/vendor/nelua-lang/nelua"
 INC=(-I"$ROOT/vendor/ghostty/include" -I"$ROOT/vendor/gc-cimgui" -I"$ROOT/vendor/lua/src" -I"$ROOT/vendor/stb")
+# The agent's WireGuard (docs/WIREGUARD.md): vendored headers count as system
+# headers, so their own warnings are not ours; lwipopts.h is generated into
+# the Nelua cache by agent/wg_netstack.nelua.
+INC_CPPCHECK=("${INC[@]}") # cppcheck knows no -isystem; it leaves vendored headers alone
+INC+=(-isystem "$ROOT/vendor/monocypher/src" -isystem "$ROOT/vendor/lwip/src/include" -isystem "$OUT/nelua/lwip-port"
+  -isystem "$ROOT/vendor/qrcodegen")
 UNITS=(core/host:host core/loader:loader agent/agent:agent)
 update=0; steps=()
 for a in "$@"; do if [[ "$a" == --update ]]; then update=1; else steps+=("$a"); fi; done
@@ -59,7 +65,7 @@ for step in "${steps[@]}"; do
       while read -r name n; do budget "warnings-$name" "$n" "build/static/warnings-$name.log"; done <"$OUT/warnings.txt" ;;
     cppcheck)
       cppcheck --quiet --enable=warning,portability --inline-suppr \
-        --suppress=missingIncludeSystem --suppress=unknownMacro "${INC[@]}" "$GEN" 2>"$OUT/cppcheck.log"
+        --suppress=missingIncludeSystem --suppress=unknownMacro "${INC_CPPCHECK[@]}" "$GEN" 2>"$OUT/cppcheck.log"
       budget cppcheck "$(grep -c ': \(error\|warning\|portability\)' "$OUT/cppcheck.log")" build/static/cppcheck.log ;;
     analyze)
       : >"$OUT/analyze.log"

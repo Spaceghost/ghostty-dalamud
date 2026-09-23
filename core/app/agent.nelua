@@ -335,6 +335,13 @@ local function agent_extras_pump(now: float64): void
 end
 
 global function agent_setup(): void
+  do -- one iroh identity for this install, so an agent's allowlist can name it
+    local sb: stringbuilder
+    sb:write(host.dir, '/iroh.key')
+    local p = sb:promote()
+    net.iroh_set_key_path(p)
+    p:destroy()
+  end
   host.local_agent.client:destroy()
   local tok = read_token()
   host.local_agent.client:init(policy.agent.host, (@uint16)(policy.agent.port), tok)

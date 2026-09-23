@@ -183,9 +183,15 @@ goes out when it settles.
   queue is under 4 MiB, the backend's `serial` changed and some visible pixel
   changed. The agent keeps a copy of what the client shows and diffs against
   it; the first frame and every size change are KEY frames.
-* Scaling is by the smallest integer factor that fits (box filter). WINPUT
-  coordinates are pixels of the frames as sent; the agent maps them back
-  (`x * factor + factor / 2`) and clamps them to the window.
+* Scaling is to the largest size that fits `max_w`×`max_h` with the window's
+  aspect ratio (`wincodec_fit`), by area averaging: each frame pixel is the
+  mean of the window area it covers, with the window pixels its edges cut
+  weighted by how much of them it covers. A 2560×1440 window under the
+  default 1920×1200 limit arrives at 1920×1080, not halved to 1280×720.
+  WINPUT coordinates are pixels of the frames as sent; the agent maps each
+  back to the window pixel under that frame pixel's centre
+  (`wincodec_unscale`) and clamps it to the window. WGEOM boxes cover every
+  frame pixel they touch (`wincodec_scale_span`).
 * WCLOSE has no answer. A live stream whose `state` becomes ENDED gets WEND
   with the backend's reason and is forgotten.
 * The main loop sleeps no longer than `wait_ms` of the backend and of the

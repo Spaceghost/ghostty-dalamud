@@ -210,6 +210,7 @@ global Host = @record{
   world_order_swap_id: integer,      -- applied after the panel loop: these two swap places
   world_order_swap_with: integer,
   window_picker_open: boolean,       -- the Windows picker (/window, core/app/winpicker.nelua)
+  agents_open: boolean,              -- the Agents window (/term agents, core/app/agentpanel.nelua)
   world_tuning: WorldTuning,        -- CONFIG.world.present / walk, read each frame
   hud_mask: HudMask,                -- the game's HUD this frame (core/hudmask.nelua; empty when off)
   walk: WorldWalk,                  -- walking up to the clicked panel
