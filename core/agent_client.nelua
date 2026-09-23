@@ -34,6 +34,9 @@ global AgentClient = @record{
   state: AgentState,
   host: string,
   port: uint16,
+  -- An iroh NodeId, when the link is addressed by key instead of host:port.
+  -- Set, it is what connect() dials and host/port are only for the log line.
+  node: string,
   token: string,
   inq: ByteQueue,
   outq: ByteQueue,
@@ -71,6 +74,7 @@ function AgentClient:destroy(): void
   self.inq:destroy()
   self.outq:destroy()
   self.host:destroy()
+  self.node:destroy()
   self.token:destroy()
   self.last_error:destroy()
   self.attach_fifo:destroy()
@@ -100,7 +104,11 @@ function AgentClient:connect(now: float64): void
   self.attach_fifo:clear()
   self.clip_fifo:clear()
   self.clip_off = false
-  self.conn = net.connect(self.host, self.port)
+  if #self.node > 0 then
+    self.conn = net.connect_node(self.node)
+  else
+    self.conn = net.connect(self.host, self.port)
+  end
   if not net.is_valid(self.conn.sock) then
     self.state = AgentState.Failed
     set_error(self, 'connect failed')

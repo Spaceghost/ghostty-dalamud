@@ -280,6 +280,8 @@ global function agent_extras_setup(): void
       end
     end
     link.client:init(cfg.cfg.host, (@uint16)(cfg.cfg.port), tok)
+    link.client.node:destroy()
+    link.client.node = cfg.cfg.node:copy()
     tok:destroy()
     link.client.on_event = agent_event
     link.client.ctx = link -- which link an event came from
@@ -287,7 +289,11 @@ global function agent_extras_setup(): void
     link.last_try = -100.0
     link.prev_state = AgentState.Disconnected
     host.agents:push(link)
-    logf(LOG_INFO, 'agent link "%s": %s:%d', link.name, cfg.cfg.host, cfg.cfg.port)
+    if #cfg.cfg.node > 0 then
+      logf(LOG_INFO, 'agent link "%s": iroh %s', link.name, cfg.cfg.node)
+    else
+      logf(LOG_INFO, 'agent link "%s": %s:%d', link.name, cfg.cfg.host, cfg.cfg.port)
+    end
   end
 end
 
@@ -332,6 +338,8 @@ global function agent_setup(): void
   host.local_agent.client:destroy()
   local tok = read_token()
   host.local_agent.client:init(policy.agent.host, (@uint16)(policy.agent.port), tok)
+  host.local_agent.client.node:destroy()
+  host.local_agent.client.node = policy.agent.node:copy()
   tok:destroy()
   host.local_agent.client.on_event = agent_event
   host.local_agent.client.ctx = nilptr
