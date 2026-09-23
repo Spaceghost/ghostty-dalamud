@@ -1,0 +1,125 @@
+-- A WireGuard device on a real UDP socket that answers ping inside the
+-- tunnel: the agent's half of tools/wg-interop.sh, which points kernel
+-- WireGuard at it (docs/WIREGUARD.md "Tests"). It logs one line per event a
+-- test can wait for: `handshake <n> index <i>`, `endpoint <addr>`, `echo <n>`.
+--
+--   wg_interop PORT PRIVATE_KEY_B64 PEER_PUBLIC_B64 PSK_B64 PEER_ALLOWED SECONDS
+require 'string'
+require 'arg'
+require 'os'
+require 'io'
+require 'memory'
+require 'agent.crypto'
+require 'agent.wg_device'
+require 'agent.wg_udp'
+
+## if not ccinfo.is_windows then
+## cinclude '<poll.h>'
+local pollfd <cimport, nodecl, ctypedef> = @record{ fd: cint, events: cshort, revents: cshort }
+local function poll(fds: *[0]pollfd, n: culong, timeout: cint): cint <cimport, nodecl> end
+local POLLIN: cshort <cimport, nodecl, const>
+## end
+
+local udp: WgUdp
+local dev: WgDevice
+local echoes = 0
+
+local function say(s: string): void
+  io.stdout:write(s, '\n')
+  io.stdout:flush()
+end
+
+local function carrier_send(ud: pointer, ep: *WgEndpoint, data: *[0]uint8, len: usize): void
+  udp:send(ep, data, len)
+end
+
+local function csum(p: *[0]uint8, len: usize, start: uint32): uint16
+  local sum = start
+  local i: usize = 0
+  while i + 1 < len do sum = sum + (((@uint32)(p[i]) << 8) | p[i + 1]) i = i + 2 end
+  if i < len then sum = sum + ((@uint32)(p[i]) << 8) end
+  while sum > 0xffff do sum = (sum & 0xffff) + (sum >> 16) end
+  return (@uint16)(~sum & 0xffff)
+end
+
+-- IPv4 ICMP echo request in, echo reply out through the device
+local function deliver(ud: pointer, peer: *WgPeer, pkt: *[0]uint8, len: usize): void
+  if len < 28 or pkt[0] >> 4 ~= 4 or pkt[9] ~= 1 then return end
+  local ihl = (@usize)(pkt[0] & 15) * 4
+  if len < ihl + 8 or pkt[ihl] ~= 8 then return end
+  local out: [2048]uint8
+  if len > 2048 then return end
+  memory.copy(&out, pkt, len)
+  for i = 0, < 4 do out[12 + i], out[16 + i] = pkt[16 + i], pkt[12 + i] end
+  out[8] = 64
+  out[10], out[11] = 0, 0
+  local h = csum(&out, ihl, 0)
+  out[10], out[11] = (@uint8)(h >> 8), (@uint8)(h & 0xff)
+  out[ihl] = 0 -- echo reply
+  out[ihl + 2], out[ihl + 3] = 0, 0
+  local c = csum(&out[ihl], len - ihl, 0)
+  out[ihl + 2], out[ihl + 3] = (@uint8)(c >> 8), (@uint8)(c & 0xff)
+  echoes = echoes + 1
+  dev:send_packet(&out, len, os.now())
+  if echoes % 10 == 1 then say('echo ' .. tostring(echoes)) end
+end
+
+local function main(): integer
+  if #arg < 6 then io.stderr:write('usage: wg_interop PORT KEY PEER PSK ALLOWED SECONDS\n') return 2 end
+  local port = (@uint16)(tointeger(arg[1]))
+  local sk: [32]uint8
+  local pk: [32]uint8
+  local psk: [32]uint8
+  if not crypto.key_from_base64(arg[2], &sk) or not crypto.key_from_base64(arg[3], &pk)
+     or not crypto.key_from_base64(arg[4], &psk) then io.stderr:write('bad key\n') return 2 end
+  local allowed: WgCidr
+  if not wgp.parse_cidr(arg[5], &allowed) then io.stderr:write('bad allowed ip\n') return 2 end
+  local seconds = tonumber(arg[6])
+  if not udp:open(port) then io.stderr:write('cannot bind\n') return 1 end
+  dev.send = carrier_send
+  dev.deliver = deliver
+  dev.wall = wg_wall
+  dev:init(&sk)
+  local p = dev:add_peer('kernel', &pk, &psk)
+  p.allowed:push(allowed)
+  say('listening ' .. tostring(port) .. (udp.v6 and ' dual-stack' or ' ipv4'))
+  local seen_index: uint32 = 0
+  local handshakes = 0
+  local ep: WgEndpoint
+  local start = os.now()
+  local buf: [65536]uint8
+  while os.now() - start < seconds do
+    local wait = dev:next_timer(os.now())
+    if wait > 0.1 then wait = 0.1 end
+    ## if not ccinfo.is_windows then
+    local fds: [1]pollfd = { { fd = udp:fd(), events = POLLIN } }
+    poll(&fds, 1, (@cint)(wait * 1000) + 1)
+    ## end
+    while true do
+      local from: WgEndpoint
+      local n = udp:recv(&buf, 65536, &from)
+      if n < 0 then break end
+      if n > 0 then dev:receive(&from, &buf, (@usize)(n), os.now()) end
+    end
+    dev:tick(os.now())
+    -- a new session: its keypair became current (for the responder, once the
+    -- initiator's first data message confirmed it)
+    if p.current.valid and p.current.local_index ~= seen_index then
+      seen_index = p.current.local_index
+      handshakes = handshakes + 1
+      say('handshake ' .. tostring(handshakes) .. ' index ' .. tostring(seen_index))
+    end
+    if p.endpoint.family ~= 0 and not p.endpoint:same(&ep) then
+      ep = p.endpoint
+      local s = ep:tostring()
+      say('endpoint ' .. s)
+      s:destroy()
+    end
+  end
+  say('done echoes ' .. tostring(echoes) .. ' handshakes ' .. tostring(handshakes))
+  dev:destroy()
+  udp:close()
+  return 0
+end
+
+os.exit(main())
