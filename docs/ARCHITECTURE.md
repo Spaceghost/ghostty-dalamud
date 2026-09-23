@@ -750,8 +750,15 @@ the agent compiles them in.
 | `test_wayland_compositor` | the agent's Wayland compositor with a real client (`yad`, GTK3): launch through `run:`, map, frame size and content, click and TEXT/KEY/WHEEL input changing the pixels, WLIST, close, a launch that exits without a window; context menus outside the window (xdg and X11) with their boxes; an X11 client through Xwayland; release and re-attach by key; WLIST `apps` and `app:` launches with cached icons; a nested desktop (cage); text-input-v3 and the clipboard read back through `yad --entry`; writes PNGs to `build/test-scratch/wayland` (only with `vendor/wayland-sdk`; skipped without yad) |
 | `test_e2e_wayland` | the plugin's agent client against a real `ghostty-agent --windows wayland`: `run:yad`, KEY and delta frames with WACK pacing, click and TEXT reaching the app, WGEOM for a context menu, the clipboard both ways (`--clipboard-file`), a disconnect keeping the app and WOPEN `key:` re-attaching it, a Flatpak GTK4 app staying mapped, SIGTERM ending the apps the agent launched (only with `vendor/wayland-sdk` and yad) |
 | `test_netlab` | the agent's netlab (docs/NETLAB.md), built twice: without moq_iroh every call says it is not built; with it, the test window published over real iroh connections in one process, the fast subscription's pictures decoded to exactly the backend's frames, the slow one (150 ms an object) losing groups and flagging the gap, stats with a selected direct path and its rtt |
+| `test_netlab_agent` | netlab over the agent protocol against a real agent (`--windows test`): NLCTL answered by NLREPLY, NLSTAT to a watcher, `demo` with no relay, NLFRAMEs rebuilt into the test window, a second connection subscribing by ticket and `view off`, the slow subscription losing groups, stop, and agents without netlab or window capture refusing |
 
 The last step checks that the core also compiles as a native host module.
+
+`tools/netlab-containers.sh` is manual too (it needs Incus): two agents in two
+containers and `iroh-relay --dev` in a third; `tests/netlab_probe.nelua` has
+B subscribe to A through the relay and checks what the netlab panel reads on
+both (relay path first, then direct; B's pictures exactly A's; the slow
+subscription losing groups). One PASS or FAIL line.
 
 `tests/smoke_agent_windows.nelua` is manual: a host client for a running
 `ghostty-agent.exe` (on Windows, or under Wine in a throwaway prefix) that
