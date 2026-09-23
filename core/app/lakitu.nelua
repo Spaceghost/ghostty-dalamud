@@ -18,6 +18,7 @@ require 'core.desk'  -- desk_yaw_quat: the same +Y turn the other client-side pr
 require 'core.world'
 require 'core.lakitu'
 require 'core.app.state'
+require 'core.app.capture'  -- the one frame buffer and the shot stages are shared
 
 local CREATE_RETRY_FRAMES: uint64 <comptime> = 300
 local LOAD_TIMEOUT_FRAMES: uint64 <comptime> = 600
@@ -164,6 +165,98 @@ local function calibrate(pc: *GuObject, dh: float32, dv: float32, dist: float32)
   if not cal_v_ok then cal_v_off = elev - cal_v_slope * dv end
 end
 
+local SHOT_SETTLE_FRAMES: integer <comptime> = 3    -- frames at the pose before firing
+local SHOT_AIM_FRAMES: integer <comptime> = 180     -- a pose the view never reaches
+local SHOT_TAKE_FRAMES: integer <comptime> = 600    -- a capture that never lands
+
+local function shot_finish(ok: boolean, path: cstring, err: cstring): void
+  lakitu_shot_record(lakitu_shot.request, ok, path, err)
+  -- Put the view back the way it was asked for: if the person was not already
+  -- watching through the camera, hand it back.
+  lakitu_want.shot = lakitu_shot.saved_shot
+  lakitu_shot = {}
+end
+
+-- Ask for a photograph from where the camera is. The pose is whatever the
+-- camera is set to, so aiming it first is `ghostty.cam{...}` then this.
+-- Returns false when one is already being taken: there is a single frame
+-- buffer under all of this and queueing pictures of a moving character is not
+-- worth the complication.
+global function lakitu_shoot(request: uint64): (boolean, string)
+  if lakitu_shot.stage ~= LAKITU_SHOT_IDLE then
+    return false, 'a shot is already being taken'
+  end
+  if lakitu_block ~= 0 then
+    return false, 'the camera cannot be shown right now'
+  end
+  if not can_steer() then
+    return false, 'this plugin build cannot move the camera'
+  end
+  lakitu_shot = {}
+  lakitu_shot.request = request
+  lakitu_shot.saved_shot = lakitu_want.shot
+  lakitu_shot.stage = LAKITU_SHOT_AIMING
+  lakitu_want.on = true
+  lakitu_want.shot = true -- the view goes to the camera; `saved_shot` puts it back
+  return true, (@string){}
+end
+
+-- Advance a shot that is in flight. Called at the end of lakitu_sync, once the
+-- view for this frame has already been written.
+local function shot_tick(dh: float32, dv: float32, dist: float32, want_h: float32,
+                         want_v: float32, want_d: float32): void
+  if lakitu_shot.stage == LAKITU_SHOT_IDLE then return end
+  lakitu_shot.waited = lakitu_shot.waited + 1
+
+  if lakitu_shot.stage == LAKITU_SHOT_AIMING then
+    -- Close enough that another frame would not move the picture.
+    local there = math.abs(wrap(dh - want_h)) < 0.02 and math.abs(dv - want_v) < 0.02
+      and math.abs(dist - want_d) < 0.1
+    if there then
+      lakitu_shot.stage = LAKITU_SHOT_SETTLING
+      lakitu_shot.settle = SHOT_SETTLE_FRAMES
+      lakitu_shot.waited = 0
+    elseif lakitu_shot.waited > SHOT_AIM_FRAMES then
+      shot_finish(false, nilptr, 'the camera never reached the pose')
+    end
+    return
+  end
+
+  if lakitu_shot.stage == LAKITU_SHOT_SETTLING then
+    -- The game has to actually draw a frame from here before it is worth
+    -- photographing: the first frame after the camera moves is the old one.
+    lakitu_shot.settle = lakitu_shot.settle - 1
+    if lakitu_shot.settle > 0 then return end
+    local started, why = capture_shot_begin(false, false, false)
+    if not started then
+      -- Something else is using the one frame buffer; wait rather than fail.
+      if lakitu_shot.waited > SHOT_TAKE_FRAMES then
+        shot_finish(false, nilptr, (@cstring)(why.data))
+      end
+      lakitu_shot.settle = 1
+      return
+    end
+    lakitu_shot.saw_serial = capture_shot.serial
+    lakitu_shot.stage = LAKITU_SHOT_TAKING
+    lakitu_shot.waited = 0
+    return
+  end
+
+  if lakitu_shot.stage == LAKITU_SHOT_TAKING then
+    if capture_shot.serial == lakitu_shot.saw_serial then
+      if lakitu_shot.waited > SHOT_TAKE_FRAMES then
+        shot_finish(false, nilptr, 'the shot was never written')
+      end
+      return
+    end
+    if capture_shot.ok then
+      shot_finish(true, (@cstring)(capture_shot.path.data), nilptr)
+    else
+      shot_finish(false, nilptr, (@cstring)(capture_shot.error.data))
+    end
+  end
+end
+
 -- Once per frame while a character is in the world.
 global function lakitu_sync(now: float64): void
   defer frame = frame + 1 end
@@ -179,6 +272,9 @@ global function lakitu_sync(now: float64): void
   -- A scene that cannot hold the camera takes it away at once: easing
   -- something that is about to stop being drawn is worse than a jump.
   if lakitu_block ~= 0 then
+    if lakitu_shot.stage ~= LAKITU_SHOT_IDLE then
+      shot_finish(false, nilptr, 'the camera was put away before the shot')
+    end
     if steering or giving_back then drop_view() end
     if obj ~= nilptr then obj_free() end
     az_live = false
@@ -320,11 +416,17 @@ global function lakitu_sync(now: float64): void
     ease(dv, want_v, lakitu_want.ease, dt),
     ease(dist, want_d, lakitu_want.ease, dt))
   lakitu_live.steering, lakitu_live.giving_back = true, false
+  -- dh/dv/dist are this frame's starting point, which is what "has the view
+  -- arrived" has to be judged on: the set above lands on the next frame.
+  shot_tick(dh, dv, dist, want_h, want_v, want_d)
 end
 
 -- /term cam [on|off|shot|body|left|right|up|down|in|out|orbit|still|reset]
 -- The framing is three numbers, so the words are all nudges of them and a
 -- person can find a shot without a menu.
+-- The state machine above is what core/lakitu.nelua hands to Lua.
+lakitu_shoot_fn = lakitu_shoot
+
 global function lakitu_command(args: string): cint
   local a = args
   if #a == 0 or a == 'on' then
@@ -355,13 +457,22 @@ global function lakitu_command(args: string): cint
     lakitu_want.orbit = lakitu_want.orbit ~= 0 and 0 or (@float32)(0.15)
   elseif a == 'still' then
     lakitu_want.orbit = 0
+  elseif a == 'shoot' then
+    -- A photograph from where the camera is, with the view put back after.
+    local ok, why = lakitu_shoot(0)
+    if not ok then
+      logf(LOG_WARN, 'cam: %s', why)
+      return 4
+    end
+    log(LOG_INFO, 'cam: taking a shot')
+    return 0
   elseif a == 'reset' then
     local on, shot, model, serial = lakitu_want.on, lakitu_want.shot, lakitu_want.model, lakitu_want.serial
     lakitu_want = lakitu_defaults()
     lakitu_want.on, lakitu_want.shot, lakitu_want.model, lakitu_want.serial = on, shot, model, serial
     spin = 0
   else
-    log(LOG_WARN, '/term cam [on|off|shot|body|left|right|up|down|in|out|orbit|still|reset]')
+    log(LOG_WARN, '/term cam [on|off|shot|shoot|body|left|right|up|down|in|out|orbit|still|reset]')
     return 4
   end
   if not lakitu_want.on then lakitu_want.shot = false end
