@@ -4,6 +4,7 @@
 require 'core.app.popup'
 require 'core.app.selftest'
 require 'core.app.rain'
+require 'core.app.lakitu'
 require 'core.app.capture'
 local strconv: type = require 'detail.strconv'
 
@@ -386,6 +387,10 @@ global function run_command(cmd: string): cint
     -- put in an allowlist.
     host.agents_open = not host.agents_open
     return 0
+  elseif verb == 'cam' then
+    -- /term cam [on|off|shot|...]: the hovering camera (docs/CAMERA.md). With
+    -- the shot on it is the view, because the game only has the one.
+    return lakitu_command(arg)
   elseif verb == 'selftest' then
     -- /term selftest [list | all | suite...]: checks inside the live game (core/app/selftest.nelua)
     return selftest_command(arg)
