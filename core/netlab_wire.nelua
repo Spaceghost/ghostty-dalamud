@@ -1,0 +1,86 @@
+-- Netlab's agent protocol payloads (docs/NETLAB.md), built and parsed here for
+-- both ends: the agent (agent/netlab.nelua) and the plugin (core/app/netlab.nelua).
+--
+--   NLCTL    req u32, command line
+--   NLREPLY  req u32, ok u8, text
+--   NLSTAT   JSON
+--   NLFRAME  sub u32, group u64, index u32, flags u8, lat_us u32, then WFRAME
+--            frames (each with its 5-byte protocol header): one picture
+require 'string'
+require 'core.protocol'
+
+global NETLAB_FRAME_HEAD: usize <comptime> = 4 + 8 + 4 + 1 + 4
+global NETLAB_FLAG_GROUP_START: uint8 <comptime> = 1 -- the first object of its group (a key picture)
+global NETLAB_FLAG_GAP: uint8 <comptime> = 2         -- groups were skipped or cut before this one
+
+global NetlabFrameHead = @record{
+  sub: uint32,
+  group: uint64,
+  index: uint32,
+  flags: uint8,
+  lat_us: uint32,
+}
+
+global netlab_wire = @record{}
+
+function netlab_wire.write_ctl(q: *ByteQueue, req: uint32, cmd: string): void
+  proto.write_frame_id(q, PROTO_NLCTL, req, (@*[0]uint8)(cmd.data), cmd.size)
+end
+
+function netlab_wire.write_reply(q: *ByteQueue, req: uint32, ok: boolean, text: string): void
+  local hd: [10]uint8
+  hd[0] = PROTO_NLREPLY
+  proto.put_u32((@*[0]uint8)(&hd[1]), (@uint32)(5 + text.size))
+  proto.put_u32((@*[0]uint8)(&hd[5]), req)
+  hd[9] = ok and 1 or 0
+  q:push(&hd, 10)
+  q:push((@*[0]uint8)(text.data), text.size)
+end
+
+-- NLFRAME's header; the body (len bytes of WFRAME frames) is pushed after it.
+function netlab_wire.write_frame_head(q: *ByteQueue, h: NetlabFrameHead, len: usize): void
+  local hd: [5 + NETLAB_FRAME_HEAD]uint8
+  hd[0] = PROTO_NLFRAME
+  proto.put_u32((@*[0]uint8)(&hd[1]), (@uint32)(NETLAB_FRAME_HEAD + len))
+  proto.put_u32((@*[0]uint8)(&hd[5]), h.sub)
+  proto.put_u64((@*[0]uint8)(&hd[9]), h.group)
+  proto.put_u32((@*[0]uint8)(&hd[17]), h.index)
+  hd[21] = h.flags
+  proto.put_u32((@*[0]uint8)(&hd[22]), h.lat_us)
+  q:push(&hd, #hd)
+end
+
+-- NLCTL: (ok, req, command); the command borrows the payload.
+function netlab_wire.parse_ctl(p: *[0]uint8, len: usize): (boolean, uint32, string)
+  if len < 4 then return false, 0, (@string){} end
+  return true, proto.get_u32(p), string{data=(@*[0]byte)(&p[4]), size=len - 4}
+end
+
+-- NLREPLY: (ok, req, success, text); the text borrows the payload.
+function netlab_wire.parse_reply(p: *[0]uint8, len: usize): (boolean, uint32, boolean, string)
+  if len < 5 then return false, 0, false, (@string){} end
+  return true, proto.get_u32(p), p[4] ~= 0, string{data=(@*[0]byte)(&p[5]), size=len - 5}
+end
+
+-- NLFRAME: (ok, head, body, body length); the body borrows the payload.
+function netlab_wire.parse_frame(p: *[0]uint8, len: usize): (boolean, NetlabFrameHead, *[0]uint8, usize)
+  if len < NETLAB_FRAME_HEAD then return false, (@NetlabFrameHead){}, nilptr, 0 end
+  local h: NetlabFrameHead = {
+    sub = proto.get_u32(p),
+    group = proto.get_u64((@*[0]uint8)(&p[4])),
+    index = proto.get_u32((@*[0]uint8)(&p[12])),
+    flags = p[16],
+    lat_us = proto.get_u32((@*[0]uint8)(&p[17])),
+  }
+  return true, h, (@*[0]uint8)(&p[NETLAB_FRAME_HEAD]), len - NETLAB_FRAME_HEAD
+end
+
+-- The next WFRAME payload of an NLFRAME body at `pos`: (ok, payload, its
+-- length, the position after it). Not ok at the end or on a malformed body.
+function netlab_wire.next_wframe(body: *[0]uint8, len: usize, pos: usize): (boolean, *[0]uint8, usize, usize)
+  if pos + PROTO_HEADER > len then return false, nilptr, 0, pos end
+  if body[pos] ~= PROTO_WFRAME then return false, nilptr, 0, pos end
+  local n = (@usize)(proto.get_u32((@*[0]uint8)(&body[pos + 1])))
+  if n > len - pos - PROTO_HEADER then return false, nilptr, 0, pos end
+  return true, (@*[0]uint8)(&body[pos + PROTO_HEADER]), n, pos + PROTO_HEADER + n
+end

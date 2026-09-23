@@ -15,7 +15,9 @@
 -- capture backend from agent/capture.nelua (--windows). Raw jobs (protocol
 -- version 4, docs/JOBS.md) are agent/jobs.nelua over agent/job_posix.nelua:
 -- a process on pipes whose output a client parses, with the Claude Code
--- command line built in agent/claude.nelua. Jobs run as this user.
+-- command line built in agent/claude.nelua. Jobs run as this user. Netlab
+-- (docs/NETLAB.md, NLCTL) is agent/netlab.nelua: a window published as a moq
+-- broadcast over iroh, subscribers to it, and their stats for the panel.
 --
 -- Usage: ghostty-agent [--listen 127.0.0.1:7777] [--iroh] [--token-file PATH]
 --                      [--clipboard-file PATH] [--replay-bytes N] [--term xterm-256color]
@@ -53,6 +55,7 @@ require 'agent.clips'
 require 'agent.wg_service'
 require 'agent.wg_cli'
 require 'agent.tailscale'
+require 'agent.netlab'
 ## if ccinfo.is_windows then
 require 'agent.pty_windows'
 require 'agent.sys_windows'
@@ -186,6 +189,7 @@ local windows: AgentWindows
 local jobs: AgentJobs
 local clips: AgentClips
 local wg: WgService
+local netlab: AgentNetlab -- docs/NETLAB.md
 
 local function log(msg: string): void
   io.stderr:write('[ghostty-agent] ', msg, '\n')
@@ -534,12 +538,19 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     send_text(c, PROTO_ERR, 'not permitted: this peer may not see windows')
   elseif typ == PROTO_WOPEN and (c.caps & CAP_RUN) == 0 and wopen_starts_program(payload, len) then
     send_text(c, PROTO_ERR, 'not permitted: this peer may not start programs')
+  elseif typ == PROTO_NLCTL and (c.caps & CAP_WINDOWS) == 0 then
+    -- netlab publishes and shows this machine's windows: the grant WOPEN needs
+    local req: uint32 = 0
+    if len >= 4 then req = proto.get_u32(payload) end
+    netlab_wire.write_reply(&c.outq, req, false, 'not permitted: this peer may not see windows')
   elseif jobs:handle(ci, &c.outq, typ, payload, len) then
     -- a raw job frame (agent/jobs.nelua)
   elseif windows:handle(ci, &c.outq, typ, payload, len) then
     -- a window frame (agent/windows.nelua)
   elseif clips:handle(ci, &c.outq, typ, payload, len) then
     -- a clip frame (agent/clips.nelua)
+  elseif netlab:handle(ci, &c.outq, typ, payload, len) then
+    -- a netlab command (agent/netlab.nelua)
   else
     send_text(c, PROTO_ERR, 'unknown frame')
   end
@@ -654,6 +665,7 @@ local function reap(): void
       windows:client_gone((@usize)(i))
       jobs:client_gone((@usize)(i))
       clips:client_gone((@usize)(i))
+      netlab:client_gone((@usize)(i))
       for si = 0, < #agent.sessions do
         session_detach(&agent.sessions[si], (@usize)(i))
         -- shift indexes above i
@@ -729,6 +741,8 @@ local function windows_cap(ms: integer): integer
   if j >= 0 and j < ms then ms = j end
   local g = wg:wait_ms(os.now())
   if g >= 0 and g < ms then ms = g end
+  local n = netlab:wait_ms(os.now())
+  if n >= 0 and n < ms then ms = n end
   return ms
 end
 
@@ -1155,6 +1169,16 @@ local function main(): integer
   end
   wg_path:destroy()
   ts:destroy()
+  do -- netlab (docs/NETLAB.md): its iroh key beside the token, so the endpoint id stays
+    local slash = 0
+    for i = 1, #token_path do
+      if token_path.data[i - 1] == '/'_b then slash = i end
+    end
+    local key: string = slash > 0 and token_path:subview(1, slash) .. 'netlab.key' or ''
+    netlab:init(windows.ok, windows.backend, key, log)
+    key:destroy()
+    netlab.queue_of, netlab.sink, netlab.sink_ctx = client_queue, netlab_frame_sink, &netlab
+  end
 
   ## if ccinfo.is_windows then
   local listen_ev = winloop_watch(agent.listen_sock, true)
@@ -1211,6 +1235,7 @@ local function main(): integer
     windows:tick(os.now())
     jobs:pump(os.now())
     clips:tick(os.now())
+    netlab:tick(os.now())
     for ci = 0, < #agent.clients do flush_client(ci) end
     reap()
   end
@@ -1245,6 +1270,10 @@ local function main(): integer
       for k = 0, < wn do
         if n < 512 then fds[n] = { fd = wfds[k], events = POLLIN } n = n + 1 end
       end
+    end
+    do -- netlab's subscriptions have something (agent/netlab.nelua)
+      local nfd = netlab:wake_fd()
+      if nfd >= 0 and n < 512 then fds[n] = { fd = nfd, events = POLLIN } n = n + 1 end
     end
     do -- the jobs' stdout and stderr pipes (agent/jobs.nelua)
       local jfds: [128]cint
@@ -1301,6 +1330,7 @@ local function main(): integer
     windows:tick(os.now())
     jobs:pump(os.now())
     clips:tick(os.now())
+    netlab:tick(os.now())
     for ci = 0, < #agent.clients do flush_client(ci) end
     reap()
   end
@@ -1318,6 +1348,7 @@ local function main(): integer
   end
   ## end
   wg:stop() -- keys wiped, forwards closed
+  netlab:destroy() -- its endpoints close, so peers see the connections end
   jobs:shutdown() -- jobs are not orphaned behind the agent, kept or not
   ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
   capture_wayland_shutdown() -- apps launched into the compositor are ended, not orphaned

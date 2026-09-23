@@ -218,6 +218,11 @@ wait_port "$WPORT" "$WAGENT" || { cat build/agent-windows.log; exit 1; }
 # the first agent runs --windows off: window requests are refused with the reason
 "${SAN_PREFIX[@]}" "$NCACHE"/test_agent_windows "$WPORT" testtoken123 "$PORT"
 
+echo "--- test_netlab_agent"
+"$NELUA" --cc "$CC" -P nogc --cache-dir "$NCACHE" -L . -b tests/test_netlab_agent.nelua
+if [[ ${#NETLAB_DEFINE[@]} -gt 0 ]]; then NL_BUILT=1; else NL_BUILT=0; fi
+"${SAN_PREFIX[@]}" "$NCACHE"/test_netlab_agent "$WPORT" testtoken123 "$NL_BUILT" "$PORT" || { tail -20 build/agent-windows.log; exit 1; }
+
 if [[ ${#WAYLAND_DEFINE[@]} -gt 0 ]]; then
   # a real Wayland client (yad, GTK3) in the agent's compositor; frames land in build/test-scratch/wayland
   mkdir -p build/test-scratch/wayland
