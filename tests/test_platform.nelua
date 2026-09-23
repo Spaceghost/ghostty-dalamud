@@ -27,6 +27,7 @@ do
     io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
     os.exit(1)
   end
+  script:destroy()
   lua_pushlstring(L, (@cstring)(root.data), root.size)
   lua_pushlstring(L, (@cstring)(scratch.data), scratch.size)
   if lua_pcall(L, 2, 0, 0) ~= LUA_OK then
@@ -42,7 +43,9 @@ do
   local dir = scratch .. '/platform'
   local luadir = dir .. '/lua'
   assert(fs_mkdir((@cstring)(dir.data)) and fs_mkdir((@cstring)(luadir.data)))
-  local f = io.open(luadir .. '/init.lua', 'wb')
+  local init = luadir .. '/init.lua'
+  local f = io.open(init, 'wb')
+  init:destroy()
   f:write([[
 return { profiles = {
   { name = 'a', transport = 'agent', command = { 'x' }, fallback = 'a (local)' },
@@ -53,7 +56,7 @@ return { profiles = {
   { name = 'e', transport = 'conpty', command = { 'cmd.exe' }, fallback = 'a' },
 } }
 ]])
-  f:close()
+  f:destroy()
   assert(policy_load(dir), policy.error)
   local a = policy_profile(0)
   assert(a.fallback == 'a (local)' and policy_profile(1).fallback == '')
@@ -85,5 +88,6 @@ return { profiles = {
   s:destroy()
   agent:destroy()
   policy_unload()
+  dir:destroy() luadir:destroy()
 end
 print('OK')

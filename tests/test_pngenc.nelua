@@ -273,7 +273,9 @@ do
   defer file:destroy() end
   assert(png_encode((@*[0]uint8)(&px[0]), (@usize)(w * 4), w, h, true, &file), 'encode 1080p')
   local raw = w * h * 3
-  print('1080p frame: ' .. tostring(#file) .. ' bytes, raw ' .. tostring(raw))
+  local line = string.format('1080p frame: %d bytes, raw %d', #file, raw)
+  print(line)
+  line:destroy()
   assert(#file < 8 * 1024 * 1024, 'a 1080p screenshot fits what the gallery takes')
   assert(#file * 4 < raw, 'and it really is compressed')
   local dw, dh = png_size((@*[0]uint8)(&file[0]), (@usize)(#file))

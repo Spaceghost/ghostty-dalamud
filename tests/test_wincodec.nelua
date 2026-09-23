@@ -72,6 +72,7 @@ do
   o3:resize((@usize)(w3 * 4))
   assert(wincodec_qoi_decode((@*[0]uint8)(&e3[0]), #e3, (@*[0]uint8)(&o3[0]), (@usize)(w3 * 4), 0, 0, w3, 1))
   assert(same_rgb((@*[0]uint8)(&v3[0]), (@*[0]uint8)(&o3[0]), w3))
+  src:destroy() enc:destroy() dst:destroy() sub:destroy() d2:destroy() v3:destroy() e3:destroy() o3:destroy()
 end
 
 -- changed tiles
@@ -100,6 +101,7 @@ do
   -- whole window when there is no previous frame
   wincodec_diff(nilptr, 0, (@*[0]uint8)(&b[0]), (@usize)(w * 4), w, h, &rects)
   assert(#rects == 1 and rects[0].w == w and rects[0].h == h)
+  a:destroy() b:destroy() rects:destroy()
 end
 
 -- sizing: the largest size that fits, aspect kept, never past a limit
@@ -238,6 +240,7 @@ do
   f, ow, oh = wincodec_downscale((@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, 5, 5, &out)
   assert(f == 2 and ow == 5 and oh == 3)
   assert(out[0] == 5 and out[1] == 10, 'factor 2 averages four pixels (rounded)')
+  src:destroy() out:destroy()
 end
 
 -- input and geometry map between window pixels and frame pixels
@@ -276,6 +279,7 @@ do
     rows = rows + rects[i].h
   end
   assert(rows == 1000)
+  rects:destroy()
 end
 
 -- WFRAME: write, parse, apply; a noisy 1920x1080 key frame spans several WFRAMEs
@@ -322,7 +326,9 @@ do
   local frames, bytes = roundtrip(64, 48, 5)
   assert(frames == 1)
   frames, bytes = roundtrip(1920, 1080, 9)
-  print(('1920x1080 key frame: %d WFRAMEs, %d bytes (raw %d)'):format(frames, bytes, 1920 * 1080 * 4))
+  local line = string.format('1920x1080 key frame: %d WFRAMEs, %d bytes (raw %d)', frames, bytes, 1920 * 1080 * 4)
+  print(line)
+  line:destroy()
   assert(frames >= 2, 'a large frame is split under the budget')
 end
 

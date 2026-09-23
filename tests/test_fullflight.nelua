@@ -139,8 +139,10 @@ local function fly(label: string, view_w: float32, view_h: float32, w: float32, 
   -- text rows, and rows of nothing but a white background (a program's output
   -- with a background colour): those go out as one merged run the width of the
   -- grid, with no glyphs in them -- what showed outside the panel in game
-  local text_row: string = string.rep('x', cols0 * 2) .. '\r\n'
-  local bg_row: string = '\27[47m' .. string.rep(' ', cols0) .. '\27[0m\r\n'
+  local xs, blanks = string.rep('x', cols0 * 2), string.rep(' ', cols0)
+  local text_row: string = xs .. '\r\n'
+  local bg_row: string = string.format('\27[47m%s\27[0m\r\n', blanks)
+  xs:destroy() blanks:destroy()
   for _ = 1, (rows0 + 4) // 2 do
     tv:feed((@*[0]uint8)(text_row.data), text_row.size)
     tv:feed((@*[0]uint8)(bg_row.data), bg_row.size)
