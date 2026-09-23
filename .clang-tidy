@@ -1,11 +1,15 @@
 # clang-tidy over the C Nelua generates (tools/ci/static.sh tidy). The checks
 # that find real defects stay on; the ones below are off because generated
 # code cannot satisfy them (reserved identifiers, its own naming and casts).
+# cert-dcl16-c (a lowercase `l` literal suffix reads like a 1) is about
+# hand-written C: Nelua's code generator writes every long double literal with
+# a lowercase `l` (39 of them in its own strconv.num2str), and nobody reads
+# the generated file for its literals.
 Checks: >
   -*,bugprone-*,cert-*,clang-analyzer-*,
   -bugprone-reserved-identifier,-cert-dcl37-c,-cert-dcl51-cpp,
   -bugprone-easily-swappable-parameters,-bugprone-macro-parentheses,
   -bugprone-narrowing-conversions,-bugprone-multi-level-implicit-pointer-conversion,-bugprone-implicit-widening-of-multiplication-result,
   -clang-analyzer-security.insecureAPI.DeprecatedOrUnsafeBufferHandling,
-  -cert-err33-c,-cert-err34-c
+  -cert-err33-c,-cert-err34-c,-cert-dcl16-c
 WarningsAsErrors: ''
