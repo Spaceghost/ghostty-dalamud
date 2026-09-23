@@ -209,10 +209,53 @@ function M.bell()
   end)
 end
 
+-- world: what the game's collision answers from your chest (the pets look at
+-- walls through it; lua/world.lua), and what each pet's last look found.
+function M.world()
+  return suite('world', function(case)
+    local rc = ghostty.raycast
+    if type(rc) ~= 'function' then
+      case('raycast', 'fail', 'ghostty.raycast is missing: pets cannot see walls')
+      return
+    end
+    local p = ghostty.player and ghostty.player() or nil
+    if not p then case('raycast', 'skip', 'no character loaded') return end
+    local ox, oy, oz = p.x, p.y + 1.1, p.z
+    local down = rc(ox, oy, oz, 0, -1, 0, 5)
+    case('raycast down', down ~= nil, down and string.format('the ground %.2f yalms below the chest', down)
+      or 'nothing within 5 yalms below the chest: the game collision answered no ray, so pets see no walls')
+    local fx, fz = math.sin(p.rotation), math.cos(p.rotation)
+    local ahead = rc(ox, oy, oz, fx, 0, fz, 30)
+    case('raycast ahead', 'pass', ahead and string.format('%.2f yalms ahead', ahead) or 'nothing within 30 yalms ahead')
+    local near, near_dir, hits = nil, 0, 0
+    for i = 0, 15 do
+      local ang = p.rotation + i * math.pi / 8
+      local d = rc(ox, oy, oz, math.sin(ang), 0, math.cos(ang), 30)
+      if d then
+        hits = hits + 1
+        if not near or d < near then near, near_dir = d, i * 22.5 end
+      end
+    end
+    case('nearest wall', 'pass', near and string.format('%.2f yalms, %.1f degrees round from where you face; %d of 16 directions hit within 30 yalms', near, near_dir, hits)
+      or 'no wall within 30 yalms in 16 directions')
+    local W = CONFIG and CONFIG.world
+    if W and W.anchors then
+      for id, a in pairs(W.anchors) do
+        if a.kind == 'pet' and not a.hidden then
+          case('pet ' .. tostring(id), 'pass', string.format('swing %.2f, in %.2f, up %.2f, %s; %s; %d blinks',
+            a.m_off or 0, a.m_pull or 0, a.m_dy or 0, a.m_fit == false and 'no room found' or 'room',
+            a.m_blink or 'shown', a.m_blinks or 0))
+        end
+      end
+    end
+  end)
+end
+
 function M.run(name, scratch)
   if name == 'settings' then return M.settings(scratch) end
   if name == 'themes' then return M.themes() end
   if name == 'bell' then return M.bell() end
+  if name == 'world' then return M.world() end
   return 'suite\tfail\tno Lua suite named ' .. clean(name)
 end
 

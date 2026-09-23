@@ -264,22 +264,41 @@ snapped back every frame.
   **not** avoided: the shim gives Lua no way to list nearby objects, only you,
   your target and objects by entity id.
 * **The world.** `ghostty.raycast` (the shim's `BGCollisionModule.RaycastMaterialFilter`,
-  the background collision the game's own ScreenToWorld uses) from your chest
-  (`collide.chest` above your feet) to the pet's centre and both edges says
-  how far in it must come to stay `collide.margin` in front of a wall
-  (`motion.pull_in`). Never into your personal space: when its slot has no
-  room it swings round you, nearest first, up to `collide.swing` radians and
-  never into the no-go cones, keeping a way round it found while that still
-  fits; with nowhere to go it takes the least cramped place. Rays straight
-  down and up from its centre keep its bottom above a floor or ledge and its
-  top below a ceiling (`motion.headroom`; the floor wins when there is no room
-  for both). That is looked at `collide.probe_hz` times a second per pet, and
-  every frame one ray from your chest to where the spring has the pet now
-  catches a wall the spring is lagging through (a contact, and the next look
-  comes at once). All pets together cast at most `collide.rays` rays a frame.
-  An older core without `ghostty.raycast` (or a shim without `raycast`)
-  simply sees no walls. Collision is background only: characters, and props
-  the game only draws, are invisible to it.
+  the background collision the game's own ScreenToWorld uses). Two parts:
+  * *Where a pet goes* (`probe_world`, on the spring's target, never its
+    output). A place fits when rays from your chest (`collide.chest` above
+    your feet) to a grid over its face (one column every `collide.spacing`,
+    at least 3, at two heights: bigger pets get more rays) leave
+    `collide.margin` in front of anything, after coming in no nearer than your
+    personal space, and rays *along* its face (left edge through the middle to
+    the right edge, following the curve, both ways at two heights, since the
+    collision is one-sided) hit nothing: that is what finds a pillar standing
+    in the panel between the points the chest rays look at. Its slot is looked
+    at first; only if it does not fit, further round you (nearest first, both
+    ways, up to `collide.swing`, never into the no-go cones; all the way round
+    once it has been hidden half a second), a few places a frame within the
+    budget, so a search can take several frames. Rays down and up keep it off
+    floors, ledges and ceilings.
+  * *Never seen inside anything* (end of `M.place_pet`). A pet only moves along
+    a clear path: whenever it has moved `collide.recheck` from the last pose
+    known clear, rays go along the way it came (its middle both ways, both
+    edges) and along its face at the new pose. Anything there and it blinks:
+    it shrinks to nothing where it was clear (`collide.blink` seconds), jumps
+    while hidden to the place the search found, once that place is itself
+    checked clear, and grows back in there, landing with a squash. At rest its
+    face is looked at again `collide.probe_hz` times a second (along it, and
+    from your chest, because a face buried in a thick wall has nothing to hit
+    along it); found in something, it is gone at once, not shrinking in it. A
+    pet with no rays left this frame holds still rather than move unchecked.
+    All pets together cast at most `collide.rays` rays a frame. `/term world
+    rays [SECONDS]` logs, per pet and frame, the rays cast, the hits and what
+    the search decided; the `world` selftest suite records what the collision
+    answers from your chest (down, ahead, the nearest wall in 16 directions).
+    An older core without `ghostty.raycast` simply sees no walls, as before.
+    Collision is background only: characters, and props the game only draws,
+    are invisible to it. The first in-game try of the version before this one
+    (an integration build of 831551d) still showed a pet inside a pillar; this
+    is the answer to that, not yet tried in game.
 * **The view.** The existing no-go cones stay as they were: no pet centre
   between the camera and you, or straight behind you. A wide pet's edge may
   still reach into the camera cone; the cones were not widened, because the

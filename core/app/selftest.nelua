@@ -388,26 +388,6 @@ local function suite_render(): void
   end
 end
 
-local function suite_world(in_world: boolean): void
-  local t = now_ms()
-  if not in_world then
-    add(SUITE_WORLD, 'projection round trip', SelftestStatus.Skip, 0, 'no character loaded (log in to run it)')
-    return
-  end
-  if host.api.get_camera == nilptr then
-    add(SUITE_WORLD, 'projection round trip', SelftestStatus.Skip, 0, 'this shim has no get_camera')
-    return
-  end
-  local cam: GuCamera
-  if host.api.get_camera(&cam) == 0 then
-    add(SUITE_WORLD, 'projection round trip', SelftestStatus.Fail, now_ms() - t, 'get_camera returned nothing with a character loaded')
-    return
-  end
-  local st, worst, msg = selftest_world_roundtrip(&cam)
-  add(SUITE_WORLD, 'projection round trip', st, now_ms() - t, msg)
-  msg:destroy()
-end
-
 -- lua/selftest.lua: one line per case, "name\tstatus\tmessage"
 local function suite_lua(suite: integer): void
   local t = now_ms()
@@ -443,6 +423,29 @@ local function suite_lua(suite: integer): void
   end
   out:destroy() scratch:destroy() dir:destroy()
 end
+
+local function suite_world(in_world: boolean): void
+  local t = now_ms()
+  if not in_world then
+    add(SUITE_WORLD, 'projection round trip', SelftestStatus.Skip, 0, 'no character loaded (log in to run it)')
+    return
+  end
+  if host.api.get_camera == nilptr then
+    add(SUITE_WORLD, 'projection round trip', SelftestStatus.Skip, 0, 'this shim has no get_camera')
+    return
+  end
+  local cam: GuCamera
+  if host.api.get_camera(&cam) == 0 then
+    add(SUITE_WORLD, 'projection round trip', SelftestStatus.Fail, now_ms() - t, 'get_camera returned nothing with a character loaded')
+    return
+  end
+  local st, worst, msg = selftest_world_roundtrip(&cam)
+  add(SUITE_WORLD, 'projection round trip', st, now_ms() - t, msg)
+  msg:destroy()
+  -- the game's collision, as the pets see it (lua/selftest.lua M.world)
+  suite_lua(SUITE_WORLD)
+end
+
 
 -- agent: true when the suite is done
 local function suite_agent(): boolean

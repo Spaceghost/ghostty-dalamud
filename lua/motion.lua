@@ -252,37 +252,134 @@ end
 -- nil for none. Every function here says how many rays it cast, so the caller
 -- can keep to a budget per frame.
 
+-- A point on a panel's face seen from above: `s` from -1 (left edge) to 1
+-- (right edge) along its (curved) width. -> x, z
+function M.face_point(x, z, yaw, hw, curve, s)
+  local rx, rz = cos(yaw), -sin(yaw)
+  local fx, fz = sin(yaw), cos(yaw)
+  local lat, fwd = hw * s, 0
+  if curve and curve > 0.01 then
+    local ang = hw * s / curve
+    lat, fwd = curve * sin(ang), curve * (1 - cos(ang))
+  end
+  return x + rx * lat + fx * fwd, z + rz * lat + fz * fwd
+end
+
+-- How many points across a panel `hw` yalms half wide the rays look at: one
+-- every `spacing` yalms or so, never fewer than 3 (both edges and the middle).
+function M.columns(hw, spacing, most)
+  local n = math.ceil(2 * hw / (spacing or 0.45)) + 1
+  if n < 3 then n = 3 end
+  if most and n > most then n = most end
+  return n
+end
+
 -- How much nearer to O (the character's chest) a panel centred at T must come
--- so that its centre and both edges keep `margin` yalms in front of whatever
--- the rays from O to them hit first. Moving the panel toward O along the line
--- O-T by `pull` yalms moves each probe point that much along the same line,
--- which brings it nearer along its own ray by pull * cos(angle between them).
--- -> pull (0 when the panel fits where it is), rays cast.
-function M.pull_in(cast, ox, oy, oz, tx, ty, tz, yaw, hw, curve, margin)
+-- so that every point of a grid over its face (`cols` across it, at `rows`
+-- heights: 1 is the middle, 2 a quarter up and down from it, 3 all three) keeps
+-- `margin` yalms in front of whatever the rays from O to it hit first. Moving
+-- the panel toward O along O-T by `pull` moves each point that much along the
+-- same line, which brings it nearer along its own ray by pull * cos(angle
+-- between them). -> pull (0 when the panel fits where it is), rays cast.
+function M.chest_pull(cast, ox, oy, oz, tx, ty, tz, yaw, hw, hh, curve, margin, cols, rows)
   local ux, uz = tx - ox, tz - oz
   local ul = sqrt(ux * ux + uz * uz)
   if ul < 1e-4 then return 0, 0 end
   ux, uz = ux / ul, uz / ul
-  local lx, lz, rx, rz = M.footprint(tx, tz, yaw, hw, curve)
+  cols, rows = cols or 3, rows or 1
   local pull, rays = 0, 0
-  for i = 0, 2 do
-    local px, pz = tx, tz
-    if i == 1 then px, pz = lx, lz elseif i == 2 then px, pz = rx, rz end
-    local dx, dy, dz = px - ox, ty - oy, pz - oz
-    local d = sqrt(dx * dx + dy * dy + dz * dz)
-    if d > 1e-4 then
-      rays = rays + 1
-      local hit = cast(ox, oy, oz, dx, dy, dz, d + margin)
-      if hit and hit < d + margin then
-        local need = d + margin - hit                 -- how far this point must come back along its ray
-        local along = (dx * ux + dz * uz) / d           -- cos between its ray and the pull
-        if along < 0.25 then along = 0.25 end           -- a probe nearly square to the pull: pull hard, not forever
-        local p = need / along
-        if p > pull then pull = p end
+  for r = 1, rows do
+    local py = ty
+    if rows == 2 then py = ty + (r == 1 and -0.5 or 0.5) * hh
+    elseif rows >= 3 then py = ty + (r - 2) * 0.6 * hh end
+    for c = 0, cols - 1 do
+      local px, pz = M.face_point(tx, tz, yaw, hw, curve, -1 + 2 * c / (cols - 1))
+      local dx, dy, dz = px - ox, py - oy, pz - oz
+      local d = sqrt(dx * dx + dy * dy + dz * dz)
+      if d > 1e-4 then
+        rays = rays + 1
+        local hit = cast(ox, oy, oz, dx, dy, dz, d + margin)
+        if hit and hit < d + margin then
+          local need = d + margin - hit               -- how far this point must come back along its ray
+          local along = (dx * ux + dz * uz) / d         -- cos between its ray and the pull
+          if along < 0.25 then along = 0.25 end         -- a point nearly square to the pull: pull hard, not forever
+          local p = need / along
+          if p > pull then pull = p end
+        end
       end
     end
   end
   return pull, rays
+end
+
+-- The centre and both edges at mid height only (what the first version
+-- looked at; kept for callers with few rays to spare).
+function M.pull_in(cast, ox, oy, oz, tx, ty, tz, yaw, hw, curve, margin)
+  return M.chest_pull(cast, ox, oy, oz, tx, ty, tz, yaw, hw, 0, curve, margin, 3, 1)
+end
+
+-- Whether anything crosses a panel's face: rays along it, from its left edge
+-- through its middle to its right edge (two segments, following the curve),
+-- at `rows` heights (1: the middle; 2: low and high on the face), and back the
+-- other way too when `both` (the game's collision is one-sided: a ray that
+-- starts inside a pillar does not see it). This is what catches a pillar
+-- standing in the panel between the points the rays from the chest look at.
+-- -> clear, rays cast.
+function M.span_clear(cast, x, y, z, yaw, hw, hh, curve, rows, both)
+  local lx, lz = M.face_point(x, z, yaw, hw, curve, -1)
+  local rx, rz = M.face_point(x, z, yaw, hw, curve, 1)
+  local rays = 0
+  rows = rows or 1
+  for r = 1, rows do
+    local py = y
+    if rows >= 2 then py = y + (r == 1 and -0.75 or 0.5) * hh end
+    for seg = 0, 1 do
+      local ax, az, bx, bz = lx, lz, x, z
+      if seg == 1 then ax, az, bx, bz = x, z, rx, rz end
+      local dx, dz = bx - ax, bz - az
+      local d = sqrt(dx * dx + dz * dz)
+      if d > 1e-4 then
+        rays = rays + 1
+        local hit = cast(ax, py, az, dx, 0, dz, d)
+        if hit and hit < d then return false, rays end
+        if both then
+          rays = rays + 1
+          hit = cast(bx, py, bz, -dx, 0, -dz, d)
+          if hit and hit < d then return false, rays end
+        end
+      end
+    end
+  end
+  return true, rays
+end
+
+-- Whether a panel can move from pose 0 to pose 1 in a straight line without
+-- anything in between: its middle both ways, both its edges forward, at mid
+-- height (each with `margin` beyond the end). -> clear, rays cast.
+function M.path_clear(cast, x0, y0, z0, yaw0, x1, y1, z1, yaw1, hw, curve, margin)
+  local rays = 0
+  margin = margin or 0
+  for i = 0, 2 do
+    local ax, az, bx, bz = x0, z0, x1, z1
+    if i > 0 then
+      local s = i == 1 and -1 or 1
+      ax, az = M.face_point(x0, z0, yaw0, hw, curve, s)
+      bx, bz = M.face_point(x1, z1, yaw1, hw, curve, s)
+    end
+    local dx, dy, dz = bx - ax, y1 - y0, bz - az
+    local d = sqrt(dx * dx + dy * dy + dz * dz)
+    if d > 1e-4 then
+      rays = rays + 1
+      local hit = cast(ax, y0, az, dx, dy, dz, d + margin)
+      if hit and hit < d + margin then return false, rays end
+      if i == 0 then
+        rays = rays + 1
+        hit = cast(bx, y1, bz, -dx, -dy, -dz, d + margin)
+        if hit and hit < d + margin then return false, rays end
+      end
+    end
+  end
+  return true, rays
 end
 
 -- The floor and the ceiling at a panel centred at (x, y, z) with half height
