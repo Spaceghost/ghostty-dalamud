@@ -2,4 +2,5 @@
 self-hosted-runner:
   labels:
     - ghostty-dalamud
+    - fedora-ghostty
     - ffxiv-live
