@@ -1238,6 +1238,13 @@ local function main(): integer
         if n < 512 then fds[n] = { fd = jfds[k], events = POLLIN } n = n + 1 end
       end
     end
+    do -- a camera frame still going into its fifo (agent/clips.nelua)
+      local cfds: [8]cint
+      local cn = clips:poll_fds(&cfds, 8)
+      for k = 0, < cn do
+        if n < 512 then fds[n] = { fd = cfds[k], events = POLLOUT } n = n + 1 end
+      end
+    end
     do -- the embedded WireGuard: its UDP socket and its forwards' sockets
       local gfds: [256]WgPollFd
       local gn = wg:poll_fds((@*[0]WgPollFd)(&gfds[0]), 256)
