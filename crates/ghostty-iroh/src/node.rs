@@ -214,7 +214,7 @@ impl Node {
             .enable_all()
             .thread_name("ghostty-iroh")
             .build()
-            .map_err(|e| format!("runtime: {e}"))?;
+            .map_err(|e| format!("runtime: {e:#}"))?;
 
         let secret = load_or_create_key(cfg.secret_key_path)?;
         let relays = cfg.relays;
@@ -224,7 +224,7 @@ impl Node {
                 b = if relays { b.discovery_n0() } else { b.relay_mode(RelayMode::Disabled) };
                 b.bind().await
             })
-            .map_err(|e| format!("bind: {e}"))?;
+            .map_err(|e| format!("bind: {e:#}"))?;
 
         Ok(Self {
             rt: Some(rt),
