@@ -1,8 +1,9 @@
 # Media over QUIC, as a second frame path
 
-> Status: this is the required direction. None of it is implemented, nothing
-> here has been observed, and this is the **largest and least certain** piece
-> of docs/MULTI_AGENT.md. It is step 5 of that file's order, and it is the
+> Status: the transport half exists; the media half does not. What is
+> implemented and observed is in "What exists" immediately below. Everything
+> after it is still the required direction, and the media half remains the
+> **largest and least certain** piece of docs/MULTI_AGENT.md. It is step 5 of that file's order, and it is the
 > only step whose central mechanism — a video decoder inside the plugin core,
 > which is a Windows PE DLL under Wine — does not exist anywhere in this
 > repository today. Read "What is unproven" before treating any of it as a
@@ -13,6 +14,43 @@ rectangles, a WFRAME per `seq`, a WACK back (docs/REMOTE_WINDOWS.md). That is
 right for a window made of text and wrong for a window playing video. This
 file says where a codec would branch off that path, and — as important — what
 must never leave it.
+
+## What exists
+
+Implemented and observed, on the fedora build host:
+
+* `crates/ghostty-iroh/src/moq.rs` presents iroh's `Connection`, `SendStream`
+  and `RecvStream` as a `web_transport_trait::Session`. moq-net is generic
+  over that trait rather than tied to an endpoint of its own, so **a moq
+  session rides the QUIC connection the plugin and the agent already have**.
+  One connection, one identity, one handshake, with media tracks alongside the
+  existing protocol -- not a second transport with its own key and its own NAT
+  traversal to get wrong.
+* `crates/ghostty-iroh/tests/moq_loopback.rs` runs moq-net's own handshake
+  across that adapter between two endpoints, over real QUIC streams, and then
+  asserts the connection moved UDP bytes both ways and opened a stream. The
+  test finishes in under a millisecond on loopback, and a green handshake that
+  touched no wire would prove nothing.
+
+Not implemented, and everything below this section is about it:
+
+* no track carries a frame;
+* no codec, and therefore none of "How a decoded frame reaches the D3D11
+  texture" (the decoder inside a Windows PE DLL under Wine is still the piece
+  that exists nowhere in this repository);
+* the plugin's frame path is unchanged -- RAW and QOI tiles, a WFRAME per
+  `seq`, a WACK back.
+
+So the question this file was written to answer -- where a codec branches off
+the tile path and what must never leave it -- is untouched. What has changed
+is that the thing to carry it on is no longer hypothetical.
+
+A note on the first consumer: a software camera (the game's composited frame
+offered to a call as a webcam) is a better first track than a video in a
+panel. It is video by definition, so it needs no damage-rate heuristic to
+decide it belongs off the tile path, and the plugin already streams frames to
+the agent for clips (`copen`/`cframe_rows` in core/app/capture.nelua) at a
+chosen fps, which is the shape a camera feed wants.
 
 ## What this is for, and what it is not for
 
