@@ -195,7 +195,7 @@ if [[ "${SKIP_SHIM:-0}" != 1 ]]; then
     cp build/plugin/GhosttyDalamud/GhosttyDalamud.dll build/plugin/GhosttyDalamud/GhosttyDalamud.json "$P.tmp/"
     # KamiToolKit (game windows, docs/NATIVE_UI.md) loads from beside the plugin
     cp build/plugin/GhosttyDalamud/KamiToolKit.dll "$P.tmp/"
-    [[ -d build/plugin/GhosttyDalamud/Assets ]] && cp -r build/plugin/GhosttyDalamud/Assets "$P.tmp/" || true
+    if [[ -d build/plugin/GhosttyDalamud/Assets ]]; then cp -r build/plugin/GhosttyDalamud/Assets "$P.tmp/"; fi
     if [[ -f build/plugin/GhosttyDalamud/GhosttyDalamud.pdb ]]; then cp build/plugin/GhosttyDalamud/GhosttyDalamud.pdb "$P.tmp/"; fi
     cp build/dist/ghostty_core.dll build/dist/ghostty_loader.dll "$P.tmp/"
     cp lua/*.lua "$P.tmp/lua/"
