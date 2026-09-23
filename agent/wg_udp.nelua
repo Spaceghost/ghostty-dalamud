@@ -5,6 +5,15 @@
 require 'agent.wg_proto'
 require 'core.sys.net'
 
+-- The OS-level socket type, as the C prototypes below see it (as in
+-- core/sys/net.nelua): NetSocket is wider, and every call converts explicitly.
+## if ccinfo.is_windows then
+local CSocket = @usize -- SOCKET
+## else
+local CSocket = @cint  -- fd
+## end
+local function csock(s: NetSocket): CSocket return (@CSocket)(s) end
+
 ## if ccinfo.is_windows then
 ## cinclude '<winsock2.h>'
 ## cinclude '<ws2tcpip.h>'
@@ -45,10 +54,10 @@ local sockaddr_in6 <cimport, nodecl, ctypedef> = @record{
 local sockaddr_storage <cimport, nodecl, ctypedef> = @record{ ss_family: cushort }
 local sockaddr <cimport, nodecl, ctypedef> = @record{ sa_family: cushort }
 local function socket(domain: cint, typ: cint, protocol: cint): NetSocket <cimport, nodecl> end
-local function bind(s: NetSocket, addr: *sockaddr, len: socklen_t): cint <cimport, nodecl> end
-local function setsockopt(s: NetSocket, level: cint, name: cint, val: pointer, len: socklen_t): cint <cimport, nodecl> end
-local function recvfrom(s: NetSocket, buf: pointer, len: csize, flags: cint, from: *sockaddr, fromlen: *socklen_t): isize <cimport, nodecl> end
-local function sendto(s: NetSocket, buf: pointer, len: csize, flags: cint, to: *sockaddr, tolen: socklen_t): isize <cimport, nodecl> end
+local function bind(s: CSocket, addr: *sockaddr, len: socklen_t): cint <cimport, nodecl> end
+local function setsockopt(s: CSocket, level: cint, name: cint, val: pointer, len: socklen_t): cint <cimport, nodecl> end
+local function recvfrom(s: CSocket, buf: pointer, len: csize, flags: cint, from: *sockaddr, fromlen: *socklen_t): isize <cimport, nodecl> end
+local function sendto(s: CSocket, buf: pointer, len: csize, flags: cint, to: *sockaddr, tolen: socklen_t): isize <cimport, nodecl> end
 local function htons(v: uint16): uint16 <cimport, nodecl> end
 local function ntohs(v: uint16): uint16 <cimport, nodecl> end
 local AF_INET: cint <cimport, nodecl, const>
@@ -93,12 +102,12 @@ function WgUdp:open(port: uint16): boolean
   local s = socket(AF_INET6, SOCK_DGRAM, IPPROTO_UDP)
   if net.is_valid(s) then
     local zero: cint = 0
-    setsockopt(s, IPPROTO_IPV6, IPV6_V6ONLY, &zero, #cint)
+    setsockopt(csock(s), IPPROTO_IPV6, IPV6_V6ONLY, &zero, #cint)
     local a: sockaddr_in6
     memory.zero(&a, #sockaddr_in6)
     a.sin6_family = (@cushort)(AF_INET6)
     a.sin6_port = htons(port)
-    if bind(s, (@*sockaddr)(&a), #sockaddr_in6) == 0 then
+    if bind(csock(s), (@*sockaddr)(&a), #sockaddr_in6) == 0 then
       self.sock, self.v6 = s, true
     else
       net.close(s)
@@ -111,14 +120,14 @@ function WgUdp:open(port: uint16): boolean
     memory.zero(&a, #sockaddr_in)
     a.sin_family = (@cushort)(AF_INET)
     a.sin_port = htons(port)
-    if bind(s, (@*sockaddr)(&a), #sockaddr_in) ~= 0 then net.close(s) return false end
+    if bind(csock(s), (@*sockaddr)(&a), #sockaddr_in) ~= 0 then net.close(s) return false end
     self.sock, self.v6 = s, false
   end
   nonblocking(self.sock)
   -- room for a burst of full-size datagrams while the loop is busy
   local size: cint = 4 * 1024 * 1024
-  setsockopt(self.sock, SOL_SOCKET, SO_RCVBUF, &size, #cint)
-  setsockopt(self.sock, SOL_SOCKET, SO_SNDBUF, &size, #cint)
+  setsockopt(csock(self.sock), SOL_SOCKET, SO_RCVBUF, &size, #cint)
+  setsockopt(csock(self.sock), SOL_SOCKET, SO_SNDBUF, &size, #cint)
   ## if ccinfo.is_windows then
   -- without this, an ICMP port unreachable for something we sent makes the
   -- next recvfrom fail with WSAECONNRESET
@@ -142,7 +151,7 @@ function WgUdp:fd(): cint return (@cint)(self.sock) end
 function WgUdp:recv(buf: *[0]uint8, cap: usize, from: *WgEndpoint): isize
   local ss: [128]uint8
   local len: socklen_t = 128
-  local n = recvfrom(self.sock, buf, cap, 0, (@*sockaddr)(&ss), &len)
+  local n = recvfrom(csock(self.sock), buf, cap, 0, (@*sockaddr)(&ss), &len)
   if n < 0 then
     ## if ccinfo.is_windows then
     local e = WSAGetLastError()
@@ -195,7 +204,7 @@ function WgUdp:send(to: *WgEndpoint, data: *[0]uint8, len: usize): boolean
     else
       for i = 0, < 16 do b[i] = to.addr[i] end
     end
-    n = sendto(self.sock, data, len, 0, (@*sockaddr)(&a), #sockaddr_in6)
+    n = sendto(csock(self.sock), data, len, 0, (@*sockaddr)(&a), #sockaddr_in6)
   else
     if to.family ~= 4 then return false end
     local a: sockaddr_in
@@ -204,7 +213,7 @@ function WgUdp:send(to: *WgEndpoint, data: *[0]uint8, len: usize): boolean
     a.sin_port = htons(to.port)
     local b = (@*[4]uint8)(&a.sin_addr)
     for i = 0, < 4 do b[i] = to.addr[i] end
-    n = sendto(self.sock, data, len, 0, (@*sockaddr)(&a), #sockaddr_in)
+    n = sendto(csock(self.sock), data, len, 0, (@*sockaddr)(&a), #sockaddr_in)
   end
   return n == (@isize)(len)
 end
