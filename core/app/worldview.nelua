@@ -860,7 +860,8 @@ global function draw_world(now: float64): void
     local appear_target: float32 = s.leaving and 0 or 1
     if s.appear < appear_target then s.appear = math.min(appear_target, s.appear + wdt * 2.0)
     elseif s.appear > appear_target then s.appear = math.max(appear_target, s.appear - wdt * 2.6) end
-    local prez = host.world_rez * s.appear
+    -- eased in and out (smoothstep): no linear ramp, no jump at either end
+    local prez = host.world_rez * s.appear * s.appear * (3 - 2 * s.appear)
     local ok, pl = policy_world_place_held(s.id, now, host.world_focus == s.id, host.world_hover == s.id)
     if not ok then diag_hidden = diag_hidden + 1 end
     -- the full-screen terminal (or the one flying back) takes the screen's size

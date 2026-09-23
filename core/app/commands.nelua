@@ -400,16 +400,18 @@ global function run_command(cmd: string): cint
   elseif verb == 'rain' then
     -- /term rain on|off|auto: force rain on world panels, or follow the weather
     return rain_command(arg)
-  elseif verb == 'world' and (arg == 'rays' or arg:find('rays ', 1, true) == 1) then
-    -- /term world rays [SECONDS]: what the game's collision answers the pets,
-    -- logged per pet every frame for a few seconds (lua/world.lua M.trace)
+  elseif verb == 'world' and (arg == 'rays' or arg:find('rays ', 1, true) == 1 or arg == 'anim' or arg:find('anim ', 1, true) == 1) then
+    -- /term world rays [SECONDS]: what the game's collision answers the pets;
+    -- /term world anim [SECONDS]: each pet's animations still moving. Logged
+    -- per pet every frame for a few seconds (lua/world.lua M.trace)
+    local kind: string = arg:subview(1, 4)
     local secs: float64 = 5
     if #arg > 5 then
       local ok, n = parse_id(arg:subview(6)) -- whole seconds
       if ok and n > 0 then secs = n end
     end
-    local msg = policy_world_trace(secs)
-    logf(LOG_INFO, 'world rays: %s', msg)
+    local msg = policy_world_trace(secs, kind)
+    logf(LOG_INFO, 'world %s: %s', kind, msg)
     msg:destroy()
     return 0
   elseif cmd == 'depth' or cmd == 'depth retry' or cmd == 'depth show' then
