@@ -160,10 +160,13 @@ push_source() {
   # flock is held for the clear and the unpack together: releasing between them
   # would leave a window where $D exists but is empty.
   "$INCUS" exec "$C" -- bash -c "mkdir -p $D $BUILD_CONTAINER_CACHE"
-  tar -C "$ROOT" --null -T "$list" -czf - | "$INCUS" exec "$C" -- bash -c "
-    flock -o -w \${BUILD_LOCK_WAIT:-7200} $BUILD_CONTAINER_CACHE/build.lock -c '
-      find $D -mindepth 1 -maxdepth 1 ! -name build ! -name vendor -exec rm -rf {} + &&
-      tar -xzf - -C $D'"
+  # `flock LOCK cmd args`, not `flock -c 'string'`: the -c form adds a quoting
+  # level that mangled this command and killed the tar mid-stream ("gzip:
+  # stdin: unexpected end of file"). This form runs bash directly and leaves
+  # stdin -- the incoming archive -- alone.
+  tar -C "$ROOT" --null -T "$list" -czf - | "$INCUS" exec "$C" -- \
+    flock -o -w "${BUILD_LOCK_WAIT:-7200}" "$BUILD_CONTAINER_CACHE/build.lock" \
+    bash -c "find $D -mindepth 1 -maxdepth 1 ! -name build ! -name vendor -exec rm -rf {} + && tar -xzf - -C $D"
   rm -f "$list"
   # the shared cache: vendor checkouts and every reusable build directory live
   # on the Incus volume, so a second container on this host starts warm

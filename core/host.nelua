@@ -2,6 +2,7 @@
 -- work lives in core/app/*; the shim only forwards calls.
 require 'core.app.panic'
 require 'core.app.commands'
+require 'core.app.agentpanel'
 require 'core.app.hostsurface'
 require 'core.app.cursor'
 require 'core.buildinfo'
@@ -158,6 +159,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     draw_inventory() -- the info bar entry's list of every terminal
     draw_settings()
     draw_window_picker() -- /window (core/app/winpicker.nelua)
+    draw_agents()        -- /term agents (core/app/agentpanel.nelua)
   end
   ask_frame(now, live) -- /ask: answers arriving, and the panel while it is up (core/app/ask.nelua)
   reap_exited(now)
