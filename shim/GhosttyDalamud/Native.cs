@@ -81,7 +81,7 @@ internal struct GuNativeState
     public float W, H;            // its size in UI units
     public float Scale;           // screen pixels per UI unit
     public float Cx, Cy, Cw, Ch;  // the content area, UI units from the addon's origin
-    public int Hovered;           // the game's addon under the pointer is this one
+    public int Hovered;           // the game's addon under the pointer: 1 this one, -1 another, 0 none
     public int Focused;           // the game has it focused
     public int UiHidden;          // the game's UI is hidden, or this addon is not shown
     public int Closes;            // times the game closed it

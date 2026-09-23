@@ -1,6 +1,11 @@
 # A terminal in a game window ("native")
 
-**Status: host tests only. Not yet observed in game.** Everything below was
+**Status: first seen in game on 3fc98a6: `/term selftest native` passed 8/8,
+and the window did not work** — an opaque black background where the ImGui
+windows are translucent glass, and a click into the text did not keep the
+keyboard. Both are fixed below and checked on the host; the fixes have not been
+seen in game yet, and the self-test now measures both there (colour read back
+from the screen, real clicks). Everything below was
 designed against the installed Dalamud (commit `e81744f6`), FFXIVClientStructs
 and KamiToolKit 2.2.48 (source commit `9c61d0f8`, the version XivDesktop ships),
 read from their sources, and checked only against fakes
@@ -13,6 +18,7 @@ this works. The list of what can still fail is at the end.
 /term native new [N]    a new terminal from profile N as a game window
 /term native off        the focused game window back to an ImGui window
 /term native status     whether the native path is available, and why not
+/term native debug      hover, press and focus changes in the log (on/off)
 ```
 
 The tab bar and the floating window header have a "Show as a game window"
@@ -33,7 +39,16 @@ not an ImGui window dressed up as one:
 
 Its content is one image node. Its texture is the terminal, drawn every frame
 by the same renderer the ImGui panel uses (`draw_terminal` → `render_termview`),
-so colours, themes, the cursor and the fallback glyphs are the panel's.
+so colours, themes, the cursor and the fallback glyphs are the panel's. Behind
+the text is the body of the ImGui windows' glass — the dropdown's palette at its
+opacity, lit by the world — and the terminal's default background is left out
+over it (`bg_alpha` 0), exactly as `draw_windows` does. The first build filled
+the texture with the theme's background at full opacity; spaceghost's is
+`#000000`, which is the black the owner saw.
+
+The window's title is "Ghostty" and the terminal's own title is its subtitle,
+cut with an ellipsis to what fits (`native_title_fit`): the title bar's font
+drew the `~` of `player@desktop:~` as a ligature.
 
 ## How the terminal gets into the image node
 
@@ -90,12 +105,23 @@ game's and closes the window like any other.
 
 **Focus** (`native_focus_step`, pure and tested):
 
-* a press on the window (the game says it is the addon under the pointer)
-  focuses it, and takes ImGui's window focus away so no ImGui terminal types
-  too; opening it by command focuses it;
+* a press on the window focuses it, and takes ImGui's window focus away so no
+  ImGui terminal types too; opening it by command focuses it;
 * a press anywhere else, the window closing or hiding, the UI hiding,
   movement or combat intent (`host.drop_focus`), or another terminal taking the
-  keyboard (a world panel focused, the dropdown opening) drops it.
+  keyboard drops it. "Another terminal" is an edge — a world panel becoming
+  focused, the dropdown opening — never a flag that can stay set. The first
+  build used `host.dropdown_focus_next`, which waits for the dropdown to draw;
+  with the dropdown hidden it stayed set and took the keyboard back the frame
+  after every click, which is the "input does not stay" the owner saw.
+* "On the window" is the shim's hover, three ways: 1 the game finds our addon
+  under the pointer, -1 another addon (in front of ours there: a click
+  elsewhere), 0 none — which is also what it says while ImGui has the mouse,
+  so then our own rectangle decides (`native_on_window`). Before, 0 counted as
+  elsewhere, so the second click on a focused window (whose mouse we had
+  taken) dropped the focus too.
+* Esc goes to the program while the terminal has focus (vim needs it); it is
+  not a way out. A click elsewhere, movement or `/term native off` is.
 
 **Mouse.** Dalamud hands ImGui mouse buttons and the wheel only while ImGui
 wants the mouse (`Win32InputHandler`: `WM_MOUSEWHEEL` and button messages are
@@ -225,7 +251,23 @@ has been observed:
 KamiToolKit started; a window opens for a self-test terminal and reports a
 scale and content size; the layout gives a texture of exactly content × scale
 pixels at a whole-pixel origin; five frames draw without an error; focus is
-taken by the window and given back when it closes; the window closes and the
-terminal is gone; and a forced failure falls back to an ImGui window. What it
-cannot check is what the eye sees: look at the window while it runs (it stays
-open for two seconds with a test pattern).
+taken by the window on opening; **colour**: eight swatches (greys, spaceghost
+red, green, blue) drawn through the game window and the same through ImGui's
+foreground list, one frame read back from the back buffer (the `/term shot`
+capture) and compared pixel by pixel, within 6 per channel, with the transfer
+that would explain grey 128 and a `CONFIG.native.gamma` to try when they
+differ; **click focus**: the cursor moved onto the text and the left button
+pressed and released through the OS (`mouse_event`, so the game, Dalamud and
+the core see it as a player's), twice, and the window must have the keyboard
+for all 20 frames after each click (skipped when the game is not in front or
+another game window covers the spot; the cursor goes back afterwards); the
+window closes and the terminal is gone; and a forced failure falls back to an
+ImGui window. The first version checked only that focus was taken on opening
+and the texture's size, which is how it passed 8/8 on a window that did not
+work.
+
+`CONFIG.native.gamma` (lua/native.lua, 1 by default) encodes every vertex
+colour for a game UI that decodes sRGB; the owner's screenshot suggests it is
+not needed (spaceghost's red text read back as `#cd5454` against `#cc6666`,
+the red channel exact, which a decode would have made 153), and the colour
+case measures it.

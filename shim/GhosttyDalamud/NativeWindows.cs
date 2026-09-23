@@ -185,7 +185,10 @@ internal static unsafe class NativeKami
         if (!Windows.TryGetValue(id, out var a)) {
             a = new TermAddon {
                 InternalName = "GhosttyTerm" + id,
-                Title = new ReadOnlySeString(title.AsSpan()),
+                // "Ghostty" in the title font; the terminal's own title (fitted by the core) as the
+                // subtitle, whose font has the characters shells put there (~, @, :)
+                Title = new ReadOnlySeString("Ghostty".AsSpan()),
+                Subtitle = new ReadOnlySeString(title.AsSpan()),
                 Size = new Vector2(w, h),
                 RememberClosePosition = false, // the core keeps the place (lua/native.lua)
                 OpenWindowSoundEffectId = 23,
@@ -197,7 +200,7 @@ internal static unsafe class NativeKami
         a.Error = 0;
         a.ClosingByUs = false;
         a.Size = new Vector2(Math.Max(w, 240), Math.Max(h, 140));
-        a.Title = new ReadOnlySeString(title.AsSpan());
+        a.Subtitle = new ReadOnlySeString(title.AsSpan());
         a.PendingPos = x >= 0 && y >= 0 ? new Vector2(x, y) : null;
         a.Pending = true;
         Later(a, t => { t.Pending = false; t.Open(); });
@@ -237,8 +240,13 @@ internal static unsafe class NativeKami
         var cs = a.ContentStartPosition;
         var cz = a.ContentSize;
         st->Cx = cs.X; st->Cy = cs.Y; st->Cw = cz.X; st->Ch = cz.Y;
+        // 1 ours, -1 another addon is under the pointer (in front of ours there), 0 none: the
+        // core then uses the window's rectangle (the game hit-tests nothing while ImGui has the mouse)
         var stage = AtkStage.Instance();
-        if (stage != null && stage->AtkCollisionManager != null && stage->AtkCollisionManager->IntersectingAddon == unit) st->Hovered = 1;
+        if (stage != null && stage->AtkCollisionManager != null) {
+            var over = stage->AtkCollisionManager->IntersectingAddon;
+            st->Hovered = over == unit ? 1 : over == null ? 0 : -1;
+        }
         if (stage != null && stage->RaptureAtkUnitManager != null && stage->RaptureAtkUnitManager->FocusedAddon == unit) st->Focused = 1;
     }
 
@@ -290,7 +298,7 @@ internal static unsafe class NativeKami
     {
         if (!Windows.TryGetValue(id, out var a)) return false;
         Later(a, t => {
-            t.Title = new ReadOnlySeString(title.AsSpan());
+            t.Subtitle = new ReadOnlySeString(title.AsSpan());
             if (t.SetUp) t.ShowTitle(title);
         });
         return true;
@@ -335,7 +343,7 @@ internal sealed unsafe class TermAddon : NativeAddon
 
     public void ShowTitle(string title)
     {
-        if (WindowNode is { } w) w.SetTitle(title, "Ghostty");
+        if (WindowNode is { } w) w.SetTitle("Ghostty", title);
     }
 
     protected override void OnFinalize(AtkUnitBase* addon)

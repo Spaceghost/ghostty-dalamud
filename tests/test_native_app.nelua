@@ -346,6 +346,8 @@ do
   assert(native_focused_id == id and want_keyboard, 'opened by command: it has the keyboard, kept from the game')
   local first = odl.VtxBuffer.Data[0]
   assert(first.pos.x == 0 and first.pos.y == 0, 'the background starts at the texture origin')
+  local a = first.col >> 24
+  assert(a > 0 and a < 255, 'the glass behind the terminal is translucent, as the ImGui windows\' is')
 end
 
 -- Keyboard: typed while focused ------------------------------------------------------------------
@@ -444,6 +446,44 @@ do
   native_focus_request = id -- bring_forward
   frame(false)
   assert(native_focused_id == id, 'brought forward')
+end
+
+-- Focus holds through what used to drop it --------------------------------------------------------
+do
+  -- the dropdown's focus request waiting for a dropdown that is not drawn
+  host.dropdown_focus_next = true
+  frame(false) frame(false) frame(false)
+  assert(native_focused_id == id, 'a waiting dropdown focus request does not take the keyboard every frame')
+  host.dropdown_focus_next = false
+  -- the dropdown opening does (it was left open by the fallback above: closed first)
+  host.dropdown_open = false
+  frame(false)
+  assert(native_focused_id == id, 'the dropdown closing takes nothing')
+  host.dropdown_open = true
+  frame(false)
+  assert(native_focused_id == 0, 'the dropdown opening takes the keyboard')
+  host.dropdown_open = false
+  -- the game hit-tests nothing while ImGui has the mouse: our rectangle decides, so a
+  -- second click on the text of a focused window keeps it
+  run_command('native debug on')
+  fw[id].st.hovered = NATIVE_HOVER_NONE
+  at(60, 40)
+  frame(true) frame(false)
+  assert(native_focused_id == id, 'a click on our rectangle focuses it')
+  for _ = 1, 10 do frame(false) end
+  frame(true) frame(false)
+  for _ = 1, 10 do frame(false) end
+  assert(native_focused_id == id, 'and a second click keeps it')
+  assert(logged('focus n -> y') >= 1, '/term native debug logs the transitions')
+  run_command('native debug off')
+  -- another game window over ours takes its own clicks
+  fw[id].st.hovered = NATIVE_HOVER_OTHER
+  frame(true) frame(false)
+  assert(native_focused_id == 0, 'a click on a game window in front of ours is a click elsewhere')
+  fw[id].st.hovered = 1
+  native_focus_request = id
+  frame(false)
+  assert(native_focused_id == id)
 end
 
 -- The resize grip ------------------------------------------------------------------------------

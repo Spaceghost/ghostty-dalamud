@@ -4,6 +4,7 @@
 -- the terminal and which drops it, and what a close means. No ImGui, no shim:
 -- tests/test_nativewin.nelua drives all of it. Not yet observed in game.
 require 'math'
+require 'string'
 
 -- The shim's answer about one window (GuHostApi.native_state), mirrored by
 -- GuNativeState in shim/GhosttyDalamud/Native.cs. Id 0 asks about the native
@@ -14,7 +15,7 @@ global GuNativeState = @record{
   w: float32, h: float32,  -- its size in UI units (unscaled)
   scale: float32,          -- screen pixels per UI unit
   cx: float32, cy: float32, cw: float32, ch: float32, -- the content area, UI units, from the addon's origin
-  hovered: cint,           -- the game's addon under the pointer is this one
+  hovered: cint,           -- the game's addon under the pointer: 1 this one, -1 another, 0 none
   focused: cint,           -- the game has this addon focused
   ui_hidden: cint,         -- the game's UI is hidden (Scroll Lock, cutscene, group pose)
   closes: cint,            -- how many times the game closed it (its x, Esc, close-all); counts up
@@ -147,7 +148,8 @@ global NativeFocusIn = @record{
   ui_hidden: boolean,
   press: boolean,
   on_window: boolean,
-  claimed_by_other: boolean, -- another terminal took the keyboard (a world panel, the dropdown opening)
+  claimed_by_other: boolean, -- another terminal took the keyboard THIS frame (an edge: a world panel
+                             -- focused, the dropdown opening), never a state that could stay set
   drop: boolean,          -- movement or combat intent (host.drop_focus)
   want: boolean,          -- asked for: opened by command, /term focus, or brought forward
 }
@@ -163,6 +165,79 @@ global function native_focus_step(focused: boolean, e: NativeFocusIn): (boolean,
   if e.want then return true, not focused end
   if e.claimed_by_other then return false, false end
   return focused, false
+end
+
+-- Whether the pointer is on our window. The shim says which addon the game
+-- finds under the pointer: 1 ours, -1 another one (it is in front of ours
+-- there), 0 none. None is also what it says while ImGui has the mouse (the
+-- game then hit-tests nothing), so our own rectangle decides then: a click on
+-- a focused window, whose mouse we took, must not count as a click elsewhere.
+global NATIVE_HOVER_OURS: cint <comptime> = 1
+global NATIVE_HOVER_NONE: cint <comptime> = 0
+global NATIVE_HOVER_OTHER: cint <comptime> = -1
+
+global function native_on_window(hovered: cint, in_rect: boolean): boolean
+  if hovered == NATIVE_HOVER_OURS then return true end
+  if hovered == NATIVE_HOVER_OTHER then return false end
+  return in_rect
+end
+
+-- Screen point (mx, my) inside window `st` (frame and title bar included).
+global function native_in_window(st: *GuNativeState, mx: float32, my: float32): boolean
+  local s = st.scale > 0.05 and st.scale or 1
+  return mx >= st.x and my >= st.y and mx < st.x + st.w * s and my < st.y + st.h * s
+end
+
+-- The window's subtitle: the terminal's title, cut with an ellipsis to what
+-- fits beside "Ghostty" in a window `w` UI units wide (the title bar font is
+-- about 7 units a character; the buttons take the right end). Owned.
+global function native_title_fit(title: string, w: float32): string
+  local room = (@integer)(math.floor((w - 150) / 7))
+  if room < 4 then room = 4 end
+  -- count UTF-8 code points, cutting on a boundary
+  local n, cut = 0, #title
+  for i = 0, < #title do
+    local b = title.data[i]
+    if (b & 0xC0) ~= 0x80 then
+      if n == room - 1 then cut = i end
+      n = n + 1
+    end
+  end
+  if n <= room then return title:copy() end
+  return title:subview(1, cut) .. '…'
+end
+
+-- A colour through the display's transfer: `gamma` 1 leaves it, 2.2 encodes
+-- it for a renderer that decodes sRGB (pow 1/gamma per channel, alpha kept).
+-- CONFIG.native.gamma; /term selftest native measures which one is needed.
+global function native_gamma_col(col: uint32, gamma: float32): uint32
+  if not (gamma > 0.2 and gamma < 5) or math.abs(gamma - 1) < 0.001 then return col end
+  local out = col & 0xFF000000
+  for k = 0, < 3 do
+    local c = (@float32)((col >> (8 * k)) & 0xFF) / 255
+    local e = (@uint32)(math.floor(math.pow(c, 1 / gamma) * 255 + 0.5))
+    out = out | ((@uint32)(math.min(e, 255)) << (8 * k))
+  end
+  return out
+end
+
+-- The self-test's colour swatches (IM_COL32 order: 0xAABBGGRR): greys, the
+-- spaceghost reds, greens and blues, drawn through the game window and
+-- through ImGui and read back from the screen.
+global NATIVE_SWATCHES <comptime> = 8
+global NATIVE_SWATCH_PX <comptime> = 12  -- a swatch's side in texture pixels
+global NATIVE_SWATCH_STEP <comptime> = 16
+global native_swatch_cols: [NATIVE_SWATCHES]uint32 = {
+  0xFF000000, 0xFF404040, 0xFF808080, 0xFFC0C0C0, 0xFFFFFFFF,
+  0xFF6666CC, 0xFF68BDB5, 0xFFBEA281,
+}
+
+-- The largest channel difference between two BGRA pixels and an IM_COL32.
+global function native_pixel_diff(b: uint8, g: uint8, r: uint8, col: uint32): integer
+  local dr = math.abs((@integer)(r) - (@integer)(col & 0xFF))
+  local dg = math.abs((@integer)(g) - (@integer)((col >> 8) & 0xFF))
+  local db = math.abs((@integer)(b) - (@integer)((col >> 16) & 0xFF))
+  return math.max(dr, math.max(dg, db))
 end
 
 -- Closing -------------------------------------------------------------------------------------
