@@ -115,8 +115,10 @@ for r in "$FC44" "$FC43"; do
   if [[ "${SKIP_NETLAB:-0}" != 1 ]]; then
     # the spec already checked the symbol before stripping; this is the shipped
     # bytes: moq-iroh-c's source paths are remapped to moq-iroh-src/ in its panics
-    rpm2cpio "$r" | cpio -i --quiet --to-stdout ./usr/bin/ghostty-agent | grep -aq 'moq-iroh-src/' ||
-      die "$r carries no netlab (moq-iroh-c is not linked in)"
+    # (into a file first: grep -q stopping early would SIGPIPE cpio under pipefail)
+    rpm2cpio "$r" | cpio -i --quiet --to-stdout ./usr/bin/ghostty-agent >"$TOP/netlab-check"
+    grep -aq 'moq-iroh-src/' "$TOP/netlab-check" || die "$r carries no netlab (moq-iroh-c is not linked in)"
+    rm -f "$TOP/netlab-check"
   fi
   rpm -qpl "$r" | grep -qx '/usr/lib/systemd/user/ghostty-agent.service' || die "$r does not carry the user unit"
 done
