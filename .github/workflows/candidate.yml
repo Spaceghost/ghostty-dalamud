@@ -20,7 +20,7 @@ concurrency:
   cancel-in-progress: true
 jobs:
   source-checks:
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || fromJSON('["ubuntu-24.04"]') }}
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'self-hosted' && github.triggering_actor == github.repository_owner && fromJSON('["self-hosted","ghostty-dalamud","fedora-ghostty"]') || fromJSON('["ubuntu-24.04"]') }}
     timeout-minutes: 10
     env:
       PYTHONDONTWRITEBYTECODE: '1'
@@ -33,7 +33,7 @@ jobs:
       - run: for script in tools/*.sh tests/run.sh; do bash -n "$script"; done
   candidate:
     needs: source-checks
-    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'self-hosted' && fromJSON('["self-hosted","Linux","X64"]') || fromJSON('["ubuntu-24.04"]') }}
+    runs-on: ${{ github.event_name == 'workflow_dispatch' && inputs.runner == 'self-hosted' && github.triggering_actor == github.repository_owner && fromJSON('["self-hosted","ghostty-dalamud","fedora-ghostty"]') || fromJSON('["ubuntu-24.04"]') }}
     timeout-minutes: 45
     env:
       DOTNET_CLI_TELEMETRY_OPTOUT: '1'
