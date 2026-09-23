@@ -90,6 +90,9 @@ run test_ghostty
 run test_wincodec
 run test_wg_crypto # the embedded WireGuard's primitives against published vectors
 run test_wg        # the WireGuard protocol: two devices, a fake network and a fake clock
+run test_wg_netstack # TCP and UDP through two tunnels and lwIP to loopback sockets, with back-pressure
+mkdir -p build/test-scratch/wg
+run test_wg_config "$ROOT/build/test-scratch/wg" # wireguard.conf, and a live service following it
 run test_pngenc
 run test_capture
 run test_capture_win32

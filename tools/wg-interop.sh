@@ -90,20 +90,61 @@ peer 'wg set wg0 listen-port 51001'
 check 'roaming: pings after the port change' peer 'ping -c 3 -W 2 10.77.0.1 >/dev/null'
 check 'roaming: our side followed to :51001' has 'endpoint .*:51001'
 
-log "rekey: pinging for ${REKEY}s"
-first="$(peer 'wg show wg0 latest-handshakes | cut -f2')"
-loss="$(peer "ping -i 1 -w $REKEY 10.77.0.1 | grep -o '[0-9.]*% packet loss'")"
-second="$(peer 'wg show wg0 latest-handshakes | cut -f2')"
-log "kernel handshakes at $first and $second; $loss"
-check 'rekey: the kernel made a new handshake' test "$second" -gt "$first"
-check 'rekey: our side saw a second session' has 'handshake 2'
-check 'rekey: no ping lost across it' test "${loss%%%*}" = 0
+if [[ "$REKEY" -gt 0 ]]; then
+  log "rekey: pinging for ${REKEY}s"
+  first="$(peer 'wg show wg0 latest-handshakes | cut -f2')"
+  loss="$(peer "ping -i 1 -w $REKEY 10.77.0.1 | grep -o '[0-9.]*% packet loss'")"
+  second="$(peer 'wg show wg0 latest-handshakes | cut -f2')"
+  log "kernel handshakes at $first and $second; $loss"
+  check 'rekey: the kernel made a new handshake' test "$second" -gt "$first"
+  check 'rekey: our side saw a second session' has 'handshake 2'
+  check 'rekey: no ping lost across it' test "${loss%%%*}" = 0
+else
+  log 'rekey: skipped (WG_REKEY_SECONDS=0)'
+fi
 
 log 'kernel peer:'
 peer 'wg show wg0' | sed 's/^/   /'
 log 'our side:'
 ours | sed 's/^/   /'
-peer 'ip link del wg0'
 stop_ours
+
+# The agent itself: its WireGuard, its netstack, its own port forwarded
+# through the tunnel, and the plugin's agent client (core/agent_client.nelua,
+# driven by tests/test_agent.nelua) talking to it from the kernel peer's side.
+APORT=17777
+log "agent: building ghostty-agent and tests/test_agent.nelua"
+agent "cd $DIR && vendor/nelua-lang/nelua --cc tools/zig-cc.sh -P nogc --cache-dir build/nelua-cache -L . -o build/wg-agent -b agent/agent.nelua >/dev/null &&
+  vendor/nelua-lang/nelua --cc tools/zig-cc.sh -P nogc --cache-dir build/nelua-cache -L . -o build/wg-test-agent -b tests/test_agent.nelua >/dev/null"
+agent_key2="$(peer 'wg genkey')"
+agent_pub2="$(peer "echo $agent_key2 | wg pubkey")"
+agent "printf '%s\n' '[Interface]' 'PrivateKey = $agent_key2' 'ListenPort = $((PORT + 1))' 'Address = 10.77.0.1/24' \
+  '' '[Peer]' 'Name = interop' 'PublicKey = $peer_pub' 'PresharedKey = $psk' 'AllowedIPs = 10.77.0.2/32' >/tmp/wg-agent.conf
+  echo interoptoken >/tmp/wg-agent-token"
+# shellcheck disable=SC2016 # expanded in the container, not here
+stop_agent() { agent '[ -f /tmp/wg-agent.pid ] && kill "$(cat /tmp/wg-agent.pid)" 2>/dev/null; rm -f /tmp/wg-agent.pid; true'; }
+stop_agent
+agent "cd $DIR && { setsid nohup build/wg-agent --listen 127.0.0.1:$APORT --token-file /tmp/wg-agent-token --windows off \
+  --clipboard-file /tmp/wg-agent-clipboard \
+  --wireguard-config /tmp/wg-agent.conf >/tmp/wg-agent.log 2>&1 & echo \$! >/tmp/wg-agent.pid; }"
+sleep 1
+peer "wg set wg0 peer $agent_pub remove
+  wg set wg0 peer $agent_pub2 preshared-key <(echo $psk) endpoint $agent_ip:$((PORT + 1)) allowed-ips 10.77.0.1/32"
+incus exec "$AGENT" -- cat "$DIR/build/wg-test-agent" | incus exec "$PEER" -- sh -c 'cat >/tmp/test_agent && chmod +x /tmp/test_agent'
+agentlog() { agent 'cat /tmp/wg-agent.log'; }
+check 'agent: its netstack answers ping in the tunnel' peer 'ping -c 3 -W 2 10.77.0.1 >/dev/null'
+check "agent: the plugin's client over the tunnel (test_agent, 10.77.0.1:$APORT)" \
+  peer "/tmp/test_agent $APORT interoptoken - 10.77.0.1 >/tmp/test_agent.log 2>&1"
+check 'agent: a 1 MB paste through the tunnel reached the shell whole' \
+  agent "[ \"\$(wc -c <$DIR/build/agent-paste)\" = 1048576 ]"
+agent_has() { agentlog | grep -q "$1"; }
+check 'agent: its log names the peer' agent_has 'interop connected from'
+check 'agent: the tunnel connections were forwarded to its listener' agent_has 'tunnel connection from 10.77.0.2 port'
+log 'test_agent over the tunnel:'
+peer 'tail -n 5 /tmp/test_agent.log' | sed 's/^/   /'
+log 'the agent:'
+agentlog | grep -i 'wireguard\|listening\|tunnel' | head -n 12 | sed 's/^/   /'
+stop_agent
+peer 'ip link del wg0'
 if [[ $fails -gt 0 ]]; then log "$fails check(s) failed"; exit 1; fi
 log 'all checks passed'
