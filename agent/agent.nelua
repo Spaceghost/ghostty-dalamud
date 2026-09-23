@@ -82,6 +82,7 @@ local function gi_node_id(out: cstring, cap: csize): int32 <cimport, nodecl> end
 local function gi_listen(allowlist_path: cstring): uint32 <cimport, nodecl> end
 local function gi_accept(listener: uint32): uint32 <cimport, nodecl> end
 local function gi_peer_id(h: uint32, out: cstring, cap: csize): int32 <cimport, nodecl> end
+local function gi_peer_caps(h: uint32): int32 <cimport, nodecl> end
 local function gi_recv(h: uint32, buf: pointer, cap: csize): int32 <cimport, nodecl> end
 local function gi_send(h: uint32, buf: pointer, len: csize): int32 <cimport, nodecl> end
 local function gi_close(h: uint32): void <cimport, nodecl> end
@@ -135,6 +136,17 @@ local Session = @record{
   exit_status: int32,
 }
 
+-- What this client may ask for. Mirrors GI_CAP_* in
+-- crates/ghostty-iroh/include/ghostty_iroh.h; the agent is the only thing that
+-- enforces them, so they are checked in one place (handle_frame) rather than
+-- spread through the modules that would otherwise each have to remember.
+local CAP_RUN: uint32 <comptime> = 1
+local CAP_SHELL: uint32 <comptime> = 2
+local CAP_CLIP_READ: uint32 <comptime> = 4
+local CAP_CLIP_WRITE: uint32 <comptime> = 8
+local CAP_WINDOWS: uint32 <comptime> = 16
+local CAP_ALL: uint32 <comptime> = 31
+
 local Client = @record{
   sock: NetSocket,
   inq: ByteQueue,
@@ -143,6 +155,7 @@ local Client = @record{
   alive: boolean,
   ev: pointer,             -- Windows: the socket's event for the event loop
   ih: uint32,              -- iroh connection handle; 0 means this client is a socket
+  caps: uint32,            -- CAP_*: what the allowlist grants this peer
 }
 
 local Agent = @record{
@@ -345,6 +358,18 @@ local function clipboard_get(): (boolean, string)
   return agent_clipboard_get()
 end
 
+-- Does this WOPEN ask the agent to START something, rather than show a window
+-- that is already up? The match text after the 13-byte head is `run:CMD`,
+-- `app:ID` or `desktop:ID` for a launch (docs/REMOTE_WINDOWS.md); anything
+-- else is a wid or a title to match. Checked here rather than in
+-- agent/windows.nelua so every refusal this agent makes is in one function.
+local WOPEN_HEAD: usize <comptime> = 13
+local function wopen_starts_program(payload: *[0]uint8, len: usize): boolean
+  if len <= WOPEN_HEAD then return false end
+  local text = string{ data = (@*[0]byte)(&payload[WOPEN_HEAD]), size = len - WOPEN_HEAD }
+  return text:subview(1, 4) == 'run:' or text:subview(1, 4) == 'app:' or text:subview(1, 8) == 'desktop:'
+end
+
 local function send_opened_error(c: *Client, why: string): void
   proto.write_frame_id(&c.outq, PROTO_OPENED, 0, (@*[0]uint8)(why.data), why.size)
 end
@@ -463,6 +488,14 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     local text = sb:promote()
     send_text(c, PROTO_LISTR, text)
     text:destroy()
+  elseif typ == PROTO_CLIP_SET and (c.caps & CAP_CLIP_WRITE) == 0 then
+    -- CLIP_SET writes the host's clipboard; CLIP_GET reads it. They are
+    -- separate grants because letting a peer paste into this machine and
+    -- letting it read what is on this machine are different things to agree
+    -- to, and `clipboard=read` is the common one.
+    send_text(c, PROTO_ERR, 'not permitted: this peer may not set the clipboard')
+  elseif typ == PROTO_CLIP_GET and (c.caps & CAP_CLIP_READ) == 0 then
+    send_text(c, PROTO_ERR, 'not permitted: this peer may not read the clipboard')
   elseif typ == PROTO_CLIP_SET then
     if len <= CLIP_MAX and clipboard_set(payload, len) then
       ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
@@ -478,6 +511,14 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     text:destroy()
   elseif typ == PROTO_HELLO then
     send_text(c, PROTO_OK, 'already authenticated')
+  elseif typ == PROTO_OPEN and (c.caps & CAP_SHELL) == 0 then
+    -- `shell=no`: the line docs/MULTI_AGENT.md calls the difference between a
+    -- window server and a remote shell service.
+    send_opened_error(c, 'not permitted: this peer may not open a shell')
+  elseif typ == PROTO_WOPEN and (c.caps & CAP_WINDOWS) == 0 then
+    send_text(c, PROTO_ERR, 'not permitted: this peer may not see windows')
+  elseif typ == PROTO_WOPEN and (c.caps & CAP_RUN) == 0 and wopen_starts_program(payload, len) then
+    send_text(c, PROTO_ERR, 'not permitted: this peer may not start programs')
   elseif jobs:handle(ci, &c.outq, typ, payload, len) then
     -- a raw job frame (agent/jobs.nelua)
   elseif windows:handle(ci, &c.outq, typ, payload, len) then
@@ -732,7 +773,15 @@ local function iroh_accept_all(): void
     -- net.close in client_close, socket_fd in the poll build-up -- is a
     -- no-op rather than a wrong fd. Unauthenticated like any other client:
     -- the PROTO_HELLO token still has to arrive (docs/MULTI_AGENT.md).
-    local cl: Client = { sock = net.invalid(), alive = true, ih = h }
+    -- The allowlist's grants for this key. A negative answer means the
+    -- library cannot say, and the header is explicit that a caller which
+    -- cannot tell must refuse rather than assume: no capabilities at all.
+    local caps: uint32 = 0
+    ## if IROH_BUILT then
+    local rc = gi_peer_caps(h)
+    if rc >= 0 then caps = (@uint32)(rc) end
+    ## end
+    local cl: Client = { sock = net.invalid(), alive = true, ih = h, caps = caps }
     agent.clients:push(cl)
     local pbuf: [80]uint8
     local pn = gi_peer_id(h, (@cstring)((@pointer)(&pbuf)), #pbuf)
@@ -1099,7 +1148,9 @@ local function main(): integer
 
     local c = net.accept(agent.listen_sock)
     while net.is_valid(c) do
-      local cl: Client = { sock = c, alive = true }
+      -- No allowlist on the socket path: the token is the whole
+      -- authorisation there, as it was before grants existed.
+      local cl: Client = { sock = c, alive = true, caps = CAP_ALL }
       agent.clients:push(cl)
       c = net.accept(agent.listen_sock)
     end
