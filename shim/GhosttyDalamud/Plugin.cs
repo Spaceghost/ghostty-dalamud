@@ -32,6 +32,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private NativeCache? nativeCache;
     private bool nativeLoaded;
     private bool hostCreated;
+    private bool nativeWindows;
     private bool walkHooked;
     private bool subscribed;
     private bool disposed;
@@ -47,6 +48,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
             nativeLoaded = true;
             HostApi.Create();
             hostCreated = true;
+            NativeWindows.Start(); // game windows (KamiToolKit) come up in the background
+            nativeWindows = true;
             installDir = Marshal.StringToCoTaskMemUTF8(install);
             configDir = Marshal.StringToCoTaskMemUTF8(Pi.ConfigDirectory.FullName);
             configsRoot = Marshal.StringToCoTaskMemUTF8(Pi.ConfigDirectory.Parent!.FullName);
@@ -119,6 +122,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
                 Native.Shutdown();
                 Native.Unload();
             }
+            if (nativeWindows) NativeWindows.Stop(); // after the core closed its windows; KamiToolKit's hooks go last
         }
         finally
         {
