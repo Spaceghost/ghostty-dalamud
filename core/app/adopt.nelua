@@ -111,6 +111,14 @@ end
 global function adopt_count(): integer return #wins end
 global function adopt_at(i: integer): *AdoptWin return wins[i] end
 
+-- Whether ImGui window name `title` is adopted.
+global function adopt_has_title(title: string): boolean
+  for i = 0, < #wins do
+    if wins[i].title == title then return true end
+  end
+  return false
+end
+
 -- Whether ImGui window `w` (any pointer from the context) belongs to an
 -- adopted window: itself, a child, a popup opened from it, or a tooltip
 -- while the pointer is inside it.
@@ -132,7 +140,8 @@ local function other_window_at(x: float32, y: float32): boolean
   if ctx == nilptr then return false end
   for i = 0, < ctx.Windows.Size do
     local w = (@*ImGuiWindow)(ctx.Windows.Data[i])
-    if w == nilptr or not w.Active or w.Hidden or w.IsFallbackWindow then continue end
+    -- drawn this frame or the last: a plugin that draws after ghostty has not set Active yet
+    if w == nilptr or not (w.Active or w.WasActive) or w.Hidden or w.IsFallbackWindow then continue end
     if (w.Flags & (ImGuiWindowFlags_ChildWindow | ImGuiWindowFlags_NoMouseInputs)) ~= 0 then continue end
     if x >= w.Pos.x and y >= w.Pos.y and x < w.Pos.x + w.Size.x and y < w.Pos.y + w.Size.y then
       if adopted_owner(w) == nilptr then return true end
@@ -181,6 +190,112 @@ local function take_list(aw: *AdoptWin, w: *ImGuiWindow, popup: boolean): void
   end
 end
 
+-- Window `root` (drawn this frame) into aw: its geometry, its own place and
+-- flags the first time, and its lists (children, popups) into the snapshot,
+-- emptied so it never reaches the screen.
+local function capture(aw: *AdoptWin, root: *ImGuiWindow): void
+  aw.drawn = true
+  if not aw.have_orig then
+    aw.have_orig = true
+    aw.orig_x, aw.orig_y, aw.orig_flags = root.Pos.x, root.Pos.y, root.Flags
+    aw.orig_w, aw.orig_h = root.SizeFull.x, root.SizeFull.y
+  end
+  adopt_snap_clear(&aw.snap)
+  aw.snap.frame = ctx.FrameCount
+  aw.x, aw.y, aw.w, aw.h = root.Pos.x, root.Pos.y, root.Size.x, root.Size.y
+  -- a size asked for last frame reaches Size at the plugin's next Begin;
+  -- until then Size and InnerRect are of different layouts and the chrome
+  -- between them cannot be measured
+  aw.laid_out = math.abs(root.Size.x - root.SizeFull.x) < 0.5 and math.abs(root.Size.y - root.SizeFull.y) < 0.5
+  local inner = root.InnerRect
+  if inner.Max.x - inner.Min.x >= 1 and inner.Max.y - inner.Min.y >= 1 then
+    aw.ix0, aw.iy0, aw.ix1, aw.iy1 = inner.Min.x, inner.Min.y, inner.Max.x, inner.Max.y
+  else -- not laid out (collapsed): the whole window
+    aw.ix0, aw.iy0, aw.ix1, aw.iy1 = aw.x, aw.y, aw.x + aw.w, aw.y + aw.h
+  end
+  take_list(aw, root, false)
+  -- its popups (and, while the pointer is in it, tooltips), back to front
+  for k = 0, < ctx.Windows.Size do
+    local w = (@*ImGuiWindow)(ctx.Windows.Data[k])
+    if w == nilptr or w == root or w.RootWindow ~= (@pointer)(w) then continue end
+    local popup = (w.Flags & (ImGuiWindowFlags_Popup | ImGuiWindowFlags_Modal)) ~= 0 and w.RootWindowPopupTree == (@pointer)(root)
+    local tip = aw.remap and remapping and (w.Flags & ImGuiWindowFlags_Tooltip) ~= 0
+    if popup or tip then take_list(aw, w, true) end
+  end
+end
+
+-- Automatic windows (CONFIG.adopt.auto) ------------------------------------------------------------
+-- Watched while a character is in the world. RenderPre looks for each one
+-- every frame, after every plugin has drawn, so the frame a watched window
+-- first appears it is claimed there: captured like an adopted window and
+-- emptied, so it never reaches the flat UI. ghostty's next frame turns the
+-- claim into a pet (adopt_window takes the capture over). Found from
+-- ghostty's own draw instead, the window could only be seen when its plugin
+-- happened to draw first: ImGui::NewFrame clears every window's Active, and
+-- Dalamud runs the plugins' draws in an order nobody controls.
+global AdoptWatch = @record{
+  name: string, title: string, plugin: string, label: string, -- owned
+  title_z: string,   -- the title with a NUL, for FindWindowByName (owned)
+  claim: *AdoptWin,  -- captured at RenderPre, not a pet yet (s is nilptr)
+  seen: boolean,     -- still listed at the last adopt_watch_end
+}
+local watch: vector(AdoptWatch)
+local watch_armed = false
+local watch_frame: cint = 0 -- ImGui's frame count when ghostty last armed the watch
+
+-- An adopted window's record, or a claim's, and everything it owns.
+local function free_win(aw: *AdoptWin): void
+  adopt_snap_destroy(&aw.snap)
+  aw.name:destroy()
+  aw.title:destroy()
+  aw.title_z:destroy()
+  aw.plugin:destroy()
+  aw.label:destroy()
+  delete(aw)
+end
+
+local function drop_claims(): void
+  for i = 0, < #watch do
+    if watch[i].claim ~= nilptr then
+      free_win(watch[i].claim)
+      watch[i].claim = nilptr
+    end
+  end
+end
+
+local function watch_claim_pass(): void
+  if not watch_armed then return end
+  -- ghostty has not drawn for a frame or two (its Draw skipped, or failing):
+  -- nobody would turn a claim into a pet, so let the windows draw flat
+  if ctx.FrameCount - watch_frame > 2 then
+    drop_claims()
+    return
+  end
+  for i = 0, < #watch do
+    local e = &watch[i]
+    if adopt_has_title(e.title) or adopt_declined(e.name) then
+      if e.claim ~= nilptr then free_win(e.claim) e.claim = nilptr end
+      continue
+    end
+    local root = imgui_int.FindWindowByName((@cstring)(e.title_z.data))
+    if root == nilptr or not root.Active or root.Hidden then
+      -- closed again before it became a pet: nothing to hold on to
+      if e.claim ~= nilptr then free_win(e.claim) e.claim = nilptr end
+      continue
+    end
+    if e.claim == nilptr then
+      local aw = new(@AdoptWin)
+      aw.name = e.name:copy()
+      aw.title = e.title:copy()
+      aw.title_z = e.title .. '\0'
+      aw.plugin = e.plugin:copy()
+      aw.label = e.label:copy()
+      e.claim = aw
+    end
+    capture(e.claim, root)
+  end
+end
+
 local function on_render_pre(c: *ImGuiContext, hook: *ImGuiContextHook): void
   if ctx == nilptr or c ~= ctx then return end
   for i = 0, < #wins do
@@ -189,35 +304,9 @@ local function on_render_pre(c: *ImGuiContext, hook: *ImGuiContextHook): void
     if aw.entry.state == AdoptState.Released then continue end
     local root = imgui_int.FindWindowByName((@cstring)(aw.title_z.data))
     if root == nilptr or not root.Active or root.Hidden then continue end
-    aw.drawn = true
-    if not aw.have_orig then
-      aw.have_orig = true
-      aw.orig_x, aw.orig_y, aw.orig_flags = root.Pos.x, root.Pos.y, root.Flags
-      aw.orig_w, aw.orig_h = root.SizeFull.x, root.SizeFull.y
-    end
-    adopt_snap_clear(&aw.snap)
-    aw.snap.frame = ctx.FrameCount
-    aw.x, aw.y, aw.w, aw.h = root.Pos.x, root.Pos.y, root.Size.x, root.Size.y
-    -- a size asked for last frame reaches Size at the plugin's next Begin;
-    -- until then Size and InnerRect are of different layouts and the chrome
-    -- between them cannot be measured
-    aw.laid_out = math.abs(root.Size.x - root.SizeFull.x) < 0.5 and math.abs(root.Size.y - root.SizeFull.y) < 0.5
-    local inner = root.InnerRect
-    if inner.Max.x - inner.Min.x >= 1 and inner.Max.y - inner.Min.y >= 1 then
-      aw.ix0, aw.iy0, aw.ix1, aw.iy1 = inner.Min.x, inner.Min.y, inner.Max.x, inner.Max.y
-    else -- not laid out (collapsed): the whole window
-      aw.ix0, aw.iy0, aw.ix1, aw.iy1 = aw.x, aw.y, aw.x + aw.w, aw.y + aw.h
-    end
-    take_list(aw, root, false)
-    -- its popups (and, while the pointer is in it, tooltips), back to front
-    for k = 0, < ctx.Windows.Size do
-      local w = (@*ImGuiWindow)(ctx.Windows.Data[k])
-      if w == nilptr or w == root or w.RootWindow ~= (@pointer)(w) then continue end
-      local popup = (w.Flags & (ImGuiWindowFlags_Popup | ImGuiWindowFlags_Modal)) ~= 0 and w.RootWindowPopupTree == (@pointer)(root)
-      local tip = aw.remap and remapping and (w.Flags & ImGuiWindowFlags_Tooltip) ~= 0
-      if popup or tip then take_list(aw, w, true) end
-    end
+    capture(aw, root)
   end
+  watch_claim_pass()
 end
 
 -- The mouse at NewFramePre -------------------------------------------------------------------------
@@ -291,6 +380,83 @@ local function remove_hooks(): void
   log(LOG_INFO, 'adopt: hooks off')
 end
 
+-- The hooks are wanted while a window is adopted or automatic ones are watched.
+local function hooks_maybe_off(): void
+  if #wins == 0 and not (watch_armed and #watch > 0) then remove_hooks() end
+end
+
+-- The automatic windows to watch (CONFIG.adopt.auto, their plugins loaded), as
+-- panels.nelua lists them: adopt_watch_begin, adopt_watch_add for each, adopt_watch_end.
+global function adopt_watch_begin(): void
+  for i = 0, < #watch do watch[i].seen = false end
+end
+
+global function adopt_watch_add(name: string, title: string, plugin: string, label: string): void
+  for i = 0, < #watch do
+    if watch[i].name == name and watch[i].title == title then watch[i].seen = true return end
+  end
+  watch:push(AdoptWatch{ name = name:copy(), title = title:copy(), plugin = plugin:copy(), label = label:copy(),
+                         title_z = title .. '\0', seen = true })
+end
+
+local function watch_free(e: *AdoptWatch): void
+  if e.claim ~= nilptr then free_win(e.claim) e.claim = nilptr end
+  e.name:destroy() e.title:destroy() e.plugin:destroy() e.label:destroy() e.title_z:destroy()
+end
+
+global function adopt_watch_end(): void
+  local i: integer = #watch - 1
+  while i >= 0 do
+    if not watch[i].seen then
+      watch_free(&watch[i])
+      watch:remove(i)
+    end
+    i = i - 1
+  end
+  hooks_maybe_off()
+end
+
+-- Each frame: whether automatic windows may be claimed now (a character in the
+-- world). Armed, the hooks go on; disarmed, claims are dropped (their windows
+-- draw flat again from the next frame) and the hooks go off if nothing needs them.
+global function adopt_watch_arm(armed: boolean): void
+  if armed and #watch > 0 then
+    if not hooks_on then
+      local ok, err = install_hooks()
+      if not ok then
+        if not warned_internal then
+          warned_internal = true
+          logf(LOG_WARN, 'adopt.auto: %s', err)
+        end
+        watch_armed = false
+        return
+      end
+    end
+    watch_armed = true
+    if ctx ~= nilptr then watch_frame = ctx.FrameCount end
+  else
+    watch_armed = false
+    drop_claims()
+    hooks_maybe_off()
+  end
+end
+
+global function adopt_watch_armed(): boolean return watch_armed end
+global function adopt_watch_count(): integer return #watch end
+global function adopt_watch_at(i: integer): *AdoptWatch return &watch[i] end
+
+-- The claim RenderPre made on window `title`, handed over (nilptr: none).
+local function take_claim(title: string): *AdoptWin
+  for i = 0, < #watch do
+    local aw = watch[i].claim
+    if aw ~= nilptr and aw.title == title then
+      watch[i].claim = nilptr
+      return aw
+    end
+  end
+  return nilptr
+end
+
 -- Adopt and release ---------------------------------------------------------------------------------
 
 -- The names pulled, one per line, for CONFIG.adopt.save (chat panels add theirs).
@@ -299,16 +465,6 @@ global function adopt_names(sb: *stringbuilder): void
     -- automatic ones come back by themselves
     if wins[i].entry.state ~= AdoptState.Released and not wins[i].automatic then sb:write(wins[i].name, '\n') end
   end
-end
-
-local function free_win(aw: *AdoptWin): void
-  adopt_snap_destroy(&aw.snap)
-  aw.name:destroy()
-  aw.title:destroy()
-  aw.title_z:destroy()
-  aw.plugin:destroy()
-  aw.label:destroy()
-  delete(aw)
 end
 
 -- Give the window back: its place and its flags as they were.
@@ -338,7 +494,7 @@ local function adopt_closed(s: *Session): void
       give_back(aw)
       wins:remove(i)
       free_win(aw)
-      if #wins == 0 then remove_hooks() end
+      hooks_maybe_off()
       panels_dirty = true
       return
     end
@@ -373,16 +529,22 @@ global function adopt_window(name: string, title: string, plugin: string, label:
   s.appear = 0
   if not make_pet(s) then
     session_remove(s)
-    if #wins == 0 then remove_hooks() end
+    hooks_maybe_off()
     return 0, 'the pet could not be placed'
   end
-  local aw = new(@AdoptWin)
+  -- an automatic window RenderPre already claimed: it has been off the flat
+  -- UI since the frame it appeared, and its capture is the pet's first picture
+  local aw = take_claim(title)
+  local claimed = aw ~= nilptr
+  if not claimed then
+    aw = new(@AdoptWin)
+    aw.name = name:copy()
+    aw.title = title:copy()
+    aw.title_z = title .. '\0'
+    aw.plugin = plugin:copy()
+    aw.label = label:copy()
+  end
   aw.s = s
-  aw.name = name:copy()
-  aw.title = title:copy()
-  aw.title_z = title .. '\0'
-  aw.plugin = plugin:copy()
-  aw.label = label:copy()
   aw.entry = { state = AdoptState.Waiting, since = host.last_time }
   aw.automatic = automatic
   aw.fit = adopt_lua_bool('fit', true) and imgui_int.SetWindowSize ~= nilptr
@@ -391,8 +553,22 @@ global function adopt_window(name: string, title: string, plugin: string, label:
   s.title:destroy()
   s.title = label:copy()
   wins:push(aw)
-  adopt_lua_size(s.id, 400, 300, 2 * PANEL_PAD, PANEL_TITLE + PANEL_PAD) -- until the window's own size is known
-  if from.z - from.x > 8 then
+  if claimed and aw.drawn then
+    -- its size is known already: the pet starts at it instead of growing into it next frame
+    aw.sized_w, aw.sized_h = aw.w, aw.h
+    if aw.fit then
+      adopt_lua_size(s.id, aw.ix1 - aw.ix0, aw.iy1 - aw.iy0, 2 * PANEL_PAD, PANEL_TITLE + PANEL_PAD)
+    else
+      adopt_lua_size(s.id, aw.w, aw.h, 2 * PANEL_PAD, PANEL_TITLE + PANEL_PAD)
+    end
+  else
+    adopt_lua_size(s.id, 400, 300, 2 * PANEL_PAD, PANEL_TITLE + PANEL_PAD) -- until the window's own size is known
+  end
+  if automatic then
+    -- straight into the world: no fly-out from its flat place, which would
+    -- show it on the flat UI first; the pet glitches in where pets appear
+    aw.flight_pending = false
+  elseif from.z - from.x > 8 then
     aw.flight_pending = false
     panel_flight_start(s.id, ImVec4{ from.x, from.y - PANEL_TITLE, from.z, from.w })
   else
@@ -416,14 +592,6 @@ global function adopt_release(name: string): (boolean, string)
   if aw == nilptr then return false, 'not adopted' end
   close_terminal(aw.s) -- Session:close -> adopt_closed gives it back at once
   return true, ''
-end
-
--- Whether ImGui window name `title` is adopted.
-global function adopt_has_title(title: string): boolean
-  for i = 0, < #wins do
-    if wins[i].title == title then return true end
-  end
-  return false
 end
 
 -- Per frame -----------------------------------------------------------------------------------------
@@ -585,6 +753,9 @@ global function adopt_shutdown(): void
     free_win(wins[i])
   end
   wins:destroy()
+  watch_armed = false
+  for i = 0, < #watch do watch_free(&watch[i]) end
+  watch:destroy()
   remove_hooks()
   warned_internal = false
   for i = 0, < #declined do declined[i]:destroy() end

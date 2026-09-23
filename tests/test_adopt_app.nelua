@@ -326,11 +326,17 @@ local api: GuHostApi = {
 }
 local dir: string = arg[1]
 
--- One frame: ImGui's NewFrame (hooks), the plugin's draw, ghostty's frame, Render (hooks).
+-- One frame: ImGui's NewFrame (hooks; every window's Active moves to
+-- WasActive and is cleared), the plugin's draw, ghostty's frame, Render
+-- (hooks). Dalamud runs the plugins' draws in an order nobody controls:
+-- `ghostty_first` puts ghostty's before the plugin's.
+local ghostty_first = false
 local function frame(press: boolean, plugin_active: boolean): void
   run_hook(ImGuiContextHookType_NewFramePre)
   ctx.InputEventsQueue.Size = 0 -- ImGui took them
-  plugin_draws(plugin_active)
+  win.WasActive = win.Active
+  win.Active = false
+  if not ghostty_first then plugin_draws(plugin_active) end
   reset_list()
   for i = 0, < #texts do texts[i]:destroy() end
   texts:clear()
@@ -348,6 +354,7 @@ local function frame(press: boolean, plugin_active: boolean): void
   panels_tick(now, true, true)
   draw_world(now)
   panels_after_world(now)
+  if ghostty_first then plugin_draws(plugin_active) end
   run_hook(ImGuiContextHookType_RenderPre)
 end
 
@@ -380,7 +387,9 @@ os.remove(dir .. '/adopted.lua')
 assert(gu_init(&api, (@cstring)(dir.data)) == 0, 'init')
 host.local_agent.last_try = 1e9 -- never dial out
 assert(imgui_bind(resolver, nilptr) > 0)
-assert(luaL_loadstring(policy.L, "CONFIG.world.occlusion = 'off'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+-- CONFIG.adopt.auto is emptied until the Mappy part: a watched window keeps the
+-- hooks on, and the parts before check that they go off with the last window
+assert(luaL_loadstring(policy.L, "CONFIG.world.occlusion = 'off'; CONFIG.adopt.auto = {}") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
 policy_refresh()
 host.world_visible, host.world_rez, host.world_last_time = true, 1, now
 host.last_time = now
@@ -508,7 +517,7 @@ do
   assert(saved():find('"chat2"', 1, true) > 0, 'the list survives the reload')
   host.world_visible, host.world_rez = true, 1
   io_state.InputQueueCharacters = { Size = 0, Capacity = #chars, Data = (@*[0]uint16)(&chars) }
-  assert(luaL_loadstring(policy.L, "CONFIG.world.occlusion = 'off'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  assert(luaL_loadstring(policy.L, "CONFIG.world.occlusion = 'off'; CONFIG.adopt.auto = {}") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
   policy_refresh()
   win.Pos = vec2(100, 50)
   frame(false, true)
@@ -677,39 +686,84 @@ do
 end
 
 -- Mappy: adopted automatically whenever its window is open -----------------------------------------------
+-- Straight into the world: RenderPre claims the window the frame it first
+-- appears, whichever of ghostty and Mappy draws first, so not one frame of it
+-- reaches the flat UI, and the claim is a pet on ghostty's next frame.
+local function mappy_opens(first: boolean): *AdoptWin
+  ghostty_first = first
+  for _ = 1, 40 do frame(false, false) end -- closed, and watched
+  assert(adopt_count() == 0 and #host.world == 0, 'nothing while it is closed')
+  assert(adopt_watch_armed() and adopt_watch_count() == 1, 'mappy is watched')
+  assert(live_hooks(ImGuiContextHookType_RenderPre) == 1, 'RenderPre is on while a window is watched')
+  -- the frame it opens: drawn by Mappy, emptied by RenderPre before anything is rendered
+  frame(false, true)
+  assert(win.Active and win_dl.CmdBuffer.Size == 0, 'its first frame never reaches the flat UI')
+  assert((win.Flags & ImGuiWindowFlags_NoMouseInputs) ~= 0, 'and takes no clicks there')
+  assert(adopt_watch_at(0).claim ~= nilptr, 'claimed at RenderPre')
+  -- ghostty's next frame: a pet with the claimed picture on it, no fly-out
+  frame(false, true)
+  assert(win_dl.CmdBuffer.Size == 0, 'still not on the flat UI')
+  assert(adopt_count() == 1 and adopt_watch_at(0).claim == nilptr, 'the claim became a pet')
+  local m = adopt_at(0)
+  assert(m.automatic and m.name == 'mappy' and m.title == '###MappyMapWindow' and m.label == 'Mappy', 'as the known mappy window')
+  assert(not panel_flight_active(m.s.id), 'no fly-out from its flat place')
+  assert(m.sized_w > 0, "the pet starts at the window's size")
+  m.s.appear = 1
+  for _ = 1, 3 do
+    frame(false, true)
+    assert(win_dl.CmdBuffer.Size == 0, 'never on the flat UI')
+  end
+  assert(m.entry.state == AdoptState.Adopted and prim_verts > 0, 'the map on the pet')
+  return m
+end
+
 do
   local mname: cstring = 'Mappy###MappyMapWindow'
   win.Name = mname
   win_id = 'MappyMapWindow'
-  for _ = 1, 40 do frame(false, true) end
-  assert(adopt_count() == 1, 'Mappy adopted without a command')
-  local m = adopt_at(0)
-  assert(m.automatic and m.name == 'mappy' and m.title == '###MappyMapWindow' and m.label == 'Mappy', 'as the known mappy window')
-  assert(panel_flight_active(m.s.id), 'flying out from the flat map')
-  for _ = 1, 3 do frame(false, true) end
-  assert(m.entry.state == AdoptState.Adopted and prim_verts > 0, 'the map on the pet')
+  assert(luaL_loadstring(policy.L, "CONFIG.adopt.auto = { mappy = true }") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  -- ghostty drawing before Mappy is what the game did: Mappy was never seen open
+  local m = mappy_opens(true)
   assert(saved():find('mappy', 1, true) == 0, 'automatic windows are not in the saved list')
-  -- its plugin closes the map: the pet goes quietly, and comes back when it opens
+  -- its plugin closes the map: the pet goes quietly
   for _ = 1, 60 do frame(false, false) end
   assert(adopt_count() == 0 and #host.world == 0, 'gone with its window')
-  for _ = 1, 40 do frame(false, true) end
-  assert(adopt_count() == 1 and adopt_at(0).automatic, 'back when it opens again')
+  -- and the other order, Mappy drawing first
+  m = mappy_opens(false)
   -- back to UI by hand: stays flat while it stays open
   assert(run_command('release mappy') == 0)
   assert(adopt_count() == 0 and adopt_declined('mappy'), 'given back and remembered')
   for _ = 1, 60 do frame(false, true) end
   assert(adopt_count() == 0 and win_dl.CmdBuffer.Size == 1, 'left on the flat UI while open')
+  assert(adopt_watch_at(0).claim == nilptr, 'not claimed while declined')
   -- closed and opened again: automatic again
   for _ = 1, 40 do frame(false, false) end
   assert(not adopt_declined('mappy'), 'forgotten once closed')
-  for _ = 1, 40 do frame(false, true) end
-  assert(adopt_count() == 1, 'automatic again after reopening')
+  m = mappy_opens(true)
+  -- ghostty stops drawing (its Draw skipped or failing) while Mappy opens: no
+  -- pet could come, so after a frame or two the map is left on the flat UI
+  for _ = 1, 60 do frame(false, false) end
+  assert(adopt_count() == 0, 'closed')
+  for k = 1, 4 do
+    run_hook(ImGuiContextHookType_NewFramePre)
+    win.WasActive = win.Active
+    win.Active = false
+    plugin_draws(true)
+    frame_count = frame_count + 1
+    ctx.FrameCount = frame_count
+    run_hook(ImGuiContextHookType_RenderPre)
+    if k >= 3 then assert(win_dl.CmdBuffer.Size == 1, 'no ghostty frames: drawn flat, not claimed') end
+  end
+  mappy_opens(true) -- ghostty back: closed first, then claimed as before
+  ghostty_first = false
   -- the settings switch: off, it stays flat, and /window adopt mappy still pulls it
   assert(luaL_loadstring(policy.L, "CONFIG.adopt.auto.mappy = false") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
   assert(run_command('release') == 0)
   for _ = 1, 40 do frame(false, false) end
+  assert(adopt_watch_count() == 0, 'no longer watched')
+  assert(live_hooks(ImGuiContextHookType_RenderPre) == 0, 'nothing watched or adopted: hooks off')
   for _ = 1, 60 do frame(false, true) end
-  assert(adopt_count() == 0, 'auto off: stays flat')
+  assert(adopt_count() == 0 and win_dl.CmdBuffer.Size == 1, 'auto off: stays flat')
   assert(run_command('adopt mappy') == 0 and adopt_count() == 1 and not adopt_at(0).automatic, 'pulled by hand')
   for _ = 1, 3 do frame(false, true) end
   assert(adopt_at(0).entry.state == AdoptState.Adopted, 'and drawn')
