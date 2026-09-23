@@ -479,7 +479,7 @@ local function handle_copen(self: *AgentClips, ci: usize, q: *ByteQueue, payload
     end
     local z = c.raw_path .. '\0'
     os.remove(c.raw_path) -- a fifo left by a crash is not a fifo we may reuse
-    local made = mkfifo((@cstring)(z.data), 0x1A0) -- 0600 == 0
+    local made = mkfifo((@cstring)(z.data), 0x1A0) == 0 -- mode 0600; a cint is always true in Nelua, so compare
     if made then
       -- O_RDWR: see the note on the camera sink above.
       c.fd = c_open((@cstring)(z.data), O_RDWR | O_NONBLOCK)
