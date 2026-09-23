@@ -26,6 +26,7 @@ end
 -- A string drawn as it is, by its begin and end: this runs every frame, and
 -- `(@cstring)(s .. '\0')` there left one string behind per frame.
 local function text(s: string): void
+  if #s == 0 then imgui.TextUnformatted('', nilptr) return end -- an empty string may have no data at all
   imgui.TextUnformatted((@cstring)(s.data), (@cstring)(&s.data[s.size]))
 end
 
