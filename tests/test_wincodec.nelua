@@ -3,6 +3,7 @@ require 'core.wincodec'
 require 'vector'
 require 'memory'
 require 'string'
+require 'math'
 
 local function image(w: integer, h: integer, seed: integer): vector(uint8)
   local v: vector(uint8)
@@ -101,7 +102,115 @@ do
   assert(#rects == 1 and rects[0].w == w and rects[0].h == h)
 end
 
--- downscaling: the smallest integer factor that fits, box averages, ragged edges
+-- sizing: the largest size that fits, aspect kept, never past a limit
+do
+  local w, h = wincodec_fit(2560, 1440, 1920, 1200)
+  assert(w == 1920 and h == 1080, 'a 2560x1440 window fills the default 1920x1200 limit, not 1280x720')
+  w, h = wincodec_fit(1920, 1080, 1920, 1200)
+  assert(w == 1920 and h == 1080, 'fits already')
+  w, h = wincodec_fit(3840, 2160, 1920, 1200)
+  assert(w == 1920 and h == 1080)
+  w, h = wincodec_fit(1200, 3000, 1920, 1200)
+  assert(w == 480 and h == 1200, 'a tall window: the height decides')
+  w, h = wincodec_fit(4000, 10, 100, 0)
+  assert(w == 100 and h == 1, 'never below one pixel; 0 is no limit')
+  w, h = wincodec_fit(10, 4000, 0, 100)
+  assert(w == 1 and h == 100)
+  w, h = wincodec_fit(333, 777, 0, 0)
+  assert(w == 333 and h == 777, 'no limit at all')
+  -- every size against every limit: within the limit, within the window, and
+  -- the aspect ratio off by less than one pixel on the side that did not decide
+  for sw = 1, 97, 7 do
+    for sh = 1, 97, 5 do
+      for mw = 0, 60, 3 do
+        for mh = 0, 60, 4 do
+          local ow, oh = wincodec_fit(sw, sh, mw, mh)
+          assert(ow >= 1 and oh >= 1 and ow <= sw and oh <= sh)
+          assert(mw == 0 or ow <= mw) assert(mh == 0 or oh <= mh)
+          if ow < sw or oh < sh then
+            -- one side sits on its limit, the other is its scaled size rounded
+            assert(ow == mw or oh == mh, 'the tighter limit is met exactly')
+            assert(math.abs(oh * sw - sh * ow) * 2 <= math.max(sw, sh) or ow == 1 or oh == 1, 'aspect kept')
+          else
+            assert((mw == 0 or sw <= mw) and (mh == 0 or sh <= mh), 'scaled only when it did not fit')
+          end
+        end
+      end
+    end
+  end
+end
+
+-- downscaling: area averages with fractional coverage at the edges of each box
+do
+  local function img(w: integer, h: integer): vector(uint8)
+    local v: vector(uint8)
+    v:resize((@usize)(w * h * 4))
+    return v
+  end
+  local out: vector(uint8)
+  -- no limit, or a frame that fits: untouched, nothing written
+  local src = img(10, 5)
+  local scaled, ow, oh = wincodec_downscale_fit((@*[0]uint8)(&src[0]), 40, 10, 5, 0, 0, &out)
+  assert(not scaled and ow == 10 and oh == 5 and #out == 0, 'no limit: untouched')
+  scaled, ow, oh = wincodec_downscale_fit((@*[0]uint8)(&src[0]), 40, 10, 5, 10, 5, &out)
+  assert(not scaled and #out == 0, 'fits already')
+  src:destroy()
+
+  -- a whole-number ratio is a plain box average: 4x2 -> 2x1
+  src = img(4, 2)
+  local vals: [8]uint8 = { 0, 10, 20, 30, 40, 50, 60, 70 }
+  for i = 0, < 8 do src[i*4], src[i*4+1], src[i*4+2], src[i*4+3] = vals[i], 200, (@uint8)(i), 9 end
+  scaled, ow, oh = wincodec_downscale_fit((@*[0]uint8)(&src[0]), 16, 4, 2, 2, 0, &out)
+  assert(scaled and ow == 2 and oh == 1 and #out == 2 * 4)
+  assert(out[0] == 25 and out[1] == 200 and out[3] == 255, 'mean of 0, 10, 40, 50; alpha opaque')
+  assert(out[4] == 45, 'mean of 20, 30, 60, 70')
+  assert(out[2] == 3 and out[6] == 5, 'means 2.5 and 4.5 round half up')
+  src:destroy()
+
+  -- a fractional ratio: 3 pixels into 2, the middle one split between them
+  src = img(3, 1)
+  src[0], src[4], src[8] = 0, 90, 180
+  scaled, ow, oh = wincodec_downscale_fit((@*[0]uint8)(&src[0]), 12, 3, 1, 2, 0, &out)
+  assert(scaled and ow == 2 and oh == 1)
+  assert(out[0] == 30, '(1 * 0 + 0.5 * 90) / 1.5')
+  assert(out[4] == 150, '(0.5 * 90 + 1 * 180) / 1.5')
+  src:destroy()
+
+  -- the owner's case: 2560x1440 at the default limit arrives at 1920x1080. A
+  -- flat colour stays exactly flat, and a 4-pixel checker (0 and 255) averages
+  -- to its mean everywhere, so no ratio drifts or bands.
+  local W, H = 2560, 1440
+  src = img(W, H)
+  for y = 0, < H do
+    for x = 0, < W do
+      local i = (y * W + x) * 4
+      local c: uint8 = ((x // 4 + y // 4) % 2 == 0) and 255 or 0
+      src[i], src[i+1], src[i+2] = 77, c, (@uint8)(y * 255 // (H - 1))
+    end
+  end
+  scaled, ow, oh = wincodec_downscale_fit((@*[0]uint8)(&src[0]), (@usize)(W * 4), W, H, 1920, 1200, &out)
+  assert(scaled and ow == 1920 and oh == 1080 and #out == 1920 * 1080 * 4)
+  local lo, hi = 255, 0
+  for y = 0, < oh do
+    for x = 0, < ow do
+      local i = (y * ow + x) * 4
+      assert(out[i] == 77, 'a flat channel stays exactly flat')
+      assert(out[i+3] == 255)
+      lo, hi = math.min(lo, out[i+1]), math.max(hi, out[i+1])
+    end
+  end
+  -- a 4/3 box over 4-pixel checks: each output pixel is mostly one check,
+  -- partly its neighbour; none is lost to a skipped column
+  assert(lo <= 64 and hi >= 191, 'the checker survives: 1920 columns sampled, not 1280')
+  -- the vertical ramp keeps its ends and stays monotonic
+  assert(out[2] <= 1 and out[((oh - 1) * ow) * 4 + 2] >= 254, 'the ramp keeps its ends')
+  for y = 1, < oh do assert(out[(y * ow) * 4 + 2] >= out[((y - 1) * ow) * 4 + 2]) end
+  src:destroy()
+  out:destroy()
+end
+
+-- the older whole-factor scaler, unchanged for its callers (the netlab publisher):
+-- the smallest integer factor that fits, box averages, ragged edges
 do
   local w, h = 10, 5
   local src: vector(uint8)
@@ -129,6 +238,30 @@ do
   f, ow, oh = wincodec_downscale((@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, 5, 5, &out)
   assert(f == 2 and ow == 5 and oh == 3)
   assert(out[0] == 5 and out[1] == 10, 'factor 2 averages four pixels (rounded)')
+end
+
+-- input and geometry map between window pixels and frame pixels
+do
+  -- the frame pixel's centre, clamped
+  assert(wincodec_unscale(10, 160, 320) == 21, 'x2: the centre of the 2-pixel box')
+  assert(wincodec_unscale(0, 1920, 2560) == 0 and wincodec_unscale(1919, 1920, 2560) == 2559)
+  assert(wincodec_unscale(3, 1920, 2560) == 4, '(3.5 * 4/3) = 4.67 -> pixel 4')
+  assert(wincodec_unscale(5000, 1920, 2560) == 2559 and wincodec_unscale(-7, 1920, 2560) == 0, 'clamped to the window')
+  assert(wincodec_unscale(17, 300, 300) == 17 and wincodec_unscale(17, 0, 0) == 17, 'unscaled, or before any frame')
+  -- every frame pixel maps into the window pixels it was averaged from
+  for x = 0, < 1920 do
+    local wx = wincodec_unscale(x, 1920, 2560)
+    assert((wx + 1) * 1920 > x * 2560 and wx * 1920 < (x + 1) * 2560, 'inside its own box')
+  end
+  -- spans cover every frame pixel they touch
+  local v, n = wincodec_scale_span(3, 4, 320, 160)
+  assert(v == 1 and n == 3, 'window 3..6 touches frame 1..3')
+  v, n = wincodec_scale_span(0, 2560, 2560, 1920)
+  assert(v == 0 and n == 1920)
+  v, n = wincodec_scale_span(-10, 30, 2560, 1920)
+  assert(v == -8 and n == 23)
+  v, n = wincodec_scale_span(5, 9, 100, 100)
+  assert(v == 5 and n == 9, 'unscaled')
 end
 
 -- banding keeps every rectangle's raw size under the limit
