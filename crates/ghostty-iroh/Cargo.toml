@@ -1,0 +1,65 @@
+[package]
+name = "ghostty-iroh"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+publish = false
+description = "iroh transport behind the ghostty-multiagent net.nelua seam, exposed as a C ABI"
+license = "MIT"
+
+[lib]
+name = "ghostty_iroh"
+# staticlib for the zig cc link lines (host agent + windows-gnu core), rlib for
+# the crate's own tests. No cdylib: it is the crate type that forces a real
+# link during the cross build, which is where the Windows build failed, and
+# nothing here loads the crate as a shared object.
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# Exact pins: docs/IROH.md requires the tree to be vendored and built
+# --offline --locked, so nothing here may float.
+iroh = "=0.35.0"
+tokio = { version = "1.44", features = [
+    "rt-multi-thread",
+    "sync",
+    "time",
+    "io-util",
+    "macros",
+] }
+rand = "=0.8.5"
+# Media over QUIC. moq-net is generic over web_transport_trait::Session, so it
+# rides the iroh connection this crate already opens rather than needing a
+# transport of its own (src/moq.rs).
+# Exact, like every other pin here: a caret range let a fresh resolve pick a
+# newer moq-net, which wants web-transport-trait 0.5, and src/moq.rs implements
+# 0.4. Anyone building without this crate's Cargo.lock hit an API mismatch.
+moq-net = "=0.2.22"
+web-transport-trait = "=0.4.0"
+bytes = "=1.12.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "=0.2.172"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "=0.59.0", features = [
+    "Win32_Foundation",
+    # CreateEventW takes a SECURITY_ATTRIBUTES, so Threading alone does not
+    # bring the symbol in.
+    "Win32_Security",
+    "Win32_System_Threading",
+] }
+
+[profile.release]
+opt-level = 2
+# The staticlib is linked into a PE DLL by zig cc; keep unwinding out of the
+# cross-module path entirely (docs/IROH.md: no callbacks, no unwinding, across
+# the boundary).
+panic = "abort"
+
+# iroh-quinn-udp queries IPV6_V6ONLY on every socket, including AF_INET ones,
+# and treats a failure as fatal. Wine answers WSAEOPNOTSUPP there, so the
+# plugin core could not open an iroh endpoint at all: "bind IPv4 failed: OS
+# Error 10045". The vendored copy takes false for an IPv4 socket, which is
+# what the answer would have been, and is otherwise unmodified 0.5.7.
+[patch.crates-io]
+iroh-quinn-udp = { path = "../patched/iroh-quinn-udp" }

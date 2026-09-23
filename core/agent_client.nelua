@@ -34,6 +34,13 @@ global AgentClient = @record{
   state: AgentState,
   host: string,
   port: uint16,
+  -- An iroh NodeId, when the link is addressed by key instead of host:port.
+  -- Set, it is what connect() dials and host/port are only for the log line.
+  node: string,
+  -- what the agent says it runs on: 'linux', 'macos', 'windows', or '' from an
+  -- agent too old to say. Never the plugin's own platform: under Wine those
+  -- differ, and a command for the agent must follow the agent.
+  platform: string,
   token: string,
   inq: ByteQueue,
   outq: ByteQueue,
@@ -71,6 +78,8 @@ function AgentClient:destroy(): void
   self.inq:destroy()
   self.outq:destroy()
   self.host:destroy()
+  self.node:destroy()
+  self.platform:destroy()
   self.token:destroy()
   self.last_error:destroy()
   self.attach_fifo:destroy()
@@ -100,10 +109,26 @@ function AgentClient:connect(now: float64): void
   self.attach_fifo:clear()
   self.clip_fifo:clear()
   self.clip_off = false
-  self.conn = net.connect(self.host, self.port)
+  if #self.node > 0 then
+    self.conn = net.connect_node(self.node)
+  else
+    self.conn = net.connect(self.host, self.port)
+  end
   if not net.is_valid(self.conn.sock) then
     self.state = AgentState.Failed
-    set_error(self, 'connect failed')
+    -- say why when the transport knows: 'connect failed' alone sends the
+    -- reader to the network when the answer is usually at the ABI boundary
+    local detail = net.last_error()
+    if #detail > 0 then
+      local sb: stringbuilder
+      sb:write('connect failed: ', detail)
+      local msg = sb:promote()
+      set_error(self, msg)
+      msg:destroy()
+    else
+      set_error(self, 'connect failed')
+    end
+    detail:destroy()
     return
   end
   self.sock = self.conn.sock
@@ -458,6 +483,8 @@ end
 local function parse_greeting(self: *AgentClient, text: string): void
   self.version = 1
   self.nonce = 0
+  self.platform:destroy()
+  self.platform = (@string){}
   local prefix: string = 'ghostty-agent '
   if text.size <= prefix.size or text:subview(1, prefix.size) ~= prefix then return end
   local v, i = parse_digits(text, prefix.size)
@@ -466,6 +493,13 @@ local function parse_greeting(self: *AgentClient, text: string): void
   if i < text.size and text.data[i] == ' '_b then
     local n, j = parse_digits(text, i + 1)
     if j > i + 1 then self.nonce = n end
+    -- optional fourth token, added later: the agent's platform
+    if j < text.size and text.data[j] == ' '_b then
+      local rest = text:subview(j + 2)
+      local e = 1
+      while e <= rest.size and rest.data[e - 1] ~= ' '_b do e = e + 1 end
+      if e > 1 then self.platform = rest:subview(1, e - 1):copy() end
+    end
   end
 end
 

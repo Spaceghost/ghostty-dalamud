@@ -52,6 +52,8 @@ local KEY_OURS: uint8 <comptime> = 0xff -- key_mods of a held key the plugin use
 
 global RemoteWin = @record{
   s: *Session,              -- the panel (the stream is freed with it)
+  agent: *AgentClient,      -- the link this stream is on; nilptr means the local one
+  agent_name: string,       -- the link's name as asked for, '' for the local one (owned)
   req: uint32,              -- WOPEN request id
   sid: uint32,              -- stream id, 0 until WOPENED
   app: string,              -- what was asked for: the run command's program, the match text, or '' (owned)
@@ -92,6 +94,14 @@ global RemoteWin = @record{
 }
 
 local streams: vector(*RemoteWin)
+
+-- The connection a stream belongs to. Streams opened before CONFIG.agents
+-- existed, and every stream on the local agent, carry nilptr.
+local function stream_agent(rw: *RemoteWin): *AgentClient
+  if rw.agent ~= nilptr then return rw.agent end
+  return &host.local_agent.client
+end
+
 local next_req: uint32 = 1
 local auto_done = false
 local old_shim_logged = false
@@ -162,6 +172,7 @@ local function free_stream(rw: *RemoteWin): void
   rw.match:destroy()
   rw.key:destroy()
   rw.fallback:destroy()
+  rw.agent_name:destroy()
   rw.geom:destroy()
   rw.geom_next:destroy()
   delete(rw)
@@ -198,7 +209,7 @@ local function remotewin_closed(s: *Session): void
       if s.keep_on_agent then
         restore_done = false -- the layout is being taken down: the next one restores it
       else
-        if rw.state == RemoteWinState.Live and rw.sid ~= 0 then host.agent:wclose(rw.sid) end
+        if rw.state == RemoteWinState.Live and rw.sid ~= 0 then stream_agent(rw):wclose(rw.sid) end
         closing_children = true
       end
       -- still Opening: its WOPENED finds no stream and is closed then
@@ -242,7 +253,7 @@ end
 local function ack(rw: *RemoteWin): void
   if not rw.ack_pending or rw.state ~= RemoteWinState.Live then return end
   if rw.s.sleeping or host.last_time - rw.drawn_at > UNDRAWN_HOLD then return end
-  host.agent:wack(rw.sid, rw.ack_seq)
+  stream_agent(rw):wack(rw.sid, rw.ack_seq)
   rw.ack_pending = false
 end
 
@@ -333,6 +344,7 @@ end
 
 global WinListEntry = @record{
   wid: uint32, w: integer, h: integer,
+  agent: string,              -- the link that listed it, '' for the local one (owned)
   app: string, title: string, -- owned
   key: string,                -- '' when the agent sends none (owned)
   extra: vector(string),      -- the columns after the title (owned)
@@ -341,7 +353,7 @@ global WinListEntry = @record{
   compositor: boolean,        -- a window of the agent's own compositor (the line has the launch column)
   raise: uint32,              -- "raise:N": a link from an app asked to show it (N counts up per request)
 }
-global WinAppEntry = @record{ id: string, name: string, icon: string, categories: string } -- owned
+global WinAppEntry = @record{ agent: string, id: string, name: string, icon: string, categories: string } -- owned
 global WinList = @record{
   windows: vector(WinListEntry),
   apps: vector(WinAppEntry),
@@ -352,14 +364,14 @@ global winlist: WinList
 local function winlist_clear(): void
   for i = 0, < #winlist.windows do
     local e = &winlist.windows[i]
-    e.app:destroy() e.title:destroy() e.key:destroy()
+    e.agent:destroy() e.app:destroy() e.title:destroy() e.key:destroy()
     for k = 0, < #e.extra do e.extra[k]:destroy() end
     e.extra:destroy()
   end
   winlist.windows:clear()
   for i = 0, < #winlist.apps do
     local a = &winlist.apps[i]
-    a.id:destroy() a.name:destroy() a.icon:destroy() a.categories:destroy()
+    a.agent:destroy() a.id:destroy() a.name:destroy() a.icon:destroy() a.categories:destroy()
   end
   winlist.apps:clear()
 end
@@ -401,7 +413,9 @@ end
 -- Take in a WLISTR payload. A window list replaces the windows; the answer
 -- to WLIST "apps" (only app, term and desktop lines) replaces the apps, so
 -- the two requests can go out together. Malformed lines are skipped.
-global function winlist_parse(data: *[0]uint8, len: usize): boolean -- true: it was the app list
+-- `agent` is the link the answer came from: its rows replace that link's rows
+-- and leave every other link's alone, so the picker shows every machine at once.
+global function winlist_parse(agent: string, data: *[0]uint8, len: usize): boolean -- true: it was the app list
   winlist.answers = winlist.answers + 1
   local windows: vector(WinListEntry)
   local apps: vector(WinAppEntry)
@@ -416,7 +430,7 @@ global function winlist_parse(data: *[0]uint8, len: usize): boolean -- true: it 
         if kind == 'app' or kind == 'term' or kind == 'desktop' then
           app_lines = app_lines + 1
           if kind == 'app' and #cols >= 3 then -- terminal apps and nested desktops: not shown yet
-            local a: WinAppEntry = { id = cols[1]:copy(), name = cols[2]:copy() }
+            local a: WinAppEntry = { agent = agent:copy(), id = cols[1]:copy(), name = cols[2]:copy() }
             if #cols > 3 then a.icon = cols[3]:copy() end
             if #cols > 4 then a.categories = cols[4]:copy() end
             apps:push(a)
@@ -426,7 +440,7 @@ global function winlist_parse(data: *[0]uint8, len: usize): boolean -- true: it 
           local okx, w = parse_count(cols[1])
           local oky, h = parse_count(cols[2])
           if okw and okx and oky and wid <= 0xffffffff then
-            local e: WinListEntry = { wid = (@uint32)(wid), w = w, h = h, app = cols[3]:copy(), title = cols[4]:copy() }
+            local e: WinListEntry = { wid = (@uint32)(wid), w = w, h = h, agent = agent:copy(), app = cols[3]:copy(), title = cols[4]:copy() }
             for k = 5, < #cols do
               e.extra:push(cols[k]:copy())
               local c = cols[k]
@@ -452,34 +466,48 @@ global function winlist_parse(data: *[0]uint8, len: usize): boolean -- true: it 
   end
   cols:destroy()
   local apps_answer = app_lines > 0 and #windows == 0
-  -- swap in what this answer carries, free what it replaces
+  -- Replace this link's rows, keep every other link's. The rows of other links
+  -- move across untouched (no copy, no free); only this link's old rows are
+  -- freed, and only the kind of list this answer carries is replaced.
   local old_windows, old_apps = winlist.windows, winlist.apps
-  if apps_answer then
-    winlist.apps = apps
-    winlist.windows = {}
-    for i = 0, < #old_windows do winlist.windows:push(old_windows[i]) end
-    old_windows:clear()
-    windows:destroy()
-  else
-    winlist.windows = windows
-    winlist.apps = {}
-    for i = 0, < #old_apps do winlist.apps:push(old_apps[i]) end
-    old_apps:clear()
-    for i = 0, < #apps do apps[i].id:destroy() apps[i].name:destroy() apps[i].icon:destroy() apps[i].categories:destroy() end
-    apps:destroy()
-  end
+  winlist.windows = {}
+  winlist.apps = {}
   for i = 0, < #old_windows do
     local e = &old_windows[i]
-    e.app:destroy() e.title:destroy() e.key:destroy()
-    for k = 0, < #e.extra do e.extra[k]:destroy() end
-    e.extra:destroy()
+    if apps_answer or e.agent ~= agent then
+      winlist.windows:push($e) -- another link's, or a list that says nothing about windows
+    else
+      e.agent:destroy() e.app:destroy() e.title:destroy() e.key:destroy()
+      for k = 0, < #e.extra do e.extra[k]:destroy() end
+      e.extra:destroy()
+    end
   end
   old_windows:destroy()
   for i = 0, < #old_apps do
     local a = &old_apps[i]
-    a.id:destroy() a.name:destroy() a.icon:destroy() a.categories:destroy()
+    if not apps_answer or a.agent ~= agent then
+      winlist.apps:push($a)
+    else
+      a.agent:destroy() a.id:destroy() a.name:destroy() a.icon:destroy() a.categories:destroy()
+    end
   end
   old_apps:destroy()
+  if apps_answer then
+    for i = 0, < #apps do winlist.apps:push(apps[i]) end
+    apps:clear() apps:destroy()
+    for i = 0, < #windows do
+      local e = &windows[i]
+      e.agent:destroy() e.app:destroy() e.title:destroy() e.key:destroy()
+      for k = 0, < #e.extra do e.extra[k]:destroy() end
+      e.extra:destroy()
+    end
+    windows:destroy()
+  else
+    for i = 0, < #windows do winlist.windows:push(windows[i]) end
+    windows:clear() windows:destroy()
+    for i = 0, < #apps do apps[i].agent:destroy() apps[i].id:destroy() apps[i].name:destroy() apps[i].icon:destroy() apps[i].categories:destroy() end
+    apps:destroy()
+  end
   return apps_answer
 end
 
@@ -692,7 +720,7 @@ local function ask_agent(rw: *RemoteWin): boolean
     rw.fallback = rw.match:copy()
   end
   local wid: uint32 = #rw.key > 0 and 0 or rw.wid
-  return host.agent:wopen(rw.req, wid, (@uint16)(rw.max_w), (@uint16)(rw.max_h), (@uint8)(policy.windows.fps), text)
+  return stream_agent(rw):wopen(rw.req, wid, (@uint16)(rw.max_w), (@uint16)(rw.max_h), (@uint8)(policy.windows.fps), text)
 end
 
 -- A link panel: asked for with WOPEN "url:" (remotewin_open_link).
@@ -714,9 +742,9 @@ local function host_open_link(url: string, why: string): void
   z:destroy()
 end
 
-global function remotewin_event(ev: *AgentEvent): void
+global function remotewin_event(link: *AgentLink, ev: *AgentEvent): void
   if ev.typ == PROTO_WLISTR then
-    if not winlist_parse(ev.data, ev.len) then
+    if not winlist_parse(link.name, ev.data, ev.len) then
       learn_keys()
       never_sweep()
       auto_wait = false
@@ -729,7 +757,7 @@ global function remotewin_event(ev: *AgentEvent): void
     local rw = find_req(ev.req)
     if rw == nilptr then
       -- its panel closed while the desktop was choosing: nobody wants the stream
-      if ev.id ~= 0 then host.agent:wclose(ev.id) end
+      if ev.id ~= 0 then host.local_agent.client:wclose(ev.id) end
       return
     end
     local text = string{data=(@*[0]byte)(ev.data), size=ev.len}
@@ -787,7 +815,7 @@ global function remotewin_event(ev: *AgentEvent): void
     -- its key comes from the agent's list (learn_keys); new windows wait for
     -- that list too (in it the window carries our sid)
     auto_wait = watching
-    host.agent:wlist()
+    host.local_agent.client:wlist()
   elseif ev.typ == PROTO_WFRAME then
     local rw = find_sid(ev.id)
     if rw ~= nilptr then on_frame(rw, ev.data, ev.len) end
@@ -799,23 +827,39 @@ end
 
 -- Agents ----------------------------------------------------------------------------
 
--- The agent a request goes to. Only the CONFIG.agent connection streams
--- windows so far: '' or 'default' names it.
+-- agent_for returns a borrowed message; this keeps the one it builds alive
+-- until the next call, so the caller may print it without owning it.
+local last_agent_error: string
+
+-- The agent a request goes to: '' or 'default' or 'local' is the CONFIG.agent
+-- connection, any other name is a CONFIG.agents link. A call's own @name wins
+-- over CONFIG.windows.agent (docs/MULTI_AGENT.md).
 local function agent_for(name: string): (*AgentClient, string)
-  if #name > 0 and name ~= 'default' then
-    return nilptr, 'only the CONFIG.agent connection streams windows so far'
+  local want: string = name
+  if #want == 0 then want = policy.windows.agent end
+  local link: *AgentLink = nilptr
+  if #want == 0 or want == 'default' or want == 'local' then
+    link = &host.local_agent
+  else
+    link = agent_by_name(want)
+    if link == nilptr then
+      local sb: stringbuilder
+      sb:write('no agent named "', want, '": add it to CONFIG.agents')
+      local msg = sb:promote()
+      last_agent_error:destroy()
+      last_agent_error = msg
+      return nilptr, last_agent_error
+    end
   end
-  if #policy.windows.agent > 0 and policy.windows.agent ~= 'default' then
-    return nilptr, 'CONFIG.windows.agent: only the CONFIG.agent connection streams windows so far'
-  end
-  if not host.agent_enabled or not host.agent:ready() then return nilptr, 'the agent is not connected' end
-  if not host.agent:windows_ok() then return nilptr, AGENT_WINDOWS_TOO_OLD end
+  if not link.enabled or not link.client:ready() then return nilptr, 'the agent is not connected' end
+  if not link.client:windows_ok() then return nilptr, AGENT_WINDOWS_TOO_OLD end
   agent_window_event = remotewin_event
-  return &host.agent, ''
+  return &link.client, ''
 end
 
 -- A trailing "@name" picks the agent; the rest is the command's own text.
-local function split_agent(args: string): (string, string)
+-- Global so the picker can narrow its list the same way while you type.
+global function window_split_agent(args: string): (string, string)
   local rest: string = args
   local name: string
   local at = 0
@@ -1010,6 +1054,12 @@ global function window_open(spec: WindowOpenSpec): (integer, string)
   rw.wid = spec.wid
   rw.key = spec.key:copy()
   rw.max_w, rw.max_h = policy.windows.max_w, policy.windows.max_h
+  -- the link agent_for chose, so every later send for this stream (WACK,
+  -- WINPUT, WCLOSE, a reopen) goes back to the same agent
+  if agent ~= &host.local_agent.client then
+    rw.agent = agent
+    rw.agent_name = spec.agent:copy()
+  end
   rw.ptr_x, rw.ptr_y = -1, -1
   rw.drawn_at = host.last_time
   streams:push(rw)
@@ -1178,7 +1228,7 @@ end
 
 -- `/term window pull [match|#wid|run CMD...] [@agent]` arguments to window_open.
 global function remotewin_pull(args: string): (boolean, string)
-  local rest, name = split_agent(args)
+  local rest, name = window_split_agent(args)
   local spec: WindowOpenSpec = { agent = name }
   if #rest > 1 and rest.data[0] == '#'_b then
     local digits = rest:subview(2)
@@ -1200,8 +1250,18 @@ end
 global function window_picker_show(show: boolean): void
   host.window_picker_open = show
   if show then
+    -- Ask every connected link, so the picker holds every machine at once and
+    -- each row carries the one it came from. A link that cannot answer is
+    -- skipped in silence: one machine being down must not empty the list.
     local ok, err = window_agent_list('')
     if not ok then logf(LOG_INFO, 'windows picker: %s', err) end -- the picker says it too
+    for i = 0, < #host.agents do
+      local link = host.agents[i]
+      if link.enabled and link.client:ready() and link.client:windows_ok() then
+        local okn, errn = window_agent_list(link.name)
+        if not okn then logf(LOG_INFO, 'windows picker: %s: %s', link.name, errn) end
+      end
+    end
   end
 end
 
@@ -1237,7 +1297,7 @@ global function window_command(args: string): cint
   local sp = args:find(' ', 1, true)
   if sp > 0 then verb, rest = args:subview(1, sp - 1), args:subview(sp + 1) end
   if verb == 'run' then
-    local cmd, _ = split_agent(rest)
+    local cmd, _ = window_split_agent(rest)
     if #cmd == 0 then sayf(LOG_WARN, 'usage: /window run CMD... [@agent]') return 4 end
     local sb: stringbuilder
     sb:write('run ', rest)
@@ -1453,7 +1513,7 @@ end
 
 -- A CONFIG.windows.auto entry whose window a restored panel already shows.
 local function pulled_already(args: string): boolean
-  local rest, _ = split_agent(args)
+  local rest, _ = window_split_agent(args)
   local m: string = rest
   local owned: string
   if #rest > 4 and rest:subview(1, 4) == 'run ' then
@@ -1478,8 +1538,8 @@ end
 -- panels, the auto pulls, and the read budget.
 global function remotewin_tick(now: float64, in_world: boolean): void
   agent_window_event = remotewin_event
-  local ready = host.agent_enabled and host.agent:ready()
-  local windows_ok = ready and host.agent:windows_ok()
+  local ready = host.local_agent.enabled and host.local_agent.client:ready()
+  local windows_ok = ready and host.local_agent.client:windows_ok()
   if not ready then
     loud_lists = 0 -- a new connection answers only what is asked of it
     watching = false
@@ -1534,7 +1594,7 @@ global function remotewin_tick(now: float64, in_world: boolean): void
     i = i - 1
     if i >= #streams then i = #streams - 1 end
   end
-  if host.agent_enabled then host.agent.read_chunks = live > 0 and 64 or 0 end -- up to 1 MiB a frame while streaming
+  if host.local_agent.enabled then host.local_agent.client.read_chunks = live > 0 and 64 or 0 end -- up to 1 MiB a frame while streaming
   -- the window panels saved with the layout, once per layout (start, /term reload)
   if not restore_done and in_world and windows_ok and player_loaded() then
     restore_done = true
@@ -1542,7 +1602,7 @@ global function remotewin_tick(now: float64, in_world: boolean): void
   end
   -- the window list pushed on every change; new windows become panels
   if windows_ok and not watching then
-    watching = host.agent:wlist_watch()
+    watching = host.local_agent.client:wlist_watch()
     watch_baseline, auto_dirty, auto_wait = true, false, false
     raise_baseline, raise_dirty = true, false
   end
@@ -1556,7 +1616,7 @@ global function remotewin_tick(now: float64, in_world: boolean): void
   if not auto_done and in_world and ready then
     auto_done = true
     if #policy.windows.autopull > 0 then
-      if not host.agent:windows_ok() then
+      if not host.local_agent.client:windows_ok() then
         logf(LOG_WARN, 'windows.auto: %s', AGENT_WINDOWS_TOO_OLD)
       else
         for k = 0, < #policy.windows.autopull do
@@ -1598,7 +1658,7 @@ end
 
 local function send_input(rw: *RemoteWin, kind: uint8, body: *[0]uint8, len: usize): void
   if rw.state ~= RemoteWinState.Live then return end
-  host.agent:winput(rw.sid, kind, body, len)
+  stream_agent(rw):winput(rw.sid, kind, body, len)
 end
 
 local function send_pointer(rw: *RemoteWin, kind: uint8, x: integer, y: integer, a: integer, b: integer): void
@@ -2025,6 +2085,8 @@ global function remotewin_shutdown(): void
     free_stream(streams[i])
   end
   streams:destroy()
+  last_agent_error:destroy()
+  last_agent_error = (@string){}
   restore_done = false
   loud_lists = 0
   watching, watch_baseline, auto_dirty, auto_wait = false, false, false, false

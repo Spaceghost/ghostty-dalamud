@@ -76,9 +76,19 @@ end
 -- ~/.config/ghostty-agent/token, its directory made on the way.
 global function agent_default_token_path(): string
   local home = os.getenv('HOME')
-  local dir = home .. '/.config/ghostty-agent'
-  os.execute('mkdir -p "' .. dir .. '"')
-  return dir .. '/token'
+  local sb: stringbuilder
+  sb:write(home, '/.config/ghostty-agent')
+  local dir = sb:promote()
+  home:destroy()
+  local cmd: stringbuilder
+  cmd:write('mkdir -p "', dir, '"')
+  local c = cmd:promote()
+  os.execute(c)
+  c:destroy()
+  local out: stringbuilder
+  out:write(dir, '/token')
+  dir:destroy()
+  return out:promote()
 end
 
 -- Write a new token file readable only by its owner (umask 077 while it is created).

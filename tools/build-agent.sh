@@ -66,13 +66,23 @@ if [[ "$WANT_WAYLAND" == 1 && ${#WAYLAND_DEFINE[@]} -eq 0 ]]; then
   exit 1
 fi
 
+# Optional iroh staticlib (docs/IROH.md). iroh_probe leaves everything empty
+# unless IROH=1 and crates/ghostty-iroh exists, so a checkout without the crate
+# builds exactly as before. Host only: this script never builds Windows.
+SKIP_WIN=1 iroh_probe
+build_iroh
+
 # Nelua takes one --cflags and keeps the last, so everything goes in one string.
 cflags="-I\"$ROOT/compat\""
 if [[ -n "${WAYLAND_CFLAGS:-}" ]]; then cflags="$cflags $WAYLAND_CFLAGS"; fi
 if [[ -n "$AGENT_CFLAGS" ]]; then cflags="$cflags $AGENT_CFLAGS"; fi
 if [[ -n "$AGENT_LDFLAGS" ]]; then cflags="$cflags $AGENT_LDFLAGS"; fi
-"$ROOT/vendor/nelua-lang/nelua" --cc "$CC" -P nogc "${WAYLAND_DEFINE[@]}" \
-  --cflags="$cflags" --cache-dir build/nelua-cache -L . -o "$OUT" -b agent/agent.nelua
+# The libraries go in --ldflags, not --cflags: nelua runs --cflags through its
+# compiler-information probe, and zig refuses a probe that links objects.
+iroh_def=()
+[[ -n "$(iroh_host_ldflags)" ]] && iroh_def=(-D IROH)
+"$ROOT/vendor/nelua-lang/nelua" --cc "$CC" -P nogc "${WAYLAND_DEFINE[@]}" "${iroh_def[@]}" \
+  --cflags="$cflags" --ldflags="$(iroh_host_ldflags)" --cache-dir build/nelua-cache -L . -o "$OUT" -b agent/agent.nelua
 
 if [[ ${#WAYLAND_DEFINE[@]} -gt 0 ]]; then wl=yes; else wl=no; fi
 echo "== $OUT (wayland compositor: $wl)"

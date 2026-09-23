@@ -86,9 +86,22 @@ remote_env() {
   epoch="$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 1)"
   e+=(--env "SOURCE_DATE_EPOCH=$epoch")
   local v
+  # The stamp has to be computed HERE. tools/build.sh falls back to
+  # `git rev-parse HEAD`, and the container receives the source as a tarball
+  # with no .git, so every remote build came out commit=unknown and the
+  # selftest's "no build stamp" check failed on it.
+  if [[ -z "${BUILD_COMMIT:-}" ]]; then
+    BUILD_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    if [[ "$BUILD_COMMIT" != unknown ]] && ! git -C "$ROOT" diff --quiet HEAD -- core lua agent 2>/dev/null; then
+      BUILD_COMMIT="$BUILD_COMMIT-dirty"
+    fi
+    export BUILD_COMMIT
+  fi
+
   # SAN and its option strings travel too, so the sanitizer suites can run here
   # rather than on the machine the game is on.
   for v in SKIP_WIN SKIP_SHIM SKIP_UMBRA SKIP_DEPS SKIP_WAYLAND MAC BUILD_COMMIT BUILD_ID \
+           IROH IROH_CRATE_DIR RUST_WINDOWS_TARGET \
            SAN ASAN_OPTIONS UBSAN_OPTIONS LSAN_OPTIONS; do
     [[ -n "${!v:-}" ]] && e+=(--env "$v=${!v}")
   done
@@ -136,9 +149,35 @@ push_source() {
   local list
   list="$(mktemp)"
   git -C "$ROOT" ls-files -z --cached --others --exclude-standard >"$list"
-  # clear the old source but keep build/ and the vendor symlink
-  "$INCUS" exec "$C" -- bash -c "mkdir -p $D && find $D -mindepth 1 -maxdepth 1 ! -name build ! -name vendor -exec rm -rf {} +"
-  tar -C "$ROOT" --null -T "$list" -czf - | "$INCUS" exec "$C" -- tar -xzf - -C "$D"
+  # Under the same lock the build takes. Every checkout shares $D on purpose --
+  # it is part of every sccache key, so a per-worktree path would give each one
+  # its own cache namespace -- which means an unlocked push can rm -rf a
+  # checkout another run is compiling. That failure does not look like a race:
+  # it surfaces as five or six unrelated crates failing at once on missing
+  # files ("extern location for proc_macro2 does not exist", "failed to open
+  # object file"), which reads as a broken toolchain rather than a clobber.
+  #
+  # flock is held for the clear and the unpack together: releasing between them
+  # would leave a window where $D exists but is empty.
+  "$INCUS" exec "$C" -- bash -c "mkdir -p $D $BUILD_CONTAINER_CACHE"
+  # Two steps, and the split is the point: the archive streams in while NO lock
+  # is held, then the lock is taken to swap the tree over from that file.
+  #
+  # Holding the lock across the stream does not work, and fails in a way that
+  # looks like corruption rather than contention: the sender starts piping
+  # immediately while the receiver is still blocked waiting for the lock, the
+  # pipe fills, and the transfer dies with "gzip: stdin: unexpected end of
+  # file" / "tar: Unexpected EOF". Measured by another session whose push was
+  # queued behind one of mine on the same lock.
+  #
+  # The unpack still has to be locked, together with the clear: releasing
+  # between them leaves a window where $D exists and is empty, which is the
+  # clobber this is here to prevent.
+  local staged="$BUILD_CONTAINER_CACHE/push-$$.tgz"
+  tar -C "$ROOT" --null -T "$list" -czf - | "$INCUS" exec "$C" -- bash -c "cat > $staged"
+  "$INCUS" exec "$C" -- \
+    flock -o -w "${BUILD_LOCK_WAIT:-7200}" "$BUILD_CONTAINER_CACHE/build.lock" \
+    bash -c "find $D -mindepth 1 -maxdepth 1 ! -name build ! -name vendor -exec rm -rf {} + && tar -xzf $staged -C $D; rm -f $staged"
   rm -f "$list"
   # the shared cache: vendor checkouts and every reusable build directory live
   # on the Incus volume, so a second container on this host starts warm

@@ -8,6 +8,7 @@ require 'core.world'
 require 'core.sys.fs'
 require 'core.sys.winpath'
 require 'core.desk'
+require 'core.lakitu'
 require 'core.theme'
 require 'core.tooltip'
 require 'io'
@@ -44,8 +45,16 @@ global DropdownCfg = @record{
 global AgentCfg = @record{
   host: string,
   port: integer,
+  node: string,          -- an iroh NodeId; set, it is used instead of host:port
   token: string,
   token_file: string,
+}
+
+-- One entry of CONFIG.agents: an agent on another machine, named by its key.
+-- The local agent stays CONFIG.agent; see docs/MULTI_AGENT.md.
+global NamedAgentCfg = @record{
+  name: string,
+  cfg: AgentCfg,
 }
 
 -- Remote desktop windows (lua/windows.lua, CONFIG.windows).
@@ -87,6 +96,7 @@ global Policy = @record{
   popup_font_size: float64,
   popup_rounding: float64,
   agent: AgentCfg,
+  agents: vector(NamedAgentCfg), -- CONFIG.agents, in the order read
   toggle_key: string,       -- ImGui key name in lowercase, e.g. "grave"
   toggle_consume_vk: integer,
   toggle_ctrl: boolean,     -- modifiers that must be held with toggle_key (others must be up)
@@ -464,6 +474,15 @@ global function policy_unload(): void
   policy.agent.host:destroy()
   policy.agent.token:destroy()
   policy.agent.token_file:destroy()
+  policy.agent.node:destroy()
+  for i = 0, < #policy.agents do
+    policy.agents[i].name:destroy()
+    policy.agents[i].cfg.host:destroy()
+    policy.agents[i].cfg.token:destroy()
+    policy.agents[i].cfg.token_file:destroy()
+    policy.agents[i].cfg.node:destroy()
+  end
+  policy.agents:destroy()
   policy.windows.open_at:destroy()
   policy.windows.auto_open:destroy()
   policy.windows.links:destroy()
@@ -492,6 +511,7 @@ global function policy_load_dirs(install: string, config: string, configs_root: 
   world_lua_register(L)
   fs_lua_register(L)
   desk_lua_register(L)
+  lakitu_lua_register(L)
   policy.L = L
 
   local sb: stringbuilder
@@ -585,6 +605,54 @@ end
   policy.agent.port = lua_field_integer(L, a, 'port', 7777)
   policy.agent.token = lua_field_string(L, a, 'token', '')
   policy.agent.token_file = lua_field_string(L, a, 'token_file', '')
+  policy.agent.node:destroy()
+  policy.agent.node = lua_field_string(L, a, 'node', '')
+  lua_pop(L, 1)
+
+  -- CONFIG.agents = { fedora = { host = ..., port = ..., token_file = ... } }
+  -- Keys are the link names used by `/window ... @name`. 'local' is reserved
+  -- for CONFIG.agent and an entry using it is ignored, with a line in the log.
+  for i = 0, < #policy.agents do
+    policy.agents[i].name:destroy()
+    policy.agents[i].cfg.host:destroy()
+    policy.agents[i].cfg.token:destroy()
+    policy.agents[i].cfg.token_file:destroy()
+    policy.agents[i].cfg.node:destroy()
+  end
+  policy.agents:clear()
+  lua_getfield(L, t, 'agents')
+  if lua_type(L, -1) == LUA_TTABLE then
+    local at: cint = lua_gettop(L)
+    lua_pushnil(L)
+    while lua_next(L, at) ~= 0 do
+      if lua_type(L, -2) == LUA_TSTRING and lua_type(L, -1) == LUA_TTABLE then
+        local klen: usize = 0
+        local kp = lua_tolstring(L, -2, &klen)
+        local key: string = string.copy((@string){ data = (@*[0]byte)(kp), size = klen })
+        local e: cint = lua_gettop(L)
+        if key == 'local' or key == 'default' then
+          if world_host.log ~= nilptr then
+            local sb: stringbuilder
+            sb:write('CONFIG.agents."', key, '" ignored: that name is the CONFIG.agent connection')
+            local line = sb:promote()
+            world_host.log((@cstring)(line.data))
+            line:destroy()
+          end
+          key:destroy()
+        else
+          local entry: NamedAgentCfg
+          entry.name = key
+          entry.cfg.host = lua_field_string(L, e, 'host', '127.0.0.1')
+          entry.cfg.port = lua_field_integer(L, e, 'port', 7777)
+          entry.cfg.token = lua_field_string(L, e, 'token', '')
+          entry.cfg.token_file = lua_field_string(L, e, 'token_file', '')
+          entry.cfg.node = lua_field_string(L, e, 'node', '')
+          policy.agents:push(entry)
+        end
+      end
+      lua_pop(L, 1)
+    end
+  end
   lua_pop(L, 1)
 
   lua_getfield(L, t, 'profiles')

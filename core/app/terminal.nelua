@@ -28,9 +28,9 @@ global terminal_close_request: integer = 0
 -- the desktop (wl-paste / xclip) and lands when the reply arrives; without it,
 -- Dalamud's clipboard (Windows / Wine) is used.
 global function paste_into(s: *Session): void
-  if host.agent_enabled and host.agent:ready() then
+  if host.local_agent.enabled and host.local_agent.client:ready() then
     host.paste_target = s.id
-    host.agent:clip_get()
+    host.local_agent.client:clip_get()
     return
   end
   local txt = imgui.GetClipboardText()
@@ -42,7 +42,7 @@ global function copy_from(s: *Session): void
   local text = selection_text(&s.view)
   if #text > 0 then
     imgui.SetClipboardText((@cstring)(text.data)) -- the game's (Wine) clipboard
-    if host.agent_enabled and host.agent:ready() then host.agent:clip_set(text) end -- the desktop's
+    if host.local_agent.enabled and host.local_agent.client:ready() then host.local_agent.client:clip_set(text) end -- the desktop's
   end
   text:destroy()
 end

@@ -1,0 +1,172 @@
+-- BLAKE2s (RFC 7693), HMAC-BLAKE2s (RFC 2104) and WireGuard's KDF, for the
+-- agent's embedded WireGuard (docs/WIREGUARD.md). Monocypher has BLAKE2b only,
+-- so this one is here, checked against RFC 7693's vectors and self-test and
+-- against Python's hashlib/hmac in tests/test_wg_crypto.nelua.
+require 'memory'
+require 'agent.crypto'
+
+local IV: [8]uint32 = {
+  0x6A09E667, 0xBB67AE85, 0x3C6EF372, 0xA54FF53A, 0x510E527F, 0x9B05688C, 0x1F83D9AB, 0x5BE0CD19,
+}
+
+local SIGMA: [10][16]uint8 = {
+  {  0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15 },
+  { 14, 10,  4,  8,  9, 15, 13,  6,  1, 12,  0,  2, 11,  7,  5,  3 },
+  { 11,  8, 12,  0,  5,  2, 15, 13, 10, 14,  3,  6,  7,  1,  9,  4 },
+  {  7,  9,  3,  1, 13, 12, 11, 14,  2,  6,  5, 10,  4,  0, 15,  8 },
+  {  9,  0,  5,  7,  2,  4, 10, 15, 14,  1, 11, 12,  6,  8,  3, 13 },
+  {  2, 12,  6, 10,  0, 11,  8,  3,  4, 13,  7,  5, 15, 14,  1,  9 },
+  { 12,  5,  1, 15, 14, 13,  4, 10,  0,  7,  6,  3,  9,  2,  8, 11 },
+  { 13, 11,  7, 14, 12,  1,  3,  9,  5,  0, 15,  4,  8,  6,  2, 10 },
+  {  6, 15, 14,  9, 11,  3,  0,  8, 12,  2, 13,  7,  1,  4, 10,  5 },
+  { 10,  2,  8,  4,  7,  6,  1,  5, 15, 11,  9, 14,  3, 12, 13,  0 },
+}
+
+global BLAKE2S_BLOCK: usize <comptime> = 64
+global BLAKE2S_OUT: usize <comptime> = 32
+
+global Blake2s = @record{
+  h: [8]uint32,
+  t: uint64,         -- bytes compressed so far
+  buf: [64]uint8,
+  n: usize,          -- bytes waiting in buf (a full block waits until more comes)
+  outlen: usize,
+}
+
+local function rotr(x: uint32, n: int32): uint32 return (x >> n) | (x << (32 - n)) end
+
+local function load32(p: *[0]uint8): uint32
+  return (@uint32)(p[0]) | ((@uint32)(p[1]) << 8) | ((@uint32)(p[2]) << 16) | ((@uint32)(p[3]) << 24)
+end
+
+local function compress(s: *Blake2s, last: boolean): void
+  local m: [16]uint32
+  local v: [16]uint32
+  for i = 0, < 16 do m[i] = load32((@*[0]uint8)(&s.buf[i * 4])) end
+  for i = 0, < 8 do v[i] = s.h[i] v[i + 8] = IV[i] end
+  v[12] = v[12] ~ (@uint32)(s.t & 0xffffffff)
+  v[13] = v[13] ~ (@uint32)(s.t >> 32)
+  if last then v[14] = ~v[14] end
+  for r = 0, < 10 do
+    local z = &SIGMA[r]
+    ## local function G(a, b, c, d, x, y)
+      v[#[a]#] = v[#[a]#] + v[#[b]#] + m[z[#[x]#]]
+      v[#[d]#] = rotr(v[#[d]#] ~ v[#[a]#], 16)
+      v[#[c]#] = v[#[c]#] + v[#[d]#]
+      v[#[b]#] = rotr(v[#[b]#] ~ v[#[c]#], 12)
+      v[#[a]#] = v[#[a]#] + v[#[b]#] + m[z[#[y]#]]
+      v[#[d]#] = rotr(v[#[d]#] ~ v[#[a]#], 8)
+      v[#[c]#] = v[#[c]#] + v[#[d]#]
+      v[#[b]#] = rotr(v[#[b]#] ~ v[#[c]#], 7)
+    ## end
+    ## G(0, 4,  8, 12,  0,  1)
+    ## G(1, 5,  9, 13,  2,  3)
+    ## G(2, 6, 10, 14,  4,  5)
+    ## G(3, 7, 11, 15,  6,  7)
+    ## G(0, 5, 10, 15,  8,  9)
+    ## G(1, 6, 11, 12, 10, 11)
+    ## G(2, 7,  8, 13, 12, 13)
+    ## G(3, 4,  9, 14, 14, 15)
+  end
+  for i = 0, < 8 do s.h[i] = s.h[i] ~ v[i] ~ v[i + 8] end
+  crypto.wipe(&m, #m)
+  crypto.wipe(&v, #v)
+end
+
+-- Start a hash of `outlen` bytes (1..32), keyed when keylen > 0 (up to 32).
+function Blake2s:init(outlen: usize, key: *[0]uint8, keylen: usize): void
+  assert(outlen >= 1 and outlen <= 32 and keylen <= 32, 'blake2s: bad lengths')
+  for i = 0, < 8 do self.h[i] = IV[i] end
+  self.h[0] = self.h[0] ~ 0x01010000 ~ ((@uint32)(keylen) << 8) ~ (@uint32)(outlen)
+  self.t = 0
+  self.n = 0
+  self.outlen = outlen
+  memory.zero(&self.buf, 64)
+  if keylen > 0 then
+    memory.copy(&self.buf, key, keylen)
+    self.n = 64
+  end
+end
+
+function Blake2s:update(data: *[0]uint8, len: usize): void
+  local off: usize = 0
+  while off < len do
+    if self.n == 64 then
+      self.t = self.t + 64
+      compress(self, false)
+      self.n = 0
+    end
+    local take = 64 - self.n
+    if take > len - off then take = len - off end
+    memory.copy(&self.buf[self.n], &data[off], take)
+    self.n = self.n + take
+    off = off + take
+  end
+end
+
+function Blake2s:final(out: *[0]uint8): void
+  self.t = self.t + self.n
+  for i = self.n, < 64 do self.buf[i] = 0 end
+  compress(self, true)
+  for i: usize = 0, < self.outlen do out[i] = (@uint8)((self.h[i // 4] >> ((i % 4) * 8)) & 0xff) end
+  crypto.wipe(self, #Blake2s)
+end
+
+-- One call: BLAKE2s of `data`, `outlen` bytes, keyed when keylen > 0.
+global function blake2s(out: *[0]uint8, outlen: usize, key: *[0]uint8, keylen: usize, data: *[0]uint8, len: usize): void
+  local s: Blake2s
+  s:init(outlen, key, keylen)
+  s:update(data, len)
+  s:final(out)
+end
+
+-- HMAC-BLAKE2s (RFC 2104, block 64, output 32). The key may be any length.
+global function hmac_blake2s(out: *[0]uint8, key: *[0]uint8, keylen: usize, data: *[0]uint8, len: usize): void
+  local k: [64]uint8
+  memory.zero(&k, 64)
+  if keylen > 64 then blake2s(&k, 32, nilptr, 0, key, keylen) else memory.copy(&k, key, keylen) end
+  local pad: [64]uint8
+  local inner: [32]uint8
+  for i = 0, < 64 do pad[i] = k[i] ~ 0x36 end
+  local s: Blake2s
+  s:init(32, nilptr, 0)
+  s:update(&pad, 64)
+  s:update(data, len)
+  s:final(&inner)
+  for i = 0, < 64 do pad[i] = k[i] ~ 0x5c end
+  s:init(32, nilptr, 0)
+  s:update(&pad, 64)
+  s:update(&inner, 32)
+  s:final(out)
+  crypto.wipe(&k, 64)
+  crypto.wipe(&pad, 64)
+  crypto.wipe(&inner, 32)
+end
+
+-- WireGuard's KDF_n (the whitepaper's HKDF over HMAC-BLAKE2s):
+--   t0 = HMAC(key, input); t1 = HMAC(t0, 0x1); ti = HMAC(t0, t(i-1) || i)
+-- writing t1..tn into the non-nil outputs (32 bytes each).
+global function wg_kdf(key: *[0]uint8, input: *[0]uint8, len: usize,
+                       out1: *[0]uint8, out2: *[0]uint8, out3: *[0]uint8): void
+  local t0: [32]uint8
+  local prev: [33]uint8
+  hmac_blake2s(&t0, key, 32, input, len)
+  prev[0] = 1
+  local t: [32]uint8
+  hmac_blake2s(&t, &t0, 32, &prev, 1)
+  if out1 ~= nilptr then memory.copy(out1, &t, 32) end
+  if out2 ~= nilptr or out3 ~= nilptr then
+    memory.copy(&prev, &t, 32)
+    prev[32] = 2
+    hmac_blake2s(&t, &t0, 32, &prev, 33)
+    if out2 ~= nilptr then memory.copy(out2, &t, 32) end
+    if out3 ~= nilptr then
+      memory.copy(&prev, &t, 32)
+      prev[32] = 3
+      hmac_blake2s(out3, &t0, 32, &prev, 33)
+    end
+  end
+  crypto.wipe(&t0, 32)
+  crypto.wipe(&prev, 33)
+  crypto.wipe(&t, 32)
+end

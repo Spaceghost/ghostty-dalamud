@@ -337,12 +337,12 @@ end
 -- ghostty.agent_status() -> {connected, version, windows_ok, agent = 'host:port'}
 local function l_agent_status(L: *lua_State): cint
   lua_createtable(L, 0, 4)
-  local ready = host.agent_enabled and host.agent:ready()
+  local ready = host.local_agent.enabled and host.local_agent.client:ready()
   lua_pushboolean(L, ready and 1 or 0) lua_setfield(L, -2, 'connected')
-  lua_pushinteger(L, ready and host.agent.version or 0) lua_setfield(L, -2, 'version')
-  lua_pushboolean(L, (ready and host.agent:windows_ok()) and 1 or 0) lua_setfield(L, -2, 'windows_ok')
+  lua_pushinteger(L, ready and host.local_agent.client.version or 0) lua_setfield(L, -2, 'version')
+  lua_pushboolean(L, (ready and host.local_agent.client:windows_ok()) and 1 or 0) lua_setfield(L, -2, 'windows_ok')
   local sb: stringbuilder
-  if host.agent_enabled then sb:write(host.agent.host, ':', host.agent.port) end
+  if host.local_agent.enabled then sb:write(host.local_agent.client.host, ':', host.local_agent.client.port) end
   local where = sb:promote()
   push_str(L, where, 'agent')
   where:destroy()
@@ -351,6 +351,36 @@ local function l_agent_status(L: *lua_State): cint
 end
 
 -- World panels (terminals and windows) ----------------------------------------------------
+
+-- ghostty.raycast(ox, oy, oz, dx, dy, dz, max) -> distance, hx, hy, hz
+-- The game's own collision (WorldRaycast) along a direction that need not be
+-- normalised: the distance to the first hit within `max` yalms and where it
+-- is, or nil when nothing is hit (and when the shim is too old to have it).
+-- Rays are not free: the callers budget them per frame, as core/app/rain.nelua
+-- does. Used by lua/world.lua so a panel stops at a wall instead of passing
+-- through it.
+local function l_raycast(L: *lua_State): cint
+  if host.api.raycast == nilptr then lua_pushnil(L) return 1 end
+  local n: [7]float32
+  for i = 1, 7 do
+    local isnum: cint = 0
+    local v = lua_tonumberx(L, (@cint)(i), &isnum)
+    if isnum == 0 then lua_pushnil(L) return 1 end
+    n[i - 1] = (@float32)(v)
+  end
+  local ox, oy, oz = n[0], n[1], n[2]
+  local dx, dy, dz = n[3], n[4], n[5]
+  local max = n[6]
+  local len = math.sqrt(dx * dx + dy * dy + dz * dz)
+  if len < 1e-6 or max <= 0 then lua_pushnil(L) return 1 end
+  dx, dy, dz = dx / len, dy / len, dz / len
+  local hx: float32, hy: float32, hz: float32 = 0, 0, 0
+  if host.api.raycast(ox, oy, oz, dx, dy, dz, max, &hx, &hy, &hz) == 0 then lua_pushnil(L) return 1 end
+  local ddx, ddy, ddz = hx - ox, hy - oy, hz - oz
+  lua_pushnumber(L, math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz))
+  lua_pushnumber(L, hx) lua_pushnumber(L, hy) lua_pushnumber(L, hz)
+  return 4
+end
 
 -- ghostty.world_panels() -> { {id, window, focused}, ... } in host.world order,
 -- without panels already glitching out
@@ -576,8 +606,10 @@ end
 
 -- The agent's last WLISTR ---------------------------------------------------------------
 
--- ghostty.agent_windows() -> { windows = {{wid, w, h, app, title, key, extra = {...}}, ...},
---                              apps = {{id, name, icon, categories}, ...}, answers = n }
+-- ghostty.agent_windows() -> { windows = {{wid, w, h, agent, app, title, key, extra = {...}}, ...},
+--                              apps = {{agent, id, name, icon, categories}, ...}, answers = n }
+-- `agent` is the machine the row is on ('' for this one), so a plugin drawing
+-- a launcher can show every linked machine and say which to open it on.
 local function l_agent_windows(L: *lua_State): cint
   lua_createtable(L, 0, 3)
   lua_createtable(L, (@cint)(#winlist.windows), 0)
@@ -585,8 +617,9 @@ local function l_agent_windows(L: *lua_State): cint
   for i = 0, < #winlist.windows do
     local e = &winlist.windows[i]
     if winlist_entry_never(e) then continue end -- CONFIG.windows.never: not shown to other plugins either
-    lua_createtable(L, 0, 7)
+    lua_createtable(L, 0, 8)
     lua_pushinteger(L, e.wid) lua_setfield(L, -2, 'wid')
+    push_str(L, e.agent, 'agent')
     lua_pushinteger(L, e.w) lua_setfield(L, -2, 'w')
     lua_pushinteger(L, e.h) lua_setfield(L, -2, 'h')
     push_str(L, e.app, 'app')
@@ -607,7 +640,8 @@ local function l_agent_windows(L: *lua_State): cint
   for i = 0, < #winlist.apps do
     local a = &winlist.apps[i]
     if winlist_app_never(a) then continue end
-    lua_createtable(L, 0, 4)
+    lua_createtable(L, 0, 5)
+    push_str(L, a.agent, 'agent')
     push_str(L, a.id, 'id')
     push_str(L, a.name, 'name')
     push_str(L, a.icon, 'icon')
@@ -677,6 +711,7 @@ global function ipc_lua_register(L: *lua_State): void
   lua_pushcclosure(L, l_agent_status, 0) lua_setfield(L, -2, 'agent_status')
   lua_pushcclosure(L, l_status, 0) lua_setfield(L, -2, 'status')
   lua_pushcclosure(L, l_world_panels, 0) lua_setfield(L, -2, 'world_panels')
+  lua_pushcclosure(L, l_raycast, 0) lua_setfield(L, -2, 'raycast')
   lua_pushcclosure(L, l_panel_focus, 0) lua_setfield(L, -2, 'panel_focus')
   lua_pushcclosure(L, l_panel_hide, 0) lua_setfield(L, -2, 'panel_hide')
   lua_pushcclosure(L, l_panel_toggle_pet, 0) lua_setfield(L, -2, 'panel_toggle_pet')

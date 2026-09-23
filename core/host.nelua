@@ -2,6 +2,7 @@
 -- work lives in core/app/*; the shim only forwards calls.
 require 'core.app.panic'
 require 'core.app.commands'
+require 'core.app.agentpanel'
 require 'core.app.hostsurface'
 require 'core.app.cursor'
 require 'core.buildinfo'
@@ -158,6 +159,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     draw_inventory() -- the info bar entry's list of every terminal
     draw_settings()
     draw_window_picker() -- /window (core/app/winpicker.nelua)
+    draw_agents()        -- /term agents (core/app/agentpanel.nelua)
   end
   ask_frame(now, live) -- /ask: answers arriving, and the panel while it is up (core/app/ask.nelua)
   reap_exited(now)
@@ -172,6 +174,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     reactions_tick(now) -- bells, finished commands, output: the character's reactions
     policy_anim_frame(now)
     desk_props_sync() -- the desk scene's furniture, as lua/desk.lua asked for it
+    lakitu_sync(now) -- the hovering camera and, while the shot is on, the view (docs/CAMERA.md)
     apply_world_pins(now)
     local under = world_under_ui_begin() -- beneath other plugins' overlays (Umbra's toolbar)
     draw_rain_world(now) -- drops fallen off world screens, behind them (core/app/rain.nelua)
@@ -182,6 +185,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
   else
     occluders_destroy_all() -- no character (loading screen, logout): boards go before the scene they sit in
     desk_props_destroy_all() -- and the desk scene's furniture
+    lakitu_destroy_all()     -- and the hovering camera
   end
   bell_demo_tick(now)
   -- the gallery prompt: a screenshot taken while a terminal is on screen (lua/gallery.lua)
@@ -303,13 +307,17 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   host.world_covers:destroy()
   host.pending_open:destroy()
   bell_reset()
-  host.agent:destroy()
+  host.local_agent.client:destroy()
   net.shutdown()
   -- ghostty_loader unloads this module and starts a fresh copy: free the Lua
   -- state and every string, and leave no pointers for the next start.
   policy_unload()
   host.world_diag:destroy()
-  host.agent_error_shown:destroy()
+  host.local_agent.error_shown:destroy()
+  agent_extras_teardown() -- the CONFIG.agents links; the local one is a field of host
+  host.local_agent.name:destroy()
+  host.local_agent.name = (@string){}
+  host.agents:destroy()   -- the loader starts a fresh core: leave no allocation behind
   host.bell_demo_label:destroy()
   host.showcase_ids:destroy()
   host.showcase_hidden:destroy()

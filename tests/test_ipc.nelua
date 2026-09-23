@@ -86,11 +86,11 @@ local function fake_connect(greeting: string): void
   assert(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
   fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK)
   fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL, 0) | O_NONBLOCK)
-  net.close(host.agent.sock)
-  host.agent.sock = fds[0]
-  host.agent.inq:destroy()
-  host.agent.outq:destroy()
-  host.agent.state = AgentState.Handshake
+  net.close(host.local_agent.client.sock)
+  host.local_agent.client.sock = fds[0]
+  host.local_agent.client.inq:destroy()
+  host.local_agent.client.outq:destroy()
+  host.local_agent.client.state = AgentState.Handshake
   peer = fds[1]
   local q: ByteQueue
   proto.write_frame(&q, PROTO_OK, (@*[0]uint8)(greeting.data), greeting.size)
@@ -105,7 +105,7 @@ local function peer_send(q: *ByteQueue): void
   end
 end
 local function peer_collect(): void
-  host.agent:flush()
+  host.local_agent.client:flush()
   local buf: [65536]uint8
   while true do
     local n = read(peer, &buf, 65536)
@@ -190,7 +190,7 @@ end
 expect('{"method":"status"}', 'assert(r.ok == false and r.error == "ghostty is not running")')
 
 assert(gu_init(&api, (@cstring)(root.data)) == 0, 'init')
-host.agent_last_try = 1e9 -- never dial out
+host.local_agent.last_try = 1e9 -- never dial out
 assert(logged('ipc:') == 0, 'lua/ipc.lua loaded quietly')
 
 -- before the first frame: no snapshot yet
@@ -215,7 +215,7 @@ assert(logged('ipc: window.open: the agent is not connected') == 1, 'a failed ch
 
 fake_connect('ghostty-agent 3 42')
 frame()
-assert(host.agent:windows_ok())
+assert(host.local_agent.client:windows_ok())
 forget()
 expect('{"method":"agent.status"}', 'assert(r.result.connected and r.result.windows_ok and r.result.version == 3, RAW)')
 

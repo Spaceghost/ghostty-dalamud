@@ -1,0 +1,172 @@
+-- wireguard.conf (agent/wg_config.nelua) and the running service's reload
+-- (agent/wg_service.nelua): what parses, what is refused with its line, the
+-- text written back, the private file, and a live service following the
+-- file as peers and forwards come and go.
+--
+--   test_wg_config SCRATCH_DIR
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'memory'
+require 'os'
+require 'io'
+require 'arg'
+require 'agent.crypto'
+require 'agent.wg_config'
+require 'agent.wg_service'
+
+local dir: string = #arg >= 1 and arg[1] or 'build/test-scratch'
+
+local function key(): string
+  local k: [32]uint8
+  assert(crypto.random(&k, 32))
+  return crypto.key_to_base64(&k)
+end
+
+local k1, k2, k3, k4 = key(), key(), key(), key()
+
+-- concatenation without the temporaries `..` leaves behind under nogc
+local function join(...: varargs): string
+  local sb: stringbuilder
+  sb:write(...)
+  return sb:promote()
+end
+
+local good = join('# a comment\n[Interface]\nPrivateKey = ', k1, '\nListenPort = 51999\n', 'Address = 10.77.12.1/24, fd4e:2b1c:9a07:1::1/64  # both families\nForward = tcp 3389\nForward = udp 47998-48000\n\n', '[Peer]\nName = laptop\nPublicKey = ', k2, '\nPresharedKey = ', k3, '\n', 'AllowedIPs = 10.77.12.2/32, fd4e:2b1c:9a07:1::2/128\nEndpoint = [2001:db8::5]:51820\nPersistentKeepalive = 25\n', '\n[peer]\npublickey = ', k4, '\nallowedips = 10.77.12.3\n')
+
+-- what parses ------------------------------------------------------------------
+do
+  local c: WgConfig
+  local ok, why = c:parse(good)
+  if not ok then error(why) end
+  assert(c.has_private and c.port == 51999)
+  assert(c.has4 and c.addr4.bits == 24 and c.addr4.addr[3] == 1, 'the interface keeps its host address')
+  assert(c.has6 and c.addr6.bits == 64 and c.addr6.addr[15] == 1)
+  assert(#c.forwards == 4 and not c.forwards[0].udp and c.forwards[0].port == 3389)
+  assert(c.forwards[1].udp and c.forwards[1].port == 47998 and c.forwards[3].port == 48000, 'a range is one forward a port')
+  assert(#c.peers == 2)
+  local p = &c.peers[0]
+  assert(p.name == 'laptop' and p.has_psk and #p.allowed == 2 and p.keepalive == 25)
+  assert(p.endpoint.family == 6 and p.endpoint.port == 51820 and p.endpoint.addr[0] == 0x20)
+  assert(#c.peers[1].name == 0 and not c.peers[1].has_psk, 'keys are case-insensitive; Name and PresharedKey are optional')
+  assert(c.peers[1].allowed[0].bits == 32, 'an address alone is one host')
+  -- written back and read again: the same
+  local text = c:format()
+  local c2: WgConfig
+  local ok2, why2 = c2:parse(text)
+  if not ok2 then error(why2) end
+  local text2 = c2:format()
+  assert(text == text2, 'format and parse agree')
+  assert(text:find('Endpoint = [2001:db8::5]:51820', 1, true) > 0)
+  assert(text:find('AllowedIPs = 10.77.12.2/32, fd4e:2b1c:9a07:1::2/128', 1, true) > 0)
+  text:destroy() text2:destroy()
+  c:destroy() c2:destroy()
+end
+
+-- what is refused, and where ------------------------------------------------------
+do
+  local bad: [11]string = {
+    '[Interface]\nPrivateKey = nope\n',
+    '[Interface]\nListenPort = 70000\n',
+    '[Interface]\nAddress = 10.0.0.300/24\n',
+    '[Interface]\nForward = sctp 1\n',
+    '[Interface]\nMTU = 1420\n',
+    'PrivateKey = x\n',
+    '[Peer]\nAllowedIPs = 10.0.0.2/32\n',
+    join('[Interface]\n\n[Peer]\nPublicKey = ', k2, '\n'),
+    join('[Peer]\nPublicKey = ', k2, '\nAllowedIPs = 10.0.0.2/33\n'),
+    join('[Peer]\nPublicKey = ', k2, '\nAllowedIPs = 10.0.0.2\nEndpoint = somewhere\n'),
+    '[Wat]\n',
+  }
+  local want_line: [11]integer = { 2, 2, 2, 2, 2, 1, 1, 3, 3, 4, 1 }
+  for i = 0, < 11 do
+    local c: WgConfig
+    local ok, why = c:parse(bad[i])
+    assert(not ok, 'refused')
+    local prefix = ('line %d:'):format(want_line[i])
+    if why:find(prefix, 1, true) ~= 1 then error(why) end
+    prefix:destroy()
+    why:destroy()
+    c:destroy()
+  end
+  for i = 7, < 10 do bad[i]:destroy() end
+end
+
+-- the file is private, and replaced whole ----------------------------------------------
+local path = join(dir, '/wireguard.conf')
+do
+  local c: WgConfig
+  local ok = c:parse(good)
+  assert(ok)
+  assert(c:save(path), 'saved')
+  ## if not ccinfo.is_windows then
+  local cmd = join('stat -c %a ', path)
+  local pf = io.popen(cmd)
+  local mode = pf:read('a')
+  pf:destroy()
+  assert(mode:find('600', 1, true) == 1, 'mode 0600')
+  mode:destroy()
+  cmd:destroy()
+  ## end
+  local back: WgConfig
+  local ok2 = back:load(path)
+  assert(ok2 and #back.peers == 2)
+  back:destroy()
+  c:destroy()
+end
+
+-- a running service follows the file ----------------------------------------------
+do
+  local c: WgConfig
+  local text = join('[Interface]\nPrivateKey = ', k1, '\nListenPort = 0\nAddress = 10.77.13.1/24\n\n[Peer]\nName = one\nPublicKey = ', k2, '\nAllowedIPs = 10.77.13.2/32\n')
+  assert(wg_write_private(path, text))
+  assert(c:load(path))
+  local svc: WgService
+  local logged: vector(string)
+  local ok, why = svc:start(&c, 17777)
+  if not ok then error(why) end
+  svc:watch(path)
+  c:destroy()
+  assert(#svc.dev.peers == 1 and svc.dev.peers[0].name == 'one')
+  local now = os.now()
+  local function settle(svc: *WgService, now: *number): void
+    $now = $now + 3
+    svc:pump($now)
+  end
+  -- a peer added, the other renamed, a forward added
+  local text2 = join('[Interface]\nPrivateKey = ', k1, '\nListenPort = 0\nAddress = 10.77.13.1/24\nForward = tcp 5900\n\n', '[Peer]\nName = uno\nPublicKey = ', k2, '\nAllowedIPs = 10.77.13.2/32\n\n[Peer]\nName = two\nPublicKey = ', k4, '\nAllowedIPs = 10.77.13.3/32\n')
+  assert(wg_write_private(path, text2))
+  settle(&svc, &now)
+  assert(#svc.dev.peers == 2, 'the new peer is taken up')
+  assert(svc.dev.peers[0].name == 'uno', 'a known peer is updated in place')
+  assert(svc.ns:forwarding({ port = 5900 }), 'the new forward listens')
+  assert(svc.ns:forwarding({ port = 17777 }), 'the agent\'s own port still does')
+  -- the status file lists both peers
+  local sp = join(path, '.status')
+  local okst, st = wg_read_file(sp)
+  assert(okst and st:find(k2, 1, true) > 0 and st:find(k4, 1, true) > 0, 'the status names both')
+  st:destroy()
+  -- a file that does not parse changes nothing
+  assert(wg_write_private(path, '[Interface]\nPrivateKey = broken\n'))
+  settle(&svc, &now)
+  assert(#svc.dev.peers == 2 and svc.on, 'a broken file keeps what runs')
+  -- a peer removed and the forward dropped
+  local text3 = join('[Interface]\nPrivateKey = ', k1, '\nListenPort = 0\nAddress = 10.77.13.1/24\n\n[Peer]\nName = two\nPublicKey = ', k4, '\nAllowedIPs = 10.77.13.3/32\n')
+  assert(wg_write_private(path, text3))
+  settle(&svc, &now)
+  assert(#svc.dev.peers == 1 and svc.dev.peers[0].name == 'two', 'the removed peer is gone')
+  assert(not svc.ns:forwarding({ port = 5900 }), 'the dropped forward no longer listens')
+  -- a new address restarts the device on it
+  local text4 = join('[Interface]\nPrivateKey = ', k1, '\nListenPort = 0\nAddress = 10.77.14.1/24\n\n[Peer]\nName = two\nPublicKey = ', k4, '\nAllowedIPs = 10.77.14.3/32\n')
+  assert(wg_write_private(path, text4))
+  settle(&svc, &now)
+  assert(svc.on and svc.addr4.addr[2] == 14 and #svc.dev.peers == 1, 'restarted on the new address')
+  svc:destroy()
+  logged:destroy()
+  text:destroy() text2:destroy() text3:destroy() text4:destroy() sp:destroy()
+end
+
+k1:destroy() k2:destroy() k3:destroy() k4:destroy()
+good:destroy()
+path:destroy()
+print('test_wg_config OK')

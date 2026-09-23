@@ -47,6 +47,12 @@ fi
 NCACHE="build/nelua-cache$SAN_SUFFIX"
 INC="-I$ROOT/vendor/ghostty/include -I$ROOT/vendor/gc-cimgui -I$ROOT/vendor/lua/src -I$ROOT/vendor/stb"
 LIBS="-L$ROOT/build/ghostty-vt-linux/lib -L$ROOT/build/lua-linux -lm"
+# The optional iroh staticlib (docs/IROH.md). Every host link here shares $LIBS,
+# including core/host.nelua below, so this is the only place it is named. The
+# guard is the built artifact: no crate, no build/lib, no change.
+if [[ "${IROH:-0}" == 1 && -f "$ROOT/build/lib/libghostty_iroh.a" ]]; then
+  LIBS="$LIBS -L$ROOT/build/lib -lghostty_iroh -lpthread -ldl -lm -lunwind"
+fi
 export LD_LIBRARY_PATH="$ROOT/build/ghostty-vt-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # wait for an agent to listen (valgrind takes seconds to get there), or for it to die
 wait_port() { # port pid
@@ -88,6 +94,11 @@ unset UMBRA_GHOSTTY_HOME GHOSTTY_HOME # the migration and config home read these
 rm -rf build/test-scratch && mkdir -p build/test-scratch/surface/config
 run test_ghostty
 run test_wincodec
+run test_wg_crypto # the embedded WireGuard's primitives against published vectors
+run test_wg        # the WireGuard protocol: two devices, a fake network and a fake clock
+run test_wg_netstack # TCP and UDP through two tunnels and lwIP to loopback sockets, with back-pressure
+mkdir -p build/test-scratch/wg
+run test_wg_config "$ROOT/build/test-scratch/wg" # wireguard.conf, and a live service following it
 run test_pngenc
 run test_capture
 run test_capture_win32
@@ -127,6 +138,7 @@ hrun test_pending "$ROOT"
 run test_lights "$ROOT"
 run test_occluders "$ROOT"
 run test_desk "$ROOT"
+run test_lakitu "$ROOT"
 run test_chrome "$ROOT"
 run test_themes "$ROOT" "$ROOT/build/test-scratch"
 run test_migrate "$ROOT" "$ROOT/build/test-scratch"
@@ -165,6 +177,12 @@ AGENT=$!
 trap 'kill $AGENT 2>/dev/null || true' EXIT
 wait_port "$PORT" "$AGENT" || { cat build/agent.log; exit 1; }
 "${SAN_PREFIX[@]}" "$NCACHE"/test_agent "$PORT" testtoken123 "$AGENT"
+
+echo "--- test_wg_cli"
+# `ghostty-agent wg`, the QR code, Tailscale detection and the listen rule, on the agent just built
+"$NELUA" --cc "$CC" -P nogc --cache-dir "$NCACHE" -L . -b tests/test_wg_cli.nelua
+rm -rf build/test-scratch/wgcli && mkdir -p build/test-scratch/wgcli
+"${SAN_PREFIX[@]}" "$NCACHE"/test_wg_cli "$ROOT/build/ghostty-agent$SAN_SUFFIX" "$ROOT/build/test-scratch/wgcli"
 
 echo "--- test_jobs"
 "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -b tests/test_jobs.nelua

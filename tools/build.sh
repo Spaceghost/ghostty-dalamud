@@ -29,7 +29,10 @@
 # build/dist/GhosttyDalamud), SKIP_UMBRA=1 (no widget), SKIP_WIN=1 (no
 # Windows core, loader or agent), SKIP_DEPS=1 (reuse the Nelua,
 # libghostty-vt and Lua builds already in build/), MAC=1 (also cross-compile
-# ghostty-agent for macOS arm64 and x86_64; untested on a Mac).
+# ghostty-agent for macOS arm64 and x86_64; untested on a Mac),
+# IROH=1 (also build and link the optional Rust staticlib crates/ghostty-iroh;
+# off by default, and a checkout without that crate is unaffected either way --
+# docs/IROH.md, docs/iroh-build-wiring.md).
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/toolchain.env"
@@ -53,6 +56,9 @@ DOTNET="${DOTNET:-dotnet}"
 NELUA="$ROOT/vendor/nelua-lang/nelua"
 export ZIG_GLOBAL_CACHE_DIR="${ZIG_GLOBAL_CACHE_DIR:-$HOME/.cache/zig-global}"
 mkdir -p build/dist build/win/lib build/win/cache build/lua-win build/lua-linux build/nelua-cache
+# Optional Rust transport staticlib. Leaves every variable below empty, and so
+# every flag it contributes empty, unless IROH=1 and the crate is present.
+iroh_probe
 
 # GHOSTTY_SCCACHE=1 (the Incus build container, docs/BUILDING.md) routes every
 # plain -c compile through the shared sccache: tools/zig-cc*.sh re-exec
@@ -88,6 +94,8 @@ if [[ "${SKIP_DEPS:-0}" != 1 ]]; then
         case $b in lua|luac) continue;; esac; "$ROOT/tools/zig-cc-win.sh" -O2 -c "$f" -o "$b.o"; done
       "$ZIG" ar rcs liblua.a ./*.o )
   fi
+  # No-op unless iroh_probe enabled it; respects SKIP_WIN the same way.
+  build_iroh
 fi
 
 # Build stamp: which commit this core is, and which build (docs/CI.md, "In-game tests")
@@ -112,23 +120,36 @@ echo "== ghostty-agent (host)"
 # shellcheck source=tools/wayland-flags.sh
 source "$ROOT/tools/wayland-flags.sh" # the Wayland compositor backend when its SDK is there
 [[ ${#WAYLAND_NELUA[@]} -gt 0 ]] && echo "with the Wayland compositor (wlroots 0.20)"
-"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${WAYLAND_NELUA[@]}" --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
+# ONE --cflags. Nelua keeps the last it is given, so passing a second here
+# silently dropped every Wayland link flag and the agent failed to find
+# xkbcommon, wayland-server and pixman-1.
+AGENT_CFLAGS="$WAYLAND_CFLAGS"
+AGENT_NELUA=("${WAYLAND_DEFINE[@]}")
+[[ -n "$(iroh_host_ldflags)" ]] && AGENT_NELUA+=(-D IROH)
+[[ -n "$AGENT_CFLAGS" ]] && AGENT_NELUA+=("--cflags=$AGENT_CFLAGS")
+[[ -n "$(iroh_host_ldflags)" ]] && AGENT_NELUA+=("--ldflags=$(iroh_host_ldflags)")
+"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${AGENT_NELUA[@]}" --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
 mkdir -p build/dist/lua && cp lua/*.lua build/dist/lua/
 mkdir -p build/dist/themes && cp themes/*.theme build/dist/themes/
 
 if [[ "${SKIP_WIN:-0}" != 1 ]]; then
+  # -D IROH must ride along with the link flags: without it net.nelua compiles
+  # its iroh half out, the linker has nothing to pull, and the build succeeds
+  # while producing a core with no iroh in it.
+  IROH_WIN_DEF=()
+  [[ -n "$(iroh_win_ldflags)" ]] && IROH_WIN_DEF=(-D IROH)
   echo "== ghostty_core.dll (windows x64)"
   rm -f build/dist/ghostty_umbra.dll build/dist/ghostty_umbra.pdb # the name before the standalone plugin
-  ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc -P noentrypoint -P "writestderr='hooked'" -P "abort='hooked'" "${STAMP[@]}" \
-    --cflags="-O2 $INC -L\"$ROOT/build/win/lib\" -L\"$ROOT/build/lua-win\"" \
+  ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc -P noentrypoint -P "writestderr='hooked'" -P "abort='hooked'" "${STAMP[@]}" "${IROH_WIN_DEF[@]}" \
+    --cflags="-O2 $INC -L\"$ROOT/build/win/lib\" -L\"$ROOT/build/lua-win\"" --ldflags="$(iroh_win_ldflags)" \
     --cache-dir build/win/cache -L . -H -o build/dist/ghostty_core.dll core/host.nelua
   printf '{"commit":"%s","build_id":"%s"}\n' "$BUILD_COMMIT" "$BUILD_ID" >build/dist/build-info.json
   echo "== ghostty_loader.dll (windows x64)"
-  ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc -P noentrypoint -P "writestderr='hooked'" -P "abort='hooked'" \
-    --cflags="-O2 $INC -L\"$ROOT/build/win/lib\" -L\"$ROOT/build/lua-win\"" \
+  ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc -P noentrypoint -P "writestderr='hooked'" -P "abort='hooked'" "${IROH_WIN_DEF[@]}" \
+    --cflags="-O2 $INC -L\"$ROOT/build/win/lib\" -L\"$ROOT/build/lua-win\"" --ldflags="$(iroh_win_ldflags)" \
     --cache-dir build/win/cache -L . -H -o build/dist/ghostty_loader.dll core/loader.nelua
   echo "== ghostty-agent.exe (windows x64)"
-  ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc --cflags="-O2" \
+  ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc "${IROH_WIN_DEF[@]}" --cflags="-O2" --ldflags="$(iroh_win_ldflags)" \
     --cache-dir build/win/cache-agent -L . -o build/dist/ghostty-agent.exe agent/agent.nelua
 fi
 

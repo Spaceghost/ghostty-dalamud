@@ -1,0 +1,420 @@
+-- agent/wg_device.nelua: two WireGuard devices on a fake network with a fake
+-- clock (docs/WIREGUARD.md "Tests"). Every datagram goes through `net`, so a
+-- test can drop, replay, reorder or re-address them.
+require 'string'
+require 'vector'
+require 'memory'
+require 'agent.crypto'
+require 'agent.wg_device'
+
+local Datagram = @record{ from: WgEndpoint, to: WgEndpoint, data: vector(uint8) }
+
+local Node = @record{
+  dev: WgDevice,
+  ep: WgEndpoint,          -- where it sends from
+  got: vector(vector(uint8)), -- IP packets delivered to it
+}
+
+local net: vector(Datagram)
+local now: number = 1000
+local wall_base: int64 = 1800000000
+
+local function fake_wall(): (int64, int64)
+  local s = (@int64)(now)
+  return wall_base + s, (@int64)((now - s) * 1e9)
+end
+
+local function node_send(ud: pointer, ep: *WgEndpoint, data: *[0]uint8, len: usize): void
+  local n = (@*Node)(ud)
+  local d: Datagram
+  d.from = n.ep
+  d.to = $ep
+  d.data:resize(len)
+  memory.copy(&d.data[0], data, len)
+  net:push(d)
+end
+
+local function node_deliver(ud: pointer, peer: *WgPeer, pkt: *[0]uint8, len: usize): void
+  local n = (@*Node)(ud)
+  local v: vector(uint8)
+  v:resize(len)
+  memory.copy(&v[0], pkt, len)
+  n.got:push(v)
+end
+
+local function endpoint4(a: uint8, b: uint8, c: uint8, d: uint8, port: uint16): WgEndpoint
+  local e: WgEndpoint = { family = 4, port = port }
+  e.addr[0], e.addr[1], e.addr[2], e.addr[3] = a, b, c, d
+  return e
+end
+
+local function cidr(s: string): WgCidr
+  local c: WgCidr
+  assert(wgp.parse_cidr(s, &c), 'cidr')
+  return c
+end
+
+local function node_init(n: *Node, ep: WgEndpoint): void
+  local sk: [32]uint8
+  assert(crypto.x25519_generate(&sk))
+  n.ep = ep
+  n.dev.ud = n
+  n.dev.send = node_send
+  n.dev.deliver = node_deliver
+  n.dev.wall = fake_wall
+  n.dev:init(&sk)
+end
+
+local function clear_got(n: *Node): void
+  for i = 0, < #n.got do n.got[i]:destroy() end
+  n.got:clear()
+end
+
+local function drop_all(): void
+  for i = 0, < #net do net[i].data:destroy() end
+  net:clear()
+end
+
+local A: Node
+local B: Node
+node_init(&A, endpoint4(192, 0, 2, 1, 40001))
+node_init(&B, endpoint4(198, 51, 100, 7, 51820))
+local psk: [32]uint8
+assert(crypto.random(&psk, 32))
+-- A knows B's endpoint (it dials); B learns A's from A's first message
+local pb = A.dev:add_peer('b', &B.dev.public, &psk)
+pb.endpoint = B.ep
+pb.allowed:push(cidr('10.77.0.1/32'))
+local pa = B.dev:add_peer('a', &A.dev.public, &psk)
+pa.allowed:push(cidr('10.77.0.2/32'))
+pa.allowed:push(cidr('fd00:77::2/128'))
+
+-- deliver what is queued (and what that makes the devices send), in order;
+-- returns how many datagrams went
+local function flush(): integer
+  local n = 0
+  while #net > 0 do
+    local d = net[0]
+    net:remove(0)
+    local to: *Node = nilptr
+    if d.to:same(&A.ep) then to = &A elseif d.to:same(&B.ep) then to = &B end
+    if to ~= nilptr then to.dev:receive(&d.from, (@*[0]uint8)(&d.data[0]), #d.data, now) end
+    d.data:destroy()
+    n = n + 1
+  end
+  return n
+end
+
+local function tick(dt: number): void
+  now = now + dt
+  A.dev:tick(now)
+  B.dev:tick(now)
+end
+
+-- run the clock in steps of `step` for `total` seconds, delivering as we go
+local function run(total: number, step: number): void
+  local t: number = 0
+  while t < total do tick(step) flush() t = t + step end
+end
+
+-- an IPv4 packet from src to dst with `n` bytes of payload tagged `tag`
+local function ip4(src: uint8, dst: uint8, n: integer, tag: uint8): vector(uint8)
+  local v: vector(uint8)
+  v:resize((@usize)(20 + n))
+  v[0] = 0x45
+  local total = 20 + n
+  v[2], v[3] = (@uint8)(total >> 8), (@uint8)(total & 0xff)
+  v[8] = 64
+  v[9] = 17
+  v[12], v[13], v[14], v[15] = 10, 77, 0, src
+  v[16], v[17], v[18], v[19] = 10, 77, 0, dst
+  for i = 0, < n do v[20 + i] = tag + (@uint8)(i) end
+  return v
+end
+
+local function send_ip(n: *Node, v: vector(uint8)): boolean
+  local ok = n.dev:send_packet((@*[0]uint8)(&v[0]), #v, now)
+  v:destroy()
+  return ok
+end
+
+local function last_tag(n: *Node): uint8
+  assert(#n.got > 0, 'a packet arrived')
+  return n.got[#n.got - 1][20]
+end
+
+-- 1. The handshake, started by data, and data both ways --------------------------
+do
+  assert(send_ip(&A, ip4(2, 1, 100, 7)), 'routed to b')
+  assert(#pb.staged == 1 and #net == 1, 'staged, and an initiation went out')
+  assert(net[0].data[0] == WG_MSG_INITIATION and #net[0].data == WG_INITIATION_SIZE)
+  flush()
+  assert(#B.got == 1 and last_tag(&B) == 7, 'the staged packet arrives after the handshake')
+  assert(pa.endpoint:same(&A.ep), 'b learned a\'s endpoint')
+  assert(pb.current.valid and pb.current.initiator, 'a uses its keys at once')
+  assert(pa.current.valid and not pa.next.valid, 'b took the keys once data arrived on them')
+  assert(pa.last_handshake_wall > 0 and pb.last_handshake_wall > 0)
+  assert(send_ip(&B, ip4(1, 2, 50, 9)))
+  flush()
+  assert(#A.got == 1 and last_tag(&A) == 9, 'b to a')
+  clear_got(&A) clear_got(&B)
+end
+
+-- 2. Replays are dropped; the window slides -----------------------------------------
+do
+  assert(send_ip(&A, ip4(2, 1, 10, 20)))
+  assert(#net == 1)
+  local copy: Datagram = { from = net[0].from, to = net[0].to }
+  copy.data:resize(#net[0].data)
+  memory.copy(&copy.data[0], &net[0].data[0], #copy.data)
+  flush()
+  assert(#B.got == 1)
+  net:push(copy)
+  flush()
+  assert(#B.got == 1, 'a replayed data message is dropped')
+  -- far ahead: 9000 messages later the old counter is outside the window
+  local w: WgReplay
+  w:reset()
+  assert(w:check(0) and w:check(5) and not w:check(5) and w:check(3), 'in any order, once')
+  assert(w:check(9000) and not w:check(5), 'behind the window')
+  assert(w:check(9000 - 8000) and not w:check(9000 - 8000), 'inside the window, once')
+  assert(not w:check(WG_REJECT_AFTER_MESSAGES), 'never at the limit')
+  clear_got(&B)
+end
+
+-- 3. Tampering and silence ---------------------------------------------------------
+do
+  assert(send_ip(&A, ip4(2, 1, 10, 30)))
+  net[0].data[20] = net[0].data[20] ~ 1
+  flush()
+  assert(#B.got == 0, 'a tampered message is dropped')
+  -- garbage of every size, and a handshake with a wrong MAC1: no answer at all
+  for len = 0, < 200 do
+    local d: Datagram = { from = endpoint4(203, 0, 113, 5, 999), to = B.ep }
+    d.data:resize((@usize)(len))
+    for i = 0, < len do d.data[i] = (@uint8)((i * 37 + len) & 0xff) end
+    if len >= 4 then d.data[0] = (@uint8)(len % 5) d.data[1], d.data[2], d.data[3] = 0, 0, 0 end
+    B.dev:receive(&d.from, len > 0 and (@*[0]uint8)(&d.data[0]) or nilptr, (@usize)(len), now)
+    d.data:destroy()
+  end
+  assert(#net == 0, 'nothing answers garbage')
+  local fake: [148]uint8
+  memory.zero(&fake, 148)
+  fake[0] = WG_MSG_INITIATION
+  B.dev:receive(&A.ep, &fake, 148, now)
+  assert(#net == 0, 'nothing answers a wrong MAC1')
+  -- a right MAC1 (anyone with b's public key can make one) on an all-zero
+  -- ephemeral key, a low-order point: the DH result is zero and refused
+  blake2s(&fake[WG_INIT_MAC1], 16, &B.dev.mac1_key, 32, &fake, WG_INIT_MAC1)
+  B.dev:receive(&A.ep, &fake, 148, now)
+  assert(#net == 0, 'the all-zero DH result is refused')
+  -- a good MAC1 on a real ephemeral key but junk after it: does not decrypt
+  local e: [32]uint8
+  assert(crypto.x25519_generate(&e))
+  crypto.x25519_public(&fake[WG_INIT_EPHEMERAL], &e)
+  blake2s(&fake[WG_INIT_MAC1], 16, &B.dev.mac1_key, 32, &fake, WG_INIT_MAC1)
+  B.dev:receive(&A.ep, &fake, 148, now)
+  assert(#net == 0, 'nothing answers an initiation that does not decrypt')
+end
+
+-- 4. Cryptokey routing ------------------------------------------------------------
+do
+  assert(send_ip(&A, ip4(9, 1, 10, 40)), 'a sends it (its own table routes by destination)')
+  flush()
+  assert(#B.got == 0, 'a source outside a\'s allowed IPs is dropped')
+  assert(not B.dev:send_packet((@*[0]uint8)(&psk), 32, now), 'not an IP packet')
+  local v = ip4(1, 99, 10, 41)
+  assert(not B.dev:send_packet((@*[0]uint8)(&v[0]), #v, now), 'no peer owns 10.77.0.99')
+  v:destroy()
+  -- an IPv6 packet from a's IPv6 address is fine
+  local v6: vector(uint8)
+  v6:resize(48)
+  v6[0] = 0x60
+  v6[5] = 8
+  local src6: WgCidr = cidr('fd00:77::2/128')
+  local dst6: WgCidr = cidr('fd00:77::1/128')
+  memory.copy(&v6[8], &src6.addr, 16)
+  memory.copy(&v6[24], &dst6.addr, 16)
+  pb.allowed:push(cidr('fd00:77::1/128'))
+  assert(A.dev:send_packet((@*[0]uint8)(&v6[0]), 48, now))
+  flush()
+  assert(#B.got == 1 and #B.got[0] == 48, 'IPv6 inside the tunnel')
+  v6:destroy()
+  clear_got(&B)
+end
+
+-- 5. Keepalives: b heard from a and has nothing to say for 10 s -------------------
+do
+  assert(send_ip(&A, ip4(2, 1, 10, 50)))
+  flush()
+  clear_got(&B)
+  local before = pb.rx_bytes
+  run(11, 0.5)
+  assert(pb.rx_bytes == before + 32, 'one keepalive (32 bytes) from b')
+  -- a, which sent data and heard only a keepalive, does not start a handshake
+  assert(pb.current.valid and pa.current.valid)
+end
+
+-- 6. Rekey after REKEY_AFTER_TIME: the initiator starts a new handshake when it sends
+do
+  local old = pb.current.local_index
+  run(121, 1)
+  assert(send_ip(&A, ip4(2, 1, 10, 60)))
+  flush()
+  assert(#B.got == 1, 'data still arrives')
+  assert(pb.current.local_index ~= old, 'a new session')
+  assert(pb.previous.valid and pb.previous.local_index == old, 'the old one is kept as previous')
+  clear_got(&B)
+  assert(send_ip(&B, ip4(1, 2, 10, 61)))
+  flush()
+  assert(#A.got == 1, 'b answers on the new session')
+  clear_got(&A)
+end
+
+-- 7. Rekey after REKEY_AFTER_MESSAGES ------------------------------------------------
+do
+  local old = pb.current.local_index
+  now = now + 1 -- a later TAI64N than the last handshake's
+  pb.current.send_counter = WG_REKEY_AFTER_MESSAGES + 1
+  pb.hs.last_sent = 0
+  assert(send_ip(&A, ip4(2, 1, 10, 70)))
+  flush()
+  assert(pb.current.local_index ~= old, 'the message count forced a new session')
+  clear_got(&B)
+end
+
+-- 8. Roaming: a moves; b answers wherever a's latest authenticated message came from
+do
+  A.ep = endpoint4(192, 0, 2, 99, 40999)
+  assert(send_ip(&A, ip4(2, 1, 10, 80)))
+  flush()
+  assert(#B.got == 1 and pa.endpoint:same(&A.ep), 'b follows a to its new address')
+  assert(send_ip(&B, ip4(1, 2, 10, 81)))
+  assert(#net == 1 and net[0].to:same(&A.ep), 'and answers there')
+  flush()
+  assert(#A.got == 1)
+  -- a forged message from elsewhere does not move it
+  local d: Datagram = { from = endpoint4(203, 0, 113, 66, 1), to = B.ep }
+  d.data:resize(64)
+  d.data[0] = WG_MSG_DATA
+  wgp.put_u32(&d.data[4], pa.current.local_index)
+  net:push(d)
+  flush()
+  assert(pa.endpoint:same(&A.ep), 'unauthenticated datagrams do not roam')
+  clear_got(&A) clear_got(&B)
+end
+
+-- 9. Replayed initiation (TAI64N) and the initiation rate ------------------------------
+do
+  pb.hs.last_sent = 0
+  A.dev:connect(pb, now)
+  assert(#net == 1)
+  local init: [148]uint8
+  memory.copy(&init, &net[0].data[0], 148)
+  flush()
+  local sessions = pa.current.local_index
+  now = now + 1
+  B.dev:receive(&A.ep, &init, 148, now)
+  assert(#net == 0, 'a replayed initiation gets no response')
+  -- two fresh initiations 10 ms apart: the second is refused
+  run(6, 1)
+  pb.hs.last_sent = 0
+  A.dev:connect(pb, now)
+  flush()
+  now = now + 0.01
+  pb.hs.last_sent = 0
+  A.dev:connect(pb, now)
+  assert(#net == 1)
+  flush()
+  assert(#net == 0, 'an initiation 10 ms after the last is not answered')
+  run(1, 0.5)
+end
+
+-- 10. Cookies under load ----------------------------------------------------------------
+do
+  run(6, 1)
+  B.dev.force_load = true
+  pb.t_retransmit = 0 -- nothing of test 9 still in flight
+  pb.cookie_at = 0
+  pb.hs.last_sent = 0
+  A.dev:connect(pb, now)
+  assert(#net == 1)
+  flush()
+  assert(pb.cookie_at == now, 'a took the cookie b sent instead of a response')
+  -- the retransmission carries MAC2 and is answered
+  local before = pb.current.local_index
+  run(6, 0.5)
+  assert(pb.current.local_index ~= before, 'the handshake completed under load')
+  B.dev.force_load = false
+  -- a cookie reply that does not decrypt is ignored
+  local bogus: [64]uint8
+  memory.zero(&bogus, 64)
+  bogus[0] = WG_MSG_COOKIE
+  wgp.put_u32(&bogus[4], pb.current.local_index)
+  local at = pb.cookie_at
+  A.dev:receive(&B.ep, &bogus, 64, now + 1)
+  assert(pb.cookie_at == at, 'a forged cookie reply changes nothing')
+end
+
+-- 11. Retransmission and giving up ------------------------------------------------------
+do
+  -- b goes away: a's handshakes go unanswered
+  pb.current.valid = false
+  pb.previous.valid = false
+  pb.hs.last_sent = 0
+  local sent = 0
+  assert(send_ip(&A, ip4(2, 1, 10, 90)))
+  sent = sent + #net
+  drop_all()
+  for _ = 1, 240 do -- 120 s: 19 tries about 5.2 s apart, then giving up
+    tick(0.5)
+    sent = sent + #net
+    drop_all()
+  end
+  assert(sent == 1 + WG_MAX_HANDSHAKES, 'the first try and 18 retries')
+  assert(#pb.staged == 0, 'the staged packet is dropped when it gives up')
+end
+
+-- 12. Keys are wiped 540 s after the last handshake -----------------------------------
+do
+  run(541, 10)
+  assert(not pb.current.valid and not pb.previous.valid and not pb.next.valid, 'a wiped its keys')
+  assert(not pa.current.valid and not pa.previous.valid and not pa.next.valid, 'b wiped its keys')
+  -- and a new handshake still works afterwards
+  pb.hs.last_sent = 0
+  assert(send_ip(&A, ip4(2, 1, 10, 100)))
+  flush()
+  assert(#B.got == 1 and last_tag(&B) == 100, 'a fresh session after the wipe')
+  clear_got(&B)
+end
+
+-- 13. b dials a (a peer with an endpoint on the responder's side) --------------------
+do
+  pa.endpoint = A.ep
+  pa.keepalive = 25
+  pa.hs.last_sent = 0
+  B.dev:connect(pa, now)
+  flush()
+  assert(pa.current.valid and pa.current.initiator, 'b initiated')
+  local before = pb.rx_bytes
+  run(26, 1)
+  assert(pb.rx_bytes > before, 'persistent keepalive from b')
+  pa.keepalive = 0
+end
+
+-- 14. Removing a peer wipes it; its datagrams are ignored ----------------------------
+do
+  assert(send_ip(&A, ip4(2, 1, 10, 110)))
+  B.dev:remove_peer(pa)
+  flush()
+  assert(#B.got == 0 and #net == 0, 'a removed peer is not heard')
+  assert(B.dev.index:__len() == 0, 'its indices are gone')
+end
+
+drop_all()
+net:destroy()
+clear_got(&A) clear_got(&B)
+A.got:destroy() B.got:destroy()
+A.dev:destroy()
+B.dev:destroy()
+print('test_wg OK')

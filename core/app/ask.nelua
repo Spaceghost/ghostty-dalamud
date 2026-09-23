@@ -45,7 +45,7 @@ global function ask_spawn(argv: *vector(string), transport: string, local_fallba
   -- pipes too, so a Windows agent's ConPTY never sees these lines. An agent
   -- below version 4 has no jobs and gets the old PTY open instead.
   if transport == 'agent' or transport == 'job' then p.transport = 'job' end
-  if p.transport == 'job' and local_fallback and (not host.agent_enabled or host.agent_down) then
+  if p.transport == 'job' and local_fallback and (not host.local_agent.enabled or host.local_agent.down) then
     p.transport = 'pipe'
   end
   p.argv = $argv -- borrowed: Session:init copies what it keeps

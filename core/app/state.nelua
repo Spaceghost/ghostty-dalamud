@@ -126,23 +126,32 @@ global LOG_INFO: cint <comptime> = 1
 global LOG_WARN: cint <comptime> = 2
 global LOG_ERROR: cint <comptime> = 3
 
+-- One connection to one ghostty-agent, and everything tracked about it.
+-- Links are heap allocated and never move: a Session holds `*AgentClient` into
+-- one of them, so growing host.agents must not invalidate those pointers.
+global AgentLink = @record{
+  name: string,                     -- 'local' for index 0, then the config's key
+  client: AgentClient,
+  enabled: boolean,
+  last_try: float64,
+  listed: boolean,                  -- LIST sent after the first successful connect
+  prev_state: AgentState,           -- connection state after the last agent_pump (reconnect detection)
+  seen: boolean,                    -- some connection reached Ready: nonce says which agent that was
+  nonce: uint64,                    -- the agent process last seen Ready (0 unknown: a version 1 agent)
+  error_shown: string,              -- connection error already shown in the waiting terminals
+  down: boolean,                    -- the last connection attempt failed (profiles with a fallback use it)
+}
+
 global Host = @record{
   api: GuHostApi,
   dir: string,                      -- writable config home (settings, world state, panic log)
   initialized: boolean,
   imgui_ok: boolean,
   imgui_missing: integer,
-  agent: AgentClient,
-  agent_enabled: boolean,
-  agent_last_try: float64,
-  agent_listed: boolean,            -- LIST sent after the first successful connect
+  local_agent: AgentLink,           -- the agent on this machine; terminals always use it
+  agents: vector(*AgentLink),       -- extra links, by name; see docs/MULTI_AGENT.md
   reattach_done: boolean,           -- LISTR handled (or no agent): the dropdown may open a fresh tab
   layout_restored: boolean,         -- LISTR put the saved layout back: saving it now keeps it
-  agent_prev_state: AgentState,     -- connection state after the last agent_pump (reconnect detection)
-  agent_seen: boolean,              -- some connection reached Ready: agent_nonce says which agent that was
-  agent_nonce: uint64,              -- the agent process last seen Ready (0 unknown: a version 1 agent)
-  agent_error_shown: string,        -- connection error already shown in the waiting terminals
-  agent_down: boolean,              -- the last connection attempt failed (profiles with a fallback use it)
   sessions: vector(*Session),
   pending_open: vector(*Session),   -- FIFO awaiting agent OPENED; nilptr = closed while waiting
   next_session_id: integer,
@@ -193,6 +202,7 @@ global Host = @record{
   world_order_swap_id: integer,      -- applied after the panel loop: these two swap places
   world_order_swap_with: integer,
   window_picker_open: boolean,       -- the Windows picker (/window, core/app/winpicker.nelua)
+  agents_open: boolean,              -- the Agents window (/term agents, core/app/agentpanel.nelua)
   world_tuning: WorldTuning,        -- CONFIG.world.present / walk, read each frame
   hud_mask: HudMask,                -- the game's HUD this frame (core/hudmask.nelua; empty when off)
   walk: WorldWalk,                  -- walking up to the clicked panel
@@ -260,6 +270,27 @@ global Host = @record{
 }
 
 global host: Host
+
+-- The 'local' link: the agent on the machine running the game. Terminals always
+-- use this one (a shell must not move because a window panel came from
+-- elsewhere); windows may name another. Created by agent_links_init before
+-- anything reads it, so this never returns nilptr after startup.
+-- The local link: the agent on the machine running the game. Terminals always
+-- use this one (a shell must not move because a window panel came from
+-- elsewhere); windows may name another. It is a field of `host`, not a heap
+-- allocation behind a call, because nelua copies a record read through a
+-- function result: `host.local_agent.client.sock = fd` would write to a temporary.
+global function agent_local(): *AgentLink <inline>
+  return &host.local_agent
+end
+
+-- The link named `name`, or nilptr when there is none.
+global function agent_by_name(name: string): *AgentLink
+  for i = 0, < #host.agents do
+    if host.agents[i].name == name then return host.agents[i] end
+  end
+  return nilptr
+end
 
 global function log(level: cint, msg: string): void
   if host.api.log == nilptr then return end

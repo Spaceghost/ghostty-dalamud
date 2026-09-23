@@ -10,9 +10,9 @@ require 'core.app.ask'
 
 global function update_status(): void
   local sb: stringbuilder
-  if host.agent_enabled then
-    if host.agent.state == AgentState.Ready then sb:write('ghostty')
-    elseif host.agent.state == AgentState.Connecting or host.agent.state == AgentState.Handshake then sb:write('ghostty ~')
+  if host.local_agent.enabled then
+    if host.local_agent.client.state == AgentState.Ready then sb:write('ghostty')
+    elseif host.local_agent.client.state == AgentState.Connecting or host.local_agent.client.state == AgentState.Handshake then sb:write('ghostty ~')
     else sb:write('ghostty x') end
   else
     sb:write('ghostty')

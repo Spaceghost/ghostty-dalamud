@@ -141,7 +141,9 @@ start_if_stopped() {
 # bare name and warn, so a fresh create never dead-ends.
 install_pinned() {
   local missing=() nevr name
-  for nevr in $BUILD_PKGS_PINNED; do
+  # RUST_PKGS_PINNED is optional (docs/IROH.md): empty in a toolchain.env that
+  # does not pin Rust, and the loop then behaves exactly as it did.
+  for nevr in $BUILD_PKGS_PINNED ${RUST_PKGS_PINNED:-}; do
     name="${nevr%%-[0-9]*}"
     if inside rpm -q --quiet "$nevr" 2>/dev/null; then continue; fi
     missing+=("$nevr")
@@ -194,6 +196,7 @@ cmd_update() {
     "$BUILD_CONTAINER_CACHE/ghostty-vt-windows" "$BUILD_CONTAINER_CACHE/lua-linux" \
     "$BUILD_CONTAINER_CACHE/lua-win" "$BUILD_CONTAINER_CACHE/nuget" \
     "$BUILD_CONTAINER_CACHE/ci" "$BUILD_CONTAINER_CACHE/vendor" \
+    "$BUILD_CONTAINER_CACHE/cargo-target" \
     "$BUILD_CONTAINER_DIR"
 
   write_profile
@@ -220,6 +223,13 @@ export CI_CACHE_DIR=\$CACHE/ci
 export DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 # sccache: local disk cache on the shared Incus volume by default; a
 # SCCACHE_BUCKET/SCCACHE_WEBDAV_ENDPOINT in BUILD_CACHE_ENV overrides it.
+# cargo (crates/ghostty-iroh, docs/IROH.md): a fixed absolute target dir on the
+# shared volume, for the same reason everything else has one -- absolute paths
+# are part of every sccache key. RUSTC_WRAPPER only matters once the crate
+# exists; it is harmless before then.
+export CARGO_TARGET_DIR=\$CACHE/cargo-target
+export RUSTC_WRAPPER=sccache
+export CARGO_NET_OFFLINE=true
 export SCCACHE_DIR=\$CACHE/sccache
 export SCCACHE_CACHE_SIZE=\${SCCACHE_CACHE_SIZE:-20G}
 export SCCACHE_IDLE_TIMEOUT=0
@@ -239,6 +249,8 @@ cmd_status() {
     echo "dotnet:   $(dotnet --version 2>/dev/null || echo MISSING) sdk=$(dotnet --list-sdks 2>/dev/null | tr "\n" " ")"
     echo "gcc:      $(gcc -dumpfullversion 2>/dev/null || echo MISSING)"
     echo "sccache:  $(sccache --version 2>/dev/null || echo MISSING)"
+    echo "cargo:    $(cargo --version 2>/dev/null || echo MISSING) rustc=$(rustc --version 2>/dev/null || echo MISSING)"
+    echo "rust-std: $(rpm -q rust-std-static-x86_64-pc-windows-gnu 2>/dev/null || echo MISSING)"
     echo "wayland:  $(rpm -q wlroots libwayland-server libxkbcommon pixman 2>&1 | tr "\n" " ")"
     echo "libwlroots-0.20.so: $(ls -l /usr/lib64/libwlroots-0.20.so 2>&1 | head -1)"
     echo "cache:    $(du -sh $CACHE 2>/dev/null | cut -f1) at $CACHE"

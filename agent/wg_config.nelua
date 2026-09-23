@@ -1,0 +1,421 @@
+-- wireguard.conf: the embedded WireGuard's keys, addresses, forwards and
+-- peers (docs/WIREGUARD.md "Files and the CLI"). wg-quick's format, which is
+-- what every WireGuard user already reads, plus two keys of our own: `Name`
+-- on a peer and `Forward` on the interface. The parser is strict: an unknown
+-- key or a bad value is an error with its line number, never skipped.
+--
+--   [Interface]
+--   PrivateKey = <base64>
+--   ListenPort = 51820
+--   Address = 10.77.12.1/24, fd4e:2b1c:9a07:1::1/64
+--   Forward = tcp 3389
+--   Forward = udp 47998-48000
+--
+--   [Peer]
+--   Name = laptop
+--   PublicKey = <base64>
+--   PresharedKey = <base64>
+--   AllowedIPs = 10.77.12.2/32, fd4e:2b1c:9a07:1::2/128
+--   Endpoint = 203.0.113.5:51820        (optional: the agent dials this peer)
+--   PersistentKeepalive = 25            (optional)
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'io'
+require 'agent.crypto'
+require 'agent.wg_proto'
+require 'agent.wg_netstack'
+require 'core.sys.fsbase'
+## if ccinfo.is_windows then
+require 'core.sys.winpath'
+local function MoveFileExW(from: pointer, to: pointer, flags: uint32): cint <cimport, nodecl> end
+local MOVEFILE_REPLACE_EXISTING: uint32 <cimport, nodecl, const>
+## else
+local function c_rename(from: cstring, to: cstring): cint <cimport 'rename', nodecl> end
+## end
+
+global WG_DEFAULT_PORT: uint16 <comptime> = 51820
+
+global WgPeerConf = @record{
+  name: string,
+  public: [32]uint8,
+  psk: [32]uint8,
+  has_psk: boolean,
+  allowed: vector(WgCidr),
+  endpoint: WgEndpoint,
+  keepalive: integer,
+  line: integer,          -- where its [Peer] is, for errors
+}
+
+global WgConfig = @record{
+  private: [32]uint8,
+  has_private: boolean,
+  port: uint16,
+  addr4: WgCidr, has4: boolean,
+  addr6: WgCidr, has6: boolean,
+  forwards: vector(WgForward),
+  peers: vector(WgPeerConf),
+}
+
+function WgConfig:destroy(): void
+  for i = 0, < #self.peers do
+    self.peers[i].name:destroy()
+    self.peers[i].allowed:destroy()
+    crypto.wipe(&self.peers[i].psk, 32)
+  end
+  self.peers:destroy()
+  self.forwards:destroy()
+  crypto.wipe(&self.private, 32)
+end
+
+local function trim(s: string): string
+  local a, b = 1, #s
+  while a <= b and (s.data[a-1] == ' '_b or s.data[a-1] == '\t'_b or s.data[a-1] == '\r'_b) do a = a + 1 end
+  while b >= a and (s.data[b-1] == ' '_b or s.data[b-1] == '\t'_b or s.data[b-1] == '\r'_b) do b = b - 1 end
+  return s:sub(a, b)
+end
+
+local function lower(s: string): string
+  local sb: stringbuilder
+  for i = 0, < #s do
+    local c = s.data[i]
+    if c >= 'A'_b and c <= 'Z'_b then c = c + 32 end
+    sb:writebyte(c)
+  end
+  return sb:promote()
+end
+
+-- the comma-separated items of a value, trimmed
+local function items(v: string): vector(string)
+  local out: vector(string)
+  local start = 1
+  for i = 1, #v + 1 do
+    if i > #v or v.data[i-1] == ','_b then
+      local piece = v:sub(start, i - 1)
+      local t = trim(piece)
+      piece:destroy()
+      if #t > 0 then out:push(t) else t:destroy() end
+      start = i + 1
+    end
+  end
+  return out
+end
+
+local function free_items(v: *vector(string)): void
+  for i = 0, < #v do v[i]:destroy() end
+  v:destroy()
+end
+
+local function parse_uint(s: string, max: integer): (boolean, integer)
+  if #s == 0 or #s > 6 then return false, 0 end
+  local n = 0
+  for i = 0, < #s do
+    local c = s.data[i]
+    if c < '0'_b or c > '9'_b then return false, 0 end
+    n = n * 10 + (c - '0'_b)
+  end
+  return n <= max, n
+end
+
+-- "tcp 3389", "udp 47998-48000": one forward per port, each to the same port
+-- on loopback.
+local function parse_forward(v: string, out: *vector(WgForward)): boolean
+  local sp = v:find(' ', 1, true)
+  if sp == 0 then return false end
+  local proto = v:sub(1, sp - 1)
+  local rest = v:sub(sp + 1)
+  local ports = trim(rest)
+  rest:destroy()
+  local udp = proto == 'udp'
+  local ok = udp or proto == 'tcp'
+  proto:destroy()
+  local dash = ports:find('-', 1, true)
+  local a, b = 0, 0
+  if ok then
+    if dash > 0 then
+      local s1 = ports:sub(1, dash - 1)
+      local s2 = ports:sub(dash + 1)
+      local ok1, n1 = parse_uint(s1, 65535)
+      local ok2, n2 = parse_uint(s2, 65535)
+      s1:destroy() s2:destroy()
+      ok = ok1 and ok2 and n1 >= 1 and n2 >= n1 and n2 - n1 < 64
+      a, b = n1, n2
+    else
+      local ok1, n1 = parse_uint(ports, 65535)
+      ok = ok1 and n1 >= 1
+      a, b = n1, n1
+    end
+  end
+  ports:destroy()
+  if not ok then return false end
+  for p = a, b do out:push(WgForward{ udp = udp, port = (@uint16)(p), to = (@uint16)(p) }) end
+  return true
+end
+
+-- "203.0.113.5:51820" or "[2001:db8::5]:51820": IP literals only.
+function wgp.parse_endpoint(v: string, out: *WgEndpoint): boolean
+  $out = {}
+  local host: string
+  local port_s: string
+  if #v > 0 and v.data[0] == '['_b then
+    local close = v:find(']', 1, true)
+    if close == 0 or close + 1 > #v or v.data[close] ~= ':'_b then return false end
+    host = v:sub(2, close - 1)
+    port_s = v:sub(close + 2)
+  else
+    local colon = 0
+    for i = #v, 1, -1 do if v.data[i-1] == ':'_b then colon = i break end end
+    if colon == 0 then return false end
+    host = v:sub(1, colon - 1)
+    port_s = v:sub(colon + 1)
+  end
+  local okp, port = parse_uint(port_s, 65535)
+  local ok = okp and port > 0 and wgp.parse_ip(host, &out.family, &out.addr)
+  host:destroy()
+  port_s:destroy()
+  out.port = (@uint16)(port)
+  return ok
+end
+
+-- Parse `text`. False and "line N: why" on the first thing it cannot use.
+function WgConfig:parse(text: string): (boolean, string)
+  $self = {}
+  self.port = WG_DEFAULT_PORT
+  local section = 0 -- 1 interface, 2 peer
+  local line_no = 0
+  local start = 1
+  local why: stringbuilder
+  local bad = false
+  local n = (@integer)(#text)
+  local i = 1
+  while i <= n + 1 and not bad do
+    if i > n or text.data[i-1] == '\n'_b then
+      line_no = line_no + 1
+      local raw = text:sub(start, i - 1)
+      start = i + 1
+      local hash = raw:find('#', 1, true)
+      local body = hash > 0 and raw:sub(1, hash - 1) or raw:copy()
+      raw:destroy()
+      local line = trim(body)
+      body:destroy()
+      if #line == 0 then
+        -- blank or a comment
+      elseif line.data[0] == '['_b then
+        local l = lower(line)
+        if l == '[interface]' then section = 1
+        elseif l == '[peer]' then
+          section = 2
+          local pc: WgPeerConf
+          pc.line = line_no
+          self.peers:push(pc)
+        else bad = true why:write('unknown section ', line) end
+        l:destroy()
+      else
+        local eq = line:find('=', 1, true)
+        if eq == 0 then bad = true why:write('expected Key = value')
+        elseif section == 0 then bad = true why:write('a key before [Interface] or [Peer]')
+        else
+          local k0 = line:sub(1, eq - 1)
+          local kt = trim(k0)
+          local key = lower(kt)
+          k0:destroy() kt:destroy()
+          local v0 = line:sub(eq + 1)
+          local v = trim(v0)
+          v0:destroy()
+          if section == 1 then
+            if key == 'privatekey' then
+              if not crypto.key_from_base64(v, &self.private) then bad = true why:write('PrivateKey is not a base64 key') end
+              self.has_private = true
+            elseif key == 'listenport' then
+              local ok, p = parse_uint(v, 65535)
+              if not ok then bad = true why:write('ListenPort is not a port') end
+              self.port = (@uint16)(p)
+            elseif key == 'address' then
+              local list = items(v)
+              for k = 0, < #list do
+                local c: WgCidr
+                if not wgp.parse_iface(list[k], &c) then bad = true why:write('Address ', list[k], ' is not an address/prefix')
+                elseif c.family == 4 then self.addr4, self.has4 = c, true
+                else self.addr6, self.has6 = c, true end
+              end
+              free_items(&list)
+            elseif key == 'forward' then
+              if not parse_forward(v, &self.forwards) then bad = true why:write('Forward wants "tcp PORT" or "udp PORT[-PORT]"') end
+            else
+              bad = true why:write('unknown [Interface] key ', key)
+            end
+          else
+            local pc = &self.peers[#self.peers - 1]
+            if key == 'name' then
+              pc.name:destroy()
+              pc.name = v:copy()
+            elseif key == 'publickey' then
+              if not crypto.key_from_base64(v, &pc.public) then bad = true why:write('PublicKey is not a base64 key') end
+            elseif key == 'presharedkey' then
+              if not crypto.key_from_base64(v, &pc.psk) then bad = true why:write('PresharedKey is not a base64 key') end
+              pc.has_psk = true
+            elseif key == 'allowedips' then
+              local list = items(v)
+              for k = 0, < #list do
+                local c: WgCidr
+                if wgp.parse_cidr(list[k], &c) then pc.allowed:push(c)
+                else bad = true why:write('AllowedIPs ', list[k], ' is not a range') end
+              end
+              free_items(&list)
+            elseif key == 'endpoint' then
+              if not wgp.parse_endpoint(v, &pc.endpoint) then bad = true why:write('Endpoint wants ADDRESS:PORT') end
+            elseif key == 'persistentkeepalive' then
+              local ok, k = parse_uint(v, 65535)
+              if not ok then bad = true why:write('PersistentKeepalive is not a number of seconds') end
+              pc.keepalive = k
+            else
+              bad = true why:write('unknown [Peer] key ', key)
+            end
+          end
+          key:destroy()
+          v:destroy()
+        end
+      end
+      line:destroy()
+    end
+    i = i + 1
+  end
+  if not bad then
+    for k = 0, < #self.peers do
+      local pc = &self.peers[k]
+      if crypto.is_zero(&pc.public, 32) then bad = true line_no = pc.line why:write('a [Peer] without a PublicKey') break end
+      if #pc.allowed == 0 then bad = true line_no = pc.line why:write('a [Peer] without AllowedIPs') break end
+    end
+  end
+  if bad then
+    local msg = why:promote()
+    local sb: stringbuilder
+    sb:writef('line %d: %s', line_no, msg)
+    msg:destroy()
+    return false, sb:promote()
+  end
+  why:destroy()
+  return true, (@string){}
+end
+
+-- Files -----------------------------------------------------------------------------
+
+-- The whole file, or false when it cannot be read.
+global function wg_read_file(path: string): (boolean, string)
+  local f = io.open(path, 'rb')
+  if not f:isopen() then f:destroy() return false, (@string){} end
+  local text = f:read('a')
+  f:destroy() -- closes it and frees the stream (close alone keeps the box: 16 bytes a call)
+  return true, text
+end
+
+-- Replace `path` with `text`, readable only by this user from the first
+-- byte: a new file is made private while it is still empty, filled, then
+-- renamed over the old one, so a reader never sees half a file.
+global function wg_write_private(path: string, text: string): boolean
+  local tmp = path .. '.new'
+  local f = io.open(tmp, 'wb')
+  if not f:isopen() then f:destroy() tmp:destroy() return false end
+  f:destroy()
+  local tz = tmp .. '\0'
+  local private = fs_make_private((@cstring)(tz.data))
+  tz:destroy()
+  if not private then tmp:destroy() return false end
+  f = io.open(tmp, 'wb')
+  if not f:isopen() then f:destroy() tmp:destroy() return false end
+  f:write(text)
+  f:destroy()
+  local ok = false
+  ## if ccinfo.is_windows then
+  local wf: [WINPATH_MAX]uint16
+  local wt: [WINPATH_MAX]uint16
+  if winpath_wide(tmp, (@*[0]uint16)(&wf), WINPATH_MAX) >= 0 and winpath_wide(path, (@*[0]uint16)(&wt), WINPATH_MAX) >= 0 then
+    ok = MoveFileExW(&wf, &wt, MOVEFILE_REPLACE_EXISTING) ~= 0
+  end
+  ## else
+  local a = tmp .. '\0'
+  local b = path .. '\0'
+  ok = c_rename((@cstring)(a.data), (@cstring)(b.data)) == 0
+  a:destroy() b:destroy()
+  ## end
+  tmp:destroy()
+  return ok
+end
+
+function WgConfig:load(path: string): (boolean, string)
+  local ok, text = wg_read_file(path)
+  if not ok then
+    local sb: stringbuilder
+    sb:write('cannot read ', path)
+    return false, sb:promote()
+  end
+  local good, why = self:parse(text)
+  crypto.wipe(text.data, text.size)
+  text:destroy()
+  return good, why
+end
+
+-- The file's text for `self`: what `ghostty-agent wg` writes back.
+function WgConfig:format(): string
+  local sb: stringbuilder
+  sb:write('# ghostty-agent embedded WireGuard (docs/WIREGUARD.md). Keep this file private.\n')
+  sb:write('# `ghostty-agent wg add|remove|forward` edit it; the agent reloads it on change.\n')
+  sb:write('[Interface]\n')
+  local key = crypto.key_to_base64(&self.private)
+  sb:writef('PrivateKey = %s\n', key)
+  crypto.wipe(key.data, key.size)
+  key:destroy()
+  sb:writef('ListenPort = %d\n', (@integer)(self.port))
+  if self.has4 or self.has6 then
+    sb:write('Address = ')
+    local ip4 = wgp.ip_tostring(4, &self.addr4.addr)
+    local ip6 = wgp.ip_tostring(6, &self.addr6.addr)
+    if self.has4 then sb:writef('%s/%d', ip4, (@integer)(self.addr4.bits)) end
+    if self.has4 and self.has6 then sb:write(', ') end
+    if self.has6 then sb:writef('%s/%d', ip6, (@integer)(self.addr6.bits)) end
+    sb:write('\n')
+    ip4:destroy() ip6:destroy()
+  end
+  for i = 0, < #self.forwards do
+    local f = self.forwards[i]
+    sb:writef('Forward = %s %d\n', f.udp and 'udp' or 'tcp', (@integer)(f.port))
+  end
+  for i = 0, < #self.peers do
+    local pc = &self.peers[i]
+    sb:write('\n[Peer]\n')
+    if #pc.name > 0 then sb:writef('Name = %s\n', pc.name) end
+    local pub = crypto.key_to_base64(&pc.public)
+    sb:writef('PublicKey = %s\n', pub)
+    pub:destroy()
+    if pc.has_psk then
+      local psk = crypto.key_to_base64(&pc.psk)
+      sb:writef('PresharedKey = %s\n', psk)
+      crypto.wipe(psk.data, psk.size)
+      psk:destroy()
+    end
+    sb:write('AllowedIPs = ')
+    for k = 0, < #pc.allowed do
+      if k > 0 then sb:write(', ') end
+      local c = pc.allowed[k]:tostring()
+      sb:write(c)
+      c:destroy()
+    end
+    sb:write('\n')
+    if pc.endpoint.family ~= 0 then
+      local ip = wgp.ip_tostring(pc.endpoint.family, &pc.endpoint.addr)
+      if pc.endpoint.family == 6 then sb:writef('Endpoint = [%s]:%d\n', ip, (@integer)(pc.endpoint.port))
+      else sb:writef('Endpoint = %s:%d\n', ip, (@integer)(pc.endpoint.port)) end
+      ip:destroy()
+    end
+    if pc.keepalive > 0 then sb:writef('PersistentKeepalive = %d\n', pc.keepalive) end
+  end
+  return sb:promote()
+end
+
+function WgConfig:save(path: string): boolean
+  local text = self:format()
+  local ok = wg_write_private(path, text)
+  crypto.wipe(text.data, text.size)
+  text:destroy()
+  return ok
+end
