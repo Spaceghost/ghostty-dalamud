@@ -734,8 +734,8 @@ local function iroh_accept_all(): void
     -- the PROTO_HELLO token still has to arrive (docs/MULTI_AGENT.md).
     local cl: Client = { sock = net.invalid(), alive = true, ih = h }
     agent.clients:push(cl)
-    local pbuf: [64]uint8
-    local pn = gi_peer_id(h, (@cstring)((@pointer)(&pbuf)), 64)
+    local pbuf: [80]uint8
+    local pn = gi_peer_id(h, (@cstring)((@pointer)(&pbuf)), #pbuf)
     if pn > 0 then
       log('iroh: connection from ' .. string{data = (@*[0]byte)(&pbuf), size = (@usize)(pn)})
     else
@@ -927,8 +927,8 @@ local function main(): integer
       return 1
     end
     do -- the NodeId is the address clients dial, so it is logged like the listen spec
-      local idbuf: [64]uint8
-      local idn = gi_node_id((@cstring)((@pointer)(&idbuf)), 64)
+      local idbuf: [80]uint8
+      local idn = gi_node_id((@cstring)((@pointer)(&idbuf)), #idbuf)
       if idn > 0 then
         log('iroh: listening as ' .. string{data = (@*[0]byte)(&idbuf), size = (@usize)(idn)})
       else
