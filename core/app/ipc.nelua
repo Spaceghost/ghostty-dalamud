@@ -352,15 +352,17 @@ end
 
 -- World panels (terminals and windows) ----------------------------------------------------
 
--- ghostty.raycast(ox, oy, oz, dx, dy, dz, max) -> distance, hx, hy, hz
--- The game's own collision (WorldRaycast) along a direction that need not be
--- normalised: the distance to the first hit within `max` yalms and where it
--- is, or nil when nothing is hit (and when the shim is too old to have it).
--- Rays are not free: the callers budget them per frame, as core/app/rain.nelua
--- does. Used by lua/world.lua so a panel stops at a wall instead of passing
--- through it.
+-- ghostty.raycast(ox, oy, oz, dx, dy, dz, max[, filter]) -> distance, hx, hy, hz, filter
+-- The game's own collision along a direction that need not be normalised: the
+-- distance to the first hit within `max` yalms and where it is, or nil when
+-- nothing is hit (and when the shim is too old to have it). `filter`: 'all'
+-- (the default where the shim has raycast_mode: every layer and material, all
+-- the player bumps into, lamp posts and posts too), 'bg' (what ScreenToWorld
+-- and an older shim use: layer 1, material bit 0x4000), 'layers' (every layer,
+-- bg's material filter). The fifth result says which filter answered. Rays
+-- are not free: callers budget them per frame, as core/app/rain.nelua does.
 local function l_raycast(L: *lua_State): cint
-  if host.api.raycast == nilptr then lua_pushnil(L) return 1 end
+  if host.api.raycast == nilptr and host.api.raycast_mode == nilptr then lua_pushnil(L) return 1 end
   local n: [7]float32
   for i = 1, 7 do
     local isnum: cint = 0
@@ -368,6 +370,15 @@ local function l_raycast(L: *lua_State): cint
     if isnum == 0 then lua_pushnil(L) return 1 end
     n[i - 1] = (@float32)(v)
   end
+  local mode: cint = 1
+  local name: cstring = 'all'
+  if lua_type(L, 8) == LUA_TSTRING then
+    local len: usize = 0
+    local p = lua_tolstring(L, 8, &len)
+    local f: string = string{data=(@*[0]byte)(p), size=len}
+    if f == 'bg' then mode, name = 0, 'bg' elseif f == 'layers' then mode, name = 2, 'layers' end
+  end
+  if host.api.raycast_mode == nilptr then mode, name = 0, 'bg' end
   local ox, oy, oz = n[0], n[1], n[2]
   local dx, dy, dz = n[3], n[4], n[5]
   local max = n[6]
@@ -375,11 +386,54 @@ local function l_raycast(L: *lua_State): cint
   if len < 1e-6 or max <= 0 then lua_pushnil(L) return 1 end
   dx, dy, dz = dx / len, dy / len, dz / len
   local hx: float32, hy: float32, hz: float32 = 0, 0, 0
-  if host.api.raycast(ox, oy, oz, dx, dy, dz, max, &hx, &hy, &hz) == 0 then lua_pushnil(L) return 1 end
+  local hit: cint = 0
+  if host.api.raycast_mode ~= nilptr then
+    hit = host.api.raycast_mode(ox, oy, oz, dx, dy, dz, max, mode, &hx, &hy, &hz)
+  else
+    hit = host.api.raycast(ox, oy, oz, dx, dy, dz, max, &hx, &hy, &hz)
+  end
+  if hit == 0 then lua_pushnil(L) return 1 end
   local ddx, ddy, ddz = hx - ox, hy - oy, hz - oz
   lua_pushnumber(L, math.sqrt(ddx * ddx + ddy * ddy + ddz * ddz))
   lua_pushnumber(L, hx) lua_pushnumber(L, hy) lua_pushnumber(L, hz)
-  return 4
+  lua_pushstring(L, name)
+  return 5
+end
+
+-- ghostty.nearby_characters([t]) -> t with t.n and t[1..n] = { x, y, z, r, h, id,
+-- kind ('player', 'mob', 'npc', 'companion') }:
+-- the characters near yours, nearest first (the shim reads the object table at
+-- most ten times a second). Fills and reuses t and its entries when given one.
+-- nil in an older shim (lua/world.lua then makes room for your target only).
+local function l_nearby_characters(L: *lua_State): cint
+  if host.api.nearby_characters == nilptr then lua_pushnil(L) return 1 end
+  local buf: [32]GuCharacter
+  local n = host.api.nearby_characters(&buf, 32)
+  if n < 0 then n = 0 end
+  if n > 32 then n = 32 end
+  if lua_type(L, 1) == LUA_TTABLE then lua_pushvalue(L, 1) else lua_createtable(L, n, 1) end
+  local t = lua_gettop(L)
+  lua_pushinteger(L, n) lua_setfield(L, t, 'n')
+  for i = 0, < n do
+    lua_rawgeti(L, t, i + 1)
+    if lua_type(L, -1) ~= LUA_TTABLE then
+      lua_pop(L, 1)
+      lua_createtable(L, 0, 5)
+      lua_pushvalue(L, -1)
+      lua_rawseti(L, t, i + 1)
+    end
+    lua_pushnumber(L, buf[i].x) lua_setfield(L, -2, 'x')
+    lua_pushnumber(L, buf[i].y) lua_setfield(L, -2, 'y')
+    lua_pushnumber(L, buf[i].z) lua_setfield(L, -2, 'z')
+    lua_pushnumber(L, buf[i].radius) lua_setfield(L, -2, 'r')
+    lua_pushinteger(L, (@lua_Integer)(buf[i].entity_id)) lua_setfield(L, -2, 'id')
+    lua_pushnumber(L, buf[i].height) lua_setfield(L, -2, 'h')
+    local kind: cstring = 'npc'
+    if buf[i].kind == 1 then kind = 'player' elseif buf[i].kind == 2 then kind = 'mob' elseif buf[i].kind == 4 then kind = 'companion' end
+    lua_pushstring(L, kind) lua_setfield(L, -2, 'kind')
+    lua_pop(L, 1)
+  end
+  return 1
 end
 
 -- ghostty.world_panels() -> { {id, window, focused}, ... } in host.world order,
@@ -712,6 +766,7 @@ global function ipc_lua_register(L: *lua_State): void
   lua_pushcclosure(L, l_status, 0) lua_setfield(L, -2, 'status')
   lua_pushcclosure(L, l_world_panels, 0) lua_setfield(L, -2, 'world_panels')
   lua_pushcclosure(L, l_raycast, 0) lua_setfield(L, -2, 'raycast')
+  lua_pushcclosure(L, l_nearby_characters, 0) lua_setfield(L, -2, 'nearby_characters')
   lua_pushcclosure(L, l_panel_focus, 0) lua_setfield(L, -2, 'panel_focus')
   lua_pushcclosure(L, l_panel_hide, 0) lua_setfield(L, -2, 'panel_hide')
   lua_pushcclosure(L, l_panel_toggle_pet, 0) lua_setfield(L, -2, 'panel_toggle_pet')

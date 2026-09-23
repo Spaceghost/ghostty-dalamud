@@ -73,6 +73,20 @@ internal unsafe struct GuHostApi
     public delegate* unmanaged[Cdecl]<int, float, float, int> NativeResize;
     public delegate* unmanaged[Cdecl]<int, byte*, int> NativeTitle;
     public delegate* unmanaged[Cdecl]<float, int> PushMonoFontPx;
+    // characters near yours (players, NPCs, chocobos), for pets to make room
+    public delegate* unmanaged[Cdecl]<GuCharacter*, int, int> NearbyCharacters;
+    // the game's collision with a chosen filter (0 the helper's, 1 everything, 2 every layer)
+    public delegate* unmanaged[Cdecl]<float, float, float, float, float, float, float, int, float*, float*, float*, int> RaycastMode;
+}
+
+// Mirrors GuCharacter in core/world.nelua.
+[StructLayout(LayoutKind.Sequential)]
+internal struct GuCharacter
+{
+    public float X, Y, Z, Radius;
+    public ulong EntityId;
+    public float Height;          // model height in yalms
+    public int Kind;              // 1 player, 2 battle NPC (mobs), 3 event NPC, 4 companion (chocobo)
 }
 
 // Mirrors GuNativeState in core/nativewin.nelua.

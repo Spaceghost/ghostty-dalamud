@@ -163,7 +163,8 @@ end
 local function window_under(ctx: *ImGuiContext, x: float32, y: float32, prefer: string): *ImGuiWindow
   for i = ctx.Windows.Size - 1, 0, -1 do
     local w = (@*ImGuiWindow)(ctx.Windows.Data[i])
-    if w == nilptr or not w.Active or w.Hidden or w.IsFallbackWindow or w.RootWindow ~= (@pointer)(w) then continue end
+    -- drawn this frame or the last: a plugin that draws after ghostty has not set Active yet
+    if w == nilptr or not (w.Active or w.WasActive) or w.Hidden or w.IsFallbackWindow or w.RootWindow ~= (@pointer)(w) then continue end
     if (w.Flags & (ImGuiWindowFlags_ChildWindow | ImGuiWindowFlags_Popup | ImGuiWindowFlags_Tooltip | ImGuiWindowFlags_NoMouseInputs)) ~= 0 then continue end
     if w.Name == nilptr or lower_has(w.Name, 'ghostty') then continue end
     local r: ImVec4 = { w.Pos.x, w.Pos.y, w.Pos.x + w.Size.x, w.Pos.y + w.Size.y }
@@ -307,7 +308,7 @@ local function restore_tick(now: float64): void
       if not imgui_int_bound then imgui_internal_bind(resolve_imgui) end
       local z = title .. '\0'
       local w = imgui_int.FindWindowByName ~= nilptr and imgui_int.FindWindowByName((@cstring)(z.data)) or nilptr
-      ready = w ~= nilptr and w.Active
+      ready = w ~= nilptr and (w.Active or w.WasActive) -- drawn this frame or, before its plugin drew, the last
       z:destroy()
     end
     kind:destroy() title:destroy() plugin:destroy() label:destroy()
@@ -324,42 +325,48 @@ end
 -- Automatic windows ---------------------------------------------------------------------------------
 -- CONFIG.adopt.auto (Mappy by default): each listed window becomes a world
 -- panel whenever it is open, unless it was given back by hand since it opened.
+-- The windows are watched from RenderPre (core/app/adopt.nelua), which claims
+-- one the frame it first appears so it never shows on the flat UI; the claim
+-- becomes a pet here on ghostty's next frame.
 
 local AUTO_EVERY <comptime> = 0.5
 local auto_at: float64 = 0
 local chat_auto_done = false -- an automatic chat is pulled once per load
 
-local function auto_tick(now: float64): void
-  if now - auto_at < AUTO_EVERY then return end
-  auto_at = now
+-- Window `w` was drawn this frame or the last. ImGui::NewFrame clears Active on
+-- every window, so from ghostty's draw a window whose plugin draws later in the
+-- frame is Active only on its WasActive.
+local function window_open(w: *ImGuiWindow): boolean
+  return w ~= nilptr and (w.Active or w.WasActive) and not w.Hidden
+end
+
+-- The watch list, twice a second: the listed windows whose plugin is loaded.
+local function auto_refresh(armed: boolean): void
   local names = adopt_lua_names('auto_names')
   defer names:destroy() end
-  if #names == 0 then return end
-  if not imgui_int_bound then imgui_internal_bind(resolve_imgui) end
+  adopt_watch_begin()
   local start = 0
   for i = 0, #names do
     if i < #names and names.data[i] ~= '\n'_b then continue end
     if i > start then
       local name = names:subview(start + 1, i)
       local kind, title, plugin, label = adopt_lua_resolve(name)
-      if kind == 'imgui' and imgui_int.FindWindowByName ~= nilptr then
-        local z = title .. '\0'
-        local w = imgui_int.FindWindowByName((@cstring)(z.data))
-        z:destroy()
-        local open = w ~= nilptr and w.Active and not w.Hidden
-        if not open then
-          adopt_undecline(name) -- closed: the next time it opens it comes out again
-        elseif not adopt_has_title(title) and not adopt_declined(name) then
-          local from: ImVec4 = { w.Pos.x, w.Pos.y, w.Pos.x + w.Size.x, w.Pos.y + w.Size.y }
-          local vp = imgui.GetMainViewport().Pos
-          from = { from.x - vp.x, from.y - vp.y, from.z - vp.x, from.w - vp.y }
-          local id, err = adopt_window(name, title, plugin, label, from, true)
-          if id == 0 then
-            logf(LOG_WARN, 'adopt.auto %s: %s', name, err)
-            adopt_decline(name) -- not again until its window closes and opens
-          end
+      if kind == 'imgui' and #title > 0 then
+        local loaded = true
+        if #plugin > 0 and host.api.plugin_loaded ~= nilptr then
+          local z = plugin .. '\0'
+          loaded = host.api.plugin_loaded((@cstring)(z.data)) ~= 0
+          z:destroy()
         end
-      elseif kind == 'native' and not chatpanel_open() and not chat_auto_done then
+        if loaded then adopt_watch_add(name, title, plugin, label) end
+        if imgui_int.FindWindowByName ~= nilptr then
+          local z = title .. '\0'
+          local w = imgui_int.FindWindowByName((@cstring)(z.data))
+          z:destroy()
+          -- closed: the next time it opens it comes out again
+          if not window_open(w) then adopt_undecline(name) end
+        end
+      elseif kind == 'native' and armed and not chatpanel_open() and not chat_auto_done then
         chat_auto_done = true
         local id, err = chatpanel_pull()
         if id == 0 then logf(LOG_WARN, 'adopt.auto %s: %s', name, err) end
@@ -368,6 +375,28 @@ local function auto_tick(now: float64): void
     end
     start = i + 1
   end
+  adopt_watch_end()
+end
+
+local function auto_tick(now: float64, armed: boolean): void
+  if not imgui_int_bound then imgui_internal_bind(resolve_imgui) end
+  if now - auto_at >= AUTO_EVERY then
+    auto_at = now
+    auto_refresh(armed)
+  end
+  adopt_watch_arm(armed and player_loaded())
+  -- what RenderPre claimed last frame becomes a pet now (every frame, not twice
+  -- a second: the window is off the flat UI until it is on its pet)
+  for i = 0, < adopt_watch_count() do
+    local e = adopt_watch_at(i)
+    if e.claim ~= nilptr then
+      local id, err = adopt_window(e.name, e.title, e.plugin, e.label, ImVec4{}, true)
+      if id == 0 then
+        logf(LOG_WARN, 'adopt.auto %s: %s', e.name, err)
+        adopt_decline(e.name) -- not again until its window closes and opens; RenderPre lets go of it
+      end
+    end
+  end
 end
 
 -- Per frame, before the world draws (gu_frame): the chat queue, the adopted
@@ -375,10 +404,8 @@ end
 global function panels_tick(now: float64, live: boolean, in_world: boolean): void
   chatpanel_tick(now, live and in_world)
   adopt_tick(now, live and in_world)
-  if live and in_world then
-    restore_tick(now)
-    auto_tick(now)
-  end
+  if live and in_world then restore_tick(now) end
+  if live then auto_tick(now, in_world) else adopt_watch_arm(false) end
   -- saved once something was pulled or given back (not while restoring: the
   -- list would lose what has not come back yet)
   if panels_dirty and (#restore_names == 0 or not restore_started) then
@@ -401,6 +428,9 @@ global function panels_let_go(): void
     if adopt_count() == n then break end -- never loop on a panel that did not close
   end
   if chatpanel_open() then chatpanel_release() end
+  -- nothing runs per frame from here: no window may be claimed for a pet that never comes
+  adopt_watch_arm(false)
+  auto_at = 0
   panels_dirty = false
   restore_started = false
 end

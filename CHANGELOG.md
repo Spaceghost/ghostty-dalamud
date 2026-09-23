@@ -32,6 +32,9 @@ BETA is built and merged but has not been seen working in game yet; SOON is stil
 
 ### Being built
 
+* Mappy's map goes straight into the world: it becomes a pet the frame its window opens and is never drawn on the flat UI first. Before, whenever the game drew Mappy after Ghostty the map was never seen open and stayed flat. Host tests only; not yet tried in game.
+* Pets float to open space instead of fighting walls: they look round you a few times a second for where it is open, counting only large things (walls, rocks, trunks, posts; not grass or clutter), and drift there calmly, staying put rather than hopping between places. They never show inside a wall or a pillar; a blink out and back in is the rare last resort. Mobs and NPCs are kept clear of as they come (a short one walks under a pet as it tucks up its hem); other players walking past are let pass. /term world rays and /term world anim show what they see and do. Host tests only; not yet tried in game.
+* Calmer, cuter pets: they follow smoothly without overshooting, bob gently on their own slow beat, keep a small tilt of their own, stack fanned out and peeking over each other instead of standing in columns, and squash a little only when they bump or land. A pet you are typing into or pointing at holds perfectly still so you can read it. Settings, Pets has the knobs; Reduce motion turns it all off. Host tests only; not yet tried in game.
 * Clean first build: the toolchain and the Dalamud references it compiles against are pinned and checked before use, the default shell is chosen per platform, and a fresh clone builds with nothing else installed.
 * Emoji, CJK and other wide glyphs drawn through the same fallback, with Noto Sans Symbols 2 and an optional monochrome Noto Emoji you drop in yourself.
 
