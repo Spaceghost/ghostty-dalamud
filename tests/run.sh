@@ -171,6 +171,12 @@ trap 'kill $AGENT 2>/dev/null || true' EXIT
 wait_port "$PORT" "$AGENT" || { cat build/agent.log; exit 1; }
 "${SAN_PREFIX[@]}" "$NCACHE"/test_agent "$PORT" testtoken123 "$AGENT"
 
+echo "--- test_wg_cli"
+# `ghostty-agent wg`, the QR code, Tailscale detection and the listen rule, on the agent just built
+"$NELUA" --cc "$CC" -P nogc --cache-dir "$NCACHE" -L . -b tests/test_wg_cli.nelua
+rm -rf build/test-scratch/wgcli && mkdir -p build/test-scratch/wgcli
+"${SAN_PREFIX[@]}" "$NCACHE"/test_wg_cli "$ROOT/build/ghostty-agent$SAN_SUFFIX" "$ROOT/build/test-scratch/wgcli"
+
 echo "--- test_jobs"
 "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -b tests/test_jobs.nelua
 build/nelua-cache/test_jobs "$PORT" testtoken123 "$AGENT"

@@ -1,5 +1,6 @@
 -- Minimal non-blocking TCP for POSIX and Winsock.
 require 'string'
+require 'stringbuilder'
 
 ## if ccinfo.is_windows then
 ## cinclude '<winsock2.h>'
@@ -61,6 +62,13 @@ local function accept(s: NetSocket, addr: *sockaddr, len: *cint): NetSocket <cim
 local function send(s: NetSocket, buf: pointer, len: csize, flags: cint): isize <cimport, nodecl> end
 local function recv(s: NetSocket, buf: pointer, len: csize, flags: cint): isize <cimport, nodecl> end
 local function shutdown(s: NetSocket, how: cint): cint <cimport, nodecl> end
+## if ccinfo.is_windows then
+local peerlen_t = @cint
+## else
+local peerlen_t <cimport 'socklen_t', nodecl> = @cuint
+## end
+local function getpeername(s: NetSocket, addr: *sockaddr, len: *peerlen_t): cint <cimport, nodecl> end
+local function ntohs(v: uint16): uint16 <cimport, nodecl> end
 local function setsockopt(s: NetSocket, level: cint, name: cint, val: pointer, len: cint): cint <cimport, nodecl> end
 local function getaddrinfo(node: cstring, service: cstring, hints: *addrinfo, res: **addrinfo): cint <cimport, nodecl> end
 local function freeaddrinfo(res: *addrinfo): void <cimport, nodecl> end
@@ -242,6 +250,18 @@ function net.send(s: NetSocket, buf: pointer, len: usize): integer
   if n >= 0 then return n end
   if would_block(last_error()) then return 0 end
   return -1
+end
+
+-- Where an accepted IPv4 connection comes from, "a.b.c.d:port"; '' when that
+-- is not known.
+function net.peer_address(s: NetSocket): string
+  local a: sockaddr_in
+  local len: peerlen_t = #sockaddr_in
+  if getpeername(s, (@*sockaddr)(&a), &len) ~= 0 or a.sin_family ~= (@cushort)(AF_INET) then return (@string){} end
+  local b = (@*[4]uint8)(&a.sin_addr)
+  local sb: stringbuilder
+  sb:writef('%d.%d.%d.%d:%d', (@integer)(b[0]), (@integer)(b[1]), (@integer)(b[2]), (@integer)(b[3]), (@integer)(ntohs(a.sin_port)))
+  return sb:promote()
 end
 
 -- Half-close: no more sends (the peer reads EOF), receiving goes on.

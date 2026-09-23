@@ -1,0 +1,449 @@
+-- `ghostty-agent wg ...`: the embedded WireGuard's peers, from the command line
+-- (docs/WIREGUARD.md "Files and the CLI"). It edits wireguard.conf; the
+-- running agent notices within two seconds and picks the change up.
+--
+--   ghostty-agent wg [--config PATH] add NAME [--endpoint HOST[:PORT]] [--no-qr]
+--                                   [--agent-port N] [--token-file PATH]
+--   ghostty-agent wg [--config PATH] list | show | remove NAME
+--   ghostty-agent wg [--config PATH] forward tcp PORT | udp PORT[-PORT] | sunshine
+--   ghostty-agent wg [--config PATH] unforward tcp PORT | udp PORT[-PORT] | sunshine
+--   ghostty-agent wg [--config PATH] init [--port N]
+--
+-- A client's private key is printed once and kept nowhere.
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'io'
+require 'os'
+require 'arg'
+require 'agent.crypto'
+require 'agent.wg_proto'
+require 'agent.wg_config'
+require 'agent.wg_qr'
+require 'agent.tailscale'
+
+-- wireguard.conf beside the token file.
+global function wg_default_config_path(token_path: string): string
+  local cut = #token_path
+  while cut > 0 and token_path.data[cut - 1] ~= '/'_b and token_path.data[cut - 1] ~= '\\'_b do cut = cut - 1 end
+  local dir = token_path:sub(1, cut)
+  local p = dir .. 'wireguard.conf'
+  dir:destroy()
+  return p
+end
+
+-- The status the running agent writes beside the file.
+global function wg_status_path(config_path: string): string
+  local p = config_path .. '.status'
+  return p
+end
+
+local function err(msg: string): integer
+  io.stderr:write('ghostty-agent wg: ', msg, '\n')
+  return 1
+end
+
+-- A random 10.x.y.0/24 (x, y avoiding 0 and 255) and RFC 4193 ULA /64, the
+-- agent at .1 and ::1 of them.
+global function wg_new_addresses(cfg: *WgConfig): boolean
+  local r: [8]uint8
+  if not crypto.random(&r, 8) then return false end
+  cfg.addr4 = { family = 4, bits = 24 }
+  cfg.addr4.addr[0], cfg.addr4.addr[1], cfg.addr4.addr[2], cfg.addr4.addr[3] = 10, 1 + r[0] % 254, 1 + r[1] % 254, 1
+  cfg.has4 = true
+  cfg.addr6 = { family = 6, bits = 64 }
+  cfg.addr6.addr[0] = 0xfd
+  for i = 1, 5 do cfg.addr6.addr[i] = r[1 + i] end -- the 40-bit global ID
+  cfg.addr6.addr[7] = 1                            -- subnet 1
+  cfg.addr6.addr[15] = 1
+  cfg.has6 = true
+  return true
+end
+
+-- A new file: a key, the default port, random addresses, no peers.
+global function wg_init_config(cfg: *WgConfig, port: uint16): boolean
+  $cfg = {}
+  if not crypto.x25519_generate(&cfg.private) then return false end
+  cfg.has_private = true
+  cfg.port = port
+  return wg_new_addresses(cfg)
+end
+
+-- The lowest host number (2..254) in the /24 that no peer uses.
+global function wg_free_host(cfg: *WgConfig): integer
+  local used: [256]boolean
+  used[0], used[1], used[255] = true, true, true
+  used[cfg.addr4.addr[3]] = true
+  for i = 0, < #cfg.peers do
+    local pc = &cfg.peers[i]
+    for k = 0, < #pc.allowed do
+      local c = &pc.allowed[k]
+      if c.family == 4 and c.addr[0] == cfg.addr4.addr[0] and c.addr[1] == cfg.addr4.addr[1]
+         and c.addr[2] == cfg.addr4.addr[2] then used[c.addr[3]] = true end
+    end
+  end
+  for h = 2, 254 do if not used[h] then return h end end
+  return 0
+end
+
+local function find_peer(cfg: *WgConfig, name: string): integer
+  for i = 0, < #cfg.peers do if cfg.peers[i].name == name then return i end end
+  return -1
+end
+
+-- The first plain IPv4 address of this machine (not loopback, not a
+-- tailnet's), for an Endpoint nobody gave.
+local function guess_host(): string
+  local all: vector(TailscaleAddr)
+  host_addresses(&all)
+  local best: string
+  for i = 0, < #all do
+    local a = &all[i]
+    if a.family == 4 and a.addr[0] ~= 127 and not tailscale_range(4, &a.addr)
+       and not (a.addr[0] == 169 and a.addr[1] == 254) then
+      best = wgp.ip_tostring(4, &a.addr)
+      break
+    end
+  end
+  host_addresses_free(&all)
+  return best
+end
+
+-- The client's side, in wg-quick's format: what the WireGuard apps import.
+global function wg_client_config(cfg: *WgConfig, client_key: *[0]uint8, psk: *[0]uint8, host: integer, endpoint: string): string
+  local sb: stringbuilder
+  local k = crypto.key_to_base64(client_key)
+  sb:writef('[Interface]\nPrivateKey = %s\nAddress = %d.%d.%d.%d/32', k, (@integer)(cfg.addr4.addr[0]),
+            (@integer)(cfg.addr4.addr[1]), (@integer)(cfg.addr4.addr[2]), host)
+  crypto.wipe(k.data, k.size)
+  k:destroy()
+  if cfg.has6 then
+    local a6: [16]uint8 = cfg.addr6.addr
+    a6[15] = (@uint8)(host)
+    local s6 = wgp.ip_tostring(6, &a6)
+    sb:write(', ', s6, '/128')
+    s6:destroy()
+  end
+  local pub: [32]uint8
+  crypto.x25519_public(&pub, &cfg.private)
+  local p = crypto.key_to_base64(&pub)
+  local s = crypto.key_to_base64(psk)
+  sb:writef('\n\n[Peer]\nPublicKey = %s\nPresharedKey = %s\n', p, s)
+  crypto.wipe(s.data, s.size)
+  p:destroy() s:destroy()
+  local a4 = wgp.ip_tostring(4, &cfg.addr4.addr)
+  sb:write('AllowedIPs = ', a4, '/32')
+  a4:destroy()
+  if cfg.has6 then
+    local a6 = wgp.ip_tostring(6, &cfg.addr6.addr)
+    sb:write(', ', a6, '/128')
+    a6:destroy()
+  end
+  sb:writef('\nEndpoint = %s\nPersistentKeepalive = 25\n', endpoint)
+  return sb:promote()
+end
+
+-- --endpoint as the client's Endpoint line wants it: HOST gets the agent's
+-- port, a bare IPv6 address its brackets; HOST:PORT and [V6]:PORT stay.
+global function wg_endpoint_text(e: string, port16: uint16): string
+  local port = (@integer)(port16)
+  local colons = 0
+  for i = 0, < #e do if e.data[i] == ':'_b then colons = colons + 1 end end
+  local sb: stringbuilder
+  if #e > 0 and e.data[0] == '['_b then
+    if e.data[#e - 1] == ']'_b then sb:writef('%s:%d', e, port) else sb:write(e) end
+  elseif colons == 0 then sb:writef('%s:%d', e, port)
+  elseif colons == 1 then sb:write(e)
+  else sb:writef('[%s]:%d', e, port) end
+  return sb:promote()
+end
+
+local function load_or_fail(path: string, cfg: *WgConfig): integer
+  local ok, why = cfg:load(path)
+  if ok then return 0 end
+  local code = err(why)
+  why:destroy()
+  return code
+end
+
+local function cmd_init(path: string, port: uint16): integer
+  local existing = io.open(path, 'rb')
+  if existing:isopen() then existing:destroy() return err(path .. ' exists already; `wg show` says what is in it') end
+  local cfg: WgConfig
+  if not wg_init_config(&cfg, port) then return err('no random source for a key') end
+  if not cfg:save(path) then cfg:destroy() return err('cannot write ' .. path) end
+  cfg:destroy()
+  io.write('wrote ', path, '\n')
+  return 0
+end
+
+local function read_token(path: string): string
+  local ok, t = wg_read_file(path)
+  if not ok then return (@string){} end
+  local sb: stringbuilder
+  for i = 0, < #t do
+    local c = t.data[i]
+    if c ~= '\n'_b and c ~= '\r'_b and c ~= ' '_b then sb:writebyte(c) end
+  end
+  t:destroy()
+  return sb:promote()
+end
+
+local function cmd_add(path: string, name: string, endpoint: string, qr: boolean, agent_port: integer, token_path: string): integer
+  if #name == 0 or #name > 64 or name:find('[\n\r#=]') > 0 then return err('a peer name is 1 to 64 characters, without # or =') end
+  local cfg: WgConfig
+  local existing = io.open(path, 'rb')
+  if existing:isopen() then
+    existing:destroy()
+    local r = load_or_fail(path, &cfg)
+    if r ~= 0 then return r end
+  elseif not wg_init_config(&cfg, WG_DEFAULT_PORT) then
+    return err('no random source for a key')
+  end
+  if find_peer(&cfg, name) >= 0 then cfg:destroy() return err('there is a peer called ' .. name .. ' already') end
+  local host = wg_free_host(&cfg)
+  if host == 0 then cfg:destroy() return err('the tunnel\'s /24 is full') end
+  local client_key: [32]uint8
+  local client_pub: [32]uint8
+  local psk: [32]uint8
+  if not crypto.x25519_generate(&client_key) or not crypto.random(&psk, 32) then cfg:destroy() return err('no random source for a key') end
+  crypto.x25519_public(&client_pub, &client_key)
+  local pc: WgPeerConf
+  pc.name = name:copy()
+  memory.copy(&pc.public, &client_pub, 32)
+  memory.copy(&pc.psk, &psk, 32)
+  pc.has_psk = true
+  local c4: WgCidr = { family = 4, bits = 32 }
+  c4.addr[0], c4.addr[1], c4.addr[2], c4.addr[3] = cfg.addr4.addr[0], cfg.addr4.addr[1], cfg.addr4.addr[2], (@uint8)(host)
+  pc.allowed:push(c4)
+  if cfg.has6 then
+    local c6: WgCidr = { family = 6, bits = 128 }
+    c6.addr = cfg.addr6.addr
+    c6.addr[15] = (@uint8)(host)
+    pc.allowed:push(c6)
+  end
+  cfg.peers:push(pc)
+  -- where the client finds the agent
+  local ep: string
+  local guessed = false
+  if #endpoint > 0 then
+    ep = wg_endpoint_text(endpoint, cfg.port)
+  else
+    local h = guess_host()
+    local sb: stringbuilder
+    if #h > 0 then sb:writef('%s:%d', h, (@integer)(cfg.port)) guessed = true
+    else sb:writef('YOUR-AGENT-ADDRESS:%d', (@integer)(cfg.port)) end
+    h:destroy()
+    ep = sb:promote()
+  end
+  if not cfg:save(path) then cfg:destroy() ep:destroy() return err('cannot write ' .. path) end
+  local text = wg_client_config(&cfg, &client_key, &psk, host, ep)
+  crypto.wipe(&client_key, 32)
+  crypto.wipe(&psk, 32)
+  local a4 = wgp.ip_tostring(4, &cfg.addr4.addr)
+  local token = read_token(token_path)
+  io.write('Added ', name, ' at ', (@integer)(cfg.addr4.addr[0]), '.', (@integer)(cfg.addr4.addr[1]), '.',
+           (@integer)(cfg.addr4.addr[2]), '.', host, ' in ', path, '.\n\n')
+  io.write('Import this into the WireGuard app on ', name, '. Its private key is shown\n',
+           'this once and kept nowhere: if it is lost, `wg remove ', name, '` and add it again.\n\n')
+  io.write(text, '\n')
+  if qr then
+    local code = wg_qr_text(text)
+    if #code > 0 then io.write(code, '\n') end
+    code:destroy()
+  end
+  crypto.wipe(text.data, text.size)
+  text:destroy()
+  io.write('Then point the plugin at the agent through the tunnel, in lua/init.lua:\n',
+           '  agent = { host = \'', a4, '\', port = ', agent_port, ', token = \'', #token > 0 and token or 'the token in ' .. token_path, '\' },\n\n')
+  if guessed then
+    io.write('The Endpoint is this machine\'s LAN address. From outside your network,\n',
+             'use --endpoint with your public address or name, and forward UDP ', (@integer)(cfg.port), ' to this machine.\n')
+  else
+    io.write('The agent must be reachable on UDP ', (@integer)(cfg.port), ': forward that port to this machine if it is behind a router.\n')
+  end
+  io.write('A running agent picks the new peer up within a few seconds.\n')
+  token:destroy()
+  a4:destroy()
+  ep:destroy()
+  cfg:destroy()
+  return 0
+end
+
+local function cmd_remove(path: string, name: string): integer
+  local cfg: WgConfig
+  local r = load_or_fail(path, &cfg)
+  if r ~= 0 then return r end
+  local i = find_peer(&cfg, name)
+  if i < 0 then cfg:destroy() return err('no peer called ' .. name) end
+  cfg.peers[i].name:destroy()
+  cfg.peers[i].allowed:destroy()
+  cfg.peers:remove(i)
+  local ok = cfg:save(path)
+  cfg:destroy()
+  if not ok then return err('cannot write ' .. path) end
+  io.write('Removed ', name, '. A running agent drops it, and wipes its keys, within a few seconds.\n')
+  return 0
+end
+
+-- `ago` in words
+local function since(t: int64): string
+  local sb: stringbuilder
+  if t <= 0 then sb:write('never')
+  else
+    local d = os.time() - t
+    if d < 120 then sb:writef('%d s ago', d)
+    elseif d < 7200 then sb:writef('%d min ago', d // 60)
+    elseif d < 172800 then sb:writef('%d h ago', d // 3600)
+    else sb:writef('%d days ago', d // 86400) end
+  end
+  return sb:promote()
+end
+
+local function cmd_list(path: string): integer
+  local cfg: WgConfig
+  local r = load_or_fail(path, &cfg)
+  if r ~= 0 then return r end
+  local sp = wg_status_path(path)
+  local _, status = wg_read_file(sp)
+  sp:destroy()
+  if #cfg.peers == 0 then io.write('No peers yet: `ghostty-agent wg add NAME`.\n') end
+  for i = 0, < #cfg.peers do
+    local pc = &cfg.peers[i]
+    local key = crypto.key_to_base64(&pc.public)
+    local addr = #pc.allowed > 0 and pc.allowed[0]:tostring() or string.copy('-')
+    -- the running agent's line for this key: key, last handshake, rx, tx, endpoint
+    local hs: int64 = 0
+    local where: string = '-'
+    local at = status:find(key, 1, true)
+    if at > 0 then
+      local e = status:find('\n', at, true)
+      if e == 0 then e = #status + 1 end
+      local line = status:sub(at, e - 1)
+      local t1 = line:find('\t', 1, true)
+      local t2 = t1 > 0 and line:find('\t', t1 + 1, true) or 0
+      if t1 > 0 and t2 > 0 then
+        local num = line:sub(t1 + 1, t2 - 1)
+        hs = tointeger(num)
+        num:destroy()
+        local last = 0
+        for k = #line, 1, -1 do if line.data[k-1] == '\t'_b then last = k break end end
+        if last > 0 then where = line:sub(last + 1) end
+      end
+      line:destroy()
+    end
+    local ago = since(hs)
+    io.write(pc.name, '\t', addr, '\t', ago, '\t', where, '\t', key, '\n')
+    ago:destroy() key:destroy() addr:destroy()
+    if where ~= '-' then where:destroy() end
+  end
+  status:destroy()
+  cfg:destroy()
+  return 0
+end
+
+local function cmd_show(path: string): integer
+  local cfg: WgConfig
+  local r = load_or_fail(path, &cfg)
+  if r ~= 0 then return r end
+  local pub: [32]uint8
+  crypto.x25519_public(&pub, &cfg.private)
+  local p = crypto.key_to_base64(&pub)
+  io.write('config: ', path, '\npublic key: ', p, '\nlisten port: UDP ', (@integer)(cfg.port), '\n')
+  p:destroy()
+  if cfg.has4 then local a = cfg.addr4:tostring() io.write('tunnel address: ', a, '\n') a:destroy() end
+  if cfg.has6 then local a = cfg.addr6:tostring() io.write('tunnel address: ', a, '\n') a:destroy() end
+  io.write('forwards: the agent\'s own port')
+  for i = 0, < #cfg.forwards do io.write(', ', cfg.forwards[i].udp and 'udp ' or 'tcp ', (@integer)(cfg.forwards[i].port)) end
+  io.write('\npeers: ', #cfg.peers, '\n')
+  local ts: Tailscale
+  ts:detect()
+  if ts.detected then io.write('Tailscale: detected (', ts.why, '); the agent does not start WireGuard unless --wireguard always\n')
+  else io.write('Tailscale: not detected\n') end
+  ts:destroy()
+  cfg:destroy()
+  return 0
+end
+
+-- tcp PORT | udp PORT[-PORT] | sunshine, as forwards
+local function parse_forwards(proto: string, ports: string, out: *vector(WgForward)): boolean
+  if proto == 'sunshine' then
+    -- Sunshine's ports (its defaults with port 47989): HTTPS, HTTP, RTSP; video, control, audio
+    local tcp: [3]uint16 = { 47984, 47989, 48010 }
+    local udp: [5]uint16 = { 47998, 47999, 48000, 48002, 48010 }
+    for k = 0, < 3 do out:push(WgForward{ port = tcp[k], to = tcp[k] }) end
+    for k = 0, < 5 do out:push(WgForward{ udp = true, port = udp[k], to = udp[k] }) end
+    return true
+  end
+  local cfg: WgConfig
+  local text = proto .. ' ' .. ports
+  local line = '[Interface]\nForward = ' .. text .. '\n'
+  local ok = cfg:parse(line)
+  text:destroy() line:destroy()
+  if ok then for i = 0, < #cfg.forwards do out:push(cfg.forwards[i]) end end
+  cfg:destroy()
+  return ok
+end
+
+local function cmd_forward(path: string, add: boolean, proto: string, ports: string): integer
+  local want: vector(WgForward)
+  if not parse_forwards(proto, ports, &want) then want:destroy() return err('say tcp PORT, udp PORT[-PORT] or sunshine') end
+  local cfg: WgConfig
+  local r = load_or_fail(path, &cfg)
+  if r ~= 0 then want:destroy() return r end
+  for i = 0, < #want do
+    local w = want[i]
+    local at = -1
+    for k = 0, < #cfg.forwards do
+      if cfg.forwards[k].udp == w.udp and cfg.forwards[k].port == w.port then at = k break end
+    end
+    if add and at < 0 then cfg.forwards:push(w) end
+    if not add and at >= 0 then cfg.forwards:remove(at) end
+  end
+  local ok = cfg:save(path)
+  cfg:destroy()
+  want:destroy()
+  if not ok then return err('cannot write ' .. path) end
+  io.write(add and 'Forwarded' or 'No longer forwarded', ': ', proto, ' ', ports, '. Tunnel peers reach it on this machine\'s loopback.\n')
+  return 0
+end
+
+-- `ghostty-agent wg ...` from argument `first` on; `token_path` is the agent's.
+global function wg_cli(first: integer, token_path: string): integer
+  local path = wg_default_config_path(token_path)
+  local i = first
+  local words: vector(string)
+  local endpoint: string = ''
+  local qr = true
+  local agent_port = 7777
+  local port: uint16 = WG_DEFAULT_PORT
+  local tpath = token_path
+  while i <= #arg do
+    local a = arg[i]
+    if a == '--config' and i < #arg then path:destroy() path = arg[i+1]:copy() i = i + 1
+    elseif a == '--endpoint' and i < #arg then endpoint = arg[i+1] i = i + 1
+    elseif a == '--no-qr' then qr = false
+    elseif a == '--agent-port' and i < #arg then agent_port = tointeger(arg[i+1]) i = i + 1
+    elseif a == '--token-file' and i < #arg then tpath = arg[i+1] i = i + 1
+    elseif a == '--port' and i < #arg then port = (@uint16)(tointeger(arg[i+1])) i = i + 1
+    else words:push(a) end
+    i = i + 1
+  end
+  local r = 2
+  local cmd: string = #words > 0 and words[0] or ''
+  if cmd == 'init' then r = cmd_init(path, port)
+  elseif cmd == 'add' and #words == 2 then r = cmd_add(path, words[1], endpoint, qr, agent_port, tpath)
+  elseif cmd == 'remove' and #words == 2 then r = cmd_remove(path, words[1])
+  elseif cmd == 'list' then r = cmd_list(path)
+  elseif cmd == 'show' then r = cmd_show(path)
+  elseif (cmd == 'forward' or cmd == 'unforward') and #words >= 2 then
+    r = cmd_forward(path, cmd == 'forward', words[1], #words >= 3 and words[2] or '')
+  else
+    io.stderr:write('usage: ghostty-agent wg [--config PATH] add NAME [--endpoint HOST[:PORT]] [--no-qr] [--agent-port N] [--token-file PATH]\n',
+                    '       ghostty-agent wg [--config PATH] list | show | remove NAME | init [--port N]\n',
+                    '       ghostty-agent wg [--config PATH] forward|unforward tcp PORT | udp PORT[-PORT] | sunshine\n')
+  end
+  words:destroy()
+  path:destroy()
+  return r
+end
