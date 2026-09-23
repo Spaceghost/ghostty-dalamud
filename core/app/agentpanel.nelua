@@ -1,0 +1,128 @@
+-- The Agents window: what every link is, where it goes, and whether it is up.
+--
+-- This exists because a NodeId is unusable without somewhere to read it. Once
+-- an agent keeps an allowlist, running one for someone means exchanging public
+-- keys, and a key that only ever appears in a log line is a key nobody will
+-- copy correctly. So: this core's own NodeId, selectable, beside every link's.
+--
+-- Status, not configuration. The settings window is the Lua schema
+-- (lua/settings.lua); links live and die while the game runs and belong here.
+
+require 'core.app.state'
+require 'core.app.remotewin'
+
+local AGENTS_WIDTH: float32 <comptime> = 560
+
+local function state_word(st: AgentState): (string, ChromeColor)
+  -- Ok is the theme's green, Close its red (core/theme.nelua). There is no
+  -- Warn: a link being down is the same "this went wrong" as a close button.
+  if st == AgentState.Ready then return 'ready', ChromeColor.Ok end
+  if st == AgentState.Connecting then return 'connecting', ChromeColor.InkDim end
+  if st == AgentState.Handshake then return 'handshake', ChromeColor.InkDim end
+  if st == AgentState.Failed then return 'down', ChromeColor.Close end
+  return 'idle', ChromeColor.InkFaint
+end
+
+-- core/imgui.nelua binds PushTextWrapPos, not TextWrapped.
+local function wrapped(text: cstring): void
+  imgui.PushTextWrapPos(0)
+  imgui.TextUnformatted(text, nilptr)
+  imgui.PopTextWrapPos()
+end
+
+-- A key is long, and the reason it is on screen is to be copied. Selectable
+-- text with InputText is the only widget here that lets the mouse take it.
+local function key_row(label: cstring, key: string, id: cstring): void
+  if #key == 0 then return end
+  imgui.TextUnformatted(label, nilptr)
+  imgui.SameLine(0, -1)
+  local buf: [80]cchar
+  local n = key.size < 79 and key.size or 79
+  for i = 0, < n do buf[i] = (@cchar)(key.data[i]) end
+  buf[n] = 0
+  -- No ReadOnly flag: core/imgui.nelua binds only two InputText flags, and
+  -- that one's numeric value has moved between ImGui versions, so a literal
+  -- would risk setting a different flag against Dalamud's build. The buffer is
+  -- refilled from the key every frame instead, so a stray edit is gone on the
+  -- next one and the field still selects and copies.
+  imgui.InputText(id, (@cstring)(&buf), #buf, 0, nilptr, nilptr)
+end
+
+local function link_row(link: *AgentLink, i: integer): void
+  imgui.PushIDInt((@cint)(i))
+  local word, col = state_word(link.client.state)
+  imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(col, 255))
+  imgui.TextUnformatted((@cstring)((#link.name > 0 and link.name or 'local') .. '\0'), nilptr)
+  imgui.PopStyleColor(1)
+  imgui.SameLine(0, -1)
+  imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkDim, 255))
+  imgui.TextUnformatted((@cstring)(('  ' .. word) .. '\0'), nilptr)
+  imgui.PopStyleColor(1)
+
+  -- How it is addressed says which transport it is on: a NodeId means QUIC.
+  if #link.client.node > 0 then
+    key_row('iroh', link.client.node, '##node')
+  else
+    local sb: stringbuilder
+    sb:writef('tcp %s:%d', link.client.host, link.client.port)
+    local line = sb:promote()
+    imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkFaint, 255))
+    imgui.TextUnformatted((@cstring)(line .. '\0'), nilptr)
+    imgui.PopStyleColor(1)
+    line:destroy()
+  end
+
+  if #link.client.platform > 0 then
+    imgui.SameLine(0, -1)
+    imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkFaint, 255))
+    imgui.TextUnformatted((@cstring)(('  ' .. link.client.platform) .. '\0'), nilptr)
+    imgui.PopStyleColor(1)
+  end
+
+  -- The transport's own words, not "connect failed": these are what made the
+  -- Wine socket failures findable at all.
+  if link.client.state == AgentState.Failed and #link.client.last_error > 0 then
+    imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.Close, 255))
+    wrapped((@cstring)(link.client.last_error .. '\0'))
+    imgui.PopStyleColor(1)
+  end
+  imgui.Separator()
+  imgui.PopID()
+end
+
+global function draw_agents(): void
+  if not host.agents_open then return end
+  if imgui.Begin == nilptr or imgui.InputText == nilptr then return end
+  imgui.SetNextWindowSize(vec2(AGENTS_WIDTH, 420), ImGuiCond_FirstUseEver)
+  local open = true
+  if imgui.Begin('Agents###ghostty_agents', &open, 0) then
+    imgui.TextUnformatted('Links', nilptr)
+    imgui.Separator()
+    link_row(&host.local_agent, 0)
+    for i = 0, < #host.agents do
+      link_row(host.agents[i], i + 1)
+    end
+
+    imgui.Spacing()
+    imgui.TextUnformatted('This machine', nilptr)
+    imgui.Separator()
+    -- Our own key, so it can be put in someone else's allowlist. Empty when
+    -- this build has no iroh, or before anything has opened an endpoint.
+    local me = net.node_id()
+    if #me > 0 then
+      key_row('iroh', me, '##me')
+    else
+      imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkDim, 255))
+      wrapped('no iroh endpoint yet: this build has no iroh, or no link has used it')
+      imgui.PopStyleColor(1)
+    end
+    me:destroy()
+
+    imgui.Spacing()
+    imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkFaint, 255))
+    wrapped('A link with a NodeId is on QUIC. Terminals always run on the local agent, whichever link a window comes from.')
+    imgui.PopStyleColor(1)
+  end
+  imgui.End()
+  host.agents_open = open
+end
