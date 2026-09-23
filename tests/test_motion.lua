@@ -88,6 +88,76 @@ do
   print('springs OK')
 end
 
+-- Animations: every eased property (motion.anim, motion.tween) sampled the
+-- way a pet drives it: continuous (no speed jumps bigger than the curve's own
+-- start), bounded (no overshoot past 2 %), settled in the time it says, the
+-- same at any frame rate, still at rest (a goal that wobbles within the dead
+-- zone moves nothing), and at the goal at once with no time (Reduce motion).
+do
+  local specs = {
+    { 'drift', 0.9, 1.2, 0.01, 1.0 }, { 'pull', 0.63, 1.5, 0.02, 0.5 }, { 'dy', 0.6, 1.0, 0.02, 0.4 },
+    { 'tuck', 0.25, 3, 0.01, 0.3 }, { 'hike', 0.35, 3, 0.02, 0.8 }, { 'squeeze', 0.3, 4, 0.01, -0.5 },
+    { 'float', 0.5, 2, 0.02, 0.7 }, { 'hop', 0.3, 4, 0.02, 0.4 }, { 'row', 0.45, 3, 0.005, -0.3 },
+    { 'roll', 0.5, 0.5, 0.0005, 0.03 }, { 'calm', 0.25, nil, nil, 1 },
+  }
+  for _, sp in ipairs(specs) do
+    local name, time, vmax, dead, step = sp[1], sp[2], sp[3], sp[4], sp[5]
+    for _, fps in ipairs({ 30, 60, 144 }) do
+      local a = {}
+      motion.anim(a, name, 0, 0, time, vmax, dead)
+      local dt = 1 / fps
+      local x, v_prev, peak, settled_at, max_dv = 0, 0, 0, nil, 0
+      local t = 0
+      local limit = vmax and math.max(time, math.abs(step) / vmax * 1.3 + time * 0.5) or time
+      while t < limit * 3 + 1 do
+        local nx = motion.anim(a, name, step, dt, time, vmax, dead)
+        local v = (nx - x) / dt
+        max_dv = math.max(max_dv, math.abs(v - v_prev))
+        v_prev, x = v, nx
+        t = t + dt
+        peak = math.max(peak, x / step)
+        if not settled_at and math.abs(x - step) <= 0.02 * math.abs(step) then settled_at = t end
+      end
+      assert(peak <= 1.02, name .. ' overshoots: ' .. peak)
+      assert(settled_at and settled_at <= limit * 1.25 + 2 / fps, string.format('%s settles in its time at %d fps: %s (%.2f)', name, fps, tostring(settled_at), limit))
+      -- no spike: the biggest change of speed in a frame is no more than the
+      -- curve's own start (critically damped: w^2 * step * dt at most)
+      local w = 5.8 / time
+      assert(max_dv <= w * w * math.abs(step) * dt * 1.05 + 1e-9, string.format('%s speed jumps at %d fps: %.3f', name, fps, max_dv))
+    end
+    -- still at rest: a goal wobbling inside the dead zone moves nothing
+    if dead then
+      local a = {}
+      motion.anim(a, name, 0.5, 0, time, vmax, dead)
+      local seed, moved = 3, 0
+      for _ = 1, 600 do
+        seed = (seed * 1103515245 + 12345) % 2147483648
+        local g = 0.5 + (seed / 2147483648 - 0.5) * dead * 1.8
+        moved = math.max(moved, math.abs(motion.anim(a, name, g, 1 / 60, time, vmax, dead) - 0.5))
+      end
+      assert(moved == 0, name .. ' twitches at rest: ' .. moved)
+    end
+    -- no time: at the goal at once
+    local a = {}
+    motion.anim(a, name, 0, 0, 0)
+    assert(motion.anim(a, name, step, 1 / 60, 0) == step, name .. ' with no time is at once')
+  end
+  -- the blink tween: smootherstep, starting and stopping with no speed
+  local a = {}
+  local prev, v_prev, max_dv, peak_v = 0, 0, 0, 0
+  motion.tween(a, 'blink', false, 0, 0)
+  for i = 1, 60 do
+    local b = motion.tween(a, 'blink', true, 1 / 120, 0.2)
+    local v = (b - prev) * 120
+    assert(b >= prev - 1e-12 and b <= 1, 'the blink grows steadily, never past its size')
+    max_dv, peak_v = math.max(max_dv, math.abs(v - v_prev)), math.max(peak_v, v)
+    prev, v_prev = b, v
+  end
+  assert(prev == 1 and v_prev < 0.2, 'the blink ends at its size, with no speed left')
+  assert(peak_v <= 1.875 / 0.2 + 1e-6, 'smootherstep: no faster than 1.875 of its time')
+  print('animations OK')
+end
+
 -- The bob, sway and squash ------------------------------------------------------------------------
 do
   -- bounded, and no two pets in lockstep
@@ -304,6 +374,10 @@ end
 -- Whether a placement, as drawn (its size, squash and curve), has any part of
 -- its face inside a box: points every tenth of its width at five heights.
 -- Self-contained (no lua/motion.lua), so it measures any version of the code.
+-- A face is looked at again each time it has moved `recheck` (3 cm), so it
+-- may touch a surface by that much between two looks: `TOUCH` allows it
+-- (in game, the depth test hides whatever is behind the surface).
+local TOUCH = 0.04
 local function inside(o)
   local sq = o.squash or 0
   local hw = o.width / o.pixels_per_yalm / 2 * (1 + sq)
@@ -319,8 +393,8 @@ local function inside(o)
     for j = -2, 2 do
       local py = o.y + hh * 0.45 * j
       for _, b in ipairs(boxes) do
-        if px > b[1] + 0.01 and px < b[4] - 0.01 and py > b[2] + 0.01 and py < b[5] - 0.01
-           and pz > b[3] + 0.01 and pz < b[6] - 0.01 then return true end
+        if px > b[1] + TOUCH and px < b[4] - TOUCH and py > b[2] + TOUCH and py < b[5] - TOUCH
+           and pz > b[3] + TOUCH and pz < b[6] - TOUCH then return true end
       end
     end
   end
@@ -397,9 +471,10 @@ do
     if seen_inside(ids[1]) then seen_in = seen_in + 1 end
     if shown(ids[1]) then back = true end
   end)
-  -- the rest check comes a few times a second: the frames before it are the
-  -- pillar appearing out of nowhere, which the game's world does not do
-  assert(seen_in <= 7, 'gone from the pillar within a tenth of a second: shown in it ' .. seen_in .. ' frames')
+  -- at rest a pet is looked at four times a second, and hidden when three looks
+  -- running find it in something (one could be noise): the frames before that
+  -- are the pillar appearing out of nowhere, which the game's world does not do
+  assert(seen_in <= 50, 'gone from the pillar within about three quarters of a second: shown in it ' .. seen_in .. ' frames')
   run(1, 1 / 60, nil, nil, function() assert(not seen_inside(ids[1]), 'and never in it again') end)
   assert(back and shown(ids[1]), 'back, clear of the pillar')
   print('pillar between the old rays OK')
@@ -660,6 +735,138 @@ do
   run(2, 1 / 60, nil, nil, function() assert(not hits_cylinder(outs[ids[1]], chars[1]), 'keeps clear of a standing NPC') end)
   chars = nil
   print('NPC OK')
+end
+
+-- 2j. Open space. The ring round you and the calm drift: in the open the
+--     pets settle and stay; in a corridor too narrow for them they drift to
+--     where it opens; in a field of small clutter (grass, knee-high stones,
+--     thin stalks) and with a collision that answers noise, nothing moves.
+do
+  local function watch(seconds, each)
+    local changes, blinks0 = 0, {}
+    local last = {}
+    for _, id in ipairs(ids) do last[id] = W.anchors[id].m_off or 0 blinks0[id] = W.anchors[id].m_blinks or 0 end
+    run(seconds, 1 / 60, nil, nil, function()
+      for _, id in ipairs(ids) do
+        local off = W.anchors[id].m_off or 0
+        if off ~= last[id] then changes = changes + 1 last[id] = off end
+      end
+      if each then each() end
+    end)
+    local blinks = 0
+    for _, id in ipairs(ids) do blinks = blinks + (W.anchors[id].m_blinks or 0) - blinks0[id] end
+    return changes, blinks
+  end
+  local function stillness(seconds)
+    local most = 0
+    local at = {}
+    for _, id in ipairs(ids) do at[id] = { outs[id].x, outs[id].z } end
+    run(seconds, 1 / 60, nil, nil, function()
+      for _, id in ipairs(ids) do
+        local o = outs[id]
+        most = math.max(most, math.sqrt((o.x - at[id][1]) ^ 2 + (o.z - at[id][2]) ^ 2))
+      end
+    end)
+    return most
+  end
+
+  -- the open field
+  fresh(2)
+  boxes = {}
+  player.x, player.z, player.rotation = 0, 0, 0
+  run(3, 1 / 60)
+  local changes, blinks = watch(6)
+  assert(changes == 0 and blinks == 0, 'open field: nothing to decide')
+  assert(stillness(3) < 0.01, 'open field: they settle and stay')
+  print('open field OK')
+
+  -- a corridor: walls close on both sides, open ahead (room there for one)
+  fresh(1)
+  boxes = { { 1.5, -5, -3, 1.8, 5, 4 }, { -1.8, -5, -3, -1.5, 5, 4 } }
+  player.x, player.z, player.rotation = 0, 0, 0
+  local worst_step = 0
+  local prev = {}
+  run(6, 1 / 60, nil, nil, function()
+    for _, id in ipairs(ids) do
+      assert(not seen_inside(id), 'corridor: never seen in a wall')
+      local o = outs[id]
+      if prev[id] and shown(id) then worst_step = math.max(worst_step, math.sqrt((o.x - prev[id][1]) ^ 2 + (o.z - prev[id][2]) ^ 2)) end
+      prev[id] = shown(id) and { o.x, o.z } or nil
+    end
+  end)
+  for _, id in ipairs(ids) do
+    local o = outs[id]
+    assert(shown(id), 'corridor: shown')
+    assert(o.z > 1.2, 'corridor: drifted toward the open end: z ' .. o.z)
+  end
+  assert(worst_step < 0.1, 'corridor: a calm drift, no jumps: ' .. worst_step)
+  local c2, b2 = watch(4)
+  assert(c2 == 0 and b2 == 0, 'corridor: and then it stays')
+  print('corridor OK')
+
+  -- clutter: knee-high stones and thin stalks all round, nothing large
+  fresh(2)
+  boxes = {}
+  local seed = 7
+  local function rnd() seed = (seed * 1103515245 + 12345) % 2147483648 return seed / 2147483648 end
+  for _ = 1, 60 do
+    local x, z = rnd() * 12 - 6, rnd() * 12 - 6
+    if x * x + z * z > 1 then
+      if rnd() < 0.5 then
+        local s = 0.15 + rnd() * 0.3
+        boxes[#boxes + 1] = { x - s, -1, z - s, x + s, 0.3 + rnd() * 0.5, z + s } -- a stone, under knee height
+      else
+        boxes[#boxes + 1] = { x - 0.02, -1, z - 0.02, x + 0.02, 1.8, z + 0.02 } -- a thin stalk
+      end
+    end
+  end
+  player.x, player.z, player.rotation = 0, 0, 0
+  run(3, 1 / 60)
+  local c3, b3 = watch(6)
+  print('clutter: decisions changed', c3, 'blinks', b3)
+  assert(c3 <= 2 and b3 == 0, 'clutter: pets do not dance round grass and stalks')
+  assert(stillness(3) < 0.02, 'clutter: and hold still')
+  print('clutter OK')
+
+  -- noise: the collision answers a stray hit one ray in eight, anywhere
+  fresh(2)
+  boxes = {}
+  local real = ghostty.raycast
+  ghostty.raycast = function(ox, oy, oz, dx, dy, dz, max, f)
+    if rnd() < 0.125 then return rnd() * max, 0, 0, 0, f or 'all' end
+    return real(ox, oy, oz, dx, dy, dz, max, f)
+  end
+  player.x, player.z, player.rotation = 0, 0, 0
+  run(3, 1 / 60)
+  local c4, b4 = watch(8)
+  local still4 = stillness(2)
+  ghostty.raycast = real
+  print('noise: decisions changed', c4, 'blinks', b4, 'moved', still4)
+  assert(c4 <= 3 and b4 == 0, 'noise: no dancing, no blinks')
+  assert(still4 < 0.05, 'noise: holding still')
+  print('noise OK')
+
+  -- blinks are rare: back and forth through a doorway for 12 s, at most one
+  -- blink per pet every four seconds
+  fresh(2)
+  boxes = { { -10, -5, 1.8, -0.7, 5, 2.1 }, { 0.7, -5, 1.8, 10, 5, 2.1 } }
+  player.x, player.z, player.rotation = 0, 0, 0
+  run(2, 1 / 60)
+  local b0 = {}
+  for _, id in ipairs(ids) do b0[id] = W.anchors[id].m_blinks or 0 end
+  local dir = 1
+  run(12, 1 / 60, nil, nil, function()
+    player.z = player.z + dir * 3 / 60
+    if player.z > 4 then dir = -1 player.rotation = math.pi elseif player.z < -1.5 then dir = 1 player.rotation = 0 end
+    for _, id in ipairs(ids) do assert(not seen_inside(id), 'doorway: never seen in the wall') end
+  end)
+  for _, id in ipairs(ids) do
+    local n = (W.anchors[id].m_blinks or 0) - b0[id]
+    print('doorway back and forth: pet', id, 'blinks', n)
+    assert(n <= 3, 'at most one blink every four seconds')
+  end
+  player.x, player.z, player.rotation = 0, 0, 0
+  print('blink rate OK')
 end
 
 -- 3. A ledge under the pet's slot: it floats up over it rather than into it.

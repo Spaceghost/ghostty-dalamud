@@ -770,14 +770,16 @@ global function policy_world_command(id: integer, args: string): string
   return err
 end
 
--- CONFIG.world.trace(seconds) -> what it will log (/term world rays).
-global function policy_world_trace(seconds: float64): string
+-- CONFIG.world.trace(seconds, kind) -> what it will log (/term world rays,
+-- /term world anim; kind 'rays' or 'anim').
+global function policy_world_trace(seconds: float64, kind: string): string
   local L = policy.L
   if L == nilptr or not policy.loaded then return string.copy('no policy loaded') end
   if not push_world_fn(L, 'trace') then return string.copy('this lua/world.lua has no trace') end
   lua_pushnumber(L, seconds)
+  lua_pushlstring(L, (@cstring)(kind.data), kind.size)
   local out: string
-  if lua_pcall(L, 1, 1, 0) == LUA_OK and lua_type(L, -1) == LUA_TSTRING then
+  if lua_pcall(L, 2, 1, 0) == LUA_OK and lua_type(L, -1) == LUA_TSTRING then
     local len: usize = 0
     local s = lua_tolstring(L, -1, &len)
     out = string.copy(string{data=(@*[0]byte)(s), size=len})

@@ -16,6 +16,7 @@ local sin, cos, sqrt, exp, abs, min, max = math.sin, math.cos, math.sqrt, math.e
 
 local function clamp(x, lo, hi) return x < lo and lo or (x > hi and hi or x) end
 M.clamp = clamp
+local EMPTY_T = {}
 
 -- Springs ------------------------------------------------------------------------------------------
 
@@ -57,6 +58,107 @@ end
 function M.follow(x, target, dt, tau)
   if not tau or tau <= 1e-3 or not (dt > 0) then return target end
   return x + (target - x) * (1 - exp(-dt / tau))
+end
+
+-- Animations ------------------------------------------------------------------------------------
+-- Every change a pet shows that is not the follow spring goes through one of
+-- these two, so each is eased (no linear snaps, no jumps in position, size or
+-- opacity), frame-rate independent, bounded, and settles in a time that is
+-- said up front. Each property has one of them; layers that add up (the
+-- follow spring's height, the bob, a hike's lift) are separate properties,
+-- each smooth on its own. The state lives in the anchor under `m_an`, one
+-- small table per property, made once. Active ones are listed by
+-- M.active_anims for /term world anim.
+
+-- A critically damped glide toward `goal`, reaching it (within 2 %) in about
+-- `time` seconds with no overshoot, its speed never above `vmax` (units per
+-- second; nil: no limit). A goal that moves less than `dead` from the one it
+-- is gliding to is ignored, so noise in what asks for it never makes it
+-- twitch at rest. `time` 0: it is at the goal at once (Reduce motion).
+-- -> the value this frame.
+function M.anim(a, key, goal, dt, time, vmax, dead)
+  local an = a.m_an
+  if not an then an = {} a.m_an = an end
+  local s = an[key]
+  if not s then
+    s = { x = goal, v = 0, goal = goal }
+    an[key] = s
+    return goal
+  end
+  if math.abs(goal - s.goal) > (dead or 0) then s.goal = goal end
+  if not time or time <= 0 then
+    s.x, s.v = s.goal, 0
+    return s.x
+  end
+  if not (dt > 0) then return s.x end
+  if dt > 0.1 then dt = 0.1 end
+  local w = 5.8 / time -- (1 + w t) e^-wt reaches 2 % at w t = 5.8
+  local steps = max(1, math.ceil(dt * 120), math.ceil(dt * w / 0.5))
+  if steps > STEPS_MAX then steps = STEPS_MAX end
+  local h = dt / steps
+  local ww, zw = w * w, 2 * w
+  local damp = 1 / (1 + zw * h)
+  local x, v = s.x, s.v
+  for _ = 1, steps do
+    v = (v + ww * (s.goal - x) * h) * damp
+    if vmax and v > vmax then v = vmax elseif vmax and v < -vmax then v = -vmax end
+    x = x + v * h
+  end
+  s.x, s.v = x, v
+  return x
+end
+
+-- The same with its speed, for callers that bank or squash on it.
+function M.anim_state(a, key)
+  local an = a.m_an
+  local s = an and an[key]
+  if not s then return nil end
+  return s.x, s.v, s.goal
+end
+
+-- Put an animation where it is to be, at rest (a blink landing somewhere new).
+function M.anim_set(a, key, value)
+  local an = a.m_an
+  if not an then an = {} a.m_an = an end
+  local s = an[key]
+  if not s then an[key] = { x = value, v = 0, goal = value } return end
+  s.x, s.v, s.goal = value, 0, value
+end
+
+-- A tween from 0 to 1 (or back) over `time` seconds on a smootherstep curve:
+-- it starts and stops with no speed at all. `on`: toward 1 or toward 0.
+-- -> the eased value, and the raw progress.
+function M.tween(a, key, on, dt, time)
+  local an = a.m_an
+  if not an then an = {} a.m_an = an end
+  local s = an[key]
+  if not s then s = { p = on and 1 or 0 } an[key] = s end
+  local target = on and 1 or 0
+  if not time or time <= 0 then s.p = target
+  elseif dt > 0 then
+    local step = math.min(dt, 0.1) / time
+    if s.p < target then s.p = math.min(target, s.p + step) elseif s.p > target then s.p = math.max(target, s.p - step) end
+  end
+  local p = s.p
+  return p * p * p * (p * (p * 6 - 15) + 10), p
+end
+
+-- The animations of anchor `a` still moving: key, value, goal, speed, into
+-- `out` (a reused table of reused rows). -> how many.
+function M.active_anims(a, out)
+  local n = 0
+  for key, s in pairs(a.m_an or EMPTY_T) do
+    local moving
+    if s.p then moving = s.p > 0 and s.p < 1
+    else moving = math.abs(s.x - s.goal) > 1e-3 or math.abs(s.v) > 1e-3 end
+    if moving then
+      n = n + 1
+      local row = out[n]
+      if not row then row = {} out[n] = row end
+      row.key, row.x, row.goal, row.v = key, s.x or s.p, s.goal or 1, s.v or 0
+    end
+  end
+  return n
 end
 
 -- The idle bob -----------------------------------------------------------------------------------
@@ -382,6 +484,160 @@ function M.path_clear(cast, x0, y0, z0, yaw0, x1, y1, z1, yaw1, hw, curve, margi
     end
   end
   return true, rays
+end
+
+-- Openness: where around you there is room -----------------------------------------------------
+-- Pets go where it is open rather than solving collisions frame by frame.
+-- A ring of rays round you at a few heights, now and then, says how far each
+-- direction is open, counting only what is large: a wall, a building, a
+-- cliff, a big rock, a trunk, a post. Grass, kerbs, clutter and gaps do not
+-- count.
+
+-- rows[h][i]: the distance the ray at height h in direction i (of n round)
+-- hit something, or false. -> free[i], filled: how far direction i is open,
+-- counting a hit only when it is
+--   tall: the same direction hits at another height within `near` of it, and
+--   wide or close: a direction beside it hits too within 1 yalm, or it is
+--   within `close` yalms (where the ring's directions are too far apart to
+--   hit a post twice).
+-- `tall` is scratch space the caller keeps (no tables made here).
+function M.classify_ring(rows, nh, n, reach, tall, free, near, close)
+  near, close = near or 0.6, close or 3
+  for i = 1, n do
+    local best = false
+    for h = 1, nh do
+      local d = rows[h][i]
+      if d then
+        local count = 0
+        for k = 1, nh do
+          local e = rows[k][i]
+          if e and math.abs(e - d) <= near then count = count + 1 end
+        end
+        if count >= 2 and (not best or d < best) then best = d end
+      end
+    end
+    tall[i] = best
+  end
+  for i = 1, n do
+    local d = tall[i]
+    local open = reach
+    if d then
+      local l, r = tall[(i - 2) % n + 1], tall[i % n + 1]
+      if d <= close or (l and math.abs(l - d) <= 1) or (r and math.abs(r - d) <= 1) then open = d end
+    end
+    free[i] = open
+  end
+end
+
+-- How much room a panel `hw` half wide has with its face `d` from the centre
+-- of the ring, facing it, in direction `phi` (radians, x = sin, z = cos):
+-- the least, over the ring directions its face spans, of how far that
+-- direction is open past the face plus `margin`. Negative: it would be in
+-- something. Directions are (i - 1) * 2 pi / n.
+function M.clearance(free, n, phi, d, hw, margin)
+  if d < 1e-3 then return -math.huge end
+  local half = math.atan(hw + margin, d)
+  local bin = 2 * math.pi / n
+  local worst = math.huge
+  for i = 1, n do
+    local th = (i - 1) * bin
+    local dl = (th - phi + math.pi) % (2 * math.pi) - math.pi
+    if math.abs(dl) <= half + bin * 0.5 then
+      local along = math.cos(dl)
+      if along < 0.3 then along = 0.3 end
+      local c = free[i] - (d / along + margin)
+      if c < worst then worst = c end
+    end
+  end
+  return worst
+end
+
+-- What crosses a panel's face, row by row: rays along it (left edge, middle,
+-- right edge, following the curve) near its bottom edge, through its middle
+-- and near its top edge. The middle and top rows are looked at each way (a ray
+-- that starts inside something does not see it) and count when both hit, or
+-- one does and a second ray a little higher agrees: one stray answer from the
+-- collision is not a wall.
+-- The bottom row is looked at one way. -> low, mid, high (each true when that
+-- row is crossed), rays cast. Low alone is clutter under it (grass tips, a
+-- short post, a crate): something to float over if it can, never a reason to
+-- blink. Mid or high is large: a wall, a pillar, a beam.
+function M.face_rows(cast, x, y, z, yaw, hw, hh, curve)
+  local lx, lz = M.face_point(x, z, yaw, hw, curve, -1)
+  local rx, rz = M.face_point(x, z, yaw, hw, curve, 1)
+  local rays = 0
+  local low, mid, high = false, false, false
+  for r = 1, 3 do
+    local py = y + (r - 2) * 0.9 * hh
+    local hit = false
+    for seg = 0, 1 do
+      if not hit then
+        local ax, az, bx, bz = lx, lz, x, z
+        if seg == 1 then ax, az, bx, bz = x, z, rx, rz end
+        local dx, dz = bx - ax, bz - az
+        local dd = math.sqrt(dx * dx + dz * dz)
+        if dd > 1e-4 then
+          rays = rays + 1
+          local h = cast(ax, py, az, dx, 0, dz, dd)
+          local fwd = h and h < dd or false
+          if r == 1 then
+            hit = fwd
+          else
+            -- each way (a ray that starts inside something does not see it),
+            -- and one way alone confirmed by a second ray a little higher
+            rays = rays + 1
+            h = cast(bx, py, bz, -dx, 0, -dz, dd)
+            local back = h and h < dd or false
+            if fwd and back then hit = true
+            elseif fwd or back then
+              rays = rays + 1
+              local py2 = py + 0.12 * hh
+              if fwd then h = cast(ax, py2, az, dx, 0, dz, dd) else h = cast(bx, py2, bz, -dx, 0, -dz, dd) end
+              hit = h and h < dd or false
+            end
+          end
+        end
+      end
+    end
+    if r == 1 then low = hit elseif r == 2 then mid = hit else high = hit end
+  end
+  return low, mid, high, rays
+end
+
+-- What is in the way of a panel moving from pose 0 to pose 1: its middle at
+-- mid height and at its top, each counted when a ray each way hits (as
+-- face_rows), and near its bottom forward (each with `margin` beyond the
+-- end). -> low, large, rays cast.
+function M.path_rows(cast, x0, y0, z0, x1, y1, z1, hh, margin)
+  margin = margin or 0
+  local dx, dy, dz = x1 - x0, y1 - y0, z1 - z0
+  local dd = math.sqrt(dx * dx + dy * dy + dz * dz)
+  if dd < 1e-4 then return false, false, 0 end
+  local rays, large, low = 0, false, false
+  local len = dd + margin
+  for k = 0, 1 do
+    if not large then
+      local oy = k * 0.9 * hh
+      rays = rays + 2
+      local h = cast(x0, y0 + oy, z0, dx, dy, dz, len)
+      local fwd = h and h < len or false
+      h = cast(x1, y1 + oy, z1, -dx, -dy, -dz, len)
+      local back = h and h < len or false
+      if fwd and back then large = true
+      elseif fwd or back then
+        rays = rays + 1
+        local oy2 = oy + 0.12 * hh
+        if fwd then h = cast(x0, y0 + oy2, z0, dx, dy, dz, len) else h = cast(x1, y1 + oy2, z1, -dx, -dy, -dz, len) end
+        large = h and h < len or false
+      end
+    end
+  end
+  if not large then
+    rays = rays + 1
+    local h = cast(x0, y0 - 0.9 * hh, z0, dx, dy, dz, len)
+    low = h and h < len or false
+  end
+  return low, large, rays
 end
 
 -- The floor and the ceiling at a panel centred at (x, y, z) with half height

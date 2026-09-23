@@ -277,68 +277,57 @@ snapped back every frame.
   rest, then lets its hem down 0.35 s after it is no longer needed. Taller
   ones are stepped aside from. A pet held still to be read makes no room, and
   keeps a hike under way as it is.
-* **The world.** `ghostty.raycast` (the shim's `raycast_mode`, through
+* **The world: open space, not collision solving.** (Rebuilt after the
+  in-game try of a5f1bf7, where pets "jumped around waaaay too much": 12 s of
+  walking logged 50 frames of blinking and the chosen place flicking between
+  -1.2 and +1.2 rad.) `ghostty.raycast` is the shim's `raycast_mode`, through
   `BGCollisionModule.RaycastMaterialFilter` with every collision layer and any
-  material). The first version asked through ClientStructs' helper, which
-  casts on layer 1 with materials having bit 0x4000, what ScreenToWorld wants
-  (ground you can click). In game that saw walls and pillars but not the
-  props on other layers: a pet walked through a stone lamp-post base the
-  player cannot walk through (Middle La Noscea), with `/term world rays` showing
-  the rays cast and none hitting it. `ghostty.raycast(..., filter)` still takes
-  'bg' (the helper's filter) and 'layers' (every layer, the helper's
-  material filter), for `/term world rays` and the `world` selftest, which report
-  what each would have seen (a ring of 16 rays at knee height; the trace
-  counts hits only the new filter makes). Not yet observed in game that the
-  wider filter sees the post: that is what those two are for. Two parts:
-  * *Where a pet goes* (`probe_world`, on the spring's target, never its
-    output). A place fits when rays from your chest (`collide.chest` above
-    your feet) to a grid over its face (one column every `collide.spacing`,
-    0.3 yalms, at least 3, at two heights: bigger pets get more rays) leave
-    `collide.margin` in front of anything, after coming in no nearer than your
-    personal space, and rays *along* its face (left edge through the middle to
-    the right edge, following the curve, both ways at two heights, since the
-    collision is one-sided) hit nothing: that is what finds a pillar standing
-    in the panel between the points the chest rays look at. Its slot is looked
-    at first; only if it does not fit, further round you (nearest first, both
-    ways, up to `collide.swing`, never into the no-go cones; all the way round
-    once it has been hidden half a second), a few places a frame within the
-    budget, so a search can take several frames. Rays down and up keep it off
-    floors, ledges and ceilings.
-  * *Never seen inside anything* (end of `M.place_pet`). A pet only moves
-    along a clear path: whenever it has moved `collide.recheck` from the last
-    pose known clear, rays go along the way it came (its middle both ways,
-    both edges) and along its face at the new pose, near its bottom and top
-    edges. When anything is there it looks for a way round first, judged
-    `collide.lookahead` yalms ahead toward where it is going (a way that fits
-    one step but not the pillar after it is none), a few ways a frame:
-    - *squeeze*: the same move at 0.7, 0.5 or 0.35 of its size; it shrinks
-      (squished narrow and tall), slips through, and springs back to size with
-      a little overshoot once its full size fits again;
-    - *float*: straight up where it is by up to `collide.float` yalms with
-      nothing overhead, then on at that height; down again once the pose
-      below is clear. Tried first when only the bottom of its face is blocked
-      (a crate, a low wall), after the others otherwise;
-    - *shuffle*: aside where it is (toward you, along its face, or both) and
-      on from there, both legs clear; it goes along that line, a step at a time.
-    Only when none is found for `collide.stuck` seconds, or the ways it takes
-    lead no nearer its place (squeezing and shuffling along a wall with its
-    place beyond it), does it *blink*: it shrinks to nothing where it was
-    clear (`collide.blink` seconds), jumps while hidden to the place the search
-    found, once that place is itself checked clear, and grows back in there,
-    landing with a squash. At rest its face is looked at again
-    `collide.probe_hz` times a second (along it, and from your chest, because a
-    face buried in a thick wall has nothing to hit along it); found in
-    something, it is gone at once, not shrinking in it. A pet with no rays
-    left this frame holds still rather than move unchecked.
-    All pets together cast at most `collide.rays` rays a frame. `/term world
-    rays [SECONDS]` logs, per pet and frame, the rays cast, the hits and what
-    the search decided; the `world` selftest suite records what the collision
-    answers from your chest (down, ahead, the nearest wall in 16 directions).
-    An older core without `ghostty.raycast` simply sees no walls, as before.
-    Collision is background only: characters, and props the game only draws,
-    are invisible to it. The first in-game try of the version before this one
-    (an integration build of 831551d) still showed a pet inside a pillar; this
-    is the answer to that, not yet tried in game.
+  material; ClientStructs' helper (layer 1, material bit 0x4000, what
+  ScreenToWorld wants) missed props on other layers, and the wider filter hits
+  grass too, so what counts is decided here, by size:
+  * *The open map* (`open_tick`): a ring of rays from where you stand,
+    `collide.open_dirs` (36) directions at three heights (0.6, 1.3 and 2.0
+    yalms), out to `open_reach` (7), swept `open_rays` (24) rays a frame and
+    again every `open_every` (0.4 s). A hit counts only if it is *tall* (the
+    same direction hits at another height within 0.6 yalm) and *wide or close*
+    (a neighbouring direction hits too, or it is within 4 yalms, where a post
+    can fall between two directions): grass, kerbs, knee-high stones and thin
+    stalks do not count (`motion.classify_ring`). Each direction's open
+    distance is smoothed: closing quickly (0.15 s), opening slowly (0.9 s).
+  * *Where a pet goes* (`place_open`): its slot while that has room
+    (`motion.clearance`: every ring direction its face spans open past its face
+    plus `margin`); else the open place nearest its slot, up to `swing` round
+    you, outside the no-go cones and away from where another pet has moved;
+    nowhere open, the roomiest, brought in as far as your personal space
+    allows. Decided every 0.5 s (0.8 s while you move) with hysteresis: a place
+    is left only after `bad_for` (0.3 s) without room, and it goes back to its
+    slot only after staying `stay` (1.5 s). It drifts there over `drift` (0.9 s)
+    through the animation layer; nothing jumps. A place the pet found blocked
+    itself (something too thin for the ring, a pillar between its rays) counts
+    as having no room for two or three seconds.
+  * *Never seen inside anything large* (end of `M.place_pet`). Each time a
+    pet moves `recheck` (3 cm) its face is looked at along three rows (near the
+    bottom, the middle, near the top; `motion.face_rows`) and its way at two
+    heights (`motion.path_rows`). The middle and top count when a ray each way
+    hits, or one does and a second ray a little higher agrees (one stray answer
+    is not a wall); the bottom row alone is clutter under it (grass tips, a
+    crate, a short post): it floats over it if it can and never stops for it.
+    Something large and it holds where it was clear, tries to squeeze through or
+    float over (`find_way`), and after three blocked looks lets the open map
+    choose again. It blinks only after `blink_after` (5) blocked looks and
+    `stuck` (1 s), and never more than once every `blink_every` (4 s): a
+    smootherstep shrink over `blink` (0.2 s; with Reduce motion a fade), a jump
+    while hidden to the place the open map chose, once that is itself clear,
+    and the same back in. At rest its face is looked at four times a second;
+    something large there three looks running hides it at once. The first
+    frame also looks from your chest (a face buried in a thick wall has nothing
+    to hit along it). A pet with no rays left this frame holds still.
+  All pets together cast at most `collide.rays` (96) rays a frame.
+  `/term world rays [SECONDS]` logs per pet and frame the rays and hits (and
+  those only the wide filter makes) and the place decided; `/term world anim
+  [SECONDS]` the animations still moving. The `world` selftest reports a ring
+  of 16 rays at knee height with each filter. None of this has been seen in
+  game yet.
 * **The view.** The existing no-go cones stay as they were: no pet centre
   between the camera and you, or straight behind you. A wide pet's edge may
   still reach into the camera cone; the cones were not widened, because the
@@ -350,6 +339,19 @@ How they move (`CONFIG.world.pet.cute`, `pet.follow`, `CONFIG.world.motion`):
   substeps of at most 1/120 s and short enough that `h * w <= 0.5`, a frame
   taken as at most 0.1 s. It never gains energy, whatever the stiffness or the
   frame rate, and 30, 60, 144 fps and a ragged frame rate trace the same curve.
+* One animation layer (`motion.anim`, `motion.tween`): everything a pet
+  shows besides the follow spring (its drift to a new place, the pull in, the
+  floor and ceiling lift, a float over something, a hop, the tuck and the hike,
+  squeezing, the row's size, its tilt, being held still, a blink) is either a
+  critically damped glide that reaches its goal in a stated time with no
+  overshoot, capped at a stated speed, with a dead zone so noise in the goal
+  never makes it twitch; or a smootherstep tween that starts and stops with no
+  speed. Each property has exactly one; properties that add up (the follow
+  spring's height, the bob, a hike) are separate and each smooth. The panels'
+  own glitch in and out (every world panel, Mappy's pet too) is eased with
+  smoothstep instead of a linear ramp. `tests/test_motion.lua` samples each
+  curve at 30, 60 and 144 fps: no speed jump bigger than the curve's own start,
+  no overshoot past 2 %, settled in its time, still at rest.
 * Calm by default (the first in-game try found them "way too flubbery"): the
   follow springs are near-critically damped (`pet.damping` 0.95; a step is
   followed without overshooting by more than 2 %, `tests/test_motion.lua`), the
