@@ -961,7 +961,18 @@ local function main(): integer
   if nonce == 0 then nonce = 1 end
   do
     local sb: stringbuilder
-    sb:writef('ghostty-agent %d %d', PROTO_VERSION, nonce)
+    -- The platform is the agent's, and the client cannot infer it: under Wine
+    -- the plugin is Windows while the agent it talks to is the Linux or macOS
+    -- host, so anything chosen from the plugin's own platform runs the wrong
+    -- command here (tools that did picked cmd.exe and got status 127).
+    ## if ccinfo.is_windows then
+    local plat: string <comptime> = 'windows'
+    ## elseif ccinfo.is_apple then
+    local plat: string <comptime> = 'macos'
+    ## else
+    local plat: string <comptime> = 'linux'
+    ## end
+    sb:writef('ghostty-agent %d %d %s', PROTO_VERSION, nonce, plat)
     agent.hello = sb:promote()
   end
   ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then

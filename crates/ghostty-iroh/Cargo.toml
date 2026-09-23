@@ -27,6 +27,12 @@ tokio = { version = "1.44", features = [
     "macros",
 ] }
 rand = "=0.8.5"
+# Media over QUIC. moq-net is generic over web_transport_trait::Session, so it
+# rides the iroh connection this crate already opens rather than needing a
+# transport of its own (src/moq.rs).
+moq-net = "0.2.22"
+web-transport-trait = "0.4.0"
+bytes = "1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "=0.2.172"
