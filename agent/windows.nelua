@@ -38,7 +38,7 @@ local WinStream = @record{
   seq: uint32,           -- last seq sent
   acked: uint32,         -- last seq the client presented
   due: float64,          -- os.now() when the next frame may go
-  factor: integer,       -- downscale of the latest frame (input maps back through it)
+  out_w: integer, out_h: integer, -- the latest frame's size as sent (input maps back through it)
   src_w: integer, src_h: integer, -- the window's own size in the latest frame
   pw: integer, ph: integer,       -- size of `prev` (0: the client has nothing)
   prev: vector(uint8),   -- what the client has, pw x ph, stride pw * 4
@@ -156,14 +156,16 @@ end
 
 -- WGEOM before the first WFRAME of a seq whose boxes differ from the last
 -- ones sent: the window's and its popups' rectangles in the picture, scaled
--- as the frame is (factor f).
-local function send_geom(s: *WinStream, q: *ByteQueue, fr: *CaptureFrame, f: integer): void
+-- as the frame is (to w x h).
+local function send_geom(s: *WinStream, q: *ByteQueue, fr: *CaptureFrame, w: integer, h: integer): void
   local n = math.min(fr.nbox, 64)
   local same = n == #s.geom
   local b: [64]CaptureBox
   for i = 0, < n do
     local r = fr.boxes[i]
-    b[i] = { x = r.x // f, y = r.y // f, w = (r.w + f - 1) // f, h = (r.h + f - 1) // f }
+    local x, bw = wincodec_scale_span(r.x, r.w, fr.w, w)
+    local y, bh = wincodec_scale_span(r.y, r.h, fr.h, h)
+    b[i] = { x = x, y = y, w = bw, h = bh }
     if same and (b[i].x ~= s.geom[i].x or b[i].y ~= s.geom[i].y or b[i].w ~= s.geom[i].w or b[i].h ~= s.geom[i].h) then same = false end
   end
   if same then return end
@@ -188,10 +190,10 @@ end
 -- client can see changed.
 local function stream_send(self: *AgentWindows, s: *WinStream, q: *ByteQueue, fr: *CaptureFrame, now: float64): void
   s.serial = fr.serial
-  local f, w, h = wincodec_downscale(fr.pixels, fr.stride, fr.w, fr.h, s.max_w, s.max_h, &s.scaled)
+  local scaled, w, h = wincodec_downscale_fit(fr.pixels, fr.stride, fr.w, fr.h, s.max_w, s.max_h, &s.scaled)
   local src, stride = fr.pixels, fr.stride
-  if f > 1 then src, stride = (@*[0]uint8)(&s.scaled[0]), (@usize)(w * 4) end
-  s.factor, s.src_w, s.src_h = f, fr.w, fr.h
+  if scaled then src, stride = (@*[0]uint8)(&s.scaled[0]), (@usize)(w * 4) end
+  s.out_w, s.out_h, s.src_w, s.src_h = w, h, fr.w, fr.h
   if not s.announced then
     send_opened(q, s.req, s.sid, w, h, self.backend.title(s.h))
     s.announced = true
@@ -205,7 +207,7 @@ local function stream_send(self: *AgentWindows, s: *WinStream, q: *ByteQueue, fr
   end
   if #s.rects == 0 then return end
   s.seq = s.seq + 1
-  send_geom(s, q, fr, f)
+  send_geom(s, q, fr, w, h)
   wincodec_write_frames(q, s.sid, s.seq, src, stride, w, h, key, &s.rects, &s.scratch, &s.body)
   -- keep what the client now shows: all of it, or the rectangles just sent
   local row = (@usize)(w * 4)
@@ -224,13 +226,6 @@ local function stream_send(self: *AgentWindows, s: *WinStream, q: *ByteQueue, fr
   s.due = now + s.interval
 end
 
--- A coordinate of the (possibly scaled) frame the client sees, in window pixels.
-local function unscale(v: integer, factor: integer, size: integer): integer
-  if factor > 1 then v = v * factor + factor // 2 end
-  if size > 0 then v = math.clamp(v, 0, size - 1) end
-  return v
-end
-
 local function get_i16(p: *[0]uint8): integer
   return (@int16)(proto.get_u16(p))
 end
@@ -242,8 +237,8 @@ local function handle_input(self: *AgentWindows, s: *WinStream, p: *[0]uint8, le
   local n = len - 1
   if ev.kind == WIN_INPUT_MOVE or ev.kind == WIN_INPUT_BUTTON or ev.kind == WIN_INPUT_WHEEL then
     if n < 4 then return end
-    ev.x = unscale(get_i16(b), s.factor, s.src_w)
-    ev.y = unscale(get_i16((@*[0]uint8)(&b[2])), s.factor, s.src_h)
+    ev.x = wincodec_unscale(get_i16(b), s.out_w, s.src_w)
+    ev.y = wincodec_unscale(get_i16((@*[0]uint8)(&b[2])), s.out_h, s.src_h)
     if ev.kind == WIN_INPUT_BUTTON then
       if n < 6 then return end
       ev.button = b[4]
@@ -312,7 +307,7 @@ function AgentWindows:handle(ci: usize, q: *ByteQueue, typ: uint8, payload: *[0]
     why:destroy()
     self.streams:push(WinStream{
       sid = self.next_sid, client = ci, req = req, h = h, max_w = max_w, max_h = max_h,
-      interval = 1.0 / fps, factor = 1, link = #match > 4 and match:subview(1, 4) == 'url:',
+      interval = 1.0 / fps, link = #match > 4 and match:subview(1, 4) == 'url:',
     })
     self.next_sid = self.next_sid + 1
     if self.next_sid == 0 then self.next_sid = 1 end
