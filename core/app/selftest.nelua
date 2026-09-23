@@ -52,6 +52,12 @@ local Runner = @record{
   suite_ms: uint64,       -- when the current suite began
   session_id: integer,    -- the agent suite's terminal
   typed: boolean,         -- the echo command has been written into that terminal
+  frames: integer,        -- frames in the current phase (the native suite)
+  held: integer,          -- frames the game window kept the keyboard after a click
+  clicks: integer,        -- clicks the native suite made
+  mouse_down: boolean,    -- the native suite's synthetic left button is down
+  cursor_saved: boolean,
+  cursor_x: integer, cursor_y: integer,
 }
 local R: Runner
 
@@ -602,6 +608,136 @@ end
 -- Phases: 0 the path, 1 waiting for KamiToolKit, 2 open, 3 waiting for the
 -- window and its frames, 4 holding it on screen, 5 closed and gone, then the
 -- forced fallback.
+-- A real click for the native suite: the cursor moved onto the game window
+-- and the left button pressed and released through the OS, so the game, Dalamud
+-- and the core each see it as they would a player's. Windows (and Wine) only.
+## if ccinfo.is_windows then
+local SelftestPoint <cimport 'POINT', nodecl> = @record{ x: clong, y: clong }
+local function SetCursorPos(x: cint, y: cint): cint <cimport, nodecl> end
+local function GetCursorPos(p: *SelftestPoint): cint <cimport, nodecl> end
+local function ClientToScreen(hwnd: pointer, p: *SelftestPoint): cint <cimport, nodecl> end
+local function mouse_event(flags: uint32, dx: uint32, dy: uint32, data: uint32, extra: usize): void <cimport, nodecl> end
+## end
+local MOUSE_LEFTDOWN: uint32 <comptime> = 0x0002
+local MOUSE_LEFTUP: uint32 <comptime> = 0x0004
+
+-- The game's window when it is in front and ours, else nilptr.
+local function game_hwnd(): pointer
+  ## if ccinfo.is_windows then
+    local h = GetForegroundWindow()
+    if h == nilptr then return nilptr end
+    local pid: uint32 = 0
+    GetWindowThreadProcessId(h, &pid)
+    if pid ~= GetCurrentProcessId() then return nilptr end
+    return h
+  ## else
+    return nilptr
+  ## end
+end
+
+-- Move the cursor to ImGui point (x, y); the first move remembers where it was.
+local function cursor_to(x: float32, y: float32): boolean
+  ## if ccinfo.is_windows then
+    local h = game_hwnd()
+    if h == nilptr then return false end
+    if not R.cursor_saved then
+      local p: SelftestPoint
+      if GetCursorPos(&p) ~= 0 then R.cursor_saved, R.cursor_x, R.cursor_y = true, p.x, p.y end
+    end
+    local vp = imgui.GetMainViewport()
+    local p: SelftestPoint = { x = (@clong)(math.floor(x - vp.Pos.x)), y = (@clong)(math.floor(y - vp.Pos.y)) }
+    -- ImGui points are the viewport's (client) pixels, or the desktop's with
+    -- multi-viewport on: either way the main viewport's origin is the client's
+    if ClientToScreen(h, &p) == 0 then return false end
+    return SetCursorPos((@cint)(p.x), (@cint)(p.y)) ~= 0
+  ## else
+    return false
+  ## end
+end
+
+local function mouse_button(down: boolean): void
+  ## if ccinfo.is_windows then
+    mouse_event(down and MOUSE_LEFTDOWN or MOUSE_LEFTUP, 0, 0, 0, 0)
+  ## end
+  R.mouse_down = down
+end
+
+-- Leave the mouse as the suite found it: button up, cursor back.
+local function mouse_restore(): void
+  if R.mouse_down then mouse_button(false) end
+  ## if ccinfo.is_windows then
+    if R.cursor_saved then SetCursorPos((@cint)(R.cursor_x), (@cint)(R.cursor_y)) end
+  ## end
+  R.cursor_saved = false
+end
+
+-- The swatches drawn through ImGui, at the top left of the screen: what the
+-- game window's must match.
+local function imgui_swatches(): void
+  local dl = imgui.GetForegroundDrawList()
+  local vp = imgui.GetMainViewport()
+  for i = 0, < NATIVE_SWATCHES do
+    local x = vp.Pos.x + 40 + i * NATIVE_SWATCH_STEP
+    imgui.DrawListAddRectFilled(dl, vec2(x, vp.Pos.y + 40), vec2(x + NATIVE_SWATCH_PX, vp.Pos.y + 40 + NATIVE_SWATCH_PX), native_swatch_cols[i], 0, 0)
+  end
+end
+
+-- The mean colour of the 4 x 4 pixels around frame point (cx, cy) of the
+-- captured frame (BGRA); false off the frame.
+local function frame_pixel(cx: integer, cy: integer): (boolean, uint8, uint8, uint8)
+  local w, h = (@integer)(capture.w), (@integer)(capture.h)
+  if cx - 2 < 0 or cy - 2 < 0 or cx + 2 > w or cy + 2 > h or #capture.pixels < w * h * 4 then return false, 0, 0, 0 end
+  local sb, sg, sr = 0, 0, 0
+  for y = cy - 2, < cy + 2 do
+    for x = cx - 2, < cx + 2 do
+      local i = (y * w + x) * 4
+      sb, sg, sr = sb + capture.pixels[i], sg + capture.pixels[i + 1], sr + capture.pixels[i + 2]
+    end
+  end
+  return true, (@uint8)(sb // 16), (@uint8)(sg // 16), (@uint8)(sr // 16)
+end
+
+-- The colour case from a captured frame: every swatch through the game window
+-- against the same through ImGui.
+local function native_colour_case(l: NativeLayout): void
+  local vp = imgui.GetMainViewport()
+  local pad = (@integer)(math.floor(4 * l.scale))
+  local worst, worst_i = 0, -1
+  local ok_all = true
+  local sb: stringbuilder
+  local grey_n, grey_i = 0, 0
+  for i = 0, < NATIVE_SWATCHES do
+    local half = NATIVE_SWATCH_PX // 2
+    local nx = l.sx - (@integer)(vp.Pos.x) + pad + i * NATIVE_SWATCH_STEP + half
+    local ny = l.sy - (@integer)(vp.Pos.y) + pad + half
+    local ix = 40 + i * NATIVE_SWATCH_STEP + half
+    local iy = 40 + half
+    local okn, nb, ng, nr = frame_pixel(nx, ny)
+    local oki, ib, ig, ir = frame_pixel(ix, iy)
+    if not okn or not oki then ok_all = false break end
+    local d = math.max(math.abs((@integer)(nr) - ir), math.max(math.abs((@integer)(ng) - ig), math.abs((@integer)(nb) - ib)))
+    if d > worst then worst, worst_i = d, i end
+    sb:writef('%s#%02x%02x%02x/#%02x%02x%02x', i > 0 and ' ' or '', nr, ng, nb, ir, ig, ib)
+    if i == 2 then grey_n, grey_i = nr, ir end
+  end
+  local detail = sb:promote()
+  defer detail:destroy() end
+  if not ok_all then
+    add(SUITE_NATIVE, 'colour', SelftestStatus.Fail, 0, 'the swatches were not inside the captured frame')
+    return
+  end
+  -- the transfer that would explain grey 128: log(native) / log(imgui)
+  local gamma: float64 = 1
+  if grey_n > 0 and grey_i > 0 and grey_i < 255 then gamma = math.log(grey_n / 255.0) / math.log(grey_i / 255.0) end
+  local hint: string
+  if worst > 6 and gamma > 0 then hint = string.format(' (try CONFIG.native.gamma = %.1f)', 1 / gamma) end
+  defer hint:destroy() end
+  local m = string.format('game window vs ImGui (native/imgui per swatch): %s; worst channel difference %d; grey 128 fits a transfer of %.2f%s',
+    detail, worst, gamma, hint)
+  add(SUITE_NATIVE, 'colour', worst <= 6 and SelftestStatus.Pass or SelftestStatus.Fail, 0, m)
+  m:destroy()
+end
+
 local function suite_native(): boolean
   local now = now_ms()
   if R.phase == 0 then
@@ -693,8 +829,103 @@ local function suite_native(): boolean
     m:destroy()
     add(SUITE_NATIVE, 'focus', focused and SelftestStatus.Pass or SelftestStatus.Fail, 0,
       focused and 'opened by command, it took the keyboard' or 'opened by command, it did not take the keyboard')
-    R.phase, R.phase_ms = 4, now
+    R.phase, R.phase_ms, R.frames = 10, now, 0
     return false
+  end
+  -- 10-12: the colour swatches through the game window and through ImGui, read back from the screen
+  if R.phase >= 10 and R.phase <= 12 then
+    if s == nilptr then add(SUITE_NATIVE, 'colour', SelftestStatus.Fail, 0, 'the terminal went away') R.phase = 4 return false end
+    native_swatch_id = s.id
+    imgui_swatches()
+    R.frames = R.frames + 1
+    if R.phase == 10 then
+      if R.frames >= 5 then -- the texture drawn a frame ago is what the game shows now
+        local ok, why = capture_grab_frame()
+        if not ok then
+          local m = string.format('no frame to read: %s', why)
+          add(SUITE_NATIVE, 'colour', SelftestStatus.Skip, 0, m)
+          m:destroy()
+          native_swatch_id = 0
+          R.phase, R.phase_ms, R.frames = 20, now, 0
+        else
+          R.phase, R.phase_ms = 11, now
+        end
+      end
+      return false
+    end
+    local st = capture_poll()
+    if st == CaptureState.Ready then
+      local _, _, l = native_win_info(s.id)
+      native_colour_case(l)
+      capture_reset()
+      native_swatch_id = 0
+      R.phase, R.phase_ms, R.frames = 20, now, 0
+    elseif st == CaptureState.Failed or now - R.phase_ms > 3000 then
+      local m = string.format('the frame could not be read back: %s', capture.reason)
+      add(SUITE_NATIVE, 'colour', SelftestStatus.Fail, now - R.phase_ms, m)
+      m:destroy()
+      capture_reset()
+      native_swatch_id = 0
+      R.phase, R.phase_ms, R.frames = 20, now, 0
+    end
+    return false
+  end
+  -- 20-27: two real clicks on the text; the keyboard must stay with the window after each
+  if R.phase >= 20 and R.phase < 30 then
+    if s == nilptr then mouse_restore() add(SUITE_NATIVE, 'click focus', SelftestStatus.Fail, 0, 'the terminal went away') R.phase = 4 return false end
+    local known, st, l, _, focused = native_win_info(s.id)
+    R.frames = R.frames + 1
+    if R.phase == 20 then
+      if game_hwnd() == nilptr then
+        add(SUITE_NATIVE, 'click focus', SelftestStatus.Skip, 0, 'the game is not the window in front (or not Windows): no click was made')
+        R.phase, R.phase_ms = 4, now
+        return false
+      end
+      native_blur_all()
+      if not cursor_to((@float32)(l.sx) + l.tex_w * 0.5, (@float32)(l.sy) + l.tex_h * 0.6) then
+        mouse_restore()
+        add(SUITE_NATIVE, 'click focus', SelftestStatus.Skip, 0, 'the cursor could not be moved')
+        R.phase, R.phase_ms = 4, now
+        return false
+      end
+      R.phase, R.frames, R.held, R.clicks = 21, 0, 0, 0
+      return false
+    end
+    if R.phase == 21 then -- the game has seen the pointer there: press
+      if R.frames < 4 then return false end
+      if st.hovered == NATIVE_HOVER_OTHER then
+        mouse_restore()
+        add(SUITE_NATIVE, 'click focus', SelftestStatus.Skip, 0, 'another game window is over it: no click was made')
+        R.phase, R.phase_ms = 4, now
+        return false
+      end
+      mouse_button(true)
+      R.clicks = R.clicks + 1
+      R.phase, R.frames = 22, 0
+      return false
+    end
+    if R.phase == 22 then -- release a few frames later, as a hand would
+      if R.frames < 3 then return false end
+      mouse_button(false)
+      R.phase, R.frames = 23, 0
+      return false
+    end
+    if R.phase == 23 then -- the keyboard stays with it
+      if focused then R.held = R.held + 1 end
+      if R.frames < 20 then return false end
+      if R.clicks == 1 then
+        R.phase, R.frames = 21, 0 -- a second click on the text, now that it has focus
+        return false
+      end
+      mouse_restore()
+      local ok = R.held == 40
+      local m = string.format('%d clicks on the text; the window had the keyboard %d of 40 frames after them (hover %d at the end)',
+        R.clicks, R.held, st.hovered)
+      add(SUITE_NATIVE, 'click focus', ok and SelftestStatus.Pass or SelftestStatus.Fail, now - R.phase_ms, m)
+      m:destroy()
+      R.phase, R.phase_ms = 4, now
+      return false
+    end
   end
   if R.phase == 4 then
     if s ~= nilptr and now - R.phase_ms < NATIVE_HOLD_MS then return false end -- look at it
@@ -1023,6 +1254,8 @@ global function selftest_shutdown(): void
     add(R.st.next < SELFTEST_SUITE_COUNT and R.st.next or SUITE_LOADER, 'interrupted', SelftestStatus.Fail, 0, 'the core shut down during the run')
     write_report('complete', true)
   end
+  mouse_restore() -- never a synthetic button left down, nor the cursor left moved
+  native_swatch_id = 0
   selftest_state_destroy(&R.st)
   R = {}
   native_force_unavailable = false -- the native suite's forced failure never outlives a run

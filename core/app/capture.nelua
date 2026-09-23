@@ -240,6 +240,18 @@ local function queue_callback(): void
   imgui.DrawListAddCallback(dl, (@pointer)(capture_render_cb), nilptr)
 end
 
+-- One whole frame for someone else to read (/term selftest native compares
+-- colours on the screen): armed and its callback queued; poll capture_poll()
+-- until Ready, read capture.pixels, then capture_reset(). False and why when
+-- it cannot be taken now.
+global function capture_grab_frame(): (boolean, string)
+  if shot.stage ~= ShotStage.None or clip.stage ~= ClipStage.None then return false, 'a /term shot or clip is running' end
+  local ok, why = arm(false)
+  if not ok then return false, why end
+  queue_callback()
+  return true, (@string){}
+end
+
 -- Commands ---------------------------------------------------------------------
 
 global function capture_app_busy(): boolean
