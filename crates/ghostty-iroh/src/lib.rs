@@ -19,6 +19,7 @@
 //! in the build container (docs/IROH.md, "Cross-compilation"). Nothing here has
 //! been built, run, or measured.
 
+pub mod moq;
 pub mod node;
 mod wakeup;
 
@@ -218,6 +219,20 @@ pub extern "C" fn gi_accept(listener: Handle) -> u32 {
 pub unsafe extern "C" fn gi_peer_id(h: Handle, out: *mut c_char, cap: usize) -> i32 {
     with_node(GI_EHANDLE, |n| match n.peer_id(h) {
         Some(id) => write_str(&id, out, cap),
+        None => GI_EHANDLE,
+    })
+}
+
+/// What the allowlist grants this peer: GI_CAP_* bits, or a negative GI_E* for
+/// a stale handle. A caller that cannot tell must refuse, not assume.
+///
+/// Everything is granted when there is no allowlist, which is what the agent
+/// already warns about at startup: a file that does not exist restricts
+/// nobody.
+#[no_mangle]
+pub extern "C" fn gi_peer_caps(h: Handle) -> i32 {
+    with_node(GI_EHANDLE, |n| match n.peer_caps(h) {
+        Some(c) => c as i32,
         None => GI_EHANDLE,
     })
 }

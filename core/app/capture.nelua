@@ -38,6 +38,10 @@ global CLIP_OPEN_TIMEOUT: float64 <comptime> = 5.0  -- waiting for the agent's a
 global CLIP_DONE_TIMEOUT: float64 <comptime> = 120.0 -- waiting for ffmpeg
 global CLIP_KIND_GIF: uint8 <comptime> = 0
 global CLIP_KIND_MP4: uint8 <comptime> = 1
+-- Not a recording: the frames go out of a v4l2loopback device on the host, so
+-- Zoom and anything else that opens a webcam opens the game instead
+-- (docs/MEETINGS.md). It runs until it is stopped and writes no file.
+global CLIP_KIND_CAM: uint8 <comptime> = 2
 
 -- Rows of PNG a frame may encode: about 48 KB of pixels, so the work per frame
 -- stays in the low milliseconds whatever the shot's width.
@@ -86,7 +90,6 @@ local Clip = @record{
   req: uint32,
   cid: uint32,
   w: integer, h: integer,   -- the size frames are sent at
-  factor: integer,          -- downscale factor the first frame settled on
   started: float64,
   next_at: float64,
   asked_at: float64,
@@ -95,6 +98,27 @@ local Clip = @record{
   bytes: usize,
   dropped: integer,
 }
+
+-- The result of the last shot, for whatever asked for one that was not a
+-- person: the camera (core/app/lakitu.nelua) and, through it, the MCP server.
+-- `serial` changes when a shot finishes, which is how a caller that queued one
+-- knows its own has landed without a callback into another thread.
+global CaptureShotResult = @record{
+  serial: uint32,
+  ok: boolean,
+  path: string,    -- owned here; copy it before the next shot
+  error: string,   -- owned here
+}
+global capture_shot: CaptureShotResult
+
+local function shot_done(ok: boolean, path: string, why: string): void
+  capture_shot.path:destroy()
+  capture_shot.error:destroy()
+  capture_shot.ok = ok
+  capture_shot.path = ok and path:copy() or (@string){}
+  capture_shot.error = ok and (@string){} or why:copy()
+  capture_shot.serial = capture_shot.serial + 1
+end
 
 local shot: Shot
 local clip: Clip
@@ -295,6 +319,20 @@ global function capture_describe(): string
   return sb:promote()
 end
 
+-- Start a shot without a person typing one: the same stages /term shot uses,
+-- minus the argument parsing and minus the gallery prompt unless asked for.
+-- False when a capture is already in flight -- there is only one frame buffer,
+-- and the caller is expected to wait rather than queue.
+global function capture_shot_begin(panel: boolean, clean: boolean, share: boolean): (boolean, string)
+  if capture_app_busy() then return false, 'one capture at a time' end
+  shot = {}
+  shot.panel, shot.clean, shot.share = panel, clean, share
+  if clean and not hud_hide(host.last_time) then shot.clean = false end
+  shot.stage = shot.clean and ShotStage.Hiding or ShotStage.Arm
+  shot.settle = HUD_SETTLE_FRAMES
+  return true, (@string){}
+end
+
 global function shot_command(args: string): cint
   if args == 'status' or args == 'diag' then
     local line = capture_describe()
@@ -314,14 +352,14 @@ global function shot_command(args: string): cint
     sayf(LOG_WARN, 'shot: %s (/term shot [panel|full] [clean])', why)
     return 3
   end
-  shot = {}
-  shot.panel, shot.clean, shot.share = panel, clean, true
-  if clean and not hud_hide(host.last_time) then
-    say(LOG_WARN, 'shot: this plugin build cannot hide the game\'s UI; taking the shot as it is')
-    shot.clean = false
+  local started, why = capture_shot_begin(panel, clean, true)
+  if not started then
+    sayf(LOG_WARN, 'shot: %s; this one is still being written', why)
+    return 4
   end
-  shot.stage = shot.clean and ShotStage.Hiding or ShotStage.Arm
-  shot.settle = HUD_SETTLE_FRAMES
+  if clean and not shot.clean then
+    say(LOG_WARN, 'shot: this plugin build cannot hide the game\'s UI; taking the shot as it is')
+  end
   return 0
 end
 
@@ -379,6 +417,7 @@ end
 
 local function shot_fail(why: string): void
   hud_restore()
+  shot_done(false, (@string){}, why)
   sayf(LOG_WARN, 'shot: %s', why)
   shot.path:destroy()
   png_enc_destroy(&shot.enc)
@@ -434,6 +473,7 @@ local function shot_tick(now: float64): void
     shot.path = (@string){}
     shot.stage = ShotStage.None
     sayf(LOG_INFO, 'shot: %dx%d, %d KB', (@integer)(capture.w), (@integer)(capture.h), bytes // 1024)
+    shot_done(true, path, (@string){})
     if shot.share then offer(path) end
     path:destroy()
   end
@@ -448,18 +488,64 @@ local function clip_finish(cancel: boolean): void
   capture_reset()
 end
 
+-- Is the game being a camera right now?
+global function capture_camera_on(): boolean
+  return clip.stage ~= ClipStage.None and clip.kind == CLIP_KIND_CAM
+end
+
+-- Turn the game into a webcam on the host, or turn it off. `/cam zoom`.
+-- Everything a clip does, without the end: the frames leave through a
+-- v4l2loopback device instead of being encoded into a file.
+global function capture_camera(on: boolean, clean: boolean): cint
+  if not on then
+    if not capture_camera_on() then
+      say(LOG_INFO, 'cam: the game is not a camera right now')
+      return 0
+    end
+    clip_finish(false)
+    say(LOG_INFO, 'cam: the game is no longer a camera')
+    return 0
+  end
+  if capture_camera_on() then
+    say(LOG_INFO, 'cam: the game is already a camera')
+    return 0
+  end
+  if capture_app_busy() then
+    say(LOG_WARN, 'cam: one capture at a time; something else is using the frame')
+    return 4
+  end
+  if not host.local_agent.client:ready() then
+    say(LOG_WARN, 'cam: no ghostty-agent connection; the camera device is on the host, so one is needed')
+    return 4
+  end
+  if capture_device() == nilptr then
+    say(LOG_WARN, 'cam: no D3D11 device from Dalamud, so no frame can be captured')
+    return 4
+  end
+  clip = {}
+  clip.panel, clip.clean, clip.kind = false, clean, CLIP_KIND_CAM
+  clip.seconds = 0 -- unused: a camera has no length
+  clip.fps = CLIP_FPS_DEFAULT
+  if clip.fps > CLIP_FPS_MAX then clip.fps = CLIP_FPS_MAX end
+  if clean and not hud_hide(host.last_time) then clip.clean = false end
+  clip.stage = ClipStage.Sizing
+  clip.asked_at = host.last_time
+  say(LOG_INFO, 'cam: starting; the host puts the game on its camera device')
+  return 0
+end
+
 -- One captured frame, scaled down and sent to the agent.
 local function clip_send_frame(): void
   local w, h = (@integer)(capture.w), (@integer)(capture.h)
   local src = (@*[0]uint8)(&capture.pixels[0])
   local stride = (@usize)(capture.w) * 4
-  local f, sw, sh = wincodec_downscale(src, stride, w, h, CLIP_MAX_W, CLIP_MAX_H, &clip_small)
+  local scaled, sw, sh = wincodec_downscale_fit(src, stride, w, h, CLIP_MAX_W, CLIP_MAX_H, &clip_small)
   local fsrc, fstride = src, stride
-  if f > 1 then
+  if scaled then
     fsrc = (@*[0]uint8)(&clip_small[0])
     fstride = (@usize)(sw) * 4
   end
-  if clip.w == 0 then clip.w, clip.h, clip.factor = sw, sh, f end
+  if clip.w == 0 then clip.w, clip.h = sw, sh end
   if sw ~= clip.w or sh ~= clip.h then
     -- the frame changed size mid-clip (a resolution change): ffmpeg was told
     -- one size and must not be sent another, so the clip ends here
@@ -496,9 +582,9 @@ local function clip_tick(now: float64): void
       return
     end
     if st == CaptureState.Ready then
-      local f, sw, sh = wincodec_downscale((@*[0]uint8)(&capture.pixels[0]), (@usize)(capture.w) * 4,
+      local _, sw, sh = wincodec_downscale_fit((@*[0]uint8)(&capture.pixels[0]), (@usize)(capture.w) * 4,
         (@integer)(capture.w), (@integer)(capture.h), CLIP_MAX_W, CLIP_MAX_H, &clip_small)
-      clip.w, clip.h, clip.factor = sw, sh, f
+      clip.w, clip.h = sw, sh
       clip.req = clip.req + 1
       if clip.req == 0 then clip.req = 1 end
       if not host.local_agent.client:copen(clip.req, clip.kind, (@uint16)(sw), (@uint16)(sh), (@uint8)(clip.fps)) then
@@ -543,7 +629,11 @@ local function clip_tick(now: float64): void
       clip_finish(false)
       return
     end
-    if now - clip.started >= clip.seconds or clip.sent >= CLIP_MAX_FRAMES or clip.bytes >= CLIP_MAX_BYTES then
+    if clip.kind == CLIP_KIND_CAM then
+      -- A camera runs until it is switched off: no time limit, and none of
+      -- the recording's size limits, because nothing is being accumulated.
+      -- The agent drops frames the device cannot keep up with.
+    elseif now - clip.started >= clip.seconds or clip.sent >= CLIP_MAX_FRAMES or clip.bytes >= CLIP_MAX_BYTES then
       clip_finish(false)
       say(LOG_INFO, 'clip: recorded; the host is encoding it')
       return

@@ -23,6 +23,7 @@
 --                      [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|gpu|none]
 --                      [--wayland-browser CMD] [--wayland-browser-profile NAME]
 --                      [--iroh [--iroh-secret PATH] [--iroh-allowlist PATH]]
+--                      [--wireguard-config PATH]
 --        ghostty-agent [--listen HOST:PORT] [--token-file PATH] --open-url URL
 --
 -- --iroh adds a second listener beside the TCP one, over iroh/QUIC
@@ -31,6 +32,10 @@
 -- sockets. A client that arrives over iroh is an ordinary Client -- same
 -- token handshake, same frames. iroh authenticates the machine, the token
 -- authorises the connection (docs/MULTI_AGENT.md).
+--
+-- --wireguard-config starts the embedded WireGuard (docs/WIREGUARD.md,
+-- agent/wg_service.nelua) from that wireguard.conf: a tunnel whose own
+-- address forwards this agent's port, and whatever else the file forwards.
 require 'string'
 require 'vector'
 require 'stringbuilder'
@@ -45,6 +50,9 @@ require 'agent.logic'
 require 'agent.windows'
 require 'agent.jobs'
 require 'agent.clips'
+require 'agent.wg_service'
+require 'agent.wg_cli'
+require 'agent.tailscale'
 ## if ccinfo.is_windows then
 require 'agent.pty_windows'
 require 'agent.sys_windows'
@@ -82,6 +90,7 @@ local function gi_node_id(out: cstring, cap: csize): int32 <cimport, nodecl> end
 local function gi_listen(allowlist_path: cstring): uint32 <cimport, nodecl> end
 local function gi_accept(listener: uint32): uint32 <cimport, nodecl> end
 local function gi_peer_id(h: uint32, out: cstring, cap: csize): int32 <cimport, nodecl> end
+local function gi_peer_caps(h: uint32): int32 <cimport, nodecl> end
 local function gi_recv(h: uint32, buf: pointer, cap: csize): int32 <cimport, nodecl> end
 local function gi_send(h: uint32, buf: pointer, len: csize): int32 <cimport, nodecl> end
 local function gi_close(h: uint32): void <cimport, nodecl> end
@@ -135,6 +144,17 @@ local Session = @record{
   exit_status: int32,
 }
 
+-- What this client may ask for. Mirrors GI_CAP_* in
+-- crates/ghostty-iroh/include/ghostty_iroh.h; the agent is the only thing that
+-- enforces them, so they are checked in one place (handle_frame) rather than
+-- spread through the modules that would otherwise each have to remember.
+local CAP_RUN: uint32 <comptime> = 1
+local CAP_SHELL: uint32 <comptime> = 2
+local CAP_CLIP_READ: uint32 <comptime> = 4
+local CAP_CLIP_WRITE: uint32 <comptime> = 8
+local CAP_WINDOWS: uint32 <comptime> = 16
+local CAP_ALL: uint32 <comptime> = 31
+
 local Client = @record{
   sock: NetSocket,
   inq: ByteQueue,
@@ -143,6 +163,7 @@ local Client = @record{
   alive: boolean,
   ev: pointer,             -- Windows: the socket's event for the event loop
   ih: uint32,              -- iroh connection handle; 0 means this client is a socket
+  caps: uint32,            -- CAP_*: what the allowlist grants this peer
 }
 
 local Agent = @record{
@@ -164,6 +185,7 @@ local agent: Agent
 local windows: AgentWindows
 local jobs: AgentJobs
 local clips: AgentClips
+local wg: WgService
 
 local function log(msg: string): void
   io.stderr:write('[ghostty-agent] ', msg, '\n')
@@ -345,6 +367,18 @@ local function clipboard_get(): (boolean, string)
   return agent_clipboard_get()
 end
 
+-- Does this WOPEN ask the agent to START something, rather than show a window
+-- that is already up? The match text after the 13-byte head is `run:CMD`,
+-- `app:ID` or `desktop:ID` for a launch (docs/REMOTE_WINDOWS.md); anything
+-- else is a wid or a title to match. Checked here rather than in
+-- agent/windows.nelua so every refusal this agent makes is in one function.
+local WOPEN_HEAD: usize <comptime> = 13
+local function wopen_starts_program(payload: *[0]uint8, len: usize): boolean
+  if len <= WOPEN_HEAD then return false end
+  local text = string{ data = (@*[0]byte)(&payload[WOPEN_HEAD]), size = len - WOPEN_HEAD }
+  return text:subview(1, 4) == 'run:' or text:subview(1, 4) == 'app:' or text:subview(1, 8) == 'desktop:'
+end
+
 local function send_opened_error(c: *Client, why: string): void
   proto.write_frame_id(&c.outq, PROTO_OPENED, 0, (@*[0]uint8)(why.data), why.size)
 end
@@ -463,6 +497,14 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     local text = sb:promote()
     send_text(c, PROTO_LISTR, text)
     text:destroy()
+  elseif typ == PROTO_CLIP_SET and (c.caps & CAP_CLIP_WRITE) == 0 then
+    -- CLIP_SET writes the host's clipboard; CLIP_GET reads it. They are
+    -- separate grants because letting a peer paste into this machine and
+    -- letting it read what is on this machine are different things to agree
+    -- to, and `clipboard=read` is the common one.
+    send_text(c, PROTO_ERR, 'not permitted: this peer may not set the clipboard')
+  elseif typ == PROTO_CLIP_GET and (c.caps & CAP_CLIP_READ) == 0 then
+    send_text(c, PROTO_ERR, 'not permitted: this peer may not read the clipboard')
   elseif typ == PROTO_CLIP_SET then
     if len <= CLIP_MAX and clipboard_set(payload, len) then
       ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
@@ -478,6 +520,14 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     text:destroy()
   elseif typ == PROTO_HELLO then
     send_text(c, PROTO_OK, 'already authenticated')
+  elseif typ == PROTO_OPEN and (c.caps & CAP_SHELL) == 0 then
+    -- `shell=no`: the line docs/MULTI_AGENT.md calls the difference between a
+    -- window server and a remote shell service.
+    send_opened_error(c, 'not permitted: this peer may not open a shell')
+  elseif typ == PROTO_WOPEN and (c.caps & CAP_WINDOWS) == 0 then
+    send_text(c, PROTO_ERR, 'not permitted: this peer may not see windows')
+  elseif typ == PROTO_WOPEN and (c.caps & CAP_RUN) == 0 and wopen_starts_program(payload, len) then
+    send_text(c, PROTO_ERR, 'not permitted: this peer may not start programs')
   elseif jobs:handle(ci, &c.outq, typ, payload, len) then
     -- a raw job frame (agent/jobs.nelua)
   elseif windows:handle(ci, &c.outq, typ, payload, len) then
@@ -667,6 +717,8 @@ local function windows_cap(ms: integer): integer
   if w >= 0 and w < ms then ms = w end
   local j = jobs:wait_ms()
   if j >= 0 and j < ms then ms = j end
+  local g = wg:wait_ms(os.now())
+  if g >= 0 and g < ms then ms = g end
   return ms
 end
 
@@ -732,7 +784,15 @@ local function iroh_accept_all(): void
     -- net.close in client_close, socket_fd in the poll build-up -- is a
     -- no-op rather than a wrong fd. Unauthenticated like any other client:
     -- the PROTO_HELLO token still has to arrive (docs/MULTI_AGENT.md).
-    local cl: Client = { sock = net.invalid(), alive = true, ih = h }
+    -- The allowlist's grants for this key. A negative answer means the
+    -- library cannot say, and the header is explicit that a caller which
+    -- cannot tell must refuse rather than assume: no capabilities at all.
+    local caps: uint32 = 0
+    ## if IROH_BUILT then
+    local rc = gi_peer_caps(h)
+    if rc >= 0 then caps = (@uint32)(rc) end
+    ## end
+    local cl: Client = { sock = net.invalid(), alive = true, ih = h, caps = caps }
     agent.clients:push(cl)
     local pbuf: [80]uint8
     local pn = gi_peer_id(h, (@cstring)((@pointer)(&pbuf)), #pbuf)
@@ -848,8 +908,25 @@ local function open_url_client(listen_spec: string, token_path: string, url: str
   ## end
 end
 
+-- --allow-insecure-listen: every connection is logged with where it came from.
+local function log_connection(c: NetSocket): void
+  local from = net.peer_address(c)
+  local sb: stringbuilder
+  sb:write('connection in the clear from ', #from > 0 and from or 'an unknown address')
+  local msg = sb:promote()
+  log(msg)
+  msg:destroy()
+  from:destroy()
+end
+
 local function main(): integer
   agent_sys_init()
+  if #arg >= 1 and arg[1] == 'wg' then -- `ghostty-agent wg ...` (agent/wg_cli.nelua)
+    local default_token = agent_default_token_path()
+    local r = wg_cli(2, default_token)
+    default_token:destroy()
+    return r
+  end
   local listen_spec: string = '127.0.0.1:7777'
   local token_path: string = ''
   local windows_name: string = 'auto'
@@ -864,6 +941,9 @@ local function main(): integer
   local iroh_on = false             -- --iroh: listen over iroh as well as TCP
   local iroh_secret: string = ''    -- --iroh-secret PATH: empty means an ephemeral key
   local iroh_allowlist: string = '' -- --iroh-allowlist PATH: empty means any peer, token only
+  local wg_config: string = ''      -- --wireguard-config: the file (default: wireguard.conf beside the token)
+  local wg_mode: string = 'auto'    -- --wireguard: auto, on, off or always (docs/WIREGUARD.md)
+  local insecure_listen = false     -- --allow-insecure-listen
   agent.replay_bytes = 256 * 1024
   agent.term = 'xterm-256color'
   agent.next_id = 1
@@ -885,10 +965,14 @@ local function main(): integer
     elseif a == '--wayland-socket' and i < #arg then wayland_socket = arg[i+1] i = i + 1 -- Linux compositor only
     elseif a == '--xkb-layout' and i < #arg then xkb_layout = arg[i+1] i = i + 1
     elseif a == '--wayland-render-node' and i < #arg then render_node = arg[i+1] i = i + 1 -- PATH, auto, gpu or none
+    elseif a == '--wireguard-config' and i < #arg then wg_config = arg[i+1] i = i + 1
+    elseif a == '--wireguard' and i < #arg then wg_mode = arg[i+1] i = i + 1
+    elseif a == '--allow-insecure-listen' then insecure_listen = true
     elseif a == '--help' or a == '-h' then
-      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME] [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|gpu|none] [--wayland-browser CMD] [--wayland-browser-profile NAME]\n',
+      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME] [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|gpu|none] [--wayland-browser CMD] [--wayland-browser-profile NAME] [--wireguard auto|on|off|always] [--wireguard-config PATH] [--allow-insecure-listen]\n',
                '                     [--iroh] [--iroh-secret PATH] [--iroh-allowlist PATH]\n',
-               '       ghostty-agent [--listen HOST:PORT] [--token-file PATH] --open-url URL\n')
+               '       ghostty-agent [--listen HOST:PORT] [--token-file PATH] --open-url URL\n',
+               '       ghostty-agent wg add NAME [--endpoint HOST[:PORT]] | list | show | remove NAME | forward ... | unforward ...\n')
       return 0
     else
       io.stderr:write('unknown argument: ', a, '\n')
@@ -898,8 +982,31 @@ local function main(): integer
   end
   if has_open_url then return open_url_client(listen_given and listen_spec or '', token_path, open_url) end
   if #token_path == 0 then token_path = agent_default_token_path() end
-  agent.token = read_token_file(token_path)
+  if wg_mode ~= 'auto' and wg_mode ~= 'on' and wg_mode ~= 'off' and wg_mode ~= 'always' then
+    io.stderr:write('--wireguard takes auto, on, off or always\n')
+    return 2
+  end
   local host, port = agent_parse_hostport(listen_spec)
+  -- The protocol is not encrypted: loopback, or a tailnet address with
+  -- Tailscale running, and nothing else unless someone insists
+  -- (docs/WIREGUARD.md "Selection").
+  local ts: Tailscale
+  ts:detect()
+  do
+    local ok, why = listen_allowed(host, &ts)
+    if not ok then
+      if not insecure_listen then
+        io.stderr:write('ghostty-agent: refusing to listen on ', listen_spec, ': ', why, '.\n',
+          'Listen on loopback and reach it through the built-in WireGuard (ghostty-agent wg add NAME),\n',
+          'through your tailnet address if this machine runs Tailscale, or through ssh -L.\n',
+          '--allow-insecure-listen listens there anyway.\n')
+        return 2
+      end
+      log('WARNING: listening on ' .. listen_spec .. ' in the clear (--allow-insecure-listen): ' .. why ..
+          '. Anyone who can reach it and read the token has a shell as you.')
+    end
+  end
+  agent.token = read_token_file(token_path)
   agent.listen_sock = net.listen(host, port)
   if not net.is_valid(agent.listen_sock) then
     log('cannot listen on ' .. listen_spec)
@@ -961,7 +1068,18 @@ local function main(): integer
   if nonce == 0 then nonce = 1 end
   do
     local sb: stringbuilder
-    sb:writef('ghostty-agent %d %d', PROTO_VERSION, nonce)
+    -- The platform is the agent's, and the client cannot infer it: under Wine
+    -- the plugin is Windows while the agent it talks to is the Linux or macOS
+    -- host, so anything chosen from the plugin's own platform runs the wrong
+    -- command here (tools that did picked cmd.exe and got status 127).
+    ## if ccinfo.is_windows then
+    local plat: string <comptime> = 'windows'
+    ## elseif ccinfo.is_apple then
+    local plat: string <comptime> = 'macos'
+    ## else
+    local plat: string <comptime> = 'linux'
+    ## end
+    sb:writef('ghostty-agent %d %d %s', PROTO_VERSION, nonce, plat)
     agent.hello = sb:promote()
   end
   ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
@@ -977,6 +1095,51 @@ local function main(): integer
   end
   jobs:init(client_queue, log) -- raw jobs (docs/JOBS.md); they run as this user
   clips.queue_of, clips.log_fn, clips.next_cid = client_queue, log, 1 -- clips of the game (docs/CAPTURE.md)
+  -- the embedded WireGuard (docs/WIREGUARD.md "Selection"): only when
+  -- Tailscale is not here, unless always
+  if #wg_config > 0 and wg_mode == 'auto' then wg_mode = 'on' end -- naming the file asks for it
+  local wg_path = #wg_config > 0 and wg_config:copy() or wg_default_config_path(token_path)
+  local wg_start = false
+  if wg_mode == 'always' then
+    wg_start = true
+    if ts.detected then log('wireguard: starting although Tailscale is here (' .. ts.why .. '), as --wireguard always asks') end
+  elseif wg_mode ~= 'off' then
+    local have, text = wg_read_file(wg_path)
+    local peers = have and text:find('[Peer]', 1, true) > 0
+    crypto.wipe(text.data, text.size)
+    text:destroy()
+    if ts.detected and (wg_mode == 'on' or peers) then
+      local addr = ts:address()
+      log('Tailscale detected (' .. ts.why .. '): WireGuard not started. To reach this agent from another machine, listen on your tailnet address: --listen ' ..
+          (#addr > 0 and addr or 'YOUR-TAILNET-ADDRESS') .. ':' .. tostring(port) .. ' (or --wireguard always)')
+      addr:destroy()
+    elseif wg_mode == 'on' then
+      wg_start = true
+      if not have then -- a key and addresses to start from; `ghostty-agent wg add` adds peers
+        local fresh: WgConfig
+        if not wg_init_config(&fresh, WG_DEFAULT_PORT) or not fresh:save(wg_path) then
+          log('wireguard: cannot make ' .. wg_path) return 2
+        end
+        fresh:destroy()
+        log('wireguard: made ' .. wg_path .. '; add a peer with `ghostty-agent wg add NAME`')
+      end
+    elseif peers then
+      wg_start = true
+    end
+  end
+  if wg_start then
+    -- refuse to start rather than run without the tunnel someone asked for
+    local cfg: WgConfig
+    local ok, why = cfg:load(wg_path)
+    if not ok then log(wg_path .. ': ' .. why) return 2 end
+    wg.log = log
+    local started, err = wg:start(&cfg, port)
+    cfg:destroy()
+    if not started then log('wireguard: ' .. err) return 2 end
+    wg:watch(wg_path) -- peers and forwards follow the file
+  end
+  wg_path:destroy()
+  ts:destroy()
 
   ## if ccinfo.is_windows then
   local listen_ev = winloop_watch(agent.listen_sock, true)
@@ -1003,6 +1166,7 @@ local function main(): integer
         if s.pty:exiting() then exiting = true end
       end
     end
+    wanted = wanted + wg:wait_handles(&handles, &n, WINLOOP_MAX_HANDLES) -- the tunnel and its forwards
     if wanted > WINLOOP_MAX_HANDLES and not overflow_logged then
       overflow_logged = true
       log('more handles than one wait takes; polling every 50 ms while that lasts')
@@ -1011,9 +1175,11 @@ local function main(): integer
     -- everything is pumped below: events from now on signal again
     winloop_reset(listen_ev)
     for ci = 0, < #agent.clients do winloop_reset(agent.clients[ci].ev) end
+    wg:reset_events()
 
     local c = net.accept(agent.listen_sock)
     while net.is_valid(c) do
+      if insecure_listen then log_connection(c) end
       local cl: Client = { sock = c, alive = true, ev = winloop_watch(c, false) }
       if cl.ev == nilptr then
         log('cannot watch a new connection; closing it')
@@ -1023,6 +1189,7 @@ local function main(): integer
       end
       c = net.accept(agent.listen_sock)
     end
+    wg:pump(os.now())
     for ci = 0, < #agent.clients do pump_client(ci) end
     for si = 0, < #agent.sessions do pump_session(si) end
     windows:pump()
@@ -1071,6 +1238,23 @@ local function main(): integer
         if n < 512 then fds[n] = { fd = jfds[k], events = POLLIN } n = n + 1 end
       end
     end
+    do -- a camera frame still going into its fifo (agent/clips.nelua)
+      local cfds: [8]cint
+      local cn = clips:poll_fds(&cfds, 8)
+      for k = 0, < cn do
+        if n < 512 then fds[n] = { fd = cfds[k], events = POLLOUT } n = n + 1 end
+      end
+    end
+    do -- the embedded WireGuard: its UDP socket and its forwards' sockets
+      local gfds: [256]WgPollFd
+      local gn = wg:poll_fds((@*[0]WgPollFd)(&gfds[0]), 256)
+      for k = 0, < gn do
+        local ev: cshort = 0
+        if gfds[k].read then ev = POLLIN end
+        if gfds[k].write then ev = ev | POLLOUT end
+        if n < 512 and ev ~= 0 then fds[n] = { fd = gfds[k].fd, events = ev } n = n + 1 end
+      end
+    end
     ## if IROH_BUILT then
     -- One fd for the whole endpoint. Nothing dispatches on it: it only keeps
     -- poll() from sleeping through an arrival, and the sweep below runs every
@@ -1088,10 +1272,14 @@ local function main(): integer
 
     local c = net.accept(agent.listen_sock)
     while net.is_valid(c) do
-      local cl: Client = { sock = c, alive = true }
+      -- No allowlist on the socket path: the token is the whole
+      -- authorisation there, as it was before grants existed.
+      if insecure_listen then log_connection(c) end
+      local cl: Client = { sock = c, alive = true, caps = CAP_ALL }
       agent.clients:push(cl)
       c = net.accept(agent.listen_sock)
     end
+    wg:pump(os.now())
     for ci = 0, < #agent.clients do pump_client(ci) end
     for si = 0, < #agent.sessions do pump_session(si) end
     windows:pump()
@@ -1114,6 +1302,7 @@ local function main(): integer
     gi_shutdown()
   end
   ## end
+  wg:stop() -- keys wiped, forwards closed
   jobs:shutdown() -- jobs are not orphaned behind the agent, kept or not
   ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
   capture_wayland_shutdown() -- apps launched into the compositor are ended, not orphaned

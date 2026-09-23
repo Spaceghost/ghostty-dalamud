@@ -114,6 +114,16 @@ gi_handle gi_accept(gi_handle listener);
 /* Writes the peer's NodeId + NUL. cap >= 65 (64 characters plus the NUL). */
 int32_t gi_peer_id(gi_handle h, char *out, size_t cap);
 
+/* What the allowlist grants this peer. Negative is a GI_E*; a caller that
+   cannot tell must refuse rather than assume. With no allowlist every bit is
+   set, which is what the agent warns about at startup. */
+#define GI_CAP_RUN        (1u << 0)  /* start a program: run:, app:, desktop: */
+#define GI_CAP_SHELL      (1u << 1)  /* open a PTY session */
+#define GI_CAP_CLIP_READ  (1u << 2)
+#define GI_CAP_CLIP_WRITE (1u << 3)
+#define GI_CAP_WINDOWS    (1u << 4)  /* list and stream windows */
+int32_t gi_peer_caps(gi_handle h);
+
 /* ---- data ------------------------------------------------------------ */
 
 /*

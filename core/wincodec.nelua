@@ -88,7 +88,136 @@ end
 
 -- Scaling --------------------------------------------------------------------
 
--- Shrink a w x h frame by the smallest integer factor that fits max_w x max_h
+-- The size a w x h frame is sent at: the largest that fits max_w x max_h
+-- (0: no limit that way) with the window's aspect ratio. Never larger than
+-- the window, never below 1 x 1; the side that does not decide is rounded to
+-- the nearest pixel, which cannot take it past its own limit.
+global function wincodec_fit(w: integer, h: integer, max_w: integer, max_h: integer): (integer, integer)
+  if w <= 0 or h <= 0 then return w, h end
+  local over_w = max_w > 0 and w > max_w
+  local over_h = max_h > 0 and h > max_h
+  if not over_w and not over_h then return w, h end
+  -- the tighter limit decides: max_w / w <= max_h / h
+  if over_w and (not over_h or max_w * h <= max_h * w) then
+    return max_w, math.clamp((2 * h * max_w + w) // (2 * w), 1, h)
+  end
+  return math.clamp((2 * w * max_h + h) // (2 * h), 1, w), max_h
+end
+
+-- One axis of n source pixels shown as m (m <= n). In units where output
+-- pixel i covers [i*n, (i+1)*n) and source pixel j covers [j*m, (j+1)*m),
+-- output pixel i takes source pixels first..last: the two ends weighted by
+-- their overlap, every one between them by m, all adding up to n.
+local AxisTap = @record{ first: int32, last: int32, wfirst: uint32, wlast: uint32 }
+
+local function axis_taps(n: integer, m: integer, taps: *vector(AxisTap)): void
+  taps:resize((@usize)(m))
+  for i = 0, < m do
+    local a, b = i * n, (i + 1) * n
+    local first, last = a // m, (b - 1) // m
+    local t = &taps[i]
+    t.first, t.last = (@int32)(first), (@int32)(last)
+    if first == last then
+      t.wfirst, t.wlast = (@uint32)(n), 0
+    else
+      t.wfirst, t.wlast = (@uint32)((first + 1) * m - a), (@uint32)(b - last * m)
+    end
+  end
+end
+
+-- Source row `p` averaged across into `row` (3 sums per output pixel, in
+-- units of n = the source width).
+local function row_taps(p: *[0]uint8, taps: *[0]AxisTap, ow: usize, m: uinteger, row: *[0]uinteger): void
+  local r: usize = 0
+  for ox: usize = 0, < ow do
+    local t = &taps[ox]
+    local f = (@usize)(t.first) * 4
+    local wf = (@uinteger)(t.wfirst)
+    local sb, sg, sr = wf * p[f], wf * p[f+1], wf * p[f+2]
+    if t.last > t.first then
+      local ib: uinteger, ig: uinteger, ir: uinteger = 0, 0, 0
+      local e = (@usize)(t.last) * 4
+      local x = f + 4
+      while x < e do
+        ib = ib + p[x] ig = ig + p[x+1] ir = ir + p[x+2]
+        x = x + 4
+      end
+      local wl = (@uinteger)(t.wlast)
+      sb = sb + m * ib + wl * p[e]
+      sg = sg + m * ig + wl * p[e+1]
+      sr = sr + m * ir + wl * p[e+2]
+    end
+    row[r], row[r+1], row[r+2] = sb, sg, sr
+    r = r + 3
+  end
+end
+
+-- Shrink a w x h frame to wincodec_fit's size by area averaging: each output
+-- pixel is the mean of the source area it covers, the source pixels cut by
+-- its edges weighted by how much of them it covers. The weights are exact
+-- integers, so a flat colour stays exactly that colour and no ratio is
+-- favoured. Returns (scaled, out_w, out_h). Not scaled: nothing is written,
+-- use `src` as it is; otherwise `out` holds out_w x out_h pixels, stride
+-- out_w * 4, alpha 255.
+global function wincodec_downscale_fit(src: *[0]uint8, stride: usize, w: integer, h: integer,
+                                       max_w: integer, max_h: integer, out: *vector(uint8)): (boolean, integer, integer)
+  local ow, oh = wincodec_fit(w, h, max_w, max_h)
+  if ow == w and oh == h then return false, w, h end
+  out:resize((@usize)(ow * oh * 4))
+  local o = (@*[0]uint8)(&out[0])
+  local xt: vector(AxisTap)
+  local yt: vector(AxisTap)
+  axis_taps(w, ow, &xt)
+  axis_taps(h, oh, &yt)
+  -- one source row averaged across (units of w), and the output row being
+  -- summed from those (units of w * h). A source row cut by the edge between
+  -- two output rows is averaged once and used by both.
+  local rowv: vector(uinteger)
+  local accv: vector(uinteger)
+  rowv:resize((@usize)(ow * 3))
+  accv:resize((@usize)(ow * 3))
+  local row, acc = (@*[0]uinteger)(&rowv[0]), (@*[0]uinteger)(&accv[0])
+  local xtp = (@*[0]AxisTap)(&xt[0])
+  local n3 = (@usize)(ow) * 3
+  local mw = (@uinteger)(ow)
+  local mh = (@uinteger)(oh)
+  -- dividing by w * h as a multiply: the sums stay below 2^53, so this is the
+  -- exact mean give or take one rounding, and a flat colour comes out exact
+  local inv = 1.0 / ((@float64)(w) * (@float64)(h))
+  local have = -1 -- the source row `row` holds
+  for oy = 0, < oh do
+    local t = yt[oy]
+    for k: usize = 0, < n3 do acc[k] = 0 end
+    for y = (@integer)(t.first), (@integer)(t.last) do
+      local wy: uinteger = mh
+      if y == (@integer)(t.first) then wy = t.wfirst elseif y == (@integer)(t.last) then wy = t.wlast end
+      if y ~= have then
+        row_taps((@*[0]uint8)(&src[(@usize)(y) * stride]), xtp, (@usize)(ow), mw, row)
+        have = y
+      end
+      for k: usize = 0, < n3 do acc[k] = acc[k] + wy * row[k] end
+    end
+    local d = (@*[0]uint8)(&o[(@usize)(oy * ow) * 4])
+    local a: usize, i: usize = 0, 0
+    for _ = 0, < ow do
+      d[i] = (@uint8)((@float64)(acc[a]) * inv + 0.5)
+      d[i+1] = (@uint8)((@float64)(acc[a+1]) * inv + 0.5)
+      d[i+2] = (@uint8)((@float64)(acc[a+2]) * inv + 0.5)
+      d[i+3] = 255
+      a, i = a + 3, i + 4
+    end
+  end
+  xt:destroy()
+  yt:destroy()
+  rowv:destroy()
+  accv:destroy()
+  return true, ow, oh
+end
+
+-- The older scaler, kept as it was for callers that map input by a whole
+-- factor (the netlab publisher): wincodec_downscale_fit above is the one
+-- that fills the limit. Shrink a w x h frame by the smallest integer factor
+-- that fits max_w x max_h
 -- (0: no limit that way), each output pixel the average of its factor x
 -- factor box (fewer at the right and bottom edges, so nothing is cut off).
 -- Returns (factor, out_w, out_h). Factor 1: nothing is written, use `src` as
@@ -121,6 +250,24 @@ global function wincodec_downscale(src: *[0]uint8, stride: usize, w: integer, h:
     end
   end
   return f, ow, oh
+end
+
+-- A coordinate in a frame sent at `out_size` pixels, in pixels of the window
+-- (`size`): the centre of the frame pixel it names, clamped to the window.
+-- Input comes back through this, so a click lands where it was drawn.
+global function wincodec_unscale(v: integer, out_size: integer, size: integer): integer
+  if out_size > 0 and size > 0 and out_size ~= size then v = ((2 * v + 1) * size) // (2 * out_size) end
+  if size > 0 then v = math.clamp(v, 0, size - 1) end
+  return v
+end
+
+-- The span [v, v + n) of window pixels (window `size`) in the pixels of a
+-- frame sent at `out_size`: every frame pixel it touches. Returns (v, n).
+global function wincodec_scale_span(v: integer, n: integer, size: integer, out_size: integer): (integer, integer)
+  if size <= 0 or out_size == size then return v, n end
+  local a = (v * out_size) // size
+  local b = -((-(v + n) * out_size) // size) -- rounded up
+  return a, b - a
 end
 
 -- QOI ------------------------------------------------------------------------

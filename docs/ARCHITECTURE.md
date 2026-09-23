@@ -486,6 +486,7 @@ core/sys/     net (POSIX + Winsock), conpty (Windows), procguard, fs / fsbase, p
 core/shaders/ HLSL sources and the committed DXBC the core embeds
 agent/        ghostty-agent PTY server (Nelua): agent.nelua, logic, pty_posix / sys_posix, pty_windows / sys_windows / winloop
 agent/        raw jobs (docs/JOBS.md): jobs.nelua, job_posix / job_windows, claude.nelua (the Claude Code command line)
+agent/        embedded WireGuard (docs/WIREGUARD.md): crypto.nelua (Monocypher), blake2s.nelua, wg_proto (constants, replay window, addresses), wg_device (handshake, transport, cookies, timers), wg_udp (the socket), wg_netstack (lwIP inside the tunnel and the loopback forwards), wg_config (wireguard.conf), wg_service (all of it in the agent's loop), wg_cli and wg_qr (`ghostty-agent wg`), tailscale (detection and the listen rule)
 lua/          shipped policy: init.lua, keymap.lua, migrate.lua, assistant.lua (/term ask), selftest.lua (/term selftest), ...
 themes/       shipped colour themes (Ghostty theme files, read by lua/themes.lua)
 shim/         GhosttyDalamud (plugin) and Umbra.Ghostty (widget) C# projects
@@ -517,6 +518,11 @@ them (`tools/wayland-flags.sh`); without them it builds without the Linux
 window backend. Dalamud's ImGui uses 16-bit
 `ImWchar` (verified against `Dalamud.Bindings.ImGui`'s generated `ImGuiIO`),
 so `InputQueueCharacters` holds BMP code points.
+
+The agent's embedded WireGuard (docs/WIREGUARD.md) adds three vendored C
+libraries, each pinned by sha256: Monocypher 4.0.2, lwIP 2.2.1 and Nayuki's QR
+Code generator 1.8.0. `tools/fetch-vendor.sh` fetches them in both modes, since
+the agent compiles them in.
 
 ## Contributing constraints and tests
 
@@ -559,6 +565,11 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_agent_logic` | the agent's pure parts: OPEN parsing, replay plans, ring indexes, CRLF for the Windows clipboard, env entries, default shells, the Windows wait timeout, command line quoting |
 | `test_capture_win32` | the Win32 window capture backend's pure parts: USB HID → virtual key, key message lParams, the characters keys stand for, mouse and wheel words, SendInput absolute coordinates, blank (all-black) captures, UTF-8 → UTF-16 for WM_CHAR, WLISTR lines, window matching |
 | `test_agent` | `ghostty-agent` end to end over TCP |
+| `test_wg_crypto` | the embedded WireGuard's primitives (docs/WIREGUARD.md): BLAKE2s against RFC 7693 (Appendix B and the Appendix E self-test), HMAC-BLAKE2s and the KDF against Python's hashlib/hmac, X25519 against RFC 7748 (and the all-zero result refused), ChaCha20-Poly1305 against RFC 8439 (tampering, in place, WireGuard's nonce form, empty messages), XChaCha20-Poly1305 against draft-irtf-cfrg-xchacha, base64 keys as wg(8) writes them |
+| `test_wg` | the WireGuard protocol (agent/wg_device.nelua) between two devices on a fake network with a fake clock: the handshake started by data, data both ways, replays and the window, tampering and silence (garbage, a wrong MAC1, the all-zero DH result, junk that does not decrypt), cryptokey routing (IPv4 and IPv6), keepalives, rekey on time and on message count, roaming (and no roaming on forged datagrams), a replayed initiation, the 20 ms initiation rate, cookies under load, retransmission and giving up, keys wiped after 540 s, the responder dialling with a persistent keepalive, removing a peer. `tools/wg-interop.sh` runs the same code against kernel WireGuard in another Incus container |
+| `test_wg_netstack` | TCP and UDP inside the tunnel (agent/wg_netstack.nelua, lwIP): a game-side connection through two WireGuard devices and two lwIP interfaces to a real echo server on loopback, 32 MB each way with the reader paused (the agent side holds at most the 256 KiB TCP window), half-close both ways, a local port that refuses (reset in the tunnel), a port that is not forwarded (refused), a spoofed source, and a UDP forward with its flow |
+| `test_wg_config` | wireguard.conf (agent/wg_config.nelua): every key, case-insensitive keys, ranges and interface addresses, the text written back and read again, each refusal with its line, the file private (0600) and replaced whole; a running WgService following the file: a peer added and one renamed in place, a forward added and dropped, a broken file keeping what runs, a removed peer gone, a new address restarting the device, the status file |
+| `test_wg_cli` | `ghostty-agent wg` on the agent just built: add (the client config, the plugin line with the token, a QR code, the client's key kept nowhere), unique names, list, forward sunshine, unforward a range, remove, show; the client config read back by our parser and paired with the agent's key; the QR modules; Tailscale's ranges and the listen rule (loopback, tailnet addresses only with Tailscale, the rest refused); the agent refusing `--listen 0.0.0.0` and a bad `--wireguard` |
 | `test_wincodec` | remote window frames: changed tiles, QOI both ways, banding, WFRAME write/parse/apply, malformed input, downscaling |
 | `test_capture_mac` | the macOS capture backend's pure parts: HID to kVK keycodes, key flags, mouse event types and click counts, frame pixels to global points, the Block literal layout, `run:APP`, window picking and WLISTR lines, UTF-16 text chunks, CGImage layouts to BGRA (the backend itself has never run on a Mac) |
 | `test_agent_windows` | remote windows end to end over TCP against `--windows test`: list, open by id and match, KEY and delta frames rebuilt, scaling, flow control, every input kind, close, WEND, failures, streams per connection, `--windows off` |
