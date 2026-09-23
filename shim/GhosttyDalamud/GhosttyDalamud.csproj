@@ -30,10 +30,15 @@
     <RestorePackagesWithLockFile>true</RestorePackagesWithLockFile>
     <Deterministic>true</Deterministic>
     <EnableDefaultNoneItems>false</EnableDefaultNoneItems>
+    <!-- KamiToolKit.dll beside the plugin: a class library does not copy its packages otherwise -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
   </PropertyGroup>
 
   <ItemGroup>
     <PackageReference Include="DalamudPackager" Version="15.0.0" PrivateAssets="all" />
+    <!-- Terminals in game windows (NativeWindows.cs, docs/NATIVE_UI.md): native addons.
+         MIT, github.com/MidoriKami/KamiToolKit; 2.2.48 is the version XivDesktop ships for Dalamud API 15. -->
+    <PackageReference Include="KamiToolKit" Version="[2.2.48]" />
     <GhosttyLua Include="../../lua/*.lua" />
     <None Include="GhosttyDalamud.json" CopyToOutputDirectory="PreserveNewest" />
     <None Include="../../build/dist/ghostty_core.dll" Link="ghostty_core.dll" CopyToOutputDirectory="PreserveNewest" />
