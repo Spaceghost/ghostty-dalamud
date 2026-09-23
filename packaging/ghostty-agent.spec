@@ -40,7 +40,7 @@
 %global clamp_mtime_to_source_date_epoch 1
 
 Name:           ghostty-agent
-Version:        0.3.1.2
+Version:        0.3.1.3
 Release:        1%{?dist}
 %if %{with wayland}
 Summary:        PTY server and desktop-window compositor for the Ghostty Dalamud plugin
