@@ -13,6 +13,7 @@ set up .NET, restore caches and call it.
 | the same, when `CI_SELF_HOSTED` is `true`; never a fork | `ci.yml` → `self-hosted` | the same stages on the self-hosted runner | nothing uploaded; it is a second opinion, not the artifact |
 | every push and pull request | `ci.yml` → `ingame-dryrun` | `tools/ci/run.sh ingame-dryrun` | pass/fail only; see [The dry run](#the-dry-run) |
 | tag `v*` | `release.yml` | `tools/ci/run.sh all` | GitHub Release for the tag with `build/release/*` (plugin zip, pluginmaster JSON, `SHA256SUMS`) and notes from the changelog |
+| `ci.yml` green on a push to `master`; never forks or pull requests | `testing-channel.yml` → `cut`, then `release.yml` called with the tag | `tools/releasekit.py auto-test`, then `tools/ci/run.sh all` | the next `vX.Y.Z-test.N` tag (a version-only commit on top of the green commit) and its release on the testing channel; see [RELEASING.md](RELEASING.md#the-testing-channel-fills-itself) |
 | push to `master`, manual; never pull requests or forks | `ingame.yml` → `ingame` | ci.yml's artifact of the commit, then `tools/ci/run.sh ingame` on the gaming PC after the owner approves | artifact `ingame-report-<sha>-<attempt>` (kept 30 days); see [In-game tests](#in-game-tests) |
 | manual with `dry_run` | `ingame.yml` → `dry-run` | `tools/ci/run.sh ingame-dryrun` on a GitHub-hosted runner | pass/fail; no game, no secret, no runner |
 
@@ -27,7 +28,9 @@ never cancelled.
 
 `ci.yml` and `release.yml` run with the default `GITHUB_TOKEN` only. `ci.yml` has
 `contents: read`; `release.yml` has `contents: write` on its one job, which is
-what creating the release needs. `ingame.yml` has `contents: read` and
+what creating the release needs. `testing-channel.yml` has `contents: write` to push
+the test tag, handed to git through the environment for that one step, never kept in
+`.git/config`. `ingame.yml` has `contents: read` and
 `actions: read` and one secret, `XIVMCP_CI_TOKEN`, stored in the `ffxiv-live`
 environment. Actions are pinned by commit SHA. No workflow uses
 `pull_request_target`.
@@ -536,9 +539,10 @@ password manager sessions), not just the two folders and the network.
 
 ## Cutting a release
 
-Run `tools/release.sh test` or `tools/release.sh stable X.Y.Z`; it checks, bumps the
-version, tags, pushes, waits for `release.yml` and verifies the result. Nobody tags by
-hand. [RELEASING.md](RELEASING.md) has the whole of it.
+Testing builds cut themselves after each green push to `master`
+(`testing-channel.yml`). Run `tools/release.sh test` for one in between, or
+`tools/release.sh stable X.Y.Z`; it checks, bumps the version, tags, pushes, waits for
+`release.yml` and verifies the result. Nobody tags by hand. [RELEASING.md](RELEASING.md) has the whole of it.
 
 ### The two channels, and the plugin repository
 

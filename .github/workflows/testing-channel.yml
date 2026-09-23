@@ -1,0 +1,94 @@
+# The testing channel fills itself. When CI passes on a commit pushed to master, cut the
+# next test build of exactly that commit and publish it through release.yml:
+#
+#   1. `tools/releasekit.py auto-test` makes a `Release vX.Y.Z-test.N` commit on top of
+#      the green commit, changing only the version files, tags it and pushes the tag.
+#      master is never written to, so there is no bot commit to loop CI or to fight
+#      branch protection, and the next build counts on from the tags.
+#   2. release.yml builds, tests and publishes that tag, and moves the floating `testing`
+#      release onto it. It is called from here because a tag pushed with the workflow
+#      token starts no workflow of its own.
+#
+# Nothing is cut when the commit is already in the newest build (the CI run of a
+# `Release` commit that tools/release.sh pushed, or a run that finished after a newer
+# one), or when nothing but release commits landed since. The notes list every commit
+# merged since the previous test build and since the last stable release, beside the
+# changelog's entries.
+#
+# One run at a time, in the order CI finished, so builds are published oldest first; a
+# newer merge waiting behind a running one replaces an older one still waiting, and is
+# then cut with both. Stable releases stay manual: `tools/release.sh stable X.Y.Z`.
+# Set the repository variable TESTING_CHANNEL_AUTO to "false" to stop this without
+# editing the file. See docs/RELEASING.md.
+name: Testing channel
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [master]
+
+permissions: {}
+
+concurrency:
+  group: testing-channel
+  cancel-in-progress: false
+
+jobs:
+  cut:
+    # a push to master of this repository whose CI passed; never a fork, never a PR
+    if: >-
+      github.repository == 'Spaceghost/ghostty-dalamud' &&
+      vars.TESTING_CHANNEL_AUTO != 'false' &&
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'push' &&
+      github.event.workflow_run.head_branch == 'master' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # push the test tag, and nothing else
+    outputs:
+      tag: ${{ steps.cut.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0 # every tag, and master, to count builds and list what merged
+          persist-credentials: false
+
+      # The token reaches git for this step only, through the environment: nothing is
+      # written into .git/config for a later step to find.
+      - name: Cut the next test build of this commit
+        id: cut
+        env:
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          auth="$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)"
+          echo "::add-mask::$auth"
+          export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http.https://github.com/.extraheader \
+            GIT_CONFIG_VALUE_0="AUTHORIZATION: basic $auth"
+          tools/releasekit.py auto-test --sha "$SHA" --push
+
+      - name: Say what was cut
+        env:
+          TAG: ${{ steps.cut.outputs.tag }}
+          REASON: ${{ steps.cut.outputs.reason }}
+        run: |
+          if [[ -n "$TAG" ]]; then
+            echo "### $TAG" >>"$GITHUB_STEP_SUMMARY"
+            tools/releasekit.py changes "$TAG" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "Nothing to cut: $REASON" >>"$GITHUB_STEP_SUMMARY"
+          fi
+
+  release:
+    needs: cut
+    if: needs.cut.outputs.tag != ''
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ needs.cut.outputs.tag }}
