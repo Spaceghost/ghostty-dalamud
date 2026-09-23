@@ -4,6 +4,7 @@
 -- in the draw list, what they would upload, when the capsule takes over, and
 -- that the capsule and `off` still behave as before.
 require 'core.host'
+require 'tests.check'
 require 'string'
 require 'arg'
 require 'io'
@@ -254,7 +255,7 @@ do
   local fh = io.open('core/shaders/panel_depth.dxbc', 'rb')
   assert(fh:isopen(), 'panel_depth.dxbc')
   local bytes = fh:read('a')
-  fh:close()
+  fh:destroy()
   assert(#bytes == #PANEL_DEPTH_DXBC and bytes:subview(1, 4) == 'DXBC', 'embedded DXBC')
   for i = 0, < #bytes do assert(bytes.data[i] == PANEL_DEPTH_DXBC[i], 'embedded DXBC bytes') end
   bytes:destroy()
@@ -386,7 +387,7 @@ assert(depth_logs == 5, 'each change of reason logged once: four fallbacks and t
 standard_z = true
 f = frame()
 render()
-assert(f.begins == 1 and depthpass.ready, 'a forward-Z camera keeps the depth test: ' .. depthpass.reason)
+check(f.begins == 1 and depthpass.ready, 'a forward-Z camera keeps the depth test: ', depthpass.reason)
 do
   local p = &depthpass.pool[0]
   assert(math.abs(p.v[36] + 0.1) < 1e-6 and math.abs(p.v[23] - 1) < 1e-6, 'ndc z = -0.1 / depth + 1')

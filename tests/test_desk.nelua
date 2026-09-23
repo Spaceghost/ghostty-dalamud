@@ -6,6 +6,7 @@
 -- the default and when the desk cannot be had, the OSC 133 scanner, and
 -- events turning into reactions that return to the hold.
 require 'core.host'
+require 'tests.check'
 require 'string'
 require 'stringbuilder'
 require 'arg'
@@ -23,7 +24,7 @@ do
   assert(w.starts == 2 and w.dones == 2 and w.last_exit == 127, 'ST terminators, extra parameters')
   -- a mark split across reads, byte by byte
   local s = '\27]133;D;2\7'
-  for i = 1, #s do feed(&w, s:sub(i, i)) end
+  for i = 1, #s do local c = s:sub(i, i) feed(&w, c) c:destroy() end
   assert(w.dones == 3 and w.last_exit == 2, 'split across reads')
   feed(&w, '\27]133;D\7')
   assert(w.dones == 4 and w.last_exit == 0, 'D without a status counts as 0')
@@ -122,10 +123,14 @@ local function lua(code: cstring): void
     assert(false, code)
   end
 end
+-- The log since the last take. It stays owned here and is freed by the next
+-- take, so a caller never frees it and must not keep it past that call.
+local taken: string
 local function take(): string
-  local s = alog:promote()
+  taken:destroy()
+  taken = alog:promote()
   alog = {}
-  return s
+  return taken
 end
 local function has(log: string, what: string): boolean return log:find(what, 1, true) > 0 end
 
@@ -205,7 +210,7 @@ lua("CONFIG.animation.enabled = true CONFIG.animation.style = 'desk' CONFIG.anim
 for _ = 1, 3 do frame() end
 toggle(true)
 local l = take()
-assert(has(l, 'set 255 0 9287 0;play 9287;'), 'sits down to work: '..l)
+check(has(l, 'set 255 0 9287 0;play 9287;'), 'sits down to work: ', l)
 assert(desk_want.count == 2, 'asked for a chair and a desk')
 for _ = 1, 5 do frame() end
 assert(creates == 2 and live == 2 and transforms == 0, 'made lazily, not placed while loading')
@@ -246,7 +251,7 @@ assert(base ~= 3 and has(l, 'set 255 0 '), 'guard puts the mood back')
 pc.x = 11
 frame()
 l = take()
-assert(has(l, 'set 255 0 0 0;play 3;'), 'stands up: '..l)
+check(has(l, 'set 255 0 0 0;play 3;'), 'stands up: ', l)
 assert(live == 0 and desk_want.count == 0, 'furniture freed')
 for _ = 1, 10 do frame() end
 assert(live == 0 and creates == 2, 'not back until the terminal opens again')
@@ -352,27 +357,27 @@ mode, param = 11, 2
 toggle(true)
 frame()
 l = take()
-assert(has(l, 'play 7358;') and not has(l, 'set '), 'a chair sit: the chair variant over the sit: '..l)
+check(has(l, 'play 7358;') and not has(l, 'set '), 'a chair sit: the chair variant over the sit: ', l)
 for _ = 1, 60 do frame() end
 l = take()
-assert(not has(l, 'play 7358;'), 'the variant loops by itself, never restarted each guard tick: '..l)
+check(not has(l, 'play 7358;'), 'the variant loops by itself, never restarted each guard tick: ', l)
 param = 1 -- now on the ground
 for _ = 1, 20 do frame() end
 l = take()
-assert(has(l, 'play 7359;'), 'another sit kind: its own variant: '..l)
+check(has(l, 'play 7359;'), 'another sit kind: its own variant: ', l)
 for _ = 1, 60 do frame() end
 l = take()
-assert(not has(l, 'play 7359;'), 'and it too plays once: '..l)
+check(not has(l, 'play 7359;'), 'and it too plays once: ', l)
 toggle(false)
 frame()
 l = take()
-assert(has(l, 'set 11 1 0 1;'), 'put away: the sit replays through SetMode: '..l)
+check(has(l, 'set 11 1 0 1;'), 'put away: the sit replays through SetMode: ', l)
 lua("CONFIG.animation.preset = 'pen'")
 mode, param = 11, 1
 toggle(true)
 frame()
 l = take()
-assert(not has(l, 'play '), 'no seated variant: the character is left sitting: '..l)
+check(not has(l, 'play '), 'no seated variant: the character is left sitting: ', l)
 toggle(false)
 frame()
 lua("CONFIG.animation.preset = 'device' CONFIG.animation.style = CONFIG.animation._style_was")
@@ -408,17 +413,17 @@ host.anim_out = false
 toggle(true)
 frame()
 l = take()
-assert(has(l, 'set 255 0 6302 0;play 6302;'), 'the phone: '..l)
+check(has(l, 'set 255 0 6302 0;play 6302;'), 'the phone: ', l)
 -- a bell: one of the bell reactions, then straight back to the device
 policy_anim_event('bell', t, 1, 0)
 l = take()
-assert(has(l, 'play 665;') or has(l, 'play 618;'), 'bell reaction: '..l)
+check(has(l, 'play 665;') or has(l, 'play 618;'), 'bell reaction: ', l)
 lua("assert(CONFIG.animation.reacting())")
 policy_anim_event('bell', t, 1, 0)
 assert(#take() == 0, 'one reaction at a time')
 for _ = 1, 150 do frame() end
 l = take()
-assert(has(l, 'play 6302;'), 'back to the hold: '..l)
+check(has(l, 'play 6302;'), 'back to the hold: ', l)
 lua("assert(not CONFIG.animation.reacting())")
 policy_anim_event('bell', t, 1, 0)
 assert(#take() == 0, 'bell cooldown')
@@ -427,7 +432,7 @@ t = t + 2
 frame() take()
 policy_anim_event('done', t, 1, 3)
 l = take()
-assert(has(l, 'play 666;') or has(l, 'play 670;') or has(l, 'play 668;') or has(l, 'play 664;'), 'failed: '..l)
+check(has(l, 'play 666;') or has(l, 'play 670;') or has(l, 'play 668;') or has(l, 'play 664;'), 'failed: ', l)
 for _ = 1, 200 do frame() end
 assert(has(take(), 'play 6302;'))
 -- success: only after a long run
@@ -438,7 +443,7 @@ policy_anim_event('done', t, 0, 3)
 assert(#take() == 0, 'a quick success is no news')
 policy_anim_event('done', t, 0, 12)
 l = take()
-assert(has(l, 'play 671;') or has(l, 'play 6216;'), 'long success: '..l)
+check(has(l, 'play 671;') or has(l, 'play 6216;'), 'long success: ', l)
 for _ = 1, 200 do frame() end
 take()
 -- output: a glance only after a quiet spell and when not typing
@@ -446,7 +451,7 @@ t = t + 30
 frame() take()
 policy_anim_event('output', t, 500, 0)
 l = take()
-assert(has(l, 'play 665;') or has(l, 'play 669;'), 'glance after quiet: '..l)
+check(has(l, 'play 665;') or has(l, 'play 669;'), 'glance after quiet: ', l)
 for _ = 1, 150 do frame() end
 take()
 policy_anim_event('output', t, 500, 0)
@@ -510,7 +515,7 @@ frame() take()
 policy_anim_event('bell', t, 1, 0)
 for _ = 1, 150 do frame() end
 l = take()
-assert(has(l, 'play 6303;'), 'seated: back to the seated device: '..l)
+check(has(l, 'play 6303;'), 'seated: back to the seated device: ', l)
 toggle(false)
 mode, param = 1, 0
 print('reactions OK')
@@ -562,4 +567,5 @@ assert(live == 2)
 gu_shutdown()
 assert(live == 0, 'shutdown frees the props')
 for i = 1, creates do paths[i]:destroy() end
+taken:destroy() alog:destroy()
 print('desk OK')

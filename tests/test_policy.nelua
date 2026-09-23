@@ -24,7 +24,7 @@ print('agent', policy.agent.host, policy.agent.port, 'token_file', policy.agent.
 assert(#policy.profiles >= 3)
 for i = 0, < #policy.profiles do
   local p = policy_profile(i)
-  io.write(string.format('profile %d: %s [%s] argv=', i, p.name, p.transport))
+  io.write('profile ', i, ': ', p.name, ' [', p.transport, '] argv=')
   for k = 0, < #p.argv do io.write(p.argv[k], ' ') end
   io.write('\n')
 end
@@ -46,6 +46,7 @@ do
   local shown = 0
   while true do
     local ok, view, send, show = policy_showcase_terminal(n + 1)
+    defer view:destroy() send:destroy() show:destroy() end
     if not ok then break end
     n = n + 1
     assert(#view > 0, 'showcase terminal has a place')
@@ -56,7 +57,7 @@ do
       assert(show:find('[^\r]\n') == 0, 'show text uses CR LF: no line discipline behind it')
       assert(show:find('\27[?25l', 1, true) > 0)
     end
-    print(string.format('showcase %d: %s send=%d show=%d bytes', n, view, #send, #show))
+    io.write('showcase ', n, ': ', view, ' send=', #send, ' show=', #show, ' bytes\n')
   end
   assert(n >= 3 and shown >= 2, 'showcase has shell and local terminals')
   local ok = policy_showcase_shot(1)

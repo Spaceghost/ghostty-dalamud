@@ -479,6 +479,7 @@ if #arg >= 2 then
     io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
     os.exit(1)
   end
+  script:destroy()
   lua_pushlstring(L, (@cstring)(root.data), root.size)
   lua_pushlstring(L, (@cstring)(scratch.data), scratch.size)
   if lua_pcall(L, 2, 0, 0) ~= LUA_OK then

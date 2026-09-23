@@ -132,9 +132,8 @@ do
   wins:push(MacWinInfo{ wid = 43, pid = 12, layer = 0, x = 0, y = 0, w = 8, h = 8, scale = 1, app = 'Tiny', title = 'dot' })
   wins:push(MacWinInfo{ wid = 44, pid = 13, layer = 0, x = 0, y = 0, w = 640, h = 480, scale = 1, app = 'TextEdit', title = '' })
   local text = capmac_list_text(&wins, 99, true, true)
-  assert(text == '0\t0\t0\tlaunch\trun:APP opens an app (open -a) and streams its first window\n'
-              .. '41\t1600\t1200\tSafari\tStart Page\n'
-              .. '44\t640\t480\tTextEdit\t\n')
+  -- one literal: `..` between literals is still a concatenation at run time, never freed
+  assert(text == '0\t0\t0\tlaunch\trun:APP opens an app (open -a) and streams its first window\n41\t1600\t1200\tSafari\tStart Page\n44\t640\t480\tTextEdit\t\n')
   text:destroy()
   text = capmac_list_text(&wins, 99, false, false)
   assert(text:find('no Screen Recording permission', 1, true) > 0)

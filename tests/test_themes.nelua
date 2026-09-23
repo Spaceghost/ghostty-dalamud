@@ -5,6 +5,7 @@
 -- their palette, cursor and selection, and the chrome; tooltip texts come
 -- from lua/tooltips.lua.
 require 'core.policy'
+require 'tests.check'
 require 'core.termview'
 require 'core.render'
 require 'core.selection'
@@ -17,6 +18,7 @@ require 'os'
 require 'arg'
 
 local root: string = arg[1]
+local settings_file = root .. '/settings.lua'
 local scratch: string = arg[2]
 
 -- The Lua side ------------------------------------------------------------------------------
@@ -30,6 +32,7 @@ do
     io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
     os.exit(1)
   end
+  script:destroy()
   lua_pushlstring(L, (@cstring)(root.data), root.size)
   lua_pushlstring(L, (@cstring)(scratch.data), scratch.size)
   if lua_pcall(L, 2, 0, 0) ~= LUA_OK then
@@ -85,7 +88,7 @@ assert(chrome_col(ChromeColor.Accent, 255) == CHROME_GOLD and chrome_col(ChromeC
   'before a theme the chrome is the old constants')
 
 -- spaceghost ----------------------------------------------------------------------------------
-os.remove((@cstring)((root .. '/settings.lua').data))
+os.remove(settings_file)
 if not policy_load(root) then
   io.stderr:write('policy load failed: ', policy.error, '\n')
   os.exit(1)
@@ -188,7 +191,7 @@ do
   w1 = want:promote()
   want:writef('text 0,0 "ab" col=%08x', col32(0xebdbb2))
   w2 = want:promote()
-  assert(out:find(w1, 1, true) > 0 and out:find(w2, 1, true) > 0, 'selection colours:\n' .. out)
+  check(out:find(w1, 1, true) > 0 and out:find(w2, 1, true) > 0, 'selection colours:\n', out)
   out:destroy() w1:destroy() w2:destroy()
   selection_clear(&v, &st)
 
@@ -225,7 +228,7 @@ do
   assert(chrome_col(ChromeColor.Accent, 255) == col32(0x8839ef), 'catppuccin-latte after a reload')
   assert(theme_term.has_cursor_text and same(theme_term.cursor_text, 0xeff1f5))
   policy_unload()
-  os.remove((@cstring)((root .. '/settings.lua').data))
+  os.remove(settings_file)
   assert(policy_load(root) and not chrome_themed(), 'without settings.lua: spaceghost')
   print('reload OK')
 end
@@ -233,5 +236,6 @@ end
 v:destroy()
 before:destroy()
 policy_unload()
-os.remove((@cstring)((root .. '/settings.lua').data))
+os.remove(settings_file)
+settings_file:destroy()
 print('OK')

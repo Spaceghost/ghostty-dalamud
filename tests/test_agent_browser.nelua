@@ -33,11 +33,13 @@ do
   local url = "https://example.org/it's?a=1&b=$(x)"
   local q = "'https://example.org/it'\\''s?a=1&b=$(x)'"
   local c = browser_expand('firefox %u', url, 'Firefox', 'firefox')
-  eq(c, 'firefox ' .. q, 'Exec %u')
-  c:destroy()
+  local want = 'firefox ' .. q
+  eq(c, want, 'Exec %u')
+  c:destroy() want:destroy()
   c = browser_expand('/usr/bin/google-chrome-stable %U', url, 'Chrome', '')
-  eq(c, '/usr/bin/google-chrome-stable ' .. q, 'Exec %U')
-  c:destroy()
+  want = '/usr/bin/google-chrome-stable ' .. q
+  eq(c, want, 'Exec %U')
+  c:destroy() want:destroy()
   c = browser_expand('flatpak run --branch=stable --arch=x86_64 --command=firefox --file-forwarding org.mozilla.firefox @@u %u @@', 'https://x.org', 'Firefox', '')
   eq(c, "flatpak run --branch=stable --arch=x86_64 --command=firefox --file-forwarding org.mozilla.firefox @@u 'https://x.org' @@", 'Flatpak Exec')
   c:destroy()

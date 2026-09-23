@@ -93,7 +93,7 @@ local function exists(name: string): boolean
   local f = io.open(p, 'rb')
   p:destroy()
   if not f:isopen() then return false end
-  f:close()
+  f:destroy()
   return true
 end
 local function write_atomic(name: string, content: string): void
@@ -102,7 +102,7 @@ local function write_atomic(name: string, content: string): void
   local f = io.open(tmp, 'wb')
   assert(f:isopen(), 'open temp file')
   f:write(content)
-  f:close()
+  f:destroy()
   local ok = os.rename(tmp, p)
   assert(ok, 'rename')
   tmp:destroy() p:destroy()
@@ -111,7 +111,7 @@ local function read_file(path: string): string
   local f = io.open(path, 'rb')
   assert(f:isopen(), 'read core')
   local c = f:read('a')
-  f:close()
+  f:destroy()
   return c
 end
 local function sleep_s(s: number): void usleep((@cuint)(s * 1000000)) end

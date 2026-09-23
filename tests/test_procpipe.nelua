@@ -11,6 +11,7 @@
 -- checks live in tests/smoke_procpipe_windows.nelua (cross-compiled for
 -- Windows, run there by hand).
 require 'core.sys.procpipe'
+require 'tests.check'
 require 'string'
 require 'stringbuilder'
 require 'vector'
@@ -78,12 +79,12 @@ do
   -- back as rows of its own width
   local out, code, exited = run('i=0; while [ $i -lt 400 ]; do printf 0123456789; i=$((i+1)); done; printf "\\n"', (@string){})
   assert(exited and code == 0, 'the child exited cleanly')
-  assert(#out == 4001, 'got ' .. #out .. ' bytes, wanted 4001')
-  assert(out:sub(4001, 4001) == '\n', 'one newline, at the end')
+  check(#out == 4001, 'wanted 4001 bytes, got ', #out)
+  assert(out:subview(4001, 4001) == '\n', 'one newline, at the end')
   assert(out:find('\r', 1, true) == 0, 'no CR was added') -- string.find gives 0 when there is none
   for i = 1, 4000 do
-    local c = out:sub(i, i)
-    assert(c >= '0' and c <= '9', 'byte ' .. i .. ' is not a digit: ' .. c)
+    local c = out:subview(i, i)
+    check(c >= '0' and c <= '9', 'not a digit at byte ', i)
   end
   out:destroy()
 end
@@ -93,14 +94,14 @@ end
 do
   local out, code, exited = run('printf "out\\n"; printf "err\\n" >&2', (@string){})
   assert(exited and code == 0)
-  assert(out:find('out\n', 1, true) ~= 0 and out:find('err\n', 1, true) ~= 0, 'both streams: ' .. out)
+  check(out:find('out\n', 1, true) ~= 0 and out:find('err\n', 1, true) ~= 0, 'both streams: ', out)
   out:destroy()
 end
 
 -- the exit status reaches the caller (the panel prints it)
 do
   local out, code, exited = run('exit 7', (@string){})
-  assert(exited and code == 7, 'status 7, got ' .. code)
+  check(exited and code == 7, 'status 7, got ', code)
   out:destroy()
 end
 
@@ -117,7 +118,7 @@ do
     if p:poll_exit() then exited = true break end
     usleep(5000)
   end
-  assert(exited and p.exit_code == 127, 'status 127, got ' .. p.exit_code)
+  check(exited and p.exit_code == 127, 'status 127, got ', p.exit_code)
   p:close()
 end
 
@@ -143,7 +144,7 @@ do
     end
   end
   local out = sb:promote()
-  assert(out == msg, 'cat gave back what was written: [' .. out .. ']')
+  check(out == msg, 'cat gave back what was written: ', out)
   out:destroy()
   p:close()
 end

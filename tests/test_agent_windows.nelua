@@ -4,6 +4,7 @@
 -- the test backend's own pixels, downscaling, flow control, every WINPUT
 -- kind, WCLOSE, WEND, failures, and streams staying with their connection.
 require 'core.sys.net'
+require 'tests.check'
 require 'core.protocol'
 require 'core.wincodec'
 require 'agent.capture' -- capture_test_render: the pixels the agent's test backend draws
@@ -247,7 +248,7 @@ local c1 = conn_open()
 -- WLIST
 do
   local text = wlist(&c1)
-  print('WLISTR:', (text:gsub('\t', ' '):gsub('\n', ' | ')))
+  do local tabs = text:gsub('\t', ' ') local shown = tabs:gsub('\n', ' | ') print('WLISTR:', shown) shown:destroy() tabs:destroy() end
   assert(text == '1\t320\t200\ttest\tpattern one\n2\t64\t48\ttest\tpattern two\n3\t96\t64\ttest\tclosing\n4\t16\t16\ttest\tstatus: 0 open\n',
     'the test backend\'s windows')
   text:destroy()
@@ -417,7 +418,7 @@ end
 -- WCLOSE: the stream stops and its handle closes
 do
   local before = status_line(&c1)
-  assert(before == 'status: 2 open', 'streams 1 and 2 are open, the rest closed: ' .. before)
+  check(before == 'status: 2 open', 'streams 1 and 2 are open, the rest closed: ', before)
   send_sid(&c1, PROTO_WCLOSE, sid1)
   local after = status_line(&c1)
   assert(after == 'status: 1 open', 'WCLOSE closes the capture')
@@ -514,7 +515,7 @@ do
   assert(sb2 == sa, 'a second link names the stream that shows the browser already')
   settle(&c, 0.2)
   local text = last_list(&w, 0.3)
-  print('watcher list:', (text:gsub('\t', ' '):gsub('\n', ' | ')))
+  do local tabs = text:gsub('\t', ' ') local shown = tabs:gsub('\n', ' | ') print('watcher list:', shown) shown:destroy() tabs:destroy() end
   local line2 = text:find('2\t64\t48\ttest\tpattern two', 1, true)
   assert(line2 > 0 and text:find('\traise:2\n', line2, true) > 0 and text:find('\traise:2\n', line2, true) < text:find('\n', line2, true) + 1,
     'watchers see the window raised, once per link')
@@ -523,7 +524,8 @@ do
   assert(okl:find('\tsid:', okl:find('2\t64\t48\ttest\tpattern two', 1, true), true) > 0 and okl:find('\tsid:', okl:find('\tsid:', 1, true) + 1, true) == 0,
     'one stream of the link window for that connection')
   okl:destroy()
-  local _, sw = wopen(&w, 0, 0, 0, 0, 'url:https://example.org/c')
+  local _, sw, _, _, tw = wopen(&w, 0, 0, 0, 0, 'url:https://example.org/c')
+  tw:destroy()
   assert(sw ~= 0 and sw ~= sa, 'a link of another connection is its own stream')
   local text2 = last_list(&w, 0.3)
   assert(text2:find('raise:3', 1, true) == 0 and text2:find('raise:2', 1, true) > 0, 'a watcher\'s own link raises nothing')

@@ -1,0 +1,11 @@
+-- An assert whose message carries a runtime value, for the host tests.
+--
+-- `assert(ok, 'what: ' .. detail)` builds its message before it checks, and
+-- with -P nogc nothing frees that string: under SAN=asan every such assert
+-- is a leak LeakSanitizer reports. check() builds the message only when it
+-- fails. `detail` is anything `..` takes: a string or a number.
+require 'string'
+
+global function check(ok: boolean, msg: string, detail: auto): void
+  if not ok then error(msg .. detail) end
+end

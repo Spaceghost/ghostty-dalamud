@@ -144,17 +144,22 @@ do
   assert(#err == 0, 'known preset')
   ok, st = policy_bell_style(1)
   assert(ok and st.rings == 1 and near(st.max_radius, 5.5), 'sonar preset')
+  err:destroy()
   err = policy_bell_command('nope')
   assert(#err > 0, 'unknown preset explains usage')
+  err:destroy()
   local shown = 0
   for i = 1, 10 do
     local more, label = policy_bell_demo(i)
+    local named = #label > 0
+    label:destroy()
     if not more then break end
-    assert(#label > 0)
+    assert(named)
     shown = shown + 1
   end
   assert(shown == 5, 'demo shows every preset once')
   err = policy_bell_command('ripple')
+  err:destroy()
   print('bell presets OK')
   assert(luaL_loadstring(L, 'CONFIG.bell.enabled = false') == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
   ok = policy_bell_style(1)
