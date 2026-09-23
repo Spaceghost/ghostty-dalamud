@@ -44,6 +44,7 @@ global DropdownCfg = @record{
 global AgentCfg = @record{
   host: string,
   port: integer,
+  node: string,          -- an iroh NodeId; set, it is used instead of host:port
   token: string,
   token_file: string,
 }
@@ -472,11 +473,13 @@ global function policy_unload(): void
   policy.agent.host:destroy()
   policy.agent.token:destroy()
   policy.agent.token_file:destroy()
+  policy.agent.node:destroy()
   for i = 0, < #policy.agents do
     policy.agents[i].name:destroy()
     policy.agents[i].cfg.host:destroy()
     policy.agents[i].cfg.token:destroy()
     policy.agents[i].cfg.token_file:destroy()
+    policy.agents[i].cfg.node:destroy()
   end
   policy.agents:destroy()
   policy.windows.open_at:destroy()
@@ -600,6 +603,8 @@ end
   policy.agent.port = lua_field_integer(L, a, 'port', 7777)
   policy.agent.token = lua_field_string(L, a, 'token', '')
   policy.agent.token_file = lua_field_string(L, a, 'token_file', '')
+  policy.agent.node:destroy()
+  policy.agent.node = lua_field_string(L, a, 'node', '')
   lua_pop(L, 1)
 
   -- CONFIG.agents = { fedora = { host = ..., port = ..., token_file = ... } }
@@ -610,6 +615,7 @@ end
     policy.agents[i].cfg.host:destroy()
     policy.agents[i].cfg.token:destroy()
     policy.agents[i].cfg.token_file:destroy()
+    policy.agents[i].cfg.node:destroy()
   end
   policy.agents:clear()
   lua_getfield(L, t, 'agents')
@@ -638,6 +644,7 @@ end
           entry.cfg.port = lua_field_integer(L, e, 'port', 7777)
           entry.cfg.token = lua_field_string(L, e, 'token', '')
           entry.cfg.token_file = lua_field_string(L, e, 'token_file', '')
+          entry.cfg.node = lua_field_string(L, e, 'node', '')
           policy.agents:push(entry)
         end
       end
