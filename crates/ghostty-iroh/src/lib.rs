@@ -223,6 +223,20 @@ pub unsafe extern "C" fn gi_peer_id(h: Handle, out: *mut c_char, cap: usize) -> 
     })
 }
 
+/// What the allowlist grants this peer: GI_CAP_* bits, or a negative GI_E* for
+/// a stale handle. A caller that cannot tell must refuse, not assume.
+///
+/// Everything is granted when there is no allowlist, which is what the agent
+/// already warns about at startup: a file that does not exist restricts
+/// nobody.
+#[no_mangle]
+pub extern "C" fn gi_peer_caps(h: Handle) -> i32 {
+    with_node(GI_EHANDLE, |n| match n.peer_caps(h) {
+        Some(c) => c as i32,
+        None => GI_EHANDLE,
+    })
+}
+
 // ---------------------------------------------------------------------------
 // data
 // ---------------------------------------------------------------------------

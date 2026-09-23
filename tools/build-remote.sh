@@ -160,13 +160,24 @@ push_source() {
   # flock is held for the clear and the unpack together: releasing between them
   # would leave a window where $D exists but is empty.
   "$INCUS" exec "$C" -- bash -c "mkdir -p $D $BUILD_CONTAINER_CACHE"
-  # `flock LOCK cmd args`, not `flock -c 'string'`: the -c form adds a quoting
-  # level that mangled this command and killed the tar mid-stream ("gzip:
-  # stdin: unexpected end of file"). This form runs bash directly and leaves
-  # stdin -- the incoming archive -- alone.
-  tar -C "$ROOT" --null -T "$list" -czf - | "$INCUS" exec "$C" -- \
+  # Two steps, and the split is the point: the archive streams in while NO lock
+  # is held, then the lock is taken to swap the tree over from that file.
+  #
+  # Holding the lock across the stream does not work, and fails in a way that
+  # looks like corruption rather than contention: the sender starts piping
+  # immediately while the receiver is still blocked waiting for the lock, the
+  # pipe fills, and the transfer dies with "gzip: stdin: unexpected end of
+  # file" / "tar: Unexpected EOF". Measured by another session whose push was
+  # queued behind one of mine on the same lock.
+  #
+  # The unpack still has to be locked, together with the clear: releasing
+  # between them leaves a window where $D exists and is empty, which is the
+  # clobber this is here to prevent.
+  local staged="$BUILD_CONTAINER_CACHE/push-$$.tgz"
+  tar -C "$ROOT" --null -T "$list" -czf - | "$INCUS" exec "$C" -- bash -c "cat > $staged"
+  "$INCUS" exec "$C" -- \
     flock -o -w "${BUILD_LOCK_WAIT:-7200}" "$BUILD_CONTAINER_CACHE/build.lock" \
-    bash -c "find $D -mindepth 1 -maxdepth 1 ! -name build ! -name vendor -exec rm -rf {} + && tar -xzf - -C $D"
+    bash -c "find $D -mindepth 1 -maxdepth 1 ! -name build ! -name vendor -exec rm -rf {} + && tar -xzf $staged -C $D; rm -f $staged"
   rm -f "$list"
   # the shared cache: vendor checkouts and every reusable build directory live
   # on the Incus volume, so a second container on this host starts warm

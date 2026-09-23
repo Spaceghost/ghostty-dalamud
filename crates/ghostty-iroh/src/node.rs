@@ -14,7 +14,7 @@
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering, AtomicU32};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -138,6 +138,10 @@ struct ConnState {
     tx: Mutex<Option<mpsc::UnboundedSender<Vec<u8>>>>,
     tx_len: AtomicUsize,
     peer: Mutex<Option<String>>,
+    /// What the allowlist grants this peer (GI_CAP_*). Everything for a
+    /// connection we opened, and for an accepted one with no allowlist -- a
+    /// file that does not exist cannot restrict anybody.
+    caps: AtomicU32,
     closing: AtomicBool,
     closed: Notify,
     wake: Arc<Wakeup>,
@@ -154,6 +158,7 @@ impl ConnState {
             tx: Mutex::new(None),
             tx_len: AtomicUsize::new(0),
             peer: Mutex::new(None),
+            caps: AtomicU32::new(GI_CAP_ALL),
             closing: AtomicBool::new(false),
             closed: Notify::new(),
             wake,
@@ -363,11 +368,15 @@ impl Node {
                             return;
                         }
                     };
+                    let mut caps = GI_CAP_ALL;
                     if let Some(list) = &allowed2 {
-                        if !list.iter().any(|a| *a == peer) {
-                            // GI_EREFUSED at the transport, before any frame.
-                            conn.close(4u32.into(), b"not allowlisted");
-                            return;
+                        match list.iter().find(|(a, _)| *a == peer) {
+                            Some((_, c)) => caps = *c,
+                            None => {
+                                // GI_EREFUSED at the transport, before any frame.
+                                conn.close(4u32.into(), b"not allowlisted");
+                                return;
+                            }
                         }
                     }
                     let (send, recv) = match conn.accept_bi().await {
@@ -376,6 +385,7 @@ impl Node {
                     };
                     let st = ConnState::new(wake2.clone(), 1);
                     *st.peer.lock().unwrap() = Some(peer.to_string());
+                    st.caps.store(caps, Ordering::Relaxed);
                     spawn_io(st.clone(), conn, send, recv);
                     ls2.pending.lock().unwrap().push_back(st);
                     wake2.signal();
@@ -407,6 +417,12 @@ impl Node {
 
     pub fn peer_id(&self, h: Handle) -> Option<String> {
         self.conn(h)?.peer.lock().unwrap().clone()
+    }
+
+    /// GI_CAP_* for this connection, or None for a stale handle. A caller that
+    /// cannot tell must not assume: the agent refuses rather than granting.
+    pub fn peer_caps(&self, h: Handle) -> Option<u32> {
+        Some(self.conn(h)?.caps.load(Ordering::Relaxed))
     }
 
     // -- data --------------------------------------------------------------
@@ -695,7 +711,59 @@ pub fn parse_node_id(s: &str) -> Option<NodeId> {
     s.trim().parse::<NodeId>().ok()
 }
 
-fn read_allowlist(p: &Path) -> std::io::Result<Vec<NodeId>> {
+/// What one allowlisted peer may do. Bits, so the agent can carry them on a
+/// client and the ABI can pass them as one integer.
+///
+/// Default is everything, because that is what an allowlist entry meant before
+/// grants existed and a file written then must keep working. A peer that
+/// should only be shown windows is written `run=no shell=no`, which is the
+/// setting docs/MULTI_AGENT.md calls the difference between a window server
+/// and a remote shell service.
+pub const GI_CAP_RUN: u32 = 1 << 0; // start a program (run:, app:, desktop:)
+pub const GI_CAP_SHELL: u32 = 1 << 1; // open a PTY session
+pub const GI_CAP_CLIP_READ: u32 = 1 << 2; // read the host clipboard
+pub const GI_CAP_CLIP_WRITE: u32 = 1 << 3; // write it
+pub const GI_CAP_WINDOWS: u32 = 1 << 4; // list and stream windows
+pub const GI_CAP_ALL: u32 = GI_CAP_RUN | GI_CAP_SHELL | GI_CAP_CLIP_READ | GI_CAP_CLIP_WRITE | GI_CAP_WINDOWS;
+
+fn truthy(v: &str) -> bool {
+    matches!(v, "1" | "yes" | "true" | "on")
+}
+
+/// `<node id> [key=value ...]`, `#` comments. Keys: run, shell, windows
+/// (yes/no) and clipboard (none/read/write/both). An unknown key is an error
+/// rather than a silent grant: a typo in a security file must not read as
+/// permission.
+fn parse_caps(rest: &str) -> Result<u32, String> {
+    let mut caps = GI_CAP_ALL;
+    for word in rest.split_whitespace() {
+        let (k, v) = match word.split_once('=') {
+            Some(kv) => kv,
+            None => return Err(format!("want key=value, got {word}")),
+        };
+        let on = truthy(v);
+        match k {
+            "run" => caps = if on { caps | GI_CAP_RUN } else { caps & !GI_CAP_RUN },
+            "shell" => caps = if on { caps | GI_CAP_SHELL } else { caps & !GI_CAP_SHELL },
+            "windows" => caps = if on { caps | GI_CAP_WINDOWS } else { caps & !GI_CAP_WINDOWS },
+            "clipboard" => {
+                caps &= !(GI_CAP_CLIP_READ | GI_CAP_CLIP_WRITE);
+                match v {
+                    "none" | "no" => {}
+                    "read" => caps |= GI_CAP_CLIP_READ,
+                    "write" => caps |= GI_CAP_CLIP_WRITE,
+                    "both" | "yes" => caps |= GI_CAP_CLIP_READ | GI_CAP_CLIP_WRITE,
+                    _ => return Err(format!("clipboard: want none|read|write|both, got {v}")),
+                }
+            }
+            "name" => {} // for whoever reads the file
+            _ => return Err(format!("unknown key {k}")),
+        }
+    }
+    Ok(caps)
+}
+
+fn read_allowlist(p: &Path) -> std::io::Result<Vec<(NodeId, u32)>> {
     let text = std::fs::read_to_string(p)?;
     let mut out = Vec::new();
     for line in text.lines() {
@@ -703,15 +771,23 @@ fn read_allowlist(p: &Path) -> std::io::Result<Vec<NodeId>> {
         if line.is_empty() {
             continue;
         }
-        match parse_node_id(line) {
-            Some(id) => out.push(id),
+        let (id_text, rest) = match line.split_once(char::is_whitespace) {
+            Some((a, b)) => (a, b),
+            None => (line, ""),
+        };
+        let id = match parse_node_id(id_text) {
+            Some(id) => id,
             None => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
-                    format!("bad node id: {line}"),
+                    format!("bad node id: {id_text}"),
                 ))
             }
-        }
+        };
+        let caps = parse_caps(rest).map_err(|e| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, format!("{id_text}: {e}"))
+        })?;
+        out.push((id, caps));
     }
     Ok(out)
 }

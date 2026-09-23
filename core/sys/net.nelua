@@ -726,9 +726,14 @@ end
 function net.node_id(): string
   ## if NET_IROH then
     if not iroh_ensure() then return string.copy('') end
-    local buf: [64]cchar
+    -- 80, not 64: the id is 64 characters and needs room for the NUL, and
+    -- gi_node_id refuses a buffer that cannot hold both. Passing #buf rather
+    -- than a literal is what stops the two drifting apart again -- this bug
+    -- was fixed in agent/agent.nelua and left here, which is how the Agents
+    -- window came to report "no iroh endpoint yet" on a core that had one.
+    local buf: [80]cchar
     buf[0] = 0
-    if gi_node_id((@cstring)(&buf), 64) < 0 then return string.copy('') end
+    if gi_node_id((@cstring)(&buf), #buf) < 0 then return string.copy('') end
     return string.copy((@string)((@cstring)(&buf)))
   ## else
     return string.copy('')
@@ -739,9 +744,10 @@ end
 function net.peer_id(s: NetSocket): string
   ## if NET_IROH then
     if is_iroh(s) then
-      local buf: [64]cchar
+      -- 80 and #buf, for the same reason as net.node_id above.
+      local buf: [80]cchar
       buf[0] = 0
-      if gi_peer_id(iroh_of(s), (@cstring)(&buf), 64) < 0 then return string.copy('') end
+      if gi_peer_id(iroh_of(s), (@cstring)(&buf), #buf) < 0 then return string.copy('') end
       return string.copy((@string)((@cstring)(&buf)))
     end
   ## end
