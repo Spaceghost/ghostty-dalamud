@@ -27,7 +27,8 @@ INC=(-I"$ROOT/vendor/ghostty/include" -I"$ROOT/vendor/gc-cimgui" -I"$ROOT/vendor
 # headers, so their own warnings are not ours; lwipopts.h is generated into
 # the Nelua cache by agent/wg_netstack.nelua.
 INC_CPPCHECK=("${INC[@]}") # cppcheck knows no -isystem; it leaves vendored headers alone
-INC+=(-isystem "$ROOT/vendor/monocypher/src" -isystem "$ROOT/vendor/lwip/src/include" -isystem "$OUT/nelua/lwip-port")
+INC+=(-isystem "$ROOT/vendor/monocypher/src" -isystem "$ROOT/vendor/lwip/src/include" -isystem "$OUT/nelua/lwip-port"
+  -isystem "$ROOT/vendor/qrcodegen")
 UNITS=(core/host:host core/loader:loader agent/agent:agent)
 update=0; steps=()
 for a in "$@"; do if [[ "$a" == --update ]]; then update=1; else steps+=("$a"); fi; done
