@@ -9,8 +9,8 @@ set up .NET, restore caches and call it.
 | Trigger | Workflow, job | Runs | Output |
 | --- | --- | --- | --- |
 | every push and pull request | `ci.yml` → `source-checks` | `python3 -m unittest discover -s tests` (portability, identity tooling) | pass/fail in seconds; needs no toolchain |
-| push to any branch, manual; never in a fork | `ci.yml` → `self-hosted` | `tools/ci/run.sh test build` in a one-shot container on the fedora build host (image `ci-runner-ghostty`) | artifact `ghostty-dalamud-<sha>` = `build/dist/` (kept 14 days) |
-| pull request from a fork, any run inside a fork, and everything while `CI_SELF_HOSTED` is `false` | `ci.yml` → `hosted` | the same stages on a GitHub-hosted runner | artifact `ghostty-dalamud-<sha>` |
+| push to any branch, manual, started by the repository owner; never in a fork | `ci.yml` → `self-hosted` | `tools/ci/run.sh test build` in a one-shot container on the fedora build host (image `ci-runner-ghostty`) | artifact `ghostty-dalamud-<sha>` = `build/dist/` (kept 14 days) |
+| a run anyone else starts, pull request from a fork, any run inside a fork, and everything while `CI_SELF_HOSTED` is `false` | `ci.yml` → `hosted` | the same stages on a GitHub-hosted runner | artifact `ghostty-dalamud-<sha>` |
 | every push and pull request | `ci.yml` → `ingame-dryrun` | `tools/ci/run.sh ingame-dryrun` | pass/fail only; see [The dry run](#the-dry-run) |
 | tag `v*` | `release.yml` | `tools/ci/run.sh all` | GitHub Release for the tag with `build/release/*` (plugin zip, pluginmaster JSON, `SHA256SUMS`) and notes from the changelog |
 | push to `master`, manual; never pull requests or forks | `ingame.yml` → `ingame` | ci.yml's artifact of the commit, then `tools/ci/run.sh ingame` on the gaming PC after the owner approves | artifact `ingame-report-<sha>-<attempt>` (kept 30 days); see [In-game tests](#in-game-tests) |
