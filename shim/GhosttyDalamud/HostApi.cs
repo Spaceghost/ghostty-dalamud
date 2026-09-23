@@ -863,11 +863,11 @@ internal static unsafe class HostApi
                     foreach (var o in Plugin.Objects) {
                         if (o == null || o.Address == me.Address) continue;
                         var k = o.ObjectKind;
-                        if (k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Player
+                        if (k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc
                             && k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.BattleNpc
                             && k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.EventNpc
                             && k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Companion) continue;
-                        if (!o.IsTargetable && k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Player) continue;
+                        if (!o.IsTargetable && k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc) continue;
                         float dx = o.Position.X - at.X, dz = o.Position.Z - at.Z;
                         float d = MathF.Sqrt(dx * dx + dz * dz);
                         if (d > NearbyReach) continue;
@@ -876,7 +876,7 @@ internal static unsafe class HostApi
                             Radius = MathF.Max(o.HitboxRadius, 0.3f), EntityId = o.GameObjectId,
                             Height = ((FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)o.Address)->Height,
                             Kind = k switch {
-                                Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Player => 1,
+                                Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc => 1,
                                 Dalamud.Game.ClientState.Objects.Enums.ObjectKind.BattleNpc => 2,
                                 Dalamud.Game.ClientState.Objects.Enums.ObjectKind.EventNpc => 3,
                                 _ => 4,
