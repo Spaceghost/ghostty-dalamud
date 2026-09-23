@@ -204,7 +204,7 @@ end
 
 -- "run:NAME" (spaces around NAME trimmed): true and a copy of NAME.
 global function capmac_parse_run(match: string): (boolean, string)
-  if #match < 4 or match:sub(1, 4) ~= 'run:' then return false, (@string){} end
+  if #match < 4 or match:subview(1, 4) ~= 'run:' then return false, (@string){} end
   local i, j = 5, #match
   while i <= j and (match.data[i-1] == ' '_b or match.data[i-1] == '\t'_b) do i = i + 1 end
   while j >= i and (match.data[j-1] == ' '_b or match.data[j-1] == '\t'_b) do j = j - 1 end
@@ -227,7 +227,7 @@ end
 global function capmac_app_is(app: string, name: string): boolean
   local a, b = app:lower(), name:lower()
   local n = #b
-  if n > 4 and b:sub(-4) == '.app' then n = n - 4 end
+  if n > 4 and b:subview(-4) == '.app' then n = n - 4 end
   local same = #a == n and memory.equals(a.data, b.data, (@usize)(n))
   a:destroy()
   b:destroy()

@@ -181,9 +181,10 @@ global function claude_parse_opts(text: string): (boolean, ClaudeOpts, string)
     end
     i = skip_ws(text, ni)
     if i > #text or text:byte(i) ~= 58 then -- ':'
+      local why = 'claude options: expected ":" after ' .. key -- before key is freed
       o:destroy()
       key:destroy()
-      return false, (@ClaudeOpts){}, string.copy('claude options: expected ":" after ' .. key)
+      return false, (@ClaudeOpts){}, why
     end
     i = skip_ws(text, i + 1)
     local bad = false

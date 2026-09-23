@@ -2,6 +2,7 @@
 -- snapping and stretch-to-fit against a fake collision scene, the drag gesture,
 -- and the drop turning any anchor into a world pin through lua/world.lua.
 require 'core.world'
+require 'tests.check'
 require 'core.policy'
 require 'string'
 require 'math'
@@ -92,9 +93,9 @@ local function check_pose(nx: float32, ny: float32, nz: float32, ax: float32, az
   nx, ny, nz = nx / l, ny / l, nz / l
   local yaw, pitch = world_pose_from_normal(nx, ny, nz, ax, az)
   local a = world_axes(yaw, pitch)
-  assert(near(a.nx, nx, 1e-4) and near(a.ny, ny, 1e-4) and near(a.nz, nz, 1e-4), what .. ': front faces the normal')
+  check(near(a.nx, nx, 1e-4) and near(a.ny, ny, 1e-4) and near(a.nz, nz, 1e-4), what, ': front faces the normal')
   local al = math.sqrt(ax * ax + az * az)
-  assert(a.uy + (a.ux * ax + a.uz * az) / al > 0, what .. ': reads upright')
+  check(a.uy + (a.ux * ax + a.uz * az) / al > 0, what, ': reads upright')
   return yaw, pitch
 end
 
@@ -652,7 +653,9 @@ do
   policy_world_save(&entries)
   entries:destroy()
   assert(lua_ok('local s = dofile(GHOSTTY_PLUGIN_DIR .. "/world-state.lua")[9001] assert(s.kind == "world" and s.zone == 132 and math.abs(s.pitch - 1.2) < 1e-4)'), 'saved as a world pin')
-  os.remove(root .. '/world-state.lua')
+  local state = root .. '/world-state.lua'
+  os.remove(state)
+  state:destroy()
 
   -- another zone hides it; unknown terminals report an error
   territory = 133

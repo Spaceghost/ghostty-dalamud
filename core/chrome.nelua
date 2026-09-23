@@ -283,67 +283,67 @@ end
 
 -- Draw `icon` centred on (cx, cy) in a button `size` pixels square.
 global function chrome_draw_icon(dl: *ImDrawList, icon: ChromeIcon, cx: float32, cy: float32, size: float32, col: uint32, hole: uint32): void
-  local r = size * 0.28
-  local t = math.max(size * 0.07, 1.5)
+  local r = size * 0.28_f32
+  local t = math.max(size * 0.07_f32, 1.5_f32)
   if icon == ChromeIcon.Plus then
     imgui.DrawListAddLine(dl, vec2(cx - r, cy), vec2(cx + r, cy), col, t)
     imgui.DrawListAddLine(dl, vec2(cx, cy - r), vec2(cx, cy + r), col, t)
   elseif icon == ChromeIcon.Chevron or icon == ChromeIcon.Hide then
     -- down: more below; up: slide away
     local d: float32 = icon == ChromeIcon.Chevron and 1 or -1
-    local pts: [3]ImVec2 = { vec2(cx - r * 0.8, cy - r * 0.35 * d), vec2(cx, cy + r * 0.45 * d), vec2(cx + r * 0.8, cy - r * 0.35 * d) }
+    local pts: [3]ImVec2 = { vec2(cx - r * 0.8_f32, cy - r * 0.35_f32 * d), vec2(cx, cy + r * 0.45_f32 * d), vec2(cx + r * 0.8_f32, cy - r * 0.35_f32 * d) }
     imgui.DrawListAddPolyline(dl, &pts[0], 3, col, 0, t)
   elseif icon == ChromeIcon.Window then
-    imgui.DrawListAddRect(dl, vec2(cx - r, cy - r * 0.8), vec2(cx + r, cy + r * 0.8), col, 2, 0, t * 0.85)
-    imgui.DrawListAddRectFilled(dl, vec2(cx - r, cy - r * 0.8), vec2(cx + r, cy - r * 0.8 + t * 1.8), col, 2, ImDrawFlags_RoundCornersTop)
+    imgui.DrawListAddRect(dl, vec2(cx - r, cy - r * 0.8_f32), vec2(cx + r, cy + r * 0.8_f32), col, 2, 0, t * 0.85_f32)
+    imgui.DrawListAddRectFilled(dl, vec2(cx - r, cy - r * 0.8_f32), vec2(cx + r, cy - r * 0.8_f32 + t * 1.8_f32), col, 2, ImDrawFlags_RoundCornersTop)
   elseif icon == ChromeIcon.Pin then
-    imgui.DrawListAddTriangleFilled(dl, vec2(cx - r * 0.42, cy - r * 0.05), vec2(cx + r * 0.42, cy - r * 0.05), vec2(cx, cy + r), col)
-    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy - r * 0.35), r * 0.6, col, 16)
-    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy - r * 0.35), r * 0.24, hole, 12)
+    imgui.DrawListAddTriangleFilled(dl, vec2(cx - r * 0.42_f32, cy - r * 0.05_f32), vec2(cx + r * 0.42_f32, cy - r * 0.05_f32), vec2(cx, cy + r), col)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy - r * 0.35_f32), r * 0.6_f32, col, 16)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy - r * 0.35_f32), r * 0.24_f32, hole, 12)
   elseif icon == ChromeIcon.Paw then
-    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy + r * 0.38), r * 0.46, col, 16)
-    imgui.DrawListAddCircleFilled(dl, vec2(cx - r * 0.72, cy - r * 0.08), r * 0.2, col, 10)
-    imgui.DrawListAddCircleFilled(dl, vec2(cx - r * 0.27, cy - r * 0.55), r * 0.21, col, 10)
-    imgui.DrawListAddCircleFilled(dl, vec2(cx + r * 0.27, cy - r * 0.55), r * 0.21, col, 10)
-    imgui.DrawListAddCircleFilled(dl, vec2(cx + r * 0.72, cy - r * 0.08), r * 0.2, col, 10)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy + r * 0.38_f32), r * 0.46_f32, col, 16)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx - r * 0.72_f32, cy - r * 0.08_f32), r * 0.2_f32, col, 10)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx - r * 0.27_f32, cy - r * 0.55_f32), r * 0.21_f32, col, 10)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx + r * 0.27_f32, cy - r * 0.55_f32), r * 0.21_f32, col, 10)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx + r * 0.72_f32, cy - r * 0.08_f32), r * 0.2_f32, col, 10)
   elseif icon == ChromeIcon.Minimize then
-    imgui.DrawListAddLine(dl, vec2(cx - r, cy + r * 0.55), vec2(cx + r, cy + r * 0.55), col, t * 1.1)
+    imgui.DrawListAddLine(dl, vec2(cx - r, cy + r * 0.55_f32), vec2(cx + r, cy + r * 0.55_f32), col, t * 1.1_f32)
   elseif icon == ChromeIcon.Gear then
     -- a wheel with square teeth and a hole
     for k = 0, < 8 do
       local a = (@float32)(k) * (@float32)(math.pi) / 4
       local ux, uy = (@float32)(math.cos(a)), (@float32)(math.sin(a))
-      imgui.DrawListAddLine(dl, vec2(cx + ux * r * 0.5, cy + uy * r * 0.5), vec2(cx + ux * r * 0.98, cy + uy * r * 0.98), col, r * 0.36)
+      imgui.DrawListAddLine(dl, vec2(cx + ux * r * 0.5_f32, cy + uy * r * 0.5_f32), vec2(cx + ux * r * 0.98_f32, cy + uy * r * 0.98_f32), col, r * 0.36_f32)
     end
-    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r * 0.7, col, 20)
-    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r * 0.3, hole, 12)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r * 0.7_f32, col, 20)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r * 0.3_f32, hole, 12)
   elseif icon == ChromeIcon.Dock then
-    imgui.DrawListAddLine(dl, vec2(cx - r, cy - r * 0.85), vec2(cx + r, cy - r * 0.85), col, t)
-    imgui.DrawListAddLine(dl, vec2(cx, cy + r), vec2(cx, cy - r * 0.1), col, t)
-    imgui.DrawListAddTriangleFilled(dl, vec2(cx - r * 0.5, cy + r * 0.05), vec2(cx + r * 0.5, cy + r * 0.05), vec2(cx, cy - r * 0.5), col)
+    imgui.DrawListAddLine(dl, vec2(cx - r, cy - r * 0.85_f32), vec2(cx + r, cy - r * 0.85_f32), col, t)
+    imgui.DrawListAddLine(dl, vec2(cx, cy + r), vec2(cx, cy - r * 0.1_f32), col, t)
+    imgui.DrawListAddTriangleFilled(dl, vec2(cx - r * 0.5_f32, cy + r * 0.05_f32), vec2(cx + r * 0.5_f32, cy + r * 0.05_f32), vec2(cx, cy - r * 0.5_f32), col)
   elseif icon == ChromeIcon.Camera then
     -- a camera body with its lens and the shutter bump
-    imgui.DrawListAddRect(dl, vec2(cx - r, cy - r * 0.55), vec2(cx + r, cy + r * 0.8), col, r * 0.25, 0, t * 0.85)
-    imgui.DrawListAddRectFilled(dl, vec2(cx - r * 0.35, cy - r * 0.85), vec2(cx + r * 0.3, cy - r * 0.55), col, 1, 0)
-    imgui.DrawListAddCircle(dl, vec2(cx, cy + r * 0.12), r * 0.38, col, 16, t * 0.85)
+    imgui.DrawListAddRect(dl, vec2(cx - r, cy - r * 0.55_f32), vec2(cx + r, cy + r * 0.8_f32), col, r * 0.25_f32, 0, t * 0.85_f32)
+    imgui.DrawListAddRectFilled(dl, vec2(cx - r * 0.35_f32, cy - r * 0.85_f32), vec2(cx + r * 0.3_f32, cy - r * 0.55_f32), col, 1, 0)
+    imgui.DrawListAddCircle(dl, vec2(cx, cy + r * 0.12_f32), r * 0.38_f32, col, 16, t * 0.85_f32)
   elseif icon == ChromeIcon.Shutter then
     -- an open shutter: a ring of blades around a bright centre
-    imgui.DrawListAddCircle(dl, vec2(cx, cy), r * 0.95, col, 18, t * 0.85)
+    imgui.DrawListAddCircle(dl, vec2(cx, cy), r * 0.95_f32, col, 18, t * 0.85_f32)
     for k = 0, < 6 do
       local a = (@float32)(k) * (@float32)(math.pi) / 3
       local ux, uy = (@float32)(math.cos(a)), (@float32)(math.sin(a))
-      imgui.DrawListAddLine(dl, vec2(cx + ux * r * 0.3, cy + uy * r * 0.3), vec2(cx + ux * r * 0.9, cy + uy * r * 0.9), col, t * 0.8)
+      imgui.DrawListAddLine(dl, vec2(cx + ux * r * 0.3_f32, cy + uy * r * 0.3_f32), vec2(cx + ux * r * 0.9_f32, cy + uy * r * 0.9_f32), col, t * 0.8_f32)
     end
-    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r * 0.26, col, 12)
+    imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r * 0.26_f32, col, 12)
   elseif icon == ChromeIcon.Game then
     -- a game window: its frame, a thick title bar, and a crystal in the body
-    imgui.DrawListAddRect(dl, vec2(cx - r, cy - r * 0.85), vec2(cx + r, cy + r * 0.85), col, 1, 0, t * 0.85)
-    imgui.DrawListAddRectFilled(dl, vec2(cx - r, cy - r * 0.85), vec2(cx + r, cy - r * 0.85 + t * 2.4), col, 1, 0)
-    local dy = cy + r * 0.2
-    imgui.DrawListAddTriangleFilled(dl, vec2(cx, dy - r * 0.42), vec2(cx + r * 0.26, dy), vec2(cx - r * 0.26, dy), col)
-    imgui.DrawListAddTriangleFilled(dl, vec2(cx - r * 0.26, dy), vec2(cx + r * 0.26, dy), vec2(cx, dy + r * 0.42), col)
+    imgui.DrawListAddRect(dl, vec2(cx - r, cy - r * 0.85_f32), vec2(cx + r, cy + r * 0.85_f32), col, 1, 0, t * 0.85_f32)
+    imgui.DrawListAddRectFilled(dl, vec2(cx - r, cy - r * 0.85_f32), vec2(cx + r, cy - r * 0.85_f32 + t * 2.4_f32), col, 1, 0)
+    local dy = cy + r * 0.2_f32
+    imgui.DrawListAddTriangleFilled(dl, vec2(cx, dy - r * 0.42_f32), vec2(cx + r * 0.26_f32, dy), vec2(cx - r * 0.26_f32, dy), col)
+    imgui.DrawListAddTriangleFilled(dl, vec2(cx - r * 0.26_f32, dy), vec2(cx + r * 0.26_f32, dy), vec2(cx, dy + r * 0.42_f32), col)
   elseif icon == ChromeIcon.Close then
-    imgui.DrawListAddLine(dl, vec2(cx - r * 0.7, cy - r * 0.7), vec2(cx + r * 0.7, cy + r * 0.7), col, t)
-    imgui.DrawListAddLine(dl, vec2(cx + r * 0.7, cy - r * 0.7), vec2(cx - r * 0.7, cy + r * 0.7), col, t)
+    imgui.DrawListAddLine(dl, vec2(cx - r * 0.7_f32, cy - r * 0.7_f32), vec2(cx + r * 0.7_f32, cy + r * 0.7_f32), col, t)
+    imgui.DrawListAddLine(dl, vec2(cx + r * 0.7_f32, cy - r * 0.7_f32), vec2(cx - r * 0.7_f32, cy + r * 0.7_f32), col, t)
   end
 end

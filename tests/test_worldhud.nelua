@@ -264,7 +264,9 @@ do
   ok, pl = policy_world_place(3, tt, false)
   local sx3, sy3, sw3, sh3 = shown(pl)
   assert(sw3 <= 0.45 * 2560 + 1 and sh3 <= 0.45 * 1440 + 1, 'fits')
-  assert(#policy_world_command(3, 'hud 0.5') > 0, 'X without Y is refused')
+  local refused = policy_world_command(3, 'hud 0.5')
+  assert(#refused > 0, 'X without Y is refused')
+  refused:destroy()
 
   -- the dock hook (drag-to-dock), then pin <-> pet leaves it a pet
   assert(#policy_world_dock(3, 0.1, 0.9, 0.4) == 0)
@@ -276,7 +278,9 @@ do
   assert(lua_ok('assert(CONFIG.world.anchors[3].kind == "pet")'), 'the title button makes it a pet')
 
   -- dragged out into the world: a pin again
-  assert(#policy_world_dock(4, 0.5, 0.5, 1) > 0, 'unknown panel')
+  local unknown = policy_world_dock(4, 0.5, 0.5, 1)
+  assert(#unknown > 0, 'unknown panel')
+  unknown:destroy()
   local pose: WorldPlacement = { x = 1, y = 2, z = 3, yaw = 0.5, width = 1800, height = 1040, ppm = 640 }
   assert(#policy_world_drop(1, pose, 0, 0) == 0)
   ok, pl = policy_world_place(1, tt, false)
@@ -295,7 +299,9 @@ do
     CONFIG.world.forget(1)
     assert(CONFIG.world.restore(1, 9101) == "world" and CONFIG.world.anchors[1].kind == "hud", "restored")
   ]]), 'persistence round-trips')
-  os.remove(root .. '/world-state.lua')
+  local state = root .. '/world-state.lua'
+  os.remove(state)
+  state:destroy()
   cam_now = game_camera(0, 5, 0, 1, 0.1, 0.78)
   cam_now.width, cam_now.height = 1920, 1080 -- same aspect, another size
   ok, pl = policy_world_place(1, tt + 10, false)

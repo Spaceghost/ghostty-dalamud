@@ -310,6 +310,7 @@ local function ffmpeg_argv(self: *AgentClips, c: *AgentClip, argv: *vector(strin
   local size: stringbuilder
   size:writef('%dx%d', c.w, c.h)
   local fps: stringbuilder
+  defer fps:destroy() end -- copied into argv, so it is freed on every return
   fps:writef('%d', c.fps)
   argv:push(self.ffmpeg:copy())
   argv:push(string.copy('-y'))
@@ -335,7 +336,7 @@ local function ffmpeg_argv(self: *AgentClips, c: *AgentClip, argv: *vector(strin
     argv:push(string.copy('-pix_fmt'))
     argv:push(string.copy('yuv420p'))
     argv:push(string.copy('-r'))
-    argv:push(fps:promote())
+    argv:push(string.copy(fps:view()))
     argv:push(string.copy('-f'))
     argv:push(string.copy('v4l2'))
     argv:push(c.device:copy())
@@ -429,10 +430,13 @@ local function handle_copen(self: *AgentClips, ci: usize, q: *ByteQueue, payload
   end
   if not self.looked then
     self.looked = true
-    self.ffmpeg = find_ffmpeg()
-    self.dir = clips_dir()
+    -- a second look (the encoder was installed since) replaces the first one's
+    self.ffmpeg:destroy() self.ffmpeg = find_ffmpeg()
+    self.dir:destroy() self.dir = clips_dir()
     if #self.ffmpeg > 0 then
-      say(self, 'clips: ffmpeg is ' .. self.ffmpeg)
+      local msg = 'clips: ffmpeg is ' .. self.ffmpeg
+      say(self, msg)
+      msg:destroy()
     end
   end
   if #self.ffmpeg == 0 then
@@ -475,7 +479,7 @@ local function handle_copen(self: *AgentClips, ci: usize, q: *ByteQueue, payload
     end
     local z = c.raw_path .. '\0'
     os.remove(c.raw_path) -- a fifo left by a crash is not a fifo we may reuse
-    local made = mkfifo((@cstring)(z.data), 0x1A0) -- 0600 == 0
+    local made = mkfifo((@cstring)(z.data), 0x1A0) == 0 -- mode 0600; a cint is always true in Nelua, so compare
     if made then
       -- O_RDWR: see the note on the camera sink above.
       c.fd = c_open((@cstring)(z.data), O_RDWR | O_NONBLOCK)
@@ -544,11 +548,11 @@ global function clips_cam_flush(c: *AgentClip): void
     else
       close(c.fd)
       c.fd = -1
-      c.pend_len, c.pend_off = 0, 0
+      c.pend_len = 0 c.pend_off = 0
       return
     end
   end
-  c.pend_len, c.pend_off = 0, 0
+  c.pend_len = 0 c.pend_off = 0
 ## end
 end
 
@@ -594,7 +598,7 @@ local function handle_cframe(self: *AgentClips, ci: usize, payload: *[0]uint8, l
       c.dropped = c.dropped + 1
       return
     end
-    c.pend_off, c.pend_len = 0, need
+    c.pend_off = 0 c.pend_len = need
     c.frames = c.frames + 1
     c.bytes = c.bytes + need
     clips_cam_flush(c)
@@ -626,7 +630,7 @@ local function handle_cend(self: *AgentClips, ci: usize, q: *ByteQueue, payload:
       ## if not ccinfo.is_windows then
         if c.fd >= 0 then close(c.fd) c.fd = -1 end
       ## end
-        c.pend_len, c.pend_off = 0, 0
+        c.pend_len = 0 c.pend_off = 0
         local sb: stringbuilder
         sb:writef('clip %d: the camera is off after %d frames', (@integer)(cid), c.frames)
         if c.dropped > 0 then

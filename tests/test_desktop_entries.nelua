@@ -11,15 +11,27 @@ require 'arg'
 
 local scratch: string = #arg >= 1 and arg[1] or '/tmp'
 
-local function check(ok: boolean, what: string): void
-  if not ok then io.stderr:write('FAIL: ', what, '\n') os.exit(1) end
+-- `detail` is appended only on failure: a message built with `..` before the
+-- check would never be freed (-P nogc), and SAN=asan reports it
+local function check(ok: boolean, what: string, detail: facultative(string)): void
+  if not ok then
+    io.stderr:write('FAIL: ', what)
+    ## if not detail.type.is_niltype then
+    io.stderr:write(detail)
+    ## end
+    io.stderr:write('\n')
+    os.exit(1)
+  end
 end
+-- the paths and commands built below, kept until the end and freed there
+local built: vector(string)
+local function keep(s: string): string built:push(s) return s end
 
 local function write_file(path: string, text: string): void
   local f = io.open(path, 'wb')
-  check(f:isopen(), 'write ' .. path)
+  check(f:isopen(), 'write ', path)
   f:write(text)
-  f:close()
+  f:destroy()
 end
 
 -- parsing
@@ -40,8 +52,8 @@ Name=New Window
 Exec=other
 ]])
   check(ok, 'an application parses')
-  check(e.name == 'Calculator', 'the unlocalized name: ' .. e.name)
-  check(e.exec == 'gnome-calculator --mode  %done', 'field codes: [' .. e.exec .. ']')
+  check(e.name == 'Calculator', 'the unlocalized name: ', e.name)
+  check(e.exec == 'gnome-calculator --mode  %done', 'field codes: ', e.exec)
   check(e.icon == 'org.example.Calc' and e.categories == 'Utility;Calculator;', 'icon, categories')
   check(not e.terminal, 'not a terminal app')
   e:destroy()
@@ -53,32 +65,34 @@ Exec=other
   check(ok4 and e4.terminal, 'a terminal app')
   e4:destroy()
   local c = desktop_exec_command('app %i --name %c %F', 'My App', 'appicon')
-  check(c == "app --icon 'appicon' --name 'My App'", 'exec %i %c: ' .. c)
+  check(c == "app --icon 'appicon' --name 'My App'", 'exec %i %c: ', c)
+  c:destroy()
   local ok5, e5 = desktop_parse('esc.desktop', '[Desktop Entry]\nType=Application\nName=Esc\nExec=sh -c "echo a\\sb"\n')
-  check(ok5 and e5.exec == 'sh -c "echo a b"', 'string escapes: ' .. e5.exec)
+  check(ok5 and e5.exec == 'sh -c "echo a b"', 'string escapes: ', e5.exec)
   e5:destroy()
 end
 
 -- a made-up XDG tree: data home with one app, a data dir with two, one of
 -- them shadowed by the data home; icons in hicolor (png and svg) and pixmaps
 local root = scratch .. '/xdg'
-os.execute("rm -rf '" .. root .. "'")
-os.execute("mkdir -p '" .. root .. "/home/applications' '" .. root .. "/sys/applications/vendor' '" .. root .. "/sys/icons/hicolor/48x48/apps' '" .. root .. "/sys/icons/hicolor/128x128/apps' '" .. root .. "/sys/icons/hicolor/scalable/apps'")
-write_file(root .. '/home/applications/org.example.Calc.desktop', '[Desktop Entry]\nType=Application\nName=Calculator (mine)\nExec=mycalc\nIcon=calc\n')
-write_file(root .. '/sys/applications/org.example.Calc.desktop', '[Desktop Entry]\nType=Application\nName=Calculator\nExec=calc\nIcon=calc\n')
-write_file(root .. '/sys/applications/org.example.TextEditor.desktop', '[Desktop Entry]\nType=Application\nName=Text Editor\nExec=gnome-text-editor %U\nIcon=org.example.TextEditor\nCategories=Utility;TextEditor;\n')
-write_file(root .. '/sys/applications/vendor/tool.desktop', '[Desktop Entry]\nType=Application\nName=Vendor Tool\nExec=/opt/vendor/bin/vtool\n')
-write_file(root .. '/sys/icons/hicolor/48x48/apps/calc.png', 'png48')
-write_file(root .. '/sys/icons/hicolor/128x128/apps/calc.png', 'png128')
-write_file(root .. '/sys/icons/hicolor/scalable/apps/org.example.TextEditor.svg', '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="red"/></svg>')
+os.execute(keep(string.format("rm -rf '%s'", root)))
+os.execute(keep(string.format("mkdir -p '%s/home/applications' '%s/sys/applications/vendor' '%s/sys/icons/hicolor/48x48/apps' '%s/sys/icons/hicolor/128x128/apps' '%s/sys/icons/hicolor/scalable/apps'",
+  root, root, root, root, root)))
+write_file(keep(root .. '/home/applications/org.example.Calc.desktop'), '[Desktop Entry]\nType=Application\nName=Calculator (mine)\nExec=mycalc\nIcon=calc\n')
+write_file(keep(root .. '/sys/applications/org.example.Calc.desktop'), '[Desktop Entry]\nType=Application\nName=Calculator\nExec=calc\nIcon=calc\n')
+write_file(keep(root .. '/sys/applications/org.example.TextEditor.desktop'), '[Desktop Entry]\nType=Application\nName=Text Editor\nExec=gnome-text-editor %U\nIcon=org.example.TextEditor\nCategories=Utility;TextEditor;\n')
+write_file(keep(root .. '/sys/applications/vendor/tool.desktop'), '[Desktop Entry]\nType=Application\nName=Vendor Tool\nExec=/opt/vendor/bin/vtool\n')
+write_file(keep(root .. '/sys/icons/hicolor/48x48/apps/calc.png'), 'png48')
+write_file(keep(root .. '/sys/icons/hicolor/128x128/apps/calc.png'), 'png128')
+write_file(keep(root .. '/sys/icons/hicolor/scalable/apps/org.example.TextEditor.svg'), '<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><rect width="16" height="16" fill="red"/></svg>')
 
 local dirs: vector(string)
 dirs:push(root .. '/home/applications')
 dirs:push(root .. '/sys/applications')
 local es = desktop_scan(&dirs)
-check(#es == 3, 'three apps, the shadowed one once: ' .. tostring(#es))
-check(es[0].name == 'Calculator (mine)', 'sorted by name, data home wins: ' .. es[0].name)
-check(es[1].name == 'Text Editor' and es[2].id == 'vendor-tool.desktop', 'sorted; subdirectory ids get their prefix: ' .. es[2].id)
+check(#es == 3, 'three apps, the shadowed one once')
+check(es[0].name == 'Calculator (mine)', 'sorted by name, data home wins: ', es[0].name)
+check(es[1].name == 'Text Editor' and es[2].id == 'vendor-tool.desktop', 'sorted; subdirectory ids get their prefix: ', es[2].id)
 
 -- finding
 check(desktop_find(&es, 'org.example.TextEditor') == 1, 'by short id')
@@ -92,13 +106,13 @@ check(desktop_find(&es, 'zzzz') == -1, 'nothing')
 local idirs: vector(string)
 idirs:push(root .. '/sys/icons')
 local p, sz = desktop_find_icon('calc', &idirs)
-check(p == root .. '/sys/icons/hicolor/128x128/apps/calc.png' and sz == 128, 'the 128 px png first: ' .. p)
+check(p == keep(root .. '/sys/icons/hicolor/128x128/apps/calc.png') and sz == 128, 'the 128 px png first: ', p)
 local p2, sz2 = desktop_find_icon('org.example.TextEditor', &idirs)
-check(p2:find('scalable', 1, true) > 0 and sz2 == 0, 'scalable svg: ' .. p2)
+check(p2:find('scalable', 1, true) > 0 and sz2 == 0, 'scalable svg: ', p2)
 local p3 = desktop_find_icon('no-such-icon-anywhere-xyz', &idirs)
 check(#p3 == 0, 'no icon')
-local p4, sz4 = desktop_find_icon(root .. '/sys/icons/hicolor/48x48/apps/calc.png', &idirs)
-check(#p4 > 0 and sz4 == DESKTOP_ICON_PX, 'an absolute path is taken as is: ' .. p4 .. ' ' .. tostring(sz4))
+local p4, sz4 = desktop_find_icon(keep(root .. '/sys/icons/hicolor/48x48/apps/calc.png'), &idirs)
+check(#p4 > 0 and sz4 == DESKTOP_ICON_PX, 'an absolute path is taken as is: ', p4)
 
 -- list lines
 do
@@ -107,19 +121,20 @@ do
   local ok4, e4 = desktop_parse('htop.desktop', '[Desktop Entry]\nType=Application\nName=Htop\nExec=htop\nTerminal=true\nCategories=System;\n')
   desktop_list_line(&sb, &e4, '')
   local l = sb:promote()
-  check(l == 'app\torg.example.TextEditor\tText Editor\t/home/u/.cache/ghostty-agent/icons/org.example.TextEditor-128.png\tUtility;TextEditor;\n'
-    .. 'term\thtop\tHtop\t\tSystem;\thtop\n', 'list lines: ' .. l)
+  check(l == 'app\torg.example.TextEditor\tText Editor\t/home/u/.cache/ghostty-agent/icons/org.example.TextEditor-128.png\tUtility;TextEditor;\nterm\thtop\tHtop\t\tSystem;\thtop\n',
+    'list lines: ', l)
+  l:destroy() e4:destroy() sb:destroy()
 end
 
 -- cache jobs: a PNG is copied, an SVG rendered (by whatever this host has)
 local cache = root .. '/cache'
-os.execute("mkdir -p '" .. cache .. "'")
+os.execute(keep(string.format("mkdir -p '%s'", cache)))
 local renderer = desktop_icon_renderer()
-print('icon renderer: ' .. (#renderer > 0 and renderer or 'none'))
+io.write('icon renderer: ', #renderer > 0 and renderer or 'none', '\n')
 do
   local sb: stringbuilder
   local d1 = desktop_icon_png(cache, 'org.example.Calc', sz)
-  check(d1 == cache .. '/org.example.Calc-128.png', 'cache name: ' .. d1)
+  check(d1 == keep(cache .. '/org.example.Calc-128.png'), 'cache name: ', d1)
   check(desktop_icon_job(&sb, p, d1, renderer), 'a png job')
   local d2 = desktop_icon_png(cache, 'org.example.TextEditor', sz2)
   local svg_ok = desktop_icon_job(&sb, p2, d2, renderer)
@@ -130,14 +145,19 @@ do
   local f = io.open(d1, 'rb')
   check(f:isopen(), 'png copied')
   local t = f:read('a')
-  f:close()
+  f:destroy()
   check(t == 'png128', 'png copied as is')
+  t:destroy()
   if svg_ok then
     local g = io.open(d2, 'rb')
-    check(g:isopen(), 'svg rendered to ' .. d2)
+    check(g:isopen(), 'svg rendered to ', d2)
     local head = g:read(8)
-    g:close()
+    g:destroy()
     check(head == '\x89PNG\r\n\x1a\n', 'the rendered icon is a PNG')
+    head:destroy()
   end
+  d1:destroy() d2:destroy() script:destroy()
 end
+for i = 0, < #built do built[i]:destroy() end
+built:destroy()
 print('desktop entries OK')

@@ -370,12 +370,17 @@ local function panel_screen(id: integer, u: float32, v: float32): ImVec2
   assert(pok)
   return vec2(sx, sy)
 end
+local adopted_file = dir .. '/adopted.lua'
+-- adopted.lua as it is now. The text stays owned here and is freed by the next
+-- call, so callers use it at once and never free it.
+local saved_text: string
 local function saved(): string
-  local f = io.open(dir .. '/adopted.lua')
-  if not f:isopen() then return '' end
-  local s = f:read('a')
-  f:close()
-  return s
+  saved_text:destroy()
+  local f = io.open(adopted_file)
+  if not f:isopen() then f:destroy() saved_text = (@string){} return saved_text end
+  saved_text = f:read('a')
+  f:destroy()
+  return saved_text
 end
 local function has_text(needle: string): boolean
   for i = 0, < #texts do if texts[i]:find(needle, 1, true) > 0 then return true end end
@@ -383,7 +388,7 @@ local function has_text(needle: string): boolean
 end
 
 -- Setup ------------------------------------------------------------------------------------------
-os.remove(dir .. '/adopted.lua')
+os.remove(adopted_file)
 assert(gu_init(&api, (@cstring)(dir.data)) == 0, 'init')
 host.local_agent.last_try = 1e9 -- never dial out
 assert(imgui_bind(resolver, nilptr) > 0)
@@ -575,7 +580,7 @@ do
   assert(near(inner_aspect(), ba, 0.01), 'the same shape')
   assert(near(win.Size.x, 400, 1) and near(win.Size.y, 200, 1), 'which is the size it had')
   -- the pet is resized (as the grips or a policy do: the anchor's width and height)
-  lua_run(string.format("local a = require('world').anchors[%d]; a.width = a.width * 1.6; a.height = a.height * 0.9", s.id))
+  do local code = string.format("local a = require('world').anchors[%d]; a.width = a.width * 1.6; a.height = a.height * 0.9", s.id) lua_run(code) code:destroy() end
   for _ = 1, 3 do frame(false, true) end
   ba, bw, bh = box_aspect(s.id)
   assert(#set_size > 0, 'the window was resized')
@@ -591,7 +596,7 @@ do
   local dx, dy = adopt_to_window(&m, PANEL_PAD + bw, PANEL_TITLE + bh)
   assert(cx >= win.InnerRect.Min.x - 0.5 and cy >= win.InnerRect.Min.y - 0.5 and dx <= win.InnerRect.Max.x + 0.5 and dy <= win.InnerRect.Max.y + 0.5, 'no gap')
   -- far larger than the screen: a smaller window, scaled up, still on the screen
-  lua_run(string.format("local a = require('world').anchors[%d]; a.width = 5000; a.height = 3000", s.id))
+  do local code = string.format("local a = require('world').anchors[%d]; a.width = 5000; a.height = 3000", s.id) lua_run(code) code:destroy() end
   for _ = 1, 3 do frame(false, true) end
   ba = box_aspect(s.id)
   assert(win.Size.x <= 2560 + 0.5 and win.Size.y <= 1440 + 0.5, 'fits the screen')
@@ -600,7 +605,7 @@ do
   -- the HUD: read from the shim, the full-screen layer left out
   assert(host.hud_mask.n == 1 and host.hud_mask.r[0].x == 900, 'the hotbar counts, the name plates do not')
   -- the pointer on the pet but on a HUD element over it: not into the window
-  lua_run(string.format("local a = require('world').anchors[%d]; a.width = 900; a.height = 600", s.id))
+  do local code = string.format("local a = require('world').anchors[%d]; a.width = 900; a.height = 600", s.id) lua_run(code) code:destroy() end
   host.world_focus = s.id
   for _ = 1, 150 do frame(false, true) end
   local ok, pl = policy_world_place(s.id, now, true)
@@ -799,4 +804,5 @@ end
 
 gu_shutdown()
 free(win) free(ctx) free(events)
+saved_text:destroy() adopted_file:destroy()
 print('test_adopt_app OK')

@@ -134,7 +134,7 @@ local function join(dir: string, name: string): string
   if #dir == 0 then return string.copy(name) end
   local last = dir.data[dir.size - 1]
   if last == '/'_b or last == '\\'_b then return dir .. name end
-  return dir .. '/' .. name
+  return string.format('%s/%s', dir, name) -- one string: dir .. '/' .. name leaks the middle one
 end
 
 -- <config>/screenshots, created when missing.

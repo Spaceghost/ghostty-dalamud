@@ -12,6 +12,7 @@
 -- (minimized) or the UI taking it (opened again), /term native off, status and
 -- shutdown.
 require 'core.host'
+require 'tests.check'
 require 'string'
 require 'vector'
 require 'arg'
@@ -280,14 +281,15 @@ local function in_list(list: *vector(*Session), s: *Session): boolean
 end
 local function read(path: string): string
   local f = io.open(path)
-  if not f:isopen() then return '' end
+  if not f:isopen() then f:destroy() return '' end
   local s = f:read('a')
-  f:close()
+  f:destroy()
   return s
 end
+local state_file = dir .. '/native-state.lua'
 
 -- Setup ------------------------------------------------------------------------------------------
-os.remove(dir .. '/native-state.lua')
+os.remove(state_file)
 assert(gu_init(&api, (@cstring)(dir.data)) == 0, 'init')
 host.local_agent.last_try = 1e9 -- never dial out
 assert(imgui_bind(resolver, nilptr) > 0)
@@ -501,9 +503,9 @@ end
 do
   feed(s, '\27]0;vim\7')
   frame(false)
-  assert(fw[id].title == 'vim', 'retitled: ' .. fw[id].title)
-  local saved = read(dir .. '/native-state.lua')
-  assert(saved:find('last = { w = 720, h = 420 }', 1, true) > 0, 'the size is kept for the next window: ' .. saved)
+  check(fw[id].title == 'vim', 'retitled: ', fw[id].title)
+  local saved = read(state_file)
+  check(saved:find('last = { w = 720, h = 420 }', 1, true) > 0, 'the size is kept for the next window: ', saved)
   saved:destroy()
 end
 
@@ -589,6 +591,7 @@ do
   host.native:clear()
 end
 
-os.remove(dir .. '/native-state.lua')
+os.remove(state_file)
+state_file:destroy()
 gu_shutdown()
 print('test_native_app OK')

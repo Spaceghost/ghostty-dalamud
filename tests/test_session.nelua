@@ -1,5 +1,6 @@
 -- Session-level behavior that does not need a transport.
 require 'core.session'
+require 'tests.check'
 require 'string'
 
 -- Regression: the title-changed callback takes (terminal, userdata) only. The
@@ -50,6 +51,7 @@ require 'core.sendtext'
 do
   local u = term_unescape('ls -la\\n^C\\e[A \\\\ \\^C')
   assert(u == 'ls -la\n\3\27[A \\ ^C', 'unescape')
+  u:destroy()
   print('sendtext OK')
 end
 
@@ -71,18 +73,21 @@ do
     end
     return sb:promote()
   end
-  assert(run(&st, {0.1, 0.2, 0, 0}, 2) == 'T', 'tap')
+  local tap = run(&st, {0.1, 0.2, 0, 0}, 2)
+  assert(tap == 'T', 'tap')
   st = {}
-  assert(run(&st, {0.1, 0.18, 0.28, 0.36}, 4) == 'D', 'double tap')
+  local dt = run(&st, {0.1, 0.18, 0.28, 0.36}, 4)
+  assert(dt == 'D', 'double tap')
   st = {}
   local h = run(&st, {0.1, 1.95, 0, 0}, 2)
-  assert(h == 'HHH', 'hold steps and repeats: '..h)
+  check(h == 'HHH', 'hold steps and repeats: ', h)
   st = {}
   local d = run(&st, {0.1, 0.2, 0.45, 0.55}, 4)
-  assert(d == 'D', 'a slow second press inside the window (release to press) is a double tap: '..d)
+  check(d == 'D', 'a slow second press inside the window (release to press) is a double tap: ', d)
   st = {}
   local th = run(&st, {0.1, 0.2, 0.35, 1.0}, 4)
-  assert(th == 'TH', 'a tap, then a hold: the tap is not lost: '..th)
+  check(th == 'TH', 'a tap, then a hold: the tap is not lost: ', th)
+  tap:destroy() dt:destroy() h:destroy() d:destroy() th:destroy()
   st = {}
   assert(pad_gesture_update(&st, true, 0.1) == PadGesture.None)
   assert(pad_gesture_update(&st, false, 0.2) == PadGesture.None)

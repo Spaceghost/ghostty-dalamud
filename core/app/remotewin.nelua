@@ -2069,8 +2069,8 @@ global function remotewin_popups(s: *Session, dl: *ImDrawList, vp: ImVec2): void
     local gw = math.min((@integer)(g.w), rw.w - gx)
     local gh = math.min((@integer)(g.h), rw.h - gy)
     if gw <= 0 or gh <= 0 then continue end
-    local px, py, pw, ph = popup_rect(rw, k)
-    pw, ph = gw * rw.fit_scale, gh * rw.fit_scale
+    local px, py = popup_rect(rw, k) -- the popup's size is its clipped part, below
+    local pw: float32, ph: float32 = gw * rw.fit_scale, gh * rw.fit_scale
     local strips = math.clamp((@integer)(math.ceil(pw / cell)), 1, STRIPS)
     local rows = math.clamp((@integer)(math.ceil(ph / cell)), 1, ROWS)
     draw_box(rw, dl, vp.x + px, vp.y + py, pw, ph, gx, gy, gw, gh, strips, rows)

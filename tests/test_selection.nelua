@@ -2,6 +2,7 @@
 -- line units, and the text copied out of a real libghostty terminal.
 require 'core.selection'
 require 'string'
+require 'io'
 
 -- the bindings mirror the C layouts (sizes from vt/selection.h on x86_64)
 assert(#GhosttyGridRef == 24 and #GhosttySelection == 64 and #GhosttyPoint == 24)
@@ -48,7 +49,7 @@ end
 
 local function check(v: *TermView, want: string, what: string)
   local got = selection_text(v)
-  print(what, '"' .. got .. '"')
+  io.write(what, '\t"', got, '"\n')
   assert(got == want, what)
   got:destroy()
 end
@@ -155,7 +156,7 @@ do
   assert(bytes(n, &out) == '\27[<64;5;3M', 'SGR wheel up at cell 5,3')
   feed(&v, '\27[?1006l')
   n = v:wheel_bytes(false, 0, 0, &out)
-  assert(bytes(n, &out) == '\27[M' .. string.char(32 + 65, 33, 33), 'X10 wheel down at 1,1')
+  assert(bytes(n, &out) == '\27[Ma!!', 'X10 wheel down at 1,1') -- button 32 + 65, column and row 1 + 32
   v:destroy()
   print('wheel OK')
 end
@@ -165,7 +166,7 @@ do
   local function at(row: string, col: integer): string
     local a, b = link_in_row(row, col)
     if a == 0 then return '' end
-    return row:sub(a, b)
+    return row:subview(a, b) -- a view of `row`: nothing to free
   end
   local row: string = 'see https://example.org/a_(b)?c=1. and (http://x.io/y), mailto:me@x.org!'
   assert(at(row, 4) == 'https://example.org/a_(b)?c=1', 'the scheme, balanced brackets kept, the full stop left out')
