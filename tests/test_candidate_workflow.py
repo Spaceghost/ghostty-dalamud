@@ -12,6 +12,16 @@ ROOT = pathlib.Path(__file__).resolve().parents[1]
 WORKFLOWS = sorted((ROOT / ".github/workflows").glob("*.yml"))
 
 
+# Where github.sha is not the commit the run is about. A called release.yml runs in its
+# caller's context, so it takes the tag it was given; testing-channel.yml runs on
+# workflow_run, where github.sha is the default branch's newest commit, not the one CI
+# passed on.
+EVENT_COMMIT = {
+    "release.yml": r"ref: \$\{\{ inputs\.tag && format\('refs/tags/\{0\}', inputs\.tag\) \|\| github\.sha \}\}",
+    "testing-channel.yml": r"ref: \$\{\{ github\.event\.workflow_run\.head_sha \}\}",
+}
+
+
 class WorkflowCheckouts(unittest.TestCase):
     def test_there_are_workflows_to_check(self):
         self.assertTrue(WORKFLOWS, "no workflows found; the guard would pass vacuously")
@@ -24,7 +34,7 @@ class WorkflowCheckouts(unittest.TestCase):
             with self.subTest(workflow=workflow.name):
                 self.assertTrue(checkouts, "a workflow with no checkout step")
                 for checkout in checkouts:
-                    self.assertRegex(checkout, r"ref: \$\{\{ github\.sha \}\}")
+                    self.assertRegex(checkout, EVENT_COMMIT.get(workflow.name, r"ref: \$\{\{ github\.sha \}\}"))
                     self.assertIn("persist-credentials: false", checkout)
                 self.assertNotIn("github.event.pull_request.head.sha", text)
 
