@@ -1,5 +1,11 @@
 -- End-to-end: start ghostty-agent (already running, see run script), open a
 -- session, read its output, check EXIT.
+--
+--   test_agent PORT TOKEN AGENT_PID [HOST]
+--
+-- HOST (default 127.0.0.1) reaches an agent elsewhere: tools/wg-interop.sh
+-- runs this through a WireGuard tunnel with AGENT_PID "-", which skips the
+-- one check that reads the agent's /proc.
 require 'core.agent_client'
 require 'string'
 require 'vector'
@@ -13,6 +19,7 @@ local function usleep(us: cuint): cint <cimport, nodecl> end
 local port: uint16 = (@uint16)(tointeger(arg[1]))
 local token: string = arg[2]
 local agent_pid: string = arg[3]
+local host: string = #arg >= 4 and arg[4] or '127.0.0.1'
 
 local got: string = ''
 local collect = true       -- append SDATA to `got` (off for floods)
@@ -63,7 +70,7 @@ local function pump1(c: *AgentClient): void
 end
 
 local c: AgentClient
-c:init('127.0.0.1', port, token)
+c:init(host, port, token)
 c.on_event = on_event
 c:connect(now)
 for _ = 1, 200 do pump1(&c) if c:ready() then break end end
@@ -101,7 +108,7 @@ local sid = opened_id
 -- a fresh terminal (fed 0) on another connection gets the whole history, no reset needed
 do
   local fresh: AgentClient
-  fresh:init('127.0.0.1', port, token)
+  fresh:init(host, port, token)
   fresh.on_event = on_event
   fresh:connect(now)
   for _ = 1, 200 do pump1(&fresh) if fresh:ready() then break end end
@@ -193,19 +200,21 @@ do
   paste:destroy()
   for _ = 1, 1500 do pump1(&c) if exited then break end end
   assert(exited and exit_status == 0, 'paste shell exits after reading everything')
-  local f = io.open('build/agent-paste', 'rb')
-  assert(f:isopen())
-  local content = f:read('a')
-  f:close()
-  print('pasted bytes:', #content)
-  assert(#content == 1048576, 'the whole paste arrived')
-  content:destroy()
+  if agent_pid ~= '-' then -- an agent elsewhere wrote the file there (tools/wg-interop.sh checks it)
+    local f = io.open('build/agent-paste', 'rb')
+    assert(f:isopen())
+    local content = f:read('a')
+    f:close()
+    print('pasted bytes:', #content)
+    assert(#content == 1048576, 'the whole paste arrived')
+    content:destroy()
+  end
 end
 
 -- frames queued before the handshake completes must not reach the agent before HELLO
 do
   local c2: AgentClient
-  c2:init('127.0.0.1', port, token)
+  c2:init(host, port, token)
   c2.on_event = on_event
   err_count = 0
   c2:connect(now)
@@ -230,6 +239,7 @@ do
   assert(opened_id ~= 0)
   local yes_id = opened_id
   usleep(2000000)
+  if agent_pid ~= '-' then
   local path: string = '/proc/' .. agent_pid .. '/status'
   local f = io.open(path, 'rb')
   assert(f:isopen(), 'agent /proc status')
@@ -246,6 +256,7 @@ do
   local limit = 16 * 1024
   if os.getenv('SAN').size > 0 then limit = 512 * 1024 end
   assert(kb > 0 and kb < limit, 'agent memory stays bounded') -- unbounded, 2 s of `yes` took 32 MiB
+  end
   -- a panel unseen for a moment: DETACH, then ATTACH with what it has read.
   -- The megabytes queued before the DETACH still arrive; none come twice.
   local read_before = opened_bytes

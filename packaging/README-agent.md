@@ -42,16 +42,59 @@ by you. The plugin reads that same file, so there is nothing to configure when
 the game and the agent are on one machine.
 
 Other flags: `--token-file PATH`, `--clipboard-file PATH`, `--replay-bytes N`,
-`--term NAME`, `--windows NAME`. `ghostty-agent --help` lists them all.
+`--term NAME`, `--windows NAME`, `--wireguard MODE`. `ghostty-agent --help`
+lists them all.
 
-When the game is on another machine, forward the port and copy the token:
+## Reach it from another machine
+
+The protocol is authenticated by the token but it is **not encrypted**, so the
+agent will not listen on a network address in the clear: `--listen 0.0.0.0:7777`
+is refused and says why. There are three ways to reach it from the machine the
+game runs on.
+
+**WireGuard, built into the agent**, for when you do not use Tailscale. It
+needs no root and no driver on this machine; the game PC runs the ordinary
+WireGuard app (Windows, macOS, Linux, iOS, Android):
+
+```sh
+ghostty-agent wg add gaming-pc --endpoint my-home.example.org
+```
+
+That prints a config for the WireGuard app, with a QR code for phones, and
+the line for the plugin (`agent = { host = '10.x.y.1', port = 7777, token = ... }`).
+The private key in it is shown once and kept nowhere. Import it on the game PC,
+forward UDP 51820 on your router to this machine, and the plugin reaches the
+agent through the tunnel. A running agent picks new peers up by itself.
+
+```sh
+ghostty-agent wg list                  # peers, their tunnel addresses, last handshake
+ghostty-agent wg remove gaming-pc      # its keys are wiped within a few seconds
+ghostty-agent wg forward tcp 3389      # RDP through the same tunnel (vnc: tcp 5900)
+ghostty-agent wg forward sunshine      # Sunshine's TCP and UDP ports, for Moonlight
+ghostty-agent wg show                  # this end's public key, port and addresses
+```
+
+Forwards reach only this machine's loopback, never the rest of your network.
+The keys live in `~/.config/ghostty-agent/wireguard.conf` (mode 0600;
+`%APPDATA%\ghostty-agent\` with an owner-only ACL on Windows). The agent starts
+WireGuard when that file has a peer, unless Tailscale is running here:
+`--wireguard off` never starts it, `--wireguard always` starts it anyway.
+The design and its threat model are in
+[docs/WIREGUARD.md](https://github.com/Spaceghost/ghostty-dalamud/blob/master/docs/WIREGUARD.md).
+
+**Tailscale.** If this machine is on a tailnet, listen on its tailnet address,
+for example `--listen 100.101.102.103:7777`; the agent allows that address
+because the tailnet encrypts it.
+
+**ssh.** Forward the port and copy the token:
 
 ```sh
 ssh -L 7777:127.0.0.1:7777 that-machine
 ```
 
-The protocol is authenticated by that token but it is not encrypted. Keep it on
-loopback, inside an `ssh -L` tunnel, or on a private network.
+`--allow-insecure-listen` listens on any address anyway. It says so at start and
+logs every connection it accepts: anyone who can reach the port and read the
+token has a shell as you.
 
 ## Start it with your session
 

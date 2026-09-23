@@ -1,6 +1,7 @@
--- Randomized stress over the two places this plugin parses bytes it did not
--- write: VT streams from a shell into libghostty, and wire frames from an
--- agent into core/protocol.nelua. Neither may crash, read out of bounds or
+-- Randomized stress over the places this project parses bytes it did not
+-- write: VT streams from a shell into libghostty, wire frames from an agent
+-- into core/protocol.nelua, and datagrams from anyone into the agent's
+-- WireGuard (agent/wg_device.nelua). Neither may crash, read out of bounds or
 -- grow the heap without bound, whatever arrives.
 --
 --   tests/fuzz [seed] [iterations]
@@ -14,6 +15,7 @@ require 'tests.heapcheck'
 require 'core.ghostty'
 require 'core.protocol'
 require 'agent.logic'
+require 'agent.wg_device'
 require 'string'
 require 'vector'
 require 'io'
@@ -150,6 +152,46 @@ local function agent_round(iter: integer): void
   hex:destroy()
 end
 
+-- Datagrams into the WireGuard device ----------------------------------------------
+-- Every message type at its own size and at random sizes, half of them with a
+-- valid MAC1 (anyone who knows the agent's public key can make one), so the
+-- parsers behind MAC1 are reached; and the address parsers on random text.
+local wg_dev: WgDevice
+local wg_sent = 0
+local wg_now: number = 1000
+local function wg_send(ud: pointer, ep: *WgEndpoint, data: *[0]uint8, len: usize): void wg_sent = wg_sent + 1 end
+local function fuzz_wall(): (int64, int64) return 1800000000 + (@int64)(wg_now), 0 end
+
+local function wg_round(iter: integer): void
+  local sizes: [6]usize = { WG_INITIATION_SIZE, WG_RESPONSE_SIZE, WG_COOKIE_SIZE, WG_DATA_MIN, 0, 0 }
+  local buf: [256]uint8
+  for _ = 1, 8 do
+    wg_now = wg_now + 0.05
+    local n = sizes[rnd_below(6)]
+    if n == 0 then n = rnd_below(256) end
+    for i: usize = 0, < n do buf[i] = (@uint8)(rnd() & 0xff) end
+    if n >= 4 and rnd_below(4) ~= 0 then
+      buf[0] = (@uint8)(1 + rnd_below(4))
+      buf[1], buf[2], buf[3] = 0, 0, 0
+    end
+    if (n == WG_INITIATION_SIZE or n == WG_RESPONSE_SIZE) and rnd_below(2) == 0 then
+      blake2s(&buf[n - 32], 16, &wg_dev.mac1_key, 32, &buf, n - 32)
+    end
+    local from: WgEndpoint = { family = 4, port = (@uint16)(rnd() & 0xffff) }
+    from.addr[0] = 203
+    wg_dev:receive(&from, &buf, n, wg_now)
+    wg_dev:tick(wg_now)
+  end
+  make_stream(&stream, 48)
+  local raw = string{data = (@*[0]byte)(&stream[0]), size = #stream}
+  local c: WgCidr
+  wgp.parse_cidr(raw, &c)
+  local fam: uint8
+  local a: [16]uint8
+  wgp.parse_ip(raw, &fam, &a)
+  local ok, f, total, src, dst = wgp.ip_header((@*[0]uint8)(&stream[0]), #stream)
+end
+
 -- Driver -----------------------------------------------------------------------------
 local seed: uint64 = 20260919
 local iters: integer = 64
@@ -166,6 +208,19 @@ srand(seed ~ 0x9e3779b9_u64)
 heap_stable('fuzz protocol', iters, proto_round)
 srand(seed ~ 0x517cc1b7_u64)
 heap_stable('fuzz agent strings', iters, agent_round)
+do
+  local key: [32]uint8
+  local peer: [32]uint8
+  for i = 0, < 32 do key[i] = (@uint8)(rnd() & 0xff) peer[i] = (@uint8)(rnd() & 0xff) end
+  wg_dev.send = wg_send
+  wg_dev.wall = fuzz_wall
+  wg_dev:init(&key)
+  wg_dev:add_peer('fuzz', &peer, nilptr)
+  wg_dev.index:reserve(16) -- its growth must not read as a leak
+end
+srand(seed ~ 0x2f0a6c11_u64)
+heap_stable('fuzz wireguard', iters, wg_round)
+wg_dev:destroy()
 
 stream:destroy()
 io.write('fuzz OK: ', vt_bytes, ' VT bytes, ', frames_read, ' frames read\n')

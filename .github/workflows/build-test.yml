@@ -75,7 +75,9 @@ jobs:
           path: |
             ~/.cache/ghostty-dalamud-ci
             vendor
-          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+          # build-common.sh builds the cached Nelua compiler: a change to how it
+          # is built must not reuse a compiler built the old way
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env', 'tools/build-common.sh') }}
       - name: Cache Zig build caches
         if: inputs.cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
