@@ -17,11 +17,11 @@ local strconv: type = require 'detail.strconv'
 
 -- Suites ------------------------------------------------------------------------
 -- In running order: `loader` swaps the core, so it goes last.
-global SELFTEST_SUITE_COUNT: integer <comptime> = 9
-global SELFTEST_SUITES: [9]string = {
-  'core', 'terminal', 'render', 'world', 'settings', 'themes', 'bell', 'agent', 'loader',
+global SELFTEST_SUITE_COUNT: integer <comptime> = 10
+global SELFTEST_SUITES: [10]string = {
+  'core', 'terminal', 'render', 'world', 'settings', 'themes', 'bell', 'agent', 'native', 'loader',
 }
-global SELFTEST_SUITE_HELP: [9]string = {
+global SELFTEST_SUITE_HELP: [10]string = {
   'the core is loaded and active, ImGui is bound, the build stamp is present',
   'a local terminal (no shell) fed known VT bytes, its grid and colours read back through libghostty',
   'a fixed terminal drawn through recorded draw calls (hash against the host build) and into an offscreen draw list twice',
@@ -30,9 +30,10 @@ global SELFTEST_SUITE_HELP: [9]string = {
   'every theme resolves, and switching and restoring gives the same colours (when lua/themes.lua exists)',
   '/term bell and /term showcase arguments parse; the bell style is restored',
   'a shell on ghostty-agent echoes a marker, exits and is closed (skipped when no agent answers)',
+  'a terminal in a game window: the addon opens, its texture is content x scale at a whole pixel, frames draw, colour swatches read back from the screen match the same through ImGui, two real clicks on its text keep the keyboard with it, it closes and gives the keyboard back, and a forced failure falls back to an ImGui window',
   'the loader swaps in the same ghostty_core.dll and back; terminals, layout and settings survive',
 }
-global SELFTEST_ALL: uint32 <comptime> = (1 << 9) - 1
+global SELFTEST_ALL: uint32 <comptime> = (1 << 10) - 1
 
 global function selftest_suite_index(name: string): integer
   for i = 0, < SELFTEST_SUITE_COUNT do

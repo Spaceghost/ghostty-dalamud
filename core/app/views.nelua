@@ -91,6 +91,10 @@ global function take_out_of_views(s: *Session): void
   for i = 0, < #host.minimized do
     if host.minimized[i] == s then host.minimized:remove(i) break end
   end
+  -- a game window closes by itself once its terminal left host.native (core/app/nativeview.nelua)
+  for i = 0, < #host.native do
+    if host.native[i] == s then host.native:remove(i) break end
+  end
   for i = 0, < #host.world do
     if host.world[i] == s then
       host.world:remove(i)
@@ -128,11 +132,20 @@ global function find_session(id: integer): *Session
   return nilptr
 end
 
--- The terminal commands act on: focused world panel, else the dropdown's
--- active tab, else the most recent floating window.
+-- A game window asked to take the keyboard (bring_forward), and the one that
+-- has it (core/app/nativeview.nelua keeps both); 0 none.
+global native_focus_request: integer = 0
+global native_focused_id: integer = 0
+
+-- The terminal commands act on: focused world panel, else a focused game
+-- window, else the dropdown's active tab, else the most recent floating window.
 global function active_terminal(): *Session
   if host.world_focus ~= 0 then
     local s = find_session(host.world_focus)
+    if s ~= nilptr then return s end
+  end
+  if native_focused_id ~= 0 then
+    local s = find_session(native_focused_id)
     if s ~= nilptr then return s end
   end
   if host.dropdown_active >= 0 and host.dropdown_active < #host.dropdown_tabs then return host.dropdown_tabs[host.dropdown_active] end
@@ -175,6 +188,9 @@ global function bring_forward(s: *Session): void
   for i = 0, < #host.windows do
     if host.windows[i] == s then set_visible(true) return end
   end
+  for i = 0, < #host.native do
+    if host.native[i] == s then native_focus_request = s.id return end
+  end
   restore(s) -- minimized (or nowhere)
 end
 
@@ -184,6 +200,7 @@ global function select_terminal(dir: integer): void
   local list: vector(*Session)
   for i = 0, < #host.dropdown_tabs do list:push(host.dropdown_tabs[i]) end
   for i = 0, < #host.windows do list:push(host.windows[i]) end
+  for i = 0, < #host.native do list:push(host.native[i]) end
   for i = 0, < #host.world do list:push(host.world[i]) end
   local n = #list
   if n > 0 then

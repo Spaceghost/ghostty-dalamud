@@ -96,12 +96,22 @@ internal static unsafe class HostApi
         Api->GameLookup     = &GameLookup;
         Api->GameAction     = &GameAction;
         Api->TextureIcon    = &TextureIcon;
+        Api->NativeOpen     = &NativeWindows.Open;
+        Api->NativeClose    = &NativeWindows.Close;
+        Api->NativeState    = &NativeWindows.State;
+        Api->NativeDraw     = &NativeWindows.Draw;
+        Api->NativeResize   = &NativeWindows.Resize;
+        Api->NativeTitle    = &NativeWindows.Title;
+        Api->PushMonoFontPx = &PushMonoFontPx;
     }
 
     public static void Free()
     {
         NativeMemory.Free(Api);
         Api = null;
+        foreach (var f in _sizedFonts.Values) f.Dispose();
+        _sizedFonts.Clear();
+        _sizedOrder.Clear();
         _worldFont?.Dispose();
         _worldFont = null;
         _monoFont?.Dispose();
@@ -490,6 +500,37 @@ internal static unsafe class HostApi
     private static void PushWorldFont()
     {
         _fontScope = _worldFont is { Available: true } ? _worldFont.Push() : Plugin.Pi.UiBuilder.MonoFontHandle.Push();
+    }
+
+    // The terminal font at an exact pixel size, for game windows at any UI scale
+    // (core/app/nativeview.nelua): built by the font atlas in the background the
+    // first time a size is asked for (0 = not ready, nothing pushed), the four
+    // sizes used last kept.
+    private const int SizedFontsKept = 4;
+    private static readonly System.Collections.Generic.Dictionary<int, IFontHandle> _sizedFonts = new();
+    private static readonly System.Collections.Generic.List<int> _sizedOrder = new();
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int PushMonoFontPx(float px)
+    {
+        try {
+            if (!(px >= 4 && px <= 128)) return 0;
+            int key = (int)MathF.Round(px);
+            if (!_sizedFonts.TryGetValue(key, out var handle)) {
+                while (_sizedOrder.Count >= SizedFontsKept) {
+                    int old = _sizedOrder[0];
+                    _sizedOrder.RemoveAt(0);
+                    if (_sizedFonts.Remove(old, out var gone)) gone.Dispose();
+                }
+                handle = TerminalFont(key);
+                _sizedFonts[key] = handle;
+            }
+            _sizedOrder.Remove(key);
+            _sizedOrder.Add(key);
+            if (!handle.Available) return 0;
+            _fontScope = handle.Push();
+            return 1;
+        } catch { return 0; }
     }
 
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]

@@ -1,6 +1,6 @@
 -- Every terminal in one list: the server info bar entry's left click
--- (CONFIG.host.dtr.on_click -> 'list'). Pets, pins, floating windows,
--- dropdown tabs and minimized terminals, each a row with its kind's icon; a
+-- (CONFIG.host.dtr.on_click -> 'list'). Pets, pins, floating windows, game
+-- windows, dropdown tabs and minimized terminals, each a row with its kind's icon; a
 -- click brings that one forward (bring_forward: shows the world screens,
 -- the dropdown or the window, or restores it) and closes the list. Our own
 -- ImGui window in the dropdown's glass, anchored where the entry was
@@ -10,7 +10,7 @@ require 'core.app.anchored_popup'
 require 'core.app.popup'
 require 'core.app.dropdown'
 
-global InventoryKind = @enum{ Pet = 0, Pin, Docked, Window, Tab, Minimized }
+global InventoryKind = @enum{ Pet = 0, Pin, Docked, Window, Tab, Minimized, Game }
 
 global InventoryRow = @record{
   s: *Session,
@@ -22,8 +22,8 @@ local INV_ROW: float32 <comptime> = 28
 local INV_HEAD: float32 <comptime> = 34
 local INV_PAD: float32 <comptime> = 8
 
-local KIND_NAMES: [6]string = { 'pet', 'pin', 'docked', 'window', 'tab', 'minimized' }
-local KIND_ICONS: [6]ChromeIcon = { ChromeIcon.Paw, ChromeIcon.Pin, ChromeIcon.Dock, ChromeIcon.Window, ChromeIcon.Chevron, ChromeIcon.Minimize }
+local KIND_NAMES: [7]string = { 'pet', 'pin', 'docked', 'window', 'tab', 'minimized', 'game window' }
+local KIND_ICONS: [7]ChromeIcon = { ChromeIcon.Paw, ChromeIcon.Pin, ChromeIcon.Dock, ChromeIcon.Window, ChromeIcon.Chevron, ChromeIcon.Minimize, ChromeIcon.Game }
 
 global function inventory_kind_name(k: InventoryKind): string
   return KIND_NAMES[(@integer)(k)]
@@ -38,7 +38,7 @@ global function inventory_world_kind(anchor: string): InventoryKind
   return InventoryKind.Pin
 end
 
--- The rows in list order: pets, pins, windows, tabs, minimized.
+-- The rows in list order: pets, pins, windows, game windows, tabs, minimized.
 global function inventory_collect(rows: *vector(InventoryRow)): void
   rows:clear()
   local pins: vector(InventoryRow)
@@ -52,6 +52,7 @@ global function inventory_collect(rows: *vector(InventoryRow)): void
   for i = 0, < #pins do rows:push(pins[i]) end
   pins:destroy()
   for i = 0, < #host.windows do rows:push(InventoryRow{ s = host.windows[i], kind = InventoryKind.Window }) end
+  for i = 0, < #host.native do rows:push(InventoryRow{ s = host.native[i], kind = InventoryKind.Game }) end
   for i = 0, < #host.dropdown_tabs do rows:push(InventoryRow{ s = host.dropdown_tabs[i], kind = InventoryKind.Tab }) end
   for i = 0, < #host.minimized do rows:push(InventoryRow{ s = host.minimized[i], kind = InventoryKind.Minimized }) end
 end
