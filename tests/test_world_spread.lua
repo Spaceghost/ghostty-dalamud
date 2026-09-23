@@ -138,7 +138,12 @@ local function tick(step)
 end
 
 -- 1. With the arrangement off, a camera down the arc leaves pets covering
---    each other: this is the complaint, reproduced.
+--    each other: this is the complaint, reproduced. Pets stacked further out
+--    and higher per step back (M.pet.stack_depth, M.pet.cute.nestle) and
+--    kept apart edge to edge (M.pet.collide) already cover each other less
+--    from here, so those are set back to the rigid slots this solver was
+--    written against: the question is what the solver does, not the slots.
+W.pet.stack_depth, W.pet.cute.nestle, W.pet.collide.enabled = 0, 0, false
 W.pet.spread.enabled = false
 look_from(0, 1.6, -9, 0, 1.6, 0)
 local off_pls = settle(6, 1 / 30)
@@ -152,6 +157,7 @@ local on_pls = settle(6, 1 / 30)
 local on_worst = worst_pair(on_pls)
 
 print(string.format('worst overlap: off %.3f, on %.3f', off_worst, on_worst))
+assert(off_worst > 0.2, 'the complaint is reproduced: pets cover each other with the arrangement off')
 assert(on_worst <= off_worst + 1e-6,
   string.format('spreading must not make overlap worse (off %.3f, on %.3f)', off_worst, on_worst))
 assert(on_worst <= math.max(W.pet.spread.overlap * 1.5, off_worst * 0.9),

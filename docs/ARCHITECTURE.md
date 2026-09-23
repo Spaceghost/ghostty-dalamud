@@ -229,6 +229,92 @@ panel, `ImGuiConfigFlags_NoMouseCursorChange` is set for the next frame so
 Dalamud's backend does not swap in an OS cursor; elsewhere it is cleared
 again, only if we set it. Not yet observed in game.
 
+## Pets: keeping out of the way, and how they move
+
+**Status: host tests only (`tests/test_motion.lua`, `tests/test_world.nelua`,
+`tests/test_worldpanel.nelua`). Not yet observed in game.** Nothing below has
+been seen in FFXIV; in particular the game's collision has only been stood in
+for by boxes in a fake `ghostty.raycast`.
+
+Pets are placed by `M.place_pet` in lua/world.lua, with the maths in
+lua/motion.lua (pure, no game). Every rule moves the point a pet's springs aim
+at first, so it glides to a free place; what still gets too close is then a
+*contact*: the pet is put back outside, loses the speed it had into the
+obstacle (keeping `collide.bounce` of it) and squashes, instead of being
+snapped back every frame.
+
+* **Other panels.** A panel is its footprint on the ground plane: the chord of
+  its (curved) face, from edge to edge. Two panels whose heights overlap keep
+  `CONFIG.world.pet.collide.gap` between their nearest edges
+  (`motion.panel_push`: exact along the nearest points when apart, the least
+  push along the line between centres, found by halving, when they cross).
+  Pets keep off the pets placed before them this frame and off every other
+  world panel placed in the last quarter second (pins, `me`/`target`
+  followers, orbits, windows); HUD-docked panels are not in the world and are
+  left alone. Pins never move for a pet. A pet that runs into a panel on its
+  way to a slot on the far side hops over it (a quick spring lifting its
+  bottom just over the other's top, down again once it has been clear for a
+  moment) rather than resting against it for good. Stacked pets now also sit
+  `pet.stack_depth` further out per step back round you: two panels a step
+  apart on the same circle cross each other, one behind the other do not.
+* **You and your target.** Besides the old personal-space radius about your
+  centre (half the panel's width + 0.6), a pet's footprint keeps
+  `collide.body` from your middle and from your current target's
+  (`ghostty.target()`). Other characters and NPCs you have not targeted are
+  **not** avoided: the shim gives Lua no way to list nearby objects, only you,
+  your target and objects by entity id.
+* **The world.** `ghostty.raycast` (the shim's `BGCollisionModule.RaycastMaterialFilter`,
+  the background collision the game's own ScreenToWorld uses) from your chest
+  (`collide.chest` above your feet) to the pet's centre and both edges says
+  how far in it must come to stay `collide.margin` in front of a wall
+  (`motion.pull_in`). Never into your personal space: when its slot has no
+  room it swings round you, nearest first, up to `collide.swing` radians and
+  never into the no-go cones, keeping a way round it found while that still
+  fits; with nowhere to go it takes the least cramped place. Rays straight
+  down and up from its centre keep its bottom above a floor or ledge and its
+  top below a ceiling (`motion.headroom`; the floor wins when there is no room
+  for both). That is looked at `collide.probe_hz` times a second per pet, and
+  every frame one ray from your chest to where the spring has the pet now
+  catches a wall the spring is lagging through (a contact, and the next look
+  comes at once). All pets together cast at most `collide.rays` rays a frame.
+  An older core without `ghostty.raycast` (or a shim without `raycast`)
+  simply sees no walls. Collision is background only: characters, and props
+  the game only draws, are invisible to it.
+* **The view.** The existing no-go cones stay as they were: no pet centre
+  between the camera and you, or straight behind you. A wide pet's edge may
+  still reach into the camera cone; the cones were not widened, because the
+  stacked slots would then fight the cones.
+
+How they move (`CONFIG.world.pet.cute`, `pet.follow`, `CONFIG.world.motion`):
+
+* One spring integrator for everything (`motion.step`): semi-implicit, in
+  substeps of at most 1/120 s and short enough that `h * w <= 0.5`, a frame
+  taken as at most 0.1 s. It never gains energy, whatever the stiffness or the
+  frame rate, and 30, 60, 144 fps and a ragged frame rate trace the same curve.
+* The bob is two sines at an irrational ratio, each pet at its own pace (0.85
+  to 1.15 of `cute.bob_speed`, from its phase), so no two bob in step; a
+  focused pet bobs a quarter as much. An idle sway, a small tilt of its own
+  (`cute.tilt`), a fan per step back for stacked pets (`cute.fan`, and the row
+  beside a focused pet starts every other tier half a brick along instead of
+  in columns), a little extra height per step back (`cute.nestle`), and a
+  bank into sideways movement (`cute.lean`) are summed into the placement's
+  `roll` through a spring of their own. A focused pet eases to still and
+  straight.
+* Squash: a spring of its own (`m_sq`), kicked by contacts (at most every
+  quarter second), by a fall that stops and by a move that stops, and
+  stretched while rising or falling fast; never beyond +-0.14. The placement
+  carries it as `squash`; `world_basis` makes the panel wider by 1 + squash
+  and shorter by the same factor, and everything that works from the basis
+  (projection, hit tests, the depth test) follows.
+* A procession: each pet is `follow.stagger` softer on its spring than the one
+  before it in the order (at most 45 % softer), so they set off and stop one
+  after another.
+* `CONFIG.world.motion.reduce` (Settings, Pets: Reduce motion) turns off the
+  bob, sway, tilt, fan, lean, squash and the procession, and the springs
+  settle without overshoot. Collision stays on.
+
+State kept on an anchor for this starts with `m_` and is never saved.
+
 ## World panels behind game geometry
 
 ImGui draws after the game, so a world panel would cover everything. With
