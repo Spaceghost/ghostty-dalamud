@@ -135,6 +135,7 @@ local TCP_NODELAY: cint <cimport, nodecl, const>
 ## cemitdecl [[gi_handle gi_listen(const char *allowlist_path);]]
 ## cemitdecl [[gi_handle gi_accept(gi_handle listener);]]
 ## cemitdecl [[int32_t   gi_peer_id(gi_handle h, char *out, size_t cap);]]
+## cemitdecl [[int32_t   gi_peer_caps(gi_handle h);]]
 ## cemitdecl [[int32_t   gi_recv(gi_handle h, void *buf, size_t cap);]]
 ## cemitdecl [[int32_t   gi_send(gi_handle h, const void *buf, size_t len);]]
 ## cemitdecl [[void      gi_close(gi_handle h);]]
@@ -153,6 +154,7 @@ local function gi_connect_poll(h: gi_handle): int32 <cimport, nodecl> end
 local function gi_listen(allowlist_path: cstring): gi_handle <cimport, nodecl> end
 local function gi_accept(listener: gi_handle): gi_handle <cimport, nodecl> end
 local function gi_peer_id(h: gi_handle, out: cstring, cap: csize): int32 <cimport, nodecl> end
+local function gi_peer_caps(h: gi_handle): int32 <cimport, nodecl> end
 local function gi_recv(h: gi_handle, buf: pointer, cap: csize): int32 <cimport, nodecl> end
 local function gi_send(h: gi_handle, buf: pointer, len: csize): int32 <cimport, nodecl> end
 local function gi_close(h: gi_handle): void <cimport, nodecl> end
@@ -738,6 +740,18 @@ function net.node_id(): string
   ## else
     return string.copy('')
   ## end
+end
+
+-- What the allowlist grants an iroh peer (GI_CAP_*), or <0 when it cannot be
+-- told -- which callers must treat as "no capabilities", not "all of them".
+-- A TCP socket has no allowlist behind it and answers -1 for the same reason:
+-- the caller decides what a connection with no grants means, and for the
+-- socket path the token is still the whole authorisation.
+function net.peer_caps(s: NetSocket): int32
+  ## if NET_IROH then
+    if is_iroh(s) then return gi_peer_caps(iroh_of(s)) end
+  ## end
+  return -1
 end
 
 -- The peer's z-base-32 NodeId for an iroh connection, empty for a TCP one.
