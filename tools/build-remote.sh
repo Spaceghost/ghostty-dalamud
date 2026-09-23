@@ -149,9 +149,21 @@ push_source() {
   local list
   list="$(mktemp)"
   git -C "$ROOT" ls-files -z --cached --others --exclude-standard >"$list"
-  # clear the old source but keep build/ and the vendor symlink
-  "$INCUS" exec "$C" -- bash -c "mkdir -p $D && find $D -mindepth 1 -maxdepth 1 ! -name build ! -name vendor -exec rm -rf {} +"
-  tar -C "$ROOT" --null -T "$list" -czf - | "$INCUS" exec "$C" -- tar -xzf - -C "$D"
+  # Under the same lock the build takes. Every checkout shares $D on purpose --
+  # it is part of every sccache key, so a per-worktree path would give each one
+  # its own cache namespace -- which means an unlocked push can rm -rf a
+  # checkout another run is compiling. That failure does not look like a race:
+  # it surfaces as five or six unrelated crates failing at once on missing
+  # files ("extern location for proc_macro2 does not exist", "failed to open
+  # object file"), which reads as a broken toolchain rather than a clobber.
+  #
+  # flock is held for the clear and the unpack together: releasing between them
+  # would leave a window where $D exists but is empty.
+  "$INCUS" exec "$C" -- bash -c "mkdir -p $D $BUILD_CONTAINER_CACHE"
+  tar -C "$ROOT" --null -T "$list" -czf - | "$INCUS" exec "$C" -- bash -c "
+    flock -o -w \${BUILD_LOCK_WAIT:-7200} $BUILD_CONTAINER_CACHE/build.lock -c '
+      find $D -mindepth 1 -maxdepth 1 ! -name build ! -name vendor -exec rm -rf {} + &&
+      tar -xzf - -C $D'"
   rm -f "$list"
   # the shared cache: vendor checkouts and every reusable build directory live
   # on the Incus volume, so a second container on this host starts warm
