@@ -486,7 +486,7 @@ core/sys/     net (POSIX + Winsock), conpty (Windows), procguard, fs / fsbase, p
 core/shaders/ HLSL sources and the committed DXBC the core embeds
 agent/        ghostty-agent PTY server (Nelua): agent.nelua, logic, pty_posix / sys_posix, pty_windows / sys_windows / winloop
 agent/        raw jobs (docs/JOBS.md): jobs.nelua, job_posix / job_windows, claude.nelua (the Claude Code command line)
-agent/        embedded WireGuard (docs/WIREGUARD.md): crypto.nelua (Monocypher), blake2s.nelua
+agent/        embedded WireGuard (docs/WIREGUARD.md): crypto.nelua (Monocypher), blake2s.nelua, wg_proto (constants, replay window, addresses), wg_device (handshake, transport, cookies, timers), wg_udp (the socket)
 lua/          shipped policy: init.lua, keymap.lua, migrate.lua, assistant.lua (/term ask), selftest.lua (/term selftest), ...
 themes/       shipped colour themes (Ghostty theme files, read by lua/themes.lua)
 shim/         GhosttyDalamud (plugin) and Umbra.Ghostty (widget) C# projects
@@ -566,6 +566,7 @@ the agent compiles them in.
 | `test_capture_win32` | the Win32 window capture backend's pure parts: USB HID → virtual key, key message lParams, the characters keys stand for, mouse and wheel words, SendInput absolute coordinates, blank (all-black) captures, UTF-8 → UTF-16 for WM_CHAR, WLISTR lines, window matching |
 | `test_agent` | `ghostty-agent` end to end over TCP |
 | `test_wg_crypto` | the embedded WireGuard's primitives (docs/WIREGUARD.md): BLAKE2s against RFC 7693 (Appendix B and the Appendix E self-test), HMAC-BLAKE2s and the KDF against Python's hashlib/hmac, X25519 against RFC 7748 (and the all-zero result refused), ChaCha20-Poly1305 against RFC 8439 (tampering, in place, WireGuard's nonce form, empty messages), XChaCha20-Poly1305 against draft-irtf-cfrg-xchacha, base64 keys as wg(8) writes them |
+| `test_wg` | the WireGuard protocol (agent/wg_device.nelua) between two devices on a fake network with a fake clock: the handshake started by data, data both ways, replays and the window, tampering and silence (garbage, a wrong MAC1, the all-zero DH result, junk that does not decrypt), cryptokey routing (IPv4 and IPv6), keepalives, rekey on time and on message count, roaming (and no roaming on forged datagrams), a replayed initiation, the 20 ms initiation rate, cookies under load, retransmission and giving up, keys wiped after 540 s, the responder dialling with a persistent keepalive, removing a peer. `tools/wg-interop.sh` runs the same code against kernel WireGuard in another Incus container |
 | `test_wincodec` | remote window frames: changed tiles, QOI both ways, banding, WFRAME write/parse/apply, malformed input, downscaling |
 | `test_capture_mac` | the macOS capture backend's pure parts: HID to kVK keycodes, key flags, mouse event types and click counts, frame pixels to global points, the Block literal layout, `run:APP`, window picking and WLISTR lines, UTF-16 text chunks, CGImage layouts to BGRA (the backend itself has never run on a Mac) |
 | `test_agent_windows` | remote windows end to end over TCP against `--windows test`: list, open by id and match, KEY and delta frames rebuilt, scaling, flow control, every input kind, close, WEND, failures, streams per connection, `--windows off` |

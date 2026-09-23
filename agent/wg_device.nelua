@@ -1,0 +1,880 @@
+-- The agent's WireGuard device (docs/WIREGUARD.md): peers, the Noise_IKpsk2
+-- handshake, transport data, cookies under load, the whitepaper's timers and
+-- roaming, exactly as WireGuard specifies them, so the stock WireGuard apps
+-- are its clients. It follows wireguard-go's structure (noise-protocol.go,
+-- timers.go, send.go, receive.go) where the whitepaper leaves a choice.
+--
+-- No sockets and no clock of its own: datagrams come in through
+-- WgDevice:receive and go out through `send` (the carrier: the UDP socket in
+-- the agent, a fake network in tests/test_wg.nelua), decrypted IP packets go
+-- to `deliver` (the netstack), and every call takes the monotonic time `now`
+-- in seconds. The wall clock (for TAI64N) is `wall`.
+--
+-- Nothing answers a datagram that fails MAC1 or its AEAD.
+require 'memory'
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'hashmap'
+require 'agent.crypto'
+require 'agent.blake2s'
+require 'agent.wg_proto'
+
+local WG_STAGED_MAX: usize <comptime> = 128   -- IP packets kept per peer while a handshake runs
+local WG_LOAD_THRESHOLD: integer <comptime> = 64 -- handshake messages a second before cookies are asked for
+
+-- handshake states
+local HS_ZEROED: uint8 <comptime> = 0
+local HS_INIT_CREATED: uint8 <comptime> = 1
+local HS_INIT_CONSUMED: uint8 <comptime> = 2
+local HS_RESP_CREATED: uint8 <comptime> = 3
+local HS_RESP_CONSUMED: uint8 <comptime> = 4
+
+global WgKeypair = @record{
+  valid: boolean,
+  initiator: boolean,
+  send_key: [32]uint8,
+  recv_key: [32]uint8,
+  send_counter: uint64,
+  replay: WgReplay,
+  local_index: uint32,
+  remote_index: uint32,
+  created: number,
+}
+
+local WgHandshake = @record{
+  state: uint8,
+  hash: [32]uint8,
+  chain: [32]uint8,
+  ephemeral: [32]uint8,        -- our ephemeral private key
+  remote_ephemeral: [32]uint8,
+  local_index: uint32,
+  remote_index: uint32,
+  last_timestamp: [12]uint8,   -- the newest TAI64N accepted from this peer
+  last_initiation_consumed: number,
+  last_sent: number,           -- when we last sent an initiation (rate limit)
+}
+
+local Staged = @record{ data: vector(uint8) }
+
+-- (eight-byte fields first and the small ones last, so the record packs)
+global WgPeer = @record{
+  name: string,
+  allowed: vector(WgCidr),
+  staged: vector(Staged),
+  hs: WgHandshake,
+  current: WgKeypair,
+  previous: WgKeypair,
+  next: WgKeypair,
+  keepalive: integer,          -- persistent keepalive, seconds (0: off)
+  cookie_at: number,           -- when the peer's cookie came (0: none)
+  -- timers: absolute times, 0 when not pending
+  t_retransmit: number,
+  t_keepalive: number,
+  t_new_handshake: number,
+  t_zero: number,
+  t_persistent: number,
+  handshake_attempts: integer,
+  -- what `ghostty-agent wg list` shows
+  last_handshake_wall: int64,  -- Unix seconds of the last completed handshake
+  rx_bytes: uint64,
+  tx_bytes: uint64,
+  public: [32]uint8,
+  psk: [32]uint8,
+  -- precomputed
+  static_ss: [32]uint8,        -- DH(our static, their static)
+  mac1_key: [32]uint8,         -- HASH("mac1----" || their public): MAC1 of what we send
+  cookie_key: [32]uint8,       -- HASH("cookie--" || their public): cookies they send us
+  cookie: [16]uint8,           -- the cookie they gave us, for MAC2 on what we send
+  last_mac1: [16]uint8,        -- MAC1 of the last handshake message we sent
+  endpoint: WgEndpoint,
+  has_mac1: boolean,
+  need_another_keepalive: boolean,
+  sent_last_minute_handshake: boolean,
+  connected: boolean,          -- has a session now (logged when it starts and ends)
+}
+
+global WgDevice = @record{
+  private: [32]uint8,
+  public: [32]uint8,
+  mac1_key: [32]uint8,         -- HASH("mac1----" || our public): MAC1 of what we receive
+  cookie_key: [32]uint8,       -- HASH("cookie--" || our public): cookies we send
+  cookie_secret: [32]uint8,
+  cookie_secret_at: number,
+  load_start: number,          -- the one-second window handshake messages are counted in
+  load_count: integer,
+  under_load_until: number,
+  force_load: boolean,         -- tests: always under load
+  peers: vector(*WgPeer),
+  index: hashmap(uint32, *WgPeer),
+  mtu: usize,
+  ud: pointer,
+  send: function(ud: pointer, ep: *WgEndpoint, data: *[0]uint8, len: usize): void,
+  deliver: function(ud: pointer, peer: *WgPeer, pkt: *[0]uint8, len: usize): void,
+  wall: function(): (int64, int64),   -- Unix seconds and nanoseconds
+  log: function(ud: pointer, msg: string): void,
+  buf: vector(uint8),           -- scratch for outgoing data
+}
+
+-- Hash helpers ---------------------------------------------------------------
+
+local function mix_hash(h: *[32]uint8, data: *[0]uint8, len: usize): void
+  local s: Blake2s
+  s:init(32, nilptr, 0)
+  s:update(h, 32)
+  s:update(data, len)
+  s:final(h)
+end
+
+local function hash2(out: *[32]uint8, a: *[0]uint8, alen: usize, b: *[0]uint8, blen: usize): void
+  local s: Blake2s
+  s:init(32, nilptr, 0)
+  s:update(a, alen)
+  s:update(b, blen)
+  s:final(out)
+end
+
+local initial_chain: [32]uint8
+local initial_hash: [32]uint8
+local initial_done = false
+
+local function initials(): void
+  if initial_done then return end
+  local c: string = WG_CONSTRUCTION
+  local id: string = WG_IDENTIFIER
+  blake2s(&initial_chain, 32, nilptr, 0, (@*[0]uint8)(c.data), c.size)
+  hash2(&initial_hash, &initial_chain, 32, (@*[0]uint8)(id.data), id.size)
+  initial_done = true
+end
+
+local function label_key(out: *[32]uint8, label: string, pub: *[32]uint8): void
+  hash2(out, (@*[0]uint8)(label.data), label.size, pub, 32)
+end
+
+local function logf(dev: *WgDevice, msg: string): void
+  if dev.log ~= nilptr then dev.log(dev.ud, msg) end
+end
+
+-- "wireguard: <peer> <what>[ <endpoint>]"
+local function log_peer(dev: *WgDevice, p: *WgPeer, what: string, with_endpoint: boolean): void
+  if dev.log == nilptr then return end
+  local sb: stringbuilder
+  sb:write('wireguard: ', p.name, ' ', what)
+  if with_endpoint then
+    local ep = p.endpoint:tostring()
+    sb:write(' ', ep)
+    ep:destroy()
+  end
+  local msg = sb:promote()
+  dev.log(dev.ud, msg)
+  msg:destroy()
+end
+
+local function jitter(): number
+  local r: [2]uint8
+  crypto.random(&r, 2)
+  return WG_REKEY_JITTER * (((@uint32)(r[0]) << 8) | r[1]) / 65536.0
+end
+
+-- Indices ----------------------------------------------------------------------
+
+local function new_index(dev: *WgDevice, peer: *WgPeer): uint32
+  while true do
+    local r: [4]uint8
+    if not crypto.random(&r, 4) then return 0 end
+    local idx = wgp.get_u32(&r)
+    if idx ~= 0 and not dev.index:has(idx) then
+      dev.index[idx] = peer
+      return idx
+    end
+  end
+  return 0
+end
+
+local function drop_index(dev: *WgDevice, idx: uint32): void
+  if idx ~= 0 then dev.index:remove(idx) end
+end
+
+local function wipe_keypair(dev: *WgDevice, kp: *WgKeypair): void
+  if kp.valid then drop_index(dev, kp.local_index) end
+  crypto.wipe(kp, #WgKeypair)
+end
+
+local function wipe_handshake(dev: *WgDevice, hs: *WgHandshake, keep_index: boolean): void
+  if not keep_index and hs.state ~= HS_ZEROED then drop_index(dev, hs.local_index) end
+  -- the timestamp and rate-limit times outlive the handshake: they stop replays
+  local ts: [12]uint8
+  memory.copy(&ts, &hs.last_timestamp, 12)
+  local consumed, sent = hs.last_initiation_consumed, hs.last_sent
+  crypto.wipe(hs, #WgHandshake)
+  memory.copy(&hs.last_timestamp, &ts, 12)
+  hs.last_initiation_consumed, hs.last_sent = consumed, sent
+end
+
+-- Device and peers -------------------------------------------------------------
+
+function WgDevice:init(private: *[0]uint8): void
+  initials()
+  memory.copy(&self.private, private, 32)
+  crypto.x25519_public(&self.public, &self.private)
+  label_key(&self.mac1_key, WG_LABEL_MAC1, &self.public)
+  label_key(&self.cookie_key, WG_LABEL_COOKIE, &self.public)
+  if self.mtu == 0 then self.mtu = 1420 end
+  self.cookie_secret_at = -1e9
+end
+
+local function peer_refresh_keys(dev: *WgDevice, p: *WgPeer): void
+  if not crypto.x25519(&p.static_ss, &dev.private, &p.public) then memory.zero(&p.static_ss, 32) end
+  label_key(&p.mac1_key, WG_LABEL_MAC1, &p.public)
+  label_key(&p.cookie_key, WG_LABEL_COOKIE, &p.public)
+end
+
+-- A new peer. `psk` may be nilptr (all zero, as WireGuard's default).
+function WgDevice:add_peer(name: string, public: *[0]uint8, psk: *[0]uint8): *WgPeer
+  local p = new(@WgPeer)
+  p.name = name:copy()
+  memory.copy(&p.public, public, 32)
+  if psk ~= nilptr then memory.copy(&p.psk, psk, 32) end
+  peer_refresh_keys(self, p)
+  self.peers:push(p)
+  return p
+end
+
+function WgDevice:find_peer(public: *[0]uint8): *WgPeer
+  for i = 0, < #self.peers do
+    if crypto.equal32(&self.peers[i].public, public) then return self.peers[i] end
+  end
+  return nilptr
+end
+
+local function free_staged(p: *WgPeer): void
+  for i = 0, < #p.staged do p.staged[i].data:destroy() end
+  p.staged:clear()
+end
+
+-- Forget a peer: its keys are wiped now, its indices go with them.
+function WgDevice:remove_peer(p: *WgPeer): void
+  for i = 0, < #self.peers do
+    if self.peers[i] == p then self.peers:remove(i) break end
+  end
+  wipe_keypair(self, &p.current)
+  wipe_keypair(self, &p.previous)
+  wipe_keypair(self, &p.next)
+  wipe_handshake(self, &p.hs, false)
+  free_staged(p)
+  p.staged:destroy()
+  p.allowed:destroy()
+  p.name:destroy()
+  crypto.wipe(p, #WgPeer)
+  delete(p)
+end
+
+function WgDevice:destroy(): void
+  while #self.peers > 0 do self:remove_peer(self.peers[#self.peers - 1]) end
+  self.peers:destroy()
+  self.index:destroy()
+  self.buf:destroy()
+  crypto.wipe(self, #WgDevice)
+end
+
+-- MACs and cookies ---------------------------------------------------------------
+
+-- MAC1 and MAC2 on a handshake message we send to `p` (the message's last 32 bytes).
+local function add_macs(p: *WgPeer, msg: *[0]uint8, len: usize, now: number): void
+  local m1 = len - 32
+  blake2s(&msg[m1], 16, &p.mac1_key, 32, msg, m1)
+  memory.copy(&p.last_mac1, &msg[m1], 16)
+  p.has_mac1 = true
+  if p.cookie_at > 0 and now - p.cookie_at < WG_COOKIE_REFRESH then
+    blake2s(&msg[m1 + 16], 16, &p.cookie, 16, msg, m1 + 16)
+  else
+    memory.zero(&msg[m1 + 16], 16)
+  end
+end
+
+local function check_mac1(dev: *WgDevice, msg: *[0]uint8, len: usize): boolean
+  local m1 = len - 32
+  local want: [16]uint8
+  blake2s(&want, 16, &dev.mac1_key, 32, msg, m1)
+  return crypto.equal16(&want, &msg[m1])
+end
+
+local function cookie_for(dev: *WgDevice, src: *WgEndpoint, now: number, out: *[16]uint8): void
+  if now - dev.cookie_secret_at >= WG_COOKIE_REFRESH then
+    crypto.random(&dev.cookie_secret, 32)
+    dev.cookie_secret_at = now
+  end
+  local b: [18]uint8
+  local n = src:bind_bytes(&b)
+  blake2s(out, 16, &dev.cookie_secret, 32, &b, n)
+end
+
+local function check_mac2(dev: *WgDevice, msg: *[0]uint8, len: usize, src: *WgEndpoint, now: number): boolean
+  local cookie: [16]uint8
+  cookie_for(dev, src, now, &cookie)
+  local m2 = len - 16
+  local want: [16]uint8
+  blake2s(&want, 16, &cookie, 16, msg, m2)
+  return crypto.equal16(&want, &msg[m2])
+end
+
+-- Answer a handshake message that arrived under load without a valid MAC2.
+local function send_cookie_reply(dev: *WgDevice, msg: *[0]uint8, len: usize, sender: uint32, src: *WgEndpoint, now: number): void
+  local reply: [64]uint8
+  memory.zero(&reply, 64)
+  reply[0] = WG_MSG_COOKIE
+  wgp.put_u32(&reply[WG_COOKIE_RECEIVER], sender)
+  if not crypto.random(&reply[WG_COOKIE_NONCE], 24) then return end
+  local cookie: [16]uint8
+  cookie_for(dev, src, now, &cookie)
+  crypto.xaead_seal(&reply[WG_COOKIE_BODY], &dev.cookie_key, &reply[WG_COOKIE_NONCE], &msg[len - 32], 16, &cookie, 16)
+  dev.send(dev.ud, src, &reply, 64)
+end
+
+-- Under load: more than WG_LOAD_THRESHOLD handshake messages in the last second.
+local function under_load(dev: *WgDevice, now: number): boolean
+  if dev.force_load then return true end
+  if now - dev.load_start >= 1 then dev.load_start = now dev.load_count = 0 end
+  dev.load_count = dev.load_count + 1
+  if dev.load_count > WG_LOAD_THRESHOLD then dev.under_load_until = now + 1 end
+  return now < dev.under_load_until
+end
+
+-- The handshake --------------------------------------------------------------------
+
+-- Initiation (whitepaper 5.4.2), written into `msg` (148 bytes).
+local function create_initiation(dev: *WgDevice, p: *WgPeer, now: number, msg: *[0]uint8): boolean
+  if crypto.is_zero(&p.static_ss, 32) then return false end
+  local hs = &p.hs
+  wipe_handshake(dev, hs, false)
+  memory.copy(&hs.chain, &initial_chain, 32)
+  memory.copy(&hs.hash, &initial_hash, 32)
+  mix_hash(&hs.hash, &p.public, 32)
+  if not crypto.x25519_generate(&hs.ephemeral) then return false end
+  memory.zero(msg, WG_INITIATION_SIZE)
+  msg[0] = WG_MSG_INITIATION
+  local epub = (@*[0]uint8)(&msg[WG_INIT_EPHEMERAL])
+  crypto.x25519_public(epub, &hs.ephemeral)
+  wg_kdf(&hs.chain, epub, 32, &hs.chain, nilptr, nilptr)
+  mix_hash(&hs.hash, epub, 32)
+  local ss: [32]uint8
+  local key: [32]uint8
+  if not crypto.x25519(&ss, &hs.ephemeral, &p.public) then return false end
+  wg_kdf(&hs.chain, &ss, 32, &hs.chain, &key, nilptr)
+  crypto.wg_seal(&msg[WG_INIT_STATIC], &key, 0, &hs.hash, 32, &dev.public, 32)
+  mix_hash(&hs.hash, &msg[WG_INIT_STATIC], 48)
+  wg_kdf(&hs.chain, &p.static_ss, 32, &hs.chain, &key, nilptr)
+  local ts: [12]uint8
+  local s, ns = dev.wall()
+  wgp.tai64n(&ts, s, ns)
+  crypto.wg_seal(&msg[WG_INIT_TIMESTAMP], &key, 0, &hs.hash, 32, &ts, 12)
+  mix_hash(&hs.hash, &msg[WG_INIT_TIMESTAMP], 28)
+  hs.local_index = new_index(dev, p)
+  if hs.local_index == 0 then return false end
+  wgp.put_u32(&msg[WG_INIT_SENDER], hs.local_index)
+  hs.state = HS_INIT_CREATED
+  crypto.wipe(&ss, 32)
+  crypto.wipe(&key, 32)
+  return true
+end
+
+-- An initiation from someone: the peer it authenticates as, or nilptr.
+local function consume_initiation(dev: *WgDevice, msg: *[0]uint8, now: number): *WgPeer
+  local hash: [32]uint8
+  local chain: [32]uint8
+  local key: [32]uint8
+  local ss: [32]uint8
+  memory.copy(&hash, &initial_hash, 32)
+  memory.copy(&chain, &initial_chain, 32)
+  mix_hash(&hash, &dev.public, 32)
+  local epub = (@*[0]uint8)(&msg[WG_INIT_EPHEMERAL])
+  mix_hash(&hash, epub, 32)
+  wg_kdf(&chain, epub, 32, &chain, nilptr, nilptr)
+  if not crypto.x25519(&ss, &dev.private, epub) then return nilptr end
+  wg_kdf(&chain, &ss, 32, &chain, &key, nilptr)
+  local their_static: [32]uint8
+  if not crypto.wg_open(&their_static, &key, 0, &hash, 32, &msg[WG_INIT_STATIC], 32) then return nilptr end
+  mix_hash(&hash, &msg[WG_INIT_STATIC], 48)
+  local p = dev:find_peer(&their_static)
+  if p == nilptr or crypto.is_zero(&p.static_ss, 32) then return nilptr end
+  wg_kdf(&chain, &p.static_ss, 32, &chain, &key, nilptr)
+  local ts: [12]uint8
+  if not crypto.wg_open(&ts, &key, 0, &hash, 32, &msg[WG_INIT_TIMESTAMP], 12) then return nilptr end
+  mix_hash(&hash, &msg[WG_INIT_TIMESTAMP], 28)
+  local hs = &p.hs
+  -- a replayed initiation carries an old timestamp; a flood comes too fast
+  if not wgp.tai64n_after(&ts, &hs.last_timestamp) then return nilptr end
+  if hs.last_initiation_consumed > 0 and now - hs.last_initiation_consumed < WG_INITIATION_RATE then return nilptr end
+  wipe_handshake(dev, hs, false)
+  memory.copy(&hs.hash, &hash, 32)
+  memory.copy(&hs.chain, &chain, 32)
+  memory.copy(&hs.remote_ephemeral, epub, 32)
+  hs.remote_index = wgp.get_u32(&msg[WG_INIT_SENDER])
+  memory.copy(&hs.last_timestamp, &ts, 12)
+  hs.last_initiation_consumed = now
+  hs.state = HS_INIT_CONSUMED
+  crypto.wipe(&key, 32)
+  crypto.wipe(&ss, 32)
+  crypto.wipe(&chain, 32)
+  return p
+end
+
+-- Response (5.4.3) to the initiation `p.hs` consumed, into `msg` (92 bytes).
+local function create_response(dev: *WgDevice, p: *WgPeer, msg: *[0]uint8): boolean
+  local hs = &p.hs
+  if hs.state ~= HS_INIT_CONSUMED then return false end
+  hs.local_index = new_index(dev, p)
+  if hs.local_index == 0 then return false end
+  memory.zero(msg, WG_RESPONSE_SIZE)
+  msg[0] = WG_MSG_RESPONSE
+  wgp.put_u32(&msg[WG_RESP_SENDER], hs.local_index)
+  wgp.put_u32(&msg[WG_RESP_RECEIVER], hs.remote_index)
+  if not crypto.x25519_generate(&hs.ephemeral) then return false end
+  local epub = (@*[0]uint8)(&msg[WG_RESP_EPHEMERAL])
+  crypto.x25519_public(epub, &hs.ephemeral)
+  mix_hash(&hs.hash, epub, 32)
+  wg_kdf(&hs.chain, epub, 32, &hs.chain, nilptr, nilptr)
+  local ss: [32]uint8
+  if not crypto.x25519(&ss, &hs.ephemeral, &hs.remote_ephemeral) then return false end
+  wg_kdf(&hs.chain, &ss, 32, &hs.chain, nilptr, nilptr)
+  if not crypto.x25519(&ss, &hs.ephemeral, &p.public) then return false end
+  wg_kdf(&hs.chain, &ss, 32, &hs.chain, nilptr, nilptr)
+  local tau: [32]uint8
+  local key: [32]uint8
+  wg_kdf(&hs.chain, &p.psk, 32, &hs.chain, &tau, &key)
+  mix_hash(&hs.hash, &tau, 32)
+  crypto.wg_seal(&msg[WG_RESP_EMPTY], &key, 0, &hs.hash, 32, nilptr, 0)
+  mix_hash(&hs.hash, &msg[WG_RESP_EMPTY], 16)
+  hs.state = HS_RESP_CREATED
+  crypto.wipe(&ss, 32) crypto.wipe(&tau, 32) crypto.wipe(&key, 32)
+  return true
+end
+
+-- A response to our initiation: its peer, or nilptr.
+local function consume_response(dev: *WgDevice, msg: *[0]uint8): *WgPeer
+  local receiver = wgp.get_u32(&msg[WG_RESP_RECEIVER])
+  local pp = dev.index:peek(receiver)
+  if pp == nilptr then return nilptr end
+  local p = $pp
+  local hs = &p.hs
+  if hs.state ~= HS_INIT_CREATED or hs.local_index ~= receiver then return nilptr end
+  local hash: [32]uint8
+  local chain: [32]uint8
+  memory.copy(&hash, &hs.hash, 32)
+  memory.copy(&chain, &hs.chain, 32)
+  local epub = (@*[0]uint8)(&msg[WG_RESP_EPHEMERAL])
+  mix_hash(&hash, epub, 32)
+  wg_kdf(&chain, epub, 32, &chain, nilptr, nilptr)
+  local ss: [32]uint8
+  if not crypto.x25519(&ss, &hs.ephemeral, epub) then return nilptr end
+  wg_kdf(&chain, &ss, 32, &chain, nilptr, nilptr)
+  if not crypto.x25519(&ss, &dev.private, epub) then return nilptr end
+  wg_kdf(&chain, &ss, 32, &chain, nilptr, nilptr)
+  local tau: [32]uint8
+  local key: [32]uint8
+  wg_kdf(&chain, &p.psk, 32, &chain, &tau, &key)
+  mix_hash(&hash, &tau, 32)
+  local ok = crypto.wg_open(nilptr, &key, 0, &hash, 32, &msg[WG_RESP_EMPTY], 0)
+  crypto.wipe(&ss, 32) crypto.wipe(&tau, 32) crypto.wipe(&key, 32)
+  if not ok then crypto.wipe(&chain, 32) return nilptr end
+  mix_hash(&hash, &msg[WG_RESP_EMPTY], 16)
+  memory.copy(&hs.hash, &hash, 32)
+  memory.copy(&hs.chain, &chain, 32)
+  hs.remote_index = wgp.get_u32(&msg[WG_RESP_SENDER])
+  hs.state = HS_RESP_CONSUMED
+  crypto.wipe(&chain, 32)
+  return p
+end
+
+-- Session keys from a finished handshake (5.4.5), and the keypair rotation of
+-- wireguard-go's BeginSymmetricSession: the initiator starts using the new
+-- keys at once; the responder keeps them as `next` until the initiator's
+-- first data message shows it has them.
+local function begin_session(dev: *WgDevice, p: *WgPeer, now: number): boolean
+  local hs = &p.hs
+  local kp: WgKeypair
+  if hs.state == HS_RESP_CONSUMED then
+    wg_kdf(&hs.chain, nilptr, 0, &kp.send_key, &kp.recv_key, nilptr)
+    kp.initiator = true
+  elseif hs.state == HS_RESP_CREATED then
+    wg_kdf(&hs.chain, nilptr, 0, &kp.recv_key, &kp.send_key, nilptr)
+    kp.initiator = false
+  else
+    return false
+  end
+  kp.valid = true
+  kp.created = now
+  kp.local_index = hs.local_index
+  kp.remote_index = hs.remote_index
+  kp.replay:reset()
+  -- the handshake's index now names the keypair
+  wipe_handshake(dev, hs, true)
+  if kp.initiator then
+    if p.next.valid then
+      wipe_keypair(dev, &p.previous)
+      p.previous = p.next
+      p.next = {}
+      wipe_keypair(dev, &p.current)
+    else
+      wipe_keypair(dev, &p.previous)
+      p.previous = p.current
+    end
+    p.current = kp
+  else
+    wipe_keypair(dev, &p.next)
+    p.next = kp
+    wipe_keypair(dev, &p.previous)
+  end
+  crypto.wipe(&kp, #WgKeypair)
+  return true
+end
+
+-- Data arrived on `next`: the initiator has the new keys, so they become current.
+local function received_with_keypair(dev: *WgDevice, p: *WgPeer, kp: *WgKeypair): boolean
+  if kp ~= &p.next then return false end
+  wipe_keypair(dev, &p.previous)
+  p.previous = p.current
+  p.current = p.next
+  p.next = {}
+  return true
+end
+
+-- Timers (wireguard-go's timers.go) ---------------------------------------------
+
+local function timers_data_sent(p: *WgPeer, now: number): void
+  if p.t_new_handshake == 0 then p.t_new_handshake = now + WG_KEEPALIVE_TIMEOUT + WG_REKEY_TIMEOUT + jitter() end
+end
+
+local function timers_data_received(p: *WgPeer, now: number): void
+  if p.t_keepalive == 0 then p.t_keepalive = now + WG_KEEPALIVE_TIMEOUT
+  else p.need_another_keepalive = true end
+end
+
+local function timers_any_sent(p: *WgPeer): void p.t_keepalive = 0 end
+local function timers_any_received(p: *WgPeer): void p.t_new_handshake = 0 end
+
+local function timers_handshake_initiated(p: *WgPeer, now: number): void
+  p.t_retransmit = now + WG_REKEY_TIMEOUT + jitter()
+end
+
+local function timers_handshake_complete(dev: *WgDevice, p: *WgPeer): void
+  p.t_retransmit = 0
+  p.handshake_attempts = 0
+  p.sent_last_minute_handshake = false
+  local s = dev.wall()
+  p.last_handshake_wall = s
+  if not p.connected then
+    -- the first session since none: say so once, not on every rekey
+    p.connected = true
+    log_peer(dev, p, 'connected from', true)
+  end
+end
+
+local function timers_session_derived(p: *WgPeer, now: number): void
+  p.t_zero = now + WG_REJECT_AFTER_TIME * 3
+end
+
+local function timers_any_traversal(p: *WgPeer, now: number): void
+  if p.keepalive > 0 then p.t_persistent = now + (@number)(p.keepalive) end
+end
+
+-- Sending ------------------------------------------------------------------------
+
+local function send_to_peer(dev: *WgDevice, p: *WgPeer, data: *[0]uint8, len: usize): boolean
+  if p.endpoint.family == 0 then return false end
+  dev.send(dev.ud, &p.endpoint, data, len)
+  p.tx_bytes = p.tx_bytes + len
+  return true
+end
+
+local function send_initiation(dev: *WgDevice, p: *WgPeer, retry: boolean, now: number): void
+  if not retry then p.handshake_attempts = 0 end
+  if p.hs.last_sent > 0 and now - p.hs.last_sent < WG_REKEY_TIMEOUT then return end
+  if p.endpoint.family == 0 then return end
+  p.hs.last_sent = now
+  local msg: [148]uint8
+  if not create_initiation(dev, p, now, &msg) then return end
+  add_macs(p, &msg, WG_INITIATION_SIZE, now)
+  timers_any_traversal(p, now)
+  send_to_peer(dev, p, &msg, WG_INITIATION_SIZE)
+  timers_any_sent(p)
+  timers_handshake_initiated(p, now)
+end
+
+local function keypair_usable(kp: *WgKeypair, now: number): boolean
+  return kp.valid and now - kp.created < WG_REJECT_AFTER_TIME and kp.send_counter < WG_REJECT_AFTER_MESSAGES
+end
+
+-- Encrypt one packet (len 0: a keepalive) on the current keypair and send it.
+-- False when there is no usable keypair.
+local function send_data(dev: *WgDevice, p: *WgPeer, pkt: *[0]uint8, len: usize, now: number): boolean
+  local kp = &p.current
+  if not keypair_usable(kp, now) then return false end
+  local padded = len
+  if len > 0 then
+    padded = (len + 15) & ~15_usize
+    if padded > dev.mtu and len <= dev.mtu then padded = dev.mtu end
+    if padded < len then padded = len end
+  end
+  local total = WG_DATA_HEAD + padded + 16
+  dev.buf:resize(total)
+  local out = (@*[0]uint8)(&dev.buf[0])
+  memory.zero(out, total)
+  out[0] = WG_MSG_DATA
+  wgp.put_u32(&out[4], kp.remote_index)
+  local counter = kp.send_counter
+  kp.send_counter = kp.send_counter + 1
+  wgp.put_u64(&out[8], counter)
+  if len > 0 then memory.copy(&out[WG_DATA_HEAD], pkt, len) end
+  crypto.wg_seal(&out[WG_DATA_HEAD], &kp.send_key, counter, nilptr, 0, &out[WG_DATA_HEAD], padded)
+  timers_any_traversal(p, now)
+  if not send_to_peer(dev, p, out, total) then return true end
+  timers_any_sent(p)
+  if len > 0 then timers_data_sent(p, now) end
+  -- keep the keys fresh: the initiator rekeys on age and on count
+  if kp.initiator and (kp.send_counter > WG_REKEY_AFTER_MESSAGES or now - kp.created > WG_REKEY_AFTER_TIME) then
+    send_initiation(dev, p, false, now)
+  end
+  return true
+end
+
+local function send_keepalive(dev: *WgDevice, p: *WgPeer, now: number): void
+  if #p.staged > 0 then return end -- staged packets go first and do the same job
+  send_data(dev, p, nilptr, 0, now)
+end
+
+local function send_staged(dev: *WgDevice, p: *WgPeer, now: number): void
+  local i = 0
+  while i < #p.staged do
+    local s = &p.staged[i]
+    if not send_data(dev, p, (@*[0]uint8)(&s.data[0]), #s.data, now) then break end
+    i = i + 1
+  end
+  for k = 0, < i do p.staged[k].data:destroy() end
+  for _ = 1, i do p.staged:remove(0) end
+end
+
+-- The peer whose allowed IPs hold `dst`: the longest prefix wins.
+function WgDevice:route(family: uint8, dst: *[0]uint8): *WgPeer
+  local best: *WgPeer = nilptr
+  local best_bits = -1
+  for i = 0, < #self.peers do
+    local p = self.peers[i]
+    for k = 0, < #p.allowed do
+      local c = &p.allowed[k]
+      if (@integer)(c.bits) > best_bits and c:contains(family, dst) then best, best_bits = p, (@integer)(c.bits) end
+    end
+  end
+  return best
+end
+
+-- An IP packet from the netstack. It goes to the peer that owns its
+-- destination, now or once a handshake is done. False: no peer owns it.
+function WgDevice:send_packet(pkt: *[0]uint8, len: usize, now: number): boolean
+  local ok, family, total, src, dst = wgp.ip_header(pkt, len)
+  if not ok then return false end
+  local p = self:route(family, dst)
+  if p == nilptr then return false end
+  if #p.staged == 0 and send_data(self, p, pkt, total, now) then return true end
+  if #p.staged >= WG_STAGED_MAX then
+    p.staged[0].data:destroy()
+    p.staged:remove(0)
+  end
+  local s: Staged
+  s.data:resize(total)
+  memory.copy(&s.data[0], pkt, total)
+  p.staged:push(s)
+  send_staged(self, p, now)
+  if #p.staged > 0 then send_initiation(self, p, false, now) end
+  return true
+end
+
+-- Receiving ------------------------------------------------------------------------
+
+local function update_endpoint(dev: *WgDevice, p: *WgPeer, src: *WgEndpoint): void
+  if p.endpoint:same(src) then return end
+  local was = p.endpoint.family ~= 0 and p.connected
+  p.endpoint = $src
+  if was then log_peer(dev, p, 'moved to', true) end
+end
+
+local function receive_initiation(dev: *WgDevice, src: *WgEndpoint, msg: *[0]uint8, now: number): void
+  local p = consume_initiation(dev, msg, now)
+  if p == nilptr then return end
+  update_endpoint(dev, p, src)
+  p.rx_bytes = p.rx_bytes + WG_INITIATION_SIZE
+  timers_any_traversal(p, now)
+  timers_any_received(p)
+  local resp: [92]uint8
+  if not create_response(dev, p, &resp) then return end
+  add_macs(p, &resp, WG_RESPONSE_SIZE, now)
+  if not begin_session(dev, p, now) then return end
+  timers_session_derived(p, now)
+  timers_any_traversal(p, now)
+  send_to_peer(dev, p, &resp, WG_RESPONSE_SIZE)
+  timers_any_sent(p)
+end
+
+local function receive_response(dev: *WgDevice, src: *WgEndpoint, msg: *[0]uint8, now: number): void
+  local p = consume_response(dev, msg)
+  if p == nilptr then return end
+  update_endpoint(dev, p, src)
+  p.rx_bytes = p.rx_bytes + WG_RESPONSE_SIZE
+  timers_any_traversal(p, now)
+  timers_any_received(p)
+  if not begin_session(dev, p, now) then return end
+  timers_session_derived(p, now)
+  timers_handshake_complete(dev, p)
+  -- the responder waits for data before it uses the keys: give it some
+  send_staged(dev, p, now)
+  if #p.staged == 0 then send_data(dev, p, nilptr, 0, now) end
+end
+
+local function receive_cookie(dev: *WgDevice, msg: *[0]uint8, now: number): void
+  local pp = dev.index:peek(wgp.get_u32(&msg[WG_COOKIE_RECEIVER]))
+  if pp == nilptr then return end
+  local p = $pp
+  if not p.has_mac1 then return end
+  local cookie: [16]uint8
+  if not crypto.xaead_open(&cookie, &p.cookie_key, &msg[WG_COOKIE_NONCE], &p.last_mac1, 16, &msg[WG_COOKIE_BODY], 16) then return end
+  memory.copy(&p.cookie, &cookie, 16)
+  p.cookie_at = now
+  p.has_mac1 = false -- one reply per message sent
+end
+
+-- The keypair of `p` whose local index is `idx`.
+local function keypair_by_index(p: *WgPeer, idx: uint32): *WgKeypair
+  if p.current.valid and p.current.local_index == idx then return &p.current end
+  if p.next.valid and p.next.local_index == idx then return &p.next end
+  if p.previous.valid and p.previous.local_index == idx then return &p.previous end
+  return nilptr
+end
+
+local function receive_data(dev: *WgDevice, src: *WgEndpoint, msg: *[0]uint8, len: usize, now: number): void
+  local pp = dev.index:peek(wgp.get_u32(&msg[4]))
+  if pp == nilptr then return end
+  local p = $pp
+  local kp = keypair_by_index(p, wgp.get_u32(&msg[4]))
+  if kp == nilptr or now - kp.created >= WG_REJECT_AFTER_TIME then return end
+  local counter = wgp.get_u64(&msg[8])
+  local n = len - WG_DATA_HEAD - 16
+  local body = (@*[0]uint8)(&msg[WG_DATA_HEAD])
+  if not crypto.wg_open(body, &kp.recv_key, counter, nilptr, 0, body, n) then return end
+  if not kp.replay:check(counter) then return end
+  update_endpoint(dev, p, src)
+  p.rx_bytes = p.rx_bytes + len
+  timers_any_traversal(p, now)
+  timers_any_received(p)
+  -- keep the keys fresh: the initiator rekeys before its keys expire
+  if kp == &p.current and kp.initiator and not p.sent_last_minute_handshake
+     and now - kp.created > WG_REJECT_AFTER_TIME - WG_KEEPALIVE_TIMEOUT - WG_REKEY_TIMEOUT then
+    p.sent_last_minute_handshake = true
+    send_initiation(dev, p, false, now)
+  end
+  if received_with_keypair(dev, p, kp) then
+    timers_handshake_complete(dev, p)
+    send_staged(dev, p, now)
+  end
+  if n == 0 then return end -- a keepalive
+  timers_data_received(p, now)
+  -- cryptokey routing: the packet's source must be one of this peer's addresses
+  local ok, family, total, psrc, pdst = wgp.ip_header(body, n)
+  if not ok then return end
+  local owner = dev:route(family, psrc)
+  if owner ~= p then return end
+  if dev.deliver ~= nilptr then dev.deliver(dev.ud, p, body, total) end
+end
+
+-- A datagram from the carrier.
+function WgDevice:receive(src: *WgEndpoint, msg: *[0]uint8, len: usize, now: number): void
+  local t = wgp.msg_type(msg, len)
+  if t == WG_MSG_INITIATION or t == WG_MSG_RESPONSE then
+    local size = t == WG_MSG_INITIATION and WG_INITIATION_SIZE or WG_RESPONSE_SIZE
+    if len ~= size or not check_mac1(self, msg, len) then return end
+    if under_load(self, now) and not check_mac2(self, msg, len, src, now) then
+      send_cookie_reply(self, msg, len, wgp.get_u32(&msg[4]), src, now)
+      return
+    end
+    if t == WG_MSG_INITIATION then receive_initiation(self, src, msg, now)
+    else receive_response(self, src, msg, now) end
+  elseif t == WG_MSG_COOKIE then
+    if len == WG_COOKIE_SIZE then receive_cookie(self, msg, now) end
+  elseif t == WG_MSG_DATA then
+    if len >= WG_DATA_MIN then receive_data(self, src, msg, len, now) end
+  end
+end
+
+-- Timers -------------------------------------------------------------------------
+
+local function zero_all(dev: *WgDevice, p: *WgPeer): void
+  wipe_keypair(dev, &p.current)
+  wipe_keypair(dev, &p.previous)
+  wipe_keypair(dev, &p.next)
+  wipe_handshake(dev, &p.hs, false)
+  free_staged(p)
+  p.t_zero = 0
+  if p.connected then
+    p.connected = false
+    log_peer(dev, p, 'idle; its keys are wiped', false)
+  end
+end
+
+-- Start a handshake with a peer that has an endpoint (one the agent dials).
+function WgDevice:connect(p: *WgPeer, now: number): void
+  send_initiation(self, p, false, now)
+end
+
+-- Run the timers that are due.
+function WgDevice:tick(now: number): void
+  for i = 0, < #self.peers do
+    local p = self.peers[i]
+    if p.t_retransmit > 0 and now >= p.t_retransmit then
+      p.t_retransmit = 0
+      if p.handshake_attempts >= WG_MAX_HANDSHAKES then
+        -- gave up: the staged packets go, and the keys follow if nothing else comes
+        p.t_keepalive = 0
+        free_staged(p)
+        if p.t_zero == 0 then p.t_zero = now + WG_REJECT_AFTER_TIME * 3 end
+      else
+        p.handshake_attempts = p.handshake_attempts + 1
+        send_initiation(self, p, true, now)
+      end
+    end
+    if p.t_keepalive > 0 and now >= p.t_keepalive then
+      p.t_keepalive = 0
+      send_keepalive(self, p, now)
+      if p.need_another_keepalive then
+        p.need_another_keepalive = false
+        p.t_keepalive = now + WG_KEEPALIVE_TIMEOUT
+      end
+    end
+    if p.t_new_handshake > 0 and now >= p.t_new_handshake then
+      -- we sent data and heard nothing back for 15 s
+      p.t_new_handshake = 0
+      send_initiation(self, p, false, now)
+    end
+    if p.t_zero > 0 and now >= p.t_zero then zero_all(self, p) end
+    if p.t_persistent > 0 and now >= p.t_persistent then
+      p.t_persistent = 0
+      if p.keepalive > 0 then
+        if keypair_usable(&p.current, now) then send_keepalive(self, p, now)
+        else send_initiation(self, p, false, now) end
+        if p.t_persistent == 0 then p.t_persistent = now + (@number)(p.keepalive) end
+      end
+    end
+  end
+end
+
+-- Seconds until the next timer is due (a large number when none is).
+function WgDevice:next_timer(now: number): number
+  local best: number = 3600
+  for i = 0, < #self.peers do
+    local p = self.peers[i]
+    local ts: [5]number = { p.t_retransmit, p.t_keepalive, p.t_new_handshake, p.t_zero, p.t_persistent }
+    for k = 0, < 5 do
+      if ts[k] > 0 and ts[k] - now < best then best = ts[k] - now end
+    end
+  end
+  if best < 0 then best = 0 end
+  return best
+end

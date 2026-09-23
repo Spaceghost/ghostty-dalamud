@@ -1,0 +1,380 @@
+-- WireGuard's fixed parts for the agent's embedded WireGuard
+-- (docs/WIREGUARD.md): the protocol's constants and message layout, the
+-- sliding replay window, endpoints, allowed-IP ranges, inner IP packet
+-- headers and TAI64N. Pure: no sockets, no clock of its own.
+require 'memory'
+require 'string'
+require 'stringbuilder'
+
+-- The whitepaper's constants (section 6 and the protocol page) -------------------
+global WG_REKEY_AFTER_MESSAGES: uint64 <comptime> = 1_u64 << 60
+global WG_REJECT_AFTER_MESSAGES: uint64 <comptime> = 0xffffffffffffffff_u64 - (1_u64 << 13)  -- 2^64 - 2^13 - 1
+global WG_REKEY_AFTER_TIME: number <comptime> = 120
+global WG_REJECT_AFTER_TIME: number <comptime> = 180
+global WG_REKEY_ATTEMPT_TIME: number <comptime> = 90
+global WG_REKEY_TIMEOUT: number <comptime> = 5
+global WG_KEEPALIVE_TIMEOUT: number <comptime> = 10
+global WG_COOKIE_REFRESH: number <comptime> = 120
+global WG_REKEY_JITTER: number <comptime> = 0.333     -- up to this much added to REKEY_TIMEOUT
+global WG_MAX_HANDSHAKES: integer <comptime> = 18      -- REKEY_ATTEMPT_TIME / REKEY_TIMEOUT
+global WG_INITIATION_RATE: number <comptime> = 0.02    -- at most one initiation per peer per 20 ms
+
+global WG_MSG_INITIATION: uint8 <comptime> = 1
+global WG_MSG_RESPONSE: uint8 <comptime> = 2
+global WG_MSG_COOKIE: uint8 <comptime> = 3
+global WG_MSG_DATA: uint8 <comptime> = 4
+
+global WG_INITIATION_SIZE: usize <comptime> = 148
+global WG_RESPONSE_SIZE: usize <comptime> = 92
+global WG_COOKIE_SIZE: usize <comptime> = 64
+global WG_DATA_HEAD: usize <comptime> = 16         -- type, receiver, counter
+global WG_DATA_MIN: usize <comptime> = 32          -- the head and an empty payload's tag
+
+-- offsets inside the messages
+global WG_INIT_SENDER: usize <comptime> = 4
+global WG_INIT_EPHEMERAL: usize <comptime> = 8
+global WG_INIT_STATIC: usize <comptime> = 40       -- 32 + 16
+global WG_INIT_TIMESTAMP: usize <comptime> = 88    -- 12 + 16
+global WG_INIT_MAC1: usize <comptime> = 116
+global WG_INIT_MAC2: usize <comptime> = 132
+global WG_RESP_SENDER: usize <comptime> = 4
+global WG_RESP_RECEIVER: usize <comptime> = 8
+global WG_RESP_EPHEMERAL: usize <comptime> = 12
+global WG_RESP_EMPTY: usize <comptime> = 44
+global WG_RESP_MAC1: usize <comptime> = 60
+global WG_RESP_MAC2: usize <comptime> = 76
+global WG_COOKIE_RECEIVER: usize <comptime> = 4
+global WG_COOKIE_NONCE: usize <comptime> = 8
+global WG_COOKIE_BODY: usize <comptime> = 32
+
+global WG_CONSTRUCTION: string <comptime> = 'Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s'
+global WG_IDENTIFIER: string <comptime> = 'WireGuard v1 zx2c4 Jason@zx2c4.com'
+global WG_LABEL_MAC1: string <comptime> = 'mac1----'
+global WG_LABEL_COOKIE: string <comptime> = 'cookie--'
+
+global wgp = @record{}
+
+function wgp.put_u32(p: *[0]uint8, v: uint32): void
+  p[0] = (@uint8)(v & 0xff) p[1] = (@uint8)((v >> 8) & 0xff) p[2] = (@uint8)((v >> 16) & 0xff) p[3] = (@uint8)(v >> 24)
+end
+function wgp.get_u32(p: *[0]uint8): uint32
+  return (@uint32)(p[0]) | ((@uint32)(p[1]) << 8) | ((@uint32)(p[2]) << 16) | ((@uint32)(p[3]) << 24)
+end
+function wgp.put_u64(p: *[0]uint8, v: uint64): void
+  for i = 0, < 8 do p[i] = (@uint8)((v >> (i * 8)) & 0xff) end
+end
+function wgp.get_u64(p: *[0]uint8): uint64
+  local v: uint64 = 0
+  for i = 7, 0, -1 do v = (v << 8) | p[i] end
+  return v
+end
+
+-- The message type: the first byte, and three reserved zero bytes.
+function wgp.msg_type(p: *[0]uint8, len: usize): uint8
+  if len < 4 or p[1] ~= 0 or p[2] ~= 0 or p[3] ~= 0 then return 0 end
+  return p[0]
+end
+
+-- Replay window --------------------------------------------------------------
+-- The kernel's counter_validate: 8192 bits, of which one 64-bit word is kept
+-- spare so the window slides a word at a time. Call it only after the message
+-- decrypted, so a forged counter cannot move the window.
+
+local REPLAY_WORDS: usize <comptime> = 128 -- 8192 bits
+local REPLAY_WINDOW: uint64 <comptime> = 8192 - 64
+
+global WgReplay = @record{ counter: uint64, bits: [128]uint64 }
+
+function WgReplay:reset(): void
+  self.counter = 0
+  memory.zero(&self.bits, #self.bits)
+end
+
+-- True the first time `their` counter is seen inside the window.
+function WgReplay:check(their: uint64): boolean
+  if self.counter >= WG_REJECT_AFTER_MESSAGES + 1 or their >= WG_REJECT_AFTER_MESSAGES then return false end
+  their = their + 1
+  if REPLAY_WINDOW + their < self.counter then return false end
+  local index = their >> 6
+  if their > self.counter then
+    local current = self.counter >> 6
+    local top = index - current
+    if top > REPLAY_WORDS then top = REPLAY_WORDS end
+    for i: uint64 = 1, top do self.bits[(i + current) & (REPLAY_WORDS - 1)] = 0 end
+    self.counter = their
+  end
+  index = index & (REPLAY_WORDS - 1)
+  local bit = 1_u64 << (their & 63)
+  if self.bits[index] & bit ~= 0 then return false end
+  self.bits[index] = self.bits[index] | bit
+  return true
+end
+
+-- Endpoints --------------------------------------------------------------------
+-- An address a datagram came from or goes to: IPv4 (family 4, the address in
+-- addr[0..3]) or IPv6 (family 6). Family 0 is "not known yet". `carrier`
+-- names what carries the datagram (0: the UDP socket), the seam for a later
+-- relay carrier (docs/WIREGUARD.md "NAT and reachability").
+
+global WgEndpoint = @record{ family: uint8, carrier: uint8, port: uint16, addr: [16]uint8 }
+
+function WgEndpoint:same(o: *WgEndpoint): boolean
+  if self.family ~= o.family or self.port ~= o.port or self.carrier ~= o.carrier then return false end
+  local n = self.family == 4 and 4 or 16
+  for i = 0, < n do if self.addr[i] ~= o.addr[i] then return false end end
+  return true
+end
+
+-- The bytes a cookie is bound to: the address and the port.
+function WgEndpoint:bind_bytes(out: *[18]uint8): usize
+  local n: usize = self.family == 4 and 4 or 16
+  memory.copy(out, &self.addr, n)
+  out[n] = (@uint8)(self.port >> 8)
+  out[n + 1] = (@uint8)(self.port & 0xff)
+  return n + 2
+end
+
+function WgEndpoint:tostring(): string
+  local sb: stringbuilder
+  if self.family == 4 then
+    sb:writef('%d.%d.%d.%d:%d', (@integer)(self.addr[0]), (@integer)(self.addr[1]), (@integer)(self.addr[2]),
+              (@integer)(self.addr[3]), (@integer)(self.port))
+  elseif self.family == 6 then
+    sb:write('[')
+    for i = 0, < 8 do
+      if i > 0 then sb:write(':') end
+      sb:writef('%x', ((@uint32)(self.addr[i * 2]) << 8) | self.addr[i * 2 + 1])
+    end
+    sb:writef(']:%d', (@integer)(self.port))
+  else
+    sb:write('(none)')
+  end
+  return sb:promote()
+end
+
+-- Allowed IPs ------------------------------------------------------------------
+
+global WgCidr = @record{ family: uint8, bits: uint8, addr: [16]uint8 }
+
+-- `a` (family 4 or 6, 4 or 16 bytes) inside the range?
+function WgCidr:contains(family: uint8, a: *[0]uint8): boolean
+  if family ~= self.family then return false end
+  local bits = (@integer)(self.bits)
+  local i = 0
+  while bits >= 8 do
+    if a[i] ~= self.addr[i] then return false end
+    i = i + 1
+    bits = bits - 8
+  end
+  if bits > 0 then
+    local mask = (@uint8)((0xff_u32 << (@int32)(8 - bits)) & 0xff)
+    if (a[i] & mask) ~= (self.addr[i] & mask) then return false end
+  end
+  return true
+end
+
+-- Dotted IPv4 or RFC 4291 IPv6 text (with ::, no zone, no embedded IPv4).
+function wgp.parse_ip(s: string, family: *uint8, addr: *[16]uint8): boolean
+  memory.zero(addr, 16)
+  if s:find(':', 1, true) > 0 then
+    -- IPv6: up to 8 groups; one :: stands for the zero groups
+    local groups: [8]uint16
+    local ng = 0
+    local gap = -1
+    local i = 0
+    local n = (@integer)(s.size)
+    if n >= 2 and s.data[0] == ':'_b and s.data[1] == ':'_b then gap = 0 i = 2 end
+    while i < n do
+      local v: uint32 = 0
+      local digits = 0
+      while i < n and digits < 5 do
+        local c = s.data[i]
+        local d: integer = -1
+        local cv = (@integer)(c)
+        if c >= '0'_b and c <= '9'_b then d = cv - 48
+        elseif c >= 'a'_b and c <= 'f'_b then d = cv - 97 + 10
+        elseif c >= 'A'_b and c <= 'F'_b then d = cv - 65 + 10 end
+        if d < 0 then break end
+        v = v * 16 + (@uint32)(d)
+        digits = digits + 1
+        i = i + 1
+      end
+      if digits == 0 or digits > 4 or ng >= 8 then return false end
+      groups[ng] = (@uint16)(v)
+      ng = ng + 1
+      if i >= n then break end
+      if s.data[i] ~= ':'_b then return false end
+      i = i + 1
+      if i < n and s.data[i] == ':'_b then
+        if gap >= 0 then return false end
+        gap = ng
+        i = i + 1
+      elseif i >= n then
+        return false -- a trailing single colon
+      end
+    end
+    if gap < 0 and ng ~= 8 then return false end
+    if gap >= 0 and ng >= 8 then return false end
+    local out = 0
+    for g = 0, < ng do
+      if g == gap then out = out + (8 - ng) end
+      addr[out * 2] = (@uint8)(groups[g] >> 8)
+      addr[out * 2 + 1] = (@uint8)(groups[g] & 0xff)
+      out = out + 1
+    end
+    $family = 6
+    return true
+  end
+  local part = 0
+  local v = 0
+  local digits = 0
+  for i = 0, < (@integer)(s.size) do
+    local c = s.data[i]
+    if c == '.'_b then
+      if digits == 0 or part >= 3 then return false end
+      addr[part] = (@uint8)(v)
+      part = part + 1
+      v = 0
+      digits = 0
+    elseif c >= '0'_b and c <= '9'_b then
+      v = v * 10 + (c - '0'_b)
+      digits = digits + 1
+      if v > 255 or digits > 3 then return false end
+    else
+      return false
+    end
+  end
+  if digits == 0 or part ~= 3 then return false end
+  addr[3] = (@uint8)(v)
+  $family = 4
+  return true
+end
+
+local function parse_prefix(s: string, out: *WgCidr, mask: boolean): boolean
+  $out = {}
+  local slash = s:find('/', 1, true)
+  local addr = slash > 0 and s:sub(1, slash - 1) or s:copy()
+  local ok = wgp.parse_ip(addr, &out.family, &out.addr)
+  addr:destroy()
+  if not ok then return false end
+  local max = out.family == 4 and 32 or 128
+  if slash > 0 then
+    local digits = s:sub(slash + 1)
+    local bits = 0
+    local good = #digits > 0 and #digits <= 3
+    for i = 0, < #digits do
+      local c = digits.data[i]
+      if c < '0'_b or c > '9'_b then good = false break end
+      bits = bits * 10 + (c - '0'_b)
+    end
+    digits:destroy()
+    if not good or bits > max then return false end
+    out.bits = (@uint8)(bits)
+  else
+    out.bits = (@uint8)(max)
+  end
+  if not mask then return true end
+  -- keep only the prefix, so the range prints the way wg(8) prints it
+  local keep = (@integer)(out.bits)
+  for i = 0, < 16 do
+    if keep >= 8 then keep = keep - 8
+    elseif keep > 0 then out.addr[i] = out.addr[i] & (@uint8)((0xff_u32 << (@int32)(8 - keep)) & 0xff) keep = 0
+    else out.addr[i] = 0 end
+  end
+  return true
+end
+
+-- A range: "10.0.0.0/24", "fd00::2/128", or an address alone (a single
+-- host). The host bits are cleared.
+function wgp.parse_cidr(s: string, out: *WgCidr): boolean
+  return parse_prefix(s, out, true)
+end
+
+-- An interface address with its prefix length ("10.77.12.1/24"): the host
+-- bits are kept.
+function wgp.parse_iface(s: string, out: *WgCidr): boolean
+  return parse_prefix(s, out, false)
+end
+
+function wgp.ip_tostring(family: uint8, a: *[0]uint8): string
+  local sb: stringbuilder
+  if family == 4 then
+    sb:writef('%d.%d.%d.%d', (@integer)(a[0]), (@integer)(a[1]), (@integer)(a[2]), (@integer)(a[3]))
+  else
+    -- RFC 5952: the longest run of two or more zero groups becomes ::
+    local best, best_len = -1, 0
+    local i = 0
+    while i < 8 do
+      if a[i * 2] == 0 and a[i * 2 + 1] == 0 then
+        local j = i
+        while j < 8 and a[j * 2] == 0 and a[j * 2 + 1] == 0 do j = j + 1 end
+        if j - i > best_len and j - i >= 2 then best, best_len = i, j - i end
+        i = j
+      else
+        i = i + 1
+      end
+    end
+    i = 0
+    while i < 8 do
+      if i == best then
+        sb:write('::')
+        i = i + best_len
+      else
+        if i > 0 and i ~= best + best_len then sb:write(':') end
+        sb:writef('%x', ((@uint32)(a[i * 2]) << 8) | a[i * 2 + 1])
+        i = i + 1
+      end
+    end
+  end
+  return sb:promote()
+end
+
+function WgCidr:tostring(): string
+  local ip = wgp.ip_tostring(self.family, &self.addr)
+  local sb: stringbuilder
+  sb:writef('%s/%d', ip, (@integer)(self.bits))
+  ip:destroy()
+  return sb:promote()
+end
+
+-- Inner IP packets ---------------------------------------------------------------
+
+-- The IP packet's own length and its source and destination (family 4 or 6),
+-- or false for something that is not a whole IPv4 or IPv6 packet within `len`.
+function wgp.ip_header(p: *[0]uint8, len: usize): (boolean, uint8, usize, *[0]uint8, *[0]uint8)
+  if len < 1 then return false, 0, 0, nilptr, nilptr end
+  local v = p[0] >> 4
+  if v == 4 then
+    if len < 20 then return false, 0, 0, nilptr, nilptr end
+    local ihl = (@usize)(p[0] & 15) * 4
+    local total = ((@usize)(p[2]) << 8) | p[3]
+    if ihl < 20 or total < ihl or total > len then return false, 0, 0, nilptr, nilptr end
+    return true, 4, total, (@*[0]uint8)(&p[12]), (@*[0]uint8)(&p[16])
+  elseif v == 6 then
+    if len < 40 then return false, 0, 0, nilptr, nilptr end
+    local total = (((@usize)(p[4]) << 8) | p[5]) + 40
+    if total > len then return false, 0, 0, nilptr, nilptr end
+    return true, 6, total, (@*[0]uint8)(&p[8]), (@*[0]uint8)(&p[24])
+  end
+  return false, 0, 0, nilptr, nilptr
+end
+
+-- TAI64N ------------------------------------------------------------------------
+-- 12 bytes, big endian: 2^62 + 10 + Unix seconds, then nanoseconds. The
+-- nanoseconds are rounded down to 2^24 ns (about 17 ms), as wireguard-go does,
+-- so the timestamp does not give away the host's clock to the nanosecond.
+
+function wgp.tai64n(out: *[0]uint8, unix_s: int64, nanos: int64): void
+  local s = (1_u64 << 62) + 10 + (@uint64)(unix_s)
+  local ns = (@uint32)(nanos) & ~0xffffff_u32
+  for i: int32 = 0, < 8 do out[i] = (@uint8)((s >> ((7 - i) * 8)) & 0xff) end
+  for i: int32 = 0, < 4 do out[8 + i] = (@uint8)((ns >> ((3 - i) * 8)) & 0xff) end
+end
+
+-- True when TAI64N `a` is later than `b` (they compare as big-endian bytes).
+function wgp.tai64n_after(a: *[0]uint8, b: *[0]uint8): boolean
+  for i = 0, < 12 do
+    if a[i] ~= b[i] then return a[i] > b[i] end
+  end
+  return false
+end
