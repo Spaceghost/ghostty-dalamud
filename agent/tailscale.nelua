@@ -1,0 +1,220 @@
+-- Is this machine on a tailnet? (docs/WIREGUARD.md "Selection".) The owner's
+-- rule: the embedded WireGuard runs only when Tailscale is not detected, and
+-- a tailnet address is the one non-loopback address the agent will listen on
+-- in the clear. Detected when tailscaled's socket or pipe is there, or an
+-- interface has an address in Tailscale's ranges: fd7a:115c:a1e0::/48 (its
+-- own) or 100.64.0.0/10 (shared with carrier-grade NAT, so the weaker sign,
+-- and the log says so).
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'agent.wg_proto'
+
+global TailscaleAddr = @record{ family: uint8, addr: [16]uint8, ifname: string }
+
+global Tailscale = @record{
+  detected: boolean,
+  why: string,                   -- what was found, for the log
+  addrs: vector(TailscaleAddr),  -- the tailnet addresses on this machine
+}
+
+-- 100.64.0.0/10
+global function tailscale_cgnat(family: uint8, a: *[0]uint8): boolean
+  return family == 4 and a[0] == 100 and (a[1] & 0xc0) == 64
+end
+
+-- fd7a:115c:a1e0::/48
+global function tailscale_ula(family: uint8, a: *[0]uint8): boolean
+  return family == 6 and a[0] == 0xfd and a[1] == 0x7a and a[2] == 0x11 and a[3] == 0x5c
+    and a[4] == 0xa1 and a[5] == 0xe0
+end
+
+global function tailscale_range(family: uint8, a: *[0]uint8): boolean
+  return tailscale_cgnat(family, a) or tailscale_ula(family, a)
+end
+
+-- Loopback: 127.0.0.0/8, ::1, "localhost".
+global function listen_is_loopback(host: string): boolean
+  if host == 'localhost' or #host == 0 then return true end
+  local fam: uint8
+  local a: [16]uint8
+  if not wgp.parse_ip(host, &fam, &a) then return false end
+  if fam == 4 then return a[0] == 127 end
+  for i = 0, < 15 do if a[i] ~= 0 then return false end end
+  return a[15] == 1
+end
+
+-- The agent's listen rule (docs/WIREGUARD.md "Selection", step 3): true when
+-- `host` may carry the plaintext token protocol. Otherwise false and why.
+global function listen_allowed(host: string, ts: *Tailscale): (boolean, string)
+  if listen_is_loopback(host) then return true, (@string){} end
+  local fam: uint8
+  local a: [16]uint8
+  if wgp.parse_ip(host, &fam, &a) and tailscale_range(fam, &a) then
+    if ts.detected then return true, (@string){} end
+    return false, string.copy('it is in a tailnet range, but Tailscale is not running here')
+  end
+  return false, string.copy('the agent protocol is not encrypted, and that address is reachable from the network')
+end
+
+## if ccinfo.is_windows then
+## cinclude '<winsock2.h>'
+## cinclude '<ws2tcpip.h>'
+## cinclude '<iphlpapi.h>'
+## linklib 'iphlpapi'
+local sockaddr <cimport, nodecl, ctypedef> = @record{ sa_family: cushort }
+local SOCKET_ADDRESS <cimport, nodecl> = @record{ lpSockaddr: *sockaddr, iSockaddrLength: cint }
+local IP_ADAPTER_UNICAST_ADDRESS <cimport, nodecl> = @record{ Next: *IP_ADAPTER_UNICAST_ADDRESS, Address: SOCKET_ADDRESS }
+local IP_ADAPTER_ADDRESSES <cimport, nodecl> = @record{
+  Next: *IP_ADAPTER_ADDRESSES, AdapterName: cstring, FirstUnicastAddress: *IP_ADAPTER_UNICAST_ADDRESS,
+}
+local function GetAdaptersAddresses(family: uint32, flags: uint32, reserved: pointer, out: *IP_ADAPTER_ADDRESSES, size: *uint32): uint32 <cimport, nodecl> end
+local function WaitNamedPipeA(name: cstring, ms: uint32): cint <cimport, nodecl> end
+local function GetLastError(): uint32 <cimport, nodecl> end
+local AF_UNSPEC: uint32 <cimport, nodecl, const>
+local GAA_FLAG_SKIP_ANYCAST: uint32 <cimport, nodecl, const>
+local GAA_FLAG_SKIP_MULTICAST: uint32 <cimport, nodecl, const>
+local GAA_FLAG_SKIP_DNS_SERVER: uint32 <cimport, nodecl, const>
+local ERROR_FILE_NOT_FOUND: uint32 <cimport, nodecl, const>
+## else
+## cinclude '<sys/types.h>'
+## cinclude '<sys/socket.h>'
+## cinclude '<ifaddrs.h>'
+## cinclude '<unistd.h>'
+local sockaddr <cimport, nodecl, ctypedef> = @record{ sa_family: cushort }
+local ifaddrs <cimport, nodecl, ctypedef> = @record{ ifa_next: *ifaddrs, ifa_name: cstring, ifa_flags: cuint, ifa_addr: *sockaddr }
+local function getifaddrs(out: **ifaddrs): cint <cimport, nodecl> end
+local function freeifaddrs(p: *ifaddrs): void <cimport, nodecl> end
+local function access(path: cstring, mode: cint): cint <cimport, nodecl> end
+local F_OK: cint <cimport, nodecl, const>
+## end
+local AF_INET: cint <cimport, nodecl, const>
+local AF_INET6: cint <cimport, nodecl, const>
+
+-- One interface address: IPv4 at sockaddr offset 4, IPv6 at offset 8.
+local function take(sa: *sockaddr, name: string, out: *vector(TailscaleAddr)): void
+  if sa == nilptr then return end
+  local fam = (@cint)(sa.sa_family)
+  local raw = (@*[0]uint8)(sa)
+  local t: TailscaleAddr
+  if fam == AF_INET then
+    t.family = 4
+    for i = 0, < 4 do t.addr[i] = raw[4 + i] end
+  elseif fam == AF_INET6 then
+    t.family = 6
+    for i = 0, < 16 do t.addr[i] = raw[8 + i] end
+  else
+    return
+  end
+  t.ifname = name:copy()
+  out:push(t)
+end
+
+-- Every address of every interface on this machine.
+global function host_addresses(out: *vector(TailscaleAddr)): void
+  ## if ccinfo.is_windows then
+  local size: uint32 = 16384
+  local buf: vector(uint8)
+  for _ = 1, 3 do
+    buf:resize(size)
+    local r = GetAdaptersAddresses(AF_UNSPEC, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER,
+                                   nilptr, (@*IP_ADAPTER_ADDRESSES)(&buf[0]), &size)
+    if r == 0 then
+      local ad = (@*IP_ADAPTER_ADDRESSES)(&buf[0])
+      while ad ~= nilptr do
+        local u = ad.FirstUnicastAddress
+        while u ~= nilptr do
+          take(u.Address.lpSockaddr, ad.AdapterName, out)
+          u = u.Next
+        end
+        ad = ad.Next
+      end
+      break
+    end
+  end
+  buf:destroy()
+  ## else
+  local list: *ifaddrs
+  if getifaddrs(&list) ~= 0 then return end
+  local p = list
+  while p ~= nilptr do
+    take(p.ifa_addr, p.ifa_name, out)
+    p = p.ifa_next
+  end
+  freeifaddrs(list)
+  ## end
+end
+
+global function host_addresses_free(v: *vector(TailscaleAddr)): void
+  for i = 0, < #v do v[i].ifname:destroy() end
+  v:destroy()
+end
+
+local function daemon_present(): (boolean, string)
+  ## if ccinfo.is_windows then
+  local pipe: cstring = '\\\\.\\pipe\\ProtectedPrefix\\LocalService\\tailscaled'
+  if WaitNamedPipeA(pipe, 1) ~= 0 or GetLastError() ~= ERROR_FILE_NOT_FOUND then
+    return true, string.copy('the tailscaled pipe is there')
+  end
+  ## else
+  local paths: [3]cstring = { '/run/tailscale/tailscaled.sock', '/var/run/tailscale/tailscaled.sock', '/var/run/tailscaled.socket' }
+  for i = 0, < 3 do
+    if access(paths[i], F_OK) == 0 then
+      local sb: stringbuilder
+      sb:write('tailscaled\'s socket ', (@string)(paths[i]), ' is there')
+      return true, sb:promote()
+    end
+  end
+  ## end
+  return false, (@string){}
+end
+
+-- Look now. Call destroy() when done.
+function Tailscale:detect(): void
+  local all: vector(TailscaleAddr)
+  host_addresses(&all)
+  local weak: string
+  for i = 0, < #all do
+    local a = &all[i]
+    if tailscale_range(a.family, &a.addr) then
+      local keep: TailscaleAddr
+      keep.family = a.family
+      keep.addr = a.addr
+      keep.ifname = a.ifname:copy()
+      self.addrs:push(keep)
+      if #self.why == 0 then
+        local ip = wgp.ip_tostring(a.family, &a.addr)
+        local sb: stringbuilder
+        sb:write('address ', ip, ' on ', a.ifname)
+        if tailscale_cgnat(a.family, &a.addr) then sb:write(' (100.64.0.0/10, which carrier-grade NAT uses too)') end
+        ip:destroy()
+        local s = sb:promote()
+        if tailscale_ula(a.family, &a.addr) then self.why = s else weak:destroy() weak = s end
+      end
+    end
+  end
+  host_addresses_free(&all)
+  local present, how = daemon_present()
+  if present then
+    self.detected = true
+    if #self.why == 0 then self.why = how else how:destroy() end
+  elseif #self.why > 0 or #weak > 0 then
+    self.detected = true
+  end
+  if #self.why == 0 then self.why = weak else weak:destroy() end
+end
+
+-- The first tailnet address, as text ('' when there is none): what the log
+-- suggests listening on.
+function Tailscale:address(): string
+  for i = 0, < #self.addrs do
+    if self.addrs[i].family == 4 then return wgp.ip_tostring(4, &self.addrs[i].addr) end
+  end
+  if #self.addrs > 0 then return wgp.ip_tostring(6, &self.addrs[0].addr) end
+  return (@string){}
+end
+
+function Tailscale:destroy(): void
+  self.why:destroy()
+  host_addresses_free(&self.addrs)
+end

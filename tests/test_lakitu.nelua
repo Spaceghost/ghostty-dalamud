@@ -230,6 +230,55 @@ do
   print('blocked OK')
 end
 
+-- A photograph: aim, settle, take, and the view put back --------------------
+do
+  -- Refusals first, while the camera cannot do it.
+  scene = 2
+  step(2)
+  local ok, why = lakitu_shoot(1)
+  assert(not ok and #why > 0, 'a blocked scene cannot be photographed')
+  scene = 0
+  step(2)
+
+  dh, dv, dist = 0.5, 0.2, 6
+  lakitu_want.shot = false
+  lakitu_want.ease = 8
+  step(3)
+  local before_h, before_v, before_d = dh, dv, dist
+
+  ok, why = lakitu_shoot(4242)
+  assert(ok, 'the shot starts')
+  assert(lakitu_shot.stage == LAKITU_SHOT_AIMING, 'and begins by aiming')
+  assert(not lakitu_shot.saved_shot, 'it remembers the view was not already the camera\'s')
+  assert(not lakitu_shoot(1), 'one at a time')
+
+  -- Aiming takes frames, and the view moves while it does.
+  step(1)
+  assert(lakitu_live.steering, 'the view is being moved')
+  step(400)
+  -- By now it has aimed, settled, fired, and is waiting for a frame that this
+  -- test has to produce itself: nothing here runs the capture state machine.
+  assert(lakitu_shot.stage == LAKITU_SHOT_TAKING, 'it is waiting for the picture')
+  assert(near(dh, lakitu_live.azimuth, 0.05), 'and the view is at the camera')
+
+  -- The capture lands.
+  capture_shot.path:destroy()
+  capture_shot.path = string.copy('/tmp/shot.png')
+  capture_shot.ok = true
+  capture_shot.serial = capture_shot.serial + 1
+  step(1)
+  assert(lakitu_shot.stage == LAKITU_SHOT_IDLE, 'the shot is done')
+  assert(lakitu_shot_count == 1 and lakitu_shot_results[0].request == 4242, 'the result is against its request')
+  assert(lakitu_shot_results[0].ok, 'and says it worked')
+  assert(lakitu_shot_results[0].path[0] == '/'_b, 'and carries the path')
+  assert(not lakitu_want.shot, 'the view was not the camera\'s before, so it is handed back')
+
+  step(60)
+  assert(near(dh, before_h, 0.05) and near(dv, before_v, 0.05) and near(dist, before_d, 0.1),
+         'and eased back to where the shot found it')
+  print('shoot OK')
+end
+
 -- Teardown --------------------------------------------------------------------
 do
   lakitu_teardown()
