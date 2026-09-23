@@ -5,6 +5,7 @@
 -- command retries, and links handed to the browser (ghostty.open_url) with an
 -- older, smaller GuHostApi.
 require 'core.host'
+require 'tests.check'
 require 'string'
 require 'stringbuilder'
 require 'vector'
@@ -118,6 +119,7 @@ end
 do
   local s = status()
   assert(s == 'ghostty off', 'status before init')
+  s:destroy()
   local w: cint, h: cint = 0, 0
   gu_popup_size(&w, &h)
   assert(w == 900 and h == 480, 'popup size defaults')
@@ -286,8 +288,9 @@ do
   for i = #'https://example.org/', < URL_MAX do sb:write('a') end
   local long = sb:promote()
   assert(#long == URL_MAX and url_is_https(long), 'up to URL_MAX bytes')
-  long = long .. 'a'
-  assert(not url_is_https(long), 'not past it')
+  local longer = long .. 'a'
+  assert(not url_is_https(longer), 'not past it')
+  longer:destroy() long:destroy()
 
   reset_calls()
   lua([[assert(ghostty.open_url('https://example.org/vote/') == true)]])
@@ -491,7 +494,7 @@ do
   gu_event(GuEventKind.Chat, w, 0, 0, 0, 'desktop')
   gu_frame()
   assert(warned:find('window desktop: not available yet', 1, true) > 0, warned)
-  assert(chatted == '[ghostty] window desktop: not available yet (reserved for a whole remote desktop on a panel)', 'said in the chat too: ' .. chatted)
+  check(chatted == '[ghostty] window desktop: not available yet (reserved for a whole remote desktop on a panel)', 'said in the chat too: ', chatted)
   gu_event(GuEventKind.Chat, w, 0, 0, 0, '')
   gu_frame()
   assert(host.window_picker_open, '/window alone: the Windows picker')
@@ -506,8 +509,8 @@ do
   assert(warned:find('usage: /window run', 1, true) == 1, warned)
   gu_event(GuEventKind.Chat, w, 0, 0, 0, 'pull Firefox')
   gu_frame()
-  assert(warned:find('window pull: ', 1, true) == 1, 'the same path as /term window pull: ' .. warned)
-  assert(chatted:find('[ghostty] window pull: ', 1, true) == 1, 'a failed pull reaches the chat: ' .. chatted)
+  check(warned:find('window pull: ', 1, true) == 1, 'the same path as /term window pull: ', warned)
+  check(chatted:find('[ghostty] window pull: ', 1, true) == 1, 'a failed pull reaches the chat: ', chatted)
   gu_event(GuEventKind.Chat, g, 0, 0, 0, 'status')
   gu_frame()
   assert(warned == 'usage: /agent ask [question]', warned)

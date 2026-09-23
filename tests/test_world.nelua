@@ -96,13 +96,13 @@ local pok, p = policy_world_place(1, 0, false)
 assert(pok and near(p.x, 10) and near(p.z, 22.5) and near(p.y, 1.7), 'here: 2.5 yalms in front, eye height')
 assert(near(p.yaw, math.pi), 'here: faces back toward the player')
 
-e = policy_world_command(2, 'target')
+e:destroy() e = policy_world_command(2, 'target')
 assert(#e == 0, e)
 pok, p = policy_world_place(2, 0, false)
 assert(pok and near(p.x, 15) and near(p.y, 3.2))
 assert(near(p.yaw, -math.pi / 2), 'target: faces the player (-X)')
 
-e = policy_world_command(3, 'orbit 4 1')
+e:destroy() e = policy_world_command(3, 'orbit 4 1')
 assert(#e == 0, e)
 pok, p = policy_world_place(3, 0, false)
 local d = math.sqrt((p.x - 10) ^ 2 + (p.z - 20) ^ 2)
@@ -110,9 +110,9 @@ assert(pok and near(d, 4), 'orbit radius')
 local pok2, p2 = policy_world_place(3, 1.0, false)
 assert(pok2 and not near(p2.x, p.x), 'orbit moves with time')
 
-e = policy_world_command(4, 'bogus')
+e:destroy() e = policy_world_command(4, 'bogus')
 assert(#e > 0, 'bad mode reports usage')
-e = policy_world_command(1, 'forget')
+e:destroy() e = policy_world_command(1, 'forget')
 pok = policy_world_place(1, 0, false)
 assert(not pok, 'forgotten anchor hides')
 print('OK')
@@ -162,7 +162,7 @@ assert(alog:find('speed 0 1.0;set 255 0 0 0;play 3;', 1, true) > 0, 'put away at
 print('animation OK')
 
 -- Pets: around the character (camera plays no part), facing it, curved.
-e = policy_world_command(9, 'pet')
+e:destroy() e = policy_world_command(9, 'pet')
 assert(#e == 0, e)
 local petok, pet = policy_world_place(9, 5.0, false)
 assert(petok, 'pet placed')
@@ -193,7 +193,7 @@ end
 policy_world_resize(9, 1200, 700)
 local _, pet_r = policy_world_place(9, 6.0, false)
 assert(pet_r.width == 1200 and pet_r.height == 700, 'resize sticks')
-e = policy_world_command(10, 'pet')
+e:destroy() e = policy_world_command(10, 'pet')
 assert(#e == 0, e)
 for step = 0, 40 do
   policy_world_place(9, 6.0 + step * 0.05, false)
@@ -254,6 +254,7 @@ do
   assert(v3 == 'min', 'agent 79 restored minimized')
   local v4 = policy_world_restore(34, 80)
   assert(#v4 == 0, 'unknown agent: default placement')
+  v1:destroy() v2:destroy() v3:destroy() v4:destroy()
   local rok, rp = policy_world_place(31, 20.0, false)
   assert(rok and rp.width == 1200, 'restored anchor keeps its size')
   assert(not rp.run_occluded, 'screens sleep when unseen by default')
@@ -324,7 +325,9 @@ do
   assert(math.abs(policy.dropdown.height - 0.3) < 1e-6, 'saved dropdown height applied at load')
   local probe: cstring = "assert(CONFIG.world.pet.distance == 4.5, 'saved pet distance applied')"
   assert(luaL_loadstring(policy.L, probe) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, 'lua-side setting applied')
-  os.remove(root .. '/settings.lua')
+  local saved = root .. '/settings.lua'
+  os.remove(saved)
+  saved:destroy()
   print('settings OK')
 end
 

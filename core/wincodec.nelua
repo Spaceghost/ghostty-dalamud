@@ -293,7 +293,7 @@ global function wincodec_qoi_encode(src: *[0]uint8, stride: usize, x: integer, y
   local pr: uint8, pg: uint8, pb: uint8 = 0, 0, 0
   local run = 0
   -- worst case 4 bytes a pixel; reserve so pushes below never reallocate
-  local base = #out
+  local base = (@usize)(#out)
   out:resize(base + (@usize)(w * h * 4))
   local o = (@*[0]uint8)(&out[0])
   local n = base
@@ -373,17 +373,18 @@ global function wincodec_qoi_decode(data: *[0]uint8, len: usize, dst: *[0]uint8,
           local v = index[b1]
           r, g, b = (@uint8)(v & 0xff), (@uint8)((v >> 8) & 0xff), (@uint8)((v >> 16) & 0xff)
         elseif b1 & QOI_MASK == QOI_OP_DIFF then
-          r = r + ((b1 >> 4) & 3) - 2
-          g = g + ((b1 >> 2) & 3) - 2
-          b = b + (b1 & 3) - 2
+          -- each channel wraps mod 256 (QOI): the casts say so
+          r = (@uint8)((@integer)(r) + ((b1 >> 4) & 3) - 2)
+          g = (@uint8)((@integer)(g) + ((b1 >> 2) & 3) - 2)
+          b = (@uint8)((@integer)(b) + (b1 & 3) - 2)
         elseif b1 & QOI_MASK == QOI_OP_LUMA then
           if pos >= len then return false end
           local b2 = data[pos]
           pos = pos + 1
           local vg = (b1 & 0x3f) - 32
           g = g + vg
-          r = r + vg - 8 + ((b2 >> 4) & 0x0f)
-          b = b + vg - 8 + (b2 & 0x0f)
+          r = (@uint8)((@integer)(r) + vg - 8 + ((b2 >> 4) & 0x0f))
+          b = (@uint8)((@integer)(b) + vg - 8 + (b2 & 0x0f))
         else -- QOI_OP_RUN
           run = (@integer)(b1 & 0x3f)
         end
@@ -450,7 +451,7 @@ global function wincodec_write_frames(q: *ByteQueue, sid: uint32, seq: uint32, s
       body:clear()
       nrect = 0
     end
-    local at = #body
+    local at = (@usize)(#body)
     body:resize(at + WINCODEC_RECT_HEAD + len)
     local p = (@*[0]uint8)(&body[at])
     proto.put_u16(p, r.x)

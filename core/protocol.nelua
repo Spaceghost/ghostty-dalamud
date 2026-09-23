@@ -152,7 +152,7 @@ require 'memory'
 global ByteQueue = @record{ buf: vector(uint8), head: usize }
 
 function ByteQueue:len(): usize
-  return #self.buf - self.head
+  return (@usize)(#self.buf) - self.head
 end
 
 function ByteQueue:push(p: *[0]uint8, n: usize): void

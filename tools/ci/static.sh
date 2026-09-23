@@ -22,11 +22,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT" || exit 1
 OUT="$ROOT/build/static"; GEN="$OUT/c"; mkdir -p "$GEN"
 NELUA="$ROOT/vendor/nelua-lang/nelua"
-INC=(-I"$ROOT/vendor/ghostty/include" -I"$ROOT/vendor/gc-cimgui" -I"$ROOT/vendor/lua/src" -I"$ROOT/vendor/stb")
-# The agent's WireGuard (docs/WIREGUARD.md): vendored headers count as system
-# headers, so their own warnings are not ours; lwipopts.h is generated into
-# the Nelua cache by agent/wg_netstack.nelua.
-INC_CPPCHECK=("${INC[@]}") # cppcheck knows no -isystem; it leaves vendored headers alone
+# Every vendored header counts as a system header, so its own warnings are not
+# ours: libghostty-vt, cimgui, Lua and stb (stb_truetype.h is compiled into the
+# core with its implementation, so its -Wconversion findings, 178 with Fedora
+# 44's gcc, were counted as the host's), and the agent's WireGuard
+# (docs/WIREGUARD.md). lwipopts.h is generated into the Nelua cache by
+# agent/wg_netstack.nelua. What Nelua generates from core/, agent/ and lua/,
+# and Nelua's own standard library, is still analysed in full.
+VENDOR_INC=("$ROOT/vendor/ghostty/include" "$ROOT/vendor/gc-cimgui" "$ROOT/vendor/lua/src" "$ROOT/vendor/stb")
+INC=()
+INC_CPPCHECK=() # cppcheck knows no -isystem: its reports from vendor/ are suppressed below instead
+for d in "${VENDOR_INC[@]}"; do INC+=(-isystem "$d"); INC_CPPCHECK+=(-I"$d"); done
 INC+=(-isystem "$ROOT/vendor/monocypher/src" -isystem "$ROOT/vendor/lwip/src/include" -isystem "$OUT/nelua/lwip-port"
   -isystem "$ROOT/vendor/qrcodegen")
 UNITS=(core/host:host core/loader:loader agent/agent:agent)
@@ -64,8 +70,13 @@ for step in "${steps[@]}"; do
       done
       while read -r name n; do budget "warnings-$name" "$n" "build/static/warnings-$name.log"; done <"$OUT/warnings.txt" ;;
     cppcheck)
+      # constStatement: Nelua writes every value-producing block as a GNU
+      # statement expression, `({ T _tmp = ...; ...; _tmp; })`, and cppcheck
+      # takes the closing `_tmp;` for a statement with no effect. Nelua source
+      # has no expression statements, so the check cannot find one of ours.
       cppcheck --quiet --enable=warning,portability --inline-suppr \
-        --suppress=missingIncludeSystem --suppress=unknownMacro "${INC_CPPCHECK[@]}" "$GEN" 2>"$OUT/cppcheck.log"
+        --suppress=missingIncludeSystem --suppress=unknownMacro "--suppress=*:$ROOT/vendor/*" --suppress=constStatement \
+        "${INC_CPPCHECK[@]}" "$GEN" 2>"$OUT/cppcheck.log"
       budget cppcheck "$(grep -c ': \(error\|warning\|portability\)' "$OUT/cppcheck.log")" build/static/cppcheck.log ;;
     analyze)
       : >"$OUT/analyze.log"

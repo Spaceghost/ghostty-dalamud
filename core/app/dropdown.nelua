@@ -254,7 +254,7 @@ local function icon_button(dl: *ImDrawList, b: *ChromeButton, key: integer, x: f
   if b.action == ChromeAction.Settings and host.settings_badge then
     chrome_draw_badge(dl, x, y, size, pal.body_top | 0xFF000000)
     if hot then
-      local k = where .. b.id .. '.badge'
+      local k = string.format('%s%s.badge', where, b.id) -- a .. b .. c would leak the middle one
       chrome_tooltip(key, hot, k, CHROME_BADGE_TIP, now)
       k:destroy()
     end

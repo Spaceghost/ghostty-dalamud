@@ -867,7 +867,7 @@ local function flatpak_running(id: string): boolean
   local f = io.popen('flatpak ps --columns=application 2>/dev/null', 'r')
   if not f:isopen() then return false end
   local out = f:read('a')
-  f:close()
+  f:destroy()
   local found = false
   local start = 1
   for pos = 1, #out + 1 do
@@ -981,7 +981,7 @@ local function descends_from(pid: cint, root: cint): boolean
     ps:destroy()
     if not f:isopen() then return false end
     local line = f:read('l')
-    f:close()
+    f:destroy()
     -- "pid (comm) state ppid ...": comm may hold spaces, so start after the last ')'
     local close_at = 0
     for i = #line, 1, -1 do if line:byte(i) == 41 then close_at = i break end end
@@ -2148,7 +2148,7 @@ local function read_cmd(cmd: string): string
   local f = io.popen(cmd, 'r')
   if not f:isopen() then return (@string){} end
   local out = f:read('a')
-  f:close()
+  f:destroy()
   local i, j = 1, #out
   while i <= j and (out:byte(i) == 32 or out:byte(i) == 9 or out:byte(i) == 10 or out:byte(i) == 13) do i = i + 1 end
   while j >= i and (out:byte(j) == 32 or out:byte(j) == 9 or out:byte(j) == 10 or out:byte(j) == 13) do j = j - 1 end
@@ -2247,14 +2247,14 @@ local function browser_on_desktop(prog: string): boolean
     path:destroy()
     if not f:isopen() then continue end
     local comm = f:read('l')
-    f:close()
+    f:destroy()
     if browser_comm_matches(comm, prog) then
       local pid = (@cint)(tointeger(nm))
       local epath = string.format('/proc/%s/environ', nm)
       local ef = io.open(epath, 'rb')
       epath:destroy()
       local env: string
-      if ef:isopen() then env = ef:read('a') ef:close() end
+      if ef:isopen() then env = ef:read('a') ef:destroy() end
       local wd = environ_value(env, 'WAYLAND_DISPLAY')
       if wd ~= wc.socket and not descends_from(pid, me) then found = true end
       env:destroy()
@@ -2702,7 +2702,7 @@ local function sys_read(path: string): string
   local f = io.open(path, 'r')
   if not f:isopen() then return (@string){} end
   local t = f:read('a')
-  f:close()
+  f:destroy()
   return t
 end
 
@@ -2749,7 +2749,7 @@ local function render_nodes(): vector(RenderNode)
         if not asked_nvidia then
           asked_nvidia = true
           local f = io.popen('timeout 5 nvidia-smi --query-gpu=pci.bus_id,memory.free,memory.total --format=csv,noheader,nounits 2>/dev/null', 'r')
-          if f:isopen() then nvidia_csv = f:read('a') f:close() end
+          if f:isopen() then nvidia_csv = f:read('a') f:destroy() end
         end
         n.free_mb, n.total_mb = wayland_nvidia_vram(nvidia_csv, n.pci)
       end
@@ -2848,7 +2848,7 @@ local function setup_link_env(): void
       'PATH=$(printf \'%s\' "$PATH" | tr \':\' \'\\n\' | grep -vxF "$here" | paste -sd: -)\n',
       'export PATH\n',
       'exec xdg-open "$@"\n')
-    f:close()
+    f:destroy()
     local sb2: stringbuilder
     sb2:write('chmod 755 ') desktop_sh_quote(&sb2, path)
     local ch = sb2:promote()

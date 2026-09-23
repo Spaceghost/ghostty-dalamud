@@ -7,6 +7,7 @@
 -- Run with the scratch directory as its first argument; run.sh points
 -- GHOSTTY_CLIP_DIR and GHOSTTY_FFMPEG into it.
 require 'agent.clips'
+require 'tests.check'
 require 'core.wincodec'
 require 'os'
 require 'io'
@@ -31,7 +32,7 @@ end
 clips.queue_of, clips.log_fn, clips.next_cid = queue_of, logline, 1
 
 local function path_of(name: string): string
-  return scratch .. '/' .. name
+  return string.format('%s/%s', scratch, name) -- one string: a .. b .. c leaks the middle one
 end
 
 local FFMPEG = path_of('fake-ffmpeg')
@@ -151,7 +152,7 @@ do
   assert(proto.get_u32((@*[0]uint8)(&p[0])) == 1, 'with the request it answers')
   assert(proto.get_u32((@*[0]uint8)(&p[4])) == 0, 'refused: no clip id')
   local why = text_of(&p, 8)
-  assert(#why > 0 and why:find('ffmpeg', 1, true) > 0, 'and the reason names ffmpeg: ' .. why)
+  check(#why > 0 and why:find('ffmpeg', 1, true) > 0, 'and the reason names ffmpeg: ', why)
   why:destroy()
   p:destroy()
   assert(#clips.clips == 0, 'nothing is recording')
@@ -194,7 +195,7 @@ do
   p:destroy()
   assert(#clips.clips == 1, 'one clip')
   out_path = clips.clips[0].out_path:copy()
-  assert(out_path:find('.gif', 1, true) > 0, 'a GIF was asked for: ' .. out_path)
+  check(out_path:find('.gif', 1, true) > 0, 'a GIF was asked for: ', out_path)
 
   local body: vector(uint8)
   defer body:destroy() end
@@ -234,7 +235,7 @@ do
   assert(proto.get_u32((@*[0]uint8)(&dp[0])) == cid, 'for this clip')
   assert(proto.get_u32((@*[0]uint8)(&dp[4])) == 0, 'and it worked')
   local path = text_of(&dp, 8)
-  assert(path == out_path, 'carrying the file it wrote: ' .. path)
+  check(path == out_path, 'carrying the file it wrote: ', path)
   path:destroy()
   dp:destroy()
   assert(file_there(out_path), 'the clip is there')
@@ -263,7 +264,7 @@ do
   assert(dok and dtyp == PROTO_CDONE, 'CDONE comes back')
   assert(proto.get_u32((@*[0]uint8)(&dp[4])) ~= 0, 'as a failure')
   local why = text_of(&dp, 8)
-  assert(why:find('ffmpeg-said-no', 1, true) > 0, 'with what the encoder said: ' .. why)
+  check(why:find('ffmpeg-said-no', 1, true) > 0, 'with what the encoder said: ', why)
   why:destroy()
   dp:destroy()
   assert(#clips.clips == 0, 'and it is forgotten')

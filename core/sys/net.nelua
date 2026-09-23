@@ -99,7 +99,6 @@ local function socket(domain: cint, typ: cint, protocol: cint): CSocket <cimport
 local function connect(s: CSocket, addr: *sockaddr, len: cint): cint <cimport, nodecl> end
 local function bind(s: CSocket, addr: *sockaddr, len: cint): cint <cimport, nodecl> end
 local function listen(s: CSocket, backlog: cint): cint <cimport, nodecl> end
-local function accept(s: CSocket, addr: *sockaddr, len: *cint): CSocket <cimport, nodecl> end
 local function send(s: CSocket, buf: pointer, len: csize, flags: cint): isize <cimport, nodecl> end
 local function recv(s: CSocket, buf: pointer, len: csize, flags: cint): isize <cimport, nodecl> end
 local function shutdown(s: CSocket, how: cint): cint <cimport, nodecl> end
@@ -109,6 +108,7 @@ local peerlen_t = @cint
 local peerlen_t <cimport 'socklen_t', nodecl> = @cuint
 ## end
 local function getpeername(s: CSocket, addr: *sockaddr, len: *peerlen_t): cint <cimport, nodecl> end
+local function accept(s: CSocket, addr: *sockaddr, len: *peerlen_t): CSocket <cimport, nodecl> end
 local function ntohs(v: uint16): uint16 <cimport, nodecl> end
 local function setsockopt(s: CSocket, level: cint, name: cint, val: pointer, len: cint): cint <cimport, nodecl> end
 local function getaddrinfo(node: cstring, service: cstring, hints: *addrinfo, res: **addrinfo): cint <cimport, nodecl> end
@@ -406,6 +406,9 @@ function net.shutdown(): void
       iroh_started = false
     end
   ## end
+  -- the loader unloads this copy after shutdown: nothing may stay allocated
+  -- (the next init sets the path again through core/app/agent.nelua)
+  iroh_key_path:destroy()
   if not net_started then return end
   ## if ccinfo.is_windows then
     WSACleanup()
@@ -537,6 +540,7 @@ end
 -- Poll a pending connect. Returns 1 connected, 0 still pending, -1 failed.
 function net.connect_poll(conn: *NetConn): integer
   if conn.connected then return 1 end
+  if not net.is_valid(conn.sock) then return -1 end -- is_iroh is false for it too: never hand the OS -1
   if is_iroh(conn.sock) then
     ## if NET_IROH then
       local r = gi_connect_poll(iroh_of(conn.sock))
@@ -609,6 +613,7 @@ end
 -- Accept on either kind of listener. Invalid means "nothing pending" for both,
 -- which is the loop termination every caller already writes.
 function net.accept(s: NetSocket): NetSocket
+  if not net.is_valid(s) then return net.invalid() end -- is_iroh is false for it too: never hand the OS -1
   if is_iroh(s) then
     ## if NET_IROH then
       return iroh_sock(gi_accept(iroh_of(s)))
@@ -631,6 +636,7 @@ end
 -- connection. Which GI_E* it was survives in net.last_error_code() /
 -- net.last_error() for the log line.
 function net.recv(s: NetSocket, buf: pointer, cap: usize): integer
+  if not net.is_valid(s) then return -1 end -- is_iroh is false for it too: never hand the OS -1
   if is_iroh(s) then
     ## if NET_IROH then
       local n = gi_recv(iroh_of(s), buf, cap)
@@ -656,6 +662,7 @@ end
 -- expected and already handled there.
 function net.send(s: NetSocket, buf: pointer, len: usize): integer
   if len == 0 then return 0 end
+  if not net.is_valid(s) then return -1 end -- is_iroh is false for it too: never hand the OS -1
   if is_iroh(s) then
     ## if NET_IROH then
       local n = gi_send(iroh_of(s), buf, len)
@@ -677,7 +684,7 @@ function net.peer_address(s: NetSocket): string
   -- An iroh peer has no IPv4 address to give: it is identified by its public
   -- key, which net.peer_id answers. '' is already this function's word for
   -- "not known", so there is nothing to invent here.
-  if is_iroh(s) then return (@string){} end
+  if not net.is_valid(s) or is_iroh(s) then return (@string){} end
   local a: sockaddr_in
   local len: peerlen_t = #sockaddr_in
   if getpeername(csock_of(s), (@*sockaddr)(&a), &len) ~= 0 or a.sin_family ~= (@cushort)(AF_INET) then return (@string){} end
@@ -693,7 +700,7 @@ function net.shutdown_write(s: NetSocket): void
   -- connection closes and exposes no half-close of its own, so a peer there
   -- reads EOF at close rather than here. Callers that use the half-close as a
   -- protocol signal need another one over iroh (docs/IROH.md).
-  if is_iroh(s) then return end
+  if not net.is_valid(s) or is_iroh(s) then return end
   ## if ccinfo.is_windows then
     shutdown(csock_of(s), 1) -- SD_SEND
   ## else

@@ -307,7 +307,7 @@ function AgentWindows:handle(ci: usize, q: *ByteQueue, typ: uint8, payload: *[0]
     why:destroy()
     self.streams:push(WinStream{
       sid = self.next_sid, client = ci, req = req, h = h, max_w = max_w, max_h = max_h,
-      interval = 1.0 / fps, link = #match > 4 and match:subview(1, 4) == 'url:',
+      interval = 1.0 / (@float64)(fps), link = #match > 4 and match:subview(1, 4) == 'url:',
     })
     self.next_sid = self.next_sid + 1
     if self.next_sid == 0 then self.next_sid = 1 end

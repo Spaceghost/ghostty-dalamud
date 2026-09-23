@@ -7,6 +7,7 @@
 -- runs this through a WireGuard tunnel with AGENT_PID "-", which skips the
 -- one check that reads the agent's /proc.
 require 'core.agent_client'
+require 'tests.check'
 require 'string'
 require 'vector'
 require 'io'
@@ -52,7 +53,7 @@ local function on_event(ctx: pointer, ev: *AgentEvent): void
   elseif ev.typ == PROTO_SDATA then
     sdata_bytes = sdata_bytes + ev.len
     if ev.id == opened_id then opened_bytes = opened_bytes + ev.len end
-    if collect then got = got .. text end
+    if collect then local more = got .. text got:destroy() got = more end
   elseif ev.typ == PROTO_EXIT then exited = true exit_status = ev.status exit_id = ev.id
   elseif ev.typ == PROTO_ATTACHED then
     attached_id = ev.id
@@ -74,7 +75,7 @@ c:init(host, port, token)
 c.on_event = on_event
 c:connect(now)
 for _ = 1, 200 do pump1(&c) if c:ready() then break end end
-assert(c:ready(), 'agent handshake: ' .. c.last_error)
+check(c:ready(), 'agent handshake: ', c.last_error)
 print('handshake ok:', first_ok, 'version', c.version, 'nonce', c.nonce)
 assert(first_ok:find('ghostty-agent 4 ', 1, true) == 1, 'the greeting carries protocol version 4 and a nonce')
 assert(c.version == 4 and c.nonce ~= 0)
@@ -94,7 +95,7 @@ assert(got:find('hello-from-pty', 1, true) > 0)
 assert(exited and exit_status == 3)
 
 -- second session: attach replay check
-got = ''
+got:destroy() got = ''
 exited = false
 argv:clear()
 argv:push('/bin/sh')
@@ -112,11 +113,11 @@ do
   fresh.on_event = on_event
   fresh:connect(now)
   for _ = 1, 200 do pump1(&fresh) if fresh:ready() then break end end
-  got = ''
+  got:destroy() got = ''
   attached_count = 0
   fresh:attach(sid, 0)
   for _ = 1, 100 do pump1(&fresh) if attached_count > 0 then break end end
-  print('replay from 0:', got:gsub('\27', 'ESC'))
+  do local shown, n = got:gsub('\27', 'ESC') print('replay from 0:', shown, n) shown:destroy() end
   assert(attached_id == sid, 'ATTACH is answered by ATTACHED with its id')
   assert(got:find('replay-me', 1, true) > 0 and got:find('\27c', 1, true) == 0, 'whole history, no reset')
   assert(attached_offset >= 9, 'ATTACHED says how much output there was')
@@ -125,7 +126,7 @@ end
 
 -- this connection had all of it queued before its DETACH: even fed 0 replays none of it
 c:detach(sid)
-got = ''
+got:destroy() got = ''
 attached_count = 0
 c:attach(sid, 0)
 for _ = 1, 100 do pump1(&c) if attached_count > 0 then break end end
@@ -133,7 +134,7 @@ assert(attached_count == 1 and #got == 0, 'output queued before the DETACH is no
 
 -- a terminal that has everything gets nothing
 c:detach(sid)
-got = ''
+got:destroy() got = ''
 attached_count = 0
 c:attach(sid, attached_offset)
 for _ = 1, 100 do pump1(&c) if attached_count > 0 then break end end
@@ -141,16 +142,16 @@ assert(attached_count == 1 and #got == 0, 'nothing missed, nothing replayed')
 
 -- a position the agent cannot serve: reset and replay what it kept
 c:detach(sid)
-got = ''
+got:destroy() got = ''
 attached_count = 0
 c:attach(sid, 0xffffffffff)
 for _ = 1, 100 do pump1(&c) if attached_count > 0 then break end end
-print('replay reset:', got:gsub('\27', 'ESC'))
+do local shown, n = got:gsub('\27', 'ESC') print('replay reset:', shown, n) shown:destroy() end
 assert(got:find('\27c', 1, true) == 1, 'replay starts with a terminal reset')
 assert(got:find('replay-me', 1, true) > 0, 'replayed output')
 
 -- attaching while attached replays nothing (every byte already came)
-got = ''
+got:destroy() got = ''
 attached_count = 0
 c:attach(sid, 0)
 for _ = 1, 100 do pump1(&c) if attached_count > 0 then break end end
@@ -184,7 +185,7 @@ c.on_event = on_event
 -- a 1 MiB paste reaches the shell whole, although the PTY takes far less at once
 do
   os.remove('build/agent-paste')
-  got = ''
+  got:destroy() got = ''
   exited = false
   argv:clear()
   argv:push('/bin/sh')
@@ -204,7 +205,7 @@ do
     local f = io.open('build/agent-paste', 'rb')
     assert(f:isopen())
     local content = f:read('a')
-    f:close()
+    f:destroy()
     print('pasted bytes:', #content)
     assert(#content == 1048576, 'the whole paste arrived')
     content:destroy()
@@ -240,11 +241,12 @@ do
   local yes_id = opened_id
   usleep(2000000)
   if agent_pid ~= '-' then
-  local path: string = '/proc/' .. agent_pid .. '/status'
+  local path: string = string.format('/proc/%s/status', agent_pid)
   local f = io.open(path, 'rb')
   assert(f:isopen(), 'agent /proc status')
   local st = f:read('a')
-  f:close()
+  f:destroy() path:destroy()
+  defer st:destroy() end
   local at = st:find('VmRSS:', 1, true)
   assert(at > 0)
   local kb = 0
@@ -254,7 +256,9 @@ do
   print('agent VmRSS kB after 2 s of unread `yes`:', kb)
   -- a sanitizer's shadow memory and valgrind's own heap are in that number too (tools/sanitize.sh)
   local limit = 16 * 1024
-  if os.getenv('SAN').size > 0 then limit = 512 * 1024 end
+  local san = os.getenv('SAN')
+  if san.size > 0 then limit = 512 * 1024 end
+  san:destroy()
   assert(kb > 0 and kb < limit, 'agent memory stays bounded') -- unbounded, 2 s of `yes` took 32 MiB
   end
   -- a panel unseen for a moment: DETACH, then ATTACH with what it has read.

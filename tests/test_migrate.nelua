@@ -5,6 +5,7 @@
 -- init.lua reads settings.lua.
 require 'core.policy'
 require 'string'
+require 'vector'
 require 'io'
 require 'os'
 require 'arg'
@@ -19,24 +20,29 @@ local function l_file_mode(L: *lua_State): cint
   if c_stat(lua_tolstring(L, 1, nilptr), &st) ~= 0 then lua_pushnil(L) return 1 end
   local m = string.format('%o', (@integer)(st.st_mode & 511))
   lua_pushlstring(L, (@cstring)(m.data), m.size)
+  m:destroy()
   return 1
 end
 
 local root: string = arg[1]
 local scratch: string = arg[2]
 
+-- the paths and Lua strings built below, kept until the end and freed there
+local built: vector(string)
+local function keep(s: string): string built:push(s) return s end
+
 local function write(path: string, data: string): void
   local f = io.open(path, 'wb')
   assert(f:isopen(), path)
   f:write(data)
-  f:close()
+  f:destroy()
 end
 
 local function exists(path: string): boolean
   local f = io.open(path, 'rb')
-  if not f:isopen() then return false end
-  f:close()
-  return true
+  local ok = f:isopen()
+  f:destroy()
+  return ok
 end
 
 local function lua_global_string(name: cstring): string
@@ -73,6 +79,7 @@ do
     io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
     os.exit(1)
   end
+  script:destroy()
   lua_pushlstring(L, (@cstring)(root.data), root.size)
   lua_pushlstring(L, (@cstring)(scratch.data), scratch.size)
   if lua_pcall(L, 2, 0, 0) ~= LUA_OK then
@@ -84,13 +91,13 @@ end
 
 -- config before install ---------------------------------------------------------------
 do
-  local base = scratch .. '/homes'
-  local config = base .. '/config'
+  local base = keep(scratch .. '/homes')
+  local config = keep(base .. '/config')
   assert(fs_mkdir((@cstring)(base.data)) and fs_mkdir((@cstring)(config.data)))
-  local lua_dir = config .. '/lua'
+  local lua_dir = keep(config .. '/lua')
   assert(fs_mkdir((@cstring)(lua_dir.data)))
-  write(config .. '/lua/world.lua', "return 'config world'\n")
-  write(config .. '/lua/init.lua', [[
+  write(keep(config .. '/lua/world.lua'), "return 'config world'\n")
+  write(keep(config .. '/lua/init.lua'), [[
 local keymap = require('keymap') -- only shipped: found beside the plugin
 return {
   toggle_key = 'f12',
@@ -103,15 +110,15 @@ return {
 ]])
   assert(policy_load_dirs(root, config, '', 'test'), policy.error)
   assert(policy.toggle_key == 'f12', 'init.lua from the config directory')
-  assert(config_string('probe_world') == 'config world', 'config/lua comes first on package.path')
-  assert(config_string('plugin_dir') == config, 'GHOSTTY_PLUGIN_DIR is the config directory')
-  assert(lua_global_string('GHOSTTY_INSTALL_DIR') == root and lua_global_string('GHOSTTY_CONFIG_DIR') == config)
+  assert(keep(config_string('probe_world')) == 'config world', 'config/lua comes first on package.path')
+  assert(keep(config_string('plugin_dir')) == config, 'GHOSTTY_PLUGIN_DIR is the config directory')
+  assert(keep(lua_global_string('GHOSTTY_INSTALL_DIR')) == root and keep(lua_global_string('GHOSTTY_CONFIG_DIR')) == config)
   assert(#policy.profiles == 1 and policy.profiles[0].name == 'probe')
   local buf: [16]cchar
   assert(policy_key_action('c', true, true, false, false, &buf, 16) == 4, 'shipped keymap through the fallback path')
 
   -- without an override the shipped init.lua loads (still seeing config/lua/world.lua)
-  assert(os.remove(config .. '/lua/init.lua'))
+  assert(os.remove(keep(config .. '/lua/init.lua')))
   assert(policy_load_dirs(root, config, '', 'test'), policy.error)
   assert(policy.toggle_key == 'grave' and #policy.profiles >= 3, 'shipped init.lua')
   print('homes OK')
@@ -119,22 +126,24 @@ end
 
 -- migration runs before init.lua -------------------------------------------------------
 do
-  local base = scratch .. '/boot'
-  local configs_root = base .. '/pluginConfigs'
-  local umbra = configs_root .. '/Umbra'
-  local legacy = umbra .. '/ghostty'
-  local config = configs_root .. '/GhosttyDalamud'
+  local base = keep(scratch .. '/boot')
+  local configs_root = keep(base .. '/pluginConfigs')
+  local umbra = keep(configs_root .. '/Umbra')
+  local legacy = keep(umbra .. '/ghostty')
+  local config = keep(configs_root .. '/GhosttyDalamud')
   local dirs: [5]string = { base, configs_root, umbra, legacy, config }
   for i = 0, < 5 do assert(fs_mkdir((@cstring)(dirs[i].data))) end
-  write(legacy .. '/settings.lua', "return { ['dropdown.height'] = 0.77 }\n")
+  write(keep(legacy .. '/settings.lua'), "return { ['dropdown.height'] = 0.77 }\n")
   assert(policy_load_dirs(root, config, configs_root, 'dalamud'), policy.error)
-  assert(exists(config .. '/settings.lua') and exists(config .. '/migrated-from-umbra.txt'), 'migrated on load')
+  assert(exists(keep(config .. '/settings.lua')) and exists(keep(config .. '/migrated-from-umbra.txt')), 'migrated on load')
   assert(math.abs(policy.dropdown.height - 0.77) < 1e-9, 'init.lua saw the migrated settings')
   -- tests never migrate
-  local other = base .. '/other'
+  local other = keep(base .. '/other')
   assert(fs_mkdir((@cstring)(other.data)))
   assert(policy_load_dirs(root, other, configs_root, 'test'), policy.error)
-  assert(not exists(other .. '/migrated-from-umbra.txt'))
+  assert(not exists(keep(other .. '/migrated-from-umbra.txt')))
   print('boot migration OK')
 end
+for i = 0, < #built do built[i]:destroy() end
+built:destroy()
 print('OK')
