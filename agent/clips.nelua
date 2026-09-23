@@ -548,11 +548,11 @@ global function clips_cam_flush(c: *AgentClip): void
     else
       close(c.fd)
       c.fd = -1
-      c.pend_len, c.pend_off = 0, 0
+      c.pend_len = 0 c.pend_off = 0
       return
     end
   end
-  c.pend_len, c.pend_off = 0, 0
+  c.pend_len = 0 c.pend_off = 0
 ## end
 end
 
@@ -598,7 +598,7 @@ local function handle_cframe(self: *AgentClips, ci: usize, payload: *[0]uint8, l
       c.dropped = c.dropped + 1
       return
     end
-    c.pend_off, c.pend_len = 0, need
+    c.pend_off = 0 c.pend_len = need
     c.frames = c.frames + 1
     c.bytes = c.bytes + need
     clips_cam_flush(c)
@@ -630,7 +630,7 @@ local function handle_cend(self: *AgentClips, ci: usize, q: *ByteQueue, payload:
       ## if not ccinfo.is_windows then
         if c.fd >= 0 then close(c.fd) c.fd = -1 end
       ## end
-        c.pend_len, c.pend_off = 0, 0
+        c.pend_len = 0 c.pend_off = 0
         local sb: stringbuilder
         sb:writef('clip %d: the camera is off after %d frames', (@integer)(cid), c.frames)
         if c.dropped > 0 then
