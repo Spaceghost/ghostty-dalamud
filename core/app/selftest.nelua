@@ -460,7 +460,10 @@ local function suite_agent(): boolean
     if platform_name() == 'windows' then
       p.argv:push('cmd.exe') p.argv:push('/c') p.argv:push('echo ' .. MARKER)
     else
-      p.argv:push('sh') p.argv:push('-c') p.argv:push('echo ' .. MARKER)
+      -- an absolute path, not `sh`: this runs on the agent's host, and the
+      -- agent's own PATH is whatever started it, which need not have one.
+      -- A session opened with no argv already falls back to /bin/sh.
+      p.argv:push('/bin/sh') p.argv:push('-c') p.argv:push('echo ' .. MARKER)
     end
     local s = session_open(&p, 40, 4)
     p.argv[2]:destroy()

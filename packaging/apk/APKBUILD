@@ -1,0 +1,71 @@
+# Contributor: Johnneylee Jack Rollins <git@spacegho.st>
+# Maintainer: Johnneylee Jack Rollins <git@spacegho.st>
+#
+# ghostty-agent for Alpine, built from the same source tarball the RPM uses:
+#
+#   tools/package-agent.sh                     # writes the tarball
+#   tools/ci/agent-apk.sh                      # builds this in an Alpine container
+#
+# Alpine has wlroots0.20, so the compositor goes in here the way it does in the
+# Fedora 44 package: apk's own so:libwlroots-0.20.so dependency is generated
+# from the linked binary, and nothing is claimed by hand. Build without it with
+#   abuild -P . rootbld  # after: options="$options !wayland"   (or SKIP_WAYLAND=1)
+#
+# No OpenRC service on purpose. The agent holds one person's terminals, runs as
+# that person, and wants their session for the clipboard; OpenRC has no
+# per-user service manager to hang that on, so on Alpine you start it yourself
+# or give it to whatever supervisor you already use. README-agent.md says so.
+pkgname=ghostty-agent
+pkgver=0.3.0.2
+pkgrel=0
+pkgdesc="PTY server and desktop-window compositor for the Ghostty Dalamud plugin"
+url="https://github.com/Spaceghost/ghostty-dalamud"
+arch="x86_64"
+license="MIT"
+# bash: tools/build-agent.sh is a bash script, and an Alpine builder has no
+# bash unless something asks for it. Without this the build fails with
+# "env: can't execute 'bash'" after unpacking, which is a long way from
+# the cause.
+makedepends="gcc make musl-dev bash"
+[ "${SKIP_WAYLAND:-0}" = 1 ] || makedepends="$makedepends wlroots0.20-dev wayland-dev
+	wayland-protocols libxkbcommon-dev pixman-dev"
+source="$pkgname-$pkgver-src.tar.gz"
+builddir="$srcdir/$pkgname-$pkgver"
+options="!check"  # check() runs the binary; see below
+# Alpine keeps man pages, READMEs and licences out of the program package, and
+# abuild enforces it: leave the man page in the root package and the build dies
+# with "Found uncompressed man pages" during prepare_subpackages. rpm compresses
+# man pages by itself, so the same packaging/ghostty-agent.1 is fine there and
+# only fails here.
+subpackages="$pkgname-doc"
+
+build() {
+	if [ "${SKIP_WAYLAND:-0}" = 1 ]; then
+		CC=gcc ./tools/build-agent.sh --no-wayland -o build/dist/ghostty-agent
+	else
+		CC=gcc ./tools/build-agent.sh --wayland -o build/dist/ghostty-agent
+		# A silently degraded package would carry none of the sonames that say
+		# what it needs, so prove the backend really linked.
+		readelf -d build/dist/ghostty-agent | grep -q 'libwlroots-0.20\.so'
+	fi
+}
+
+check() {
+	# No network, no X, no game.
+	./build/dist/ghostty-agent --help >/dev/null
+}
+
+package() {
+	install -Dm0755 build/dist/ghostty-agent "$pkgdir"/usr/bin/ghostty-agent
+	install -Dm0644 packaging/README-agent.md \
+		"$pkgdir"/usr/share/doc/$pkgname/README-agent.md
+	install -Dm0644 LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE
+	install -Dm0644 packaging/ghostty-agent.1 "$pkgdir"/usr/share/man/man1/ghostty-agent.1
+	# Compress it here rather than leaving it to default_doc, so this does not
+	# depend on which abuild version does the compressing.
+	gzip -9n "$pkgdir"/usr/share/man/man1/ghostty-agent.1
+	# The systemd unit ships as documentation: it is what a systemd machine
+	# needs and what the tarball installs, and it is inert here.
+	install -Dm0644 packaging/ghostty-agent.service \
+		"$pkgdir"/usr/share/doc/$pkgname/ghostty-agent.service
+}

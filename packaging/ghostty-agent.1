@@ -1,0 +1,192 @@
+.TH GHOSTTY\-AGENT 1 "2026-09-22" "ghostty-agent" "User Commands"
+.SH NAME
+ghostty\-agent \- terminal and desktop-window server for the Ghostty plugin for Final Fantasy XIV
+.SH SYNOPSIS
+.B ghostty\-agent
+.RI [ options ]
+.br
+.B ghostty\-agent
+.RB [ \-\-listen
+.IR HOST:PORT ]
+.RB [ \-\-token\-file
+.IR PATH ]
+.B \-\-open\-url
+.I URL
+.SH DESCRIPTION
+.B ghostty\-agent
+holds the terminal sessions that the Ghostty plugin shows inside Final Fantasy
+XIV. The game connects to it over TCP and opens shells, ssh clients, tmux or
+anything else; those sessions outlive the plugin reloading, the game closing,
+and the machine the game runs on. Reattaching replays the recent output so the
+terminal redraws exactly as it was.
+.PP
+It runs as you, not as a system service: every shell it opens is yours, it
+writes only under your home directory, and it needs no privileges.
+.PP
+On Linux it can also be a headless Wayland compositor of its own. Programs
+started into that compositor \(em a browser, an editor \(em become windows the
+game can show as panels in the world, and X11 programs work there through
+Xwayland. That backend is present only in builds made against wlroots 0.20;
+.B ghostty\-agent
+says which it is when it starts.
+.SH OPTIONS
+.TP
+.BI \-\-listen " HOST:PORT"
+Address to listen on. Default
+.BR 127.0.0.1:7777 .
+The connection is authenticated by a token but is
+.B not encrypted:
+listen on loopback, on a private network such as Tailscale or WireGuard, or
+inside an
+.B ssh \-L
+tunnel.
+.TP
+.BI \-\-token\-file " PATH"
+Where the shared token lives. Default
+.IR ~/.config/ghostty\-agent/token ,
+created with mode 0600 on first start if it does not exist.
+.TP
+.BI \-\-clipboard\-file " PATH"
+A file used to exchange clipboard contents with the plugin.
+.TP
+.BI \-\-replay\-bytes " N"
+How much recent output each session keeps for replay on reattach. Default 262144.
+.TP
+.BI \-\-term " NAME"
+The
+.B TERM
+value given to shells. Default
+.BR xterm\-256color .
+.TP
+.BI \-\-windows " NAME"
+Which window-capture backend to use:
+.BR auto ", " off ", " wayland ", " win32 ", " mac " or " test .
+Default
+.BR auto ,
+which is
+.B wayland
+on Linux.
+.TP
+.BI \-\-wayland\-socket " NAME"
+Name of the compositor's Wayland socket under
+.BR $XDG_RUNTIME_DIR .
+Default
+.BR ffxiv\-0 ,
+or the next free
+.BR ffxiv\- N.
+.TP
+.BI \-\-xkb\-layout " LAYOUT"
+Keyboard layout for the compositor's seat.
+.TP
+.BI \-\-wayland\-render\-node " PATH|auto|gpu|none"
+Which GPU the compositor draws with.
+.RS
+.TP
+.B auto
+The default. The card with the most free video memory among those driving
+.I no
+display and with at least 1 GiB free; software rendering when there is none.
+This is the answer for the machine running the game: it never takes the card
+the game is drawing on.
+.TP
+.B gpu
+The best card there is \(em one driving a display included, and one whose free
+video memory cannot be read included, which is every Intel GPU and any NVIDIA
+card on a host without
+.BR nvidia\-smi .
+For a machine that is not running the game, where refusing the only card means
+software rendering for nothing.
+.TP
+.BI /dev/dri/renderD N
+That node, with no checks.
+.TP
+.BR none ", " pixman ", " off
+Software rendering.
+.RE
+.TP
+.BI \-\-wayland\-browser " CMD"
+The browser command the compositor runs when the game opens a link.
+.TP
+.BI \-\-wayland\-browser\-profile " NAME"
+A profile name passed to that browser.
+.TP
+.BI \-\-open\-url " URL"
+Ask an already-running agent to open
+.I URL
+and exit, rather than starting a server.
+.TP
+.BR \-h ", " \-\-help
+Print usage and exit.
+.SH FILES
+.TP
+.I ~/.config/ghostty\-agent/token
+The shared token, mode 0600, written on first start. The plugin reads the same
+file when the game and the agent are on one machine.
+.TP
+.I /usr/lib/systemd/user/ghostty\-agent.service
+A systemd
+.B user
+service. Start it with
+.B systemctl \-\-user enable \-\-now ghostty\-agent
+and keep your shells alive between logins with
+.BR "loginctl enable\-linger" .
+It is deliberately not a system service: a system service has no desktop
+session, and would lose the clipboard and every remote window.
+.SH ENVIRONMENT
+.TP
+.B GHOSTTY_WAYLAND_RENDER_NODE
+Same values as
+.BR \-\-wayland\-render\-node .
+.TP
+.B GHOSTTY_WAYLAND_SOCKET
+Same as
+.BR \-\-wayland\-socket .
+.TP
+.B GHOSTTY_XWAYLAND
+.B off
+leaves Xwayland out;
+.B eager
+starts it with the agent instead of with the first X11 client.
+.TP
+.B GHOSTTY_FFMPEG
+The
+.B ffmpeg
+to use for short screen recordings; otherwise the first one on
+.BR $PATH .
+.SH EXAMPLES
+Run it for a game on the same machine:
+.PP
+.RS
+.B ghostty\-agent \-\-listen 127.0.0.1:7777
+.RE
+.PP
+Run it on another machine, reachable over a private network, using whichever GPU
+it has:
+.PP
+.RS
+.B ghostty\-agent \-\-listen 0.0.0.0:7777 \-\-wayland\-render\-node gpu
+.RE
+.PP
+Reach an agent on another machine without exposing it:
+.PP
+.RS
+.B ssh \-L 7777:127.0.0.1:7777 that\-machine
+.RE
+.SH EXIT STATUS
+.TP
+.B 0
+Asked to print usage, or stopped cleanly.
+.TP
+.B 1
+Could not listen on the given address.
+.TP
+.B 2
+A bad argument.
+.SH SEE ALSO
+.BR systemctl (1),
+.BR loginctl (1),
+.BR ssh (1)
+.PP
+The project, and the rest of the documentation:
+.UR https://github.com/Spaceghost/ghostty\-dalamud
+.UE

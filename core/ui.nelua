@@ -210,6 +210,27 @@ local function l_spacing(L: *lua_State): cint imgui.Spacing() return 0 end
 global ui_push_mono: function(): void
 global ui_pop_font: function(): void
 
+-- How many ImGui child regions the policy's Lua has open right now.
+--
+-- CONFIG.ask.draw runs under lua_pcall, which protects the C stack but not
+-- ImGui's: Lua raising an error between ui.child() and ui.end_child() returns
+-- cleanly to the core and leaves a child open, and the End() that follows takes
+-- the game down. Lua calling end_child() without a child would do the same from
+-- the other side. Counting them lets the caller put ImGui back (ui_close_children)
+-- so a mistake in a policy file is a glitch in a panel, not a dead client.
+global ui_child_depth: cint = 0
+
+-- Close whatever the policy left open. Returns how many it had to close, so the
+-- caller can say so once rather than every frame.
+global function ui_close_children(): cint
+  local leaked = ui_child_depth
+  while ui_child_depth > 0 do
+    imgui.EndChild()
+    ui_child_depth = ui_child_depth - 1
+  end
+  return leaked
+end
+
 local function arg_lstring(L: *lua_State, idx: cint): string
   local len: usize = 0
   local p = lua_tolstring(L, idx, &len)
@@ -303,14 +324,21 @@ end
 -- but `reserve` pixels at the bottom. Always close it with ui.end_child.
 local function l_child(L: *lua_State): cint
   local reserve = (@float32)(lua_tonumberx(L, 2, nilptr))
-  lua_pushboolean(L, imgui.BeginChild(arg_string(L, 1), vec2(0, -math.max(reserve, 0)), false, 0) and 1 or 0)
+  -- Counted whatever it returns: ImGui wants an EndChild for every BeginChild,
+  -- open or not.
+  local open = imgui.BeginChild(arg_string(L, 1), vec2(0, -math.max(reserve, 0)), false, 0)
+  ui_child_depth = ui_child_depth + 1
+  lua_pushboolean(L, open and 1 or 0)
   return 1
 end
 
 -- ui.end_child([follow]): `follow` scrolls it to the bottom first.
 local function l_end_child(L: *lua_State): cint
+  -- An end_child the policy never opened would be an EndChild with no child.
+  if ui_child_depth <= 0 then return 0 end
   if lua_toboolean(L, 1) ~= 0 and imgui.SetScrollHereY ~= nilptr then imgui.SetScrollHereY(1.0) end
   imgui.EndChild()
+  ui_child_depth = ui_child_depth - 1
   return 0
 end
 

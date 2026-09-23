@@ -223,6 +223,29 @@ def notes(c: dict[str, str], v: Version, assets: Path | None, rel: dict | None =
     else:
         out.append(f"2. Open `/xlplugins`, search for **{name}** and install it. Dalamud updates it from then on.")
     out.append(f"\nStep by step, with pictures: <{LISTING_PAGE}>\n")
+    have = {a.name for a in assets.iterdir()} if assets and assets.is_dir() else set()
+    agent = c.get("AGENT", "").strip()
+    if agent and have & {f"{agent}.fc44.x86_64.rpm", f"{agent}-linux-x86_64.tar.gz"}:
+        version = manifest_version(c)
+        out.append("\n**The agent.** The plugin talks to `ghostty-agent` on the machine whose shells "
+                   "you want. It is the one piece you fetch yourself.\n")
+        if f"{agent}.fc44.x86_64.rpm" in have:
+            out.append("Fedora 44 or newer, with remote desktop windows:\n")
+            out.append("```sh\n"
+                       f"sudo dnf install https://github.com/{repo}/releases/download/{v.tag}/{agent}.fc44.x86_64.rpm\n"
+                       "systemctl --user enable --now {agent}\n```\n")
+        if f"{agent}.fc43.x86_64.rpm" in have:
+            out.append("* Fedora 43, and any other rpm distribution with glibc 2.36 or newer: the same with "
+                       "`{agent}.fc43.x86_64.rpm` \u2014 terminals, jobs and clips, no compositor.")
+        if f"{agent}.apk" in have:
+            out.append("* Alpine: `apk add --allow-untrusted {agent}.apk` \u2014 it carries the compositor too.")
+        if f"{agent}-linux-x86_64.tar.gz" in have:
+            out.append(f"* Any other Linux: `{agent}-{version}-linux-x86_64.tar.gz`, or build a package of "
+                       f"your own from `{agent}-{version}-src.tar.gz` with `rpmbuild -tb`.")
+        if f"{agent}-{version}-windows-x64.zip" in have:
+            out.append(f"* Windows: `{agent}-{version}-windows-x64.zip`.")
+        out.append("\nEach carries its own README. The repository's README, under \u201cLinux\u201d, has the rest.\n")
+
     sums = assets / "SHA256SUMS" if assets else None
     if sums and sums.is_file():
         out.append("## Checksums\n")
@@ -308,6 +331,17 @@ def verify(c: dict[str, str], v: Version, version4: str | None, wait: bool = Tru
     version4 = version4 or entry["AssemblyVersion"]
     have = {a["name"] for a in info["assets"]}
     want = {"latest.zip", f"{internal}-{version4}.zip", listing_name, "SHA256SUMS"}
+    # A mod that ships a host-side helper names it in release.conf as AGENT;
+    # the rest of these tools are shared with the other plugins here, and a
+    # mod without one must not be asked for artifacts it never builds.
+    agent = c.get("AGENT", "").strip()
+    if agent:
+        want |= {f"{agent}-{version4}-windows-x64.zip",
+                 f"{agent}-{version4}-src.tar.gz", f"{agent}-src.tar.gz",
+                 f"{agent}-{version4}-linux-x86_64.tar.gz", f"{agent}-linux-x86_64.tar.gz",
+                 f"{agent}-{version4}-1.fc44.x86_64.rpm", f"{agent}.fc44.x86_64.rpm",
+                 f"{agent}-{version4}-1.fc43.x86_64.rpm", f"{agent}.fc43.x86_64.rpm",
+                 f"{agent}-{version4}-r0.apk", f"{agent}.apk"}
     if want - have:
         raise Fail(f"release {v.tag} is missing " + ", ".join(sorted(want - have)))
     print(f"   release   {info['name']}: " + ", ".join(sorted(have)))

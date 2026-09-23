@@ -132,7 +132,7 @@ and is not tested. None of it has been tried in game yet.
   closing; reattaching replays the recent raw output and libghostty rebuilds
   the screen, which is the same model Superlogical uses. This is the transport
   to use when the game runs under Wine/Proton on Linux, and on native Windows
-  with `ghostty-agent.exe` (see [Windows](#windows)).
+  with `ghostty-agent.exe` (see [Linux](#linux) and [Windows](#windows)).
 * **conpty** – a Windows pseudo console inside the game process (PowerShell,
   cmd, `ssh.exe`, …). Needs no agent, but its shells end when the game
   closes. On native Windows the default profiles fall back to it while no
@@ -276,7 +276,8 @@ Updates arrive like any other plugin's, and ticking **testing** on its entry opt
 into test builds (and nothing else) ahead of a release. The page at
 <https://spacegho.st/mods/ffxiv/plugins/> explains it with a section per mod. It is a
 third-party repository: Dalamud will say nobody but the author reviewed these plugins,
-which is true. You still run the agent yourself (step 1 below).
+which is true. You still run the agent yourself — on Linux it is a package or a
+tarball ([Linux](#linux)), on Windows the `windows-x64` zip ([Windows](#windows)).
 
 **Or build it yourself** — the path the rest of this section describes, and the one the
 author develops on. Nothing here depends on the repository above.
@@ -311,6 +312,120 @@ author develops on. Nothing here depends on the repository above.
    **Ghostty** and tick load on boot. If Dalamud says the location does not
    exist and your home directory is reached through a symlink, try the path
    with the symlink resolved (`readlink -f`), or the other way round.
+
+## Linux
+
+Nothing a Linux player needs involves Zig, the .NET SDK or a checkout of this
+repository: the plugin installs from the repository above in one click, and the
+agent is the one file you fetch yourself.
+
+The packages below are built, installed and run inside a Fedora container on
+every push, and **nobody has yet installed one from a published release on their
+own machine**.
+
+### Get the agent
+
+* **Fedora 44 or newer.** This build carries the Wayland compositor that remote
+  desktop windows and the browser integration need.
+
+  ```sh
+  sudo dnf install https://github.com/Spaceghost/ghostty-dalamud/releases/latest/download/ghostty-agent.fc44.x86_64.rpm
+  systemctl --user enable --now ghostty-agent
+  ```
+
+  The package is unsigned, so dnf says it skipped the OpenPGP check and carries on.
+
+* **Fedora 43, and any other rpm distribution with glibc 2.36 or newer.** The
+  same, with `ghostty-agent.fc43.x86_64.rpm`. Fedora 43 ships wlroots 0.19 and
+  the compositor needs 0.20, so dnf refuses the Fedora 44 package there and
+  names the library it cannot provide. Terminals, jobs and clips work; remote
+  desktop windows are not in this build.
+
+* **Alpine.** Alpine has wlroots 0.20, so its package carries the compositor too.
+
+  ```sh
+  doas apk add --allow-untrusted ghostty-agent.apk
+  ```
+
+  There is no service file: OpenRC has no per-user service manager to hang a
+  program that holds one person's terminals on, so you start it yourself.
+
+* **Any other Linux.**
+
+  ```sh
+  tar -xzf ghostty-agent-<version>-linux-x86_64.tar.gz
+  cd ghostty-agent-<version>-linux-x86_64
+  install -Dm0755 ghostty-agent ~/.local/bin/ghostty-agent
+  ```
+
+Check what you downloaded against the release's own `SHA256SUMS`
+(`sha256sum -c SHA256SUMS`).
+
+| Asset | What |
+|---|---|
+| `ghostty-agent.fc44.x86_64.rpm` | Fedora 44 and newer, with the Wayland compositor |
+| `ghostty-agent.fc43.x86_64.rpm` | any rpm distribution with glibc 2.36+, no compositor |
+| `ghostty-agent.apk` | Alpine, musl, with the Wayland compositor |
+| `ghostty-agent-linux-x86_64.tar.gz` | the same binary as the `.fc43` package, its unit and its README |
+| `ghostty-agent-src.tar.gz` | the agent's own source; `rpmbuild -tb` builds a package from it offline |
+
+`BUILD-INFO.txt` inside the tarball names the machine it was built on, the
+glibc it needs and whether the compositor is in it.
+
+### Run the agent
+
+```sh
+ghostty-agent --listen 127.0.0.1:7777
+```
+
+The first start writes a token to `~/.config/ghostty-agent/token`, readable only
+by you; the plugin reads that same file, so there is nothing to configure when
+the game and the agent are on one machine. Other flags: `--token-file PATH`,
+`--clipboard-file PATH`, `--replay-bytes N`, `--term NAME`, `--windows NAME`.
+
+When the game is on another machine, forward the port and copy the token over:
+`ssh -L 7777:127.0.0.1:7777 …`. The token authenticates the connection but the
+stream is not encrypted, so keep it on loopback, in that tunnel, or on a private
+network. `journalctl --user -u ghostty-agent -f` is its log.
+
+### Start it with your session
+
+The package ships a systemd **user** unit:
+
+```sh
+systemctl --user enable --now ghostty-agent
+```
+
+From the tarball, install the unit it carries:
+
+```sh
+install -Dm0644 ghostty-agent.service ~/.config/systemd/user/ghostty-agent.service
+systemctl --user daemon-reload
+systemctl --user enable --now ghostty-agent
+```
+
+`loginctl enable-linger "$USER"` keeps your shells alive between logins.
+`systemctl --user import-environment WAYLAND_DISPLAY DISPLAY` hands the
+clipboard helpers your session when they cannot find it themselves.
+
+None of this needs root: the agent is a normal user process, and it is a user
+service on purpose. A system service has no session, and would quietly lose the
+clipboard and every remote window.
+
+### Build it yourself
+
+A C compiler, `make` and `git`. No Zig, no .NET SDK, no Dalamud reference
+assemblies, no `vendor/ghostty`.
+
+```sh
+tools/fetch-vendor.sh agent     # only what the agent needs
+tools/build-agent.sh            # build/dist/ghostty-agent
+```
+
+`tools/build-agent.sh --wayland` builds the compositor in on any host that has
+wlroots 0.20 headers, which is how you get remote desktop windows outside the
+Fedora 44 package. For a package of your own,
+`tools/package-agent.sh && rpmbuild -tb build/dist/ghostty-agent-<version>-src.tar.gz`.
 
 ## Windows
 
@@ -466,8 +581,8 @@ with the depth test on.
 
 ## Themes
 
-**New and untested in game**: only the host tests (`tests/test_themes.*`)
-have run it.
+Run in game: `/term theme catppuccin-latte` recoloured the terminals and the
+glass around them in one frame, and `/term theme spaceghost` put them back.
 
 <!-- screenshots TODO: the dropdown and a world screen in spaceghost, gruvbox-dark, catppuccin and catppuccin-latte -->
 
@@ -595,9 +710,15 @@ the terminal.
 
 ## Ask panel (`/ask`)
 
-**New and untested in game**: only the host tests (`tests/test_ask.*`, with a
+**Still untested in game**: only the host tests (`tests/test_ask.*`, with a
 scripted ImGui) have run it. It needs an almanac with threads
 (`almanac ask --stream-json`, `almanac threads`).
+
+The first in-game `/ask` ended the game process: the panel popped one more style
+colour than it pushed, and the ImGui Dalamud ships does not check the depth
+(fixed in 68728c9; `tests/test_imgui_stack.py` now guards every core draw
+function). The panel has not been drawn in game since the fix, so it stays
+untested here rather than verified.
 
 `/ask <question>` (or `/term ask`, `/agent ask`) answers in a Ghostty glass
 panel instead of a terminal: your question and the answer as chat bubbles,
@@ -810,11 +931,17 @@ Tested on the host (`tests/run.sh`): the libghostty-vt binding, cell renderer,
 key encoding, DualSense report parsing, Lua policy, agent protocol and server,
 the plugin's activation state machine, its command / info bar / IPC registration and the config
 migration (`tests/test_hostsurface.nelua`, `tests/test_migrate.*`), the
-per-platform defaults and local fallbacks (`tests/test_platform.*`), `/term ask` (`tests/test_assistant.*`; untested in game), the `/ask` panel (`tests/test_ask.*`; untested in game), themes and tooltips (`tests/test_themes.*`; untested in game) and the
+per-platform defaults and local fallbacks (`tests/test_platform.*`), `/term ask` (`tests/test_assistant.*`; untested in game), the `/ask` panel (`tests/test_ask.*`; untested in game), themes (`tests/test_themes.*`; run in game) and tooltips (untested in game: they need a pointer resting on a control, which nothing here can drive) and the
 agent's shared pure logic (`tests/test_agent_logic.nelua`) and glyph coverage
 -- emoji, wide characters, the fallback font chain and the tofu box for a code
 point no font has ([`docs/GLYPHS.md`](docs/GLYPHS.md),
-`tests/test_glyphfb.nelua`; untested in game). Both C#
+`tests/test_glyphfb.nelua`). Checked in game and rendering: box drawing, block
+elements, braille, CJK, emoji, the powerline separators (U+E0B0..E0BF, drawn as
+shapes by `core/boxdraw.nelua`), Nerd Font icons in the BMP private-use area and
+Nerd Font icons above U+FFFF (U+F05A0, U+F0A0F), which can only come from
+`core/glyphfb.nelua` because Dalamud's ImGui stores 16-bit code points. An
+unassigned code point (U+10FFFD) drew the tofu box with its hex digits, which is
+what makes the rest of that list mean something. Both C#
 projects, the Windows DLLs and `ghostty-agent.exe` compile.
 
 **The standalone plugin, its info bar entry and the IPC-only Umbra widget have
@@ -914,6 +1041,32 @@ separately running agent. Neither path is certified by Linux host tests.
 For the optional Umbra widget, stage it with `tools/install-dev.sh --widget`,
 add `Umbra.Ghostty.dll` in Umbra's plugin settings, and add its toolbar widget.
 The standalone plugin is designed not to require Umbra.
+
+### Keeping the game up
+
+`tools/crash-restart.sh` answers the crash dialog, which covers a crash Dalamud
+catches. It cannot help with a crash that takes the process down without a
+dialog, a machine that has rebooted, or a game nobody has started yet.
+
+`tools/ffxiv-session.sh` covers those:
+
+```sh
+tools/ffxiv-session.sh status      # game, launcher, whether XivMcp answers
+tools/ffxiv-session.sh start       # launch it, and wait until XivMcp answers
+tools/ffxiv-session.sh install     # a systemd --user unit that keeps it up
+```
+
+`start` finishes when XivMcp answers on its port, not when the process exists,
+because the game is not usable for a while after that.
+
+Logging in stays XIVLauncher's own saved login: tick **Auto-login** in
+XIVLauncher once, by hand, and the credentials live in your keyring. The script
+never sees them, and `start` refuses with an explanation when auto-login is off
+rather than typing into a login box. A machine that must be logged into by hand
+cannot be brought back unattended, which is the point of the script.
+
+**Untested:** written against XIVLauncher.Core as a flatpak, but not yet run on
+a machine that has one.
 
 ## Configuration and transports
 
