@@ -82,6 +82,8 @@ echo "--- test_defaults (shipped per-platform policy)"
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_defaults.lua
 echo "--- test_world_spread (panels keeping off each other on screen)"
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_world_spread.lua
+echo "--- test_motion (springs, bob and squash, pets keeping off walls, panels and characters)"
+"$ROOT/vendor/nelua-lang/nelua-lua" tests/test_motion.lua
 echo "--- test_ask_rich (the /ask answer: markdown, links, layout, drawing)"
 GHOSTTY_TEST_SCRATCH="$ROOT/build/test-scratch/ask-rich" "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_ask_rich.lua "$ROOT"
 if [[ "${SKIP_SHIM:-0}" != 1 ]] && command -v dotnet >/dev/null; then

@@ -103,6 +103,8 @@ internal static unsafe class HostApi
         Api->NativeResize   = &NativeWindows.Resize;
         Api->NativeTitle    = &NativeWindows.Title;
         Api->PushMonoFontPx = &PushMonoFontPx;
+        Api->NearbyCharacters = &NearbyCharacters;
+        Api->RaycastMode    = &RaycastMode;
     }
 
     public static void Free()
@@ -914,6 +916,91 @@ internal static unsafe class HostApi
         try {
             var h = FFXIVClientStructs.FFXIV.Client.Game.HousingManager.Instance();
             return h != null && h->IndoorTerritory != null ? 1 : 0;
+        } catch { return 0; }
+    }
+
+    // Characters within NearbyReach yalms of yours, nearest first (players,
+    // battle and event NPCs, chocobos; not you): position and hitbox radius.
+    // The object table is walked at most every NearbyEvery seconds and the
+    // answer kept, so a pet asking every frame costs a copy. Called from the
+    // plugin's Draw, on the game's main thread, as GetObject is.
+    private const float NearbyReach = 15f;
+    private const double NearbyEvery = 0.1;
+    private const int NearbyMax = 32;
+    private static readonly GuCharacter[] NearbyCache = new GuCharacter[NearbyMax];
+    private static int nearbyCount;
+    private static long nearbyAt;
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int NearbyCharacters(GuCharacter* outp, int cap)
+    {
+        try {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (now - nearbyAt > (long)(NearbyEvery * System.Diagnostics.Stopwatch.Frequency)) {
+                nearbyAt = now;
+                nearbyCount = 0;
+                if (Plugin.Objects.LocalPlayer is { } me) {
+                    var at = me.Position;
+                    var found = new System.Collections.Generic.List<(float d, GuCharacter c)>(16);
+                    foreach (var o in Plugin.Objects) {
+                        if (o == null || o.Address == me.Address) continue;
+                        var k = o.ObjectKind;
+                        if (k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc
+                            && k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.BattleNpc
+                            && k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.EventNpc
+                            && k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Companion) continue;
+                        if (!o.IsTargetable && k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc) continue;
+                        float dx = o.Position.X - at.X, dz = o.Position.Z - at.Z;
+                        float d = MathF.Sqrt(dx * dx + dz * dz);
+                        if (d > NearbyReach) continue;
+                        found.Add((d, new GuCharacter {
+                            X = o.Position.X, Y = o.Position.Y, Z = o.Position.Z,
+                            Radius = MathF.Max(o.HitboxRadius, 0.3f), EntityId = o.GameObjectId,
+                            Height = ((FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)o.Address)->Height,
+                            Kind = k switch {
+                                Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Pc => 1,
+                                Dalamud.Game.ClientState.Objects.Enums.ObjectKind.BattleNpc => 2,
+                                Dalamud.Game.ClientState.Objects.Enums.ObjectKind.EventNpc => 3,
+                                _ => 4,
+                            },
+                        }));
+                    }
+                    found.Sort((a, b) => a.d.CompareTo(b.d));
+                    for (int i = 0; i < found.Count && i < NearbyMax; i++) NearbyCache[nearbyCount++] = found[i].c;
+                }
+            }
+            int n = Math.Min(nearbyCount, cap);
+            for (int i = 0; i < n; i++) outp[i] = NearbyCache[i];
+            return n;
+        } catch { return 0; }
+    }
+
+    // The same ray through the game's collision with a choice of filter, for
+    // pets (lua/world.lua): which colliders count is what decides whether a
+    // pet sees a lamp post. BGCollisionModule's own helper (mode 0, `Raycast`
+    // above) asks for layer 1 and materials with bit 0x4000 set, which is what
+    // ScreenToWorld wants (ground you can click) and misses props the player
+    // still bumps into. mode 1: every layer, any non-zero material. mode 2:
+    // every layer, the helper's material filter (to tell layer from material).
+    // 1 with the first hit within `max` yalms, else 0.
+    [UnmanagedCallersOnly(CallConvs = [typeof(System.Runtime.CompilerServices.CallConvCdecl)])]
+    private static int RaycastMode(float ox, float oy, float oz, float dx, float dy, float dz, float max, int mode,
+                                   float* hx, float* hy, float* hz)
+    {
+        try {
+            var fw = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance();
+            if (fw == null || fw->BGCollisionModule == null) return 0;
+            var o = new System.Numerics.Vector3(ox, oy, oz);
+            var d = new System.Numerics.Vector3(dx, dy, dz);
+            var hit = default(FFXIVClientStructs.FFXIV.Common.Component.BGCollision.RaycastHit);
+            int* flags = stackalloc int[4];
+            int layers;
+            if (mode == 1) { flags[0] = -1; flags[1] = -1; flags[2] = 0; flags[3] = 0; layers = -1; }        // mask all, value 0: any material
+            else if (mode == 2) { flags[0] = 0x4000; flags[1] = 0; flags[2] = 0x4000; flags[3] = 0; layers = -1; }
+            else { flags[0] = 0x4000; flags[1] = 0; flags[2] = 0x4000; flags[3] = 0; layers = 1; }
+            if (!fw->BGCollisionModule->RaycastMaterialFilter(&hit, &o, &d, max, layers, flags)) return 0;
+            *hx = hit.Point.X; *hy = hit.Point.Y; *hz = hit.Point.Z;
+            return 1;
         } catch { return 0; }
     }
 

@@ -770,6 +770,30 @@ global function policy_world_command(id: integer, args: string): string
   return err
 end
 
+-- CONFIG.world.trace(seconds, kind) -> what it will log (/term world rays,
+-- /term world anim; kind 'rays' or 'anim').
+global function policy_world_trace(seconds: float64, kind: string): string
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return string.copy('no policy loaded') end
+  if not push_world_fn(L, 'trace') then return string.copy('this lua/world.lua has no trace') end
+  lua_pushnumber(L, seconds)
+  lua_pushlstring(L, (@cstring)(kind.data), kind.size)
+  local out: string
+  if lua_pcall(L, 2, 1, 0) == LUA_OK and lua_type(L, -1) == LUA_TSTRING then
+    local len: usize = 0
+    local s = lua_tolstring(L, -1, &len)
+    out = string.copy(string{data=(@*[0]byte)(s), size=len})
+  elseif lua_type(L, -1) == LUA_TSTRING then
+    local len: usize = 0
+    local s = lua_tolstring(L, -1, &len)
+    out = string.format('error: %s', string{data=(@*[0]byte)(s), size=len})
+  else
+    out = string.copy('no answer')
+  end
+  lua_pop(L, 3)
+  return out
+end
+
 -- CONFIG.world.kind(terminal_id) -> its anchor's kind ('pet', 'world', 'follow',
 -- 'orbit', 'hud'); '' without an anchor or an older lua/world.lua.
 global function policy_world_kind(id: integer): string
@@ -787,8 +811,9 @@ global function policy_world_kind(id: integer): string
   return kind
 end
 
--- CONFIG.world.place(terminal_id, time, focused) -> placement table or nil (hidden).
-global function policy_world_place(id: integer, t: float64, focused: boolean): (boolean, WorldPlacement)
+-- CONFIG.world.place(terminal_id, time, focused, held) -> placement table or
+-- nil (hidden). `held`: the pointer is on it (it holds still to be read).
+global function policy_world_place_held(id: integer, t: float64, focused: boolean, held: boolean): (boolean, WorldPlacement)
   local pl: WorldPlacement
   local L = policy.L
   if L == nilptr or not policy.loaded then return false, pl end
@@ -796,8 +821,9 @@ global function policy_world_place(id: integer, t: float64, focused: boolean): (
   lua_pushinteger(L, id)
   lua_pushnumber(L, t)
   lua_pushboolean(L, focused and 1 or 0)
+  lua_pushboolean(L, held and 1 or 0)
   local ok = false
-  if lua_pcall(L, 3, 1, 0) ~= LUA_OK then
+  if lua_pcall(L, 4, 1, 0) ~= LUA_OK then
     log_hook_error(L, POLICY_HOOK_PLACE, 'world.place')
   elseif lua_type(L, -1) == LUA_TTABLE then
     local r: cint = lua_gettop(L)
@@ -807,6 +833,8 @@ global function policy_world_place(id: integer, t: float64, focused: boolean): (
     pl.yaw = (@float32)(lua_field_number(L, r, 'yaw', 0))
     pl.pitch = (@float32)(lua_field_number(L, r, 'pitch', 0))
     pl.roll = (@float32)(lua_field_number(L, r, 'roll', 0))
+    pl.squash = (@float32)(lua_field_number(L, r, 'squash', 0))
+    pl.tuck = (@float32)(lua_field_number(L, r, 'tuck', 0))
     pl.width = (@float32)(lua_field_number(L, r, 'width', 900))
     pl.height = (@float32)(lua_field_number(L, r, 'height', 520))
     pl.ppm = (@float32)(lua_field_number(L, r, 'pixels_per_yalm', 300))
@@ -831,6 +859,11 @@ global function policy_world_place(id: integer, t: float64, focused: boolean): (
   end
   lua_pop(L, 3)
   return ok, pl
+end
+
+-- CONFIG.world.place(terminal_id, time, focused) -> placement table or nil (hidden).
+global function policy_world_place(id: integer, t: float64, focused: boolean): (boolean, WorldPlacement)
+  return policy_world_place_held(id, t, focused, false)
 end
 
 -- CONFIG.world.lighting() -> r, g, b, backlight: the world's light on a panel,

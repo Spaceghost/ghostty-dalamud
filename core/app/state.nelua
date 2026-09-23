@@ -149,6 +149,17 @@ global GuHostApi = @record{
   -- the terminal font built at `px` pixels pushed (pop with pop_font); 0 = not
   -- built yet, nothing pushed (it is being built for next time)
   push_mono_font_px: function(px: float32): cint,
+  -- characters near yours (players, NPCs, chocobos; not you), nearest first,
+  -- at most `cap`: how many were written. nilptr in older shims: pets make
+  -- room for your target only (lua/world.lua)
+  nearby_characters: function(out: *[0]GuCharacter, cap: cint): cint,
+  -- the game's collision as `raycast`, with a choice of filter: 0 the one
+  -- `raycast` uses (layer 1, material bit 0x4000: ground you can click), 1
+  -- every layer and any material (all the player bumps into, lamp posts too),
+  -- 2 every layer with the first's material filter. nilptr in older shims:
+  -- ghostty.raycast falls back to `raycast`
+  raycast_mode: function(ox: float32, oy: float32, oz: float32, dx: float32, dy: float32, dz: float32,
+                         max: float32, mode: cint, hx: *float32, hy: *float32, hz: *float32): cint,
 }
 
 global LOG_INFO: cint <comptime> = 1
@@ -205,6 +216,8 @@ global Host = @record{
   -- terminals pinned into the game world (placement from lua/world.lua)
   world: vector(*Session),
   world_focus: integer,             -- session id with keyboard focus, 0 = none
+  world_hover: integer,             -- world panel under the pointer last frame (held still to be read), 0 = none
+  world_hover_now: integer,         -- the same, being found this frame
   world_visible: boolean,           -- world/pet terminals shown (own toggle)
   -- mouse resize of a world panel (core/app/resize.nelua): its id, 0 none; the mode is WORLD_GRIP_* bits
   world_drag_id: integer,

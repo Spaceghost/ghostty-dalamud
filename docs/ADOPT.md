@@ -39,6 +39,43 @@ leaves it flat until its window has closed and opened again. Settings →
 open" turns it off; the grip and `/window adopt mappy` still work.
 Automatic windows are not in the saved list (they come back by themselves).
 
+**Straight into the world** (host tests only, `tests/test_adopt_app.nelua`
+"mappy"; not yet observed in game). An automatic window goes into the world
+the frame it appears and is never drawn on the flat UI:
+
+* While a character is in the world and a listed window's plugin is loaded,
+  the window is *watched* (`adopt_watch_*` in `core/app/adopt.nelua`; the
+  list is refreshed twice a second by `core/app/panels.nelua`) and the
+  RenderPre hook stays on, even with nothing adopted yet.
+* RenderPre, which runs after every plugin's Draw, looks each watched window
+  up every frame. The first frame it is drawn it is *claimed*: captured
+  exactly like an adopted window (snapshot, geometry, its own place and
+  flags) and its lists emptied, so that frame never reaches the screen and
+  clicks pass through it.
+* ghostty's next frame turns the claim into a pet (`adopt_window` takes the
+  capture over): the pet starts at the window's size with its picture on it,
+  and glitches in where pets appear. There is no fly-out from the flat
+  window's place for an automatic window, since that would show it flat
+  first; pulling by hand (grip, `/window adopt`) still flies out.
+* A claim that cannot become a pet (its plugin went away, no character) is
+  let go and the name declined until the window closes, so a refused window
+  is flat after one hidden frame rather than hidden for good.
+
+**Why Mappy was never pulled in (finding, 2026-09-22).** The game's
+`dalamud.log` for that day has no `adopt:` line at all: `adopt_window` was
+never called, so neither the id nor a refusal was the problem. The id
+matches: Mappy 3.2.0.0 (`~/.xlcore/installedPlugins/Mappy/3.2.0.0`) still
+opens `###MappyMapWindow`, and KamiLib adds nothing to the name. The old
+automatic check ran in ghostty's own Draw and asked for `window.Active`, but
+`ImGui::NewFrame` clears `Active` on every window and only the window's own
+`Begin` sets it again, so from ghostty's Draw a window whose plugin draws
+*later* in the frame is never Active. Dalamud runs plugin draws in the order
+their UiBuilders subscribed; ghostty's plugin instance was created before
+Mappy's in that session (03:33:01 against 03:33:04), so Mappy most likely
+drew after ghostty on every frame. That ordering is inferred from the log, not
+observed. The host test's fake now resets `Active` at each NewFrame and runs
+the frame in both orders.
+
 Mappy's id was checked against the installed Mappy 3.2.0.0 (the string
 `###MappyMapWindow` in Mappy.dll); ChatTwo's against ChatTwo 1.40.6.0
 (`Chat 2###chat2`). ImGui hashes only what follows `###`, so the id matches
@@ -68,6 +105,8 @@ the work out of that order:
   `ImGuiWindowFlags_NoMouseInputs` for the next frame's hover test, so clicks
   pass through the invisible window to the game; its next `Begin` resets its
   flags anyway, so the bit only lives from Render to the next Begin.
+* The same pass claims automatic windows the frame they appear (see "Mappy
+  is automatic"), so they never reach the flat UI either.
 * The snapshot is drawn **on the next frame**, inside the panel's content
   area (worldview calls `panel_content` where a terminal would be drawn), so
   it is bent with the rest of the panel by `world_transform_vertices`, sits
@@ -95,8 +134,9 @@ hook between `Render()` and Dalamud's `RenderDrawData`), and hiding the
 window with `HiddenFramesForRenderOnly` (a hidden window is never hovered, so
 the pointer could not reach it).
 
-The hooks go on with the first adopted window and off with the last, and in
-`gu_shutdown`, `/term reload` and the kill switch. `igRemoveContextHook` only
+The hooks go on with the first adopted window, or as soon as an automatic
+window is watched, and off when neither is left, and in `gu_shutdown`,
+`/term reload` and the kill switch. `igRemoveContextHook` only
 marks a hook; ImGui never calls a marked one, so a core swapped by the loader
 leaves nothing callable behind.
 
@@ -214,8 +254,9 @@ colours, and says so once in the log.
 `/window adopt` and the grip record what is pulled in `adopted.lua` in the
 config directory (not automatic ones). After `/term reload` or a restart,
 once a character is loaded, each saved name is pulled again as soon as its
-window is open (looked for for 30 seconds). `CONFIG.adopt.restore = false`
-turns this off.
+window is open (looked for for 30 seconds; open means drawn this frame or
+the last, since from ghostty's Draw a window whose plugin draws later is only
+`WasActive`). `CONFIG.adopt.restore = false` turns this off.
 
 ## Known risks (what to watch in game)
 
