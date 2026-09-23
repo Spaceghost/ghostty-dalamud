@@ -66,6 +66,7 @@ global WorldPlacement = @record{
   yaw: float32,           -- direction the readable side faces
   pitch: float32,         -- tilt back, radians
   roll: float32,          -- turn about the front normal, radians (counterclockwise as seen from the front)
+  squash: float32,        -- squash and stretch (lua/motion.lua): > 0 wider and shorter, < 0 narrower and taller; 0 none
   width: float32,         -- panel size in terminal pixels
   height: float32,
   ppm: float32,           -- terminal pixels per world unit (yalm)
@@ -103,6 +104,13 @@ global function world_basis(p: WorldPlacement): WorldBasis
   local sp, cp = math.sin(p.pitch), math.cos(p.pitch)
   local sr, cr = math.sin(p.roll), math.cos(p.roll)
   local inv = 1.0 / (p.ppm > 0 and p.ppm or 300.0)
+  -- squash: wider by 1 + sq and shorter by as much, so the area stays. Across
+  -- goes through ypp and up through u, and everything that works from the
+  -- basis (projection, hit tests, the depth test) follows both.
+  local sq = p.squash
+  if not (sq == sq) then sq = 0 end -- NaN from a policy mistake: none
+  sq = math.clamp(sq, -0.3, 0.3)
+  local sx: float64, sv: float64 = 1 + sq, 1 / (1 + sq)
   -- front normal f = (sy, 0, cy); a viewer in front looks along -f and sees
   -- right = up x f = (cy, 0, -sy); tilt: up leans back away from the viewer,
   -- (-sy sp, cp, -cy sp); roll turns both about the panel's normal
@@ -112,8 +120,8 @@ global function world_basis(p: WorldPlacement): WorldBasis
     cx = p.x, cy = p.y, cz = p.z,
     rx = (@float32)(cr * r0x + sr * u0x), ry = (@float32)(sr * u0y), rz = (@float32)(cr * r0z + sr * u0z),
     fx = (@float32)(sy), fz = (@float32)(cy),
-    ux = (@float32)((cr * u0x - sr * r0x) * inv), uy = (@float32)(cr * u0y * inv), uz = (@float32)((cr * u0z - sr * r0z) * inv),
-    ypp = (@float32)(inv),
+    ux = (@float32)((cr * u0x - sr * r0x) * inv * sv), uy = (@float32)(cr * u0y * inv * sv), uz = (@float32)((cr * u0z - sr * r0z) * inv * sv),
+    ypp = (@float32)(inv * sx),
     curve = p.curve,
     hw = p.width * 0.5, hh = p.height * 0.5,
     tint_r = p.tint_r > 0 and p.tint_r or 1, tint_g = p.tint_g > 0 and p.tint_g or 1, tint_b = p.tint_b > 0 and p.tint_b or 1,
@@ -1202,7 +1210,7 @@ global function world_drag_pose(pl: WorldPlacement, ox: float32, oy: float32, oz
   local a = world_axes(out.yaw, 0)
   local du, dv = (u - pl.width * 0.5) * ypp, (pl.height * 0.5 - v) * ypp
   out.x, out.y, out.z = gx - a.rx * du, gy - dv, gz - a.rz * du
-  out.pitch, out.roll, out.curve = 0, 0, 0
+  out.pitch, out.roll, out.curve, out.squash = 0, 0, 0, 0
   out.hud = false
   return out
 end
