@@ -2,7 +2,7 @@
   "Author": "Johnneylee Jack Rollins",
   "Name": "Ghostty",
   "InternalName": "GhosttyDalamud",
-  "AssemblyVersion": "0.3.1.4",
+  "AssemblyVersion": "0.3.1.6",
   "Punchline": "Eorzea is a terminal multiplexer.",
   "Description": "Developer preview. A Quake-style dropdown, floating windows and terminals pinned in the world, connected to shells on your own machine through ghostty-agent, or to local ConPTY on Windows. /term to toggle. Works with or without Umbra; with Umbra, the Ghostty toolbar widget shows its status and a popup terminal. Target-platform and in-game verification are still in progress.",
   "RepoUrl": "https://github.com/Spaceghost/ghostty-dalamud",
