@@ -12,12 +12,24 @@ Run it through tools/release.sh; the release workflow calls the rest:
   notes TAG --assets DIR    (workflow) the release notes, from the changelog
   installer-notes TAG       (workflow) the few lines Dalamud's installer shows
   verify TAG                the release, its files, the listing and every download
+  changes TAG               what was merged into master for this build, per channel:
+                            since the previous test build and since the last stable
+                            release (testing), or since the last stable (stable)
+  auto-test --sha SHA       (workflow) the testing channel on its own: after CI is green
+                            on a master commit, cut the next test build of it. The
+                            version commit is made on top of SHA and only the tag is
+                            pushed, so master is never written to
 
 Versions. A tag is vX.Y.Z (stable) or vX.Y.Z-test.N (testing). Dalamud compares the
 four-part AssemblyVersion, so the fourth number counts builds of X.Y.Z: test N is
 X.Y.Z.N, and the stable release is one more than the last test (X.Y.Z.0 when there was
 none). Every build is therefore newer than the one before it, and a tester on
 X.Y.Z-test.N is offered the stable X.Y.Z.
+
+A test tag made by auto-test points at a `Release <tag>` commit whose parent is the master
+commit it builds and which changes nothing but the version files. That is how a build is
+cut without writing to master: the tag carries the version, master keeps the one it had,
+and the next build counts on from the tags, not from the manifest.
 
 Everything a repository has to say about itself is in tools/release.conf. Python 3.9+
 and the standard library only; `release` and `verify` also need git and an
@@ -29,6 +41,7 @@ import argparse
 import datetime
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -158,6 +171,36 @@ def bump(c: dict[str, str], old4: str, new4: str, write: bool) -> list[str]:
     return changed
 
 
+def plan(c: dict[str, str], kind: str, base: str | None) -> tuple[Version, str]:
+    """The tag and the four-part version of the next build of this kind."""
+    old4 = manifest_version(c)
+    old3 = old4.rsplit(".", 1)[0]
+    stables = stable_bases()
+    if kind == "test":
+        if not base:
+            # the newest base a test tag has reached: auto-test builds move past the manifest
+            base = max([old3] + [Version(t).base for t in tags() if Version(t).testing], key=key)
+            if base in stables:
+                x, y, z = key(base)
+                base = f"{x}.{y}.{z + 1}"
+        build = last_test(base) + 1
+        tag = f"v{base}-test.{build}"
+    else:
+        build = last_test(base) + 1 if last_test(base) else 0
+        tag = f"v{base}"
+    v = Version(tag)
+    if v.base in stables:
+        raise Fail(f"{v.base} is already released")
+    if stables and key(v.base) <= key(stables[-1]):
+        raise Fail(f"{v.base} is not newer than the last stable release, {stables[-1]}")
+    if key(v.base) < key(old3):
+        raise Fail(f"{v.base} is older than the version in the tree, {old3}")
+    new4 = f"{v.base}.{build}"
+    if key(new4) <= key(old4) and new4 != old4:
+        raise Fail(f"{new4} is not newer than {old4}")
+    return v, new4
+
+
 # ---------------------------------------------------------------- changelog
 
 def changelog(c: dict[str, str]) -> list[dict]:
@@ -178,6 +221,77 @@ def section(c: dict[str, str], v: Version) -> dict:
 
 def shipped(rel: dict) -> list[dict]:
     return [i for i in rel["items"] if i["status"] != "next"]
+
+
+# ---------------------------------------------------------------- what was merged
+
+RELEASE_SUBJECT = re.compile(r"^Release v\d+\.\d+\.\d+(?:-test\.\d+)?$")
+PR_REF = re.compile(r"\(#(\d+)\)$|^Merge pull request #(\d+)")
+
+
+def plain(subject: str) -> str:
+    """A commit subject without the (#N) GitHub appends to a squash."""
+    return re.sub(r"\s*\(#\d+\)$", "", subject)
+
+
+def tag_order(t: str) -> tuple:
+    """Release order: every test build of X.Y.Z comes before the stable X.Y.Z."""
+    v = Version(t)
+    return key(v.base) + ((0, v.test) if v.testing else (1, 0))
+
+
+def previous(v: Version, testing: bool | None) -> str | None:
+    """The newest tag released before v: of the given channel, or of either when None."""
+    older = [t for t in tags() if tag_order(t) < tag_order(v.tag)
+             and (testing is None or Version(t).testing == testing)]
+    return max(older, key=tag_order, default=None)
+
+
+def merged(since: str | None, head: str = "HEAD") -> list[dict]:
+    """What landed on master after `since` and up to `head`, oldest first.
+
+    First parent only, so a merged pull request counts once, under its merge or squash
+    commit. `Release <tag>` commits are the release machinery, not features, and a tag
+    that auto-test put on top of master is reached through its parent all the same."""
+    span = f"{since}..{head}" if since else head
+    out = []
+    for line in run("git", "log", "--first-parent", "--reverse", "--format=%H%x1f%s", span).splitlines():
+        sha, _, subject = line.partition("\x1f")
+        if not sha or RELEASE_SUBJECT.match(subject):
+            continue
+        m = PR_REF.search(subject)
+        out.append({"sha": sha, "subject": subject, "pr": int(m.group(1) or m.group(2)) if m else None})
+    return out
+
+
+def head_of(v: Version) -> str:
+    """Where a build's history ends: its tag once it exists, HEAD while it is being cut."""
+    return v.tag if run("git", "rev-parse", "--verify", "--quiet", f"refs/tags/{v.tag}", check=False) else "HEAD"
+
+
+def changes(c: dict[str, str], v: Version, head: str | None = None) -> str:
+    """The merged history of this build, per channel, as Markdown."""
+    head = head or head_of(v)
+    repo = c["REPO"]
+
+    def listed(items: list[dict]) -> list[str]:
+        lines = []
+        for i in items:
+            ref = f"#{i['pr']}" if i["pr"] else f"[`{i['sha'][:7]}`](https://github.com/{repo}/commit/{i['sha']})"
+            lines.append(f"* {md(plain(i['subject']))} ({ref})")
+        return lines or ["* Nothing merged."]
+
+    out = []
+    stable = previous(v, testing=False)
+    if v.testing:
+        last = previous(v, testing=None)
+        if last and last != stable:
+            out.append(f"### Since the previous test build, {last}\n")
+            out.extend(listed(merged(last, head)))
+            out.append("")
+    out.append(f"### Since the last stable release, {stable}\n" if stable else "### Everything so far\n")
+    out.extend(listed(merged(stable, head)))
+    return "\n".join(out) + "\n"
 
 
 # ---------------------------------------------------------------- notes
@@ -213,6 +327,10 @@ def notes(c: dict[str, str], v: Version, assets: Path | None, rel: dict | None =
             out.append(f"## {heading}\n")
             out.extend(f"* {md(t)}" for t in texts)
             out.append("")
+    if not items:
+        out.append("The changelog has no entries for this build yet; what was merged is below.\n")
+    out.append("## Merged\n")
+    out.append(changes(c, v))
     out.append("## Install\n")
     out.append(f"1. In game, open `/xlsettings` → **Experimental** → **Custom Plugin Repositories**, add "
                f"`{LISTING}`, press **+**, then **Save and close**.")
@@ -270,6 +388,12 @@ def installer_notes(c: dict[str, str], v: Version, limit: int = 2000) -> str:
     for item in shipped(section(c, v)):
         lead = re.split(r"(?<=[.:;!?])\s", item["text"], maxsplit=1)[0].rstrip(".:;")
         lines.append(f"- {labels[item['status']]}: {lead}")
+    if v.testing:
+        last = previous(v, testing=None)
+        since = merged(last, head_of(v))
+        if since:
+            lines.append(f"Merged since {last}:" if last else "Merged:")
+            lines.extend("- " + plain(i["subject"]) for i in since)
     text = ""
     for n, line in enumerate(lines):
         if len(text) + len(line) > limit:
@@ -295,12 +419,98 @@ def check_tag(c: dict[str, str], v: Version) -> None:
     master = run("git", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/master", check=False)
     if not master:
         raise Fail("origin/master is not here: fetch the full history (fetch-depth: 0)")
-    if subprocess.run(["git", "merge-base", "--is-ancestor", "HEAD", master], cwd=ROOT).returncode != 0:
-        raise Fail(f"{v.tag} is not on master: releases are cut from master only")
+    where = "on master"
+    if not ancestor("HEAD", master):
+        if not (v.testing and version_commit_on(c, v, master)):
+            raise Fail(f"{v.tag} is not on master: releases are cut from master only")
+        where = "a version commit on master"
     rel = section(c, v)
-    if not shipped(rel):
-        raise Fail("the changelog section for this build is empty")
-    say(f"{v.tag}: {c['INTERNAL_NAME']} {have}, {v.channel}, on master, {len(shipped(rel))} changelog entries")
+    since = merged(previous(v, testing=None), "HEAD")
+    if not shipped(rel) and not (v.testing and since):
+        raise Fail("the changelog section for this build is empty" + (" and nothing was merged" if v.testing else ""))
+    say(f"{v.tag}: {c['INTERNAL_NAME']} {have}, {v.channel}, {where}, {len(shipped(rel))} changelog entries, "
+        f"{len(since)} merged since the last build")
+
+
+def ancestor(a: str, b: str) -> bool:
+    return subprocess.run(["git", "merge-base", "--is-ancestor", a, b], cwd=ROOT,
+                          stderr=subprocess.DEVNULL).returncode == 0
+
+
+def version_files(c: dict[str, str]) -> set[str]:
+    return set(c["VERSION_FILES"].split() + c.get("BASE_VERSION_FILES", "").split())
+
+
+def version_commit_on(c: dict[str, str], v: Version, master: str) -> bool:
+    """HEAD is what auto-test makes: `Release <tag>` on top of a master commit, touching
+    nothing but the files that carry the version."""
+    parents = run("git", "rev-list", "--parents", "-n", "1", "HEAD").split()[1:]
+    if len(parents) != 1 or not ancestor(parents[0], master):
+        return False
+    if run("git", "log", "-1", "--format=%s", "HEAD") != f"Release {v.tag}":
+        return False
+    touched = set(run("git", "diff", "--name-only", parents[0], "HEAD").splitlines())
+    return bool(touched) and touched <= version_files(c)
+
+
+# ---------------------------------------------------------------- auto-test (workflow)
+
+BOT = ("github-actions[bot]", "41898282+github-actions[bot]@users.noreply.github.com")
+
+
+def output(**values: str) -> None:
+    """Step outputs for GitHub Actions, and the same lines on stdout."""
+    lines = "".join(f"{k}={v}\n" for k, v in values.items())
+    print(lines, end="")
+    target = os.environ.get("GITHUB_OUTPUT")
+    if target:
+        with open(target, "a", encoding="utf-8") as fh:
+            fh.write(lines)
+
+
+def auto_test(c: dict[str, str], sha: str, push: bool) -> None:
+    """Cut the next test build of a master commit whose CI is green, without writing to
+    master: the version commit sits on top of it, and only its tag is pushed.
+
+    Nothing is cut when that commit is already in the newest build (a release commit's
+    own CI run, or a run that finished after a newer one), or when nothing but release
+    commits landed since. Prints tag=<tag> (empty when skipped) and why."""
+    if push:
+        run("git", "fetch", "--quiet", "--no-tags", "origin", "master", "refs/tags/v*:refs/tags/v*")
+    sha = run("git", "rev-parse", "--verify", f"{sha}^{{commit}}")
+    master = run("git", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/master", check=False)
+    if not master or not ancestor(sha, master):
+        raise Fail(f"{sha[:7]} is not on origin/master")
+    if run("git", "rev-parse", "HEAD") != sha:
+        raise Fail(f"check out {sha[:7]} first (detached is fine)")
+    if run("git", "status", "--porcelain", "--untracked-files=no"):
+        raise Fail("the working tree is not clean")
+    newest = max(tags(), key=tag_order, default=None)
+    if newest and ancestor(sha, newest):
+        say(f"{sha[:7]} is already in {newest}: nothing to cut")
+        output(tag="", reason=f"already in {newest}")
+        return
+    since = merged(newest, sha)
+    if not since:
+        say(f"nothing but release commits since {newest}: nothing to cut")
+        output(tag="", reason=f"nothing merged since {newest}")
+        return
+    old4 = manifest_version(c)
+    v, new4 = plan(c, "test", None)
+    say(f"{c['NAME']}: {v.tag} ({new4}) from {sha[:7]}, {len(since)} merged since {newest or 'the start'}")
+    bump(c, old4, new4, write=True)
+    ident = ["-c", f"user.name={BOT[0]}", "-c", f"user.email={BOT[1]}"]
+    files = sorted(version_files(c))
+    run("git", "add", "--", *files)
+    run("git", *ident, "commit", "--quiet", "-m", f"Release {v.tag}", "-m",
+        f"The testing channel's build of {sha}, cut by `tools/releasekit.py auto-test` after CI "
+        f"passed on it. Only the version changes; master is not written to.")
+    run("git", *ident, "tag", "-a", v.tag, "-m", title(c, v))
+    check_tag(c, v)
+    if push:
+        run("git", "push", "origin", f"refs/tags/{v.tag}")
+        say(f"pushed {v.tag}")
+    output(tag=v.tag, reason=f"{len(since)} merged since {newest or 'the start'}")
 
 
 # ---------------------------------------------------------------- verify
@@ -435,29 +645,8 @@ def release(c: dict[str, str], kind: str, base: str | None, headline: str | None
         raise Fail("master and origin/master differ: pull or push first")
 
     old4 = manifest_version(c)
-    old3 = old4.rsplit(".", 1)[0]
-    stables = stable_bases()
-    if kind == "test":
-        if not base:
-            base = old3
-            if base in stables:
-                x, y, z = key(base)
-                base = f"{x}.{y}.{z + 1}"
-        build = last_test(base) + 1
-        tag = f"v{base}-test.{build}"
-    else:
-        build = last_test(base) + 1 if last_test(base) else 0
-        tag = f"v{base}"
-    v = Version(tag)
-    if v.base in stables:
-        raise Fail(f"{v.base} is already released")
-    if stables and key(v.base) <= key(stables[-1]):
-        raise Fail(f"{v.base} is not newer than the last stable release, {stables[-1]}")
-    if key(v.base) < key(old3):
-        raise Fail(f"{v.base} is older than the version in the tree, {old3}")
-    new4 = f"{v.base}.{build}"
-    if key(new4) <= key(old4) and new4 != old4:
-        raise Fail(f"{new4} is not newer than {old4}")
+    v, new4 = plan(c, kind, base)
+    tag = v.tag
     say(f"{c['NAME']}: {old4} -> {new4}, tag {tag} ({v.channel})" + ("  [dry run]" if dry else ""))
 
     ci_green(c, head)
@@ -534,11 +723,18 @@ def main(argv: list[str]) -> int:
     p = sub.add_parser("notes")
     p.add_argument("tag")
     p.add_argument("--assets", type=Path, help="the folder holding SHA256SUMS")
+    sub.add_parser("changes", help="what was merged for a build, per channel").add_argument("tag")
+    p = sub.add_parser("auto-test", help="(workflow) cut the next test build of a green master commit")
+    p.add_argument("--sha", required=True, help="the master commit CI passed on")
+    p.add_argument("--push", action="store_true", help="push the tag (otherwise it stays local)")
     p = sub.add_parser("verify", help="check a published release end to end")
     p.add_argument("tag")
     p.add_argument("--no-wait", action="store_true", help="do not wait for the listing's cache")
     args = ap.parse_args(argv)
     c = conf()
+    if args.cmd == "auto-test":
+        auto_test(c, args.sha, args.push)
+        return 0
     if args.cmd in ("test", "stable"):
         if args.version and not re.fullmatch(r"\d+\.\d+\.\d+", args.version):
             raise Fail(f"{args.version} is not X.Y.Z")
@@ -551,6 +747,8 @@ def main(argv: list[str]) -> int:
         print(title(c, v))
     elif args.cmd == "notes":
         sys.stdout.write(notes(c, v, args.assets))
+    elif args.cmd == "changes":
+        sys.stdout.write(changes(c, v))
     elif args.cmd == "installer-notes":
         print(installer_notes(c, v))
     elif args.cmd == "verify":
