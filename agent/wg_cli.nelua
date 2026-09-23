@@ -38,8 +38,10 @@ global function wg_status_path(config_path: string): string
   return p
 end
 
-local function err(msg: string): integer
-  io.stderr:write('ghostty-agent wg: ', msg, '\n')
+-- the message in pieces: `err('a ' .. b)` would leave a string nothing frees
+local function err(...: varargs): integer
+  io.stderr:write('ghostty-agent wg: ', ...)
+  io.stderr:write('\n')
   return 1
 end
 
@@ -168,10 +170,10 @@ end
 
 local function cmd_init(path: string, port: uint16): integer
   local existing = io.open(path, 'rb')
-  if existing:isopen() then existing:destroy() return err(path .. ' exists already; `wg show` says what is in it') end
+  if existing:isopen() then existing:destroy() return err(path, ' exists already; `wg show` says what is in it') end
   local cfg: WgConfig
   if not wg_init_config(&cfg, port) then return err('no random source for a key') end
-  if not cfg:save(path) then cfg:destroy() return err('cannot write ' .. path) end
+  if not cfg:save(path) then cfg:destroy() return err('cannot write ', path) end
   cfg:destroy()
   io.write('wrote ', path, '\n')
   return 0
@@ -200,7 +202,7 @@ local function cmd_add(path: string, name: string, endpoint: string, qr: boolean
   elseif not wg_init_config(&cfg, WG_DEFAULT_PORT) then
     return err('no random source for a key')
   end
-  if find_peer(&cfg, name) >= 0 then cfg:destroy() return err('there is a peer called ' .. name .. ' already') end
+  if find_peer(&cfg, name) >= 0 then cfg:destroy() return err('there is a peer called ', name, ' already') end
   local host = wg_free_host(&cfg)
   if host == 0 then cfg:destroy() return err('the tunnel\'s /24 is full') end
   local client_key: [32]uint8
@@ -236,7 +238,7 @@ local function cmd_add(path: string, name: string, endpoint: string, qr: boolean
     h:destroy()
     ep = sb:promote()
   end
-  if not cfg:save(path) then cfg:destroy() ep:destroy() return err('cannot write ' .. path) end
+  if not cfg:save(path) then cfg:destroy() ep:destroy() return err('cannot write ', path) end
   local text = wg_client_config(&cfg, &client_key, &psk, host, ep)
   crypto.wipe(&client_key, 32)
   crypto.wipe(&psk, 32)
@@ -275,13 +277,13 @@ local function cmd_remove(path: string, name: string): integer
   local r = load_or_fail(path, &cfg)
   if r ~= 0 then return r end
   local i = find_peer(&cfg, name)
-  if i < 0 then cfg:destroy() return err('no peer called ' .. name) end
+  if i < 0 then cfg:destroy() return err('no peer called ', name) end
   cfg.peers[i].name:destroy()
   cfg.peers[i].allowed:destroy()
   cfg.peers:remove(i)
   local ok = cfg:save(path)
   cfg:destroy()
-  if not ok then return err('cannot write ' .. path) end
+  if not ok then return err('cannot write ', path) end
   io.write('Removed ', name, '. A running agent drops it, and wipes its keys, within a few seconds.\n')
   return 0
 end
@@ -376,10 +378,11 @@ local function parse_forwards(proto: string, ports: string, out: *vector(WgForwa
     return true
   end
   local cfg: WgConfig
-  local text = proto .. ' ' .. ports
-  local line = '[Interface]\nForward = ' .. text .. '\n'
+  local sb: stringbuilder
+  sb:write('[Interface]\nForward = ', proto, ' ', ports, '\n')
+  local line = sb:promote()
   local ok = cfg:parse(line)
-  text:destroy() line:destroy()
+  line:destroy()
   if ok then for i = 0, < #cfg.forwards do out:push(cfg.forwards[i]) end end
   cfg:destroy()
   return ok
@@ -403,7 +406,7 @@ local function cmd_forward(path: string, add: boolean, proto: string, ports: str
   local ok = cfg:save(path)
   cfg:destroy()
   want:destroy()
-  if not ok then return err('cannot write ' .. path) end
+  if not ok then return err('cannot write ', path) end
   io.write(add and 'Forwarded' or 'No longer forwarded', ': ', proto, ' ', ports, '. Tunnel peers reach it on this machine\'s loopback.\n')
   return 0
 end
