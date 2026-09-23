@@ -466,9 +466,10 @@ do
   assert(remotewin_command('close') == 0)
   for _ = 1, 90 do world_frame(false) end
   assert(#host.world == 1 and find_session(s2_id) == nilptr, 'closed')
+  local wreq = proto.get_u32(p) -- p points into the frames forget() frees
   forget()
   local b: [12]uint8
-  proto.put_u32(&b, proto.get_u32(p))
+  proto.put_u32(&b, wreq)
   proto.put_u32((@*[0]uint8)(&b[4]), 55)
   local q: ByteQueue
   proto.write_frame(&q, PROTO_WOPENED, &b, 12)
