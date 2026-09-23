@@ -56,6 +56,8 @@ M['ask.game_actions'] = 'Let the assistant use game actions and chat (XivMcp sti
 M['ask.close'] = 'Hide the panel (/ask brings it back); the conversation stays'
 M['ask.send'] = 'Send (Enter); Shift+Enter starts a new line'
 M['ask.stop'] = 'Stop this answer'
+M['ask.copy'] = 'Copy the last answer, as written, to the clipboard'
+M['ask.run'] = 'Run this command now, as if you typed it in chat and pressed Enter'
 M['command./agent'] = 'ghostty-agent: /agent ask [question] asks the local AI assistant'
 
 -- The toolbar popup's taskbar chips.
