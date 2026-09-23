@@ -710,8 +710,9 @@ the terminal.
 
 ## Ask panel (`/ask`)
 
-**Still untested in game**: only the host tests (`tests/test_ask.*`, with a
-scripted ImGui) have run it. It needs an almanac with threads
+**Still untested in game**: only the host tests (`tests/test_ask.*`,
+`tests/test_ask_rich.lua` and `tests/test_ask_draw.nelua`, with a scripted or
+fake ImGui) have run it. It needs an almanac with threads
 (`almanac ask --stream-json`, `almanac threads`).
 
 The first in-game `/ask` ended the game process: the panel popped one more style
@@ -742,10 +743,43 @@ the answer streaming in as it is written, with an input box for follow-ups.
   one to continue it), **Stop** ends an answer, **Pin** floats the panel beside
   your character as a pet (the same as `/window adopt ask`; "back to UI"
   returns it). `/ask` alone shows or hides the panel.
-* **Markdown, lightly:** fenced code blocks in the monospace font, headings,
-  bullets, bold and `code` marks dropped, and `https://` links (bare or
-  `[label](url)`) as clickable links under their paragraph that open in your
-  browser (`ghostty.open_url`: https only).
+* **Rich answers** (`lua/askmd.lua`, `lua/askview.lua`): headings, bold,
+  italic and struck-through text, bullet, numbered and task lists, tables,
+  block quotes, horizontal rules, inline `code` and fenced code blocks in the
+  monospace font with a **copy** button, word-wrapped at the panel's width in
+  the theme's colours. Text fades in as it streams. An answer is parsed once
+  per change of its text and laid out once per width, and drawn with
+  draw-list primitives only (`core/ui.nelua`: `text_at`, `rect_at`, ...), so
+  a Lua error part way through cannot leave ImGui unbalanced; that answer is
+  shown as plain bubbles instead, and the status line says why.
+* **Links** (`lua/asklinks.lua`), each on click only, with a tooltip saying
+  what the click does:
+  * `https://` pages (bare, `<...>` or `[label](url)`) open in your browser
+    through the agent's open-url path; other schemes are shown, never opened.
+    Each answer ends with its sources.
+  * Map coordinates such as `(X: 9.9, Y: 8.6)` place a flag and open the map,
+    in the zone or aetheryte the answer named before them, else where you are.
+  * Names the game knows, looked up in its own sheets by the shim
+    (`shim/GhosttyDalamud/GameLinks.cs`): a zone opens its map, an aetheryte
+    or NPC is flagged on it, an item is linked into your chat input (never
+    sent), a quest opens in the journal, a duty in the Duty Finder. Actions
+    and statuses only explain themselves in a tooltip. Items, actions,
+    statuses, quests and duties show the game's icon beside them.
+  * A slash command in a code span (`` `/term selftest` ``) goes into your
+    chat input, not sent; the panel then offers **Run**, and only that runs
+    it. Chat channels and emotes (`/say`, `/tell`, `/p`, `/l1`, `/em`, ...)
+    are never run from the panel.
+  * Two or three follow-up questions under the newest answer ask on click; a
+    right-click asks in a new thread that links back ("from: ..." under the
+    title, and in the thread list).
+  * The shim refuses every game action while you are in combat and before you
+    are logged in, and none of them moves your character or uses an action.
+
+  **Host tests only** (`tests/test_ask_rich.lua` with a fake game and a fake
+  ImGui, `tests/test_ask_draw.nelua` through the real core): not yet drawn or
+  clicked in game, and the game-side calls (the map flag, the item link, the
+  journal, the Duty Finder, the chat input) have only been compiled against
+  Dalamud, never run.
 * **Game actions** are off; the tick box in the panel (or
   `assistant.game_actions`) adds `--allow-game-actions`, and XivMcp still asks
   you in game to confirm each action. The panel never approves almanac's own
@@ -755,9 +789,9 @@ the answer streaming in as it is written, with an input box for follow-ups.
 * **How it runs:** the core runs `CONFIG.assistant.stream` (default
   `almanac ask --stream-json`) plus the thread options, `--` and the question
   as one argument on a hidden session whose output goes to `lua/ask.lua` line
-  by line instead of a screen. Its JSON lines are the protocol; the C# shim is
-  unchanged. A `/term reload` ends a running answer (the thread keeps
-  everything up to the last finished one).
+  by line instead of a screen. Its JSON lines are the protocol; the C# shim
+  only adds the game links above. A `/term reload` ends a running answer (the
+  thread keeps everything up to the last finished one).
 * **Never a pseudo console.** A JSON object on one line can be longer than any
   console, and a ConPTY is a screen: it would wrap that line into rows and
   hand it back with CR/LF inserted, and the line would stop parsing. So the

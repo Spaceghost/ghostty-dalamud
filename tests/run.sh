@@ -82,6 +82,8 @@ echo "--- test_defaults (shipped per-platform policy)"
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_defaults.lua
 echo "--- test_world_spread (panels keeping off each other on screen)"
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_world_spread.lua
+echo "--- test_ask_rich (the /ask answer: markdown, links, layout, drawing)"
+GHOSTTY_TEST_SCRATCH="$ROOT/build/test-scratch/ask-rich" "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_ask_rich.lua "$ROOT"
 if [[ "${SKIP_SHIM:-0}" != 1 ]] && command -v dotnet >/dev/null; then
   echo "--- native cache isolation (C#, no game)"
   DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 dotnet run --project tests/cache/CacheTests.csproj -c Release
@@ -154,6 +156,7 @@ run test_winpath "$ROOT" "$ROOT/build/test-scratch"
 run test_assistant "$ROOT"
 mkdir -p build/test-scratch/ask
 run test_ask "$ROOT" "$ROOT/build/test-scratch/ask"
+run test_ask_draw "$ROOT"
 run test_hostsurface "$ROOT" "$ROOT/build/test-scratch/surface"
 run test_native_app "$ROOT"
 run test_depthpass "$ROOT"
