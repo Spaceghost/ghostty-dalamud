@@ -406,6 +406,9 @@ function net.shutdown(): void
       iroh_started = false
     end
   ## end
+  -- the loader unloads this copy after shutdown: nothing may stay allocated
+  -- (the next init sets the path again through core/app/agent.nelua)
+  iroh_key_path:destroy()
   if not net_started then return end
   ## if ccinfo.is_windows then
     WSACleanup()
