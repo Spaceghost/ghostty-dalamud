@@ -25,6 +25,7 @@ BETA is built and merged but has not been seen working in game yet; SOON is stil
 
 ### Being built
 
+* Mappy's map goes straight into the world: it becomes a pet the frame its window opens and is never drawn on the flat UI first. Before, whenever the game drew Mappy after Ghostty the map was never seen open and stayed flat. Host tests only; not yet tried in game.
 * Clean first build: the toolchain and the Dalamud references it compiles against are pinned and checked before use, the default shell is chosen per platform, and a fresh clone builds with nothing else installed.
 * Emoji, CJK and other wide glyphs drawn through the same fallback, with Noto Sans Symbols 2 and an optional monochrome Noto Emoji you drop in yourself.
 
