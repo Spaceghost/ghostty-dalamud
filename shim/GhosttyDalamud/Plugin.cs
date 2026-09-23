@@ -28,6 +28,7 @@ public sealed unsafe class Plugin : IDalamudPlugin
     [PluginService] internal static IChatGui Chat { get; private set; } = null!;
     [PluginService] internal static IGameGui GameGui { get; private set; } = null!;
     [PluginService] internal static ITextureProvider Textures { get; private set; } = null!;
+    [PluginService] internal static IDataManager Data { get; private set; } = null!;
 
     private NativeCache? nativeCache;
     private bool nativeLoaded;

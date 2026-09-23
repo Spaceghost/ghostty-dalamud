@@ -1,0 +1,256 @@
+-- The /ask panel drawn through a fake ImGui that counts every push, begin and
+-- child: the rich answer's primitives (core/ui.nelua: measure, text_at with
+-- the monospace font and every style, rect/frame/line_at, tip_rich, mouse,
+-- origin, advance) run in the real core, and ImGui ends each frame as it
+-- started -- also when CONFIG.ask.draw raises an error inside a child region
+-- with the monospace font in use, which is how the first /ask took the game
+-- down. tests/test_ask_rich.lua covers the Lua side on its own.
+require 'core.host'
+require 'string'
+require 'io'
+require 'os'
+require 'arg'
+
+local root: string = arg[1]
+
+-- the counters: every begin, push and child, and what was drawn
+local begins, ends, children, child_ends = 0, 0, 0, 0
+local col_push, col_pop, var_push, var_pop = 0, 0, 0, 0
+local tips, tip_ends, wraps, wrap_pops, clips, clip_pops = 0, 0, 0, 0, 0, 0
+local fonts, font_pops = 0, 0
+local texts, lines, rects, images, dummies, cursor_hand = 0, 0, 0, 0, 0, 0
+local clip_ok = false
+local cursor: ImVec2 = { 20, 40 }
+local vp: ImGuiViewport
+local fake_io: ImGuiIO
+local dl: ImDrawList
+
+local function f_viewport(): *ImGuiViewport return &vp end
+local function f_io(): *ImGuiIO return &fake_io end
+local function f_begin(name: cstring, open: *boolean, flags: cint): boolean begins = begins + 1 return true end
+local function f_end(): void ends = ends + 1 end
+local function f_begin_child(id: cstring, size: ImVec2, border: boolean, flags: cint): boolean children = children + 1 return true end
+local function f_end_child(): void child_ends = child_ends + 1 end
+local function f_set_pos(p: ImVec2, c: cint, pivot: ImVec2): void end
+local function f_set_size(s: ImVec2, c: cint): void end
+local function f_void(): void end
+local function f_push_var_f(i: cint, v: float32): void var_push = var_push + 1 end
+local function f_push_var_v(i: cint, v: ImVec2): void var_push = var_push + 1 end
+local function f_pop_var(n: cint): void var_pop = var_pop + n end
+local function f_push_col(i: cint, c: uint32): void col_push = col_push + 1 end
+local function f_push_col4(i: cint, c: ImVec4): void col_push = col_push + 1 end
+local function f_pop_col(n: cint): void col_pop = col_pop + n end
+local function f_hovered(flags: cint): boolean return true end
+local function f_focused(flags: cint): boolean return true end
+local function f_win_pos(out: *ImVec2): void $out = { 10, 10 } end
+local function f_win_size(out: *ImVec2): void $out = { 500, 600 } end
+local function f_draw_list(): *ImDrawList return &dl end
+local function f_font(): *ImFont return (@*ImFont)(&dl) end
+local function f_font_size(): float32 return 16 end
+local function f_calc(out: *ImVec2, font: *ImFont, size: float32, maxw: float32, wrapw: float32, b: cstring, e: cstring, rem: *cstring): void
+  local n = (@isize)((@usize)(e) - (@usize)(b))
+  $out = { (@float32)(n) * size * 0.45, size }
+end
+local function f_text(d: *ImDrawList, f: *ImFont, s: float32, p: ImVec2, c: uint32, b: cstring, e: cstring, w: float32, clip: *ImVec4): void texts = texts + 1 end
+local function f_rect_filled(d: *ImDrawList, a: ImVec2, b: ImVec2, c: uint32, r: float32, f: cint): void rects = rects + 1 end
+local function f_rect(d: *ImDrawList, a: ImVec2, b: ImVec2, c: uint32, r: float32, f: cint, t: float32): void rects = rects + 1 end
+local function f_line(d: *ImDrawList, a: ImVec2, b: ImVec2, c: uint32, t: float32): void lines = lines + 1 end
+local function f_tri(d: *ImDrawList, a: ImVec2, b: ImVec2, c: ImVec2, col: uint32): void end
+local function f_circle(d: *ImDrawList, c: ImVec2, r: float32, col: uint32, n: cint, t: float32): void end
+local function f_circle_filled(d: *ImDrawList, c: ImVec2, r: float32, col: uint32, n: cint): void end
+local function f_polyline(d: *ImDrawList, pts: *ImVec2, n: cint, col: uint32, f: cint, t: float32): void end
+local function f_image(d: *ImDrawList, t: pointer, a: ImVec2, b: ImVec2, ua: ImVec2, ub: ImVec2, c: uint32): void images = images + 1 end
+local function f_push_clip(d: *ImDrawList, a: ImVec2, b: ImVec2, i: boolean): void clips = clips + 1 end
+local function f_pop_clip(d: *ImDrawList): void clip_pops = clip_pops + 1 end
+local function f_prim_reserve(d: *ImDrawList, i: cint, v: cint): void end
+local function f_prim_vtx(d: *ImDrawList, p: ImVec2, uv: ImVec2, c: uint32): void end
+local function f_uv(out: *ImVec2): void $out = { 0, 0 } end
+local function f_cursor(out: *ImVec2): void $out = cursor end
+local function f_set_cursor(p: ImVec2): void cursor = p end
+local function f_avail(out: *ImVec2): void $out = { 460, 400 } end
+local function f_dummy(s: ImVec2): void dummies = dummies + 1 cursor.y = cursor.y + s.y end
+local function f_mouse(out: *ImVec2): void $out = { 60, 60 } end
+local function f_clicked(b: cint, r: boolean): boolean return false end
+local function f_cursor_shape(c: cint): void cursor_hand = cursor_hand + 1 end
+local function f_set_clip(t: cstring): void clip_ok = (@string)(t) == 'copied text' end
+local function f_tooltip(): void tips = tips + 1 end
+local function f_tooltip_end(): void tip_ends = tip_ends + 1 end
+local function f_wrap(x: float32): void wraps = wraps + 1 end
+local function f_wrap_pop(): void wrap_pops = wrap_pops + 1 end
+local function f_text_u(b: cstring, e: cstring): void end
+local function f_small_button(l: cstring): boolean return false end
+local function f_button(l: cstring, s: ImVec2): boolean return false end
+local function f_same_line(o: float32, s: float32): void end
+local function f_checkbox(l: cstring, v: *boolean): boolean return false end
+local function f_selectable(l: cstring, s: boolean, f: cint, sz: ImVec2): boolean return false end
+local function f_input_ml(l: cstring, b: cstring, n: csize, s: ImVec2, f: cint, cb: pointer, u: pointer): boolean return false end
+local function f_key_pressed(k: cint, r: boolean): boolean return false end
+local function f_focus_here(o: cint): void end
+local function f_scroll(): float32 return 0 end
+local function f_scroll_here(r: float32): void end
+local function f_frame(): cint return 1 end
+local function f_time(): float64 return 1 end
+local function f_item_hovered(f: cint): boolean return false end
+local function f_invisible(id: cstring, s: ImVec2, f: cint): boolean return false end
+local function f_item_active(): boolean return false end
+local function f_push_id(i: cint): void end
+local function f_mono(): void fonts = fonts + 1 end
+local function f_pop_font(): void font_pops = font_pops + 1 end
+
+local function resolver(name: cstring): pointer
+  local n: string = name
+  if n == 'igGetMainViewport' then return (@pointer)(f_viewport) end
+  if n == 'igGetIO' then return (@pointer)(f_io) end
+  if n == 'igBegin' then return (@pointer)(f_begin) end
+  if n == 'igEnd' then return (@pointer)(f_end) end
+  if n == 'igBeginChild_Str' then return (@pointer)(f_begin_child) end
+  if n == 'igEndChild' then return (@pointer)(f_end_child) end
+  if n == 'igSetNextWindowPos' then return (@pointer)(f_set_pos) end
+  if n == 'igSetNextWindowSize' then return (@pointer)(f_set_size) end
+  if n == 'igSetNextWindowFocus' then return (@pointer)(f_void) end
+  if n == 'igPushStyleVar_Float' then return (@pointer)(f_push_var_f) end
+  if n == 'igPushStyleVar_Vec2' then return (@pointer)(f_push_var_v) end
+  if n == 'igPopStyleVar' then return (@pointer)(f_pop_var) end
+  if n == 'igPushStyleColor_U32' then return (@pointer)(f_push_col) end
+  if n == 'igPushStyleColor_Vec4' then return (@pointer)(f_push_col4) end
+  if n == 'igPopStyleColor' then return (@pointer)(f_pop_col) end
+  if n == 'igIsWindowHovered' then return (@pointer)(f_hovered) end
+  if n == 'igIsWindowFocused' then return (@pointer)(f_focused) end
+  if n == 'igGetWindowPos' then return (@pointer)(f_win_pos) end
+  if n == 'igGetWindowSize' then return (@pointer)(f_win_size) end
+  if n == 'igGetWindowDrawList' then return (@pointer)(f_draw_list) end
+  if n == 'igGetFont' then return (@pointer)(f_font) end
+  if n == 'igGetFontSize' then return (@pointer)(f_font_size) end
+  if n == 'ImFont_CalcTextSizeA' then return (@pointer)(f_calc) end
+  if n == 'ImDrawList_AddText_FontPtr' then return (@pointer)(f_text) end
+  if n == 'ImDrawList_AddRectFilled' then return (@pointer)(f_rect_filled) end
+  if n == 'ImDrawList_AddRect' then return (@pointer)(f_rect) end
+  if n == 'ImDrawList_AddLine' then return (@pointer)(f_line) end
+  if n == 'ImDrawList_AddTriangleFilled' then return (@pointer)(f_tri) end
+  if n == 'ImDrawList_AddCircle' then return (@pointer)(f_circle) end
+  if n == 'ImDrawList_AddCircleFilled' then return (@pointer)(f_circle_filled) end
+  if n == 'ImDrawList_AddPolyline' then return (@pointer)(f_polyline) end
+  if n == 'ImDrawList_AddImage' then return (@pointer)(f_image) end
+  if n == 'ImDrawList_PushClipRect' then return (@pointer)(f_push_clip) end
+  if n == 'ImDrawList_PopClipRect' then return (@pointer)(f_pop_clip) end
+  if n == 'ImDrawList_PrimReserve' then return (@pointer)(f_prim_reserve) end
+  if n == 'ImDrawList_PrimVtx' then return (@pointer)(f_prim_vtx) end
+  if n == 'igGetFontTexUvWhitePixel' then return (@pointer)(f_uv) end
+  if n == 'igGetCursorScreenPos' then return (@pointer)(f_cursor) end
+  if n == 'igSetCursorScreenPos' then return (@pointer)(f_set_cursor) end
+  if n == 'igGetContentRegionAvail' then return (@pointer)(f_avail) end
+  if n == 'igDummy' then return (@pointer)(f_dummy) end
+  if n == 'igGetMousePos' then return (@pointer)(f_mouse) end
+  if n == 'igIsMouseClicked' then return (@pointer)(f_clicked) end
+  if n == 'igSetMouseCursor' then return (@pointer)(f_cursor_shape) end
+  if n == 'igSetClipboardText' then return (@pointer)(f_set_clip) end
+  if n == 'igBeginTooltip' then return (@pointer)(f_tooltip) end
+  if n == 'igEndTooltip' then return (@pointer)(f_tooltip_end) end
+  if n == 'igPushTextWrapPos' then return (@pointer)(f_wrap) end
+  if n == 'igPopTextWrapPos' then return (@pointer)(f_wrap_pop) end
+  if n == 'igTextUnformatted' then return (@pointer)(f_text_u) end
+  if n == 'igSmallButton' then return (@pointer)(f_small_button) end
+  if n == 'igButton' then return (@pointer)(f_button) end
+  if n == 'igSameLine' then return (@pointer)(f_same_line) end
+  if n == 'igCheckbox' then return (@pointer)(f_checkbox) end
+  if n == 'igSelectable_Bool' then return (@pointer)(f_selectable) end
+  if n == 'igInputTextMultiline' then return (@pointer)(f_input_ml) end
+  if n == 'igIsKeyPressed' then return (@pointer)(f_key_pressed) end
+  if n == 'igSetKeyboardFocusHere' then return (@pointer)(f_focus_here) end
+  if n == 'igGetScrollY' then return (@pointer)(f_scroll) end
+  if n == 'igGetScrollMaxY' then return (@pointer)(f_scroll) end
+  if n == 'igSetScrollHereY' then return (@pointer)(f_scroll_here) end
+  if n == 'igGetFrameCount' then return (@pointer)(f_frame) end
+  if n == 'igGetTime' then return (@pointer)(f_time) end
+  if n == 'igIsItemHovered' then return (@pointer)(f_item_hovered) end
+  if n == 'igInvisibleButton' then return (@pointer)(f_invisible) end
+  if n == 'igIsItemActive' then return (@pointer)(f_item_active) end
+  if n == 'igPushID_Int' then return (@pointer)(f_push_id) end
+  if n == 'igPopID' then return (@pointer)(f_void) end
+  if n == 'igSeparator' then return (@pointer)(f_void) end
+  if n == 'igSpacing' then return (@pointer)(f_void) end
+  return nilptr
+end
+
+local function log_cb(level: cint, msg: cstring): void io.write('[log ', level, '] ', msg, '\n') end
+local api: GuHostApi = { size = #GuHostApi, log = log_cb, push_mono_font = f_mono, pop_font = f_pop_font }
+assert(gu_init(&api, (@cstring)(root.data)) == 0)
+
+local function lua_run(code: cstring): void
+  if luaL_loadstring(policy.L, code) ~= LUA_OK or lua_pcall(policy.L, 0, 0, 0) ~= LUA_OK then
+    io.stderr:write(code, '\n', (@cstring)(lua_tolstring(policy.L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+end
+
+local function balanced(what: string): void
+  if begins ~= ends or children ~= child_ends or col_push ~= col_pop or var_push ~= var_pop
+     or tips ~= tip_ends or wraps ~= wrap_pops or clips ~= clip_pops or fonts ~= font_pops then
+    io.stderr:write(what, ': unbalanced: begin ', begins, '/', ends, ' child ', children, '/', child_ends,
+      ' colour ', col_push, '/', col_pop, ' var ', var_push, '/', var_pop, ' tooltip ', tips, '/', tip_ends,
+      ' wrap ', wraps, '/', wrap_pops, ' clip ', clips, '/', clip_pops, ' font ', fonts, '/', font_pops, '\n')
+    os.exit(1)
+  end
+end
+
+imgui_bind(resolver, nilptr)
+
+-- A rich answer, drawn by lua/ask.lua through the real primitives
+lua_run([==[
+  CONFIG.ask.reset()
+  local S = CONFIG.ask.state
+  S.loaded, S.shown = true, true -- no remembered thread to load: nothing runs
+  S.messages = {
+    { role = 'user', text = 'how?' },
+    { role = 'assistant', tools = {}, text = '# Heading\n**bold** *italic* ~~gone~~ `code` and [a link](https://example.org).\n\n'
+      .. '- one\n- [x] done\n\n> quoted\n\n| a | b |\n|---|---|\n| 1 | 2 |\n\n```lua\nlocal x = 1\n```\n\n---\nAt (X: 9.9, Y: 8.6).' },
+  }
+]==])
+ask_frame(1.0, true)
+balanced('a rich answer')
+assert(begins == 1 and children == 1, 'the panel and its conversation')
+assert(texts > 20 and rects > 5 and lines > 1, 'drawn rich')
+assert(fonts > 0, 'the code in the monospace font')
+lua_run([==[
+  local m = CONFIG.ask.state.messages[2]
+  assert(m.lay and m.lay.h > 0, 'laid out')
+  assert(not m.rich_error, tostring(m.rich_error))
+]==])
+print('rich answer OK')
+
+-- The primitives one by one, then an error inside the child, mid-way through a
+-- monospace run and a tooltip: ImGui is put back all the same
+lua_run([==[
+  SAVED_DRAW = CONFIG.ask.draw
+  CONFIG.ask.draw = function()
+    local ui = ghostty.ui
+    assert(ui.child('##ask_log', 40))
+    local x, y, w, c0, c1 = ui.origin()
+    assert(w == 460 and c1 > c0, 'origin')
+    local mw, mh = ui.measure('hello', 1, 1.5)
+    assert(mw > 0 and mh == 24, 'measure ' .. mw .. ' ' .. mh)
+    assert(ui.font_size() == 16)
+    ui.text_at(x, y, 'bold italic under strike', 3, 255, 1, 1.2, 1 | 2 | 4 | 8, x + 50)
+    ui.rect_at(x, y, x + 10, y + 10, 99, 400, 3) -- colour and alpha out of range: clamped
+    ui.frame_at(x, y, x + 10, y + 10, 0, 128, 3)
+    ui.line_at(x, y, x + 10, y, 1, 128)
+    assert(ui.icon_at(60561, x, y, x + 16, y + 16) == false, 'no icons in this shim')
+    ui.tip_rich('Title', 'body', 'Click: something', 0)
+    local mx, my, hovered, clicked, right = ui.mouse()
+    assert(mx == 60 and my == 60 and hovered and not clicked and not right)
+    ui.hand()
+    ui.copy('copied text')
+    ui.advance(30)
+    error('a policy mistake inside the child')
+  end
+]==])
+ask_frame(2.0, true)
+balanced('an error inside the child')
+assert(cursor_hand == 1 and clip_ok, 'the pointer and the clipboard')
+lua_run("CONFIG.ask.draw = SAVED_DRAW")
+ask_frame(3.0, true)
+balanced('the frame after')
+print('error in a child OK')
+
+gu_shutdown()
+print('OK')

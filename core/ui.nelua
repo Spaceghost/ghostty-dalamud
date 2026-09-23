@@ -427,9 +427,228 @@ local function l_width(L: *lua_State): cint
   return 1
 end
 
+-- Rich text for the /ask panel (lua/askview.lua) ------------------------------------------
+-- Draw-list primitives at screen positions, plus measuring. None of them leaves
+-- anything pushed or begun in ImGui (the monospace font is pushed and popped
+-- inside the one call), so Lua failing between two of them cannot unbalance
+-- ImGui the way an unclosed child could (ui_close_children).
+
+-- A game icon by icon id as an ImTextureID, nilptr while it loads or when the
+-- shim has none; set by core/app/gamelink.nelua. Lua never holds the pointer.
+global ui_icon_texture: function(icon: uint32): pointer
+
+local function arg_num(L: *lua_State, idx: cint, default: float32): float32
+  if lua_type(L, idx) ~= LUA_TNUMBER then return default end
+  return (@float32)(lua_tonumberx(L, idx, nilptr))
+end
+
+-- Chrome colour `idx` (core/theme.nelua's ChromeColor, 0-based) at alpha `alpha_idx` (0..255).
+local function arg_col(L: *lua_State, idx: cint, alpha_idx: cint): uint32
+  local c = (@integer)(arg_num(L, idx, (@float32)(ChromeColor.Ink)))
+  if c < 0 or c >= CHROME_COLOR_COUNT then c = (@integer)(ChromeColor.Ink) end
+  local a = (@integer)(arg_num(L, alpha_idx, 255))
+  if a < 0 then a = 0 elseif a > 255 then a = 255 end
+  return chrome_col((@ChromeColor)(c), (@uint8)(a))
+end
+
+-- font 1: the monospace font, pushed (true) when there is one; pop with ui_pop_font.
+local function push_font(L: *lua_State, idx: cint): boolean
+  if lua_type(L, idx) == LUA_TNUMBER and lua_tointegerx(L, idx, nilptr) == 1
+     and ui_push_mono ~= nilptr and ui_pop_font ~= nilptr then
+    ui_push_mono()
+    return true
+  end
+  return false
+end
+
+-- ui.font_size() -> the current font's size in pixels
+local function l_font_size(L: *lua_State): cint
+  local size: float32 = 13
+  if imgui.GetFontSize ~= nilptr then size = imgui.GetFontSize() end
+  lua_pushnumber(L, size)
+  return 1
+end
+
+-- ui.measure(text[, font[, scale]]) -> width, height of one unwrapped line.
+-- font: 0 the UI font, 1 monospace; scale: of the font's size.
+local function l_measure(L: *lua_State): cint
+  local text = arg_lstring(L, 1)
+  if imgui.FontCalcTextSizeA == nilptr or imgui.GetFont == nilptr then
+    lua_pushnumber(L, 0) lua_pushnumber(L, 0)
+    return 2
+  end
+  local scale = arg_num(L, 3, 1)
+  local pushed = push_font(L, 2)
+  local size = imgui.GetFontSize() * scale
+  local sz: ImVec2 = { 0, size }
+  if #text > 0 then
+    imgui.FontCalcTextSizeA(&sz, imgui.GetFont(), size, 1e9, 0, (@cstring)(&text.data[0]), (@cstring)(&text.data[#text]), nilptr)
+  end
+  if pushed then ui_pop_font() end
+  lua_pushnumber(L, sz.x)
+  lua_pushnumber(L, math.max(sz.y, size))
+  return 2
+end
+
+-- ui.text_at(x, y, text, colour, alpha[, font[, scale[, style[, clip_x]]]]):
+-- one run of text with its top left at (x, y). style bits: 1 bold (drawn twice,
+-- a pixel apart), 2 italic (the glyphs sheared), 4 underline, 8 strike; clip_x
+-- cuts it off at that x.
+local function l_text_at(L: *lua_State): cint
+  local text = arg_lstring(L, 3)
+  if #text == 0 or imgui.DrawListAddText == nilptr or imgui.GetWindowDrawList == nilptr then return 0 end
+  local x, y = arg_num(L, 1, 0), arg_num(L, 2, 0)
+  local col = arg_col(L, 4, 5)
+  local scale = arg_num(L, 7, 1)
+  local style = (@integer)(arg_num(L, 8, 0))
+  local pushed = push_font(L, 6)
+  local font = imgui.GetFont()
+  local size = imgui.GetFontSize() * scale
+  local dl = imgui.GetWindowDrawList()
+  local b = (@cstring)(&text.data[0])
+  local e = (@cstring)(&text.data[#text])
+  local clip: ImVec4
+  local clipp: *ImVec4 = nilptr
+  if lua_type(L, 9) == LUA_TNUMBER then
+    clip = { x - size, y - size, arg_num(L, 9, x), y + size * 2 }
+    clipp = &clip
+  end
+  local n0 = dl.VtxBuffer.Size
+  imgui.DrawListAddText(dl, font, size, vec2(x, y), col, b, e, 0, clipp)
+  if style & 1 ~= 0 then imgui.DrawListAddText(dl, font, size, vec2(x + 1, y), col, b, e, 0, clipp) end
+  if style & 2 ~= 0 then
+    -- lean what was just added around the baseline
+    local base = y + size
+    for i = n0, < dl.VtxBuffer.Size do
+      local v = &dl.VtxBuffer.Data[i]
+      v.pos.x = v.pos.x + (base - v.pos.y) * 0.2
+    end
+  end
+  if style & 12 ~= 0 and imgui.FontCalcTextSizeA ~= nilptr then
+    local sz: ImVec2
+    imgui.FontCalcTextSizeA(&sz, font, size, 1e9, 0, b, e, nilptr)
+    local w = sz.x
+    if clipp ~= nilptr and x + w > clip.z then w = clip.z - x end
+    if style & 4 ~= 0 then imgui.DrawListAddLine(dl, vec2(x, y + size), vec2(x + w, y + size), col, 1) end
+    if style & 8 ~= 0 then imgui.DrawListAddLine(dl, vec2(x, y + size * 0.55), vec2(x + w, y + size * 0.55), col, 1) end
+  end
+  if pushed then ui_pop_font() end
+  return 0
+end
+
+-- ui.rect_at(x0, y0, x1, y1, colour, alpha[, rounding]): a filled box.
+local function l_rect_at(L: *lua_State): cint
+  if imgui.DrawListAddRectFilled == nilptr or imgui.GetWindowDrawList == nilptr then return 0 end
+  imgui.DrawListAddRectFilled(imgui.GetWindowDrawList(), vec2(arg_num(L, 1, 0), arg_num(L, 2, 0)),
+    vec2(arg_num(L, 3, 0), arg_num(L, 4, 0)), arg_col(L, 5, 6), math.max(arg_num(L, 7, 0), 0), 0)
+  return 0
+end
+
+-- ui.frame_at(x0, y0, x1, y1, colour, alpha[, rounding]): a box's outline.
+local function l_frame_at(L: *lua_State): cint
+  if imgui.DrawListAddRect == nilptr or imgui.GetWindowDrawList == nilptr then return 0 end
+  imgui.DrawListAddRect(imgui.GetWindowDrawList(), vec2(arg_num(L, 1, 0), arg_num(L, 2, 0)),
+    vec2(arg_num(L, 3, 0), arg_num(L, 4, 0)), arg_col(L, 5, 6), math.max(arg_num(L, 7, 0), 0), 0, 1)
+  return 0
+end
+
+-- ui.line_at(x0, y0, x1, y1, colour, alpha[, thickness])
+local function l_line_at(L: *lua_State): cint
+  if imgui.DrawListAddLine == nilptr or imgui.GetWindowDrawList == nilptr then return 0 end
+  imgui.DrawListAddLine(imgui.GetWindowDrawList(), vec2(arg_num(L, 1, 0), arg_num(L, 2, 0)),
+    vec2(arg_num(L, 3, 0), arg_num(L, 4, 0)), arg_col(L, 5, 6), math.max(arg_num(L, 7, 1), 0.5))
+  return 0
+end
+
+-- ui.icons() -> whether ui.icon_at can draw game icons in this build
+local function l_icons(L: *lua_State): cint
+  lua_pushboolean(L, (ui_icon_texture ~= nilptr and imgui.DrawListAddImage ~= nilptr) and 1 or 0)
+  return 1
+end
+
+-- ui.icon_at(icon_id, x0, y0, x1, y1) -> drawn: a game icon (false while it loads).
+local function l_icon_at(L: *lua_State): cint
+  local id = arg_num(L, 1, 0)
+  if ui_icon_texture == nilptr or imgui.DrawListAddImage == nilptr or id <= 0 or id > 4e9 then
+    lua_pushboolean(L, 0)
+    return 1
+  end
+  local tex = ui_icon_texture((@uint32)(id))
+  if tex == nilptr then lua_pushboolean(L, 0) return 1 end
+  imgui.DrawListAddImage(imgui.GetWindowDrawList(), tex, vec2(arg_num(L, 2, 0), arg_num(L, 3, 0)),
+    vec2(arg_num(L, 4, 0), arg_num(L, 5, 0)), vec2(0, 0), vec2(1, 1), 0xFFFFFFFF)
+  lua_pushboolean(L, 1)
+  return 1
+end
+
+-- ui.origin() -> x, y, width, clip_y0, clip_y1: where the next item goes (on
+-- the screen), the width left on the row, and the band of the current window
+-- that is visible (what is outside it need not be drawn).
+local function l_origin(L: *lua_State): cint
+  local at: ImVec2
+  local avail: ImVec2
+  local wp: ImVec2
+  local ws: ImVec2
+  imgui.GetCursorScreenPos(&at)
+  imgui.GetContentRegionAvail(&avail)
+  imgui.GetWindowPos(&wp)
+  imgui.GetWindowSize(&ws)
+  lua_pushnumber(L, at.x)
+  lua_pushnumber(L, at.y)
+  lua_pushnumber(L, avail.x)
+  lua_pushnumber(L, wp.y)
+  lua_pushnumber(L, wp.y + ws.y)
+  return 5
+end
+
+-- ui.advance(height): the room what was drawn at ui.origin() takes, full width.
+local function l_advance(L: *lua_State): cint
+  local avail: ImVec2
+  imgui.GetContentRegionAvail(&avail)
+  imgui.Dummy(vec2(math.max(avail.x, 1), math.max(arg_num(L, 1, 0), 0)))
+  return 0
+end
+
+-- ui.mouse() -> x, y, hovered, clicked, right_clicked: the pointer, whether it
+-- is over this window (and nothing on top of it), and the presses this frame.
+local function l_mouse(L: *lua_State): cint
+  local p: ImVec2
+  if imgui.GetMousePos ~= nilptr then imgui.GetMousePos(&p) end
+  local hovered = imgui.IsWindowHovered ~= nilptr and imgui.IsWindowHovered(0)
+  lua_pushnumber(L, p.x)
+  lua_pushnumber(L, p.y)
+  lua_pushboolean(L, hovered and 1 or 0)
+  lua_pushboolean(L, (hovered and imgui.IsMouseClicked ~= nilptr and imgui.IsMouseClicked(0, false)) and 1 or 0)
+  lua_pushboolean(L, (hovered and imgui.IsMouseClicked ~= nilptr and imgui.IsMouseClicked(1, false)) and 1 or 0)
+  return 5
+end
+
+-- ui.hand(): a pointing hand for the pointer this frame (over a link).
+local function l_hand(L: *lua_State): cint
+  if imgui.SetMouseCursor ~= nilptr then imgui.SetMouseCursor(ImGuiMouseCursor_Hand) end
+  return 0
+end
+
+-- ui.copy(text): onto the game's clipboard.
+local function l_copy(L: *lua_State): cint
+  local p = lua_tolstring(L, 1, nilptr)
+  if p ~= nilptr and imgui.SetClipboardText ~= nilptr then imgui.SetClipboardText(p) end
+  return 0
+end
+
+-- ui.tip_rich(title, body, hint[, icon_id]): a tooltip now, with a heading, an
+-- optional game icon and what a click does.
+local function l_tip_rich(L: *lua_State): cint
+  local icon: pointer = nilptr
+  local id = arg_num(L, 4, 0)
+  if id > 0 and id < 4e9 and ui_icon_texture ~= nilptr then icon = ui_icon_texture((@uint32)(id)) end
+  tooltip_show_rich(arg_lstring(L, 1), arg_lstring(L, 2), arg_lstring(L, 3), icon)
+  return 0
+end
+
 -- Adds `ui` to the table on top of the stack.
 global function ui_lua_register(L: *lua_State): void
-  lua_createtable(L, 0, 32)
+  lua_createtable(L, 0, 48)
   lua_pushcclosure(L, l_tabs, 0) lua_setfield(L, -2, 'tabs')
   lua_pushcclosure(L, l_tab, 0) lua_setfield(L, -2, 'tab')
   lua_pushcclosure(L, l_end_tab, 0) lua_setfield(L, -2, 'end_tab')
@@ -459,5 +678,19 @@ global function ui_lua_register(L: *lua_State): void
   lua_pushcclosure(L, l_selectable, 0) lua_setfield(L, -2, 'selectable')
   lua_pushcclosure(L, l_small_button, 0) lua_setfield(L, -2, 'small_button')
   lua_pushcclosure(L, l_width, 0) lua_setfield(L, -2, 'width')
+  lua_pushcclosure(L, l_font_size, 0) lua_setfield(L, -2, 'font_size')
+  lua_pushcclosure(L, l_measure, 0) lua_setfield(L, -2, 'measure')
+  lua_pushcclosure(L, l_text_at, 0) lua_setfield(L, -2, 'text_at')
+  lua_pushcclosure(L, l_rect_at, 0) lua_setfield(L, -2, 'rect_at')
+  lua_pushcclosure(L, l_frame_at, 0) lua_setfield(L, -2, 'frame_at')
+  lua_pushcclosure(L, l_line_at, 0) lua_setfield(L, -2, 'line_at')
+  lua_pushcclosure(L, l_icons, 0) lua_setfield(L, -2, 'icons')
+  lua_pushcclosure(L, l_icon_at, 0) lua_setfield(L, -2, 'icon_at')
+  lua_pushcclosure(L, l_origin, 0) lua_setfield(L, -2, 'origin')
+  lua_pushcclosure(L, l_advance, 0) lua_setfield(L, -2, 'advance')
+  lua_pushcclosure(L, l_mouse, 0) lua_setfield(L, -2, 'mouse')
+  lua_pushcclosure(L, l_hand, 0) lua_setfield(L, -2, 'hand')
+  lua_pushcclosure(L, l_copy, 0) lua_setfield(L, -2, 'copy')
+  lua_pushcclosure(L, l_tip_rich, 0) lua_setfield(L, -2, 'tip_rich')
   lua_setfield(L, -2, 'ui')
 end
