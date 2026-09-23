@@ -23,10 +23,14 @@ M.width = 720
 M.height = 420
 -- The terminal's font size at UI scale 1, in pixels; 0 = the dropdown's.
 M.font_size = 0
--- The terminal's background: 1 = the theme's background colour, opaque (the
--- colours then match the ImGui panel exactly); lower lets the game's window
--- background show through.
-M.opacity = 1.0
+-- The glass behind the terminal: nil = the dropdown's opacity and glass, the
+-- same translucent background the ImGui windows have; a number from 0 to 1
+-- sets its opacity for game windows only.
+M.opacity = nil
+-- The display's transfer for game windows: 1 draws colours as they are (what
+-- the ImGui windows do); 2.2 encodes them first, for a game UI that decodes
+-- sRGB. /term selftest native measures it and says which one matches.
+M.gamma = 1
 
 -- Persistence ---------------------------------------------------------------------
 -- native-state.lua in the config directory: the last size used, and each

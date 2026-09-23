@@ -11,6 +11,7 @@
 require 'core.app.terminal'
 require 'core.app.bell'
 require 'core.app.cursor'
+require 'core.chrome'
 require 'core.nativewin'
 local strconv: type = require 'detail.strconv'
 
@@ -50,7 +51,10 @@ local NativeWin = @record{
   report_button: integer,
   m0x: float32, m0y: float32, w0: float32, h0: float32, -- where a grip drag started
   last_col: integer, last_row: integer, -- the cell of the last motion report
-  title: string,             -- last title sent
+  title: string,             -- last title sent (the terminal's, before fitting)
+  title_w: float32,          -- the window width it was fitted to
+  dbg_hover: cint,           -- /term native debug: the last hover state logged
+  dbg_on: boolean,
   saved_x: float32, saved_y: float32, saved_w: float32, saved_h: float32,
 }
 
@@ -68,9 +72,17 @@ local path_status: cint = NATIVE_NONE
 local path_error: cint = 0
 local path_since: float64 = -1
 local settings_at: float64 = -1
-local set_opacity: float32 = 1
+local set_opacity: float32 = -1 -- < 0: the dropdown's glass opacity, as the ImGui windows have
 local set_font: float32 = 0
 local set_enabled = true
+local set_gamma: float32 = 1
+local prev_world_focus: integer = 0
+local prev_dropdown_open = false
+
+-- /term native debug: hover, press and focus changes in the log.
+global native_debug: boolean = false
+-- The self-test's colour swatches are drawn over this window's terminal; 0 none.
+global native_swatch_id: integer = 0
 
 -- The offscreen draw list: cimgui's constructor and reset, resolved once --------------------
 local Off = @record{
@@ -121,12 +133,14 @@ end
 local function read_settings(now: float64): void
   if settings_at >= 0 and now >= settings_at and now - settings_at < SETTINGS_EVERY then return end
   settings_at = now
-  set_opacity, set_font, set_enabled = 1, 0, true
+  set_opacity, set_font, set_enabled, set_gamma = -1, 0, true, 1
   local L = policy.L
   if L == nilptr or not policy.loaded or not push_native(L) then return end
-  set_opacity = (@float32)(math.clamp(lua_field_number(L, -1, 'opacity', 1), 0, 1))
+  local o = lua_field_number(L, -1, 'opacity', -1)
+  set_opacity = o < 0 and -1 or (@float32)(math.clamp(o, 0, 1))
   set_font = (@float32)(math.clamp(lua_field_number(L, -1, 'font_size', 0), 0, 96))
   set_enabled = lua_field_boolean(L, -1, 'enabled', true)
+  set_gamma = (@float32)(math.clamp(lua_field_number(L, -1, 'gamma', 1), 0.25, 4))
   lua_pop(L, 2)
 end
 
@@ -261,6 +275,13 @@ end
 global function native_focused_session(): *Session
   if native_focused_id == 0 then return nilptr end
   return in_native(native_focused_id)
+end
+
+-- For the self-test: every game window gives the keyboard back, as a click
+-- elsewhere would, so the next click is a first click again.
+global function native_blur_all(): void
+  for i = 0, < #wins do wins[i].focused = false end
+  native_focused_id = 0
 end
 
 -- For the self-test: what window `id` is doing.
@@ -405,6 +426,22 @@ end
 
 -- Drawing ---------------------------------------------------------------------------------------
 
+-- The glass behind the terminal, the body of the ImGui windows' glass: the
+-- dropdown's palette at its opacity (CONFIG.native.opacity overrides), lit by
+-- the world like theirs, translucent where theirs is.
+local function glass(dl: *ImDrawList, tw: float32, th: float32): void
+  local light = chrome_light(1, 1, 1, 0, 0)
+  if policy.dropdown.world_tint > 0 then
+    local ok, r, g, b, bl = policy_world_lighting()
+    if ok then light = chrome_light(r, g, b, bl, (@float32)(policy.dropdown.world_tint)) end
+  end
+  local opacity = set_opacity >= 0 and set_opacity or (@float32)(policy.dropdown.opacity)
+  local pal = chrome_palette(opacity, policy.dropdown.glass, light)
+  local first = dl.VtxBuffer.Size
+  imgui.DrawListAddRectFilled(dl, vec2(0, 0), vec2(tw, th), 0xFFFFFFFF, 0, 0)
+  chrome_shade_vertical(dl, first, 0, th, pal.body_top, pal.body_bottom)
+end
+
 local function draw_win(w: *NativeWin, s: *Session, l: *NativeLayout, now: float64): boolean
   if w.dl == nilptr then
     local shared = off.shared()
@@ -419,17 +456,22 @@ local function draw_win(w: *NativeWin, s: *Session, l: *NativeLayout, now: float
   local tw, th = (@float32)(l.tex_w), (@float32)(l.tex_h)
   imgui.DrawListPushClipRect(dl, vec2(0, 0), vec2(tw, th), false)
   font_texture(dl)
-  local alpha = (@uint8)(math.clamp(set_opacity * 255 + 0.5, 0, 255))
-  local bg = theme_rgb(0x101014)
-  if theme_term.has_background then bg = theme_term.background end
-  imgui.DrawListAddRectFilled(dl, vec2(0, 0), vec2(tw, th), im_col32(bg.r, bg.g, bg.b, alpha), 0, 0)
+  glass(dl, tw, th)
   local pad = math.floor(4 * l.scale)
   local fs = s.font_scale > 0 and (@float32)(s.font_scale) or 1
   terminal_native_texture = font_texture -- draw_terminal starts the pushed font's texture with it
   host.drawing_native = true
   host.native_font_px = l.font_px
-  draw_terminal(s, dl, vec2(pad, pad), tw - 2 * pad, th - 2 * pad, l.font_px / fs, w.focused, false, alpha, 0)
+  -- the terminal's default background left out, over the glass, exactly as the
+  -- ImGui windows draw it (dropdown.nelua draw_windows: bg_alpha 0)
+  draw_terminal(s, dl, vec2(pad, pad), tw - 2 * pad, th - 2 * pad, l.font_px / fs, w.focused, false, 0, 0)
   host.drawing_native = false
+  if native_swatch_id == w.id then
+    for i = 0, < NATIVE_SWATCHES do
+      local x = pad + i * NATIVE_SWATCH_STEP
+      imgui.DrawListAddRectFilled(dl, vec2(x, pad), vec2(x + NATIVE_SWATCH_PX, pad + NATIVE_SWATCH_PX), native_swatch_cols[i], 0, 0)
+    end
+  end
   bell_rect_glow(dl, vec2(0, 0), vec2(tw, th), 0, s.id)
   -- the resize grip, in the corner like the ImGui window's
   local g = native_grip_px(l) * 0.7
@@ -437,6 +479,13 @@ local function draw_win(w: *NativeWin, s: *Session, l: *NativeLayout, now: float
   imgui.DrawListAddTriangleFilled(dl, vec2(tw - inset - g, th - inset), vec2(tw - inset, th - inset - g), vec2(tw - inset, th - inset),
     chrome_col(ChromeColor.Accent, w.drag == DRAG_GRIP and 200 or 90))
   imgui.DrawListPopClipRect(dl)
+  -- CONFIG.native.gamma: every colour through the display's transfer
+  -- (textured glyphs keep their coverage; only vertex colours change)
+  if math.abs(set_gamma - 1) > 0.001 then
+    for i = 0, < dl.VtxBuffer.Size do
+      dl.VtxBuffer.Data[i].col = native_gamma_col(dl.VtxBuffer.Data[i].col, set_gamma)
+    end
+  end
   w.cap_w = native_capacity(w.cap_w, l.tex_w)
   w.cap_h = native_capacity(w.cap_h, l.tex_h)
   return host.api.native_draw((@cint)(w.id), dl, (@cint)(l.tex_w), (@cint)(l.tex_h), (@cint)(w.cap_w), (@cint)(w.cap_h),
@@ -450,29 +499,42 @@ local function busy(): boolean
 end
 
 -- One window, set up and visible (or hidden with the UI).
+-- Another terminal took the keyboard this frame: a world panel became
+-- focused, or the dropdown opened. Edges only: a flag that stays set (the
+-- dropdown's focus request waits for the dropdown to draw) must not take the
+-- keyboard from a game window every frame.
+local other_claimed = false
+
 local function frame_open(w: *NativeWin, s: *Session, now: float64, r_pressed: boolean): void
   local hidden = w.st.ui_hidden ~= 0
   -- the title follows the terminal's
   local name = s:display_name()
-  if name ~= w.title and host.api.native_title ~= nilptr then
-    local z = name .. '\0'
+  if (name ~= w.title or w.st.w ~= w.title_w) and host.api.native_title ~= nilptr then
+    local fitted = native_title_fit(name, w.st.w)
+    local z = fitted .. '\0'
     host.api.native_title((@cint)(w.id), (@cstring)(z.data))
     z:destroy()
+    fitted:destroy()
     w.title:destroy()
     w.title = string.copy(name)
+    w.title_w = w.st.w
   end
   local base = set_font > 0 and set_font or (@float32)(host.dropdown_font_size > 0 and host.dropdown_font_size or 15)
   local fs = s.font_scale > 0 and (@float32)(s.font_scale) or 1
   local l = native_layout(&w.st, base, fs)
   w.layout = l
-  local on_window = w.st.hovered ~= 0 and not hidden
+  local mp: ImVec2
+  imgui.GetMousePos(&mp)
+  local in_rect = native_in_window(&w.st, mp.x, mp.y)
+  local on_window = not hidden and native_on_window(w.st.hovered, in_rect)
   local e: NativeFocusIn = {
     open = true, ui_hidden = hidden,
     press = host.lmb_pressed or r_pressed, on_window = on_window,
-    claimed_by_other = host.world_focus ~= 0 or host.dropdown_focus_next,
+    claimed_by_other = other_claimed,
     drop = host.drop_focus,
     want = native_focus_request == w.id,
   }
+  local was = w.focused
   if native_focus_request == w.id then native_focus_request = 0 end
   local focused, took = native_focus_step(w.focused, e)
   w.focused = focused
@@ -482,6 +544,13 @@ local function frame_open(w: *NativeWin, s: *Session, now: float64, r_pressed: b
     if imgui.SetWindowFocusNil ~= nilptr then imgui.SetWindowFocusNil() end
   end
   if focused then native_focused_id = w.id elseif native_focused_id == w.id then native_focused_id = 0 end
+  if native_debug and (e.press or was ~= focused or w.st.hovered ~= w.dbg_hover or on_window ~= w.dbg_on) then
+    logf(LOG_INFO, 'native %d: pointer %.0f,%.0f hover %d in_rect %s on_window %s press %s want %s other %s drop %s hidden %s: focus %s -> %s',
+      w.id, mp.x, mp.y, w.st.hovered, in_rect and 'y' or 'n', on_window and 'y' or 'n', e.press and 'y' or 'n',
+      e.want and 'y' or 'n', e.claimed_by_other and 'y' or 'n', e.drop and 'y' or 'n', hidden and 'y' or 'n',
+      was and 'y' or 'n', focused and 'y' or 'n')
+    w.dbg_hover, w.dbg_on = w.st.hovered, on_window
+  end
   if hidden or not l.ok then
     s:pump()
     return
@@ -517,12 +586,11 @@ global function native_frame(now: float64, live: boolean): void
   read_settings(now)
   if native_focus_request ~= 0 and in_native(native_focus_request) == nilptr then native_focus_request = 0 end
   reconcile()
-  if #wins == 0 then
-    prev_rmb = host.rmb_down
-    return
-  end
   local r_pressed = host.rmb_down and not prev_rmb
   prev_rmb = host.rmb_down
+  other_claimed = (host.world_focus ~= 0 and host.world_focus ~= prev_world_focus) or (host.dropdown_open and not prev_dropdown_open)
+  prev_world_focus, prev_dropdown_open = host.world_focus, host.dropdown_open
+  if #wins == 0 then return end
   local ok, starting = native_available()
   if ok and starting then
     if path_since < 0 then path_since = now end
@@ -552,9 +620,11 @@ global function native_frame(now: float64, live: boolean): void
       local ww, wh, wx, wy = lua_geometry(w.agent_id)
       if w.seen_open and w.saved_w > 0 then ww, wh, wx, wy = w.saved_w, w.saved_h, w.saved_x, w.saved_y end
       local name = s:display_name()
-      local z = name .. '\0'
+      local fitted = native_title_fit(name, ww)
+      local z = fitted .. '\0'
       local asked = host.api.native_open((@cint)(w.id), (@cstring)(z.data), ww, wh, wx, wy) ~= 0
       z:destroy()
+      fitted:destroy()
       if not asked then
         fall_back(w, s, 'the plugin refused to open a game window')
         continue
@@ -562,6 +632,7 @@ global function native_frame(now: float64, live: boolean): void
       w.asked, w.asked_at, w.suspended = true, now, false
       w.title:destroy()
       w.title = string.copy(name)
+      w.title_w = ww
       w.closes = 0
       w.cap_w, w.cap_h = 0, 0 -- a new addon makes a new texture
       s:pump()
@@ -613,6 +684,10 @@ global function native_command(args: string): cint
         w.focused and 'focused' or 'not focused', w.draws)
     end
     return 0
+  elseif args == 'debug' or args == 'debug on' or args == 'debug off' then
+    native_debug = args == 'debug on' or (args == 'debug' and not native_debug)
+    sayf(LOG_INFO, 'game windows: hover, press and focus changes %s the log', native_debug and 'go to' or 'no longer go to')
+    return 0
   elseif args == 'off' then
     local s = native_focused_session()
     if s == nilptr and #host.native > 0 then s = host.native[#host.native - 1] end
@@ -642,7 +717,7 @@ global function native_command(args: string): cint
     native_show(s, true)
     return 0
   end
-  log(LOG_WARN, 'usage: /term native [new [N] | off | status]')
+  log(LOG_WARN, 'usage: /term native [new [N] | off | status | debug [on|off]]')
   return 4
 end
 
@@ -659,6 +734,8 @@ global function native_shutdown(): void
   native_reason:destroy()
   reason_said:destroy()
   prev_rmb = false
+  prev_world_focus, prev_dropdown_open, other_claimed = 0, false, false
+  native_swatch_id = 0
   path_status, path_error, path_since = NATIVE_NONE, 0, -1
   settings_at = -1
   off = {}
