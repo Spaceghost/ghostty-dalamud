@@ -120,10 +120,14 @@ echo "== ghostty-agent (host)"
 # shellcheck source=tools/wayland-flags.sh
 source "$ROOT/tools/wayland-flags.sh" # the Wayland compositor backend when its SDK is there
 [[ ${#WAYLAND_NELUA[@]} -gt 0 ]] && echo "with the Wayland compositor (wlroots 0.20)"
-# This link passes no --cflags when iroh is off, exactly as it did before.
-IROH_NELUA_HOST=()
-[[ -n "$(iroh_host_ldflags)" ]] && IROH_NELUA_HOST=(--cflags="$(iroh_host_ldflags)")
-"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${WAYLAND_NELUA[@]}" "${IROH_NELUA_HOST[@]}" --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
+# ONE --cflags. Nelua keeps the last it is given, so passing a second here
+# silently dropped every Wayland link flag and the agent failed to find
+# xkbcommon, wayland-server and pixman-1.
+AGENT_CFLAGS="$WAYLAND_CFLAGS$(iroh_host_ldflags)"
+AGENT_NELUA=("${WAYLAND_DEFINE[@]}")
+[[ -n "$(iroh_host_ldflags)" ]] && AGENT_NELUA+=(-D IROH)
+[[ -n "$AGENT_CFLAGS" ]] && AGENT_NELUA+=("--cflags=$AGENT_CFLAGS")
+"$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${AGENT_NELUA[@]}" --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
 mkdir -p build/dist/lua && cp lua/*.lua build/dist/lua/
 mkdir -p build/dist/themes && cp themes/*.theme build/dist/themes/
 

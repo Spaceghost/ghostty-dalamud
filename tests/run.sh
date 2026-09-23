@@ -51,7 +51,7 @@ LIBS="-L$ROOT/build/ghostty-vt-linux/lib -L$ROOT/build/lua-linux -lm"
 # including core/host.nelua below, so this is the only place it is named. The
 # guard is the built artifact: no crate, no build/lib, no change.
 if [[ "${IROH:-0}" == 1 && -f "$ROOT/build/lib/libghostty_iroh.a" ]]; then
-  LIBS="$LIBS -L$ROOT/build/lib -lghostty_iroh -lpthread -ldl"
+  LIBS="$LIBS -L$ROOT/build/lib -lghostty_iroh -lpthread -ldl -lm -lunwind"
 fi
 export LD_LIBRARY_PATH="$ROOT/build/ghostty-vt-linux/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 # wait for an agent to listen (valgrind takes seconds to get there), or for it to die

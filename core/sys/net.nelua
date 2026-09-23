@@ -1,18 +1,59 @@
--- Minimal non-blocking TCP for POSIX and Winsock.
+-- Minimal non-blocking TCP for POSIX and Winsock, plus an optional second
+-- transport (iroh/QUIC, crates/ghostty-iroh) behind the same functions.
+--
+-- A NetSocket is still a scalar. It now carries a one-bit tag that says which
+-- backend owns it, so a connection can be TCP or iroh per connection and every
+-- caller (core/agent_client.nelua, agent/agent.nelua, tests) keeps its code:
+-- net.close/recv/send/accept/socket_fd branch on the tag, net.is_valid and
+-- net.invalid stay correct for both.
+--
+-- NOTHING BELOW HAS BEEN COMPILED OR RUN. No build, no cargo, no test suite was
+-- executed for this file; the unverified list is in the worker's report.
 require 'string'
+
+-- Is the iroh backend compiled into this build?
+--
+-- tools/build-common.sh defines NO C macro and NO Nelua pragma for iroh: with
+-- IROH=1 (and the crate, and cargo) iroh_probe sets IROH_HOST_LIBDIR /
+-- IROH_WIN_LIBDIR, and the only thing that reaches the compiler is link flags
+--   -L"$ROOT/build/lib" -lghostty_iroh ...
+-- from iroh_host_ldflags / iroh_win_ldflags. There is nothing named
+-- GHOSTTY_IROH or HAVE_IROH anywhere to test, and inventing one would mean
+-- editing a build file this worker does not own.
+--
+-- So the gate is the artifact those same flags point at: iroh is compiled in
+-- when IROH=1 is in the environment AND the staticlib iroh_probe would link
+-- actually exists. That is the same three gates iroh_probe applies (IROH=1,
+-- crate present, cargo present), observed at their output instead of re-derived
+-- -- if cargo was missing, build_iroh never produced the .a and this stays off,
+-- which is exactly what the link flags do.
+--
+-- Two caveats, stated rather than hidden:
+--   * The probe is a relative path, so it is correct only when Nelua is invoked
+--     with the repo root as the working directory. tools/build.sh, tools/
+--     build-agent.sh and tests/run.sh all `cd "$ROOT"` first, so this holds
+--     today; a hand-run `nelua` from elsewhere silently builds TCP-only.
+-- The gate is `-D IROH`, which tools/build-common.sh's iroh_nelua_*_define
+-- adds exactly when it has a staticlib to link against; agent/agent.nelua
+-- gates its own iroh code on the same define. Probing for the .a from the
+-- preprocessor would guess at nelua's cwd and at whether the crate has been
+-- built yet, and would disagree with the linker rather than follow it.
+## NET_IROH = IROH and true or false
 
 ## if ccinfo.is_windows then
 ## cinclude '<winsock2.h>'
 ## cinclude '<ws2tcpip.h>'
 ## linklib 'ws2_32'
-global NetSocket = @usize   -- SOCKET
+-- The OS-level socket type, as the C prototypes below see it. NetSocket is a
+-- wider tagged value; every call into libc/Winsock converts explicitly.
+local CSocket = @usize   -- SOCKET
 local INVALID_SOCKET: usize <cimport, nodecl, const>
 local WSADATA <cimport, nodecl> = @record{ wVersion: uint16, wHighVersion: uint16 }
 local function WSAStartup(ver: uint16, data: pointer): cint <cimport, nodecl> end
 local function WSACleanup(): cint <cimport, nodecl> end
 local function WSAGetLastError(): cint <cimport, nodecl> end
-local function closesocket(s: NetSocket): cint <cimport, nodecl> end
-local function ioctlsocket(s: NetSocket, cmd: clong, argp: *culong): cint <cimport, nodecl> end
+local function closesocket(s: CSocket): cint <cimport, nodecl> end
+local function ioctlsocket(s: CSocket, cmd: clong, argp: *culong): cint <cimport, nodecl> end
 local FIONBIO: clong <cimport, nodecl, const>
 local WSAEWOULDBLOCK: cint <cimport, nodecl, const>
 local WSAEINPROGRESS: cint <cimport, nodecl, const>
@@ -28,7 +69,7 @@ local WSAEALREADY: cint <cimport, nodecl, const>
 ## cinclude '<fcntl.h>'
 ## cinclude '<unistd.h>'
 ## cinclude '<errno.h>'
-global NetSocket = @cint
+local CSocket = @cint    -- fd
 local function close(fd: cint): cint <cimport, nodecl> end
 local function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
 local F_GETFL: cint <cimport, nodecl, const>
@@ -53,14 +94,14 @@ local addrinfo <cimport, nodecl, ctypedef> = @record{
   ai_flags: cint, ai_family: cint, ai_socktype: cint, ai_protocol: cint,
   ai_addrlen: csize, ai_addr: *sockaddr, ai_canonname: cstring, ai_next: *addrinfo,
 }
-local function socket(domain: cint, typ: cint, protocol: cint): NetSocket <cimport, nodecl> end
-local function connect(s: NetSocket, addr: *sockaddr, len: cint): cint <cimport, nodecl> end
-local function bind(s: NetSocket, addr: *sockaddr, len: cint): cint <cimport, nodecl> end
-local function listen(s: NetSocket, backlog: cint): cint <cimport, nodecl> end
-local function accept(s: NetSocket, addr: *sockaddr, len: *cint): NetSocket <cimport, nodecl> end
-local function send(s: NetSocket, buf: pointer, len: csize, flags: cint): isize <cimport, nodecl> end
-local function recv(s: NetSocket, buf: pointer, len: csize, flags: cint): isize <cimport, nodecl> end
-local function setsockopt(s: NetSocket, level: cint, name: cint, val: pointer, len: cint): cint <cimport, nodecl> end
+local function socket(domain: cint, typ: cint, protocol: cint): CSocket <cimport, nodecl> end
+local function connect(s: CSocket, addr: *sockaddr, len: cint): cint <cimport, nodecl> end
+local function bind(s: CSocket, addr: *sockaddr, len: cint): cint <cimport, nodecl> end
+local function listen(s: CSocket, backlog: cint): cint <cimport, nodecl> end
+local function accept(s: CSocket, addr: *sockaddr, len: *cint): CSocket <cimport, nodecl> end
+local function send(s: CSocket, buf: pointer, len: csize, flags: cint): isize <cimport, nodecl> end
+local function recv(s: CSocket, buf: pointer, len: csize, flags: cint): isize <cimport, nodecl> end
+local function setsockopt(s: CSocket, level: cint, name: cint, val: pointer, len: cint): cint <cimport, nodecl> end
 local function getaddrinfo(node: cstring, service: cstring, hints: *addrinfo, res: **addrinfo): cint <cimport, nodecl> end
 local function freeaddrinfo(res: *addrinfo): void <cimport, nodecl> end
 local function htons(v: uint16): uint16 <cimport, nodecl> end
@@ -72,9 +113,246 @@ local SOL_SOCKET: cint <cimport, nodecl, const>
 local SO_REUSEADDR: cint <cimport, nodecl, const>
 local TCP_NODELAY: cint <cimport, nodecl, const>
 
+-- ---------------------------------------------------------------------------
+-- The iroh C ABI (crates/ghostty-iroh/include/ghostty_iroh.h).
+--
+-- Declared <cimport, nodecl> like every other C symbol here, but the header is
+-- not on any include path (tools/build-common.sh passes only -L/-l), so the
+-- prototypes are emitted inline with cemitdecl -- the same trick
+-- core/glyphfb.nelua:31 uses. They are a hand copy of the header and must be
+-- kept in step with it by hand; gi_abi_version() is checked at init so a drift
+-- fails loudly instead of corrupting a handle.
+## if NET_IROH then
+## cemitdecl [[#include <stddef.h>]]
+## cemitdecl [[#include <stdint.h>]]
+## cemitdecl [[typedef uint32_t gi_handle;]]
+## cemitdecl [[int32_t   gi_abi_version(void);]]
+## cemitdecl [[int32_t   gi_init(const char *secret_key_path);]]
+## cemitdecl [[void      gi_shutdown(void);]]
+## cemitdecl [[int32_t   gi_node_id(char *out, size_t cap);]]
+## cemitdecl [[gi_handle gi_connect(const char *node_id);]]
+## cemitdecl [[int32_t   gi_connect_poll(gi_handle h);]]
+## cemitdecl [[gi_handle gi_listen(const char *allowlist_path);]]
+## cemitdecl [[gi_handle gi_accept(gi_handle listener);]]
+## cemitdecl [[int32_t   gi_peer_id(gi_handle h, char *out, size_t cap);]]
+## cemitdecl [[int32_t   gi_recv(gi_handle h, void *buf, size_t cap);]]
+## cemitdecl [[int32_t   gi_send(gi_handle h, const void *buf, size_t len);]]
+## cemitdecl [[void      gi_close(gi_handle h);]]
+## cemitdecl [[int32_t   gi_wakeup_fd(void);]]
+## cemitdecl [[void     *gi_wakeup_handle(void);]]
+## cemitdecl [[void      gi_wakeup_drain(void);]]
+## cemitdecl [[int32_t   gi_wait_ms(int32_t cap_ms);]]
+## cemitdecl [[int32_t   gi_last_error(char *out, size_t cap);]]
+local gi_handle = @uint32
+local function gi_abi_version(): int32 <cimport, nodecl> end
+local function gi_init(secret_key_path: cstring): int32 <cimport, nodecl> end
+local function gi_shutdown(): void <cimport, nodecl> end
+local function gi_node_id(out: cstring, cap: csize): int32 <cimport, nodecl> end
+local function gi_connect(node_id: cstring): gi_handle <cimport, nodecl> end
+local function gi_connect_poll(h: gi_handle): int32 <cimport, nodecl> end
+local function gi_listen(allowlist_path: cstring): gi_handle <cimport, nodecl> end
+local function gi_accept(listener: gi_handle): gi_handle <cimport, nodecl> end
+local function gi_peer_id(h: gi_handle, out: cstring, cap: csize): int32 <cimport, nodecl> end
+local function gi_recv(h: gi_handle, buf: pointer, cap: csize): int32 <cimport, nodecl> end
+local function gi_send(h: gi_handle, buf: pointer, len: csize): int32 <cimport, nodecl> end
+local function gi_close(h: gi_handle): void <cimport, nodecl> end
+local function gi_wakeup_fd(): int32 <cimport, nodecl> end
+local function gi_wakeup_handle(): pointer <cimport, nodecl> end
+local function gi_wakeup_drain(): void <cimport, nodecl> end
+local function gi_wait_ms(cap_ms: int32): int32 <cimport, nodecl> end
+local function gi_last_error(out: cstring, cap: csize): int32 <cimport, nodecl> end
+local function getenv(name: cstring): cstring <cimport, nodecl, cinclude '<stdlib.h>'> end
+## end
+
+-- GI_E* from the header, mirrored so the log line can name the failure even
+-- though net.recv/net.send collapse every one of them to -1.
+global GI_EAGAIN: int32 <comptime> = 0
+global GI_ECLOSED: int32 <comptime> = -1
+global GI_ERESET: int32 <comptime> = -2
+global GI_ETIMEOUT: int32 <comptime> = -3
+global GI_EREFUSED: int32 <comptime> = -4
+global GI_EUNREACH: int32 <comptime> = -5
+global GI_EADDR: int32 <comptime> = -6
+global GI_EHANDLE: int32 <comptime> = -7
+global GI_EINTERNAL: int32 <comptime> = -8
+
+-- ---------------------------------------------------------------------------
+-- NetSocket: still one scalar, now tagged.
+--
+-- Widened to 64 bits on both platforms so a full 32-bit gi_handle fits beside
+-- the tag with nothing truncated. A gi_handle is generation-tagged (low 16 bits
+-- slot, high 16 bits generation), so its top bit WILL be set after enough slot
+-- reuse -- masking it down to 31 bits would be a time bomb on the reconnect
+-- loop, which runs every 3 s while an agent is down.
+--
+--   bit 62 set  -> iroh: the low 32 bits are the gi_handle (never 0)
+--   bit 62 clear-> TCP:  the value is an fd (POSIX) or a SOCKET (Windows)
+--
+-- Bit 62, not 63: on POSIX the value stays positive, so it can never collide
+-- with net.invalid() == -1. On Windows INVALID_SOCKET is all-ones and so has
+-- bit 62 set too -- which is why is_iroh() tests net.is_valid() FIRST. Real
+-- SOCKET values are kernel handles that fit in 32 bits, so bit 62 is free
+-- there.
+--
+-- Widening is visible to anything that declares its own C prototype in terms of
+-- NetSocket: agent/winloop.nelua:13 (WSAEventSelect) is the only one, and on
+-- win64 usize and uint64 are the same width, so the call is unchanged. Handing
+-- winloop_watch a TAGGED handle would be wrong -- that is a caller change the
+-- agent owns, not this file.
+## if ccinfo.is_windows then
+global NetSocket = @uint64
+## else
+global NetSocket = @int64
+## end
+local IROH_TAG: NetSocket <const> = (@NetSocket)(1) << 62
+
 global net = @record{}
 
 local net_started: boolean = false
+
+function net.invalid(): NetSocket
+  ## if ccinfo.is_windows then
+    return (@NetSocket)(INVALID_SOCKET)
+  ## else
+    return -1
+  ## end
+end
+
+function net.is_valid(s: NetSocket): boolean
+  return s ~= net.invalid()
+end
+
+-- True for a handle this file handed out from the iroh backend. The invalid
+-- test comes first: INVALID_SOCKET has every bit set, tag included.
+local function is_iroh(s: NetSocket): boolean
+  if not net.is_valid(s) then return false end
+  return (s & IROH_TAG) ~= 0
+end
+
+## if NET_IROH then
+local function iroh_of(s: NetSocket): gi_handle
+  return (@gi_handle)(s & 0xFFFFFFFF)
+end
+-- gi 0 is always invalid, on both platforms; map it to whatever net.invalid()
+-- is here rather than letting a tagged zero look like a live handle.
+local function iroh_sock(h: gi_handle): NetSocket
+  if h == 0 then return net.invalid() end
+  return IROH_TAG | (@NetSocket)(h)
+end
+## end
+
+-- The TCP half of a NetSocket, for the C calls.
+local function csock_invalid(): CSocket
+  ## if ccinfo.is_windows then
+    return (@CSocket)(INVALID_SOCKET)
+  ## else
+    return -1
+  ## end
+end
+local function csock_of(s: NetSocket): CSocket
+  return (@CSocket)(s)
+end
+local function tcp_sock(c: CSocket): NetSocket
+  if c == csock_invalid() then return net.invalid() end
+  return (@NetSocket)(c)
+end
+
+-- ---------------------------------------------------------------------------
+-- Last failure, for the log line only.
+--
+-- net.recv and net.send have to collapse every GI_E* to -1 (callers treat -1 as
+-- "connection lost": core/agent_client.nelua:631-637, :673-685). The code and
+-- the crate's own text are kept here so the distinction survives into the log
+-- instead of disappearing at the boundary: a caller that wants it reads
+-- net.last_error_code() / net.last_error() right after a -1.
+local ERR_CAP: usize <comptime> = 256
+local err_buf: [256]cchar
+local err_code: int32 = 0
+
+local function err_name(code: int32): string
+  if code == GI_EAGAIN then return 'again' end
+  if code == GI_ECLOSED then return 'peer closed' end
+  if code == GI_ERESET then return 'stream reset' end
+  if code == GI_ETIMEOUT then return 'timed out' end
+  if code == GI_EREFUSED then return 'refused' end
+  if code == GI_EUNREACH then return 'unreachable' end
+  if code == GI_EADDR then return 'bad node id' end
+  if code == GI_EHANDLE then return 'stale handle' end
+  if code == GI_EINTERNAL then return 'internal error' end
+  return 'unknown error'
+end
+
+-- GI_E* of the last iroh failure, or 0 when the last thing to fail was not the
+-- iroh backend. Never cleared by a success, only overwritten by a failure.
+function net.last_error_code(): integer
+  return err_code
+end
+
+-- '<name>: <crate text>' for the last iroh failure, empty when there is none.
+-- Caller owns the string.
+function net.last_error(): string
+  if err_code == 0 then return string.copy('') end
+  local text: string = (@string)((@cstring)(&err_buf))
+  if #text == 0 then return string.copy(err_name(err_code)) end
+  return err_name(err_code) .. ': ' .. text
+end
+
+## if NET_IROH then
+-- Record a GI_E* and pull the crate's text for it. Returns -1 so failing call
+-- sites can `return iroh_fail(rc)`.
+local function iroh_fail(code: int32): integer
+  err_code = code
+  err_buf[0] = 0
+  gi_last_error((@cstring)(&err_buf), ERR_CAP)
+  err_buf[ERR_CAP - 1] = 0
+  return -1
+end
+## end
+
+-- ---------------------------------------------------------------------------
+-- Lifecycle.
+
+local iroh_started: boolean = false
+
+-- Bring up the iroh endpoint, once, on first iroh use -- NOT from net.init:
+-- gi_init starts a tokio runtime and an endpoint, and a build that only ever
+-- speaks TCP (every test today) must not pay for that.
+--
+-- The secret key path comes from GHOSTTY_IROH_KEY; unset means an ephemeral key
+-- and therefore a NodeId that changes on every restart, which is fine for a
+-- client and wrong for an agent that peers pin.
+local function iroh_ensure(): boolean
+  ## if NET_IROH then
+    if iroh_started then return true end
+    if gi_abi_version() ~= 1 then
+      err_code = GI_EINTERNAL
+      err_buf[0] = 0
+      return false
+    end
+    local key = getenv('GHOSTTY_IROH_KEY')
+    local rc = gi_init(key)
+    if rc ~= 0 then
+      iroh_fail(rc)
+      return false
+    end
+    iroh_started = true
+    return true
+  ## else
+    err_code = GI_EINTERNAL
+    err_buf[0] = 0
+    return false
+  ## end
+end
+
+-- True when this build can speak iroh at all. Callers pick a backend per link
+-- (see net.connect_node); this only says whether the choice exists.
+function net.iroh_available(): boolean
+  ## if NET_IROH then
+    return true
+  ## else
+    return false
+  ## end
+end
 
 function net.init(): boolean
   if net_started then return true end
@@ -87,8 +365,17 @@ function net.init(): boolean
 end
 
 -- Balance net.init: Winsock counts WSAStartup calls, and each core copy the
--- loader unloads must hand its reference back.
+-- loader unloads must hand its reference back. gi_init is refcounted the same
+-- way and gi_shutdown joins the runtime threads before returning, which is the
+-- whole point on Windows -- ghostty_core.dll must not unmap with a runtime
+-- thread alive.
 function net.shutdown(): void
+  ## if NET_IROH then
+    if iroh_started then
+      gi_shutdown()
+      iroh_started = false
+    end
+  ## end
   if not net_started then return end
   ## if ccinfo.is_windows then
     WSACleanup()
@@ -96,24 +383,18 @@ function net.shutdown(): void
   net_started = false
 end
 
-function net.invalid(): NetSocket
-  ## if ccinfo.is_windows then
-    return INVALID_SOCKET
-  ## else
-    return -1
-  ## end
-end
-
-function net.is_valid(s: NetSocket): boolean
-  return s ~= net.invalid()
-end
-
 function net.close(s: NetSocket): void
   if not net.is_valid(s) then return end
+  if is_iroh(s) then
+    ## if NET_IROH then
+      gi_close(iroh_of(s))
+    ## end
+    return
+  end
   ## if ccinfo.is_windows then
-    closesocket(s)
+    closesocket(csock_of(s))
   ## else
-    close(s)
+    close((@cint)(csock_of(s)))
   ## end
 end
 
@@ -133,18 +414,18 @@ local function would_block(err: cint): boolean
   ## end
 end
 
-local function set_nonblocking(s: NetSocket): boolean
+local function set_nonblocking(c: CSocket): boolean
   ## if ccinfo.is_windows then
     local one: culong = 1
-    return ioctlsocket(s, FIONBIO, &one) == 0
+    return ioctlsocket(c, FIONBIO, &one) == 0
   ## else
     -- close-on-exec as well: a process the agent starts (a shell, a
     -- clipboard tool, an app) must not inherit connections, or a closed one
     -- stays half-open for as long as that process lives
-    fcntl(s, F_SETFD, FD_CLOEXEC)
-    local flags = fcntl(s, F_GETFL, 0)
+    fcntl(c, F_SETFD, FD_CLOEXEC)
+    local flags = fcntl(c, F_GETFL, 0)
     if flags < 0 then return false end
-    return fcntl(s, F_SETFL, flags | O_NONBLOCK) >= 0
+    return fcntl(c, F_SETFL, flags | O_NONBLOCK) >= 0
   ## end
 end
 
@@ -161,35 +442,87 @@ local function parse_ipv4(host: string, port: uint16, out: *sockaddr_in): boolea
 end
 
 -- A connection attempt in progress.
+--
+-- `.sock` and `.connected` are the only fields callers read
+-- (core/agent_client.nelua:103-111, agent/agent.nelua:606-614). `.addr` is the
+-- TCP backend's private state and is meaningless for an iroh link: there is no
+-- re-issued connect() to poll and a 32-byte NodeId does not fit a sockaddr_in,
+-- so the iroh half keeps nothing beyond the tagged handle in `.sock`.
 global NetConn = @record{ sock: NetSocket, addr: sockaddr_in, connected: boolean }
 
--- Begin a non-blocking connect. Check `net.is_valid(conn.sock)` for failure.
+-- Begin a non-blocking TCP connect. Check `net.is_valid(conn.sock)` for failure.
 function net.connect(host: string, port: uint16): NetConn
   net.init()
   local conn: NetConn
   conn.sock = net.invalid()
   if not parse_ipv4(host, port, &conn.addr) then return conn end
-  local s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
-  if not net.is_valid(s) then return conn end
-  set_nonblocking(s)
+  local c = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+  if c == csock_invalid() then return conn end
+  set_nonblocking(c)
   local one: cint = 1
-  setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, #cint)
-  conn.sock = s
-  local r = connect(s, (@*sockaddr)(&conn.addr), #sockaddr_in)
+  setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, #cint)
+  conn.sock = tcp_sock(c)
+  local r = connect(c, (@*sockaddr)(&conn.addr), #sockaddr_in)
   if r == 0 then conn.connected = true return conn end
   local err = last_error()
   if would_block(err) then return conn end
-  net.close(s)
+  net.close(conn.sock)
   conn.sock = net.invalid()
+  return conn
+end
+
+-- Begin a non-blocking iroh connect to a z-base-32 NodeId. Same shape as
+-- net.connect: failure is `net.is_valid(conn.sock) == false`, and the result
+-- goes through the identical connect_poll/recv/send/close path.
+--
+-- How a caller picks: by what the link is addressed with, never by probing.
+-- docs/IROH.md ("Addressing a link") gives each entry in CONFIG.agents either
+-- `node` or `host`/`port`; `node` -> net.connect_node(node), `host`/`port` ->
+-- net.connect(host, port), both set -> an error at the config layer, not a
+-- fallback here, because a silent fallback hides exactly the failure the iroh
+-- path is meant to prove. Nothing in this file guesses.
+function net.connect_node(node: string): NetConn
+  local conn: NetConn
+  conn.sock = net.invalid()
+  ## if NET_IROH then
+    if #node == 0 then err_code = GI_EADDR err_buf[0] = 0 return conn end
+    if not iroh_ensure() then return conn end
+    local nz: string = node .. '\0'
+    local h = gi_connect((@cstring)(nz.data))
+    nz:destroy()
+    if h == 0 then
+      -- gi_connect fails by handle (bad NodeId, or before gi_init); the reason
+      -- is only in gi_last_error.
+      iroh_fail(GI_EADDR)
+      return conn
+    end
+    conn.sock = iroh_sock(h)
+  ## else
+    err_code = GI_EINTERNAL
+    err_buf[0] = 0
+  ## end
   return conn
 end
 
 -- Poll a pending connect. Returns 1 connected, 0 still pending, -1 failed.
 function net.connect_poll(conn: *NetConn): integer
   if conn.connected then return 1 end
+  if is_iroh(conn.sock) then
+    ## if NET_IROH then
+      local r = gi_connect_poll(iroh_of(conn.sock))
+      if r == 1 then conn.connected = true return 1 end
+      if r == 0 then return 0 end
+      -- The crate runs its own connect deadline below the caller's 5 s timer
+      -- (core/agent_client.nelua:657) and reports GI_ETIMEOUT itself.
+      return iroh_fail(r)
+    ## else
+      return -1
+    ## end
+  end
   -- Re-issuing connect() with the same address reports progress portably:
   -- EISCONN once established, EALREADY/EINPROGRESS while pending.
-  local r = connect(conn.sock, (@*sockaddr)(&conn.addr), #sockaddr_in)
+  local c = csock_of(conn.sock)
+  local r = connect(c, (@*sockaddr)(&conn.addr), #sockaddr_in)
   if r == 0 then conn.connected = true return 1 end
   local err = last_error()
   ## if ccinfo.is_windows then
@@ -205,29 +538,80 @@ function net.listen(host: string, port: uint16): NetSocket
   net.init()
   local addr: sockaddr_in
   if not parse_ipv4(host, port, &addr) then return net.invalid() end
-  local s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
-  if not net.is_valid(s) then return s end
+  local c = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP)
+  if c == csock_invalid() then return net.invalid() end
   local one: cint = 1
-  setsockopt(s, SOL_SOCKET, SO_REUSEADDR, &one, #cint)
-  if bind(s, (@*sockaddr)(&addr), #sockaddr_in) ~= 0 then net.close(s) return net.invalid() end
-  if listen(s, 16) ~= 0 then net.close(s) return net.invalid() end
-  set_nonblocking(s)
-  return s
+  setsockopt(c, SOL_SOCKET, SO_REUSEADDR, &one, #cint)
+  if bind(c, (@*sockaddr)(&addr), #sockaddr_in) ~= 0 then net.close(tcp_sock(c)) return net.invalid() end
+  if listen(c, 16) ~= 0 then net.close(tcp_sock(c)) return net.invalid() end
+  set_nonblocking(c)
+  return tcp_sock(c)
 end
 
+-- Start accepting iroh connections on this endpoint. `allowlist_path` is a file
+-- of z-base-32 node ids, one per line; empty means "any peer", leaving
+-- authorisation to the PROTO_HELLO token exactly as the TCP listener does.
+--
+-- This does NOT replace net.listen: the loopback TCP listener stays up
+-- regardless (agent/agent.nelua:745 has the Wayland capture helper connecting
+-- back over it). An agent that wants both holds two listen handles and calls
+-- net.accept on each.
+function net.listen_node(allowlist_path: string): NetSocket
+  ## if NET_IROH then
+    if not iroh_ensure() then return net.invalid() end
+    local h: gi_handle
+    if #allowlist_path == 0 then
+      h = gi_listen((@cstring)(nilptr))
+    else
+      local pz: string = allowlist_path .. '\0'
+      h = gi_listen((@cstring)(pz.data))
+      pz:destroy()
+    end
+    if h == 0 then iroh_fail(GI_EINTERNAL) return net.invalid() end
+    return iroh_sock(h)
+  ## else
+    err_code = GI_EINTERNAL
+    err_buf[0] = 0
+    return net.invalid()
+  ## end
+end
+
+-- Accept on either kind of listener. Invalid means "nothing pending" for both,
+-- which is the loop termination every caller already writes.
 function net.accept(s: NetSocket): NetSocket
-  local c = accept(s, nilptr, nilptr)
-  if net.is_valid(c) then
+  if is_iroh(s) then
+    ## if NET_IROH then
+      return iroh_sock(gi_accept(iroh_of(s)))
+    ## else
+      return net.invalid()
+    ## end
+  end
+  local c = accept(csock_of(s), nilptr, nilptr)
+  if c ~= csock_invalid() then
     set_nonblocking(c)
     local one: cint = 1
     setsockopt(c, IPPROTO_TCP, TCP_NODELAY, &one, #cint)
   end
-  return c
+  return tcp_sock(c)
 end
 
 -- Returns bytes read (>0), 0 when nothing is available, -1 on EOF/error.
+--
+-- Every GI_E* collapses to -1 here, deliberately: callers map -1 to a torn-down
+-- connection. Which GI_E* it was survives in net.last_error_code() /
+-- net.last_error() for the log line.
 function net.recv(s: NetSocket, buf: pointer, cap: usize): integer
-  local n = recv(s, buf, cap, 0)
+  if is_iroh(s) then
+    ## if NET_IROH then
+      local n = gi_recv(iroh_of(s), buf, cap)
+      if n > 0 then return n end
+      if n == 0 then return 0 end   -- GI_EAGAIN: nothing right now, retry
+      return iroh_fail(n)
+    ## else
+      return -1
+    ## end
+  end
+  local n = recv(csock_of(s), buf, cap, 0)
   if n > 0 then return n end
   if n == 0 then return -1 end
   if would_block(last_error()) then return 0 end
@@ -235,14 +619,112 @@ function net.recv(s: NetSocket, buf: pointer, cap: usize): integer
 end
 
 -- Returns bytes written (>=0) or -1 on error.
+--
+-- A full QUIC stream window is GI_EAGAIN -> 0, NOT -1: flush
+-- (core/agent_client.nelua:631-637) treats -1 as "connection lost" and tears
+-- the link down, while 0 means "stop, retry next frame". Partial writes are
+-- expected and already handled there.
 function net.send(s: NetSocket, buf: pointer, len: usize): integer
   if len == 0 then return 0 end
-  local n = send(s, buf, len, 0)
+  if is_iroh(s) then
+    ## if NET_IROH then
+      local n = gi_send(iroh_of(s), buf, len)
+      if n >= 0 then return n end   -- 0 included: window full, retry
+      return iroh_fail(n)
+    ## else
+      return -1
+    ## end
+  end
+  local n = send(csock_of(s), buf, len, 0)
   if n >= 0 then return n end
   if would_block(last_error()) then return 0 end
   return -1
 end
 
+-- The pollable fd for a TCP connection, unchanged.
+--
+-- For an iroh handle the honest answer is "there isn't one", and this returns
+-- -1 rather than inventing one. gi_wakeup_fd() exists, but it is ONE
+-- endpoint-wide, level-triggered "something, somewhere" signal, not this
+-- connection's readiness: returning it here would put the same fd in the poll
+-- array once per connection and claim a readiness it cannot know. -1 is also
+-- the value poll(2) ignores, so an iroh entry landing in the agent's flat
+-- fds[512] array (agent/agent.nelua:813-838) costs a slot and nothing else --
+-- and that loop never reads revents anyway, so the connection is still pumped
+-- every pass.
+--
+-- The agent adds net.iroh_wakeup_fd() ONCE, beside the sockets, and calls
+-- net.iroh_wakeup_drain() once per pass; net.iroh_wait_ms() shortens the sleep
+-- where there is no fd at all (Windows). Those are caller changes; this file
+-- only exposes them.
 function net.socket_fd(s: NetSocket): cint
-  return (@cint)(s)
+  if is_iroh(s) then return -1 end
+  return (@cint)(csock_of(s))
+end
+
+-- Endpoint-wide readiness, for the agent's wait loop. -1 when there is none
+-- (no iroh in this build, iroh not started, or a platform with no fd).
+function net.iroh_wakeup_fd(): cint
+  ## if NET_IROH then
+    if not iroh_started then return -1 end
+    return (@cint)(gi_wakeup_fd())
+  ## else
+    return -1
+  ## end
+end
+
+-- Windows manual-reset event for the same signal; nilptr when there is none.
+function net.iroh_wakeup_handle(): pointer
+  ## if NET_IROH then
+    if not iroh_started then return nilptr end
+    return gi_wakeup_handle()
+  ## else
+    return nilptr
+  ## end
+end
+
+-- Clear the wakeup; once per wait-loop pass.
+function net.iroh_wakeup_drain(): void
+  ## if NET_IROH then
+    if iroh_started then gi_wakeup_drain() end
+  ## end
+end
+
+-- How long the caller may sleep, <= cap_ms. Plugs into windows_cap the way
+-- windows:wait_ms does, so a platform with no fd still shortens its sleep.
+function net.iroh_wait_ms(cap_ms: cint): cint
+  ## if NET_IROH then
+    if not iroh_started then return cap_ms end
+    local ms = (@cint)(gi_wait_ms((@int32)(cap_ms)))
+    if ms < 0 or ms > cap_ms then return cap_ms end
+    return ms
+  ## else
+    return cap_ms
+  ## end
+end
+
+-- This endpoint's z-base-32 NodeId, empty when there is none. Caller owns it.
+function net.node_id(): string
+  ## if NET_IROH then
+    if not iroh_ensure() then return string.copy('') end
+    local buf: [64]cchar
+    buf[0] = 0
+    if gi_node_id((@cstring)(&buf), 64) < 0 then return string.copy('') end
+    return string.copy((@string)((@cstring)(&buf)))
+  ## else
+    return string.copy('')
+  ## end
+end
+
+-- The peer's z-base-32 NodeId for an iroh connection, empty for a TCP one.
+function net.peer_id(s: NetSocket): string
+  ## if NET_IROH then
+    if is_iroh(s) then
+      local buf: [64]cchar
+      buf[0] = 0
+      if gi_peer_id(iroh_of(s), (@cstring)(&buf), 64) < 0 then return string.copy('') end
+      return string.copy((@string)((@cstring)(&buf)))
+    end
+  ## end
+  return string.copy('')
 end

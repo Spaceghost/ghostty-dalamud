@@ -89,6 +89,7 @@ remote_env() {
   # SAN and its option strings travel too, so the sanitizer suites can run here
   # rather than on the machine the game is on.
   for v in SKIP_WIN SKIP_SHIM SKIP_UMBRA SKIP_DEPS SKIP_WAYLAND MAC BUILD_COMMIT BUILD_ID \
+           IROH IROH_CRATE_DIR RUST_WINDOWS_TARGET \
            SAN ASAN_OPTIONS UBSAN_OPTIONS LSAN_OPTIONS; do
     [[ -n "${!v:-}" ]] && e+=(--env "$v=${!v}")
   done

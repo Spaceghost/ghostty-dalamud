@@ -57,11 +57,27 @@ iroh_probe() {
 # when iroh is off, so an unconditional "$(iroh_host_ldflags)" is the no-op it
 # looks like.
 iroh_host_ldflags() {
-  [[ -n "$IROH_HOST_LIBDIR" ]] && printf ' -L"%s" -lghostty_iroh -lpthread -ldl -lm' "$IROH_HOST_LIBDIR"
+  # -lunwind: the shipped rust-std references _Unwind_* even with panic=abort,
+  # so the staticlib does not link without an unwinder (libunwind-devel is in
+  # BUILD_PKGS for it).
+  [[ -n "$IROH_HOST_LIBDIR" ]] && printf ' -L"%s" -lghostty_iroh -lpthread -ldl -lm -lunwind' "$IROH_HOST_LIBDIR"
   return 0
 }
 iroh_win_ldflags() {
   [[ -n "$IROH_WIN_LIBDIR" ]] && printf ' -L"%s" -lghostty_iroh %s' "$IROH_WIN_LIBDIR" "$IROH_WIN_SYSLIBS"
+  return 0
+}
+
+# Nelua needs to know whether the symbols are there to link against, not only
+# where to find them: code that declares gi_* unconditionally fails at link
+# when the crate is off. Guard it with `## if IROH then` and splice this in.
+# Prints nothing when iroh is off, so an unconditional use is a no-op.
+iroh_nelua_host_define() {
+  [[ -n "$IROH_HOST_LIBDIR" ]] && printf ' -DIROH'
+  return 0
+}
+iroh_nelua_win_define() {
+  [[ -n "$IROH_WIN_LIBDIR" ]] && printf ' -DIROH'
   return 0
 }
 
