@@ -222,8 +222,8 @@ local function check_frame(scr: *Screen, wid: uint32, n: integer, w: integer, h:
   local want: vector(uint8)
   local small: vector(uint8)
   capture_test_render(wid, n, w, h, &want)
-  local f, sw, sh = wincodec_downscale((@*[0]uint8)(&want[0]), (@usize)(w * 4), w, h, max_w, max_h, &small)
-  local src = f > 1 and (@*[0]uint8)(&small[0]) or (@*[0]uint8)(&want[0])
+  local scaled, sw, sh = wincodec_downscale_fit((@*[0]uint8)(&want[0]), (@usize)(w * 4), w, h, max_w, max_h, &small)
+  local src = scaled and (@*[0]uint8)(&small[0]) or (@*[0]uint8)(&want[0])
   local ok = scr.w == sw and scr.h == sh and same_rgb(src, (@*[0]uint8)(&scr.px[0]), sw * sh)
   want:destroy()
   small:destroy()
@@ -313,6 +313,27 @@ do
   winput(&c1, sid, WIN_INPUT_MOVE, &b, 4)
   local text = wlist(&c1)
   assert(text:find('pattern one: move 21 41', 1, true) > 0, 'a scaled pointer maps back (x2, box centre)')
+  text:destroy()
+  send_sid(&c1, PROTO_WCLOSE, sid)
+  scr.px:destroy()
+  title:destroy()
+end
+
+-- a limit that is not a whole-number fraction of the window: 320x200 into
+-- 240 wide arrives at 240x150, not halved to 160x100, and input still lands
+-- on the window pixel under the frame pixel
+do
+  local req, sid, w, h, title = wopen(&c1, 1, 240, 0, 30, '')
+  assert(w == 240 and h == 150, 'the largest size that fits, not the next whole factor')
+  local scr: Screen
+  local seq, key, area = recv_seq(&c1, sid, &scr, 3)
+  assert(seq == 1 and key and check_frame(&scr, 1, 1, 320, 200, 240, 0), 'a fractionally scaled KEY frame')
+  local b: [4]uint8
+  proto.put_u16(&b, 10)
+  proto.put_u16((@*[0]uint8)(&b[2]), 20)
+  winput(&c1, sid, WIN_INPUT_MOVE, &b, 4)
+  local text = wlist(&c1)
+  assert(text:find('pattern one: move 14 27', 1, true) > 0, 'x 10.5 * 4/3 = 14, y 20.5 * 4/3 = 27.3')
   text:destroy()
   send_sid(&c1, PROTO_WCLOSE, sid)
   scr.px:destroy()

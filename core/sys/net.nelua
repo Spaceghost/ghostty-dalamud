@@ -10,6 +10,7 @@
 -- NOTHING BELOW HAS BEEN COMPILED OR RUN. No build, no cargo, no test suite was
 -- executed for this file; the unverified list is in the worker's report.
 require 'string'
+require 'stringbuilder'
 
 -- Is the iroh backend compiled into this build?
 --
@@ -101,6 +102,14 @@ local function listen(s: CSocket, backlog: cint): cint <cimport, nodecl> end
 local function accept(s: CSocket, addr: *sockaddr, len: *cint): CSocket <cimport, nodecl> end
 local function send(s: CSocket, buf: pointer, len: csize, flags: cint): isize <cimport, nodecl> end
 local function recv(s: CSocket, buf: pointer, len: csize, flags: cint): isize <cimport, nodecl> end
+local function shutdown(s: CSocket, how: cint): cint <cimport, nodecl> end
+## if ccinfo.is_windows then
+local peerlen_t = @cint
+## else
+local peerlen_t <cimport 'socklen_t', nodecl> = @cuint
+## end
+local function getpeername(s: CSocket, addr: *sockaddr, len: *peerlen_t): cint <cimport, nodecl> end
+local function ntohs(v: uint16): uint16 <cimport, nodecl> end
 local function setsockopt(s: CSocket, level: cint, name: cint, val: pointer, len: cint): cint <cimport, nodecl> end
 local function getaddrinfo(node: cstring, service: cstring, hints: *addrinfo, res: **addrinfo): cint <cimport, nodecl> end
 local function freeaddrinfo(res: *addrinfo): void <cimport, nodecl> end
@@ -135,6 +144,7 @@ local TCP_NODELAY: cint <cimport, nodecl, const>
 ## cemitdecl [[gi_handle gi_listen(const char *allowlist_path);]]
 ## cemitdecl [[gi_handle gi_accept(gi_handle listener);]]
 ## cemitdecl [[int32_t   gi_peer_id(gi_handle h, char *out, size_t cap);]]
+## cemitdecl [[int32_t   gi_peer_caps(gi_handle h);]]
 ## cemitdecl [[int32_t   gi_recv(gi_handle h, void *buf, size_t cap);]]
 ## cemitdecl [[int32_t   gi_send(gi_handle h, const void *buf, size_t len);]]
 ## cemitdecl [[void      gi_close(gi_handle h);]]
@@ -153,6 +163,7 @@ local function gi_connect_poll(h: gi_handle): int32 <cimport, nodecl> end
 local function gi_listen(allowlist_path: cstring): gi_handle <cimport, nodecl> end
 local function gi_accept(listener: gi_handle): gi_handle <cimport, nodecl> end
 local function gi_peer_id(h: gi_handle, out: cstring, cap: csize): int32 <cimport, nodecl> end
+local function gi_peer_caps(h: gi_handle): int32 <cimport, nodecl> end
 local function gi_recv(h: gi_handle, buf: pointer, cap: csize): int32 <cimport, nodecl> end
 local function gi_send(h: gi_handle, buf: pointer, len: csize): int32 <cimport, nodecl> end
 local function gi_close(h: gi_handle): void <cimport, nodecl> end
@@ -660,6 +671,36 @@ function net.send(s: NetSocket, buf: pointer, len: usize): integer
   return -1
 end
 
+-- Where an accepted IPv4 connection comes from, "a.b.c.d:port"; '' when that
+-- is not known.
+function net.peer_address(s: NetSocket): string
+  -- An iroh peer has no IPv4 address to give: it is identified by its public
+  -- key, which net.peer_id answers. '' is already this function's word for
+  -- "not known", so there is nothing to invent here.
+  if is_iroh(s) then return (@string){} end
+  local a: sockaddr_in
+  local len: peerlen_t = #sockaddr_in
+  if getpeername(csock_of(s), (@*sockaddr)(&a), &len) ~= 0 or a.sin_family ~= (@cushort)(AF_INET) then return (@string){} end
+  local b = (@*[4]uint8)(&a.sin_addr)
+  local sb: stringbuilder
+  sb:writef('%d.%d.%d.%d:%d', (@integer)(b[0]), (@integer)(b[1]), (@integer)(b[2]), (@integer)(b[3]), (@integer)(ntohs(a.sin_port)))
+  return sb:promote()
+end
+
+-- Half-close: no more sends (the peer reads EOF), receiving goes on.
+function net.shutdown_write(s: NetSocket): void
+  -- Over iroh this is a no-op: the crate closes the send side when the
+  -- connection closes and exposes no half-close of its own, so a peer there
+  -- reads EOF at close rather than here. Callers that use the half-close as a
+  -- protocol signal need another one over iroh (docs/IROH.md).
+  if is_iroh(s) then return end
+  ## if ccinfo.is_windows then
+    shutdown(csock_of(s), 1) -- SD_SEND
+  ## else
+    shutdown(csock_of(s), 1) -- SHUT_WR
+  ## end
+end
+
 -- The pollable fd for a TCP connection, unchanged.
 --
 -- For an iroh handle the honest answer is "there isn't one", and this returns
@@ -738,6 +779,18 @@ function net.node_id(): string
   ## else
     return string.copy('')
   ## end
+end
+
+-- What the allowlist grants an iroh peer (GI_CAP_*), or <0 when it cannot be
+-- told -- which callers must treat as "no capabilities", not "all of them".
+-- A TCP socket has no allowlist behind it and answers -1 for the same reason:
+-- the caller decides what a connection with no grants means, and for the
+-- socket path the token is still the whole authorisation.
+function net.peer_caps(s: NetSocket): int32
+  ## if NET_IROH then
+    if is_iroh(s) then return gi_peer_caps(iroh_of(s)) end
+  ## end
+  return -1
 end
 
 -- The peer's z-base-32 NodeId for an iroh connection, empty for a TCP one.

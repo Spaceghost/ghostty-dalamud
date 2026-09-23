@@ -391,6 +391,70 @@ they were opened, wrapping; hidden panels are skipped. With none focused,
 camera turn. The result in `requests`: `{"id": panel}`, or `no world panel
 shown`.
 
+### cam.shoot
+
+```json
+{"method": "cam.shoot", "params": {"yaw": 0.4, "height": 1.5, "distance": 2.2}}
+```
+
+A photograph of the player from the hovering camera (docs/CAMERA.md). The pose
+is optional and in the camera's own terms: `yaw` radians around the character
+measured from the way they are facing (0 is straight in front of the face),
+`height` yalms above their feet, `distance` yalms out, `ease` how fast the
+camera moves there. Left out, it shoots from wherever the camera already is.
+
+The answer is the usual `{"queued": true, "request": N}`, and then a second
+wait: the camera has to reach the pose, the game has to draw a frame from
+there, and the frame has to be encoded. The picture shows up in `cam.state`'s
+`shots` against that same request id.
+
+The view is put back where it was found afterwards -- including being handed
+back entirely if the person was not already watching through the camera. The
+whole round trip is a handful of frames, which is the only reason this can be
+done at all: the game draws one view, so there is no second camera to read,
+only this one borrowed briefly.
+
+One shot at a time. A second while one is in flight is refused ("a shot is
+already being taken") rather than queued, because queueing pictures of a
+character who is walking away produces pictures of nothing in particular.
+
+### cam.set
+
+```json
+{"method": "cam.set", "params": {"on": true, "yaw": 2.6, "shot": false}}
+```
+
+Moves the camera, or puts it away, without taking a picture. The same pose
+fields as `cam.shoot`, plus `orbit` (radians per second, a slow circle),
+`on` (whether the camera exists at all) and `shot` (whether the view is the
+camera's, for as long as you like rather than for one frame).
+
+### cam.state
+
+```json
+{"method": "cam.state"}
+```
+
+```json
+{"ok": true, "result": {
+  "on": true, "shot": false, "placed": true, "steering": false,
+  "blocked": 0, "shooting": 0, "shots_rev": 3,
+  "distance": 2.2, "height": 1.5, "yaw": 0.4, "orbit": 0,
+  "x": 10.9, "y": 3.5, "z": 22.1,
+  "shots": [{"request": 1726732800001, "ok": true, "path": "...png", "error": ""}]
+}}
+```
+
+`blocked` is non-zero while the scene cannot hold the camera (a cutscene,
+group pose, a loading screen, no character). `shooting` is 0 when idle and
+otherwise says where a shot has got to: 1 aiming, 2 settling, 3 taking,
+4 returning the view. `shots` keeps the last 8 results, oldest first, and
+`shots_rev` changes when one lands -- poll that rather than the whole object.
+
+A shot that failed carries `error` and no `path`; the reasons a caller can
+act on are the camera never reaching the pose and the capture never being
+written.
+
 ### keys.reserve
 
 ```json

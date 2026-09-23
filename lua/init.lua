@@ -14,6 +14,7 @@ local themes = require('themes')
 local tooltips = require('tooltips')
 local windows = require('windows')
 local adopt = require('adopt')
+local lakitu = require('lakitu')
 local gallery = require('gallery')
 local native = require('native')
 
@@ -74,7 +75,7 @@ local config = {
     -- functions): /window pull | run CMD | list | close, /ask [question],
     -- /agent ask [question]. Their /help lines are in lua/tooltips.lua.
     -- A name another plugin holds is retried; {} registers none.
-    verb_commands = { ['/window'] = 'window', ['/ask'] = 'ask', ['/agent'] = 'agent' },
+    verb_commands = { ['/window'] = 'window', ['/ask'] = 'ask', ['/agent'] = 'agent', ['/cam'] = 'cam' },
     help = 'Show/hide the terminal. window [n|list|pull [match]|close] | new [n] | native [new [n]|off|status] | pin [here|me|target|orbit] | unpin | ask [question] | theme [name] | shot [panel] [clean] | clip [seconds] | share | config | reload',
     -- Server info bar entry. 'auto' shows it only while no Umbra toolbar
     -- widget is showing ghostty's status; 'always' | 'never'.
@@ -159,6 +160,10 @@ local config = {
   -- Terminals in game windows (/term native, the "Show as a game window"
   -- button): sizes, font and background: lua/native.lua (docs/NATIVE_UI.md).
   native = native,
+  -- The hovering camera (/term cam, docs/CAMERA.md): an object that floats on
+  -- an orbit around you, and -- with the shot on -- the view itself, since the
+  -- game renders only the one. Shots and the body model: lua/lakitu.lua.
+  lakitu = lakitu,
   -- The settings window (/term config) and its saved overrides (settings.lua).
   settings = settings,
   world_pins = {},

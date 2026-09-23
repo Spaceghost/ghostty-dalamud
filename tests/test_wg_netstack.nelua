@@ -1,0 +1,269 @@
+-- agent/wg_netstack.nelua: TCP through two WireGuard devices and two lwIP
+-- interfaces in one process, to a real socket on this machine's loopback,
+-- the way a game PC reaches the agent (docs/WIREGUARD.md "Forwards").
+--
+--   game side: WgTunnelConn -> netstack A (10.77.0.2) -> device A
+--   agent side: device B -> netstack B (10.77.0.1) -> forward -> 127.0.0.1:PORT
+--
+-- The loopback end is an echo server in this file, which can stop reading to
+-- make the tunnel push back.
+require 'string'
+require 'vector'
+require 'memory'
+require 'os'
+require 'core.protocol'
+require 'core.sys.net'
+require 'agent.crypto'
+require 'agent.wg_device'
+require 'agent.wg_netstack'
+
+local function usleep(us: cuint): cint <cimport, nodecl> end
+## cinclude '<unistd.h>'
+
+local Node = @record{ dev: WgDevice, ns: WgNetstack, ep: WgEndpoint }
+local Datagram = @record{ from: WgEndpoint, to: WgEndpoint, data: vector(uint8) }
+local net_q: vector(Datagram)
+local A: Node
+local B: Node
+
+local function node_send(ud: pointer, ep: *WgEndpoint, data: *[0]uint8, len: usize): void
+  local n = (@*Node)(ud)
+  local d: Datagram = { from = n.ep, to = $ep }
+  d.data:resize(len)
+  memory.copy(&d.data[0], data, len)
+  net_q:push(d)
+end
+local delivered, emitted, unrouted = 0, 0, 0
+local function node_deliver(ud: pointer, peer: *WgPeer, pkt: *[0]uint8, len: usize): void
+  local n = (@*Node)(ud)
+  delivered = delivered + 1
+  n.ns:input(pkt, len)
+end
+local function ns_output(ud: pointer, pkt: *[0]uint8, len: usize): void
+  local n = (@*Node)(ud)
+  emitted = emitted + 1
+  if not n.dev:send_packet(pkt, len, os.now()) then unrouted = unrouted + 1 end
+end
+local function wall(): (int64, int64) return 1800000000 + (@int64)(os.now()), 0 end
+
+local function cidr(s: string): WgCidr
+  local c: WgCidr
+  assert(wgp.parse_cidr(s, &c))
+  return c
+end
+
+local function node_init(n: *Node, port: uint16, addr: string): void
+  local sk: [32]uint8
+  assert(crypto.x25519_generate(&sk))
+  n.ep = { family = 4, port = port }
+  n.ep.addr[0], n.ep.addr[3] = 192, (@uint8)(port & 0xff)
+  n.dev.ud, n.dev.send, n.dev.deliver, n.dev.wall = n, node_send, node_deliver, wall
+  n.dev:init(&sk)
+  n.ns.ud, n.ns.output = n, ns_output
+  local a: WgCidr
+  assert(wgp.parse_iface(addr, &a))
+  assert(n.ns:init(&a, nilptr, 1420), 'netstack up')
+end
+
+node_init(&A, 40002, '10.77.0.2/24')
+node_init(&B, 51820, '10.77.0.1/24')
+local psk: [32]uint8
+assert(crypto.random(&psk, 32))
+local pb = A.dev:add_peer('agent', &B.dev.public, &psk)
+pb.endpoint = B.ep
+pb.allowed:push(cidr('10.77.0.1/32'))
+local pa = B.dev:add_peer('game', &A.dev.public, &psk)
+pa.allowed:push(cidr('10.77.0.2/32'))
+
+-- the loopback end: an echo server that can stop reading
+local srv_port: uint16 = (@uint16)(30000 + os.time() % 20000)
+local listen_sock = net.listen('127.0.0.1', srv_port)
+assert(net.is_valid(listen_sock), 'echo server listens')
+local srv_sock: NetSocket = net.invalid()
+local srv_q: ByteQueue
+local srv_eof = false
+local srv_reading = true
+local srv_got: usize = 0
+
+local function serve(): void
+  if not net.is_valid(srv_sock) then
+    srv_sock = net.accept(listen_sock)
+    return
+  end
+  if srv_reading and not srv_eof and srv_q:len() < 256 * 1024 then
+    local buf: [16384]uint8
+    local n = net.recv(srv_sock, &buf, 16384)
+    if n > 0 then srv_q:push(&buf, (@usize)(n)) srv_got = srv_got + (@usize)(n)
+    elseif n < 0 then srv_eof = true end
+  end
+  while srv_q:len() > 0 do
+    local n = net.send(srv_sock, srv_q:peek(), srv_q:len())
+    if n <= 0 then break end
+    srv_q:consume((@usize)(n))
+  end
+  if srv_eof and srv_q:len() == 0 and net.is_valid(srv_sock) then
+    net.close(srv_sock) -- the echo is done: close our side too
+    srv_sock = net.invalid()
+  end
+end
+
+local function step(): void
+  local now = os.now()
+  local guard = 0
+  while #net_q > 0 and guard < 10000 do
+    local d = net_q[0]
+    net_q:remove(0)
+    if d.to:same(&A.ep) then A.dev:receive(&d.from, (@*[0]uint8)(&d.data[0]), #d.data, now)
+    elseif d.to:same(&B.ep) then B.dev:receive(&d.from, (@*[0]uint8)(&d.data[0]), #d.data, now) end
+    d.data:destroy()
+    guard = guard + 1
+  end
+  A.dev:tick(now) B.dev:tick(now)
+  A.ns:pump(now) B.ns:pump(now)
+  serve()
+end
+
+-- the most the agent side held for the loopback socket at any moment
+local max_backlog: usize = 0
+local function backlog(): usize
+  local m: usize = 0
+  for i = 0, < #B.ns.flows do m = m + B.ns.flows[i].to_local:len() end
+  return m
+end
+
+-- 1. A connection through the tunnel to the forwarded port, 32 MB echoed back
+do
+  assert(B.ns:forward({ port = 7777, to = srv_port }), 'forward 7777')
+  local c: WgTunnelConn
+  local agent = cidr('10.77.0.1/32')
+  assert(A.ns:dial(&agent, 7777, &c), 'dial')
+  local total: usize = 32 * 1024 * 1024 -- more than the loopback socket buffers hold
+  local sent: usize = 0
+  local got: vector(uint8)
+  local deadline = os.now() + 120
+  local started = os.now()
+  local paused_at: number = 0
+  local shut = false
+  while #got < total and os.now() < deadline do
+    -- queue the next piece of the pattern
+    while c.connected and sent < total and c.outq:len() < 65536 do
+      local piece: [4096]uint8
+      for i = 0, < 4096 do piece[i] = (@uint8)(((sent + (@usize)(i)) * 7 + ((sent + (@usize)(i)) >> 11)) & 0xff) end
+      c.outq:push(&piece, 4096)
+      sent = sent + 4096
+    end
+    c:pump()
+    step()
+    -- once 1 MB has come back, the echo server stops reading for 3 s: the
+    -- loopback socket's buffers fill, and then the tunnel must hold back (a
+    -- closed TCP window) rather than queue without bound
+    if paused_at == 0 and c.inq:len() + #got >= 1024 * 1024 then paused_at = os.now() srv_reading = false end
+    if not srv_reading and os.now() - paused_at > 3 then srv_reading = true end
+    local b = backlog()
+    if b > max_backlog then max_backlog = b end
+    while c.inq:len() > 0 do
+      local n = c.inq:len()
+      local at = #got
+      got:resize(at + n)
+      memory.copy(&got[at], c.inq:peek(), n)
+      c.inq:consume(n)
+    end
+    if sent >= total and c.outq:len() == 0 and not shut then c:shutdown() shut = true end
+    if c.failed then
+      print('failed: lwIP error', c.err, 'sent', sent, 'got', #got, 'connected', c.connected, 'flows', #B.ns.flows,
+        'emitted', emitted, 'unrouted', unrouted, 'delivered', delivered, 'sessions', pb.current.valid, pa.current.valid)
+      error('the connection stays up')
+    end
+    usleep(200)
+  end
+  assert(#got == total, 'all of it came back')
+  for i: usize = 0, < total do
+    if got[i] ~= (@uint8)((i * 7 + (i >> 11)) & 0xff) then error('echoed byte differs') end
+  end
+  local report = ('32 MB through the tunnel and back in %.1f s; while the reader paused, the agent side held at most %d bytes'):format(os.now() - started, max_backlog)
+  print(report)
+  report:destroy()
+  assert(max_backlog > 0, 'the pause reached the tunnel')
+  assert(max_backlog <= 256 * 1024 + 65536, 'back-pressure: bounded by the TCP window, not by the data')
+  -- half-close: our FIN reached the echo server, which closed, and that FIN came back
+  local until_eof = os.now() + 5
+  while not c.eof and os.now() < until_eof do step() usleep(500) end
+  assert(c.eof, 'the far side\'s FIN came back through the tunnel')
+  c:close()
+  got:destroy()
+  local settle = os.now() + 2
+  while #B.ns.flows > 0 and os.now() < settle do step() usleep(500) end
+  assert(#B.ns.flows == 0, 'the forwarded connection is gone on both sides')
+end
+
+-- 2. A port nobody listens on locally: the tunnel side is reset
+do
+  local closed: uint16 = srv_port + 1
+  assert(B.ns:forward({ port = 7778, to = closed }))
+  local c: WgTunnelConn
+  local agent = cidr('10.77.0.1/32')
+  assert(A.ns:dial(&agent, 7778, &c))
+  local deadline = os.now() + 5
+  while not c.failed and os.now() < deadline do step() usleep(500) end
+  assert(c.failed, 'refused locally means reset in the tunnel')
+  c:close()
+end
+
+-- 3. A port that is not forwarded at all: lwIP answers RST, as any host would
+do
+  local c: WgTunnelConn
+  local agent = cidr('10.77.0.1/32')
+  assert(A.ns:dial(&agent, 9, &c))
+  local deadline = os.now() + 5
+  while not c.failed and os.now() < deadline do step() usleep(500) end
+  assert(c.failed and not c.connected, 'not forwarded: refused')
+  c:close()
+end
+
+-- 4. The agent side cannot be spoofed: a packet claiming another source is dropped
+do
+  local fake: [40]uint8
+  memory.zero(&fake, 40)
+  fake[0], fake[3], fake[8], fake[9] = 0x45, 40, 64, 6
+  fake[12], fake[13], fake[14], fake[15] = 10, 77, 0, 99
+  fake[16], fake[17], fake[18], fake[19] = 10, 77, 0, 1
+  A.dev:send_packet(&fake, 40, os.now()) -- a routes by destination and sends it
+  step()
+  assert(#B.ns.flows == 0, 'nothing opened from a spoofed source')
+end
+
+-- 5. A UDP forward (Sunshine's video and audio are UDP): tunnel datagrams to
+-- a loopback UDP echo and the answers back to the sender's address and port
+do
+  local echo: WgUdp
+  local eport: uint16 = srv_port + 2
+  assert(echo:open(eport), 'udp echo')
+  assert(B.ns:forward({ udp = true, port = 7070, to = eport }))
+  local u: WgTunnelUdp
+  assert(A.ns:udp_open(&u))
+  local agent = cidr('10.77.0.1/32')
+  local ping: string = 'moonlight says hello'
+  assert(A.ns:udp_send(&u, &agent, 7070, (@*[0]uint8)(ping.data), ping.size))
+  local deadline = os.now() + 5
+  while u.count == 0 and os.now() < deadline do
+    step()
+    local buf: [2048]uint8
+    local from: WgEndpoint
+    local n = echo:recv(&buf, 2048, &from)
+    if n > 0 then echo:send(&from, &buf, (@usize)(n)) end
+    usleep(500)
+  end
+  assert(u.count == 1 and #u.got == ping.size and memory.equals(&u.got[0], ping.data, ping.size), 'the echo came back through the tunnel')
+  assert(#B.ns.uflows == 1, 'one flow for one sender')
+  u:close()
+  echo:close()
+end
+
+net.close(listen_sock)
+if net.is_valid(srv_sock) then net.close(srv_sock) end
+srv_q:destroy()
+A.ns:destroy() B.ns:destroy()
+A.dev:destroy() B.dev:destroy()
+for i = 0, < #net_q do net_q[i].data:destroy() end
+net_q:destroy()
+print('test_wg_netstack OK')
