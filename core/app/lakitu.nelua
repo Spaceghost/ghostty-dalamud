@@ -1,0 +1,373 @@
+-- The hovering camera (docs/CAMERA.md): one client-side background object on
+-- an orbit around the character, and -- while the shot is on -- the game's
+-- own camera moved onto that same orbit, so what you see is what the object
+-- sees. lua/lakitu.lua decides the framing; this module makes the object,
+-- moves it, and borrows and returns the view.
+--
+-- The object follows the rules the other client-side props follow
+-- (core/app/deskprops.nelua): created lazily, transformed only once its model
+-- has loaded, a model that never loads given up on with one warning, freed
+-- whenever the scene cannot hold it. Only this client sees it and it has no
+-- collision.
+--
+-- The view is borrowed the way world panels borrow it (core/app/worldview.nelua)
+-- and never at the same time: a panel being presented outranks the camera,
+-- because the person asked for that one just now.
+require 'math'
+require 'core.desk'  -- desk_yaw_quat: the same +Y turn the other client-side props use
+require 'core.world'
+require 'core.lakitu'
+require 'core.app.state'
+
+local CREATE_RETRY_FRAMES: uint64 <comptime> = 300
+local LOAD_TIMEOUT_FRAMES: uint64 <comptime> = 600
+local LOAD_RETRY_FRAMES: uint64 <comptime> = 1800
+local HANDED_BACK: float32 <comptime> = 0.01 -- radians: close enough to let go
+
+local obj: pointer = nilptr
+local obj_model: [256]cchar
+local obj_serial: uint32 = 0
+local born: uint64 = 0
+local ready = false
+local retry_at: uint64 = 0
+local frame: uint64 = 1
+local warned = false
+local territory: uint32 = 0
+
+local spin: float32 = 0          -- accumulated `orbit`, radians
+local az: float32 = 0            -- the body's azimuth, eased toward its mark
+local az_live = false            -- `az` means something (not the first frame)
+local last_now: float64 = 0
+
+-- The view, while we have it.
+local steering = false
+local giving_back = false
+local saved_h: float32 = 0
+local saved_v: float32 = 0
+local saved_d: float32 = 0
+
+-- How the game's dir_h/dir_v relate to world angles. Both are read off the
+-- live camera rather than assumed: dir_h is a rotation offset, so one sample
+-- fixes it exactly, and dir_v's sign is settled by watching the person move
+-- their own camera (a guess here is a camera that flips upside down).
+local cal_h: float32 = 0
+local cal_h_ok = false
+local cal_v_slope: float32 = 1
+local cal_v_off: float32 = 0
+local cal_v_ok = false
+local cal_v_dv: float32 = 0
+local cal_v_elev: float32 = 0
+local cal_v_have = false
+
+local function available(): boolean
+  return host.api.bg_create ~= nilptr and host.api.bg_ready ~= nilptr
+    and host.api.bg_set_transform ~= nilptr and host.api.bg_destroy ~= nilptr
+end
+
+local function can_steer(): boolean
+  return host.api.get_camera_state ~= nilptr and host.api.set_camera_state ~= nilptr
+end
+
+local function warn_once(msg: string): void
+  if warned then return end
+  warned = true
+  log(LOG_WARN, msg)
+end
+
+-- The shortest way round from `a` to `b`.
+local function wrap(a: float32): float32
+  while a > math.pi do a = a - (@float32)(2 * math.pi) end
+  while a < -math.pi do a = a + (@float32)(2 * math.pi) end
+  return a
+end
+
+local function ease(from: float32, to: float32, rate: float32, dt: float32): float32
+  if rate <= 0 or dt <= 0 then return to end
+  local k = (@float32)(1 - math.exp(-rate * dt))
+  if k > 1 then k = 1 end
+  return from + (to - from) * k
+end
+
+local function ease_angle(from: float32, to: float32, rate: float32, dt: float32): float32
+  local d = wrap(to - from)
+  if rate <= 0 or dt <= 0 then return from + d end
+  local k = (@float32)(1 - math.exp(-rate * dt))
+  if k > 1 then k = 1 end
+  return from + d * k
+end
+
+local function obj_free(): void
+  if obj ~= nilptr and host.api.bg_destroy ~= nilptr then host.api.bg_destroy(obj) end
+  obj, ready = nilptr, false
+end
+
+-- Give the view back at once, without easing: teardown and the blocked cases,
+-- where easing something that is about to stop drawing is worse than a jump.
+local function drop_view(): void
+  if steering and can_steer() and saved_d > 0 then
+    host.api.set_camera_state(saved_h, saved_v, saved_d)
+  end
+  steering, giving_back, saved_d = false, false, 0
+end
+
+global function lakitu_destroy_all(): void
+  obj_free()
+  obj_serial = 0
+  territory = 0
+  az_live = false
+  lakitu_live = {}
+end
+
+global function lakitu_teardown(): void
+  drop_view()
+  lakitu_destroy_all()
+  lakitu_off()
+  lakitu_block = 0
+  warned = false
+end
+
+-- Why the camera may not show now. Unlike the desk scene this does not mind
+-- combat or a mount: a call does not end because a mob turned up.
+local function blocked(have_pc: boolean): cint
+  local f: cint = 0
+  if host.api.scene_flags ~= nilptr then f = host.api.scene_flags() & 15 end
+  if not have_pc then f = f | LAKITU_BLOCK_NO_CHARACTER end
+  return f
+end
+
+-- Read the live camera and keep the two calibrations current. Called only
+-- while we are NOT steering, so every sample is the person's own camera.
+local function calibrate(pc: *GuObject, dh: float32, dv: float32, dist: float32): void
+  local cam: GuCamera
+  if host.api.get_camera == nilptr or host.api.get_camera(&cam) == 0 then return end
+  local ok, ex, ey, ez = world_camera_position(&cam)
+  if not ok then return end
+  local dx, dz = ex - pc.x, ez - pc.z
+  local flat = (@float32)(math.sqrt(dx * dx + dz * dz))
+  if flat < 0.05 then return end -- straight overhead: the azimuth means nothing
+
+  cal_h = wrap((@float32)(math.atan(dx, dz)) - dh)
+  cal_h_ok = true
+
+  -- Elevation of the eye above the character's feet, as an angle.
+  local elev = (@float32)(math.atan(ey - pc.y, flat))
+  if cal_v_have and math.abs(dv - cal_v_dv) > 0.05 then
+    local slope = (elev - cal_v_elev) / (dv - cal_v_dv)
+    -- only the sign and rough scale are believable frame to frame
+    if math.abs(slope) > 0.2 and math.abs(slope) < 5 then
+      cal_v_slope = slope
+      cal_v_off = elev - slope * dv
+      cal_v_ok = true
+    end
+  end
+  cal_v_dv, cal_v_elev, cal_v_have = dv, elev, true
+  if not cal_v_ok then cal_v_off = elev - cal_v_slope * dv end
+end
+
+-- Once per frame while a character is in the world.
+global function lakitu_sync(now: float64): void
+  defer frame = frame + 1 end
+  local dt = (@float32)(last_now > 0 and now - last_now or 0)
+  if dt < 0 or dt > 0.25 then dt = 0 end -- a stall, a loading screen: no leap
+  last_now = now
+
+  local pc: GuObject
+  local have_pc = host.api.get_object ~= nilptr
+    and host.api.get_object(WORLD_PLAYER, 0, &pc) ~= 0 and pc.found ~= 0
+  lakitu_block = blocked(have_pc)
+
+  -- A scene that cannot hold the camera takes it away at once: easing
+  -- something that is about to stop being drawn is worse than a jump.
+  if lakitu_block ~= 0 then
+    if steering or giving_back then drop_view() end
+    if obj ~= nilptr then obj_free() end
+    az_live = false
+    lakitu_live = {}
+    return
+  end
+  -- Switched off is different: the body goes, but the view is handed back the
+  -- gentle way below, because the person is still standing there watching it.
+  local want_body = lakitu_want.on
+  if not want_body then
+    if obj ~= nilptr then obj_free() end
+    az_live = false
+    lakitu_live = {}
+  end
+  if territory ~= 0 and pc.territory ~= territory then obj_free() end
+  territory = pc.territory
+
+  -- Where the camera wants to be: an azimuth around the character, turning
+  -- with them, plus whatever `orbit` has wound up so far.
+  if want_body then
+    spin = spin + lakitu_want.orbit * dt
+    spin = wrap(spin)
+    local mark = wrap(pc.rotation + lakitu_want.yaw + spin)
+    if not az_live then
+      az, az_live = mark, true
+    else
+      az = wrap(ease_angle(az, mark, lakitu_want.ease, dt))
+    end
+
+    local bx = pc.x + (@float32)(math.sin(az)) * lakitu_want.distance
+    local bz = pc.z + (@float32)(math.cos(az)) * lakitu_want.distance
+    local by = pc.y + lakitu_want.height
+    lakitu_live.x, lakitu_live.y, lakitu_live.z = bx, by, bz
+    lakitu_live.azimuth = az
+
+    -- -- the body ----------------------------------------------------------
+    if lakitu_want.model[0] ~= 0 and available() then
+      if obj ~= nilptr and obj_serial ~= lakitu_want.serial then obj_free() end
+      if obj == nilptr and frame >= retry_at then
+        obj = host.api.bg_create((@cstring)(&lakitu_want.model[0]))
+        if obj == nilptr then
+          retry_at = frame + CREATE_RETRY_FRAMES
+          warn_once('cam: could not create the camera body (lua/lakitu.lua model)')
+        else
+          obj_model = lakitu_want.model
+          obj_serial = lakitu_want.serial
+          born, ready = frame, false
+        end
+      end
+      if obj ~= nilptr and not ready then
+        if host.api.bg_ready(obj) ~= 0 then
+          ready = true
+        elseif frame - born >= LOAD_TIMEOUT_FRAMES then
+          warn_once('cam: the camera body model did not load (lua/lakitu.lua model)')
+          obj_free()
+          retry_at = frame + LOAD_RETRY_FRAMES
+        end
+      end
+      if obj ~= nilptr and ready then
+        -- turned to look back at the character: facing is (sin, 0, cos), so the
+        -- way home from the body is the body's azimuth turned half a circle.
+        local qy, qw = desk_yaw_quat(wrap(az + (@float32)(math.pi)))
+        local s = lakitu_want.scale
+        if host.api.bg_set_transform(obj, bx, by, bz, 0, qy, 0, qw, s, s, s) == 0 then
+          obj_free()
+          retry_at = frame + CREATE_RETRY_FRAMES
+          warn_once('cam: could not place the camera body')
+        else
+          lakitu_live.placed = true
+        end
+      end
+    elseif obj ~= nilptr then
+      obj_free() -- the model was taken away: a camera with no body still works
+    end
+  end -- want_body
+
+  -- -- the shot -----------------------------------------------------------
+  if not can_steer() then
+    lakitu_live.steering, lakitu_live.giving_back = false, false
+    return
+  end
+  local dh: float32, dv: float32, dist: float32, dmin: float32
+  if host.api.get_camera_state(&dh, &dv, &dist, &dmin) == 0 then return end
+
+  -- A panel being presented outranks us: the person asked for that just now.
+  if host.cam_active or host.cam_restore then
+    -- It gives the view back itself, so ours is stale: let go of it entirely
+    -- rather than yanking the camera somewhere the person did not ask for.
+    if steering or giving_back then steering, giving_back, saved_d = false, false, 0 end
+    lakitu_live.steering, lakitu_live.giving_back = false, false
+    return
+  end
+
+  if not lakitu_want.shot then
+    if steering then
+      steering, giving_back = false, true
+    end
+    if giving_back then
+      if saved_d <= 0 then
+        giving_back = false
+      else
+        local nh = ease_angle(dh, saved_h, lakitu_want.ease, dt)
+        local nv = ease(dv, saved_v, lakitu_want.ease, dt)
+        local nd = ease(dist, saved_d, lakitu_want.ease, dt)
+        host.api.set_camera_state(nh, nv, nd)
+        if math.abs(wrap(nh - saved_h)) < HANDED_BACK and math.abs(nv - saved_v) < HANDED_BACK
+           and math.abs(nd - saved_d) < 0.05 then
+          giving_back, saved_d = false, 0
+        end
+      end
+    else
+      calibrate(&pc, dh, dv, dist)
+    end
+    lakitu_live.steering, lakitu_live.giving_back = false, giving_back
+    return
+  end
+
+  if not steering then
+    -- Take it, remembering exactly what to hand back.
+    calibrate(&pc, dh, dv, dist)
+    saved_h, saved_v, saved_d = dh, dv, dist
+    steering, giving_back = true, false
+    if not cal_h_ok then
+      warn_once('cam: the camera position is not readable; the shot may be turned round')
+    end
+  end
+
+  -- The eye goes where the body is. `dist` is the orbit radius, which is what
+  -- `distance` already means, and the elevation follows from `height`.
+  local want_h = wrap(az - cal_h)
+  local flat = lakitu_want.distance
+  local elev = (@float32)(math.atan(lakitu_want.height, flat > 0.05 and flat or 0.05))
+  local want_v = (elev - cal_v_off) / (cal_v_slope ~= 0 and cal_v_slope or 1)
+  local want_d = lakitu_want.distance
+  if want_d < dmin then want_d = dmin end
+
+  host.api.set_camera_state(
+    ease_angle(dh, want_h, lakitu_want.ease, dt),
+    ease(dv, want_v, lakitu_want.ease, dt),
+    ease(dist, want_d, lakitu_want.ease, dt))
+  lakitu_live.steering, lakitu_live.giving_back = true, false
+end
+
+-- /term cam [on|off|shot|body|left|right|up|down|in|out|orbit|still|reset]
+-- The framing is three numbers, so the words are all nudges of them and a
+-- person can find a shot without a menu.
+global function lakitu_command(args: string): cint
+  local a = args
+  if #a == 0 or a == 'on' then
+    lakitu_want.on = true
+  elseif a == 'off' then
+    lakitu_want.on, lakitu_want.shot = false, false
+  elseif a == 'shot' then
+    lakitu_want.on = true
+    lakitu_want.shot = not lakitu_want.shot
+  elseif a == 'body' then
+    lakitu_want.on = true
+    lakitu_want.shot = false
+  elseif a == 'left' then
+    lakitu_want.yaw = wrap(lakitu_want.yaw - 0.4)
+  elseif a == 'right' then
+    lakitu_want.yaw = wrap(lakitu_want.yaw + 0.4)
+  elseif a == 'up' then
+    lakitu_want.height = lakitu_want.height + 0.3
+  elseif a == 'down' then
+    lakitu_want.height = lakitu_want.height - 0.3
+  elseif a == 'in' then
+    lakitu_want.distance = lakitu_want.distance - 0.5
+    if lakitu_want.distance < 0.5 then lakitu_want.distance = 0.5 end
+  elseif a == 'out' then
+    lakitu_want.distance = lakitu_want.distance + 0.5
+    if lakitu_want.distance > 20 then lakitu_want.distance = 20 end
+  elseif a == 'orbit' then
+    lakitu_want.orbit = lakitu_want.orbit ~= 0 and 0 or (@float32)(0.15)
+  elseif a == 'still' then
+    lakitu_want.orbit = 0
+  elseif a == 'reset' then
+    local on, shot, model, serial = lakitu_want.on, lakitu_want.shot, lakitu_want.model, lakitu_want.serial
+    lakitu_want = lakitu_defaults()
+    lakitu_want.on, lakitu_want.shot, lakitu_want.model, lakitu_want.serial = on, shot, model, serial
+    spin = 0
+  else
+    log(LOG_WARN, '/term cam [on|off|shot|body|left|right|up|down|in|out|orbit|still|reset]')
+    return 4
+  end
+  if not lakitu_want.on then lakitu_want.shot = false end
+  logf(LOG_INFO, 'cam: %s, shot %s, %.1f yalms, %.1f up, yaw %.2f%s',
+       lakitu_want.on and 'on' or 'off', lakitu_want.shot and 'on' or 'off',
+       lakitu_want.distance, lakitu_want.height, lakitu_want.yaw,
+       lakitu_want.orbit ~= 0 and ', orbiting' or '')
+  return 0
+end
