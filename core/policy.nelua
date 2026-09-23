@@ -807,8 +807,9 @@ global function policy_world_kind(id: integer): string
   return kind
 end
 
--- CONFIG.world.place(terminal_id, time, focused) -> placement table or nil (hidden).
-global function policy_world_place(id: integer, t: float64, focused: boolean): (boolean, WorldPlacement)
+-- CONFIG.world.place(terminal_id, time, focused, held) -> placement table or
+-- nil (hidden). `held`: the pointer is on it (it holds still to be read).
+global function policy_world_place_held(id: integer, t: float64, focused: boolean, held: boolean): (boolean, WorldPlacement)
   local pl: WorldPlacement
   local L = policy.L
   if L == nilptr or not policy.loaded then return false, pl end
@@ -816,8 +817,9 @@ global function policy_world_place(id: integer, t: float64, focused: boolean): (
   lua_pushinteger(L, id)
   lua_pushnumber(L, t)
   lua_pushboolean(L, focused and 1 or 0)
+  lua_pushboolean(L, held and 1 or 0)
   local ok = false
-  if lua_pcall(L, 3, 1, 0) ~= LUA_OK then
+  if lua_pcall(L, 4, 1, 0) ~= LUA_OK then
     log_hook_error(L, POLICY_HOOK_PLACE, 'world.place')
   elseif lua_type(L, -1) == LUA_TTABLE then
     local r: cint = lua_gettop(L)
@@ -852,6 +854,11 @@ global function policy_world_place(id: integer, t: float64, focused: boolean): (
   end
   lua_pop(L, 3)
   return ok, pl
+end
+
+-- CONFIG.world.place(terminal_id, time, focused) -> placement table or nil (hidden).
+global function policy_world_place(id: integer, t: float64, focused: boolean): (boolean, WorldPlacement)
+  return policy_world_place_held(id, t, focused, false)
 end
 
 -- CONFIG.world.lighting() -> r, g, b, backlight: the world's light on a panel,

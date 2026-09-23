@@ -62,6 +62,16 @@ internal unsafe struct GuHostApi
     public delegate* unmanaged[Cdecl]<GuHudRect*, int, int> HudRects;
     public delegate* unmanaged[Cdecl]<int, byte*, byte*, byte*, byte*, byte*, nuint, int> HttpPost;
     public delegate* unmanaged[Cdecl]<int> Indoor;
+    // characters near yours (players, NPCs, chocobos), for pets to make room
+    public delegate* unmanaged[Cdecl]<GuCharacter*, int, int> NearbyCharacters;
+}
+
+// Mirrors GuCharacter in core/world.nelua.
+[StructLayout(LayoutKind.Sequential)]
+internal struct GuCharacter
+{
+    public float X, Y, Z, Radius;
+    public ulong EntityId;
 }
 
 // Mirrors GuHudRect in core/hudmask.nelua.

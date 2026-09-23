@@ -772,6 +772,29 @@ do
   print('mappy OK')
 end
 
+-- ghostty.nearby_characters (core/app/ipc.nelua): nil without the shim's
+-- forwarder; with it, the characters as a reused table
+do
+  assert(luaL_loadstring(policy.L, "assert(ghostty.nearby_characters() == nil, 'no forwarder: nil')") == LUA_OK
+    and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, 'nearby_characters without the shim')
+  local function fake_nearby(out: *[0]GuCharacter, cap: cint): cint
+    assert(cap >= 2)
+    out[0] = { x = 11, y = 0, z = 21, radius = 0.5, entity_id = 900 }
+    out[1] = { x = 14, y = 1, z = 20, radius = 0.8, entity_id = 901 }
+    return 2
+  end
+  host.api.nearby_characters = fake_nearby
+  assert(luaL_loadstring(policy.L, [[
+    local t = ghostty.nearby_characters()
+    assert(t and t.n == 2 and t[1].x == 11 and t[1].z == 21 and t[1].id == 900 and t[2].r > 0.79 and t[2].id == 901, 'two characters')
+    local first = t[1]
+    local u = ghostty.nearby_characters(t)
+    assert(u == t and u[1] == first, 'the table and its entries are reused')
+  ]]) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, 'nearby_characters with the shim')
+  host.api.nearby_characters = nilptr
+  print('nearby characters OK')
+end
+
 gu_shutdown()
 free(win) free(ctx) free(events)
 print('test_adopt_app OK')

@@ -851,6 +851,7 @@ global function draw_world(now: float64): void
   local diag_q: [4]ImVec2
   local look_on = false
   local look_x: float32, look_y: float32, look_z: float32 = 0, 0, 0
+  host.world_hover, host.world_hover_now = host.world_hover_now, 0
   for i = 0, < #host.world do
     local s = host.world[i]
     -- each panel glitches in when it appears or wakes, and out before it closes
@@ -858,7 +859,7 @@ global function draw_world(now: float64): void
     if s.appear < appear_target then s.appear = math.min(appear_target, s.appear + wdt * 2.0)
     elseif s.appear > appear_target then s.appear = math.max(appear_target, s.appear - wdt * 2.6) end
     local prez = host.world_rez * s.appear
-    local ok, pl = policy_world_place(s.id, now, host.world_focus == s.id)
+    local ok, pl = policy_world_place_held(s.id, now, host.world_focus == s.id, host.world_hover == s.id)
     if not ok then diag_hidden = diag_hidden + 1 end
     -- the full-screen terminal (or the one flying back) takes the screen's size
     local full_this = s.id == host.world_full_id or (host.world_full_id == 0 and s.id == host.world_full_last)
@@ -942,6 +943,8 @@ global function draw_world(now: float64): void
         local grip = 0
         if uok and ft <= 0 then grip = world_grip_at(&cam, &b, pl.width, pl.height, mu, mv) end
         -- the panel an Alt press would pick up (its grips too), and how far out along the ray it is held
+        -- the pointer on it: held still next frame, so its text can be read
+        if hovered and host.world_hover_now == 0 and not over_window then host.world_hover_now = s.id end
         if (hovered or grip ~= 0) and ft <= 0 and prez > 0.9 and host.world_visible and not over_window and ray_ok then
           local gx, gy, gz = world_point(&b, mu, mv)
           drag_in.hover_id, drag_in.hover_u, drag_in.hover_v = s.id, mu, mv

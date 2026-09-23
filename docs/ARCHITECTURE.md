@@ -257,12 +257,15 @@ snapped back every frame.
   moment) rather than resting against it for good. Stacked pets now also sit
   `pet.stack_depth` further out per step back round you: two panels a step
   apart on the same circle cross each other, one behind the other do not.
-* **You and your target.** Besides the old personal-space radius about your
-  centre (half the panel's width + 0.6), a pet's footprint keeps
-  `collide.body` from your middle and from your current target's
-  (`ghostty.target()`). Other characters and NPCs you have not targeted are
-  **not** avoided: the shim gives Lua no way to list nearby objects, only you,
-  your target and objects by entity id.
+* **You, and other characters.** A pet keeps out of your personal space
+  (half its width + 0.6 about your centre, and `collide.body` from your
+  middle) at once. Other characters are not walls: `ghostty.nearby_characters()`
+  (the shim walks Dalamud's IObjectTable for players, battle and event NPCs
+  and chocobos within 15 yalms at most ten times a second; nil in an older
+  shim, where your target stands in) lists them, and a pet makes room only for
+  someone who stays in its place for `collide.dwell` seconds, and goes back
+  once they have been gone `collide.dwell_out` seconds. Someone walking
+  through is let pass.
 * **The world.** `ghostty.raycast` (the shim's `BGCollisionModule.RaycastMaterialFilter`,
   the background collision the game's own ScreenToWorld uses). Two parts:
   * *Where a pet goes* (`probe_world`, on the spring's target, never its
@@ -279,17 +282,32 @@ snapped back every frame.
     once it has been hidden half a second), a few places a frame within the
     budget, so a search can take several frames. Rays down and up keep it off
     floors, ledges and ceilings.
-  * *Never seen inside anything* (end of `M.place_pet`). A pet only moves along
-    a clear path: whenever it has moved `collide.recheck` from the last pose
-    known clear, rays go along the way it came (its middle both ways, both
-    edges) and along its face at the new pose. Anything there and it blinks:
-    it shrinks to nothing where it was clear (`collide.blink` seconds), jumps
-    while hidden to the place the search found, once that place is itself
-    checked clear, and grows back in there, landing with a squash. At rest its
-    face is looked at again `collide.probe_hz` times a second (along it, and
-    from your chest, because a face buried in a thick wall has nothing to hit
-    along it); found in something, it is gone at once, not shrinking in it. A
-    pet with no rays left this frame holds still rather than move unchecked.
+  * *Never seen inside anything* (end of `M.place_pet`). A pet only moves
+    along a clear path: whenever it has moved `collide.recheck` from the last
+    pose known clear, rays go along the way it came (its middle both ways,
+    both edges) and along its face at the new pose, near its bottom and top
+    edges. When anything is there it looks for a way round first, judged
+    `collide.lookahead` yalms ahead toward where it is going (a way that fits
+    one step but not the pillar after it is none), a few ways a frame:
+    - *squeeze*: the same move at 0.7, 0.5 or 0.35 of its size; it shrinks
+      (squished narrow and tall), slips through, and springs back to size with
+      a little overshoot once its full size fits again;
+    - *float*: straight up where it is by up to `collide.float` yalms with
+      nothing overhead, then on at that height; down again once the pose
+      below is clear. Tried first when only the bottom of its face is blocked
+      (a crate, a low wall), after the others otherwise;
+    - *shuffle*: aside where it is (toward you, along its face, or both) and
+      on from there, both legs clear; it goes along that line, a step at a time.
+    Only when none is found for `collide.stuck` seconds, or the ways it takes
+    lead no nearer its place (squeezing and shuffling along a wall with its
+    place beyond it), does it *blink*: it shrinks to nothing where it was
+    clear (`collide.blink` seconds), jumps while hidden to the place the search
+    found, once that place is itself checked clear, and grows back in there,
+    landing with a squash. At rest its face is looked at again
+    `collide.probe_hz` times a second (along it, and from your chest, because a
+    face buried in a thick wall has nothing to hit along it); found in
+    something, it is gone at once, not shrinking in it. A pet with no rays
+    left this frame holds still rather than move unchecked.
     All pets together cast at most `collide.rays` rays a frame. `/term world
     rays [SECONDS]` logs, per pet and frame, the rays cast, the hits and what
     the search decided; the `world` selftest suite records what the collision
@@ -310,27 +328,37 @@ How they move (`CONFIG.world.pet.cute`, `pet.follow`, `CONFIG.world.motion`):
   substeps of at most 1/120 s and short enough that `h * w <= 0.5`, a frame
   taken as at most 0.1 s. It never gains energy, whatever the stiffness or the
   frame rate, and 30, 60, 144 fps and a ragged frame rate trace the same curve.
-* The bob is two sines at an irrational ratio, each pet at its own pace (0.85
-  to 1.15 of `cute.bob_speed`, from its phase), so no two bob in step; a
-  focused pet bobs a quarter as much. An idle sway, a small tilt of its own
-  (`cute.tilt`), a fan per step back for stacked pets (`cute.fan`, and the row
-  beside a focused pet starts every other tier half a brick along instead of
-  in columns), a little extra height per step back (`cute.nestle`), and a
-  bank into sideways movement (`cute.lean`) are summed into the placement's
-  `roll` through a spring of their own. A focused pet eases to still and
-  straight.
-* Squash: a spring of its own (`m_sq`), kicked by contacts (at most every
-  quarter second), by a fall that stops and by a move that stops, and
-  stretched while rising or falling fast; never beyond +-0.14. The placement
-  carries it as `squash`; `world_basis` makes the panel wider by 1 + squash
-  and shorter by the same factor, and everything that works from the basis
-  (projection, hit tests, the depth test) follows.
-* A procession: each pet is `follow.stagger` softer on its spring than the one
-  before it in the order (at most 45 % softer), so they set off and stop one
-  after another.
-* `CONFIG.world.motion.reduce` (Settings, Pets: Reduce motion) turns off the
-  bob, sway, tilt, fan, lean, squash and the procession, and the springs
-  settle without overshoot. Collision stays on.
+* Calm by default (the first in-game try found them "way too flubbery"): the
+  follow springs are near-critically damped (`pet.damping` 0.95; a step is
+  followed without overshooting by more than 2 %, `tests/test_motion.lua`), the
+  roll spring and the HUD springs are damped the same way.
+* The bob is two sines at an irrational ratio, each pet at its own slow pace
+  (0.85 to 1.15 of `cute.bob_speed`, 0.6 rad/s, from its phase), at most
+  `pet.bob` (2 cm) up and down, so no two bob in step. An idle sway, a small
+  tilt of its own (`cute.tilt`), a fan per step back for stacked pets
+  (`cute.fan`, and the row beside a focused pet starts every other tier half a
+  brick along instead of in columns), a little extra height per step back
+  (`cute.nestle`), and a slight bank into sideways movement (`cute.lean`) are
+  summed into the placement's `roll` through a spring of their own and never
+  go past `cute.max_tilt` (2 degrees).
+* Held still to be read: a pet you are typing into (keyboard focus) or
+  pointing at (the core passes the panel under the pointer last frame as
+  `held` to `CONFIG.world.place`) eases in a few frames to no bob, no tilt
+  and no squash, so its text never moves while you read it.
+* Squash: a spring of its own (`m_sq`), kicked only by real events (a
+  contact, at most every quarter second; a fall that stops; popping back
+  after a squeeze or a blink), never by stops or turns, and never past 4 %
+  (`SQUASH_MAX`). The placement carries it as `squash`; `world_basis` makes
+  the panel wider by 1 + squash and shorter by the same factor, and
+  everything that works from the basis (projection, hit tests, the depth test)
+  follows.
+* A procession: each pet is `follow.stagger` (0.04) softer on its spring
+  than the one before it in the order, so they set off and stop one after
+  another.
+* `CONFIG.world.motion.reduce` (Settings, Pets: Reduce motion) is a true
+  zero: no bob, sway, tilt, fan, lean, squash or procession, and the springs
+  settle without overshoot. Collision, squeezing and blinking stay, since they
+  are what keeps a pet out of walls.
 
 State kept on an anchor for this starts with `m_` and is never saved.
 

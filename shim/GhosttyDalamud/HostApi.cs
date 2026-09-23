@@ -93,6 +93,7 @@ internal static unsafe class HostApi
         Api->HudRects       = &HudRects;
         Api->HttpPost       = &HttpPost;
         Api->Indoor         = &Indoor;
+        Api->NearbyCharacters = &NearbyCharacters;
     }
 
     public static void Free()
@@ -832,6 +833,55 @@ internal static unsafe class HostApi
         try {
             var h = FFXIVClientStructs.FFXIV.Client.Game.HousingManager.Instance();
             return h != null && h->IndoorTerritory != null ? 1 : 0;
+        } catch { return 0; }
+    }
+
+    // Characters within NearbyReach yalms of yours, nearest first (players,
+    // battle and event NPCs, chocobos; not you): position and hitbox radius.
+    // The object table is walked at most every NearbyEvery seconds and the
+    // answer kept, so a pet asking every frame costs a copy. Called from the
+    // plugin's Draw, on the game's main thread, as GetObject is.
+    private const float NearbyReach = 15f;
+    private const double NearbyEvery = 0.1;
+    private const int NearbyMax = 32;
+    private static readonly GuCharacter[] NearbyCache = new GuCharacter[NearbyMax];
+    private static int nearbyCount;
+    private static long nearbyAt;
+
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int NearbyCharacters(GuCharacter* outp, int cap)
+    {
+        try {
+            long now = System.Diagnostics.Stopwatch.GetTimestamp();
+            if (now - nearbyAt > (long)(NearbyEvery * System.Diagnostics.Stopwatch.Frequency)) {
+                nearbyAt = now;
+                nearbyCount = 0;
+                if (Plugin.Objects.LocalPlayer is { } me) {
+                    var at = me.Position;
+                    var found = new System.Collections.Generic.List<(float d, GuCharacter c)>(16);
+                    foreach (var o in Plugin.Objects) {
+                        if (o == null || o.Address == me.Address) continue;
+                        var k = o.ObjectKind;
+                        if (k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Player
+                            && k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.BattleNpc
+                            && k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.EventNpc
+                            && k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Companion) continue;
+                        if (!o.IsTargetable && k != Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Player) continue;
+                        float dx = o.Position.X - at.X, dz = o.Position.Z - at.Z;
+                        float d = MathF.Sqrt(dx * dx + dz * dz);
+                        if (d > NearbyReach) continue;
+                        found.Add((d, new GuCharacter {
+                            X = o.Position.X, Y = o.Position.Y, Z = o.Position.Z,
+                            Radius = MathF.Max(o.HitboxRadius, 0.3f), EntityId = o.GameObjectId,
+                        }));
+                    }
+                    found.Sort((a, b) => a.d.CompareTo(b.d));
+                    for (int i = 0; i < found.Count && i < NearbyMax; i++) NearbyCache[nearbyCount++] = found[i].c;
+                }
+            }
+            int n = Math.Min(nearbyCount, cap);
+            for (int i = 0; i < n; i++) outp[i] = NearbyCache[i];
+            return n;
         } catch { return 0; }
     }
 

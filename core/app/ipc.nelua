@@ -382,6 +382,37 @@ local function l_raycast(L: *lua_State): cint
   return 4
 end
 
+-- ghostty.nearby_characters([t]) -> t with t.n and t[1..n] = { x, y, z, r, id }:
+-- the characters near yours, nearest first (the shim reads the object table at
+-- most ten times a second). Fills and reuses t and its entries when given one.
+-- nil in an older shim (lua/world.lua then makes room for your target only).
+local function l_nearby_characters(L: *lua_State): cint
+  if host.api.nearby_characters == nilptr then lua_pushnil(L) return 1 end
+  local buf: [32]GuCharacter
+  local n = host.api.nearby_characters(&buf, 32)
+  if n < 0 then n = 0 end
+  if n > 32 then n = 32 end
+  if lua_type(L, 1) == LUA_TTABLE then lua_pushvalue(L, 1) else lua_createtable(L, n, 1) end
+  local t = lua_gettop(L)
+  lua_pushinteger(L, n) lua_setfield(L, t, 'n')
+  for i = 0, < n do
+    lua_rawgeti(L, t, i + 1)
+    if lua_type(L, -1) ~= LUA_TTABLE then
+      lua_pop(L, 1)
+      lua_createtable(L, 0, 5)
+      lua_pushvalue(L, -1)
+      lua_rawseti(L, t, i + 1)
+    end
+    lua_pushnumber(L, buf[i].x) lua_setfield(L, -2, 'x')
+    lua_pushnumber(L, buf[i].y) lua_setfield(L, -2, 'y')
+    lua_pushnumber(L, buf[i].z) lua_setfield(L, -2, 'z')
+    lua_pushnumber(L, buf[i].radius) lua_setfield(L, -2, 'r')
+    lua_pushinteger(L, (@lua_Integer)(buf[i].entity_id)) lua_setfield(L, -2, 'id')
+    lua_pop(L, 1)
+  end
+  return 1
+end
+
 -- ghostty.world_panels() -> { {id, window, focused}, ... } in host.world order,
 -- without panels already glitching out
 local function l_world_panels(L: *lua_State): cint
@@ -712,6 +743,7 @@ global function ipc_lua_register(L: *lua_State): void
   lua_pushcclosure(L, l_status, 0) lua_setfield(L, -2, 'status')
   lua_pushcclosure(L, l_world_panels, 0) lua_setfield(L, -2, 'world_panels')
   lua_pushcclosure(L, l_raycast, 0) lua_setfield(L, -2, 'raycast')
+  lua_pushcclosure(L, l_nearby_characters, 0) lua_setfield(L, -2, 'nearby_characters')
   lua_pushcclosure(L, l_panel_focus, 0) lua_setfield(L, -2, 'panel_focus')
   lua_pushcclosure(L, l_panel_hide, 0) lua_setfield(L, -2, 'panel_hide')
   lua_pushcclosure(L, l_panel_toggle_pet, 0) lua_setfield(L, -2, 'panel_toggle_pet')

@@ -34,7 +34,7 @@ M.pet = {
   side = 1.45,           -- radians from the character's heading to its side (pi/2 = square to the side)
   step = 0.55,           -- radians between pets stacked on the same side
   stiffness = 5.0,       -- spring stiffness: higher follows more tightly
-  damping = 0.8,         -- 1 = settle with no overshoot; lower swings like a pendulum before settling
+  damping = 0.95,        -- 1 = settle with no overshoot; lower swings like a pendulum before settling
   walk_speed = 0.6,      -- yalms per second above which the character counts as moving
   run_speed = 5.5,       -- yalms per second at which run_back is fully applied (running is ~6)
   run_back = 0.35,       -- radians the slots swing further back while running
@@ -43,7 +43,7 @@ M.pet = {
   stack_out = 1.1,       -- yalms further out per pet pair that no longer fits beside you
   stack_depth = 0.55,    -- yalms further out per step back round you: a stacked pet sits behind the
                          -- one before it, not through it (two panels a step apart round you cross)
-  bob = 0.035,           -- vertical bob in yalms (each pet on its own beat: M.pet.cute)
+  bob = 0.02,            -- vertical bob in yalms, up and down (each pet on its own beat: M.pet.cute)
   drift = 0.0,           -- radians they wander (small, so a focused pet holds still)
   curve = 9.0,           -- curve radius in yalms (concave toward the character); larger = flatter, 0 = flat
   gap = 0.3,             -- minimum yalms between neighbouring pets
@@ -98,22 +98,24 @@ M.pet = {
   -- in the order, so they follow like a small procession and set off and stop
   -- one after another.
   follow = {
-    stagger = 0.08,      -- each place in the order is this much softer on its spring (at most 45 % softer)
+    stagger = 0.04,      -- each place in the order is this much softer on its spring (at most 45 % softer)
   },
-  -- The pets' character: a gentle bob on each pet's own beat (M.pet.bob is how
-  -- high), a lean it sways on, a small tilt of its own, stacked pets fanned out
-  -- a little, a bank into sideways movement, and a squash when they bump or
-  -- land that wobbles and settles. A focused pet holds still and straight.
+  -- The pets' character, kept calm: a slow bob on each pet's own beat (M.pet.bob
+  -- is how high), a lean it barely sways on, a small tilt of its own, stacked
+  -- pets fanned out a little, a slight bank into sideways movement, and a small
+  -- squash when they bump or land. A pet you are typing into or pointing at
+  -- holds still and straight, so its text never moves while you read it.
   -- M.motion.reduce turns all of it off.
   cute = {
-    bob_speed = 0.9,     -- radians per second of the bob (each pet a little faster or slower)
-    sway = 0.018,        -- radians of idle lean
-    tilt = 0.03,         -- radians each pet keeps tilted, its own way
-    fan = 0.045,         -- radians more per step back that a stacked pet fans out
+    bob_speed = 0.6,     -- radians per second of the bob (each pet a little faster or slower): slow
+    sway = 0.008,        -- radians of idle lean
+    tilt = 0.012,        -- radians each pet keeps tilted, its own way
+    fan = 0.012,         -- radians more per step back that a stacked pet fans out
     nestle = 0.12,       -- yalms higher per step back, so stacked pets peek over each other
-    lean = 0.02,         -- radians of bank per yalm/s of sideways movement
-    max_lean = 0.1,      -- radians
-    squash = 1.0,        -- how much bumps and landings squash a pet (0 = none)
+    lean = 0.006,        -- radians of bank per yalm/s of sideways movement
+    max_lean = 0.02,     -- radians
+    max_tilt = 0.035,    -- radians all of the above together never go past (2 degrees)
+    squash = 1.0,        -- how much bumps and landings squash a pet (0 = none; never more than 4 %)
   },
   -- Keeping out of the way: pets never pass through each other, other world
   -- panels, your character or your target, and never show inside the game's
@@ -137,6 +139,11 @@ M.pet = {
     swing = 1.2,         -- radians a pet may swing round you to find room before squeezing in
     swing_step = 0.3,    -- radians per try
     bounce = 0.25,       -- of the speed into a contact that comes back out
+    float = 1.5,         -- yalms a pet may float up to pass over something low
+    stuck = 0.3,         -- seconds a pet looks for a way round (squeeze, float, shuffle) before it blinks
+    lookahead = 0.8,     -- yalms ahead a way round must be clear for
+    dwell = 1.2,         -- seconds a character must stay in a pet's place before it makes room
+    dwell_out = 1.0,     -- seconds they must have been gone before it goes back
     recheck = 0.04,      -- yalms a pet moves before its path and face are looked at again
     blink = 0.12,        -- seconds a blink out (and in again) takes
     trace = false,       -- log what the rays find, per pet, every frame (/term world rays)
@@ -214,7 +221,7 @@ M.drag = {
 M.hud = {
   distance = 1.6,     -- yalms in front of the camera (the panel keeps its screen size at any distance)
   stiffness = 14,     -- spring stiffness: higher follows the camera more tightly
-  damping = 0.75,     -- 1 = settles with no overshoot; lower wobbles a little first
+  damping = 0.95,     -- 1 = settles with no overshoot; lower wobbles a little first
   tilt = 0.10,        -- radians the panel lags in facing per rad/s the camera turns
   roll = 0.06,        -- radians it banks per rad/s the camera turns sideways
   drag = 0.025,       -- screen fractions it slides back per rad/s the camera turns
@@ -1007,6 +1014,7 @@ local spread
 -- Keeping out of the way (M.pet.collide) and the pets' character (M.pet.cute) --------
 
 local EMPTY = {}
+local SQUASH_MAX = 0.04 -- a pet is never squashed or stretched by more than 4 %
 
 -- Whether pets look at the game's collision: collision and the world on, and a
 -- core that has ghostty.raycast.
@@ -1117,6 +1125,10 @@ local function probe_world(a, p, t, ang, dist, y, hw, hh, curve, min_r, swing, u
   end
   local margin = col.margin or 0.15
   local ox, oy, oz = p.x, p.y + (col.chest or 1.1), p.z
+  -- looked at with the skin M.place_pet keeps round it, so a place found here
+  -- is one it can be shown at
+  local skin = 2 * (col.recheck or 0.04)
+  hw, hh = hw + skin, hh + skin
   local cols = motion.columns(hw, col.spacing or 0.45, 9)
   local cost = place_cost(cols)
   local step = math.max(col.swing_step or 0.3, 0.05)
@@ -1224,24 +1236,217 @@ local function contact(a, nx, nz, depth, x, z, t)
   if into > 0.3 and gain > 0 and not (M.motion and M.motion.reduce)
      and (not a.m_kick or t - a.m_kick > 0.25 or t < a.m_kick) then
     a.m_kick = t
-    motion.squash_kick(a, math.min(into, 4) * 0.9 * gain)
+    motion.squash_kick(a, math.min(into, 4) * 0.25 * gain)
   end
   return x, z
 end
 
--- Your target (another character, or an NPC you are talking to): pets keep
--- out of it as they keep out of you. Once per frame.
-local function target_at(t, p)
-  if M._tt ~= t then
-    M._tt = t
-    M._tbuf = M._tbuf or {}
-    local tg = ghostty.target and ghostty.target(M._tbuf) or nil
-    if tg and tg.entity_id ~= p.entity_id and (tg.x - p.x) ^ 2 + (tg.z - p.z) ^ 2 < 400 then M._tg = tg else M._tg = nil end
+-- The characters near yours, once per frame (ghostty.nearby_characters: players,
+-- NPCs, chocobos). An older shim has no list: your target stands in for it.
+local function characters_at(t, p)
+  if M._chr_t ~= t then
+    M._chr_t = t
+    local list = ghostty.nearby_characters and ghostty.nearby_characters(M._chr) or nil
+    if list then
+      M._chr = list
+    else
+      local c = M._chr_fb or { n = 0, {} }
+      M._chr_fb, M._chr = c, c
+      M._tbuf = M._tbuf or {}
+      local tg = ghostty.target and ghostty.target(M._tbuf) or nil
+      c.n = 0
+      if tg and tg.entity_id ~= p.entity_id and (tg.x - p.x) ^ 2 + (tg.z - p.z) ^ 2 < 400 then
+        local e = c[1]
+        e.x, e.y, e.z, e.r, e.id = tg.x, tg.y, tg.z, 0.5, tg.entity_id
+        c.n = 1
+      end
+    end
   end
-  return M._tg
+  return M._chr
 end
 
-function M.place_pet(id, a, p, t, focused)
+-- Characters are not walls: a pet does not dodge someone passing through its
+-- place, only someone who stays there (M.pet.collide.dwell seconds), and it
+-- goes back once they have been gone a while (dwell_out), so it never flickers
+-- between the two. Each pet keeps, per character, when they came into its
+-- place and whether it is making room: a.m_chr[id] = { in_at, seen, room }.
+-- Pushes the slot target (tx, tz) clear of every character it makes room for.
+local function make_room(a, t, p, tx, tz, hw, curve)
+  local col = M.pet.collide or EMPTY
+  local list = characters_at(t, p)
+  if not list or (list.n == 0 and not a.m_chr) then return tx, tz end
+  local tyaw = yaw_towards(tx, tz, p.x, p.z)
+  local ax0, az0, ax1, az1 = motion.footprint(tx, tz, tyaw, hw, curve) -- where it wants to be
+  local recs = a.m_chr
+  local body = col.body or 0.55
+  for i = 1, list.n do
+    local c = list[i]
+    local d = motion.point_seg(c.x, c.z, ax0, az0, ax1, az1)
+    local over = d < body + (c.r or 0.5) * 0.5
+    local rec = recs and recs[c.id]
+    if over then
+      if not recs then recs = {} a.m_chr = recs end
+      if not rec then rec = { in_at = t, seen = t, room = false } recs[c.id] = rec end
+      if not rec.in_at then rec.in_at = t end
+      rec.seen = t
+      if not rec.room and t - rec.in_at >= (col.dwell or 1.2) then rec.room = true end
+    elseif rec then
+      if rec.room then
+        if t - rec.seen >= (col.dwell_out or 1.0) then rec.room, rec.in_at = false, nil end
+      elseif t - rec.seen > 0.3 then
+        rec.in_at = nil -- passed through: the next stay counts from the start
+      end
+    end
+    if rec and rec.room then
+      local fx0, fz0, fx1, fz1 = motion.footprint(tx, tz, tyaw, hw, curve)
+      local depth, nx, nz = motion.point_push(c.x, c.z, body + (c.r or 0.5) * 0.5 + 0.05, fx0, fz0, fx1, fz1, tx - p.x, tz - p.z)
+      if depth > 0 then tx, tz = tx + nx * depth, tz + nz * depth end
+    end
+  end
+  -- forget characters long gone
+  if recs then
+    for cid, rec in pairs(recs) do
+      if t - rec.seen > 5 or t < rec.seen then recs[cid] = nil end
+    end
+    if next(recs) == nil then a.m_chr = nil end
+  end
+  return tx, tz
+end
+
+-- Ways round something in a pet's path (M.place_pet), tried before a blink.
+-- Each is looked at from the pose last known clear (cx, cy, cz, cyaw) to the
+-- pose the spring wanted this frame (x, y, z, yaw):
+--   squeeze f   the same move at f of its size (then it shrinks and goes)
+--   float d     straight up d yalms where it is, and the move from up there
+--               (then it floats up and over, and comes down once clear)
+--   shuffle     the move shifted a little along its face or toward you
+-- The order depends on what is in the way: low things (the bottom of its face
+-- blocked, the top clear) are floated over first; everything else squeezed
+-- through first. A few ways a frame within the ray budget; `a.m_wi` says how
+-- far the search got, false once every way has been tried.
+-- shuffles: along its face (its right) and toward you, from where it is
+local SHUFFLES = {
+  { 'shuffle', 0, 0.35 }, { 'shuffle', -0.35, 0.35 }, { 'shuffle', 0.35, 0.35 },
+  { 'shuffle', 0, 0.7 }, { 'shuffle', -0.35, 0.7 }, { 'shuffle', 0.35, 0.7 },
+  { 'shuffle', -0.35, 0 }, { 'shuffle', 0.35, 0 },
+}
+local SQUEEZES = { { 'squeeze', 0.7 }, { 'squeeze', 0.5 }, { 'squeeze', 0.35 } }
+local FLOATS = { { 'float', 0.35 }, { 'float', 0.7 }, { 'float', 1.1 }, { 'float', 1.5 } }
+local function ways(...)
+  local out = {}
+  for _, list in ipairs({ ... }) do for _, w in ipairs(list) do out[#out + 1] = w end end
+  return out
+end
+local WAYS_LOW = ways(FLOATS, SQUEEZES, SHUFFLES)
+local WAYS = ways(SQUEEZES, SHUFFLES, FLOATS)
+
+-- hw, hh: its full size; hw_k, hh_k: the size it is drawn at now.
+local function find_way(a, p, t, x, y, z, yaw, hw, hh, hw_k, hh_k, curve)
+  local col = M.pet.collide or EMPTY
+  if a.m_wi == false then return false end
+  local cx, cy, cz, cyaw = a.m_cx, a.m_cy, a.m_cz, a.m_cyaw
+  if not a.m_wk then
+    if rays_left(t) < 4 then return false end
+    -- what is in the way: along the face low and high, both ways
+    local low = not motion.span_clear(cast, x, y - 0.9 * hh_k, z, yaw, hw_k, 0, curve, 1, true)
+    local high = not motion.span_clear(cast, x, y + 0.9 * hh_k, z, yaw, hw_k, 0, curve, 1, true)
+    a.m_wk = (low and not high) and 1 or 2
+  end
+  local list = a.m_wk == 1 and WAYS_LOW or WAYS
+  local margin = col.margin or 0.15
+  local float_max = col.float or 1.5
+  while true do
+    local i = a.m_wi + 1
+    local way = list[i]
+    if not way then a.m_wi = false return false end
+    local kind = way[1]
+    if kind == 'squeeze' then
+      local f = way[2]
+      if f < (a.m_sqz_goal or 1) - 0.01 then
+        if rays_left(t) < 8 then return false end
+        if motion.path_clear(cast, cx, cy, cz, cyaw, x, y, z, yaw, hw * f, curve, 0.02)
+           and motion.span_clear(cast, x, y, z, yaw, hw * f, hh * f, curve, 2, false) then
+          a.m_sqz_goal = f
+          if not (M.motion and M.motion.reduce) then motion.squash_kick(a, -0.2 * ((M.pet.cute or EMPTY).squash or 1)) end
+          return true
+        end
+      end
+    elseif kind == 'float' then
+      local d = way[2]
+      if (a.m_lift or 0) + d <= float_max + 1e-6 then
+        if rays_left(t) < 13 then return false end
+        -- up where it is, nothing overhead, and the move clear from up there
+        local up = cast(cx, cy + hh_k, cz, 0, 1, 0, d + margin)
+        if not up
+           and motion.path_clear(cast, cx, cy, cz, cyaw, cx, cy + d, cz, cyaw, hw_k, curve, 0.02)
+           and motion.path_clear(cast, cx, cy + d, cz, cyaw, x, y + d, z, yaw, hw_k, curve, 0.02)
+           and motion.span_clear(cast, x, y + d, z, yaw, hw_k, hh_k, curve, 2, false) then
+          a.m_lift = (a.m_lift or 0) + d
+          a.m_rise_to = cy + d
+          return true
+        end
+      end
+    else -- shuffle: aside first where it is, then on from there
+      local sa, sr = way[2], way[3]
+      if rays_left(t) < 12 then return false end
+      local rx, rz = cos(cyaw), -sin(cyaw)
+      local ux, uz = p.x - cx, p.z - cz
+      local ul = math.sqrt(ux * ux + uz * uz)
+      if ul > 1e-3 then ux, uz = ux / ul, uz / ul end
+      local ox, oz = rx * sa + ux * sr, rz * sa + uz * sr
+      local ax, az = cx + ox, cz + oz                     -- aside
+      local ayaw = yaw_towards(ax, az, p.x, p.z)
+      local sx, sz = x + ox, z + oz                       -- and on
+      local syaw = yaw_towards(sx, sz, p.x, p.z)
+      if motion.path_clear(cast, cx, cy, cz, cyaw, ax, cy, az, ayaw, hw_k, curve, 0.02)
+         and motion.path_clear(cast, ax, cy, az, ayaw, sx, y, sz, syaw, hw_k, curve, 0.02)
+         and motion.span_clear(cast, sx, y, sz, syaw, hw_k, hh_k, curve, 2, false) then
+        local nx, nz = (a.m_shx or 0) + ox, (a.m_shz or 0) + oz
+        local nl = math.sqrt(nx * nx + nz * nz)
+        if nl > 1.2 then nx, nz = nx / nl * 1.2, nz / nl * 1.2 end
+        a.m_shx, a.m_shz = nx, nz
+        -- the clear line it was looked at along is the way it goes, a step at a time
+        a.m_via_x, a.m_via_y, a.m_via_z = ax, cy, az
+        return true
+      end
+    end
+    a.m_wi = i
+  end
+end
+
+-- Back to normal once the way is behind it: the shuffle fades out, and a few
+-- times a second, a while after the last way was taken, it tries its full size
+-- again (springing back with a little pop) and coming back down, each only
+-- when that is clear where it is.
+local function relax_ways(a, p, t, dt, hw, hh, hw_k, hh_k, curve)
+  local col = M.pet.collide or EMPTY
+  local calm = not a.m_way_t or t - a.m_way_t > 0.6 or t < a.m_way_t
+  if not calm then return end
+  if a.m_shx then
+    local k = math.exp(-dt / 1.0)
+    a.m_shx, a.m_shz = a.m_shx * k, a.m_shz * k
+    if math.abs(a.m_shx) + math.abs(a.m_shz) < 0.01 then a.m_shx, a.m_shz = nil, nil end
+  end
+  if (a.m_sqz_goal or a.m_lift) and t - (a.m_rt or -1e9) >= 1 / math.max(col.probe_hz or 10, 0.5) then
+    a.m_rt = t
+    local cx, cy, cz, cyaw = a.m_cx, a.m_cy, a.m_cz, a.m_cyaw
+    if a.m_sqz_goal and rays_left(t) >= 8 then
+      if motion.span_clear(cast, cx, cy, cz, cyaw, hw, hh, curve, 2, true) then
+        a.m_sqz_goal = nil
+        if not (M.motion and M.motion.reduce) then motion.squash_kick(a, 0.2 * ((M.pet.cute or EMPTY).squash or 1)) end
+      end
+    end
+    if a.m_lift and not a.m_rise_to and rays_left(t) >= 12 then
+      local d = a.m_lift
+      if motion.path_clear(cast, cx, cy, cz, cyaw, cx, cy - d, cz, cyaw, hw_k, curve, 0.02)
+         and motion.span_clear(cast, cx, cy - d, cz, cyaw, hw_k, hh_k, curve, 2, true) then
+        a.m_lift = nil
+      end
+    end
+  end
+end
+
+function M.place_pet(id, a, p, t, focused, held)
   local cfg = M.pet
   local cute = cfg.cute or EMPTY
   local col = cfg.collide or EMPTY
@@ -1271,10 +1476,10 @@ function M.place_pet(id, a, p, t, focused)
   -- as wide as it may be drawn: a squash widens it (by at most 14 %)
   local hw_c = half_w * (1 + math.max(a.m_sq or 0, 0))
 
-  -- held still and straight while focused (easing in and out of it); nothing
-  -- lively at all with M.motion.reduce
+  -- held still and straight while you type into it or point at it (easing in
+  -- and out of it quickly); nothing lively at all with M.motion.reduce
   local calm
-  calm, a.m_calm_v = motion.step(a.m_calm or 0, a.m_calm_v or 0, focused and 1 or 0, dt, 12, 1)
+  calm, a.m_calm_v = motion.step(a.m_calm or 0, a.m_calm_v or 0, (focused or held) and 1 or 0, dt, 40, 1)
   a.m_calm = calm
   local lively = reduce and 0 or clamp(1 - calm, 0, 1)
   local phase = a.phase or 0
@@ -1339,15 +1544,14 @@ function M.place_pet(id, a, p, t, focused)
   if colliding then
     local tyaw = yaw_towards(tx, tz, p.x, p.z)
     tx, tz = keep_off_panels(a, id, ids, k, lined_up, t, tx, base_y, tz, tyaw, hw_c, half_h, curve, gap + 0.05, nil)
-    local tg = target_at(t, p)
-    if tg then
-      local ax0, az0, ax1, az1 = motion.footprint(tx, tz, tyaw, half_w, curve)
-      local depth, nx, nz = motion.point_push(tg.x, tg.z, (col.body or 0.55) + 0.05, ax0, az0, ax1, az1, tx - p.x, tz - p.z)
-      if depth > 0 then tx, tz = tx + nx * depth, tz + nz * depth end
-    end
+    -- characters who stay in its place (not ones passing through)
+    tx, tz = make_room(a, t, p, tx, tz, half_w, curve)
   end
-  -- the bob: each pet on its own beat; a focused one only a quarter as much
-  local ty = base_y + motion.bob(t, phase, cfg.bob, cute.bob_speed or 0.9) * (reduce and 0 or (0.25 + 0.75 * lively))
+  -- a way round something in its path, found below: shuffled aside, floated up
+  tx, tz = tx + (a.m_shx or 0), tz + (a.m_shz or 0)
+  -- the bob: each pet on its own beat; none while it is held still
+  local ty = base_y + motion.bob(t, phase, cfg.bob, cute.bob_speed or 0.6) * lively
+    + (a.m_lift or 0)
 
   -- a procession: each pet a little softer on its spring than the one before
   -- it in the order, so they set off and stop one after another
@@ -1388,12 +1592,6 @@ function M.place_pet(id, a, p, t, focused)
     local ax0, az0, ax1, az1 = motion.footprint(x, z, yaw0, half_w, curve)
     local depth, nx, nz = motion.point_push(p.x, p.z, body_r, ax0, az0, ax1, az1, x - p.x, z - p.z)
     if depth > 0 then x, z = contact(a, nx, nz, depth, x, z, t) end
-    local tg = target_at(t, p)
-    if tg then
-      ax0, az0, ax1, az1 = motion.footprint(x, z, yaw0, half_w, curve)
-      depth, nx, nz = motion.point_push(tg.x, tg.z, body_r, ax0, az0, ax1, az1, x - p.x, z - p.z)
-      if depth > 0 then x, z = contact(a, nx, nz, depth, x, z, t) end
-    end
   elseif not lined_up then
     -- collision off: pets kept apart by their centres, as before
     for i = 1, k - 1 do
@@ -1421,6 +1619,18 @@ function M.place_pet(id, a, p, t, focused)
     contact(a, (cx - x) / moved, (cz - z) / moved, 0, x, z, t) -- only the speed into the cone's edge
     x, z = cx, cz -- exactly on the edge (the cone turns round you, the contact goes straight)
   end
+  -- Squeezed smaller to slip through a tight gap (below), and springing back
+  -- to size once there is room again (the barest overshoot).
+  local sqz
+  sqz, a.m_sqz_v = motion.step(a.m_sqz or 1, a.m_sqz_v or 0, a.m_sqz_goal or 1, dt, 160, a.m_sqz_goal and 1 or 0.8)
+  sqz = clamp(sqz, 0.25, 1.2)
+  a.m_sqz = sqz
+  -- the size it is drawn at, which is what may not touch anything
+  -- plus a skin of twice `recheck`: between two looks it may move that much,
+  -- and no part of it may reach into anything meanwhile
+  local skin = 2 * (col.recheck or 0.04)
+  local hw_k = hw_c * sqz + skin
+  local hh_k = half_h * sqz / (1 + math.min(a.m_sq or 0, 0)) + skin
   -- Never seen inside anything (M.pet.collide, the game's collision). The
   -- pet only moves along a clear path: each time it has moved `recheck` from
   -- the last pose known clear, rays go along the way it came (its middle both
@@ -1441,7 +1651,7 @@ function M.place_pet(id, a, p, t, focused)
         if a.m_fit and not a.m_si then
           if rays_left(t) >= 11 then
             local tyaw = yaw_towards(place_x, place_z, p.x, p.z)
-            if pose_clear(p, place_x, ty, place_z, tyaw, hw_c, half_h, curve) then
+            if pose_clear(p, place_x, ty, place_z, tyaw, hw_k, hh_k, curve) then
               x, y, z, yaw_fix = place_x, ty, place_z, nil
               a.m_cx, a.m_cy, a.m_cz, a.m_cyaw = x, y, z, tyaw
               a.m_blink, a.m_bs = 'in', 0.02
@@ -1456,11 +1666,36 @@ function M.place_pet(id, a, p, t, focused)
       a.x_v, a.y_v, a.z_v, a.m_hop, a.m_hop_v = 0, 0, 0, 0, 0
       a.y = y
     else
+      -- floating up over something: straight up where it was clear first
+      if a.m_rise_to and a.m_cx then
+        if y < a.m_rise_to - 0.05 then x, z = a.m_cx, a.m_cz else a.m_rise_to = nil end
+      end
+      -- squeezing: holds still until it is small enough to slip through
+      local squeezing = a.m_sqz_goal and sqz > a.m_sqz_goal + 0.03 and a.m_cx
+      if squeezing then
+        x, y, z = a.m_cx, a.m_cy, a.m_cz
+        a.x_v, a.y_v, a.z_v = 0, 0, 0
+        a.y = y - (a.m_hop or 0)
+      end
+      -- shuffling aside: along the line found clear, at a brisk float
+      if a.m_via_x and a.m_cx and not squeezing then
+        local vx, vy, vz = a.m_via_x - a.m_cx, a.m_via_y - a.m_cy, a.m_via_z - a.m_cz
+        local vl = math.sqrt(vx * vx + vy * vy + vz * vz)
+        local stepl = 3.0 * dt
+        if vl <= stepl + 1e-4 then
+          x, y, z = a.m_via_x, a.m_via_y, a.m_via_z
+          a.m_via_x, a.m_via_y, a.m_via_z = nil, nil, nil
+        else
+          x, y, z = a.m_cx + vx / vl * stepl, a.m_cy + vy / vl * stepl, a.m_cz + vz / vl * stepl
+        end
+        a.x_v, a.y_v, a.z_v = 0, 0, 0
+        a.y = y - (a.m_hop or 0)
+      end
       local yaw_n = yaw_towards(x, z, p.x, p.z)
       local recheck = col.recheck or 0.04
       local first = a.m_cx == nil
       local far = first or (x - a.m_cx) ^ 2 + (y - a.m_cy) ^ 2 + (z - a.m_cz) ^ 2 > recheck * recheck
-        or math.abs(wrap(yaw_n - a.m_cyaw)) * hw_c > recheck
+        or math.abs(wrap(yaw_n - a.m_cyaw)) * hw_k > recheck
       if far then
         if rays_left(t) < (first and 11 or 12) then
           if first then
@@ -1473,33 +1708,68 @@ function M.place_pet(id, a, p, t, focused)
           end
         else
           local ok
-          if first then ok = pose_clear(p, x, y, z, yaw_n, hw_c, half_h, curve)
+          if first then ok = pose_clear(p, x, y, z, yaw_n, hw_k, hh_k, curve)
           else
-            ok = motion.path_clear(cast, a.m_cx, a.m_cy, a.m_cz, a.m_cyaw, x, y, z, yaw_n, hw_c, curve, 0.02)
-            if ok then ok = motion.span_clear(cast, x, y, z, yaw_n, hw_c, half_h, curve, 2, true) end
+            ok = motion.path_clear(cast, a.m_cx, a.m_cy, a.m_cz, a.m_cyaw, x, y, z, yaw_n, hw_k, curve, 0.02)
+            if ok then ok = motion.span_clear(cast, x, y, z, yaw_n, hw_k, hh_k, curve, 2, true) end
           end
           a.m_ct = t
           if ok then
             a.m_cx, a.m_cy, a.m_cz, a.m_cyaw = x, y, z, yaw_n
+            a.m_stuck_t, a.m_wi, a.m_wk = nil, nil, nil
+            -- clear of it for half a second: whatever blocked it is behind it
+            if a.m_ep_t and t - (a.m_blocked_t or 0) > 0.5 then a.m_ep_t = nil end
           elseif first then
             a.m_cx, a.m_cy, a.m_cz, a.m_cyaw = x, y, z, yaw_n
             a.m_blink, a.m_bs, a.m_hidden_at, a.m_urgent = 'hidden', 0, t, true
           else
+            -- blocked: a way round it first (squeeze through, float over,
+            -- shuffle aside), looked for over a few frames; a blink only when
+            -- there is none (a wall, a door you walked through)
+            local nx, ny, nz = x, y, z
             x, y, z, yaw_fix = a.m_cx, a.m_cy, a.m_cz, a.m_cyaw
             a.x_v, a.y_v, a.z_v, a.m_hop, a.m_hop_v = 0, 0, 0, 0, 0
             a.y = y
-            a.m_blink, a.m_bs = 'out', a.m_bs or 1
-            a.m_blinks = (a.m_blinks or 0) + 1
-            a.m_urgent = true
+            if not a.m_stuck_t then a.m_stuck_t, a.m_wi, a.m_wk = t, 0, nil end
+            -- ways that lead nowhere (squeezing and shuffling along a wall
+            -- with its place on the far side) are not progress: without
+            -- getting nearer its place for a while it blinks after all
+            -- (time spent blocked counts, not time spent moving along a way)
+            local gone = math.sqrt((place_x - x) ^ 2 + (place_z - z) ^ 2)
+            if not a.m_ep_t or gone < a.m_ep_best - 0.15 then a.m_ep_t, a.m_ep_best, a.m_ep_dt = t, gone, 0 end
+            a.m_ep_dt = (a.m_ep_dt or 0) + dt
+            a.m_blocked_t = t
+            local lost = a.m_ep_dt > (col.stuck or 0.3) + 0.3
+            -- the ways are judged a stretch ahead toward where it is going
+            -- (up to `lookahead`), not one frame's step: a squeeze that fits
+            -- the first step but not the pillar after it is no way through
+            local lx, ly, lz = tx - x, ty - y, tz - z
+            local ll = math.sqrt(lx * lx + ly * ly + lz * lz)
+            local reach = math.min(ll, col.lookahead or 0.8)
+            if ll > 1e-3 then
+              nx, ny, nz = x + lx / ll * reach, y + ly / ll * reach, z + lz / ll * reach
+            end
+            local nyaw = yaw_towards(nx, nz, p.x, p.z)
+            if not lost and find_way(a, p, t, nx, ny, nz, nyaw, hw_c, half_h, hw_k, hh_k, curve) then
+              a.m_stuck_t, a.m_wi, a.m_wk = nil, nil, nil
+              a.m_way_t = t
+            elseif lost or a.m_wi == false or t - a.m_stuck_t > (col.stuck or 0.3) then
+              a.m_stuck_t, a.m_wi, a.m_wk, a.m_ep_t = nil, nil, nil, nil
+              a.m_via_x, a.m_via_y, a.m_via_z = nil, nil, nil
+              a.m_blink, a.m_bs = 'out', a.m_bs or 1
+              a.m_blinks = (a.m_blinks or 0) + 1
+              a.m_urgent = true
+            end
           end
         end
       end
+      if not far and not squeezing and a.m_cx then relax_ways(a, p, t, dt, hw_c, half_h, hw_k, hh_k, curve) end
       if not far and a.m_cx and t - (a.m_ct or -1e9) >= 1 / math.max(col.probe_hz or 10, 0.5) and rays_left(t) >= 11 then
         -- at rest, looked at again now and then: found inside something (it
         -- appeared there, or the pet did), it is gone at once, not shrinking
         -- in it, and comes back at a clear place
         a.m_ct = t
-        if not pose_clear(p, a.m_cx, a.m_cy, a.m_cz, a.m_cyaw, hw_c, half_h, curve) then
+        if not pose_clear(p, a.m_cx, a.m_cy, a.m_cz, a.m_cyaw, hw_k, hh_k, curve) then
           x, y, z, yaw_fix = a.m_cx, a.m_cy, a.m_cz, a.m_cyaw
           a.x_v, a.y_v, a.z_v, a.m_hop, a.m_hop_v = 0, 0, 0, 0, 0
           a.y = y
@@ -1512,7 +1782,7 @@ function M.place_pet(id, a, p, t, focused)
         a.m_bs = math.min(1, (a.m_bs or 0) + dt / blink_t)
         if a.m_bs >= 1 then
           a.m_blink, a.m_bs = nil, 1
-          if not reduce then motion.squash_kick(a, 1.4 * (cute.squash or 1)) end -- lands with a squash
+          if not reduce then motion.squash_kick(a, 0.35 * (cute.squash or 1)) end -- lands with a small squash
         end
       end
     end
@@ -1558,33 +1828,46 @@ function M.place_pet(id, a, p, t, focused)
     local fan = side * level * (cute.fan or 0)
     roll_t = lively * ((cute.tilt or 0) * motion.persona(phase) + fan + motion.sway(t, phase, cute.sway or 0, 0.6))
     local lat = (a.x_v or 0) * cos(yaw) - (a.z_v or 0) * sin(yaw)
-    local ml = cute.max_lean or 0.1
+    local ml = cute.max_lean or 0.02
     roll_t = roll_t + lively * clamp(lat * (cute.lean or 0), -ml, ml)
+    local mt = cute.max_tilt or 0.035
+    roll_t = clamp(roll_t, -mt, mt)
     yaw = yaw + lively * motion.sway(t, phase + 1.7, (cute.sway or 0) * 0.8, 0.5)
   end
-  local roll
-  roll, a.m_roll_v = motion.step(a.m_roll or 0, a.m_roll_v or 0, roll_t, dt, 30, 0.8)
+  local roll = 0
+  if reduce then
+    a.m_roll_v = 0
+  else
+    roll, a.m_roll_v = motion.step(a.m_roll or 0, a.m_roll_v or 0, roll_t, dt, 30, 1)
+    if lively < 0.999 then roll = roll * lively a.m_roll_v = (a.m_roll_v or 0) * lively end -- held still: straight with it
+  end
   a.m_roll = roll
 
-  -- squash: a fall that stops lands with a squash, a move that stops settles
-  -- with a small one, rising or falling fast stretches it; bumps kick it too
+  -- squash: small (never past 4 %, area kept), and only for real events: a
+  -- bump (contact), a fall that stops (landing), popping back after a squeeze
+  -- or a blink. Stops and turns do not squash. None at all while held still
+  -- or with M.motion.reduce.
   local sq = 0
   local gain = (cute.squash or 1) * lively
-  if reduce or gain <= 0 then
-    a.m_sq, a.m_sq_v = 0, 0
+  if reduce then
+    a.m_sq, a.m_sq_v, a.m_fall = 0, 0, nil
   else
     local vy = a.y_v or 0
-    local sp = math.sqrt((a.x_v or 0) ^ 2 + (a.z_v or 0) ^ 2)
-    if vy < -0.4 then a.m_fall = math.min(-vy, 3) end
-    if a.m_fall and vy > -0.05 then motion.squash_kick(a, a.m_fall * 0.6 * gain) a.m_fall = nil end
-    if sp > 1.2 then a.m_move = math.min(math.max(a.m_move or 0, sp), 6) end -- the fastest it went
-    if a.m_move and sp < 0.35 then motion.squash_kick(a, a.m_move * 0.2 * gain) a.m_move = nil end
-    sq = motion.squash(a, -clamp(math.abs(vy) * 0.035, 0, 0.05) * gain, dt, 110, 0.3, 0.14)
+    if vy < -0.6 then a.m_fall = math.min(-vy, 3) end
+    if a.m_fall and vy > -0.05 then motion.squash_kick(a, a.m_fall * 0.25 * gain) a.m_fall = nil end
+    -- squeezed through a gap: a little narrower and taller on top of it
+    local squish = (1 - math.min(sqz, 1)) * 0.06
+    sq = motion.squash(a, -squish * gain, dt, 110, 0.7, SQUASH_MAX)
+    if lively < 0.999 then
+      -- held still: whatever squash is left goes at once with it
+      sq = sq * lively
+      a.m_sq, a.m_sq_v = sq, (a.m_sq_v or 0) * lively
+    end
   end
 
   -- blinking: shrunk (its pixels shown denser) and faded; never quite 0
   local shown = math.max(bs, 0.02)
-  local out = placement(a, x, y, z, yaw, 0, width, height, ppy / shown, (a.opacity or M.defaults.opacity) * shown, curve, t)
+  local out = placement(a, x, y, z, yaw, 0, width, height, ppy / (shown * sqz), (a.opacity or M.defaults.opacity) * shown, curve, t)
   out.roll, out.squash = roll, sq
   if M._trace_for then M._trace_until, M._trace_for = t + M._trace_for, nil end
   if M._trace_until and t <= M._trace_until and ghostty.log then
@@ -1890,7 +2173,7 @@ function M.walkable(id)
   return a.kind == 'world' or (a.kind == 'follow' and not a.player)
 end
 
-function M.place(id, t, focused)
+function M.place(id, t, focused, held)
   note_focus(id, t, focused)
   local a = M.anchors[id]
   if not a or a.hidden then return nil end
@@ -1921,7 +2204,7 @@ function M.place(id, t, focused)
   end
 
   if a.kind == 'pet' then
-    return M.place_pet(id, a, p, t, focused)
+    return M.place_pet(id, a, p, t, focused, held)
   end
 
   if a.kind == 'orbit' then
