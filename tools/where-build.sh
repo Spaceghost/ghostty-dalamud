@@ -38,6 +38,7 @@ set -euo pipefail
 
 BUILD_MIN_AVAIL_MB="${BUILD_MIN_AVAIL_MB:-6144}"
 BUILD_MAX_SWAP_PCT="${BUILD_MAX_SWAP_PCT:-80}"
+# shellcheck source=/dev/null  # build.env is untracked and optional
 [[ -f "$(dirname "${BASH_SOURCE[0]}")/../build.env" ]] && source "$(dirname "${BASH_SOURCE[0]}")/../build.env"  # this machine's remote name
 BUILD_REMOTE="${BUILD_REMOTE:-${INCUS_REMOTE:-${BUILD_REMOTE_NAME:-build}}}"
 INCUS="${INCUS:-incus}"
@@ -144,6 +145,7 @@ wb_decide() {
 }
 
 if [[ -n "${WHERE_BUILD_LIB:-}" ]]; then
+  # shellcheck disable=SC2317  # exit is reached only when run rather than sourced
   return 0 2>/dev/null || exit 0
 fi
 

@@ -48,6 +48,7 @@ die() { printf 'remote: error: %s\n' "$*" >&2; exit 1; }
 
 # The Incus remote is named per machine: BUILD_REMOTE_NAME from the
 # environment, from an untracked build.env, or toolchain.env's placeholder.
+# shellcheck source=/dev/null  # build.env is untracked and optional
 [[ -f "$ROOT/build.env" ]] && source "$ROOT/build.env"
 BUILD_REMOTE_NAME="${BUILD_REMOTE_NAME:-build}"
 if [[ -z "${INCUS_REMOTE:-}" ]]; then

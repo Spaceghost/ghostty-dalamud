@@ -223,7 +223,7 @@ do
   assert(G.token == nil and S.values['gallery.token'] == nil, 'not linked yet')
   local n_up, n_post = #uploads, #posts
   G.tick(1000, false)
-  local msg = G.command('')
+  G.command('')
   local shot = G._state.offer.path
   frame({ 'Share##gallery_share' })
   assert(#uploads == n_up and #posts == n_post + 1, 'no link: a code is asked for first, nothing uploads')

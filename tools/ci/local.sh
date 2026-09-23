@@ -57,6 +57,7 @@ have_remote() {
   [[ -x "$REMOTE_SH" ]] || return 1
   [[ -n "${INCUS_REMOTE:-}" ]] && return 0
   command -v "${INCUS:-incus}" >/dev/null || return 1
+  # shellcheck source=/dev/null  # build.env is untracked and optional
   [[ -f "$ROOT/build.env" ]] && source "$ROOT/build.env"
   "${INCUS:-incus}" remote list --format csv 2>/dev/null | cut -d, -f1 | grep -qx "${BUILD_REMOTE_NAME:-build}"
 }

@@ -50,6 +50,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 STATE="${BUILD_PLACEMENT_STATE:-${XDG_STATE_HOME:-$HOME/.local/state}/ghostty-build}"
 JOBS="$STATE/jobs"
 INCUS="${INCUS:-incus}"
+# shellcheck source=/dev/null  # build.env is untracked and optional
 [[ -f "$HERE/../build.env" ]] && source "$HERE/../build.env"  # this machine's remote name
 BUILD_REMOTE="${BUILD_REMOTE:-${INCUS_REMOTE:-${BUILD_REMOTE_NAME:-build}}}"
 
@@ -123,6 +124,7 @@ run_local() { # run_local DIR CMD -> exit status of CMD
   # Its own session, so the guard can stop the whole tree with one signal and
   # can never reach this wrapper, the shell that called it, or the game.
   set +e
+  # shellcheck disable=SC2016  # expanded by the inner bash, from the PLACED_* environment
   PLACED_CMD="$cmd" PLACED_PGID_FILE="$d/pgid" PLACED_DIR="$PROJECT" \
   BUILD_PLACEMENT=0 \
     setsid --wait bash -c 'echo $$ >"$PLACED_PGID_FILE"; cd "$PLACED_DIR"; exec bash -c "$PLACED_CMD"'

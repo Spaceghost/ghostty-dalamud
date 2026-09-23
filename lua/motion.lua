@@ -33,7 +33,8 @@ local STEPS_MAX = 64
 -- frame rate, or a hitch (dt is taken as at most 0.1 s). The same motion at
 -- 30, 60 or 144 fps, to within the substep size.
 function M.step(x, v, target, dt, k, zeta)
-  if not (dt > 0) then return x, v end
+  -- not (dt > 0) rather than dt <= 0, here and below: a NaN dt stops too
+  if not (dt > 0) then return x, v end -- luacheck: ignore 581
   if dt > 0.1 then dt = 0.1 end
   local w = 2 * sqrt(max(k or 0, 0))
   if w > W_MAX then w = W_MAX end
@@ -56,7 +57,7 @@ end
 -- Exponential follow toward `target` with time constant tau seconds (0: at
 -- once). Unconditionally stable: it only ever closes part of the gap.
 function M.follow(x, target, dt, tau)
-  if not tau or tau <= 1e-3 or not (dt > 0) then return target end
+  if not tau or tau <= 1e-3 or not (dt > 0) then return target end -- luacheck: ignore 581
   return x + (target - x) * (1 - exp(-dt / tau))
 end
 
@@ -90,7 +91,7 @@ function M.anim(a, key, goal, dt, time, vmax, dead)
     s.x, s.v = s.goal, 0
     return s.x
   end
-  if not (dt > 0) then return s.x end
+  if not (dt > 0) then return s.x end -- luacheck: ignore 581
   if dt > 0.1 then dt = 0.1 end
   local w = 5.8 / time -- (1 + w t) e^-wt reaches 2 % at w t = 5.8
   local steps = max(1, math.ceil(dt * 120), math.ceil(dt * w / 0.5))
