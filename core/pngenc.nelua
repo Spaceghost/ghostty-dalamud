@@ -168,7 +168,8 @@ local function compress_to(e: *PngEnc, limit: usize): void
           while l < maxl and fl[(@usize)(cand) + l] == fl[p + l] do l = l + 1 end
           if l > best_len then
             best_len, best_dist = l, dist
-            if l >= NICE_MATCH then break end
+            -- at maxl nothing can be longer, and the quick test above would read fl[p + maxl]: past the end
+            if l >= NICE_MATCH or l >= maxl then break end
           end
         end
         cand = (@integer)(chain[(@usize)(cand) & (WSIZE - 1)]) - 1
