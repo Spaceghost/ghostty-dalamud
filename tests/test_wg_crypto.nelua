@@ -1,0 +1,309 @@
+-- agent/crypto.nelua and agent/blake2s.nelua against published vectors: the
+-- primitives of the agent's embedded WireGuard (docs/WIREGUARD.md "Crypto and
+-- its vectors").
+require 'string'
+require 'vector'
+require 'memory'
+require 'agent.crypto'
+require 'agent.blake2s'
+
+local function unhex(s: string): vector(uint8)
+  local v: vector(uint8)
+  local function nib(c: byte): uint8
+    if c >= '0'_b and c <= '9'_b then return c - '0'_b end
+    if c >= 'a'_b and c <= 'f'_b then return c - 'a'_b + 10 end
+    assert(c >= 'A'_b and c <= 'F'_b, 'hex digit')
+    return c - 'A'_b + 10
+  end
+  local i: usize = 0
+  while i < s.size do
+    if s.data[i] == ' '_b or s.data[i] == ':'_b then i = i + 1
+    else
+      v:push((nib(s.data[i]) << 4) | nib(s.data[i + 1]))
+      i = i + 2
+    end
+  end
+  return v
+end
+
+local function same(a: *[0]uint8, b: *[0]uint8, n: usize): boolean
+  for i: usize = 0, < n do if a[i] ~= b[i] then return false end end
+  return true
+end
+
+local function hexeq(p: *[0]uint8, n: usize, want: string, what: string): void
+  local w = unhex(want)
+  if #w ~= n then error(what .. ': vector length') end
+  if not same(p, (@*[0]uint8)(&w[0]), n) then
+    local got: string = ''
+    for i: usize = 0, < n do got = got .. string.format('%02x', p[i]) end
+    error(what .. ': got ' .. got)
+  end
+  w:destroy()
+end
+
+local function P(v: *vector(uint8)): *[0]uint8
+  if #v == 0 then return nilptr end
+  return (@*[0]uint8)(&v[0])
+end
+
+-- BLAKE2s, RFC 7693 Appendix B --------------------------------------------------
+do
+  local out: [32]uint8
+  local abc: string = 'abc'
+  blake2s(&out, 32, nilptr, 0, (@*[0]uint8)(abc.data), 3)
+  hexeq(&out, 32, '508C5E8C327C14E2E1A72BA34EEB452F37458B209ED63A294D999B4C86675982', 'BLAKE2s-256("abc")')
+  -- the same in pieces across a block boundary
+  local s: Blake2s
+  local long: vector(uint8)
+  for i = 0, < 200 do long:push((@uint8)(i)) end
+  local whole: [32]uint8
+  blake2s(&whole, 32, nilptr, 0, P(&long), 200)
+  s:init(32, nilptr, 0)
+  s:update(P(&long), 63) s:update((@*[0]uint8)(&long[63]), 1) s:update((@*[0]uint8)(&long[64]), 0)
+  s:update((@*[0]uint8)(&long[64]), 64) s:update((@*[0]uint8)(&long[128]), 72)
+  s:final(&out)
+  assert(same(&out, &whole, 32), 'streaming equals one call')
+  long:destroy()
+end
+
+-- BLAKE2s, RFC 7693 Appendix E self-test: every output length (16, 20, 28, 32)
+-- times every input length (0, 3, 64, 65, 255, 1024), keyed and unkeyed,
+-- hashed together.
+do
+  local function seq(out: *[0]uint8, len: usize, seed: uint32): void
+    local a: uint32 = 0xDEAD4BAD * seed
+    local b: uint32 = 1
+    for i: usize = 0, < len do
+      local t = a + b
+      a = b
+      b = t
+      out[i] = (@uint8)((t >> 24) & 0xff)
+    end
+  end
+  local md_len: [4]usize = { 16, 20, 28, 32 }
+  local in_len: [6]usize = { 0, 3, 64, 65, 255, 1024 }
+  local inbuf: [1024]uint8
+  local md: [32]uint8
+  local key: [32]uint8
+  local ctx: Blake2s
+  ctx:init(32, nilptr, 0)
+  for i = 0, < 4 do
+    local outlen = md_len[i]
+    for j = 0, < 6 do
+      local inlen = in_len[j]
+      seq(&inbuf, inlen, (@uint32)(inlen))
+      blake2s(&md, outlen, nilptr, 0, &inbuf, inlen)
+      ctx:update(&md, outlen)
+      seq(&key, outlen, (@uint32)(outlen))
+      blake2s(&md, outlen, &key, outlen, &inbuf, inlen)
+      ctx:update(&md, outlen)
+    end
+  end
+  ctx:final(&md)
+  hexeq(&md, 32, '6A411F08CE25ADCDFB02ABA641451CEC53C598B24F4FC787FBDC88797F4C1DFE', 'RFC 7693 Appendix E self-test')
+end
+
+-- HMAC-BLAKE2s and WireGuard's KDF. No RFC publishes these; the expected
+-- values come from Python's own hmac and hashlib.blake2s (Python 3.14,
+-- Fedora 44), an independent implementation:
+--   H = lambda b: hashlib.blake2s(b).digest()
+--   hm = lambda k, b: hmac.new(k, b, hashlib.blake2s).digest()
+--   ci = H(b'Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s'); t0 = hm(ci, bytes(range(1, 33)))
+--   t1 = hm(t0, b'\x01'); t2 = hm(t0, t1 + b'\x02'); t3 = hm(t0, t2 + b'\x03')
+do
+  local out: [32]uint8
+  local construction: string = 'Noise_IKpsk2_25519_ChaChaPoly_BLAKE2s'
+  local identifier: string = 'WireGuard v1 zx2c4 Jason@zx2c4.com'
+  local ci: [32]uint8
+  blake2s(&ci, 32, nilptr, 0, (@*[0]uint8)(construction.data), construction.size)
+  hexeq(&ci, 32, '60e26daef327efc02ec335e2a025d2d016eb4206f87277f52d38d1988b78cd36', 'initial chaining key')
+  local s: Blake2s
+  s:init(32, nilptr, 0)
+  s:update(&ci, 32)
+  s:update((@*[0]uint8)(identifier.data), identifier.size)
+  s:final(&out)
+  hexeq(&out, 32, '2211b361081ac566691243db458ad5322d9c6c662293e8b70ee19c65ba079ef3', 'initial hash')
+
+  local k32: [32]uint8
+  for i = 0, < 32 do k32[i] = (@uint8)(i) end
+  hmac_blake2s(&out, &k32, 32, (@*[0]uint8)(identifier.data), identifier.size)
+  hexeq(&out, 32, 'b9f2e5767a6cdfa821d56eb9a1d60bd7604e1f6eaa167773dd4580ccb475d570', 'HMAC-BLAKE2s, 32-byte key')
+  local big: [100]uint8
+  for i = 0, < 100 do big[i] = 0xaa end
+  local msg: string = 'Test Using Larger Than Block-Size Key'
+  hmac_blake2s(&out, &big, 100, (@*[0]uint8)(msg.data), msg.size)
+  hexeq(&out, 32, '5701a0c602dec0c38dc0b998dc6c47cda63b86e145e3ed5e227028dc500b2779', 'HMAC-BLAKE2s, key longer than a block')
+
+  local input: [32]uint8
+  for i = 0, < 32 do input[i] = (@uint8)(i + 1) end
+  local t1: [32]uint8
+  local t2: [32]uint8
+  local t3: [32]uint8
+  wg_kdf(&ci, &input, 32, &t1, &t2, &t3)
+  hexeq(&t1, 32, 'c84b602256edf8cb02f4c85e186dd022766e0d04f81da9b3b1237333ec7f852f', 'KDF t1')
+  hexeq(&t2, 32, 'd58cc632deb7a04c4447024b071b3eea96d09729a96c48117240bf28b54d5a0f', 'KDF t2')
+  hexeq(&t3, 32, '563457f9624f515acd75040684241962ad46d9a892427dbf306c38d81560a610', 'KDF t3')
+  local only1: [32]uint8
+  wg_kdf(&ci, &input, 32, &only1, nilptr, nilptr)
+  assert(same(&only1, &t1, 32), 'KDF1 is KDF3 cut short')
+  wg_kdf(&ci, nilptr, 0, &only1, nilptr, nilptr)
+  hexeq(&only1, 32, 'bd968725a9177942a8c2e4253d1dde31cf7b19ec001b4a3a3d141cd9d998d3ba', 'KDF of the empty input')
+
+  -- keyed BLAKE2s-128, the MAC of MAC1 and MAC2
+  local data: [100]uint8
+  for i = 0, < 100 do data[i] = (@uint8)(i) end
+  blake2s(&out, 16, &k32, 32, &data, 100)
+  hexeq(&out, 16, '0b67d33f8b859c3157fbabd9e6e47ed0', 'keyed BLAKE2s-128')
+end
+
+-- X25519, RFC 7748 --------------------------------------------------------------
+do
+  local k = unhex('a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4')
+  local u = unhex('e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c')
+  local out: [32]uint8
+  assert(crypto.x25519(&out, P(&k), P(&u)))
+  hexeq(&out, 32, 'c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552', 'RFC 7748 5.2 vector 1')
+  k:destroy() u:destroy()
+  k = unhex('4b66e9d4d1b4673c5ad22691957d6af5c11b6421e0ea01d42ca4169e7918ba0d')
+  u = unhex('e5210f12786811d3f4b7959d0538ae2c31dbe7106fc03c3efc4cd549c715a493')
+  assert(crypto.x25519(&out, P(&k), P(&u)))
+  hexeq(&out, 32, '95cbde9476e8907d7aade45cb4b873f88b595a68799fa152e6f8f7647aac7957', 'RFC 7748 5.2 vector 2')
+  k:destroy() u:destroy()
+  -- 6.1: both sides of a Diffie-Hellman exchange
+  local a = unhex('77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a')
+  local b = unhex('5dab087e624a8a4b79e17f8b83800ee66f3bb1292618b6fd1c2f8b27ff88e0eb')
+  local apub: [32]uint8
+  local bpub: [32]uint8
+  crypto.x25519_public(&apub, P(&a))
+  crypto.x25519_public(&bpub, P(&b))
+  hexeq(&apub, 32, '8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a', 'RFC 7748 6.1 Alice public')
+  hexeq(&bpub, 32, 'de9edb7d7b7dc1b4d35b61c2ece435373f8343c85b78674dadfc7e146f882b4f', 'RFC 7748 6.1 Bob public')
+  local s1: [32]uint8
+  local s2: [32]uint8
+  assert(crypto.x25519(&s1, P(&a), &bpub) and crypto.x25519(&s2, P(&b), &apub))
+  hexeq(&s1, 32, '4a5d9d5ba4ce2de1728e3bf480350f25e07e21c947d19e3376f09b3c1e161742', 'RFC 7748 6.1 shared')
+  assert(same(&s1, &s2, 32))
+  -- a low-order public key (here 0) gives the all-zero secret, which is refused
+  local zero: [32]uint8
+  memory.zero(&zero, 32)
+  assert(not crypto.x25519(&out, P(&a), &zero), 'all-zero shared secret refused')
+  a:destroy() b:destroy()
+  -- generated keys are clamped and random
+  local g1: [32]uint8
+  local g2: [32]uint8
+  assert(crypto.x25519_generate(&g1) and crypto.x25519_generate(&g2))
+  assert(g1[0] & 7 == 0 and g1[31] & 128 == 0 and g1[31] & 64 ~= 0, 'clamped')
+  assert(not same(&g1, &g2, 32), 'two keys differ')
+end
+
+-- ChaCha20-Poly1305, RFC 8439 2.8.2 -------------------------------------------
+local sunscreen: string = "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+do
+  local key = unhex('808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f')
+  local nonce = unhex('070000004041424344454647')
+  local ad = unhex('50515253c0c1c2c3c4c5c6c7')
+  local n = sunscreen.size
+  local out: vector(uint8)
+  out:resize(n + 16)
+  crypto.aead_ietf_seal(P(&out), P(&key), P(&nonce), P(&ad), #ad, (@*[0]uint8)(sunscreen.data), n)
+  hexeq(P(&out), n, 'd31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d63dbea45e8ca9671282fafb69da92728b1a71de0a9e060b2905d6a5b67ecd3b3692ddbd7f2d778b8c9803aee328091b58fab324e4fad675945585808b4831d7bc3ff4def08e4b7a9de576d26586cec64b6116', 'RFC 8439 ciphertext')
+  hexeq((@*[0]uint8)(&out[n]), 16, '1ae10b594f09e26a7e902ecbd0600691', 'RFC 8439 tag')
+  local back: vector(uint8)
+  back:resize(n)
+  assert(crypto.aead_ietf_open(P(&back), P(&key), P(&nonce), P(&ad), #ad, P(&out), n))
+  assert(same(P(&back), (@*[0]uint8)(sunscreen.data), n), 'opens to the plaintext')
+  -- any flipped bit is refused, and nothing is written
+  local spots: [4]usize = { 0, n - 1, n, n + 15 }
+  for si = 0, < 4 do
+    local at = spots[si]
+    out[at] = out[at] ~ 1
+    memory.zero(P(&back), n)
+    assert(not crypto.aead_ietf_open(P(&back), P(&key), P(&nonce), P(&ad), #ad, P(&out), n), 'tampering refused')
+    assert(crypto.is_zero(P(&back), n), 'nothing written on failure')
+    out[at] = out[at] ~ 1
+  end
+  ad[0] = ad[0] ~ 1
+  assert(not crypto.aead_ietf_open(P(&back), P(&key), P(&nonce), P(&ad), #ad, P(&out), n), 'wrong AD refused')
+  ad[0] = ad[0] ~ 1
+  -- in place
+  memory.copy(P(&back), (@*[0]uint8)(sunscreen.data), n)
+  back:resize(n + 16)
+  crypto.aead_ietf_seal(P(&back), P(&key), P(&nonce), P(&ad), #ad, P(&back), n)
+  assert(same(P(&back), P(&out), n + 16), 'sealing in place')
+  assert(crypto.aead_ietf_open(P(&back), P(&key), P(&nonce), P(&ad), #ad, P(&back), n), 'opening in place')
+  assert(same(P(&back), (@*[0]uint8)(sunscreen.data), n))
+  -- WireGuard's nonce form: 4 zero bytes, counter little endian. Counter
+  -- 0x4746454443424140 with a zero prefix is the same nonce as above but for
+  -- its first byte, so it must differ from the vector and open with wg_open.
+  local wg: vector(uint8)
+  wg:resize(n + 16)
+  crypto.wg_seal(P(&wg), P(&key), 0x4746454443424140, P(&ad), #ad, (@*[0]uint8)(sunscreen.data), n)
+  assert(not same(P(&wg), P(&out), 16), 'a different nonce')
+  nonce[0] = 0
+  crypto.aead_ietf_seal(P(&out), P(&key), P(&nonce), P(&ad), #ad, (@*[0]uint8)(sunscreen.data), n)
+  assert(same(P(&wg), P(&out), n + 16), 'wg nonce = 0x00000000 || le64(counter)')
+  assert(crypto.wg_open(P(&back), P(&key), 0x4746454443424140, P(&ad), #ad, P(&wg), n))
+  assert(not crypto.wg_open(P(&back), P(&key), 0x4746454443424141, P(&ad), #ad, P(&wg), n), 'another counter refused')
+  -- an empty message: just a tag (a WireGuard keepalive, the handshake's empty field)
+  local tag: [16]uint8
+  crypto.wg_seal(&tag, P(&key), 0, nilptr, 0, nilptr, 0)
+  assert(crypto.wg_open(nilptr, P(&key), 0, nilptr, 0, &tag, 0), 'empty message')
+  key:destroy() nonce:destroy() ad:destroy() out:destroy() back:destroy() wg:destroy()
+end
+
+-- XChaCha20-Poly1305, draft-irtf-cfrg-xchacha-03 A.3.1 ---------------------------
+do
+  local key = unhex('808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f')
+  local nonce = unhex('404142434445464748494a4b4c4d4e4f5051525354555657')
+  local ad = unhex('50515253c0c1c2c3c4c5c6c7')
+  local n = sunscreen.size
+  local out: vector(uint8)
+  out:resize(n + 16)
+  crypto.xaead_seal(P(&out), P(&key), P(&nonce), P(&ad), #ad, (@*[0]uint8)(sunscreen.data), n)
+  hexeq(P(&out), n, 'bd6d179d3e83d43b9576579493c0e939572a1700252bfaccbed2902c21396cbb731c7f1b0b4aa6440bf3a82f4eda7e39ae64c6708c54c216cb96b72e1213b4522f8c9ba40db5d945b11b69b982c1bb9e3f3fac2bc369488f76b2383565d3fff921f9664c97637da9768812f615c68b13b52e', 'XChaCha20-Poly1305 ciphertext')
+  hexeq((@*[0]uint8)(&out[n]), 16, 'c0875924c1c7987947deafd8780acf49', 'XChaCha20-Poly1305 tag')
+  local back: vector(uint8)
+  back:resize(n)
+  assert(crypto.xaead_open(P(&back), P(&key), P(&nonce), P(&ad), #ad, P(&out), n))
+  assert(same(P(&back), (@*[0]uint8)(sunscreen.data), n))
+  out[3] = out[3] ~ 0x80
+  assert(not crypto.xaead_open(P(&back), P(&key), P(&nonce), P(&ad), #ad, P(&out), n), 'tampering refused')
+  key:destroy() nonce:destroy() ad:destroy() out:destroy() back:destroy()
+end
+
+-- Base64 keys as wg(8) writes them ---------------------------------------------
+do
+  -- RFC 7748 6.1's Alice public key, as `wg pubkey` prints it
+  local k = unhex('8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a')
+  local s = crypto.key_to_base64(P(&k))
+  if s ~= 'hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo=' then error('base64: ' .. s) end
+  local back: [32]uint8
+  assert(crypto.key_from_base64(s, &back) and same(&back, P(&k), 32), 'round trip')
+  assert(not crypto.key_from_base64('hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmo', &back), 'short')
+  assert(not crypto.key_from_base64('hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTmp=', &back), 'stray low bits')
+  assert(not crypto.key_from_base64('hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066Spjqq!Tmo=', &back), 'not base64')
+  assert(not crypto.key_from_base64('hSDwCYkwp1R0i33ctD73Wg2/Og0mOBr066SpjqqbTm==', &back), 'two pads')
+  s:destroy()
+  k:destroy()
+  -- random keys round-trip
+  for _ = 1, 50 do
+    local r: [32]uint8
+    assert(crypto.random(&r, 32))
+    local t = crypto.key_to_base64(&r)
+    assert(crypto.key_from_base64(t, &back) and same(&back, &r, 32))
+    t:destroy()
+  end
+end
+
+-- the random source fills more than one getrandom chunk
+do
+  local big: [1000]uint8
+  memory.zero(&big, 1000)
+  assert(crypto.random(&big, 1000))
+  local zeros = 0
+  for i = 0, < 1000 do if big[i] == 0 then zeros = zeros + 1 end end
+  assert(zeros < 30, 'random bytes, not a zeroed buffer')
+end
+
+print('test_wg_crypto OK')
