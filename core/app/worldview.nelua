@@ -847,7 +847,6 @@ global function draw_world(now: float64): void
   if host.order_drag.id ~= 0 then click = false end
   local carried_pl: WorldPlacement
   local clicked = click and not over_window
-  local clicked_any = false
   local diag_hidden, diag_behind = 0, 0
   local diag_drawn = false -- the first drawn panel, for the log line
   local diag_pl: WorldPlacement
@@ -1055,7 +1054,6 @@ global function draw_world(now: float64): void
             host.world_focus = s.id
             -- the keyboard is the panel's alone: no ImGui terminal keeps focus beside it
             if imgui.SetWindowFocusNil ~= nilptr then imgui.SetWindowFocusNil() end
-            clicked_any = true
             if button == WORLD_BUTTON_NONE and grip == 0 then
               if selected_unit then
                 host.last_click_id = 0 -- a double click on text selects a word instead

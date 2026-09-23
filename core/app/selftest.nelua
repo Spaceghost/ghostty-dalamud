@@ -705,7 +705,7 @@ end
 local function native_colour_case(l: NativeLayout): void
   local vp = imgui.GetMainViewport()
   local pad = (@integer)(math.floor(4 * l.scale))
-  local worst, worst_i = 0, -1
+  local worst = 0
   local ok_all = true
   local sb: stringbuilder
   local grey_n, grey_i = 0, 0
@@ -719,7 +719,7 @@ local function native_colour_case(l: NativeLayout): void
     local oki, ib, ig, ir = frame_pixel(ix, iy)
     if not okn or not oki then ok_all = false break end
     local d = math.max(math.abs((@integer)(nr) - ir), math.max(math.abs((@integer)(ng) - ig), math.abs((@integer)(nb) - ib)))
-    if d > worst then worst, worst_i = d, i end
+    if d > worst then worst = d end
     sb:writef('%s#%02x%02x%02x/#%02x%02x%02x', i > 0 and ' ' or '', nr, ng, nb, ir, ig, ib)
     if i == 2 then grey_n, grey_i = nr, ir end
   end
