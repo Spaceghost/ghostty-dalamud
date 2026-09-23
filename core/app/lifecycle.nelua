@@ -7,6 +7,7 @@ require 'core.app.ipc'
 require 'core.app.winpicker'
 require 'core.app.gallery'
 require 'core.app.ask'
+require 'core.app.gamelink'
 
 global function update_status(): void
   local sb: stringbuilder
@@ -17,7 +18,7 @@ global function update_status(): void
   else
     sb:write('ghostty')
   end
-  local total = #host.dropdown_tabs + #host.windows + #host.world + #host.minimized
+  local total = #host.dropdown_tabs + #host.windows + #host.world + #host.minimized + #host.native
   if total > 0 then sb:writef(' %d', total) end
   if #host.minimized > 0 then sb:writef(' (%d min)', #host.minimized) end
   host.status:destroy()
@@ -84,6 +85,7 @@ global function load_policy(): boolean
   boot_lua_register(policy.L)
   gallery_lua_register(policy.L) -- ghostty.http_upload / game_string for lua/gallery.lua
   ask_lua_register(policy.L) -- ghostty.ask_spawn / ask_cancel / ask_echo / ask_pin for lua/ask.lua
+  gamelink_lua_register(policy.L) -- ghostty.game_lookup / game_action and game icons for lua/asklinks.lua
   ipc_lua_register(policy.L) -- ghostty.window_* for lua/ipc.lua
   ipc_load(install, host.dir) -- GhosttyDalamud.v1.Call's own Lua state (docs/IPC.md)
   settings_badge_refresh()

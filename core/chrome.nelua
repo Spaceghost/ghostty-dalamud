@@ -200,9 +200,10 @@ global ChromeAction = @enum{
   Share,                                                        -- the tab bar: a screenshot to the gallery
   Shot,                                                         -- the tab bar: take one now, terminals included
   Dock, Close,                                                  -- a floating window's header
+  Native,                                                       -- both: show it as a game window (docs/NATIVE_UI.md)
 }
 
-global ChromeIcon = @enum{ Plus = 0, Chevron, Window, Pin, Paw, Minimize, Gear, Hide, Dock, Close, Camera, Shutter }
+global ChromeIcon = @enum{ Plus = 0, Chevron, Window, Pin, Paw, Minimize, Gear, Hide, Dock, Close, Camera, Shutter, Game }
 
 global ChromeButton = @record{
   id: string,
@@ -212,11 +213,12 @@ global ChromeButton = @record{
   tip: string,
 }
 
-global CHROME_TAB_BUTTONS <comptime> = 10
+global CHROME_TAB_BUTTONS <comptime> = 11
 global chrome_tab_buttons: [CHROME_TAB_BUTTONS]ChromeButton = {
   { id = 'new', action = ChromeAction.NewTab, icon = ChromeIcon.Plus, group = 0, tip = 'New tab' },
   { id = 'profiles', action = ChromeAction.Profiles, icon = ChromeIcon.Chevron, group = 0, tip = 'New tab from a profile' },
   { id = 'window', action = ChromeAction.Window, icon = ChromeIcon.Window, group = 1, tip = 'Pop this tab out into a window' },
+  { id = 'native', action = ChromeAction.Native, icon = ChromeIcon.Game, group = 1, tip = 'Show this tab as a game window' },
   { id = 'pin', action = ChromeAction.Pin, icon = ChromeIcon.Pin, group = 1, tip = 'Pin this tab into the world where you stand' },
   { id = 'pet', action = ChromeAction.Pet, icon = ChromeIcon.Paw, group = 1, tip = 'Let this tab float beside you as a pet' },
   { id = 'min', action = ChromeAction.Minimize, icon = ChromeIcon.Minimize, group = 1, tip = 'Minimize this tab to the toolbar' },
@@ -226,9 +228,10 @@ global chrome_tab_buttons: [CHROME_TAB_BUTTONS]ChromeButton = {
   { id = 'hide', action = ChromeAction.Hide, icon = ChromeIcon.Hide, group = 2, tip = 'Hide the dropdown' },
 }
 
-global CHROME_WINDOW_BUTTONS <comptime> = 3
+global CHROME_WINDOW_BUTTONS <comptime> = 4
 global chrome_window_buttons: [CHROME_WINDOW_BUTTONS]ChromeButton = {
   { id = 'dock', action = ChromeAction.Dock, icon = ChromeIcon.Dock, group = 0, tip = 'Back into the dropdown as a tab' },
+  { id = 'native', action = ChromeAction.Native, icon = ChromeIcon.Game, group = 0, tip = 'Show it as a game window' },
   { id = 'pet', action = ChromeAction.Pet, icon = ChromeIcon.Paw, group = 0, tip = 'Let it float beside you as a pet' },
   { id = 'close', action = ChromeAction.Close, icon = ChromeIcon.Close, group = 1, tip = 'Close the terminal' },
 }
@@ -332,6 +335,13 @@ global function chrome_draw_icon(dl: *ImDrawList, icon: ChromeIcon, cx: float32,
       imgui.DrawListAddLine(dl, vec2(cx + ux * r * 0.3, cy + uy * r * 0.3), vec2(cx + ux * r * 0.9, cy + uy * r * 0.9), col, t * 0.8)
     end
     imgui.DrawListAddCircleFilled(dl, vec2(cx, cy), r * 0.26, col, 12)
+  elseif icon == ChromeIcon.Game then
+    -- a game window: its frame, a thick title bar, and a crystal in the body
+    imgui.DrawListAddRect(dl, vec2(cx - r, cy - r * 0.85), vec2(cx + r, cy + r * 0.85), col, 1, 0, t * 0.85)
+    imgui.DrawListAddRectFilled(dl, vec2(cx - r, cy - r * 0.85), vec2(cx + r, cy - r * 0.85 + t * 2.4), col, 1, 0)
+    local dy = cy + r * 0.2
+    imgui.DrawListAddTriangleFilled(dl, vec2(cx, dy - r * 0.42), vec2(cx + r * 0.26, dy), vec2(cx - r * 0.26, dy), col)
+    imgui.DrawListAddTriangleFilled(dl, vec2(cx - r * 0.26, dy), vec2(cx + r * 0.26, dy), vec2(cx, dy + r * 0.42), col)
   elseif icon == ChromeIcon.Close then
     imgui.DrawListAddLine(dl, vec2(cx - r * 0.7, cy - r * 0.7), vec2(cx + r * 0.7, cy + r * 0.7), col, t)
     imgui.DrawListAddLine(dl, vec2(cx + r * 0.7, cy - r * 0.7), vec2(cx - r * 0.7, cy + r * 0.7), col, t)

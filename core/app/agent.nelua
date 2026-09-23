@@ -201,6 +201,8 @@ global function agent_event(ctx: pointer, ev: *AgentEvent): void
             host.windows:push(s)
           elseif view == 'min' then
             host.minimized:push(s)
+          elseif view == 'native' then
+            host.native:push(s) -- a game window again (core/app/nativeview.nelua; an ImGui window if it cannot be)
           else
             host.dropdown_tabs:push(s)
             host.dropdown_active = #host.dropdown_tabs - 1

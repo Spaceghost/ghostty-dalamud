@@ -71,7 +71,7 @@ local function has(s: string) assert(rep:find(s, 1, true) > 0, s) end
 has('"complete": true')
 has('"ok": true')
 has('"state": "complete"')
-has('"selection": "core terminal render world settings themes bell agent loader"')
+has('"selection": "core terminal render world settings themes bell agent native loader"')
 has('"id": "unstamped"')
 has('"plugin_version": "unknown"') -- no GhosttyDalamud.json beside a checkout's lua/
 has('{ "suite": "core", "case": "active", "status": "pass"')
@@ -89,13 +89,14 @@ has('{ "suite": "bell", "case": "bell styles", "status": "pass"')
 has('{ "suite": "bell", "case": "showcase terminals", "status": "pass"')
 has('{ "suite": "bell", "case": "bell restored", "status": "pass"')
 has('{ "suite": "agent", "case": "echo", "status": "skip"')
+has('{ "suite": "native", "case": "path", "status": "skip"')
 has('{ "suite": "loader", "case": "swap", "status": "skip"')
 assert(rep:find('"status": "fail"', 1, true) == 0, 'nothing failed')
 rep:destroy()
 assert(not exists(config .. '/selftest/scratch/settings.lua'), 'the settings scratch file is removed')
 assert(not exists(config .. '/settings.lua'), "the player's settings file is never written")
 local s = logs:promote()
-assert(s:find('selftest core terminal render world settings themes bell agent loader: PASS', 1, true) > 0, 'one-line summary')
+assert(s:find('selftest core terminal render world settings themes bell agent native loader: PASS', 1, true) > 0, 'one-line summary')
 s:destroy()
 
 -- a timestamped copy beside latest.json
@@ -132,7 +133,7 @@ do
   gu_shutdown()
   procguard_fake.now_ms = 100000
   local f = io.open(config .. '/selftest/state.tsv', 'wb')
-  f:write('ghostty-selftest-state 1\nrun\tr-9\nselection\t257\nnext\t8\nstep\t1\nstarted_ms\t90000\n',
+  f:write('ghostty-selftest-state 1\nrun\tr-9\nselection\t513\nnext\t9\nstep\t1\nstarted_ms\t90000\n',
     'started_utc\t2026-09-19T00:00:00Z\nswap_ms\t99000\n',
     'fp\ttab=;window=;min=;world=;settings=0000000000000000;build=unstamped\n',
     'case\tcore\tactive\tpass\t0\tactivation ACTIVE\n')
@@ -158,7 +159,7 @@ do
   gu_shutdown()
   procguard_fake.now_ms = 500000
   local g = io.open(config .. '/selftest/state.tsv', 'wb')
-  g:write('ghostty-selftest-state 1\nrun\told\nselection\t256\nnext\t8\nstep\t1\nswap_ms\t1000\n')
+  g:write('ghostty-selftest-state 1\nrun\told\nselection\t512\nnext\t9\nstep\t1\nswap_ms\t1000\n')
   g:destroy()
   assert(gu_init_ex(&api, &info) == INIT_OK)
   selftest_tick(false)

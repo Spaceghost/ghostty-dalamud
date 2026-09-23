@@ -7,6 +7,7 @@ require 'core.app.terminal'
 require 'core.chrome'
 require 'core.tooltip'
 require 'core.app.bell'
+require 'core.app.nativeview'
 require 'core.app.gallery'
 require 'core.app.capture'
 require 'C.stdio'
@@ -83,6 +84,10 @@ global function dropdown_run(action: ChromeAction): void
     host.windows:push(s)
     host.dropdown_tabs:remove(host.dropdown_active)
     clamp_active()
+  elseif action == ChromeAction.Native then
+    -- the active tab as a game window (an ImGui window when that cannot be)
+    native_show(s, true)
+    clamp_active()
   end
 end
 
@@ -132,6 +137,9 @@ global function window_run(i: integer, action: ChromeAction): boolean
     host.windows:remove(i)
     if make_pet(s) then return true end
     host.windows:insert(i, s)
+  elseif action == ChromeAction.Native then
+    native_show(s, true) -- takes it out of host.windows either way
+    return true
   elseif action == ChromeAction.Dock then
     -- back into the dropdown as a tab
     host.windows:remove(i)
