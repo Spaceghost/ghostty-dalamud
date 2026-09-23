@@ -461,22 +461,28 @@ global function lakitu_command(args: string): cint
     -- A photograph from where the camera is, with the view put back after.
     local ok, why = lakitu_shoot(0)
     if not ok then
-      logf(LOG_WARN, 'cam: %s', why)
+      sayf(LOG_WARN, 'cam: %s', why)
       return 4
     end
-    log(LOG_INFO, 'cam: taking a shot')
+    say(LOG_INFO, 'cam: taking a shot')
     return 0
+  elseif a == 'zoom' or a == 'webcam' or a == 'stream' then
+    -- The game out as a camera the rest of the desktop can open
+    -- (docs/MEETINGS.md). A toggle, because that is how a camera is used.
+    return capture_camera(not capture_camera_on(), false)
+  elseif a == 'zoom clean' or a == 'webcam clean' then
+    return capture_camera(not capture_camera_on(), true)
   elseif a == 'reset' then
     local on, shot, model, serial = lakitu_want.on, lakitu_want.shot, lakitu_want.model, lakitu_want.serial
     lakitu_want = lakitu_defaults()
     lakitu_want.on, lakitu_want.shot, lakitu_want.model, lakitu_want.serial = on, shot, model, serial
     spin = 0
   else
-    log(LOG_WARN, '/term cam [on|off|shot|shoot|body|left|right|up|down|in|out|orbit|still|reset]')
+    say(LOG_WARN, '/cam [on|off|shot|shoot|zoom|body|left|right|up|down|in|out|orbit|still|reset]')
     return 4
   end
   if not lakitu_want.on then lakitu_want.shot = false end
-  logf(LOG_INFO, 'cam: %s, shot %s, %.1f yalms, %.1f up, yaw %.2f%s',
+  sayf(LOG_INFO, 'cam: %s, shot %s, %.1f yalms, %.1f up, yaw %.2f%s',
        lakitu_want.on and 'on' or 'off', lakitu_want.shot and 'on' or 'off',
        lakitu_want.distance, lakitu_want.height, lakitu_want.yaw,
        lakitu_want.orbit ~= 0 and ', orbiting' or '')
