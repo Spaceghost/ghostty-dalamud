@@ -31,6 +31,8 @@ global GuCharacter = @record{
   x: float32, y: float32, z: float32,
   radius: float32,        -- hitbox radius in yalms
   entity_id: uint64,
+  height: float32,        -- model height in yalms
+  kind: cint,             -- 1 player, 2 battle NPC, 3 event NPC, 4 companion
 }
 
 -- A character in screen space: a capsule from feet to head, and its depth.
@@ -75,6 +77,7 @@ global WorldPlacement = @record{
   pitch: float32,         -- tilt back, radians
   roll: float32,          -- turn about the front normal, radians (counterclockwise as seen from the front)
   squash: float32,        -- squash and stretch (lua/motion.lua): > 0 wider and shorter, < 0 narrower and taller; 0 none
+  tuck: float32,          -- hem tucked up: shorter by this share of its height, its top edge where it was (0 none, at most 0.6)
   width: float32,         -- panel size in terminal pixels
   height: float32,
   ppm: float32,           -- terminal pixels per world unit (yalm)
@@ -119,13 +122,22 @@ global function world_basis(p: WorldPlacement): WorldBasis
   if not (sq == sq) then sq = 0 end -- NaN from a policy mistake: none
   sq = math.clamp(sq, -0.3, 0.3)
   local sx: float64, sv: float64 = 1 + sq, 1 / (1 + sq)
+  -- tuck: the bottom edge drawn up toward the top, the top edge staying put
+  -- (not area-kept: a pet lifting its hem so something passes under it)
+  local tk = p.tuck
+  if not (tk == tk) then tk = 0 end
+  tk = math.clamp(tk, 0, 0.6)
+  sv = sv * (1 - tk)
   -- front normal f = (sy, 0, cy); a viewer in front looks along -f and sees
   -- right = up x f = (cy, 0, -sy); tilt: up leans back away from the viewer,
   -- (-sy sp, cp, -cy sp); roll turns both about the panel's normal
   local r0x, r0z = cy, -sy
   local u0x, u0y, u0z = -sy * sp, cp, -cy * sp
+  -- the top edge (hh pixels up from the middle) stays where it was: the middle
+  -- rises by the height taken off the bottom, half of it
+  local lift = p.height * 0.5 * tk * inv / (1 + sq)
   local b: WorldBasis = {
-    cx = p.x, cy = p.y, cz = p.z,
+    cx = p.x + (@float32)((cr * u0x - sr * r0x) * lift), cy = p.y + (@float32)(cr * u0y * lift), cz = p.z + (@float32)((cr * u0z - sr * r0z) * lift),
     rx = (@float32)(cr * r0x + sr * u0x), ry = (@float32)(sr * u0y), rz = (@float32)(cr * r0z + sr * u0z),
     fx = (@float32)(sy), fz = (@float32)(cy),
     ux = (@float32)((cr * u0x - sr * r0x) * inv * sv), uy = (@float32)(cr * u0y * inv * sv), uz = (@float32)((cr * u0z - sr * r0z) * inv * sv),

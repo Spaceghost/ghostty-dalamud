@@ -179,22 +179,27 @@ local function slab(o, d, lo, hi, t0, t1)
   if t0 > t1 then return nil end
   return t0, t1
 end
-local function raycast(ox, oy, oz, dx, dy, dz, max)
+-- A box marked `prop` stands for the game's props (lamp posts, stone posts):
+-- on another collision layer, so the old filter ('bg', layer 1 only) misses it
+-- and 'all' and 'layers' see it, as in game.
+local function raycast(ox, oy, oz, dx, dy, dz, max, filter)
   rays_cast = rays_cast + 1
+  filter = filter or 'all'
   local l = math.sqrt(dx * dx + dy * dy + dz * dz)
   if l < 1e-9 then return nil end
   dx, dy, dz = dx / l, dy / l, dz / l
   local best
   for _, b in ipairs(boxes) do
     local inside = ox > b[1] and ox < b[4] and oy > b[2] and oy < b[5] and oz > b[3] and oz < b[6]
-    if not inside then
+    if not inside and not (b.prop and filter == 'bg') then
       local t0, t1 = slab(ox, dx, b[1], b[4], 0, max)
       if t0 then t0, t1 = slab(oy, dy, b[2], b[5], t0, t1) end
       if t0 then t0 = slab(oz, dz, b[3], b[6], t0, t1) end
       if t0 and (not best or t0 < best) then best = t0 end
     end
   end
-  return best
+  if best then return best, 0, 0, 0, filter end
+  return nil
 end
 
 -- The world maths with it --------------------------------------------------------------------------
@@ -253,7 +258,7 @@ ghostty = {
     for i, c in ipairs(chars) do
       local e = buf[i] or {}
       buf[i] = e
-      e.x, e.y, e.z, e.r, e.id = c.x, 0, c.z, 0.5, c.id
+      e.x, e.y, e.z, e.r, e.id, e.h, e.kind = c.x, 0, c.z, c.r or 0.5, c.id, c.h or 1.7, c.kind or 'player'
     end
     return buf
   end,
@@ -421,6 +426,38 @@ do
   print('walking past a pillar OK')
 end
 
+-- 2c'. A stone post (in game: Middle La Noscea, a lamp post's base) is a prop
+--      on a collision layer the old filter never looked at: with it the pet
+--      walks straight through the post, with every layer it goes round.
+do
+  local function past_post(filter_bg)
+    fresh(1)
+    boxes = {}
+    player.x, player.z, player.rotation = 0, 0, 0
+    run(3, 1 / 60)
+    local o = outs[ids[1]]
+    local bottom = o.y - o.height / o.pixels_per_yalm / 2
+    -- 0.25 across, reaching a quarter of the way up the pet
+    boxes = { { o.x - 0.12, -1, 2.6, o.x + 0.13, bottom + 0.35, 2.85, prop = true } }
+    local real = ghostty.raycast
+    if filter_bg then ghostty.raycast = function(...) local a1, a2, a3, a4, a5, a6, a7 = ... return real(a1, a2, a3, a4, a5, a6, a7, 'bg') end end
+    local seen = 0
+    run(3, 1 / 60, nil, nil, function()
+      player.z = player.z + 2 / 60
+      if seen_inside(ids[1]) then seen = seen + 1 end
+    end)
+    ghostty.raycast = real
+    player.x, player.z = 0, 0
+    return seen
+  end
+  local old = past_post(true)
+  local now = past_post(false)
+  print('a post the old filter cannot see: frames inside it, old filter', old, 'every layer', now)
+  assert(old > 0, 'with the old filter the pet goes through the post (what the game showed)')
+  assert(now == 0, 'with every layer it never does')
+  print('post OK')
+end
+
 -- 2d. Through a doorway: you walk through, your pets on either side would
 --     float through the wall, which is too thick and too tall to squeeze,
 --     shuffle or float past. They blink out on this side and back in on the
@@ -510,9 +547,67 @@ do
   player.x, player.z = 0, 0
 end
 
--- 2g. Characters: someone walking through a pet's place is let pass (the pet
---     does not dodge), someone who stays in it for a couple of seconds gets
---     room, and once they have gone the pet goes back.
+-- The drawn face (squash, tuck: hem up, top edge where it was) against a
+-- character's cylinder (radius r, height h, feet at y): any point inside it.
+local function hits_cylinder(o, c)
+  local sq, tk = o.squash or 0, o.tuck or 0
+  local hw = o.width / o.pixels_per_yalm / 2 * (1 + sq)
+  local hh = o.height / o.pixels_per_yalm / 2 / (1 + sq)
+  local top = o.y + hh
+  local bottom = top - 2 * hh * (1 - tk)
+  local rx, rz, fx, fz = math.cos(o.yaw), -math.sin(o.yaw), math.sin(o.yaw), math.cos(o.yaw)
+  for i = -10, 10 do
+    local lat, fwd = hw * i / 10, 0
+    if o.curve and o.curve > 0.01 then
+      local ang = lat / o.curve
+      lat, fwd = o.curve * math.sin(ang), o.curve * (1 - math.cos(ang))
+    end
+    local px, pz = o.x + rx * lat + fx * fwd, o.z + rz * lat + fz * fwd
+    if (px - c.x) ^ 2 + (pz - c.z) ^ 2 < (c.r or 0.5) ^ 2 then
+      for j = 0, 4 do
+        local py = bottom + (top - bottom) * j / 4
+        if py > (c.y or 0) and py < (c.y or 0) + (c.h or 1.7) then return true end
+      end
+    end
+  end
+  return false
+end
+
+-- 2g. Characters. Other players walking through a pet's place are let pass;
+--     one who stays gets room, and it goes back once they have gone.
+do
+  fresh(1)
+  boxes = {}
+  player.x, player.z, player.rotation = 0, 0, 0
+  run(3, 1 / 60)
+  local o = outs[ids[1]]
+  local rest_x, rest_z, rest_y = o.x, o.z, o.y
+  chars = { { x = o.x - 3, z = o.z, id = 900, kind = 'player' } }
+  local moved = 0
+  run(2, 1 / 60, nil, nil, function()
+    chars[1].x = chars[1].x + 3 / 60 -- walking straight through it at a walk
+    local q = outs[ids[1]]
+    moved = math.max(moved, math.sqrt((q.x - rest_x) ^ 2 + (q.z - rest_z) ^ 2) + math.abs(q.y - rest_y) + (q.tuck or 0))
+  end)
+  assert(moved < 0.06, 'a player passing by is let pass: moved ' .. moved)
+  -- someone stands in its place
+  chars[1].x, chars[1].z = rest_x, rest_z
+  run(0.8, 1 / 60)
+  local q = outs[ids[1]]
+  assert(math.sqrt((q.x - rest_x) ^ 2 + (q.z - rest_z) ^ 2) < 0.05 and (q.tuck or 0) < 0.01, 'not at once: they may be passing')
+  run(2.2, 1 / 60)
+  assert(not hits_cylinder(outs[ids[1]], chars[1]), 'a player who stays gets room')
+  chars = {}
+  run(3, 1 / 60)
+  q = outs[ids[1]]
+  assert(math.sqrt((q.x - rest_x) ^ 2 + (q.z - rest_z) ^ 2) < 0.1 and (q.tuck or 0) < 0.01 and math.abs(q.y - rest_y) < 0.1, 'and it goes back once they have gone')
+  chars = nil
+  print('players OK')
+end
+
+-- 2h. A mob walks through the pet's place: the pet sees it coming, tucks its
+--     hem up and floats a little so it walks under, never touching its
+--     cylinder, and lets its hem down again once it has passed.
 do
   fresh(1)
   boxes = {}
@@ -520,30 +615,51 @@ do
   run(3, 1 / 60)
   local o = outs[ids[1]]
   local rest_x, rest_z = o.x, o.z
-  chars = { { x = o.x - 3, z = o.z, id = 900 } }
-  local moved = 0
-  run(2, 1 / 60, nil, nil, function()
-    chars[1].x = chars[1].x + 3 / 60 -- walking straight through it at a walk
+  chars = { { x = o.x - 4, z = o.z, id = 901, kind = 'mob', r = 0.6, h = 1.2 } }
+  local most_tuck, most_lift, sidestep = 0, 0, 0
+  run(3, 1 / 60, nil, nil, function()
+    chars[1].x = chars[1].x + 3 / 60
     local q = outs[ids[1]]
-    moved = math.max(moved, math.sqrt((q.x - rest_x) ^ 2 + (q.z - rest_z) ^ 2))
+    assert(not hits_cylinder(q, chars[1]), 'never touches the mob')
+    most_tuck = math.max(most_tuck, q.tuck or 0)
+    most_lift = math.max(most_lift, W.anchors[ids[1]].m_hlift or 0)
+    sidestep = math.max(sidestep, math.sqrt((q.x - rest_x) ^ 2 + (q.z - rest_z) ^ 2))
   end)
-  assert(moved < 0.05, 'a passer-by is let pass: moved ' .. moved)
-  -- someone stands in its place
-  chars[1].x, chars[1].z = rest_x, rest_z
-  run(0.8, 1 / 60)
-  local q = outs[ids[1]]
-  assert(math.sqrt((q.x - rest_x) ^ 2 + (q.z - rest_z) ^ 2) < 0.05, 'not at once: they may be passing')
-  run(2.2, 1 / 60)
-  q = outs[ids[1]]
-  local ax, az, bx, bz = motion.footprint(q.x, q.z, q.yaw, q.width / q.pixels_per_yalm / 2, q.curve)
-  local d = motion.point_seg(chars[1].x, chars[1].z, ax, az, bx, bz)
-  assert(d >= W.pet.collide.body, 'someone who stays gets room: ' .. d)
-  chars = {}
-  run(3, 1 / 60)
-  q = outs[ids[1]]
-  assert(math.sqrt((q.x - rest_x) ^ 2 + (q.z - rest_z) ^ 2) < 0.1, 'and it goes back once they have gone')
+  print('a mob walks under: tuck', most_tuck, 'lift', most_lift, 'sidestep', sidestep)
+  assert(most_tuck > 0.1, 'it tucked its hem up')
+  assert(sidestep < 0.2, 'rather than stepping aside')
+  run(2, 1 / 60)
+  assert((outs[ids[1]].tuck or 0) < 0.01, 'and let it down once the mob had passed')
+  -- Reduce motion: no tuck, a plain lift
+  W.motion.reduce = true
+  chars[1].x = o.x - 4
+  local tucked = 0
+  run(3, 1 / 60, nil, nil, function()
+    chars[1].x = chars[1].x + 3 / 60
+    local q = outs[ids[1]]
+    assert(not hits_cylinder(q, chars[1]), 'reduced: never touches the mob either')
+    tucked = math.max(tucked, q.tuck or 0)
+  end)
+  assert(tucked < 1e-6, 'reduced: no tuck')
+  W.motion.reduce = false
   chars = nil
-  print('characters OK')
+  print('mob OK')
+end
+
+-- 2i. An NPC standing right beside the pet's place, too tall to pass under:
+--     the pet keeps clear of it at once (no waiting, as for players), by
+--     stepping aside.
+do
+  fresh(1)
+  boxes = {}
+  player.x, player.z, player.rotation = 0, 0, 0
+  run(3, 1 / 60)
+  local o = outs[ids[1]]
+  chars = { { x = o.x + 0.3, z = o.z + 0.4, id = 902, kind = 'npc', r = 0.5, h = 3.0 } }
+  run(0.5, 1 / 60)
+  run(2, 1 / 60, nil, nil, function() assert(not hits_cylinder(outs[ids[1]], chars[1]), 'keeps clear of a standing NPC') end)
+  chars = nil
+  print('NPC OK')
 end
 
 -- 3. A ledge under the pet's slot: it floats up over it rather than into it.
@@ -644,7 +760,8 @@ do
   run(4, 1 / 60)
   local ys = { {}, {}, {} }
   local rolls = {}
-  run(4, 1 / 60, nil, nil, function()
+  -- long enough for a few slow bobs (about ten seconds each)
+  run(24, 1 / 60, nil, nil, function()
     for i = 1, 3 do ys[i][#ys[i] + 1] = outs[ids[i]].y end
     rolls[#rolls + 1] = outs[ids[1]].roll
   end)
@@ -667,7 +784,7 @@ do
   do
     local id = ids[1]
     local hy, hr, hs = {}, 0, 0
-    for _ = 1, 60 do frame(1 / 60) end
+    for _ = 1, 300 do frame(1 / 60) end -- back from the row beside the focused one
     for _ = 1, 120 do
       clock = clock + 1 / 60
       for _, other in ipairs(ids) do outs[other] = W.place(other, clock, false, other == id) end
@@ -676,9 +793,14 @@ do
     end
     local tail = {}
     for k = 60, #hy do tail[#tail + 1] = hy[k] end
-    assert(spread_of(tail) < 1e-3 and hr < 0.036 and hs <= 0.04, 'pointed at: held still')
-    local _, lr = nil, 0
-    lr = math.abs(outs[id].roll)
+    -- the bob is gone; what is left is the spring easing the last millimetre
+    -- to rest, one way, not a wobble
+    local ups, downs = 0, 0
+    for k = 2, #tail do
+      if tail[k] > tail[k - 1] + 1e-7 then ups = ups + 1 elseif tail[k] < tail[k - 1] - 1e-7 then downs = downs + 1 end
+    end
+    assert(spread_of(tail) < 3e-3 and (ups == 0 or downs == 0) and hr < 0.036 and hs <= 0.04, 'pointed at: held still')
+    local lr = math.abs(outs[id].roll)
     assert(lr < 1e-3 and outs[id].squash == 0, 'pointed at: straight, unsquashed')
   end
   -- a run that stops: they lean, settle with a squash, and trail like a

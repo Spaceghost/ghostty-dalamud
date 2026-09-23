@@ -259,19 +259,41 @@ snapped back every frame.
   apart on the same circle cross each other, one behind the other do not.
 * **You, and other characters.** A pet keeps out of your personal space
   (half its width + 0.6 about your centre, and `collide.body` from your
-  middle) at once. Other characters are not walls: `ghostty.nearby_characters()`
-  (the shim walks Dalamud's IObjectTable for players, battle and event NPCs
-  and chocobos within 15 yalms at most ten times a second; nil in an older
-  shim, where your target stands in) lists them, and a pet makes room only for
-  someone who stays in its place for `collide.dwell` seconds, and goes back
-  once they have been gone `collide.dwell_out` seconds. Someone walking
-  through is let pass.
-* **The world.** `ghostty.raycast` (the shim's `BGCollisionModule.RaycastMaterialFilter`,
-  the background collision the game's own ScreenToWorld uses). Two parts:
+  middle) at once. `ghostty.nearby_characters()` lists the rest (the shim walks
+  Dalamud's IObjectTable for players, battle NPCs, event NPCs and companions
+  within 15 yalms at most ten times a second, with hitbox radius, model height
+  and kind; nil in an older shim, where your target stands in as an NPC):
+  - *mobs, NPCs and chocobos* are kept clear of at once, where they are and
+    where they are going (their velocity, smoothed, `collide.predict`
+    seconds ahead), their radius plus `collide.body`;
+  - *other players* are let pass: a pet makes room only for one who stays in
+    its place `collide.dwell` seconds, and goes back once they have been gone
+    `collide.dwell_out`.
+  Room is made the tidiest way: a character short enough to pass under
+  (`collide.under` yalms, and a ray up from the pet's top for a ceiling) gets
+  a *hike*: the pet tucks its hem up (the placement's `tuck`: the bottom edge
+  drawn toward the top, the top edge where it was, not area-kept, at most
+  `collide.tuck` of its height; none with Reduce motion) and floats up for the
+  rest, then lets its hem down 0.35 s after it is no longer needed. Taller
+  ones are stepped aside from. A pet held still to be read makes no room, and
+  keeps a hike under way as it is.
+* **The world.** `ghostty.raycast` (the shim's `raycast_mode`, through
+  `BGCollisionModule.RaycastMaterialFilter` with every collision layer and any
+  material). The first version asked through ClientStructs' helper, which
+  casts on layer 1 with materials having bit 0x4000, what ScreenToWorld wants
+  (ground you can click). In game that saw walls and pillars but not the
+  props on other layers: a pet walked through a stone lamp-post base the
+  player cannot walk through (Middle La Noscea), with `/term world rays` showing
+  the rays cast and none hitting it. `ghostty.raycast(..., filter)` still takes
+  'bg' (the helper's filter) and 'layers' (every layer, the helper's
+  material filter), for `/term world rays` and the `world` selftest, which report
+  what each would have seen (a ring of 16 rays at knee height; the trace
+  counts hits only the new filter makes). Not yet observed in game that the
+  wider filter sees the post: that is what those two are for. Two parts:
   * *Where a pet goes* (`probe_world`, on the spring's target, never its
     output). A place fits when rays from your chest (`collide.chest` above
     your feet) to a grid over its face (one column every `collide.spacing`,
-    at least 3, at two heights: bigger pets get more rays) leave
+    0.3 yalms, at least 3, at two heights: bigger pets get more rays) leave
     `collide.margin` in front of anything, after coming in no nearer than your
     personal space, and rays *along* its face (left edge through the middle to
     the right edge, following the curve, both ways at two heights, since the

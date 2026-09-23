@@ -94,6 +94,7 @@ internal static unsafe class HostApi
         Api->HttpPost       = &HttpPost;
         Api->Indoor         = &Indoor;
         Api->NearbyCharacters = &NearbyCharacters;
+        Api->RaycastMode    = &RaycastMode;
     }
 
     public static void Free()
@@ -873,6 +874,13 @@ internal static unsafe class HostApi
                         found.Add((d, new GuCharacter {
                             X = o.Position.X, Y = o.Position.Y, Z = o.Position.Z,
                             Radius = MathF.Max(o.HitboxRadius, 0.3f), EntityId = o.GameObjectId,
+                            Height = ((FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)o.Address)->Height,
+                            Kind = k switch {
+                                Dalamud.Game.ClientState.Objects.Enums.ObjectKind.Player => 1,
+                                Dalamud.Game.ClientState.Objects.Enums.ObjectKind.BattleNpc => 2,
+                                Dalamud.Game.ClientState.Objects.Enums.ObjectKind.EventNpc => 3,
+                                _ => 4,
+                            },
                         }));
                     }
                     found.Sort((a, b) => a.d.CompareTo(b.d));
@@ -882,6 +890,35 @@ internal static unsafe class HostApi
             int n = Math.Min(nearbyCount, cap);
             for (int i = 0; i < n; i++) outp[i] = NearbyCache[i];
             return n;
+        } catch { return 0; }
+    }
+
+    // The same ray through the game's collision with a choice of filter, for
+    // pets (lua/world.lua): which colliders count is what decides whether a
+    // pet sees a lamp post. BGCollisionModule's own helper (mode 0, `Raycast`
+    // above) asks for layer 1 and materials with bit 0x4000 set, which is what
+    // ScreenToWorld wants (ground you can click) and misses props the player
+    // still bumps into. mode 1: every layer, any non-zero material. mode 2:
+    // every layer, the helper's material filter (to tell layer from material).
+    // 1 with the first hit within `max` yalms, else 0.
+    [UnmanagedCallersOnly(CallConvs = [typeof(System.Runtime.CompilerServices.CallConvCdecl)])]
+    private static int RaycastMode(float ox, float oy, float oz, float dx, float dy, float dz, float max, int mode,
+                                   float* hx, float* hy, float* hz)
+    {
+        try {
+            var fw = FFXIVClientStructs.FFXIV.Client.System.Framework.Framework.Instance();
+            if (fw == null || fw->BGCollisionModule == null) return 0;
+            var o = new System.Numerics.Vector3(ox, oy, oz);
+            var d = new System.Numerics.Vector3(dx, dy, dz);
+            var hit = default(FFXIVClientStructs.FFXIV.Common.Component.BGCollision.RaycastHit);
+            int* flags = stackalloc int[4];
+            int layers;
+            if (mode == 1) { flags[0] = -1; flags[1] = -1; flags[2] = 0; flags[3] = 0; layers = -1; }        // mask all, value 0: any material
+            else if (mode == 2) { flags[0] = 0x4000; flags[1] = 0; flags[2] = 0x4000; flags[3] = 0; layers = -1; }
+            else { flags[0] = 0x4000; flags[1] = 0; flags[2] = 0x4000; flags[3] = 0; layers = 1; }
+            if (!fw->BGCollisionModule->RaycastMaterialFilter(&hit, &o, &d, max, layers, flags)) return 0;
+            *hx = hit.Point.X; *hy = hit.Point.Y; *hz = hit.Point.Z;
+            return 1;
         } catch { return 0; }
     }
 

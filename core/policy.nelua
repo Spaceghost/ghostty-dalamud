@@ -830,6 +830,7 @@ global function policy_world_place_held(id: integer, t: float64, focused: boolea
     pl.pitch = (@float32)(lua_field_number(L, r, 'pitch', 0))
     pl.roll = (@float32)(lua_field_number(L, r, 'roll', 0))
     pl.squash = (@float32)(lua_field_number(L, r, 'squash', 0))
+    pl.tuck = (@float32)(lua_field_number(L, r, 'tuck', 0))
     pl.width = (@float32)(lua_field_number(L, r, 'width', 900))
     pl.height = (@float32)(lua_field_number(L, r, 'height', 520))
     pl.ppm = (@float32)(lua_field_number(L, r, 'pixels_per_yalm', 300))

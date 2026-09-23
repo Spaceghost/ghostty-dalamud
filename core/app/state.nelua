@@ -124,6 +124,13 @@ global GuHostApi = @record{
   -- at most `cap`: how many were written. nilptr in older shims: pets make
   -- room for your target only (lua/world.lua)
   nearby_characters: function(out: *[0]GuCharacter, cap: cint): cint,
+  -- the game's collision as `raycast`, with a choice of filter: 0 the one
+  -- `raycast` uses (layer 1, material bit 0x4000: ground you can click), 1
+  -- every layer and any material (all the player bumps into, lamp posts too),
+  -- 2 every layer with the first's material filter. nilptr in older shims:
+  -- ghostty.raycast falls back to `raycast`
+  raycast_mode: function(ox: float32, oy: float32, oz: float32, dx: float32, dy: float32, dz: float32,
+                         max: float32, mode: cint, hx: *float32, hy: *float32, hz: *float32): cint,
 }
 
 global LOG_INFO: cint <comptime> = 1
