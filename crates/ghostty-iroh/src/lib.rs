@@ -19,6 +19,7 @@
 //! in the build container (docs/IROH.md, "Cross-compilation"). Nothing here has
 //! been built, run, or measured.
 
+pub mod moq;
 pub mod node;
 mod wakeup;
 
