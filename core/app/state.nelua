@@ -16,6 +16,7 @@ require 'core.agent_client'
 require 'core.world'
 require 'core.depthpass'
 require 'core.hudmask'
+require 'core.nativewin'
 require 'core.sendtext'
 require 'core.sys.dualsense_reader'
 require 'allocators.default'
@@ -120,6 +121,26 @@ global GuHostApi = @record{
   -- 1 while the game has the character inside a housing interior; nilptr in
   -- older shims: the collision rays alone decide (core/app/rain.nelua)
   indoor: function(): cint,
+  -- A terminal in a game window (docs/NATIVE_UI.md, core/app/nativeview.nelua):
+  -- a KamiToolKit addon per session id whose image node shows a texture the
+  -- terminal is drawn into. nilptr in older shims: /term native opens an ImGui
+  -- window instead. Every call answers 0 when it could not do what it says.
+  -- open: title, size in UI units, screen position (-1, -1: the game's choice); 1 = asked
+  native_open: function(id: cint, title: cstring, w: float32, h: float32, x: float32, y: float32): cint,
+  native_close: function(id: cint): cint,       -- 1 = asked (the state says CLOSED once it is gone)
+  -- what the window is doing (id 0: the native path itself); 1 = `out` filled
+  native_state: function(id: cint, out: *GuNativeState): cint,
+  -- render `dl` (texture pixels from 0, 0) into the window's texture, made
+  -- cap_w x cap_h (a new texture only when that changes), `tex_w` x `tex_h` of
+  -- it shown by the image node at (node_x, node_y) sized node_w x node_h UI
+  -- units; 1 = drawn
+  native_draw: function(id: cint, dl: *ImDrawList, tex_w: cint, tex_h: cint, cap_w: cint, cap_h: cint,
+                        node_x: float32, node_y: float32, node_w: float32, node_h: float32): cint,
+  native_resize: function(id: cint, w: float32, h: float32): cint, -- the window's new size, UI units
+  native_title: function(id: cint, title: cstring): cint,
+  -- the terminal font built at `px` pixels pushed (pop with pop_font); 0 = not
+  -- built yet, nothing pushed (it is being built for next time)
+  push_mono_font_px: function(px: float32): cint,
 }
 
 global LOG_INFO: cint <comptime> = 1
@@ -227,6 +248,10 @@ global Host = @record{
   anim_out: boolean,                -- last state sent to lua/animation.lua
   world_saved_at: float64,
   drawing_world: boolean,           -- draw_terminal uses the world font
+  -- terminals in game windows (core/app/nativeview.nelua, docs/NATIVE_UI.md)
+  native: vector(*Session),
+  drawing_native: boolean,          -- draw_terminal draws into a game window's texture
+  native_font_px: float32,          -- ... at this font size
   settings_open: boolean,
   settings_badge: boolean,          -- CONFIG.settings.badge(): a dot on the settings button (unseen vote ideas)
   pad: PadGestureState,             -- toggle button: tap / double tap / hold

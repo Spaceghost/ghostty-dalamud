@@ -1,0 +1,665 @@
+-- Terminals in game windows (docs/NATIVE_UI.md): the core's side. Each
+-- terminal in host.native has a game addon made by the shim (KamiToolKit);
+-- every frame the terminal is drawn by the usual renderer into an offscreen
+-- draw list, and the shim renders that into the texture the addon's image
+-- node shows. Mouse and keyboard reach the terminal through ImGui's IO while
+-- the game says its window is under the pointer or the terminal has focus.
+-- The pure parts (layout, focus, closing) are core/nativewin.nelua.
+--
+-- Host tests only (tests/test_native_app.nelua against a fake shim). Not yet
+-- observed in game; /term selftest native is the in-game check.
+require 'core.app.terminal'
+require 'core.app.bell'
+require 'core.app.cursor'
+require 'core.nativewin'
+local strconv: type = require 'detail.strconv'
+
+local ImDrawListFlags_AntiAliasedLines: cint <cimport, nodecl, const>
+local ImDrawListFlags_AntiAliasedLinesUseTex: cint <cimport, nodecl, const>
+local ImDrawListFlags_AntiAliasedFill: cint <cimport, nodecl, const>
+local ImDrawListFlags_AllowVtxOffset: cint <cimport, nodecl, const>
+
+local OPEN_WAIT <comptime> = 5.0     -- seconds for an asked-for window to be set up
+local READY_WAIT <comptime> = 20.0   -- seconds for the native path (KamiToolKit) to start
+local DRAW_FAILS <comptime> = 3      -- failed draws in a row before the terminal falls back
+local SETTINGS_EVERY <comptime> = 1.0
+
+local DRAG_NONE <comptime> = 0
+local DRAG_SELECT <comptime> = 1     -- a left press on the text: selection (terminal_mouse)
+local DRAG_REPORT <comptime> = 2     -- a press the program asked to be told about
+local DRAG_GRIP <comptime> = 3       -- the resize grip
+
+-- One game window.
+local NativeWin = @record{
+  id: integer,               -- the session's id
+  agent_id: uint32,          -- for its saved size and place (0: no agent session)
+  asked: boolean,            -- native_open sent
+  asked_at: float64,
+  seen_open: boolean,        -- it has been set up at least once
+  gone: boolean,             -- closed by the game or given up: nothing to close
+  suspended: boolean,        -- went with the UI; opened again when the UI is back
+  closes: cint,              -- the shim's close counter when last seen
+  focused: boolean,
+  fails: integer,            -- failed draws in a row
+  draws: integer,            -- successful draws (the self-test counts them)
+  st: GuNativeState,
+  layout: NativeLayout,
+  cap_w: integer, cap_h: integer, -- the texture's allocation
+  dl: *ImDrawList,
+  drag: integer,
+  report_button: integer,
+  m0x: float32, m0y: float32, w0: float32, h0: float32, -- where a grip drag started
+  last_col: integer, last_row: integer, -- the cell of the last motion report
+  title: string,             -- last title sent
+  saved_x: float32, saved_y: float32, saved_w: float32, saved_h: float32,
+}
+
+local wins: vector(*NativeWin)
+
+-- native_focus_request and native_focused_id live in core/app/views.nelua.
+-- Why the native path is unavailable, as last found ('' when it is).
+global native_reason: string
+-- The self-test's forced failure: every window falls back.
+global native_force_unavailable: boolean = false
+
+local reason_said: string -- the last reason said in chat (said once per reason)
+local prev_rmb = false
+local path_status: cint = NATIVE_NONE
+local path_error: cint = 0
+local path_since: float64 = -1
+local settings_at: float64 = -1
+local set_opacity: float32 = 1
+local set_font: float32 = 0
+local set_enabled = true
+
+-- The offscreen draw list: cimgui's constructor and reset, resolved once --------------------
+local Off = @record{
+  tried: boolean,
+  shared: function(): pointer,
+  create: function(shared: pointer): *ImDrawList,
+  destroy: function(dl: *ImDrawList): void,
+  reset: function(dl: *ImDrawList): void,
+  push_tex: function(dl: *ImDrawList, tex: pointer): void,
+}
+local off: Off
+
+local function off_bind(): boolean
+  if not off.tried then
+    off.tried = true
+    off.shared = (@function(): pointer)(resolve_imgui('igGetDrawListSharedData'))
+    off.create = (@function(shared: pointer): *ImDrawList)(resolve_imgui('ImDrawList_ImDrawList'))
+    off.destroy = (@function(dl: *ImDrawList): void)(resolve_imgui('ImDrawList_destroy'))
+    off.reset = (@function(dl: *ImDrawList): void)(resolve_imgui('ImDrawList__ResetForNewFrame'))
+    off.push_tex = (@function(dl: *ImDrawList, tex: pointer): void)(resolve_imgui('ImDrawList_PushTextureID'))
+  end
+  return off.shared ~= nilptr and off.create ~= nilptr and off.destroy ~= nilptr and off.reset ~= nilptr and off.push_tex ~= nilptr
+end
+
+-- The texture holding the font's white pixel and glyphs: a fresh draw list
+-- starts on it, as a window's list does after PushFont.
+local function font_texture(dl: *ImDrawList): void
+  if off.push_tex == nilptr or imgui.GetFont == nilptr then return end
+  local font = imgui.GetFont()
+  if font == nilptr or font.ContainerAtlas == nilptr then return end
+  local atlas = font.ContainerAtlas
+  if atlas.Textures.Size <= 0 or atlas.Textures.Data == nilptr then return end
+  local i = atlas.TextureIndexCommon
+  if i < 0 or i >= atlas.Textures.Size then i = 0 end
+  local tex = atlas.Textures.Data[i].TexID
+  if tex ~= nilptr then off.push_tex(dl, tex) end
+end
+
+-- CONFIG.native (lua/native.lua) ----------------------------------------------------------------
+local function push_native(L: *lua_State): boolean
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'native')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  return true
+end
+
+local function read_settings(now: float64): void
+  if settings_at >= 0 and now >= settings_at and now - settings_at < SETTINGS_EVERY then return end
+  settings_at = now
+  set_opacity, set_font, set_enabled = 1, 0, true
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_native(L) then return end
+  set_opacity = (@float32)(math.clamp(lua_field_number(L, -1, 'opacity', 1), 0, 1))
+  set_font = (@float32)(math.clamp(lua_field_number(L, -1, 'font_size', 0), 0, 96))
+  set_enabled = lua_field_boolean(L, -1, 'enabled', true)
+  lua_pop(L, 2)
+end
+
+-- CONFIG.native.geometry(agent_id) -> w, h, x, y
+local function lua_geometry(agent_id: uint32): (float32, float32, float32, float32)
+  local w: float32, h: float32, x: float32, y: float32 = 720, 420, -1, -1
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_native(L) then return w, h, x, y end
+  lua_getfield(L, -1, 'geometry')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return w, h, x, y end
+  lua_pushinteger(L, (@integer)(agent_id))
+  if lua_pcall(L, 1, 4, 0) == LUA_OK then
+    if lua_type(L, -4) == LUA_TNUMBER then w = (@float32)(lua_tonumberx(L, -4, nilptr)) end
+    if lua_type(L, -3) == LUA_TNUMBER then h = (@float32)(lua_tonumberx(L, -3, nilptr)) end
+    if lua_type(L, -2) == LUA_TNUMBER then x = (@float32)(lua_tonumberx(L, -2, nilptr)) end
+    if lua_type(L, -1) == LUA_TNUMBER then y = (@float32)(lua_tonumberx(L, -1, nilptr)) end
+    lua_pop(L, 6)
+  else
+    lua_pop(L, 3)
+  end
+  return w, h, x, y
+end
+
+-- CONFIG.native.remember(agent_id, w, h, x, y) then save(); or forget(agent_id) then save().
+local function lua_remember(agent_id: uint32, forget: boolean, w: float32, h: float32, x: float32, y: float32): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_native(L) then return end
+  if forget then lua_getfield(L, -1, 'forget') else lua_getfield(L, -1, 'remember') end
+  if lua_type(L, -1) == LUA_TFUNCTION then
+    lua_pushinteger(L, (@integer)(agent_id))
+    local n: cint = 1
+    if not forget then
+      lua_pushnumber(L, w) lua_pushnumber(L, h) lua_pushnumber(L, x) lua_pushnumber(L, y)
+      n = 5
+    end
+    if lua_pcall(L, n, 0, 0) ~= LUA_OK then lua_pop(L, 1) end
+  else
+    lua_pop(L, 1)
+  end
+  lua_getfield(L, -1, 'save')
+  if lua_type(L, -1) == LUA_TFUNCTION then
+    if lua_pcall(L, 0, 0, 0) ~= LUA_OK then lua_pop(L, 1) end
+  else
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+end
+
+-- Availability ------------------------------------------------------------------------------------
+
+local function set_reason(r: string): void
+  local c = string.copy(r) -- `r` may be native_reason itself
+  native_reason:destroy()
+  native_reason = c
+end
+
+-- Whether a terminal can be shown as a game window now, and why not.
+-- `starting` is true while the shim is still bringing KamiToolKit up.
+global function native_available(): (boolean, boolean)
+  if native_force_unavailable then set_reason('forced off by the self-test') return false, false end
+  if not set_enabled then set_reason('turned off in lua/native.lua (enabled = false)') return false, false end
+  if host.api.native_open == nilptr or host.api.native_state == nilptr or host.api.native_draw == nilptr
+     or host.api.native_close == nilptr then
+    set_reason('this GhosttyDalamud.dll has no game windows (an older plugin build)')
+    return false, false
+  end
+  if not off_bind() then set_reason('cimgui lacks the draw list exports') return false, false end
+  local st: GuNativeState
+  if host.api.native_state(0, &st) == 0 then set_reason('the plugin did not answer') return false, false end
+  path_status, path_error = st.status, st.error
+  if st.status == NATIVE_FAILED then
+    set_reason(native_error_text(st.error))
+    return false, false
+  end
+  set_reason('')
+  return true, st.status ~= NATIVE_OPEN
+end
+
+local function say_reason(what: string): void
+  if native_reason == reason_said then return end
+  reason_said:destroy()
+  reason_said = string.copy(native_reason)
+  sayf(LOG_WARN, '%s: no game window (%s); opened as an ImGui window instead', what, native_reason)
+end
+
+-- The views ---------------------------------------------------------------------------------------
+
+local function win_of(id: integer): *NativeWin
+  for i = 0, < #wins do
+    if wins[i].id == id then return wins[i] end
+  end
+  return nilptr
+end
+
+local function in_native(id: integer): *Session
+  for i = 0, < #host.native do
+    if host.native[i].id == id then return host.native[i] end
+  end
+  return nilptr
+end
+
+-- An ImGui floating window instead (unavailable, failed, or asked for).
+local function to_window(s: *Session): void
+  take_out_of_views(s)
+  host.windows:push(s)
+  set_visible(true)
+end
+
+-- Show `s` as a game window. False when the native path is unavailable: it
+-- is then an ImGui floating window, and the reason is said once.
+global function native_show(s: *Session, focus: boolean): boolean
+  if s == nilptr then return false end
+  local ok = native_available()
+  if not ok then
+    say_reason('game window')
+    to_window(s)
+    return false
+  end
+  take_out_of_views(s)
+  host.native:push(s)
+  if focus then native_focus_request = s.id end
+  return true
+end
+
+-- The game window of `s` back to an ImGui floating window.
+global function native_to_window(s: *Session): void
+  if s == nilptr or in_native(s.id) == nilptr then return end
+  to_window(s)
+end
+
+-- The terminal whose game window has the keyboard.
+global function native_focused_session(): *Session
+  if native_focused_id == 0 then return nilptr end
+  return in_native(native_focused_id)
+end
+
+-- For the self-test: what window `id` is doing.
+global function native_win_info(id: integer): (boolean, GuNativeState, NativeLayout, integer, boolean)
+  local w = win_of(id)
+  if w == nilptr then return false, (@GuNativeState){}, (@NativeLayout){}, 0, false end
+  return true, w.st, w.layout, w.draws, w.focused
+end
+
+local function free_win(w: *NativeWin): void
+  if w.dl ~= nilptr and off.destroy ~= nilptr then off.destroy(w.dl) end
+  w.dl = nilptr
+  w.title:destroy()
+  delete(w)
+end
+
+-- Give up on the game window of `s` (unavailable, never opened, failing):
+-- an ImGui window instead.
+local function fall_back(w: *NativeWin, s: *Session, why: string): void
+  set_reason(why)
+  say_reason('game window')
+  if not w.gone and host.api.native_close ~= nilptr then host.api.native_close((@cint)(w.id)) end
+  w.gone = true
+  if w.focused then native_focused_id = 0 end
+  w.focused = false
+  to_window(s)
+end
+
+-- Windows for new game-window terminals, and closing the ones that left.
+local function reconcile(): void
+  local i: integer = #wins - 1
+  while i >= 0 do
+    local w = wins[i]
+    -- a window given up on (closed by the game, fallen back) goes even when its
+    -- terminal was shown as a game window again since: that gets a fresh one
+    if w.gone or in_native(w.id) == nilptr then
+      if not w.gone and host.api.native_close ~= nilptr then host.api.native_close((@cint)(w.id)) end
+      if find_session(w.id) == nilptr and w.agent_id ~= 0 then lua_remember(w.agent_id, true, 0, 0, 0, 0) end -- closed for good
+      if native_focused_id == w.id then native_focused_id = 0 end
+      free_win(w)
+      wins:remove(i)
+    end
+    i = i - 1
+  end
+  for k = 0, < #host.native do
+    local s = host.native[k]
+    if win_of(s.id) == nilptr then
+      local w = new(@NativeWin)
+      w.id = s.id
+      if s.kind == TransportKind.Agent then w.agent_id = s.agent_id end
+      w.report_button = -1
+      w.last_col, w.last_row = -1, -1
+      wins:push(w)
+    end
+  end
+end
+
+-- Input -----------------------------------------------------------------------------------------
+
+local function report(s: *Session, button: integer, action: integer, col: integer, row: integer): void
+  local io = imgui.GetIO()
+  local mods = 0
+  if io.KeyAlt then mods = mods | 8 end
+  if io.KeyCtrl then mods = mods | 16 end
+  local out: [32]byte
+  local n = s.view:mouse_bytes(button, action, col, row, mods, &out)
+  if n > 0 then s:write(&out, (@usize)(n)) end
+end
+
+-- The pointer on window `w` of `s` this frame: grip, selection, reports, wheel.
+local function pointer_input(w: *NativeWin, s: *Session, l: *NativeLayout, on_window: boolean, now: float64, r_pressed: boolean): void
+  local io = imgui.GetIO()
+  local mp: ImVec2
+  imgui.GetMousePos(&mp)
+  local lx, ly, inside = native_local(l, mp.x, mp.y)
+  local on_content = on_window and inside
+  local pad = math.floor(4 * l.scale)
+  local tx, ty = lx - pad, ly - pad -- in the terminal's own pixels
+  local col, row = selection_cell_at(tx, ty, s.cell_w, s.cell_h, s.cols, s.rows)
+  local tracking = s.view:mouse_tracking() and not io.KeyShift
+
+  if w.drag == DRAG_NONE then
+    if host.lmb_pressed and on_content then
+      host.click_used = true
+      if native_grip_hit(l, lx, ly) then
+        w.drag = DRAG_GRIP
+        w.m0x, w.m0y, w.w0, w.h0 = mp.x, mp.y, w.st.w, w.st.h
+      elseif tracking then
+        w.drag = DRAG_REPORT
+        w.report_button = 0
+        report(s, 0, 0, col, row)
+        w.last_col, w.last_row = col, row
+      else
+        w.drag = DRAG_SELECT
+        terminal_mouse(s, tx, ty, true, true, true, now)
+      end
+    elseif r_pressed and on_content and tracking then
+      host.click_used = true
+      w.drag = DRAG_REPORT
+      w.report_button = 2
+      report(s, 2, 0, col, row)
+      w.last_col, w.last_row = col, row
+    elseif on_content and tracking and (col ~= w.last_col or row ~= w.last_row) then
+      report(s, 3, 2, col, row) -- any-motion mode (1003) wants the pointer with no button held
+      w.last_col, w.last_row = col, row
+    end
+  elseif w.drag == DRAG_SELECT then
+    terminal_mouse(s, tx, ty, true, false, host.lmb_down, now)
+    if not host.lmb_down then w.drag = DRAG_NONE end
+  elseif w.drag == DRAG_REPORT then
+    local held = w.report_button == 2 and host.rmb_down or (w.report_button ~= 2 and host.lmb_down)
+    if held then
+      if col ~= w.last_col or row ~= w.last_row then
+        report(s, w.report_button, 2, col, row)
+        w.last_col, w.last_row = col, row
+      end
+    else
+      report(s, w.report_button, 1, col, row)
+      w.drag, w.report_button = DRAG_NONE, -1
+    end
+  elseif w.drag == DRAG_GRIP then
+    local vp = imgui.GetMainViewport()
+    local nw, nh = native_resize_size(w.w0, w.h0, w.m0x, w.m0y, mp.x, mp.y, l.scale, vp.Size.x, vp.Size.y)
+    if (math.abs(nw - w.st.w) >= 1 or math.abs(nh - w.st.h) >= 1) and host.api.native_resize ~= nilptr then
+      host.api.native_resize((@cint)(w.id), nw, nh)
+    end
+    if not host.lmb_down then w.drag = DRAG_NONE end
+  end
+
+  -- the wheel reaches ImGui only while it has the mouse (below): scrollback,
+  -- or wheel reports / arrow keys for the program, Ctrl zooms
+  if on_content and w.drag ~= DRAG_GRIP and io.MouseWheel ~= 0 then terminal_wheel(s, tx, ty) end
+  -- Take the mouse from the game while the terminal has focus and the pointer
+  -- is on its text, or a drag started there goes on: the wheel and further
+  -- clicks come to us, the camera does not turn or zoom. The first click on an
+  -- unfocused window goes to the game, which brings the window forward.
+  if (w.focused and on_content) or w.drag ~= DRAG_NONE then
+    imgui.SetNextFrameWantCaptureMouse(true)
+    cursor_over_world = true
+  end
+end
+
+-- Drawing ---------------------------------------------------------------------------------------
+
+local function draw_win(w: *NativeWin, s: *Session, l: *NativeLayout, now: float64): boolean
+  if w.dl == nilptr then
+    local shared = off.shared()
+    if shared == nilptr then return false end
+    w.dl = off.create(shared)
+    if w.dl == nilptr then return false end
+  end
+  local dl = w.dl
+  off.reset(dl)
+  dl.Flags = ImDrawListFlags_AntiAliasedLines | ImDrawListFlags_AntiAliasedLinesUseTex | ImDrawListFlags_AntiAliasedFill
+    | ImDrawListFlags_AllowVtxOffset
+  local tw, th = (@float32)(l.tex_w), (@float32)(l.tex_h)
+  imgui.DrawListPushClipRect(dl, vec2(0, 0), vec2(tw, th), false)
+  font_texture(dl)
+  local alpha = (@uint8)(math.clamp(set_opacity * 255 + 0.5, 0, 255))
+  local bg = theme_rgb(0x101014)
+  if theme_term.has_background then bg = theme_term.background end
+  imgui.DrawListAddRectFilled(dl, vec2(0, 0), vec2(tw, th), im_col32(bg.r, bg.g, bg.b, alpha), 0, 0)
+  local pad = math.floor(4 * l.scale)
+  local fs = s.font_scale > 0 and (@float32)(s.font_scale) or 1
+  terminal_native_texture = font_texture -- draw_terminal starts the pushed font's texture with it
+  host.drawing_native = true
+  host.native_font_px = l.font_px
+  draw_terminal(s, dl, vec2(pad, pad), tw - 2 * pad, th - 2 * pad, l.font_px / fs, w.focused, false, alpha, 0)
+  host.drawing_native = false
+  bell_rect_glow(dl, vec2(0, 0), vec2(tw, th), 0, s.id)
+  -- the resize grip, in the corner like the ImGui window's
+  local g = native_grip_px(l) * 0.7
+  local inset = math.floor(2 * l.scale)
+  imgui.DrawListAddTriangleFilled(dl, vec2(tw - inset - g, th - inset), vec2(tw - inset, th - inset - g), vec2(tw - inset, th - inset),
+    chrome_col(ChromeColor.Accent, w.drag == DRAG_GRIP and 200 or 90))
+  imgui.DrawListPopClipRect(dl)
+  w.cap_w = native_capacity(w.cap_w, l.tex_w)
+  w.cap_h = native_capacity(w.cap_h, l.tex_h)
+  return host.api.native_draw((@cint)(w.id), dl, (@cint)(l.tex_w), (@cint)(l.tex_h), (@cint)(w.cap_w), (@cint)(w.cap_h),
+    l.node_x, l.node_y, l.node_w, l.node_h) ~= 0
+end
+
+-- The frame -------------------------------------------------------------------------------------
+
+local function busy(): boolean
+  return host.api.scene_flags ~= nilptr and host.api.scene_flags() ~= 0
+end
+
+-- One window, set up and visible (or hidden with the UI).
+local function frame_open(w: *NativeWin, s: *Session, now: float64, r_pressed: boolean): void
+  local hidden = w.st.ui_hidden ~= 0
+  -- the title follows the terminal's
+  local name = s:display_name()
+  if name ~= w.title and host.api.native_title ~= nilptr then
+    local z = name .. '\0'
+    host.api.native_title((@cint)(w.id), (@cstring)(z.data))
+    z:destroy()
+    w.title:destroy()
+    w.title = string.copy(name)
+  end
+  local base = set_font > 0 and set_font or (@float32)(host.dropdown_font_size > 0 and host.dropdown_font_size or 15)
+  local fs = s.font_scale > 0 and (@float32)(s.font_scale) or 1
+  local l = native_layout(&w.st, base, fs)
+  w.layout = l
+  local on_window = w.st.hovered ~= 0 and not hidden
+  local e: NativeFocusIn = {
+    open = true, ui_hidden = hidden,
+    press = host.lmb_pressed or r_pressed, on_window = on_window,
+    claimed_by_other = host.world_focus ~= 0 or host.dropdown_focus_next,
+    drop = host.drop_focus,
+    want = native_focus_request == w.id,
+  }
+  if native_focus_request == w.id then native_focus_request = 0 end
+  local focused, took = native_focus_step(w.focused, e)
+  w.focused = focused
+  if took then
+    -- no ImGui window keeps the keyboard beside it, and no world panel
+    host.world_focus = 0
+    if imgui.SetWindowFocusNil ~= nilptr then imgui.SetWindowFocusNil() end
+  end
+  if focused then native_focused_id = w.id elseif native_focused_id == w.id then native_focused_id = 0 end
+  if hidden or not l.ok then
+    s:pump()
+    return
+  end
+  if on_window and (host.lmb_pressed or r_pressed) then host.click_used = true end -- not a click on the bare world
+  pointer_input(w, s, &l, on_window, now, r_pressed)
+  if draw_win(w, s, &l, now) then
+    w.fails = 0
+    w.draws = w.draws + 1
+  else
+    w.fails = w.fails + 1
+    if w.fails == DRAW_FAILS then
+      local why = native_error_text(w.st.error ~= 0 and w.st.error or NATIVE_ERR_TEXTURE)
+      fall_back(w, s, why)
+      return
+    end
+  end
+  -- where it is and how big, kept for the next time (not while a button is down: mid-drag)
+  if not host.lmb_down and (w.st.x ~= w.saved_x or w.st.y ~= w.saved_y or w.st.w ~= w.saved_w or w.st.h ~= w.saved_h) then
+    w.saved_x, w.saved_y, w.saved_w, w.saved_h = w.st.x, w.st.y, w.st.w, w.st.h
+    if w.seen_open and w.st.w > 0 and w.st.h > 0 then lua_remember(w.agent_id, false, w.st.w, w.st.h, w.st.x, w.st.y) end
+  end
+end
+
+-- Per frame from gu_frame (core/host.nelua), after the ImGui windows so their
+-- terminals claim the keyboard first. `live`: the core is active (not
+-- suspended behind the legacy core).
+global function native_frame(now: float64, live: boolean): void
+  if not live then
+    for i = 0, < #host.native do host.native[i]:pump() end
+    return
+  end
+  read_settings(now)
+  if native_focus_request ~= 0 and in_native(native_focus_request) == nilptr then native_focus_request = 0 end
+  reconcile()
+  if #wins == 0 then
+    prev_rmb = host.rmb_down
+    return
+  end
+  local r_pressed = host.rmb_down and not prev_rmb
+  prev_rmb = host.rmb_down
+  local ok, starting = native_available()
+  if ok and starting then
+    if path_since < 0 then path_since = now end
+  else
+    path_since = -1
+  end
+  for i = 0, < #wins do
+    local w = wins[i]
+    local s = in_native(w.id)
+    if s == nilptr or w.gone then continue end
+    if not ok then
+      fall_back(w, s, native_reason)
+      continue
+    end
+    if not w.asked then
+      if starting then
+        if path_since >= 0 and now - path_since > READY_WAIT then fall_back(w, s, 'KamiToolKit did not start in time') end
+        s:pump()
+        continue
+      end
+      -- hidden with the UI: open it again once the UI is back
+      local pst: GuNativeState
+      if w.suspended and (host.api.native_state(0, &pst) == 0 or pst.ui_hidden ~= 0 or busy()) then
+        s:pump()
+        continue
+      end
+      local ww, wh, wx, wy = lua_geometry(w.agent_id)
+      if w.seen_open and w.saved_w > 0 then ww, wh, wx, wy = w.saved_w, w.saved_h, w.saved_x, w.saved_y end
+      local name = s:display_name()
+      local z = name .. '\0'
+      local asked = host.api.native_open((@cint)(w.id), (@cstring)(z.data), ww, wh, wx, wy) ~= 0
+      z:destroy()
+      if not asked then
+        fall_back(w, s, 'the plugin refused to open a game window')
+        continue
+      end
+      w.asked, w.asked_at, w.suspended = true, now, false
+      w.title:destroy()
+      w.title = string.copy(name)
+      w.closes = 0
+      w.cap_w, w.cap_h = 0, 0 -- a new addon makes a new texture
+      s:pump()
+      continue
+    end
+    local st: GuNativeState
+    if host.api.native_state((@cint)(w.id), &st) == 0 then st.status = NATIVE_NONE end
+    w.st = st
+    if st.status == NATIVE_OPENING then
+      if now - w.asked_at > OPEN_WAIT then fall_back(w, s, 'the game window did not open within 5 s') else s:pump() end
+    elseif st.status == NATIVE_FAILED then
+      fall_back(w, s, native_error_text(st.error ~= 0 and st.error or NATIVE_ERR_OPEN))
+    elseif st.status == NATIVE_OPEN then
+      w.seen_open = true
+      frame_open(w, s, now, r_pressed)
+    else -- CLOSED or NONE: the game closed it
+      if w.focused then native_focused_id = 0 end
+      w.focused = false
+      w.drag = DRAG_NONE
+      w.asked = false
+      if w.dl ~= nilptr and off.destroy ~= nilptr then off.destroy(w.dl) w.dl = nilptr end
+      local kind = native_close_kind(false, st.ui_hidden ~= 0, busy())
+      if kind == NativeClose.Suspend then
+        w.suspended = true
+        s:pump()
+      else
+        -- its x, Esc or close-all: minimized, the shell still running
+        w.gone = true
+        minimize(s)
+        logf(LOG_INFO, 'game window %d closed: terminal minimized', s.id)
+      end
+    end
+  end
+end
+
+-- `/term native [new [N] | off | status]` --------------------------------------------------------
+global function native_command(args: string): cint
+  if args == 'status' then
+    local ok, starting = native_available()
+    if ok then
+      sayf(LOG_INFO, 'game windows: %s, %d open', starting and 'starting' or 'available', #host.native)
+    else
+      sayf(LOG_INFO, 'game windows: unavailable (%s)', native_reason)
+    end
+    for i = 0, < #wins do
+      local w = wins[i]
+      logf(LOG_INFO, 'game window %d: status %d, %.0fx%.0f at %.0f,%.0f scale %.2f, texture %dx%d, font %.0f px, %s, %d drawn',
+        w.id, w.st.status, w.st.w, w.st.h, w.st.x, w.st.y, w.st.scale, w.layout.tex_w, w.layout.tex_h, w.layout.font_px,
+        w.focused and 'focused' or 'not focused', w.draws)
+    end
+    return 0
+  elseif args == 'off' then
+    local s = native_focused_session()
+    if s == nilptr and #host.native > 0 then s = host.native[#host.native - 1] end
+    if s == nilptr then log(LOG_WARN, 'native off: no game window') return 4 end
+    native_to_window(s)
+    return 0
+  elseif args == 'new' or (#args > 4 and args:subview(1, 4) == 'new ') then
+    local n = policy.default_profile
+    if #args > 4 then
+      local ok, id = strconv.str2int(args:subview(5), 10)
+      if not ok then return 3 end
+      n = id
+    end
+    local s = session_new(n - 1, 80, 24)
+    if s == nilptr then return 2 end
+    native_show(s, true)
+    return 0
+  elseif #args == 0 then
+    local s = active_terminal()
+    if s == nilptr then
+      s = session_new(policy.default_profile - 1, 80, 24)
+      if s == nilptr then return 2 end
+    elseif in_native(s.id) ~= nilptr then
+      native_focus_request = s.id
+      return 0
+    end
+    native_show(s, true)
+    return 0
+  end
+  log(LOG_WARN, 'usage: /term native [new [N] | off | status]')
+  return 4
+end
+
+-- Shutdown and /term reload: every game window closes (the shells stay; the
+-- layout brings them back as game windows).
+global function native_shutdown(): void
+  for i = 0, < #wins do
+    local w = wins[i]
+    if not w.gone and host.api.native_close ~= nilptr then host.api.native_close((@cint)(w.id)) end
+    free_win(w)
+  end
+  wins:destroy()
+  native_focus_request, native_focused_id = 0, 0
+  native_reason:destroy()
+  reason_said:destroy()
+  prev_rmb = false
+  path_status, path_error, path_since = NATIVE_NONE, 0, -1
+  settings_at = -1
+  off = {}
+end

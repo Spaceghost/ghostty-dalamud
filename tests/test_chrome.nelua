@@ -158,7 +158,7 @@ end
 
 -- Buttons: ids, actions, layout -------------------------------------------------------------
 do
-  local seen: [14]integer
+  local seen: [16]integer
   for i = 0, < CHROME_TAB_BUTTONS do
     local b = chrome_tab_buttons[i]
     assert(#b.tip > 0 and #b.id > 0, 'every button explains itself')
@@ -166,12 +166,12 @@ do
     seen[b.action] = seen[b.action] + 1
     for k = i + 1, < CHROME_TAB_BUTTONS do assert(chrome_tab_buttons[k].id ~= b.id, 'ids are unique') end
   end
-  local wants: [10]ChromeAction = {
-    ChromeAction.NewTab, ChromeAction.Profiles, ChromeAction.Window, ChromeAction.Pin,
+  local wants: [11]ChromeAction = {
+    ChromeAction.NewTab, ChromeAction.Profiles, ChromeAction.Window, ChromeAction.Native, ChromeAction.Pin,
     ChromeAction.Pet, ChromeAction.Minimize, ChromeAction.Shot, ChromeAction.Share,
     ChromeAction.Settings, ChromeAction.Hide,
   }
-  for i = 0, < 10 do assert(seen[wants[i]] == 1, 'each tab bar action has exactly one button') end
+  for i = 0, < 11 do assert(seen[wants[i]] == 1, 'each tab bar action has exactly one button') end
   for i = 0, < CHROME_WINDOW_BUTTONS do
     local b = chrome_window_buttons[i]
     assert(#b.tip > 0 and chrome_action(b.id) == b.action, b.id)
@@ -229,7 +229,7 @@ end
 imgui_bind(resolver, nilptr)
 do
   local dl: ImDrawList
-  for k = ChromeIcon.Plus, ChromeIcon.Shutter do
+  for k = ChromeIcon.Plus, ChromeIcon.Game do
     local icon = (@ChromeIcon)(k)
     prims = 0
     minx, miny, maxx, maxy = 1e9, 1e9, -1e9, -1e9
@@ -299,7 +299,7 @@ do
   print('settings badge OK')
 end
 
-local used: [14]integer
+local used: [16]integer
 local function press(id: string): void
   local a = chrome_action(id)
   assert(a ~= ChromeAction.None, id)
@@ -344,10 +344,15 @@ assert(#host.dropdown_tabs == 1 and host.dropdown_active == 0 and #host.sessions
 press('new')
 press('window')
 assert(#host.windows == 1 and #host.dropdown_tabs == 1 and host.dropdown_active == 0, 'window pops the active tab out')
+-- a game window: this test's shim has none, so an ImGui window instead (docs/NATIVE_UI.md)
+press('new')
+press('native')
+assert(#host.windows == 2 and #host.native == 0 and #host.dropdown_tabs == 1 and host.dropdown_active == 0, 'no game windows here: an ImGui window')
+assert(window_run(1, ChromeAction.Close) and #host.windows == 1)
 press('min')
 assert(#host.minimized == 1 and #host.dropdown_tabs == 0 and not host.dropdown_open, 'min tucks it away; the last one hides the dropdown')
-local tab_only: [4]string = { 'window', 'pin', 'pet', 'min' }
-for i = 0, < 4 do press(tab_only[i]) end
+local tab_only: [5]string = { 'window', 'native', 'pin', 'pet', 'min' }
+for i = 0, < 5 do press(tab_only[i]) end
 assert(#host.windows == 1 and #host.minimized == 1 and #host.world == 0, 'tab actions without a tab do nothing')
 
 -- pet and pin need a character in the world

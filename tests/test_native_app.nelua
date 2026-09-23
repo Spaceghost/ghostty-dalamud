@@ -1,0 +1,554 @@
+-- Terminals in game windows (core/app/nativeview.nelua, docs/NATIVE_UI.md) in
+-- an embedded core, against a fake ImGui (an offscreen draw list included) and
+-- a fake shim standing in for KamiToolKit: the fallback to an ImGui window
+-- when the shim has no game windows, waiting while KamiToolKit starts, the
+-- window opened with the saved size, the texture drawn at the window's scale
+-- with the font at that size, keyboard focus taken on opening and by a click,
+-- typed keys reaching the shell only while focused, the mouse taken from the
+-- game only over a focused window's text, selection and copy, Ctrl+wheel zoom
+-- with the font following, mouse reports for a program that asks, the resize
+-- grip, the title following the terminal's, the size saved, the UI hiding and
+-- coming back, failed draws falling back, the game closing the window
+-- (minimized) or the UI taking it (opened again), /term native off, status and
+-- shutdown.
+require 'core.host'
+require 'string'
+require 'vector'
+require 'arg'
+
+## cinclude '<stdlib.h>'
+local function calloc(n: csize, size: csize): pointer <cimport, nodecl> end
+local FONT_SIZE: csize <cimport 'sizeof(ImFont)', nodecl, const>
+local ATLAS_SIZE: csize <cimport 'sizeof(ImFontAtlas)', nodecl, const>
+
+local function near(a: float32, b: float32, eps: float32): boolean return math.abs(a - b) <= eps end
+
+local log_lines: vector(string)
+local function log_cb(level: cint, msg: cstring): void
+  io.write('[log ', level, '] ', msg, '\n')
+  log_lines:push(string.copy(msg))
+end
+local function logged(needle: string): integer
+  local n = 0
+  for i = 0, < #log_lines do
+    if log_lines[i]:find(needle, 1, true) > 0 then n = n + 1 end
+  end
+  return n
+end
+
+-- Fake ImGui --------------------------------------------------------------------------------------
+local MAX_CMDS <comptime> = 4096
+local MAX_VERTS <comptime> = 400000
+local ocmds: [MAX_CMDS]ImDrawCmd
+local overts: [MAX_VERTS]ImDrawVert
+local odl: ImDrawList -- the offscreen list the core asks cimgui to make
+local fg: ImDrawList
+local fg_cmds: [64]ImDrawCmd
+local fg_verts: [4096]ImDrawVert
+local viewport: ImGuiViewport = { Size = { 2560, 1440 } }
+local now: float64 = 300
+local mouse_at: ImVec2 = { -5000, -5000 }
+local frame_count = 0
+local chars: [8]uint16
+local io_state: ImGuiIO
+local function fake_io(): *ImGuiIO return &io_state end
+local texts: vector(string)
+local creates, destroys, resets = 0, 0, 0
+local pushed_tex: pointer = nilptr
+
+local function reset_list(l: *ImDrawList, c: *[0]ImDrawCmd, cn: cint, v: *[0]ImDrawVert, vn: cint): void
+  c[0] = { ClipRect = { 0, 0, 8192, 8192 } }
+  l.CmdBuffer = { Size = 1, Capacity = cn, Data = c }
+  l.VtxBuffer = { Size = 0, Capacity = vn, Data = v }
+end
+local function push_vert(l: *ImDrawList, p: ImVec2, col: uint32): void
+  if l.VtxBuffer.Size >= l.VtxBuffer.Capacity then return end
+  l.VtxBuffer.Data[l.VtxBuffer.Size] = { pos = p, col = col }
+  l.VtxBuffer.Size = l.VtxBuffer.Size + 1
+end
+local function quad(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32): void
+  push_vert(l, a, col) push_vert(l, vec2(b.x, a.y), col) push_vert(l, b, col) push_vert(l, vec2(a.x, b.y), col)
+end
+local function fake_rect_filled(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint): void quad(l, a, b, col) end
+local function fake_rect(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint, th: float32): void quad(l, a, b, col) end
+local function fake_line(l: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, th: float32): void quad(l, a, b, col) end
+local function fake_triangle(l: *ImDrawList, a: ImVec2, b: ImVec2, c: ImVec2, col: uint32): void
+  push_vert(l, a, col) push_vert(l, b, col) push_vert(l, c, col)
+end
+local function fake_text(l: *ImDrawList, font: *ImFont, size: float32, pos: ImVec2, col: uint32, tb: cstring, te: cstring, ww: float32, clip: *ImVec4): void
+  local s: string = tb
+  if te ~= nilptr then s = string{ data = (@*[0]byte)(tb), size = (@usize)((@isize)(te) - (@isize)(tb)) } end
+  if l == &odl then texts:push(s:copy()) end
+  quad(l, pos, vec2(pos.x + 8, pos.y + 16), col)
+end
+local function fake_prim_reserve(l: *ImDrawList, idx: cint, vtx: cint): void end
+local function fake_prim_vtx(l: *ImDrawList, pos: ImVec2, uv: ImVec2, col: uint32): void push_vert(l, pos, col) end
+local function fake_uv(out: *ImVec2): void $out = vec2(0, 0) end
+local function fake_push_clip(l: *ImDrawList, a: ImVec2, b: ImVec2, intersect: boolean): void end
+local function fake_pop_clip(l: *ImDrawList): void end
+local function fake_calc(pOut: *ImVec2, font: *ImFont, size: float32, mw: float32, ww: float32, tb: cstring, te: cstring, rem: *cstring): void
+  $pOut = vec2(math.floor(size * 0.5 + 0.5), size) -- one cell: half the size wide (whole pixels: runs merge), the size high
+end
+local function fake_fg(): *ImDrawList return &fg end
+local function fake_viewport(): *ImGuiViewport return &viewport end
+local function fake_mouse(out: *ImVec2): void $out = mouse_at end
+local function fake_false_flags(flags: cint): boolean return false end
+local want_mouse = false
+local function fake_want_mouse(want: boolean): void if want then want_mouse = true end end
+local want_keyboard = false
+local function fake_want_keyboard(want: boolean): void if want then want_keyboard = true end end
+-- a font whose atlas has two textures; the white pixel lives in the second
+local atlas_tex: [2]ImFontAtlasTexture = { { TexID = (@pointer)(0x1111_usize) }, { TexID = (@pointer)(0x2222_usize) } }
+local font = (@*ImFont)(calloc(1, FONT_SIZE))
+local atlas = (@*ImFontAtlas)(calloc(1, ATLAS_SIZE))
+atlas.Textures = { Size = 2, Capacity = 2, Data = (@*[0]ImFontAtlasTexture)(&atlas_tex) }
+atlas.TextureIndexCommon = 1
+font.ContainerAtlas = atlas
+local function fake_font(): *ImFont return font end
+local function fake_font_size(): float32 return 16 end
+local function fake_time(): float64 return now end
+local function fake_clicked(button: cint, rep: boolean): boolean return false end
+local focus_nils = 0
+local function fake_focus_nil(): void focus_nils = focus_nils + 1 end
+local function fake_frame_count(): cint return frame_count end
+local function fake_key_down(key: cint): boolean return false end
+local function fake_key_pressed(key: cint, rep: boolean): boolean return false end
+local clipboard: string
+local function fake_set_clipboard(text: cstring): void clipboard:destroy() clipboard = string.copy(text) end
+local function fake_get_clipboard(): cstring return nilptr end
+-- the offscreen draw list's constructor, reset and texture push
+local shared_data: [16]byte
+local function fake_shared(): pointer return &shared_data end
+local function fake_create(shared: pointer): *ImDrawList
+  assert(shared == &shared_data, 'made with the shared data')
+  creates = creates + 1
+  reset_list(&odl, &ocmds, MAX_CMDS, &overts, MAX_VERTS)
+  return &odl
+end
+local function fake_destroy(l: *ImDrawList): void assert(l == &odl) destroys = destroys + 1 end
+local function fake_reset(l: *ImDrawList): void
+  assert(l == &odl)
+  resets = resets + 1
+  reset_list(&odl, &ocmds, MAX_CMDS, &overts, MAX_VERTS)
+  for i = 0, < #texts do texts[i]:destroy() end
+  texts:clear()
+end
+local function fake_push_tex(l: *ImDrawList, t: pointer): void if l == &odl then pushed_tex = t end end
+
+local function resolver(name: cstring): pointer
+  local n: string = name
+  if n == 'ImDrawList_AddRectFilled' then return (@pointer)(fake_rect_filled) end
+  if n == 'ImDrawList_AddRect' then return (@pointer)(fake_rect) end
+  if n == 'ImDrawList_AddLine' then return (@pointer)(fake_line) end
+  if n == 'ImDrawList_AddTriangleFilled' then return (@pointer)(fake_triangle) end
+  if n == 'ImDrawList_AddText_FontPtr' then return (@pointer)(fake_text) end
+  if n == 'ImDrawList_PrimReserve' then return (@pointer)(fake_prim_reserve) end
+  if n == 'ImDrawList_PrimVtx' then return (@pointer)(fake_prim_vtx) end
+  if n == 'igGetFontTexUvWhitePixel' then return (@pointer)(fake_uv) end
+  if n == 'ImDrawList_PushClipRect' then return (@pointer)(fake_push_clip) end
+  if n == 'ImDrawList_PopClipRect' then return (@pointer)(fake_pop_clip) end
+  if n == 'ImFont_CalcTextSizeA' then return (@pointer)(fake_calc) end
+  if n == 'igGetForegroundDrawList_Nil' then return (@pointer)(fake_fg) end
+  if n == 'igGetMainViewport' then return (@pointer)(fake_viewport) end
+  if n == 'igGetMousePos' then return (@pointer)(fake_mouse) end
+  if n == 'igIsWindowHovered' then return (@pointer)(fake_false_flags) end
+  if n == 'igSetNextFrameWantCaptureMouse' then return (@pointer)(fake_want_mouse) end
+  if n == 'igSetNextFrameWantCaptureKeyboard' then return (@pointer)(fake_want_keyboard) end
+  if n == 'igGetFont' then return (@pointer)(fake_font) end
+  if n == 'igGetFontSize' then return (@pointer)(fake_font_size) end
+  if n == 'igGetTime' then return (@pointer)(fake_time) end
+  if n == 'igGetIO' then return (@pointer)(fake_io) end
+  if n == 'igIsMouseClicked' then return (@pointer)(fake_clicked) end
+  if n == 'igSetWindowFocus_Nil' then return (@pointer)(fake_focus_nil) end
+  if n == 'igGetFrameCount' then return (@pointer)(fake_frame_count) end
+  if n == 'igIsKeyDown' then return (@pointer)(fake_key_down) end
+  if n == 'igIsKeyPressed' then return (@pointer)(fake_key_pressed) end
+  if n == 'igSetClipboardText' then return (@pointer)(fake_set_clipboard) end
+  if n == 'igGetClipboardText' then return (@pointer)(fake_get_clipboard) end
+  if n == 'igGetDrawListSharedData' then return (@pointer)(fake_shared) end
+  if n == 'ImDrawList_ImDrawList' then return (@pointer)(fake_create) end
+  if n == 'ImDrawList_destroy' then return (@pointer)(fake_destroy) end
+  if n == 'ImDrawList__ResetForNewFrame' then return (@pointer)(fake_reset) end
+  if n == 'ImDrawList_PushTextureID' then return (@pointer)(fake_push_tex) end
+  return nilptr
+end
+
+-- The fake shim: KamiToolKit's addons ---------------------------------------------------------------
+local FakeWin = @record{
+  st: GuNativeState,
+  opens: integer, closes: integer, draws: integer,
+  open_w: float32, open_h: float32, open_x: float32, open_y: float32,
+  title: string,
+  tex_w: integer, tex_h: integer, cap_w: integer, cap_h: integer,
+  node: ImVec4,
+  resize_w: float32, resize_h: float32, resizes: integer,
+}
+local fw: [16]FakeWin
+local path: GuNativeState = { status = NATIVE_OPENING }
+local ui_hidden: cint = 0
+local draw_ok = true
+local pushed_px: float32 = 0
+local font_pushes, font_pops = 0, 0
+local scene: cint = 0
+
+local function fake_open(id: cint, title: cstring, w: float32, h: float32, x: float32, y: float32): cint
+  assert(id > 0 and id < 16)
+  local f = &fw[id]
+  f.opens = f.opens + 1
+  f.open_w, f.open_h, f.open_x, f.open_y = w, h, x, y
+  f.title:destroy()
+  f.title = string.copy(title)
+  f.st.status = NATIVE_OPENING
+  return 1
+end
+local function fake_close(id: cint): cint
+  fw[id].closes = fw[id].closes + 1
+  fw[id].st.status = NATIVE_NONE
+  return 1
+end
+local function fake_state(id: cint, out: *GuNativeState): cint
+  if id == 0 then
+    $out = path
+    out.ui_hidden = ui_hidden
+    return 1
+  end
+  $out = fw[id].st
+  if ui_hidden ~= 0 then out.ui_hidden = 1 end
+  return 1
+end
+local function fake_draw(id: cint, dl: *ImDrawList, tw: cint, th: cint, cw: cint, ch: cint, nx: float32, ny: float32, nw: float32, nh: float32): cint
+  assert(dl == &odl, 'the offscreen list')
+  local f = &fw[id]
+  if not draw_ok then return 0 end
+  f.draws = f.draws + 1
+  f.tex_w, f.tex_h, f.cap_w, f.cap_h = tw, th, cw, ch
+  f.node = { nx, ny, nw, nh }
+  return 1
+end
+local function fake_resize(id: cint, w: float32, h: float32): cint
+  fw[id].resizes = fw[id].resizes + 1
+  fw[id].resize_w, fw[id].resize_h = w, h
+  return 1
+end
+local function fake_title(id: cint, t: cstring): cint
+  fw[id].title:destroy()
+  fw[id].title = string.copy(t)
+  return 1
+end
+local function fake_push_px(px: float32): cint
+  pushed_px = px
+  font_pushes = font_pushes + 1
+  return 1
+end
+local function fake_pop_font(): void font_pops = font_pops + 1 end
+local function fake_scene(): cint return scene end
+
+local api: GuHostApi = { size = #GuHostApi, log = log_cb, resolve_imgui = resolver }
+local dir: string = arg[1]
+
+local function set_open(id: integer, x: float32, y: float32, scale: float32): void
+  fw[id].st = { status = NATIVE_OPEN, x = x, y = y, w = 720, h = 420, scale = scale, cx = 8, cy = 40, cw = 704, ch = 372 }
+end
+
+local rmb_down = false
+local function frame(lmb: boolean): void
+  now = now + 1.0 / 60
+  frame_count = frame_count + 1
+  host.frame = host.frame + 1
+  host.last_time = now
+  host.lmb_pressed = lmb and not host.lmb_down and not rmb_down
+  host.lmb_down, host.rmb_down = lmb, rmb_down
+  host.click_used = false
+  host.terminal_focused = host.terminal_focused_now
+  host.terminal_focused_now = false
+  want_mouse, want_keyboard = false, false
+  native_frame(now, true)
+  io_state.MouseWheel = 0
+end
+
+local function feed(s: *Session, text: string): void s.view:feed((@*[0]uint8)(text.data), text.size) end
+local function pending(s: *Session): string
+  return string{ data = (@*[0]byte)(s.pending_out:peek()), size = s.pending_out:len() }
+end
+local function has_text(needle: string): boolean
+  for i = 0, < #texts do if texts[i]:find(needle, 1, true) > 0 then return true end end
+  return false
+end
+local function in_list(list: *vector(*Session), s: *Session): boolean
+  for i = 0, < #$list do if (@*vector(*Session))(list)[i] == s then return true end end
+  return false
+end
+local function read(path: string): string
+  local f = io.open(path)
+  if not f:isopen() then return '' end
+  local s = f:read('a')
+  f:close()
+  return s
+end
+
+-- Setup ------------------------------------------------------------------------------------------
+os.remove(dir .. '/native-state.lua')
+assert(gu_init(&api, (@cstring)(dir.data)) == 0, 'init')
+host.local_agent.last_try = 1e9 -- never dial out
+assert(imgui_bind(resolver, nilptr) > 0)
+host.last_time = now
+io_state.InputQueueCharacters = { Size = 0, Capacity = #chars, Data = (@*[0]uint16)(&chars) }
+io_state.DeltaTime = 1.0 / 60
+
+-- No game windows in this shim: an ImGui window, and why ---------------------------------------------
+do
+  local s = session_new(policy.default_profile - 1, 80, 24)
+  assert(s ~= nilptr and s.kind == TransportKind.Agent and s.awaiting_open, 'an agent terminal waiting for its shell')
+  assert(not native_show(s, true), 'no game window without the shim callbacks')
+  assert(in_list(&host.windows, s) and #host.native == 0, 'an ImGui window instead')
+  assert(logged('no game window') == 1 and logged('an older plugin build') == 1, 'and why, once')
+  close_terminal(s)
+  host.dropdown_focus_next = false -- the dropdown the window opened in would have taken this on its next draw
+end
+
+-- The fake shim from here on
+host.api.native_open, host.api.native_close, host.api.native_state = fake_open, fake_close, fake_state
+host.api.native_draw, host.api.native_resize, host.api.native_title = fake_draw, fake_resize, fake_title
+host.api.push_mono_font_px, host.api.pop_font = fake_push_px, fake_pop_font
+host.api.scene_flags = fake_scene
+
+-- Opening: KamiToolKit starting, then ready; the window's saved size --------------------------------
+local s = session_new(policy.default_profile - 1, 80, 24)
+local id = s.id
+do
+  assert(native_show(s, true), 'a game window')
+  assert(in_list(&host.native, s) and not in_list(&host.dropdown_tabs, s), 'in host.native only')
+  frame(false)
+  assert(fw[id].opens == 0, 'nothing opens while KamiToolKit starts')
+  path.status = NATIVE_OPEN
+  frame(false)
+  assert(fw[id].opens == 1 and fw[id].open_w == 720 and fw[id].open_h == 420 and fw[id].open_x == -1 and fw[id].open_y == -1,
+    'opened at lua/native.lua\'s size, placed by the game')
+  assert(fw[id].title == s:display_name(), 'titled like the terminal')
+  frame(false)
+  assert(fw[id].draws == 0 and creates == 0, 'nothing drawn before the addon is set up')
+end
+
+-- Drawing at the window's scale ------------------------------------------------------------------
+local l: NativeLayout
+do
+  set_open(id, 101.3, 50.6, 1.5)
+  feed(s, 'hello native')
+  frame(false)
+  l = native_layout(&fw[id].st, (@float32)(host.dropdown_font_size), 1)
+  assert(l.ok and fw[id].draws == 1 and creates == 1, 'drawn once the window is up')
+  assert(fw[id].tex_w == l.tex_w and fw[id].tex_h == l.tex_h, 'the texture is the content at the scale')
+  assert(fw[id].cap_w == native_capacity(0, l.tex_w) and fw[id].cap_h == native_capacity(0, l.tex_h), 'allocated in steps')
+  assert(near(fw[id].node.x, l.node_x, 1e-4) and near(fw[id].node.z, l.node_w, 1e-4) and near(fw[id].node.w, l.node_h, 1e-4), 'node placed')
+  assert(pushed_px == l.font_px and l.font_px == 23 and font_pops >= 1, 'the font built at 15 x 1.5, and popped')
+  assert(pushed_tex == (@pointer)(0x2222_usize), 'the offscreen list starts on the atlas texture with the white pixel')
+  assert(has_text('hello') and has_text('native'), 'the terminal is in the texture')
+  assert(native_focused_id == id and want_keyboard, 'opened by command: it has the keyboard, kept from the game')
+  local first = odl.VtxBuffer.Data[0]
+  assert(first.pos.x == 0 and first.pos.y == 0, 'the background starts at the texture origin')
+end
+
+-- Keyboard: typed while focused ------------------------------------------------------------------
+do
+  frame(false)
+  assert(native_focused_id == id, 'still focused')
+  local before = s.pending_out:len()
+  chars[0], chars[1] = 'l'_b, 's'_b
+  io_state.InputQueueCharacters.Size = 2
+  frame(false)
+  assert(s.pending_out:len() == before + 2 and pending(s):subview(before + 1) == 'ls', 'typed into the shell')
+end
+
+-- Mouse: taken from the game over a focused window's text; selection and copy ---------------------------
+local function at(x: float32, y: float32): void mouse_at = vec2((@float32)(l.sx) + x, (@float32)(l.sy) + y) end
+do
+  fw[id].st.hovered = 1
+  at(40, 30)
+  frame(false)
+  assert(want_mouse, 'the wheel and clicks come to us over the focused window\'s text')
+  at(-50, 30)
+  frame(false)
+  assert(not want_mouse, 'not off the text (the title bar and frame stay the game\'s)')
+  at(10, 10)
+  frame(true)
+  assert(s.sel.dragging and host.click_used, 'a press on the text starts a selection, and is no click on the world')
+  at(200, 10)
+  frame(true)
+  frame(false)
+  assert(not s.sel.dragging and #clipboard > 0, 'released: selected and copied')
+end
+
+-- Ctrl+wheel zoom: the font follows at the new size ------------------------------------------------
+do
+  at(40, 30)
+  io_state.KeyCtrl, io_state.MouseWheel = true, 1
+  frame(false)
+  io_state.KeyCtrl = false
+  assert(near((@float32)(s.font_scale), 1.1, 1e-4), 'zoomed')
+  frame(false)
+  assert(pushed_px == native_font_px(15 * 1.1 * 1.5), 'the font at the zoomed size')
+  s.font_scale = 1
+  frame(false)
+end
+
+-- Mouse reports for a program that asks --------------------------------------------------------------
+do
+  feed(s, '\27[?1000h\27[?1006h')
+  local before = s.pending_out:len()
+  at(40, 30)
+  frame(true)
+  local sent = pending(s):subview(before + 1)
+  assert(sent:subview(1, 5) == '\27[<0;' and sent.data[sent.size - 1] == 'M'_b, 'a press report, not a selection')
+  assert(not s.sel.dragging, 'no selection')
+  before = s.pending_out:len()
+  frame(false)
+  sent = pending(s):subview(before + 1)
+  assert(sent:subview(1, 5) == '\27[<0;' and sent.data[sent.size - 1] == 'm'_b, 'the release')
+  -- Shift selects anyway
+  io_state.KeyShift = true
+  frame(true)
+  assert(s.sel.dragging, 'Shift+press selects')
+  frame(false)
+  io_state.KeyShift = false
+  feed(s, '\27[?1000l\27[?1006l')
+end
+
+-- A press elsewhere gives the keyboard back; a press on the window takes it -----------------------------
+do
+  fw[id].st.hovered = 0
+  mouse_at = vec2(5, 5)
+  frame(true)
+  frame(false)
+  assert(native_focused_id == 0, 'unfocused')
+  local before = s.pending_out:len()
+  chars[0] = 'x'_b
+  io_state.InputQueueCharacters.Size = 1
+  frame(false)
+  assert(s.pending_out:len() == before and not want_keyboard, 'keys go to the game, not the shell')
+  io_state.InputQueueCharacters.Size = 0
+  fw[id].st.hovered = 1
+  local nils = focus_nils
+  at(40, -20) -- the title bar: on the window, off the text
+  frame(true)
+  frame(false)
+  assert(native_focused_id == id and focus_nils > nils, 'a click on the window focuses it, and no ImGui window keeps the keyboard')
+  assert(not s.sel.dragging, 'a title bar click selects nothing')
+end
+
+-- Another terminal taking the keyboard -------------------------------------------------------------
+do
+  host.world_focus = 999
+  frame(false)
+  assert(native_focused_id == 0, 'a world panel took it')
+  host.world_focus = 0
+  native_focus_request = id -- bring_forward
+  frame(false)
+  assert(native_focused_id == id, 'brought forward')
+end
+
+-- The resize grip ------------------------------------------------------------------------------
+do
+  at((@float32)(l.tex_w) - 2, (@float32)(l.tex_h) - 2)
+  frame(true)
+  mouse_at.x = mouse_at.x + 150
+  frame(true)
+  assert(fw[id].resizes >= 1 and fw[id].resize_w == 820 and fw[id].resize_h == 420, '150 px at 1.5 is 100 UI units wider')
+  frame(false)
+  assert(not s.sel.dragging, 'the grip is no selection')
+end
+
+-- The title follows; the size is saved -----------------------------------------------------------
+do
+  feed(s, '\27]0;vim\7')
+  frame(false)
+  assert(fw[id].title == 'vim', 'retitled: ' .. fw[id].title)
+  local saved = read(dir .. '/native-state.lua')
+  assert(saved:find('last = { w = 720, h = 420 }', 1, true) > 0, 'the size is kept for the next window: ' .. saved)
+  saved:destroy()
+end
+
+-- The UI hides and comes back ----------------------------------------------------------------------
+do
+  local draws = fw[id].draws
+  ui_hidden = 1
+  frame(false)
+  assert(fw[id].draws == draws and native_focused_id == 0, 'hidden: not drawn, no keyboard')
+  ui_hidden = 0
+  frame(false)
+  assert(fw[id].draws == draws + 1, 'drawn again')
+end
+
+-- Failed draws: an ImGui window instead ----------------------------------------------------------------
+do
+  draw_ok = false
+  frame(false) frame(false) frame(false)
+  draw_ok = true
+  assert(in_list(&host.windows, s) and #host.native == 0 and fw[id].closes == 1, 'three failed draws: back to an ImGui window, the addon closed')
+  assert(logged('no game window (the terminal texture could not be made or drawn)') == 1, 'and why')
+  frame(false)
+  assert(destroys == 1, 'the offscreen list freed with its window')
+end
+
+-- The game closes it: minimized ------------------------------------------------------------------
+do
+  assert(native_show(s, true) and in_list(&host.native, s))
+  frame(false)
+  assert(fw[id].opens == 2, 'opened again')
+  set_open(id, 300, 200, 1)
+  frame(false)
+  assert(fw[id].draws > 0 and native_focused_id == id)
+  fw[id].st.status = NATIVE_CLOSED
+  frame(false)
+  assert(in_list(&host.minimized, s) and #host.native == 0 and native_focused_id == 0, 'its x or Esc: minimized, the shell still there')
+  assert(logged('closed: terminal minimized') == 1)
+end
+
+-- The UI takes it (a cutscene): opened again afterwards ------------------------------------------------
+do
+  assert(native_show(s, false))
+  frame(false)
+  set_open(id, 300, 200, 1)
+  frame(false)
+  local opens = fw[id].opens
+  scene = 1
+  fw[id].st.status = NATIVE_CLOSED
+  frame(false)
+  assert(in_list(&host.native, s) and not in_list(&host.minimized, s), 'kept: it went with the UI')
+  frame(false)
+  assert(fw[id].opens == opens, 'not while the cutscene lasts')
+  scene = 0
+  frame(false)
+  assert(fw[id].opens == opens + 1, 'opened again once it is over')
+  assert(fw[id].open_w == 720 and fw[id].open_x == 300, 'where it was')
+end
+
+-- /term native off, status; a new one; shutdown -----------------------------------------------------------
+do
+  set_open(id, 300, 200, 1)
+  frame(false)
+  local closes = fw[id].closes
+  assert(run_command('native status') == 0)
+  assert(run_command('native off') == 0)
+  frame(false)
+  assert(in_list(&host.windows, s) and fw[id].closes == closes + 1, 'back to an ImGui window, the addon closed')
+  assert(run_command('native bogus') == 4, 'usage')
+  -- the self-test's forced failure
+  native_force_unavailable = true
+  assert(not native_show(s, false) and in_list(&host.windows, s), 'forced off: ImGui window')
+  native_force_unavailable = false
+  -- the chrome's button on a floating window
+  local wi = -1
+  for i = 0, < #host.windows do if host.windows[i] == s then wi = i end end
+  assert(window_run(wi, ChromeAction.Native) and in_list(&host.native, s), 'the window header\'s game window button')
+  frame(false)
+  set_open(id, 300, 200, 1)
+  frame(false)
+  local c2 = fw[id].closes
+  native_shutdown()
+  assert(fw[id].closes == c2 + 1, 'shutdown closes every game window')
+  host.native:clear()
+end
+
+os.remove(dir .. '/native-state.lua')
+gu_shutdown()
+print('test_native_app OK')

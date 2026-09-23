@@ -15,6 +15,7 @@ local tooltips = require('tooltips')
 local windows = require('windows')
 local adopt = require('adopt')
 local gallery = require('gallery')
+local native = require('native')
 
 -- The agent connection and profiles for where the game runs (native Windows,
 -- or Wine/Proton on Linux): see lua/platform.lua. The token authenticates the
@@ -74,7 +75,7 @@ local config = {
     -- /agent ask [question]. Their /help lines are in lua/tooltips.lua.
     -- A name another plugin holds is retried; {} registers none.
     verb_commands = { ['/window'] = 'window', ['/ask'] = 'ask', ['/agent'] = 'agent' },
-    help = 'Show/hide the terminal. window [n|list|pull [match]|close] | new [n] | pin [here|me|target|orbit] | unpin | ask [question] | theme [name] | shot [panel] [clean] | clip [seconds] | share | config | reload',
+    help = 'Show/hide the terminal. window [n|list|pull [match]|close] | new [n] | native [new [n]|off|status] | pin [here|me|target|orbit] | unpin | ask [question] | theme [name] | shot [panel] [clean] | clip [seconds] | share | config | reload',
     -- Server info bar entry. 'auto' shows it only while no Umbra toolbar
     -- widget is showing ghostty's status; 'always' | 'never'.
     dtr = {
@@ -155,6 +156,9 @@ local config = {
   -- uploaded until you click Share. Folders, timings: lua/gallery.lua; the
   -- prompt and credit toggles are in Settings, Gallery.
   gallery = gallery,
+  -- Terminals in game windows (/term native, the "Show as a game window"
+  -- button): sizes, font and background: lua/native.lua (docs/NATIVE_UI.md).
+  native = native,
   -- The settings window (/term config) and its saved overrides (settings.lua).
   settings = settings,
   world_pins = {},
