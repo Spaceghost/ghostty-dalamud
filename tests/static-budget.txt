@@ -1,6 +1,6 @@
-analyze 62
-cppcheck 13
-tidy 110
-warnings-agent 13
-warnings-host 632
+analyze 38
+cppcheck 4
+tidy 70
+warnings-agent 9
+warnings-host 501
 warnings-loader 3
