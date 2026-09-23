@@ -1,0 +1,46 @@
+-- What this agent tells a client it can do, in its greeting
+-- (core/agent_caps.nelua). One function per feature, so each feature's code
+-- decides its own word and nothing else has to know how.
+require 'core.agent_caps'
+require 'core.buildinfo'
+require 'agent.capture' -- CAPTURE_BUILT
+require 'agent.netlab'  -- NETLAB_BUILT
+
+-- Embedded WireGuard (docs/WIREGUARD.md) is in every build: on with the
+-- tunnel up, off when it did not start (Tailscale is here, no peers, or
+-- --wireguard off; the agent's log says which).
+global function agent_wg_capability(running: boolean): uint8
+  if running then return AGENT_CAP_ON end
+  return AGENT_CAP_OFF
+end
+
+-- The Wayland compositor: on when it is linked and it is the running window
+-- backend, off when linked but something else (or nothing) runs, absent when
+-- this build has none (Windows and macOS never do).
+global function agent_compositor_capability(windows_ok: boolean, backend_name: string): uint8
+  ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
+  if windows_ok and backend_name == 'wayland' then return AGENT_CAP_ON end
+  return AGENT_CAP_OFF
+  ## else
+  return AGENT_CAP_ABSENT
+  ## end
+end
+
+global function agent_netlab_capability(): uint8
+  if NETLAB_BUILT then return AGENT_CAP_ON end
+  return AGENT_CAP_ABSENT
+end
+
+global AGENT_PLATFORM: string <comptime> = #[ccinfo.is_windows and 'windows' or ccinfo.is_apple and 'macos' or ccinfo.is_linux and 'linux' or 'unknown']#
+
+-- The whole set. version and platform borrow comptime strings: do not destroy.
+global function agent_capabilities(windows_ok: boolean, backend_name: string, wg_running: boolean): AgentCaps
+  return AgentCaps{
+    known = true,
+    version = BUILD_VERSION_NUMBER,
+    platform = AGENT_PLATFORM,
+    compositor = agent_compositor_capability(windows_ok, backend_name),
+    netlab = agent_netlab_capability(),
+    wg = agent_wg_capability(wg_running),
+  }
+end

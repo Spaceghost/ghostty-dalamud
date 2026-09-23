@@ -86,6 +86,8 @@ echo "--- test_motion (springs, bob and squash, pets keeping off walls, panels a
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_motion.lua
 echo "--- test_ask_rich (the /ask answer: markdown, links, layout, drawing)"
 GHOSTTY_TEST_SCRATCH="$ROOT/build/test-scratch/ask-rich" "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_ask_rich.lua "$ROOT"
+echo "--- test_agentcaps (what the Settings tab says about the agent's features)"
+"$ROOT/vendor/nelua-lang/nelua-lua" tests/test_agentcaps.lua
 if [[ "${SKIP_SHIM:-0}" != 1 ]] && command -v dotnet >/dev/null; then
   echo "--- native cache isolation (C#, no game)"
   DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 dotnet run --project tests/cache/CacheTests.csproj -c Release
@@ -175,6 +177,7 @@ run test_selftest_run "$ROOT" "$ROOT/build/test-scratch/selftest"
 hrun test_reinit "$ROOT"
 
 run test_agent_logic
+run test_agent_caps
 
 # netlab (docs/NETLAB.md): without moq_iroh every call says so; with it, a window
 # over real iroh connections in this process. The Rust library is not

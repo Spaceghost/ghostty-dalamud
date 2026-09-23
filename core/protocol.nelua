@@ -3,7 +3,9 @@
 -- payload. Session ids are u32 little-endian. Strings are UTF-8, no NUL.
 --
 -- client -> agent
---   HELLO   token                    answered by OK "ghostty-agent <version> <nonce>"
+--   HELLO   token                    answered by OK "ghostty-agent <version> <nonce> key=value..."
+--                                    (the words: the agent's release, platform and features;
+--                                    core/agent_caps.nelua. Older agents send none)
 --   OPEN    cols u16, rows u16, argv... (NUL separated), then "\0\0", env... (NUL separated)
 --   DATA    id, bytes
 --   RESIZE  id, cols u16, rows u16

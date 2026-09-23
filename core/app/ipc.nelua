@@ -334,9 +334,12 @@ local function l_window_place(L: *lua_State): cint
   return 1
 end
 
--- ghostty.agent_status() -> {connected, version, windows_ok, agent = 'host:port'}
+-- ghostty.agent_status() -> {connected, version, windows_ok, agent = 'host:port',
+-- window_lists, agent_version, platform, caps}. caps is nil when the agent did
+-- not say (an older agent), else {compositor, netlab, wg} each 'on' | 'off' |
+-- 'absent' | 'unknown' (core/agent_caps.nelua); lua/agentcaps.lua shows them.
 local function l_agent_status(L: *lua_State): cint
-  lua_createtable(L, 0, 4)
+  lua_createtable(L, 0, 8)
   local ready = host.local_agent.enabled and host.local_agent.client:ready()
   lua_pushboolean(L, ready and 1 or 0) lua_setfield(L, -2, 'connected')
   lua_pushinteger(L, ready and host.local_agent.client.version or 0) lua_setfield(L, -2, 'version')
@@ -347,6 +350,20 @@ local function l_agent_status(L: *lua_State): cint
   push_str(L, where, 'agent')
   where:destroy()
   lua_pushinteger(L, winlist.answers) lua_setfield(L, -2, 'window_lists')
+  local caps = &host.local_agent.client.caps
+  -- an agent from before the key=value words may still name its platform
+  if ready and not caps.known and #host.local_agent.client.platform > 0 then
+    push_str(L, host.local_agent.client.platform, 'platform')
+  end
+  if ready and caps.known then
+    push_str(L, caps.version, 'agent_version')
+    push_str(L, caps.platform, 'platform')
+    lua_createtable(L, 0, 3)
+    push_str(L, agent_caps.state_name(caps.compositor), 'compositor')
+    push_str(L, agent_caps.state_name(caps.netlab), 'netlab')
+    push_str(L, agent_caps.state_name(caps.wg), 'wg')
+    lua_setfield(L, -2, 'caps')
+  end
   return 1
 end
 
