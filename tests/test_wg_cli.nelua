@@ -1,0 +1,192 @@
+-- `ghostty-agent wg` (agent/wg_cli.nelua), the QR code (agent/wg_qr.nelua),
+-- Tailscale detection and the listen rule (agent/tailscale.nelua):
+-- docs/WIREGUARD.md "Selection" and "Files and the CLI".
+--
+--   test_wg_cli AGENT_BINARY SCRATCH_DIR
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'io'
+require 'os'
+require 'arg'
+require 'agent.crypto'
+require 'agent.wg_config'
+require 'agent.wg_cli'
+require 'agent.wg_qr'
+require 'agent.tailscale'
+
+local agent_bin: string = arg[1]
+local dir: string = arg[2]
+
+local function join(...: varargs): string
+  local sb: stringbuilder
+  sb:write(...)
+  return sb:promote()
+end
+
+-- run a command line; its output and whether it exited 0
+local function run(cmd: string): (string, boolean)
+  local full = join(cmd, ' 2>&1; echo "[exit $?]"')
+  local pf = io.popen(full)
+  local out = pf:read('a')
+  pf:destroy()
+  full:destroy()
+  return out, out:find('[exit 0]', 1, true) > 0
+end
+
+-- the listen rule and Tailscale's ranges ------------------------------------------
+do
+  local a: [16]uint8
+  local fam: uint8
+  assert(wgp.parse_ip('100.83.231.2', &fam, &a) and tailscale_cgnat(fam, &a) and not tailscale_ula(fam, &a))
+  assert(wgp.parse_ip('100.128.0.1', &fam, &a) and not tailscale_range(fam, &a), '100.128/10 is outside')
+  assert(wgp.parse_ip('100.63.255.255', &fam, &a) and not tailscale_range(fam, &a))
+  assert(wgp.parse_ip('fd7a:115c:a1e0::53', &fam, &a) and tailscale_ula(fam, &a))
+  assert(wgp.parse_ip('fd7a:115c:a1e1::1', &fam, &a) and not tailscale_range(fam, &a))
+  local none: Tailscale
+  local here: Tailscale
+  here.detected = true
+  local cases: [9]string = { '127.0.0.1', '127.3.4.5', 'localhost', '::1', '0.0.0.0', '192.168.1.5', '100.83.231.2', 'fd7a:115c:a1e0::1', '::' }
+  local want_none: [9]boolean = { true, true, true, true, false, false, false, false, false }
+  local want_here: [9]boolean = { true, true, true, true, false, false, true, true, false }
+  for i = 0, < 9 do
+    local ok1, why1 = listen_allowed(cases[i], &none)
+    local ok2, why2 = listen_allowed(cases[i], &here)
+    if ok1 ~= want_none[i] or ok2 ~= want_here[i] then error(cases[i]) end
+    assert(ok1 or #why1 > 0, 'a refusal says why')
+    why1:destroy() why2:destroy()
+  end
+  -- detection runs on this machine, whatever it finds
+  local ts: Tailscale
+  ts:detect()
+  print('Tailscale here:', ts.detected, ts.why)
+  assert(not ts.detected or #ts.why > 0, 'a detection says what it saw')
+  ts:destroy()
+end
+
+-- addresses, endpoints, the client's config ---------------------------------------
+do
+  local cfg: WgConfig
+  assert(wg_init_config(&cfg, 51820))
+  assert(cfg.addr4.addr[0] == 10 and cfg.addr4.addr[1] >= 1 and cfg.addr4.addr[1] <= 254 and cfg.addr4.addr[3] == 1)
+  assert(cfg.addr6.addr[0] == 0xfd and cfg.addr6.bits == 64 and cfg.addr6.addr[15] == 1, 'an RFC 4193 /64, the agent at ::1')
+  assert(wg_free_host(&cfg) == 2, 'the first peer is .2')
+  local e1 = wg_endpoint_text('example.org', 51820)
+  local e2 = wg_endpoint_text('example.org:4000', 51820)
+  local e3 = wg_endpoint_text('2001:db8::5', 51820)
+  local e4 = wg_endpoint_text('[2001:db8::5]:9', 51820)
+  local e5 = wg_endpoint_text('[2001:db8::5]', 51820)
+  assert(e1 == 'example.org:51820' and e2 == 'example.org:4000' and e3 == '[2001:db8::5]:51820'
+         and e4 == '[2001:db8::5]:9' and e5 == '[2001:db8::5]:51820', 'endpoints')
+  e1:destroy() e2:destroy() e3:destroy() e4:destroy() e5:destroy()
+  -- the client's config is wg-quick's format: our own parser reads it, and
+  -- its keys pair with the agent's
+  local ck: [32]uint8
+  local psk: [32]uint8
+  assert(crypto.x25519_generate(&ck) and crypto.random(&psk, 32))
+  -- (an address, not a name: the agent's own file takes IP literals only)
+  local text = wg_client_config(&cfg, &ck, &psk, 7, '198.51.100.7:51820')
+  local client: WgConfig
+  local ok, why = client:parse(text)
+  if not ok then error(why) end
+  assert(client.has_private and memory.equals(&client.private, &ck, 32))
+  assert(client.addr4.addr[3] == 7 and client.addr4.bits == 32 and client.addr6.addr[15] == 7)
+  assert(#client.peers == 1 and memory.equals(&client.peers[0].psk, &psk, 32))
+  local agent_pub: [32]uint8
+  crypto.x25519_public(&agent_pub, &cfg.private)
+  assert(memory.equals(&client.peers[0].public, &agent_pub, 32), 'the agent\'s public key')
+  assert(client.peers[0].allowed[0].bits == 32 and client.peers[0].allowed[0].addr[3] == 1, 'only the agent routes through it')
+  assert(text:find('PersistentKeepalive = 25', 1, true) > 0)
+  -- the QR code carries it: a code big enough for the text, and the same every time
+  local m1: vector(boolean)
+  local m2: vector(boolean)
+  local n = wg_qr_modules(text, &m1)
+  assert(n >= 45 and n <= 177 and #m1 == n * n, 'a QR code of a WireGuard config')
+  assert(wg_qr_modules(text, &m2) == n)
+  for i = 0, < #m1 do assert(m1[i] == m2[i]) end
+  local drawn = wg_qr_text(text)
+  assert(#drawn > 0 and drawn:find('▀', 1, true) > 0, 'drawn in half blocks')
+  drawn:destroy() m1:destroy() m2:destroy()
+  crypto.wipe(text.data, text.size)
+  text:destroy()
+  client:destroy()
+  cfg:destroy()
+end
+
+-- the command line, end to end, on the agent binary ------------------------------------
+do
+  local conf = join(dir, '/wireguard.conf')
+  local tok = join(dir, '/token')
+  local f = io.open(tok, 'wb')
+  f:write('clitoken\n')
+  f:destroy()
+  os.remove(conf)
+  local base = join(agent_bin, ' wg --config ', conf, ' --token-file ', tok)
+  local c1 = join(base, ' add laptop --endpoint example.org --agent-port 7788')
+  local out, ok = run(c1)
+  if not ok then error(out) end
+  assert(out:find('\nEndpoint = example.org:51820\n', 1, true) > 0, 'the endpoint and port')
+  assert(out:find("port = 7788, token = 'clitoken'", 1, true) > 0, 'the plugin line with the token')
+  assert(out:find('\27[30;47m', 1, true) > 0, 'a QR code')
+  assert(out:find('PrivateKey = ', 1, true) > 0)
+  -- the client's private key was shown, and is not in the file
+  local at = out:find('PrivateKey = ', 1, true)
+  local shown = out:sub(at + 13, at + 13 + 43)
+  local _, file = wg_read_file(conf)
+  assert(#shown == 44 and file:find(shown, 1, true) == 0, 'the client key is kept nowhere')
+  assert(file:find('Name = laptop', 1, true) > 0)
+  file:destroy() shown:destroy() out:destroy()
+  local c2 = join(base, ' add phone --no-qr')
+  out, ok = run(c2)
+  assert(ok and out:find('\27[', 1, true) == 0, '--no-qr')
+  out:destroy()
+  local c3 = join(base, ' add laptop')
+  out, ok = run(c3)
+  assert(not ok and out:find('already', 1, true) > 0, 'names are unique')
+  out:destroy()
+  local c4 = join(base, ' list')
+  out, ok = run(c4)
+  assert(ok and out:find('laptop\t10.', 1, true) == 1 and out:find('\nphone\t10.', 1, true) > 0, 'both listed')
+  out:destroy()
+  local c5 = join(base, ' forward sunshine')
+  out, ok = run(c5)
+  assert(ok)
+  out:destroy()
+  local cfg: WgConfig
+  assert(cfg:load(conf))
+  assert(#cfg.forwards == 8 and #cfg.peers == 2)
+  assert(cfg.peers[0].allowed[0].addr[3] == 2 and cfg.peers[1].allowed[0].addr[3] == 3, '.2 and .3')
+  cfg:destroy()
+  local c6 = join(base, ' unforward udp 47998-48000')
+  out, ok = run(c6)
+  out:destroy()
+  local c7 = join(base, ' remove laptop')
+  out, ok = run(c7)
+  assert(ok)
+  out:destroy()
+  assert(cfg:load(conf))
+  assert(#cfg.forwards == 5 and #cfg.peers == 1 and cfg.peers[0].name == 'phone')
+  cfg:destroy()
+  local c8 = join(base, ' show')
+  out, ok = run(c8)
+  assert(ok and out:find('public key: ', 1, true) > 0 and out:find('Tailscale: ', 1, true) > 0)
+  out:destroy()
+  local c9 = join(base, ' frobnicate')
+  out, ok = run(c9)
+  assert(not ok and out:find('usage:', 1, true) > 0)
+  out:destroy()
+  -- the agent refuses to listen in the clear, and says what to do instead
+  local c10 = join(agent_bin, ' --listen 0.0.0.0:1 --token-file ', tok, ' --windows off --wireguard off')
+  out, ok = run(c10)
+  assert(not ok and out:find('refusing to listen on 0.0.0.0:1', 1, true) > 0 and out:find('wg add', 1, true) > 0, 'refused')
+  out:destroy()
+  local c11 = join(agent_bin, ' --wireguard sometimes --token-file ', tok)
+  out, ok = run(c11)
+  assert(not ok and out:find('auto, on, off or always', 1, true) > 0)
+  out:destroy()
+  c1:destroy() c2:destroy() c3:destroy() c4:destroy() c5:destroy() c6:destroy()
+  c7:destroy() c8:destroy() c9:destroy() c10:destroy() c11:destroy()
+  base:destroy() conf:destroy() tok:destroy()
+end
+
+print('test_wg_cli OK')

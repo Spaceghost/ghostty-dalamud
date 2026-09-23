@@ -24,6 +24,11 @@ require 'agent.clip_run'
 
 global CLIPS_KIND_GIF: uint8 <comptime> = 0
 global CLIPS_KIND_MP4: uint8 <comptime> = 1
+-- A camera rather than a recording: the frames go straight out of a
+-- v4l2loopback device, so anything that opens a webcam (Zoom, a browser)
+-- opens the game instead. Linux only -- v4l2loopback is a Linux thing --
+-- and it never writes a file (docs/MEETINGS.md).
+global CLIPS_KIND_CAM: uint8 <comptime> = 2
 -- What the agent accepts, whatever the plugin asks for.
 global CLIPS_MAX_W: integer <comptime> = 1920
 global CLIPS_MAX_H: integer <comptime> = 1080
@@ -42,6 +47,12 @@ global AgentClip = @record{
   out_path: string,
   err_path: string,
   file: *C.FILE,          -- the raw frames, nilptr once closed
+  fd: cint,               -- CAM: the write end of the fifo ffmpeg reads (-1 when closed)
+  live: boolean,          -- CAM: ffmpeg is running for the whole clip, not at the end
+  dropped: integer,       -- CAM: frames the device was too busy to take
+  pend_off: usize,        -- CAM: how much of `frame` has reached the fifo
+  pend_len: usize,        -- CAM: 0 when nothing is waiting to go
+  device: string,         -- CAM: the v4l2 device being written
   frames: integer,
   bytes: usize,
   bad: integer,           -- frames dropped because they did not decode
@@ -60,6 +71,74 @@ global AgentClips = @record{
   ffmpeg: string,         -- the encoder found on the host ('' when there is none)
   looked: boolean,
 }
+
+-- The camera sink (Linux only) ---------------------------------------------------
+--
+-- ffmpeg reads a fifo and writes the v4l2loopback device; the agent writes
+-- frames into the fifo. A fifo rather than a pipe on ffmpeg's stdin because
+-- the clip runner is a plain spawn with no stdin (agent/clip_run.nelua), and
+-- because a path is what the existing argv already takes.
+--
+-- The write end is opened O_RDWR: opening a fifo write-only fails with ENXIO
+-- until a reader attaches, and ffmpeg attaches whenever it gets round to it.
+-- O_RDWR never blocks and never races. It is then non-blocking, so a device
+-- that is not draining costs a dropped frame rather than a stalled agent --
+-- which is the right answer for a camera, where a late frame is worthless.
+## if not ccinfo.is_windows then
+## cinclude '<sys/stat.h>'
+## cinclude '<sys/types.h>'
+## cinclude '<fcntl.h>'
+## cinclude '<unistd.h>'
+## cinclude '<errno.h>'
+local O_RDWR: cint <cimport, nodecl, const>
+local O_NONBLOCK: cint <cimport, nodecl, const>
+local EAGAIN: cint <cimport, nodecl, const>
+local EINTR: cint <cimport, nodecl, const>
+local function mkfifo(path: cstring, mode: cuint): cint <cimport, nodecl> end
+local function c_open(path: cstring, flags: cint): cint <cimport 'open', nodecl> end
+local function write(fd: cint, buf: pointer, n: usize): isize <cimport, nodecl> end
+local function close(fd: cint): cint <cimport, nodecl> end
+-- errno is a macro standing for an lvalue, not a function: imported as a
+-- variable, because `errno()` is not C.
+local c_errno: cint <cimport 'errno', nodecl>
+## end
+
+-- Where the frames go. GHOSTTY_V4L2_DEVICE names it; otherwise the first
+-- v4l2loopback device whose name is not the one OBS took, so the two can be
+-- used at once. '' when there is no loopback device at all, which is a real
+-- answer: the module has to be loaded before this can work.
+local function find_v4l2_device(): string
+## if ccinfo.is_windows then
+  return (@string){}
+## else
+  local env = os.getenv('GHOSTTY_V4L2_DEVICE')
+  if #env > 0 then return env end
+  env:destroy()
+  for n = 0, 63 do
+    local namepath: stringbuilder
+    namepath:writef('/sys/devices/virtual/video4linux/video%d/name', n)
+    local np = namepath:promote()
+    defer np:destroy() end
+    local f = io.open(np, 'rb')
+    if f:isopen() then
+      local name = f:read('l')
+      f:close()
+      f:destroy()
+      -- A loopback device that is not the one OBS is presenting.
+      if #name > 0 and name:find('OBS', 1, true) == 0 then
+        name:destroy()
+        local dev: stringbuilder
+        dev:writef('/dev/video%d', n)
+        return dev:promote()
+      end
+      name:destroy()
+    else
+      f:destroy()
+    end
+  end
+  return (@string){}
+## end
+end
 
 local function say(self: *AgentClips, msg: string): void
   if self.log_fn ~= nilptr then self.log_fn(msg) end
@@ -184,6 +263,11 @@ end
 
 local function clip_destroy(c: *AgentClip): void
   if c.file ~= nilptr then C.fclose(c.file) c.file = nilptr end
+## if not ccinfo.is_windows then
+  -- A camera's fifo: closing it is also how its encoder is told to stop.
+  if c.fd >= 0 then close(c.fd) c.fd = -1 end
+## end
+  c.device:destroy()
   c.raw_path:destroy()
   c.out_path:destroy()
   c.err_path:destroy()
@@ -239,9 +323,24 @@ local function ffmpeg_argv(self: *AgentClips, c: *AgentClip, argv: *vector(strin
   argv:push(string.copy('-video_size'))
   argv:push(size:promote())
   argv:push(string.copy('-framerate'))
-  argv:push(fps:promote())
+  argv:push(string.copy(fps:view()))
   argv:push(string.copy('-i'))
   argv:push(c.raw_path:copy())
+  if c.kind == CLIPS_KIND_CAM then
+    -- Straight out of the loopback device. yuv420p because that is what every
+    -- program that opens a webcam expects; -r pins the output rate so a
+    -- dropped frame does not slow the stream down for whoever is watching.
+    argv:push(string.copy('-vf'))
+    argv:push(string.copy('scale=trunc(iw/2)*2:trunc(ih/2)*2'))
+    argv:push(string.copy('-pix_fmt'))
+    argv:push(string.copy('yuv420p'))
+    argv:push(string.copy('-r'))
+    argv:push(fps:promote())
+    argv:push(string.copy('-f'))
+    argv:push(string.copy('v4l2'))
+    argv:push(c.device:copy())
+    return
+  end
   if c.kind == CLIPS_KIND_MP4 then
     argv:push(string.copy('-vf'))
     argv:push(string.copy('scale=trunc(iw/2)*2:trunc(ih/2)*2'))
@@ -312,10 +411,16 @@ local function handle_copen(self: *AgentClips, ci: usize, q: *ByteQueue, payload
     send_copened(q, req, 0, 'that frame rate is not one the host records')
     return
   end
-  if kind ~= CLIPS_KIND_GIF and kind ~= CLIPS_KIND_MP4 then
+  if kind ~= CLIPS_KIND_GIF and kind ~= CLIPS_KIND_MP4 and kind ~= CLIPS_KIND_CAM then
     send_copened(q, req, 0, 'unknown clip kind')
     return
   end
+  ## if ccinfo.is_windows then
+  if kind == CLIPS_KIND_CAM then
+    send_copened(q, req, 0, 'the camera device is a Linux thing (v4l2loopback); this host cannot offer one')
+    return
+  end
+  ## end
   local open = 0
   for i = 0, < #self.clips do if not self.clips[i].encoding then open = open + 1 end end
   if open >= CLIPS_MAX_OPEN then
@@ -351,6 +456,7 @@ local function handle_copen(self: *AgentClips, ci: usize, q: *ByteQueue, payload
   err_name:writef('ghostty_%d.log', (@integer)(cid))
   local c: AgentClip = {
     cid = cid, client = ci, kind = kind, w = w, h = h, fps = fps,
+    fd = -1, -- never 0: a zeroed fd here would close stdin on teardown
   }
   local rn = raw_name:promote()
   local on = out_name:promote()
@@ -359,26 +465,105 @@ local function handle_copen(self: *AgentClips, ci: usize, q: *ByteQueue, payload
   c.out_path = path_in(self.dir, on)
   c.err_path = path_in(self.dir, en)
   rn:destroy() on:destroy() en:destroy()
-  local z = c.raw_path .. '\0'
-  c.file = C.fopen((@cstring)(z.data), 'wb')
-  z:destroy()
-  if c.file == nilptr then
-    clip_destroy(&c)
-    send_copened(q, req, 0, 'the host could not open a file for the frames')
-    return
+  if kind == CLIPS_KIND_CAM then
+  ## if not ccinfo.is_windows then
+    c.device = find_v4l2_device()
+    if #c.device == 0 then
+      clip_destroy(&c)
+      send_copened(q, req, 0, 'no v4l2loopback device on this host: load the module (or set GHOSTTY_V4L2_DEVICE) and the game can be a camera')
+      return
+    end
+    local z = c.raw_path .. '\0'
+    os.remove(c.raw_path) -- a fifo left by a crash is not a fifo we may reuse
+    local made = mkfifo((@cstring)(z.data), 0x1A0) -- 0600 == 0
+    if made then
+      -- O_RDWR: see the note on the camera sink above.
+      c.fd = c_open((@cstring)(z.data), O_RDWR | O_NONBLOCK)
+    end
+    z:destroy()
+    if not made or c.fd < 0 then
+      os.remove(c.raw_path)
+      clip_destroy(&c)
+      send_copened(q, req, 0, 'the host could not make a pipe for the camera frames')
+      return
+    end
+    -- The encoder runs for the whole time the camera is open, not at the end.
+    local argv: vector(string)
+    ffmpeg_argv(self, &c, &argv)
+    local ok, proc, why = ClipProc.start(&argv, c.err_path)
+    argv_destroy(&argv)
+    if not ok then
+      close(c.fd) c.fd = -1
+      os.remove(c.raw_path)
+      clip_destroy(&c)
+      send_copened(q, req, 0, why)
+      return
+    end
+    c.proc = proc
+    c.live = true
+    c.started = os.now()
+  ## end
+  else
+    local z = c.raw_path .. '\0'
+    c.file = C.fopen((@cstring)(z.data), 'wb')
+    z:destroy()
+    if c.file == nilptr then
+      clip_destroy(&c)
+      send_copened(q, req, 0, 'the host could not open a file for the frames')
+      return
+    end
   end
   c.frame:resize((@usize)(w) * (@usize)(h) * 4)
+  local live = c.live
+  local dev = c.device:copy()
+  defer dev:destroy() end
   self.clips:push(c)
   send_copened(q, req, cid, (@string){})
-  sayf(self, 'clip %d: recording %s', cid, self.clips[#self.clips - 1].out_path)
+  if live then
+    sayf(self, 'clip %d: the game is a camera on %s', cid, dev)
+  else
+    sayf(self, 'clip %d: recording %s', cid, self.clips[#self.clips - 1].out_path)
+  end
+end
+
+-- Hand as much of the waiting frame to the fifo as it will take right now.
+-- Called when a frame arrives and again whenever poll() says the fifo can be
+-- written, so a frame crosses as many passes as the device needs.
+global function clips_cam_flush(c: *AgentClip): void
+## if not ccinfo.is_windows then
+  if not c.live or c.fd < 0 or c.pend_len == 0 then return end
+  local dst = (@*[0]uint8)(&c.frame[0])
+  while c.pend_off < c.pend_len do
+    local n = write(c.fd, (@pointer)(&dst[c.pend_off]), c.pend_len - c.pend_off)
+    if n > 0 then
+      c.pend_off = c.pend_off + (@usize)(n)
+    elseif c_errno == EINTR then
+      continue
+    elseif c_errno == EAGAIN then
+      return -- the pipe is full; the rest goes on the next pass
+    else
+      close(c.fd)
+      c.fd = -1
+      c.pend_len, c.pend_off = 0, 0
+      return
+    end
+  end
+  c.pend_len, c.pend_off = 0, 0
+## end
 end
 
 local function handle_cframe(self: *AgentClips, ci: usize, payload: *[0]uint8, len: usize): void
   if len < 9 then return end
   local cid = proto.get_u32(payload)
   local c = find_clip(self, cid)
-  if c == nilptr or c.client ~= ci or c.encoding or c.file == nilptr then return end
-  if c.frames >= CLIPS_MAX_FRAMES or c.bytes >= CLIPS_MAX_BYTES then return end
+  if c == nilptr or c.client ~= ci or c.encoding then return end
+  if c.live then
+    if c.fd < 0 then return end
+  else
+    if c.file == nilptr then return end
+    -- A camera has no end, so the recording limits are not its limits.
+    if c.frames >= CLIPS_MAX_FRAMES or c.bytes >= CLIPS_MAX_BYTES then return end
+  end
   local enc = payload[8]
   local data = (@*[0]uint8)(&payload[9])
   local dlen = len - 9
@@ -395,6 +580,24 @@ local function handle_cframe(self: *AgentClips, ci: usize, payload: *[0]uint8, l
     end
   else
     c.bad = c.bad + 1
+    return
+  end
+  if c.live then
+    -- A frame is far larger than a pipe buffer -- 3.5 MB against 64 KB at
+    -- 1280x720 -- so it cannot be written in one go without blocking, and a
+    -- frame half-written and then abandoned would shear the picture and put
+    -- every frame after it out of step: the reader counts bytes and does not
+    -- look for a frame boundary. So a frame is handed over across as many
+    -- passes as it takes, and a frame that arrives while one is still going
+    -- is the one that gets dropped.
+    if c.pend_len > 0 then
+      c.dropped = c.dropped + 1
+      return
+    end
+    c.pend_off, c.pend_len = 0, need
+    c.frames = c.frames + 1
+    c.bytes = c.bytes + need
+    clips_cam_flush(c)
     return
   end
   local wrote = C.fwrite(dst, 1, need, c.file)
@@ -415,6 +618,28 @@ local function handle_cend(self: *AgentClips, ci: usize, q: *ByteQueue, payload:
     local c = &self.clips[i]
     if c.cid == cid and c.client == ci then
       if c.encoding then return end
+      if c.live then
+        -- Closing the fifo is what tells ffmpeg the stream has ended: it reads
+        -- EOF and exits by itself, and the device goes with it. The clip stays
+        -- in the list as `encoding` so the ordinary reap below collects it --
+        -- dropping it here instead would leave the encoder a zombie.
+      ## if not ccinfo.is_windows then
+        if c.fd >= 0 then close(c.fd) c.fd = -1 end
+      ## end
+        c.pend_len, c.pend_off = 0, 0
+        local sb: stringbuilder
+        sb:writef('clip %d: the camera is off after %d frames', (@integer)(cid), c.frames)
+        if c.dropped > 0 then
+          sb:writef(' (%d the device could not keep up with)', c.dropped)
+        end
+        local msg = sb:promote()
+        say(self, msg)
+        msg:destroy()
+        c.encoding = true
+        c.live = false
+        c.started = os.now()
+        return
+      end
       if c.file ~= nilptr then C.fclose(c.file) c.file = nilptr end
       if cancel or c.frames == 0 then
         os.remove(c.raw_path)
@@ -441,8 +666,27 @@ local function handle_cend(self: *AgentClips, ci: usize, q: *ByteQueue, payload:
   end
 end
 
+-- The fds the agent's poll() should watch for us: the write end of a camera
+-- fifo that still has a frame going. Nothing to read here -- a camera only
+-- ever writes -- so an idle camera contributes no fd at all.
+function AgentClips:poll_fds(out: *[0]cint, cap: usize): usize
+  local n: usize = 0
+  for i = 0, < #self.clips do
+    local c = &self.clips[i]
+    if c.live and c.fd >= 0 and c.pend_len > 0 and n < cap then
+      out[n] = c.fd
+      n = n + 1
+    end
+  end
+  return n
+end
+
 -- One frame of the agent's loop: finished encoders answer their clip.
 function AgentClips:tick(now: float64): void
+  -- Push any waiting camera frame along, whether or not poll() said so: the
+  -- loop also wakes for client traffic, and a frame that is half across
+  -- should not wait for the next one to push it.
+  for i = 0, < #self.clips do clips_cam_flush(&self.clips[i]) end
   local i: usize = 0
   while i < #self.clips do
     local c = &self.clips[i]
@@ -450,7 +694,15 @@ function AgentClips:tick(now: float64): void
       local exited, status = c.proc:poll()
       if exited then
         local q = self.queue_of ~= nilptr and self.queue_of(c.client) or nilptr
-        os.remove(c.raw_path) -- the raw frames are large; the clip is what is wanted
+        os.remove(c.raw_path) -- the raw frames (or the camera's fifo) go
+        if #c.device > 0 then
+          -- A camera wrote no file, so there is nothing to check for and
+          -- nothing to hand back but the fact that it stopped.
+          if q ~= nilptr then send_cdone(q, c.cid, 0, (@string){}) end
+          os.remove(c.err_path)
+          drop(self, i)
+          continue
+        end
         if status == 0 and file_exists(c.out_path) then
           os.remove(c.err_path)
           if q ~= nilptr then send_cdone(q, c.cid, 0, c.out_path) end

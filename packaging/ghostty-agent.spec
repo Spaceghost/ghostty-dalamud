@@ -40,14 +40,16 @@
 %global clamp_mtime_to_source_date_epoch 1
 
 Name:           ghostty-agent
-Version:        0.3.1.2
+Version:        0.3.1.4
 Release:        1%{?dist}
 %if %{with wayland}
 Summary:        PTY server and desktop-window compositor for the Ghostty Dalamud plugin
 %else
 Summary:        PTY server for the Ghostty Dalamud plugin, without the compositor
 %endif
-License:        MIT
+# The agent is MIT; it compiles in Monocypher (CC0-1.0 or BSD-2-Clause), lwIP
+# (BSD-3-Clause) and Nayuki's QR Code generator (MIT) for its WireGuard.
+License:        MIT AND BSD-3-Clause AND (CC0-1.0 OR BSD-2-Clause)
 URL:            https://github.com/Spaceghost/ghostty-dalamud
 Source0:        %{name}-%{version}-src.tar.gz
 ExclusiveArch:  x86_64
@@ -102,6 +104,10 @@ remote desktop windows are not in it. It depends on glibc alone.
 
 %prep
 %autosetup -n %{name}-%{version}
+# the licences of the vendored C the WireGuard compiles in, under names that do not collide
+cp -p vendor/lwip/COPYING lwip-COPYING
+cp -p vendor/monocypher/LICENCE.md monocypher-LICENCE.md
+cp -p vendor/qrcodegen/LICENSE qrcodegen-LICENSE
 
 %build
 %set_build_flags
@@ -150,7 +156,7 @@ wait "$agent" || true
 # live terminal on upgrade, which is the one thing the agent exists to prevent.
 
 %files
-%license LICENSE
+%license LICENSE lwip-COPYING monocypher-LICENCE.md qrcodegen-LICENSE
 %doc README-agent.md
 %{_bindir}/ghostty-agent
 %{_userunitdir}/ghostty-agent.service
