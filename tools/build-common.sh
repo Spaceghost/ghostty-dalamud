@@ -16,7 +16,10 @@ require_linux_build_host() {
 build_nelua() {
   # nelua is a tracked executable launcher, not evidence of a built compiler.
   command -v "$CC" >/dev/null || { echo "C compiler not found: $CC" >&2; return 127; }
-  make -C "$ROOT/vendor/nelua-lang" -j"$JOBS" CC="$CC"
+  # ARCH_CFLAGS empty: Nelua's Makefile defaults to -march=native, and CI caches
+  # vendor/ across runners, so a compiler built on one CPU died with "Illegal
+  # instruction" on the next runner that restored it.
+  make -C "$ROOT/vendor/nelua-lang" -j"$JOBS" CC="$CC" ARCH_CFLAGS=
   [[ -x "$ROOT/vendor/nelua-lang/nelua-lua" ]] || {
     echo 'Nelua build did not produce nelua-lua.' >&2; return 1;
   }

@@ -1,0 +1,228 @@
+-- The agent's cryptography, over vendored Monocypher 4 (toolchain.env,
+-- docs/WIREGUARD.md "Crypto and its vectors"): X25519, ChaCha20-Poly1305 in
+-- its IETF form (WireGuard's transport and handshake AEAD), XChaCha20-Poly1305
+-- (WireGuard's cookies), a random source that never falls back to a weak one,
+-- constant-time comparison and wiping. MULTIPLEXER.md's Noise sessions are to
+-- use the same bindings. BLAKE2s is agent/blake2s.nelua.
+--
+-- Buffers are `*[0]uint8` with explicit lengths, as in core/protocol.nelua.
+require 'memory'
+require 'string'
+
+-- vendor/monocypher, found from this file so any working directory builds it
+##[[
+local fs = require 'nelua.utils.fs'
+local dir = fs.abspath(fs.join(context:get_visiting_directory(), '..', 'vendor', 'monocypher', 'src'))
+cincdir(dir)
+cfile(fs.join(dir, 'monocypher.c'))
+]]
+## cinclude '<monocypher.h>'
+
+-- the whole layout, so #mc_aead_ctx is the size crypto_wipe must clear
+local mc_aead_ctx <cimport 'crypto_aead_ctx', nodecl> = @record{ counter: uint64, key: [32]uint8, nonce: [8]uint8 }
+local function crypto_x25519(shared: *[0]uint8, sk: *[0]uint8, pk: *[0]uint8): void <cimport, nodecl> end
+local function crypto_x25519_public_key(pk: *[0]uint8, sk: *[0]uint8): void <cimport, nodecl> end
+local function crypto_aead_init_ietf(ctx: *mc_aead_ctx, key: *[0]uint8, nonce: *[0]uint8): void <cimport, nodecl> end
+local function crypto_aead_write(ctx: *mc_aead_ctx, ct: *[0]uint8, mac: *[0]uint8, ad: *[0]uint8, ad_size: csize,
+                                 pt: *[0]uint8, size: csize): void <cimport, nodecl> end
+local function crypto_aead_read(ctx: *mc_aead_ctx, pt: *[0]uint8, mac: *[0]uint8, ad: *[0]uint8, ad_size: csize,
+                                ct: *[0]uint8, size: csize): cint <cimport, nodecl> end
+local function crypto_aead_lock(ct: *[0]uint8, mac: *[0]uint8, key: *[0]uint8, nonce: *[0]uint8,
+                                ad: *[0]uint8, ad_size: csize, pt: *[0]uint8, size: csize): void <cimport, nodecl> end
+local function crypto_aead_unlock(pt: *[0]uint8, mac: *[0]uint8, key: *[0]uint8, nonce: *[0]uint8,
+                                  ad: *[0]uint8, ad_size: csize, ct: *[0]uint8, size: csize): cint <cimport, nodecl> end
+local function crypto_verify16(a: *[0]uint8, b: *[0]uint8): cint <cimport, nodecl> end
+local function crypto_verify32(a: *[0]uint8, b: *[0]uint8): cint <cimport, nodecl> end
+local function crypto_wipe(p: pointer, n: csize): void <cimport, nodecl> end
+
+## if ccinfo.is_windows then
+## cinclude '<windows.h>'
+## cinclude '<bcrypt.h>'
+## linklib 'bcrypt'
+local function BCryptGenRandom(alg: pointer, buf: pointer, n: uint32, flags: uint32): int32 <cimport, nodecl> end
+local BCRYPT_USE_SYSTEM_PREFERRED_RNG: uint32 <cimport, nodecl, const>
+## elseif ccinfo.is_apple then
+## cinclude '<sys/random.h>'
+local function getentropy(buf: pointer, n: csize): cint <cimport, nodecl> end
+## else
+## cinclude '<sys/random.h>'
+local function getrandom(buf: pointer, n: csize, flags: cuint): isize <cimport, nodecl> end
+## end
+
+global CRYPTO_KEY: usize <comptime> = 32
+global CRYPTO_TAG: usize <comptime> = 16
+
+global crypto = @record{}
+
+-- `n` bytes from the operating system's CSPRNG. False when it has none or it
+-- failed: callers refuse to go on rather than use anything weaker.
+function crypto.random(buf: *[0]uint8, n: usize): boolean
+  local off: usize = 0
+  while off < n do
+    local chunk: usize = n - off
+    if chunk > 256 then chunk = 256 end
+    ## if ccinfo.is_windows then
+    if BCryptGenRandom(nilptr, &buf[off], (@uint32)(chunk), BCRYPT_USE_SYSTEM_PREFERRED_RNG) ~= 0 then return false end
+    ## elseif ccinfo.is_apple then
+    if getentropy(&buf[off], chunk) ~= 0 then return false end
+    ## else
+    local got = getrandom(&buf[off], chunk, 0)
+    if got <= 0 then return false end
+    chunk = (@usize)(got)
+    ## end
+    off = off + chunk
+  end
+  return true
+end
+
+function crypto.wipe(p: pointer, n: usize): void
+  crypto_wipe(p, n)
+end
+
+-- Constant time: true when the 16 or 32 bytes are equal.
+function crypto.equal16(a: *[0]uint8, b: *[0]uint8): boolean return crypto_verify16(a, b) == 0 end
+function crypto.equal32(a: *[0]uint8, b: *[0]uint8): boolean return crypto_verify32(a, b) == 0 end
+
+-- Constant time: true when all `n` bytes are zero.
+function crypto.is_zero(p: *[0]uint8, n: usize): boolean
+  local acc: uint8 = 0
+  for i: usize = 0, < n do acc = acc | p[i] end
+  return acc == 0
+end
+
+-- X25519 --------------------------------------------------------------------
+
+-- A new private key, clamped as `wg genkey` clamps it. False without randomness.
+function crypto.x25519_generate(sk: *[0]uint8): boolean
+  if not crypto.random(sk, 32) then return false end
+  sk[0] = sk[0] & 248
+  sk[31] = (sk[31] & 127) | 64
+  return true
+end
+
+function crypto.x25519_public(pk: *[0]uint8, sk: *[0]uint8): void
+  crypto_x25519_public_key(pk, sk)
+end
+
+-- The shared secret. False for an all-zero result (a low-order public key),
+-- which WireGuard must reject rather than use.
+function crypto.x25519(shared: *[0]uint8, sk: *[0]uint8, pk: *[0]uint8): boolean
+  crypto_x25519(shared, sk, pk)
+  return not crypto.is_zero(shared, 32)
+end
+
+-- ChaCha20-Poly1305, IETF (RFC 8439) -------------------------------------------
+-- Monocypher's aead context re-keys itself after every message; a fresh
+-- context per message makes each one plain RFC 8439, which is what WireGuard
+-- needs. `out` is len + 16 bytes (the tag last); it may be `pt` itself.
+
+function crypto.aead_ietf_seal(out: *[0]uint8, key: *[0]uint8, nonce: *[0]uint8,
+                               ad: *[0]uint8, ad_len: usize, pt: *[0]uint8, len: usize): void
+  local ctx: mc_aead_ctx
+  crypto_aead_init_ietf(&ctx, key, nonce)
+  crypto_aead_write(&ctx, out, &out[len], ad, ad_len, pt, len)
+  crypto_wipe(&ctx, #mc_aead_ctx)
+end
+
+-- `ct` is len bytes of ciphertext followed by its 16-byte tag. Nothing is
+-- written to `out` (len bytes, may be `ct`) unless the tag verifies.
+function crypto.aead_ietf_open(out: *[0]uint8, key: *[0]uint8, nonce: *[0]uint8,
+                               ad: *[0]uint8, ad_len: usize, ct: *[0]uint8, len: usize): boolean
+  local ctx: mc_aead_ctx
+  crypto_aead_init_ietf(&ctx, key, nonce)
+  local ok = crypto_aead_read(&ctx, out, &ct[len], ad, ad_len, ct, len) == 0
+  crypto_wipe(&ctx, #mc_aead_ctx)
+  return ok
+end
+
+-- WireGuard's nonce: four zero bytes and the 64-bit counter, little endian.
+local function wg_nonce(nonce: *[12]uint8, counter: uint64): void
+  for i = 0, < 4 do nonce[i] = 0 end
+  for i = 0, < 8 do nonce[4 + i] = (@uint8)((counter >> (i * 8)) & 0xff) end
+end
+
+function crypto.wg_seal(out: *[0]uint8, key: *[0]uint8, counter: uint64,
+                        ad: *[0]uint8, ad_len: usize, pt: *[0]uint8, len: usize): void
+  local nonce: [12]uint8
+  wg_nonce(&nonce, counter)
+  crypto.aead_ietf_seal(out, key, &nonce, ad, ad_len, pt, len)
+end
+
+function crypto.wg_open(out: *[0]uint8, key: *[0]uint8, counter: uint64,
+                        ad: *[0]uint8, ad_len: usize, ct: *[0]uint8, len: usize): boolean
+  local nonce: [12]uint8
+  wg_nonce(&nonce, counter)
+  return crypto.aead_ietf_open(out, key, &nonce, ad, ad_len, ct, len)
+end
+
+-- XChaCha20-Poly1305 (draft-irtf-cfrg-xchacha), 24-byte nonce ---------------
+
+function crypto.xaead_seal(out: *[0]uint8, key: *[0]uint8, nonce: *[0]uint8,
+                           ad: *[0]uint8, ad_len: usize, pt: *[0]uint8, len: usize): void
+  crypto_aead_lock(out, &out[len], key, nonce, ad, ad_len, pt, len)
+end
+
+function crypto.xaead_open(out: *[0]uint8, key: *[0]uint8, nonce: *[0]uint8,
+                           ad: *[0]uint8, ad_len: usize, ct: *[0]uint8, len: usize): boolean
+  return crypto_aead_unlock(out, &ct[len], key, nonce, ad, ad_len, ct, len) == 0
+end
+
+-- Base64 keys (the form every WireGuard config uses) ---------------------------
+
+local B64: string <comptime> = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/'
+
+-- 32 bytes as the 44-character padded base64 of `wg genkey`.
+function crypto.key_to_base64(key: *[0]uint8): string
+  local out: [44]byte
+  local o = 0
+  local i = 0
+  while i < 32 do
+    local b0 = (@uint32)(key[i])
+    local b1: uint32 = i + 1 < 32 and key[i+1] or 0
+    local b2: uint32 = i + 2 < 32 and key[i+2] or 0
+    local v = (b0 << 16) | (b1 << 8) | b2
+    out[o] = B64.data[(v >> 18) & 63]
+    out[o+1] = B64.data[(v >> 12) & 63]
+    out[o+2] = i + 1 < 32 and B64.data[(v >> 6) & 63] or '='_b
+    out[o+3] = i + 2 < 32 and B64.data[v & 63] or '='_b
+    o = o + 4
+    i = i + 3
+  end
+  return string.copy(string{data=(@*[0]byte)(&out), size=44})
+end
+
+local function b64_value(c: byte): integer
+  local v = (@integer)(c)
+  if c >= 'A'_b and c <= 'Z'_b then return v - 65 end
+  if c >= 'a'_b and c <= 'z'_b then return v - 97 + 26 end
+  if c >= '0'_b and c <= '9'_b then return v - 48 + 52 end
+  if c == '+'_b then return 62 end
+  if c == '/'_b then return 63 end
+  return -1
+end
+
+-- A 44-character base64 key back to 32 bytes. False for anything else,
+-- including a last character with bits that 32 bytes cannot have.
+function crypto.key_from_base64(s: string, key: *[0]uint8): boolean
+  if s.size ~= 44 or s.data[43] ~= '='_b or s.data[42] == '='_b then return false end
+  local o = 0
+  for i = 0, < 44, 4 do
+    local v: uint32 = 0
+    local pad = 0
+    for k = 0, < 4 do
+      local c = s.data[i + k]
+      local d = b64_value(c)
+      if c == '='_b and i == 40 and k == 3 then d = 0 pad = 1
+      elseif d < 0 then return false end
+      v = (v << 6) | (@uint32)(d)
+    end
+    key[o] = (@uint8)(v >> 16)
+    key[o+1] = (@uint8)((v >> 8) & 0xff)
+    if pad == 0 then key[o+2] = (@uint8)(v & 0xff) o = o + 3
+    else
+      if v & 0xff ~= 0 then return false end -- non-canonical: stray low bits
+      o = o + 2
+    end
+  end
+  return o == 32
+end
