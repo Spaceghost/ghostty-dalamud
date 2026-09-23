@@ -1,0 +1,179 @@
+-- A terminal in a game window (docs/NATIVE_UI.md): the pure parts. What the
+-- shim reports about the window (GuNativeState), where the texture goes and
+-- how big it is at the window's scale, the resize grip, which press focuses
+-- the terminal and which drops it, and what a close means. No ImGui, no shim:
+-- tests/test_nativewin.nelua drives all of it. Not yet observed in game.
+require 'math'
+
+-- The shim's answer about one window (GuHostApi.native_state), mirrored by
+-- GuNativeState in shim/GhosttyDalamud/Native.cs. Id 0 asks about the native
+-- path itself: status READY, STARTING or FAILED.
+global GuNativeState = @record{
+  status: cint,            -- NATIVE_*
+  x: float32, y: float32,  -- the addon's screen position (pixels)
+  w: float32, h: float32,  -- its size in UI units (unscaled)
+  scale: float32,          -- screen pixels per UI unit
+  cx: float32, cy: float32, cw: float32, ch: float32, -- the content area, UI units, from the addon's origin
+  hovered: cint,           -- the game's addon under the pointer is this one
+  focused: cint,           -- the game has this addon focused
+  ui_hidden: cint,         -- the game's UI is hidden (Scroll Lock, cutscene, group pose)
+  closes: cint,            -- how many times the game closed it (its x, Esc, close-all); counts up
+  error: cint,             -- NATIVE_ERR_* of the last failure, 0 none
+}
+
+global NATIVE_NONE: cint <comptime> = 0      -- no such window
+global NATIVE_OPENING: cint <comptime> = 1   -- asked to open, not set up yet (id 0: the path is starting)
+global NATIVE_OPEN: cint <comptime> = 2      -- set up and visible (id 0: the path is ready)
+global NATIVE_CLOSED: cint <comptime> = 3    -- gone (closed by the game or by us)
+global NATIVE_FAILED: cint <comptime> = 4    -- could not be made (id 0: the path is unavailable)
+
+global NATIVE_ERR_KAMI: cint <comptime> = 1  -- KamiToolKit did not start
+global NATIVE_ERR_OPEN: cint <comptime> = 2  -- the addon could not be opened
+global NATIVE_ERR_TEXTURE: cint <comptime> = 3 -- the draw list texture could not be made or drawn
+global NATIVE_ERR_THREAD: cint <comptime> = 4 -- drawn off the main thread
+
+global function native_error_text(e: cint): string
+  if e == NATIVE_ERR_KAMI then return 'KamiToolKit did not start'
+  elseif e == NATIVE_ERR_OPEN then return 'the game window could not be opened'
+  elseif e == NATIVE_ERR_TEXTURE then return 'the terminal texture could not be made or drawn'
+  elseif e == NATIVE_ERR_THREAD then return 'the texture was drawn off the game\'s main thread'
+  end
+  return 'unknown'
+end
+
+global NATIVE_MAX_TEX: integer <comptime> = 8192  -- D3D11's texture limit is 16384; a terminal never needs more
+global NATIVE_TEX_STEP: integer <comptime> = 256  -- the texture grows in these steps, so resizing seldom remakes it
+global NATIVE_FONT_MIN: float32 <comptime> = 6
+global NATIVE_FONT_MAX: float32 <comptime> = 96
+global NATIVE_GRIP: float32 <comptime> = 14       -- the resize grip's side in UI units
+global NATIVE_MIN_W: float32 <comptime> = 240     -- smallest window, UI units
+global NATIVE_MIN_H: float32 <comptime> = 140
+
+-- Where the terminal goes in a window at scale `scale`.
+global NativeLayout = @record{
+  ok: boolean,               -- false: nothing to draw (no area, no scale)
+  tex_w: integer, tex_h: integer, -- texture pixels actually used
+  node_x: float32, node_y: float32, -- the image node, UI units from the addon's origin
+  node_w: float32, node_h: float32,
+  sx: integer, sy: integer,  -- the content's screen origin, whole pixels
+  scale: float32,
+  font_px: float32,          -- the size to draw the terminal at
+}
+
+local function roundf(v: float32): integer
+  return (@integer)(math.floor(v + 0.5))
+end
+
+-- A whole pixel size within the fonts' range: the shim builds one font per size.
+global function native_font_px(px: float32): float32
+  if not (px > 0) then return NATIVE_FONT_MIN end
+  return math.clamp((@float32)(roundf(px)), NATIVE_FONT_MIN, NATIVE_FONT_MAX)
+end
+
+-- The layout of window `st` for a terminal whose font is `base_px` at scale 1,
+-- zoomed by `font_scale` (0 = 1). One texel is one screen pixel: the texture
+-- is the content's size in screen pixels, the node that many pixels divided by
+-- the scale, and it starts on a whole screen pixel so filtering never blurs it.
+global function native_layout(st: *GuNativeState, base_px: float32, font_scale: float32): NativeLayout
+  local l: NativeLayout
+  local s = st.scale
+  if not (s > 0.05 and s < 20) then return l end -- also false for NaN
+  if not (st.cw > 0 and st.ch > 0) then return l end
+  l.scale = s
+  l.sx = roundf(st.x + st.cx * s)
+  l.sy = roundf(st.y + st.cy * s)
+  l.node_x = ((@float32)(l.sx) - st.x) / s
+  l.node_y = ((@float32)(l.sy) - st.y) / s
+  -- the content ends where it ends on screen; the start moved by up to half a pixel
+  local ex = st.x + (st.cx + st.cw) * s
+  local ey = st.y + (st.cy + st.ch) * s
+  l.tex_w = math.clamp((@integer)(math.floor(ex + 0.001)) - l.sx, 0, NATIVE_MAX_TEX)
+  l.tex_h = math.clamp((@integer)(math.floor(ey + 0.001)) - l.sy, 0, NATIVE_MAX_TEX)
+  if l.tex_w < 1 or l.tex_h < 1 then return (@NativeLayout){} end
+  l.node_w = (@float32)(l.tex_w) / s
+  l.node_h = (@float32)(l.tex_h) / s
+  local fs = font_scale > 0 and font_scale or 1
+  l.font_px = native_font_px(base_px * fs * s)
+  l.ok = true
+  return l
+end
+
+-- The texture's allocation for `need` pixels: rounded up to NATIVE_TEX_STEP,
+-- kept while it is big enough (`have`), never past NATIVE_MAX_TEX.
+global function native_capacity(have: integer, need: integer): integer
+  if need <= have and have > 0 then return have end
+  local c = ((math.max(need, 1) + NATIVE_TEX_STEP - 1) // NATIVE_TEX_STEP) * NATIVE_TEX_STEP
+  return math.min(c, NATIVE_MAX_TEX)
+end
+
+-- The pointer at screen (mx, my) in texture pixels, and whether it is on the texture.
+global function native_local(l: *NativeLayout, mx: float32, my: float32): (float32, float32, boolean)
+  local x, y = mx - (@float32)(l.sx), my - (@float32)(l.sy)
+  return x, y, l.ok and x >= 0 and y >= 0 and x < (@float32)(l.tex_w) and y < (@float32)(l.tex_h)
+end
+
+-- The resize grip's side in texture pixels.
+global function native_grip_px(l: *NativeLayout): float32
+  return math.max(6, math.floor(NATIVE_GRIP * l.scale))
+end
+
+-- Whether texture pixel (x, y) is on the grip (the bottom-right corner).
+global function native_grip_hit(l: *NativeLayout, x: float32, y: float32): boolean
+  if not l.ok then return false end
+  local g = native_grip_px(l)
+  return x >= (@float32)(l.tex_w) - g and y >= (@float32)(l.tex_h) - g
+    and x < (@float32)(l.tex_w) and y < (@float32)(l.tex_h)
+end
+
+-- Dragging the grip: the window's new size in UI units, from its size when
+-- the drag started (w0, h0), where the pointer was then (m0) and is now (m),
+-- at scale `scale`; at least NATIVE_MIN_W x NATIVE_MIN_H, at most the screen.
+global function native_resize_size(w0: float32, h0: float32, m0x: float32, m0y: float32, mx: float32, my: float32,
+                                   scale: float32, screen_w: float32, screen_h: float32): (float32, float32)
+  local s = scale > 0.05 and scale or 1
+  local w = math.floor(w0 + (mx - m0x) / s + 0.5)
+  local h = math.floor(h0 + (my - m0y) / s + 0.5)
+  local maxw = math.max(NATIVE_MIN_W, screen_w > 0 and screen_w / s or 16384)
+  local maxh = math.max(NATIVE_MIN_H, screen_h > 0 and screen_h / s or 16384)
+  return math.clamp(w, NATIVE_MIN_W, maxw), math.clamp(h, NATIVE_MIN_H, maxh)
+end
+
+-- Focus ----------------------------------------------------------------------------------------
+-- What happened this frame that decides whether the game window keeps the
+-- keyboard. `press` is a left or right press anywhere; `on_window` whether the
+-- game said the pointer was on our addon when it happened.
+global NativeFocusIn = @record{
+  open: boolean,          -- set up and visible
+  ui_hidden: boolean,
+  press: boolean,
+  on_window: boolean,
+  claimed_by_other: boolean, -- another terminal took the keyboard (a world panel, the dropdown opening)
+  drop: boolean,          -- movement or combat intent (host.drop_focus)
+  want: boolean,          -- asked for: opened by command, /term focus, or brought forward
+}
+
+-- Whether the terminal has the keyboard after this frame, and whether it just
+-- took it (the caller then takes ImGui's window focus away).
+global function native_focus_step(focused: boolean, e: NativeFocusIn): (boolean, boolean)
+  if not e.open or e.ui_hidden or e.drop then return false, false end
+  if e.press then
+    local f = e.on_window
+    return f, f and not focused
+  end
+  if e.want then return true, not focused end
+  if e.claimed_by_other then return false, false end
+  return focused, false
+end
+
+-- Closing -------------------------------------------------------------------------------------
+global NativeClose = @enum{
+  Ours = 0,     -- we closed it (off, shutdown): nothing more to do
+  Suspend,      -- gone with the UI (hidden, cutscene, loading): open it again when the UI is back
+  User,         -- its x, Esc or close-all: the terminal goes to the minimized list
+}
+
+global function native_close_kind(asked: boolean, ui_hidden: boolean, busy: boolean): NativeClose
+  if asked then return NativeClose.Ours end
+  if ui_hidden or busy then return NativeClose.Suspend end
+  return NativeClose.User
+end
