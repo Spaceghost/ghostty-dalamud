@@ -1,10 +1,22 @@
 #!/usr/bin/env bash
 # Fetch dependencies at the revisions pinned in toolchain.env.
+#
+#   tools/fetch-vendor.sh [all|agent]
+#     all     everything the full plugin build needs (the default)
+#     agent   only what tools/build-agent.sh needs: the Nelua compiler, and the
+#             Wayland SDK headers when this host can extract them
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/toolchain.env"
 V="$ROOT/vendor"
 mkdir -p "$V"
+
+MODE="${1:-all}"
+case "$MODE" in
+  all | agent) ;;
+  -h | --help) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  *) echo 'usage: tools/fetch-vendor.sh [all|agent]' >&2; exit 2 ;;
+esac
 
 clone_pin() {
   local dir="$V/$1"
@@ -19,6 +31,8 @@ clone_pin() {
 }
 
 clone_pin nelua-lang "$NELUA_REPOSITORY" "$NELUA_COMMIT"
+
+if [[ "$MODE" == all ]]; then
 clone_pin ghostty "$GHOSTTY_REPOSITORY" "$GHOSTTY_COMMIT"
 clone_pin gc-cimgui "$CIMGUI_REPOSITORY" "$CIMGUI_COMMIT"
 clone_pin umbra-dist "$UMBRA_DIST_REPOSITORY" "$UMBRA_DIST_COMMIT"
@@ -41,6 +55,7 @@ if [[ ! -f "$V/stb/stb_truetype.h" ]] || ! echo "$STB_TRUETYPE_SHA256  $V/stb/st
   mv "$V/stb/stb_truetype.h.tmp" "$V/stb/stb_truetype.h"
 fi
 echo "stb_truetype $(grep -m1 -o 'v[0-9.]*' "$V/stb/stb_truetype.h")"
+fi # MODE == all
 
 # The cargo vendor tree for crates/ghostty-iroh (docs/IROH.md). Optional: a
 # toolchain.env with no CARGO_VENDOR_URL, or a checkout with no crate, skips it
@@ -90,6 +105,11 @@ if [[ "$(uname -s)" == Linux && "${SKIP_WAYLAND:-0}" != 1 && ! -f "$V/wayland-sd
   fi
 fi
 [[ -f "$V/wayland-sdk/.pinned" ]] && echo "wayland-sdk (wlroots 0.20)"
+
+if [[ "$MODE" == agent ]]; then
+  echo 'agent: the Nelua compiler is all tools/build-agent.sh needs'
+  exit 0
+fi
 
 # The installed runtime and these compile-time reference assemblies are separate.
 if [[ -n "${DALAMUD_LIB_PATH:-}" ]]; then

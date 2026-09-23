@@ -206,6 +206,21 @@ end
 
 -- Per frame ------------------------------------------------------------------------------
 
+-- Counted style colours. ImGui's PopStyleColor does not check the depth in the
+-- build Dalamud ships, so a pop deeper than the stack reads an empty ColorStack
+-- and writes Style.Colors at a junk index -- a stray write inside the game
+-- process, not a wrong colour. Keeping the tally here means the count can never
+-- drift from the pushes the way a literal did.
+local ask_cols: cint = 0
+local function push_col(idx: cint, col: uint32): void
+  imgui.PushStyleColorU32(idx, col)
+  ask_cols = ask_cols + 1
+end
+local function pop_cols(): void
+  if ask_cols > 0 then imgui.PopStyleColor(ask_cols) end
+  ask_cols = 0
+end
+
 local function draw_panel(focus: boolean): void
   local vp = imgui.GetMainViewport()
   imgui.SetNextWindowPos(vec2(vp.Pos.x + vp.Size.x - 48, vp.Pos.y + vp.Size.y * 0.45), ImGuiCond_FirstUseEver, vec2(1, 0.5))
@@ -215,18 +230,18 @@ local function draw_panel(focus: boolean): void
   imgui.PushStyleVarVec2(ImGuiStyleVar_WindowPadding, vec2(14, 12))
   imgui.PushStyleVarFloat(ImGuiStyleVar_WindowRounding, rounding)
   imgui.PushStyleVarFloat(ImGuiStyleVar_WindowBorderSize, 0)
-  imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.Ink, 255))
-  imgui.PushStyleColorU32(ImGuiCol_Button, chrome_col(ChromeColor.Chip, 220))
-  imgui.PushStyleColorU32(ImGuiCol_ButtonHovered, chrome_col(ChromeColor.ChipHot, 235))
-  imgui.PushStyleColorU32(ImGuiCol_ButtonActive, chrome_col(ChromeColor.Accent, 200))
-  imgui.PushStyleColorU32(ImGuiCol_FrameBg, chrome_col(ChromeColor.GlassFlat, 235))
-  imgui.PushStyleColorU32(ImGuiCol_Header, chrome_col(ChromeColor.Chip, 200))
-  imgui.PushStyleColorU32(ImGuiCol_HeaderHovered, chrome_col(ChromeColor.ChipHot, 220))
-  imgui.PushStyleColorU32(ImGuiCol_ScrollbarBg, chrome_col(ChromeColor.GlassFlat, 0))
-  imgui.PushStyleColorU32(ImGuiCol_ScrollbarGrab, chrome_col(ChromeColor.Chip, 200))
-  imgui.PushStyleColorU32(ImGuiCol_ResizeGrip, chrome_col(ChromeColor.Accent, 60))
-  imgui.PushStyleColorU32(ImGuiCol_ResizeGripHovered, chrome_col(ChromeColor.Accent, 160))
-  imgui.PushStyleColorU32(ImGuiCol_ResizeGripActive, chrome_col(ChromeColor.Accent, 230))
+  push_col(ImGuiCol_Text, chrome_col(ChromeColor.Ink, 255))
+  push_col(ImGuiCol_Button, chrome_col(ChromeColor.Chip, 220))
+  push_col(ImGuiCol_ButtonHovered, chrome_col(ChromeColor.ChipHot, 235))
+  push_col(ImGuiCol_ButtonActive, chrome_col(ChromeColor.Accent, 200))
+  push_col(ImGuiCol_FrameBg, chrome_col(ChromeColor.GlassFlat, 235))
+  push_col(ImGuiCol_Header, chrome_col(ChromeColor.Chip, 200))
+  push_col(ImGuiCol_HeaderHovered, chrome_col(ChromeColor.ChipHot, 220))
+  push_col(ImGuiCol_ScrollbarBg, chrome_col(ChromeColor.GlassFlat, 0))
+  push_col(ImGuiCol_ScrollbarGrab, chrome_col(ChromeColor.Chip, 200))
+  push_col(ImGuiCol_ResizeGrip, chrome_col(ChromeColor.Accent, 60))
+  push_col(ImGuiCol_ResizeGripHovered, chrome_col(ChromeColor.Accent, 160))
+  push_col(ImGuiCol_ResizeGripActive, chrome_col(ChromeColor.Accent, 230))
   local flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoDocking |
     ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
   local visible = imgui.Begin('Ask###ghostty_ask', nilptr, flags)
@@ -244,9 +259,14 @@ local function draw_panel(focus: boolean): void
     dropdown_glass(imgui.GetWindowDrawList(), wp.x, wp.y, wp.x + wsz.x, wp.y + wsz.y, rounding, 36)
     ui_push_mono, ui_pop_font = host.api.push_mono_font, host.api.pop_font
     policy_ask_draw()
+    -- ask.draw ran under lua_pcall, which unwinds Lua without unwinding ImGui.
+    -- If it failed part way through, a child region is still open and the End()
+    -- below would take the game down; close whatever it left. policy_ask_draw
+    -- has already logged the Lua error itself.
+    ui_close_children()
   end
   imgui.End()
-  imgui.PopStyleColor(13)
+  pop_cols()
 end
 
 -- Per frame: the jobs' output to Lua (always, so answers keep arriving while

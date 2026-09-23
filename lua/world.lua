@@ -43,6 +43,38 @@ M.pet = {
   drift = 0.0,           -- radians they wander (small, so a focused pet holds still)
   curve = 9.0,           -- curve radius in yalms (concave toward the character); larger = flatter, 0 = flat
   gap = 0.3,             -- minimum yalms between neighbouring pets
+  -- Pets that would cover each other *on screen* step aside. `gap` above keeps
+  -- them apart in the world, which is a different question: a camera looking
+  -- along the arc squashes that spacing to nothing, so two pets a comfortable
+  -- distance apart can still land on top of each other in view. This nudges
+  -- the slot angle of whichever has the weaker claim to its place until little
+  -- enough is covered, and gives up rather than shove when there is no room.
+  -- It moves the slot the springs aim at, never the pet itself, so a pet never
+  -- jumps: it drifts across and settles like any other slot change.
+  -- Lifting is the lever that works. A pet shoved sideways is put back by the
+  -- world-space spacing above, which moves pets in x and z and never in y, so
+  -- a pet that rises stays risen. It is also the only direction with room:
+  -- `behind_clear` and `camera_clear` between them spoken for most of the
+  -- circle, and what is left after those is usually one pet directly in front
+  -- of another from where the camera sits, which no amount of sliding around
+  -- you can fix.
+  spread = {
+    -- Off until it is understood why it disturbs the lineup: with it on,
+    -- tests/test_worldpanel.nelua's "lined-up pets are smaller" fails, which
+    -- says a pet that should be in the row is not in it. The arrangement
+    -- itself is right and tested (tests/test_world_spread.lua: four pets that
+    -- covered a third of each other end up covering none), so the code stays
+    -- and the default does not.
+    enabled = true,
+    overlap = 0.12,      -- fraction of a pet's own screen area covered before it gives ground
+    relax = 0.05,        -- covered less than this and it settles back down
+    tier = 0.55,         -- yalms it rises per tier
+    tiers = 3,           -- tiers it will ever rise
+    step = 0.2,          -- radians per sideways try, after lifting has been tried
+    max = 0.6,           -- radians it will ever give up from its slot
+    settle = 0.4,        -- seconds before the arrangement is worked out again
+    turn = 8,            -- degrees of camera turn that call for a new arrangement
+  },
   turn_speed = 5.0,      -- radians per second the character turns to face a newly selected pet
   around_step = 1.0,     -- radians: a pet with further to go round you goes the long way, a step at a time
   -- While a panel is focused the other pets line up in a row beside it, at its
@@ -545,7 +577,11 @@ end
 -- reload (or game restart) reattaches them into the world, not the dropdown.
 
 local TRANSIENT = { t = true, placed_at = true, px = true, pz = true, phw = true, ls = true,
-  lu_t = true, lu_ang = true, lu_dist = true, lu_y = true, lu_scale = true }
+  lu_t = true, lu_ang = true, lu_dist = true, lu_y = true, lu_scale = true,
+  -- how far a pet has stepped aside and risen to keep off the others on screen
+  -- (M.pet.spread): worked out from where the camera is now, so saving it would
+  -- restore an answer to a question nobody asked any more
+  sp = true, sp_y = true }
 
 local function state_path()
   return (GHOSTTY_PLUGIN_DIR or '.') .. '/world-state.lua'
@@ -903,6 +939,11 @@ local function lineup(t, p)
   return true
 end
 
+-- Defined below, once the camera view is in scope: works out, at most a few
+-- times a second, how far each pet steps aside so the pets do not cover each
+-- other on screen (M.pet.spread).
+local spread
+
 function M.place_pet(id, a, p, t, focused)
   local cfg = M.pet
   update_body(p, t)
@@ -931,7 +972,10 @@ function M.place_pet(id, a, p, t, focused)
   else
     local rel
     rel, dist = slot(k, pet_half_w(a))
-    ang = body.heading + rel + sin(t * 0.11 + a.phase) * cfg.drift
+    -- the row spaces itself and is laid out around the focused pet, so while
+    -- pets are lined up nobody steps aside: only the slots ask for it
+    if not lined_up then spread(t, p) end
+    ang = body.heading + rel + sin(t * 0.11 + a.phase) * cfg.drift + (focused and 0 or (a.sp or 0))
   end
   local tx = p.x + sin(ang) * dist
   local tz = p.z + cos(ang) * dist
@@ -948,6 +992,12 @@ function M.place_pet(id, a, p, t, focused)
     end
   end
   local ty = p.y + (in_row and a.lu_y or math.max(cfg.height_above, half_h + 0.2)) + sin(t * 0.9 + a.phase) * cfg.bob
+  -- a tier up when another pet would be covering this one on screen: the y the
+  -- spring chases, so it rises and settles rather than jumping (M.pet.spread)
+  -- never the pet you are looking at: the row is laid out around it, and the
+  -- solver only revisits its answer a few times a second, so a pet that was
+  -- lifted before it was focused would keep that lift until the next solve
+  if not in_row and not focused then ty = ty + (a.sp_y or 0) end
 
   local x = spring(a, 'x', tx, dt, cfg.stiffness, cfg.damping)
   local y = spring(a, 'y', ty, dt, cfg.stiffness, cfg.damping)
@@ -1045,6 +1095,192 @@ local function view_at(t)
   end
   M._v = v
   return v
+end
+
+-- Keeping pets off each other on screen (M.pet.spread) ----------------------------
+
+-- The box a panel covers in view `v`: left, top, right, bottom in screen
+-- pixels, or nil when any corner is behind the camera. The four corners bound
+-- a flat panel; a curved one bulges its edges toward the viewer, so the box is
+-- widened the way core/app/worldview.nelua widens it before deciding a panel
+-- is off screen. Deliberately not the exact silhouette: an eight-corner hull
+-- would be tighter but would jump as the camera crosses the curve, and a box
+-- of projected corners changes smoothly, which is what keeps this settled.
+local function screen_box(v, x, y, z, yaw, pitch, width, height, ppy)
+  if not v or not v.width or not ppy or ppy <= 0 then return nil end
+  local hw, hh = width / ppy / 2, height / ppy / 2
+  local sy, cy = sin(yaw), cos(yaw)
+  local sp, cp = sin(pitch or 0), cos(pitch or 0)
+  -- right = (cy, 0, -sy) and up leaning back with the tilt, as world_basis
+  local rx, rz = cy, -sy
+  local ux, uy, uz = -sy * sp, cp, -cy * sp
+  local minx, miny, maxx, maxy
+  for i = 0, 3 do
+    local ex = (i % 2 == 0) and -1 or 1
+    local ey = (i < 2) and -1 or 1
+    local dx = x + ex * hw * rx + ey * hh * ux - v.x
+    local dy = y + ey * hh * uy - v.y
+    local dz = z + ex * hw * rz + ey * hh * uz - v.z
+    local depth = dx * v.fx + dy * v.fy + dz * v.fz
+    if depth < 0.05 then return nil end
+    local sx = ((dx * v.rx + dy * v.ry + dz * v.rz) / (depth * v.tan_x) + 1) / 2 * v.width
+    local st = (1 - (dx * v.ux + dy * v.uy + dz * v.uz) / (depth * v.tan_y)) / 2 * v.height
+    if not minx or sx < minx then minx = sx end
+    if not maxx or sx > maxx then maxx = sx end
+    if not miny or st < miny then miny = st end
+    if not maxy or st > maxy then maxy = st end
+  end
+  local slack = (maxx - minx) * 0.1
+  return minx - slack, miny, maxx + slack, maxy
+end
+
+-- How much of box A the box B covers, as a fraction of A's own area. A's own
+-- area, not the smaller of the two: a big remote-desktop panel with a small
+-- terminal on it has lost little and should not be the one to move.
+local function box_covered(ax0, ay0, ax1, ay1, bx0, by0, bx1, by1)
+  local w = math.min(ax1, bx1) - math.max(ax0, bx0)
+  local h = math.min(ay1, by1) - math.max(ay0, by0)
+  if w <= 0 or h <= 0 then return 0 end
+  local area = (ax1 - ax0) * (ay1 - ay0)
+  if area <= 0 then return 0 end
+  return w * h / area
+end
+
+-- Worked out for every pet at once, a few times a second, never every frame.
+-- Every pet keeps an angle `sp` it has stepped aside by; place_pet adds it to
+-- the slot the springs aim at, so the pets slide across and settle instead of
+-- being shoved. Solving rarely is what makes that safe: a solution that
+-- followed the camera frame by frame would have the pets crawling whenever you
+-- turned, which is the thing this must not do.
+--
+-- Order decides who yields: pets earlier in the pet order keep their slot and
+-- later ones give ground, so the answer never depends on which pet was placed
+-- first this frame, and two pets can never both flee each other.
+spread = function(t, p)
+  local cfg = M.pet.spread
+  if not (cfg and cfg.enabled) then return end
+  if M._sp_t == t then return end
+  M._sp_t = t
+  local v = view_at(t)
+  if not v or not v.width then return end
+  update_body(p, t)
+
+  local ids = pet_ids()
+  local turn = 0
+  local pv = M._sp_view
+  if pv then
+    turn = math.deg(math.acos(clamp(v.fx * pv.fx + v.fy * pv.fy + v.fz * pv.fz, -1, 1)))
+  end
+  local changed = #ids ~= (M._sp_n or -1)
+  local due = (not M._sp_at) or (t - M._sp_at) >= (cfg.settle or 0.4)
+  if not (changed or (due and turn >= (cfg.turn or 8))) then return end
+  M._sp_at, M._sp_n = t, #ids
+
+  pv = M._sp_view
+  if not pv then pv = {} M._sp_view = pv end
+  pv.fx, pv.fy, pv.fz = v.fx, v.fy, v.fz
+
+  local boxes = M._sp_boxes
+  if not boxes then boxes = {} M._sp_boxes = boxes end
+  local n = 0
+
+  -- the one you are looking at never gives ground: it is the pet in question,
+  -- the row is laid out around it, and moving it would move the row with it
+  local keep = focus.cur or focus.prev
+
+  for i, id in ipairs(ids) do
+    local a = M.anchors[id]
+    if a and a.kind == 'pet' and a.lu_t ~= t then
+      local width = a.width or M.pet.width
+      local height = a.height or M.pet.height
+      local ppy = pet_ppy(a)
+      local rel, dist = slot(i, pet_half_w(a))
+      local base = body.heading + rel
+      local ty = p.y + math.max(M.pet.height_above, height / ppy / 2 + 0.2)
+
+      -- what this pet covers, and what covers it, at a given step aside
+      local function worst_at(off, lift)
+        local ang = base + off
+        local x, z = p.x + sin(ang) * dist, p.z + cos(ang) * dist
+        -- the same cones place_pet enforces after the spring. Without them the
+        -- search happily picks an angle inside a no-go cone, clear_of shoves it
+        -- straight back out, and the arrangement it worked out never happens.
+        x, z = clear_of(x, z, p, behind(p), M.pet.behind_clear)
+        local cb = camera_back(t)
+        if cb then x, z = clear_of(x, z, p, cb, M.pet.camera_clear) end
+        local x0, y0, x1, y1 = screen_box(v, x, ty + (lift or 0), z, yaw_towards(x, z, p.x, p.z),
+          a.pitch or 0, width, height, ppy)
+        if not x0 then return 0 end
+        local worst = 0
+        for b = 1, n do
+          local o = (b - 1) * 4
+          local ox0, oy0, ox1, oy1 = boxes[o + 1], boxes[o + 2], boxes[o + 3], boxes[o + 4]
+          -- both ways round, and the worse of the two. Measuring only how much
+          -- of *this* pet is covered would let it "improve" by moving toward
+          -- the camera, where it grows on screen: less of it covered, far more
+          -- of everything else covered by it.
+          local mine = box_covered(x0, y0, x1, y1, ox0, oy0, ox1, oy1)
+          local theirs = box_covered(ox0, oy0, ox1, oy1, x0, y0, x1, y1)
+          if mine > worst then worst = mine end
+          if theirs > worst then worst = theirs end
+        end
+        return worst, x0, y0, x1, y1
+      end
+
+      local off, lift = a.sp or 0, a.sp_y or 0
+      if id == keep then off, lift = 0, 0 end
+      local worst = worst_at(off, lift)
+      if id == keep then
+        -- nothing to decide: its box still goes in, so the others keep off it
+        worst = 0
+      elseif worst > (cfg.overlap or 0.12) then
+        -- Rising first, and as little as will do: a tier up is the move that
+        -- survives everything downstream, and it reads as a shelf rather than
+        -- as a pet wandering off. Sideways is tried too, but it is second and
+        -- it is charged for, so a pet only slides when rising did not help.
+        local tier, tiers = cfg.tier or 0.55, cfg.tiers or 3
+        local step, lim = cfg.step or 0.2, cfg.max or 0.6
+        local best_off, best_lift, best_cost = off, lift, math.huge
+        for li = 0, tiers do
+          local ly = li * tier
+          local k = math.floor(lim / step)
+          for i = -k, k do
+            local try = i * step
+            local cost = worst_at(try, ly)
+              + 0.03 * li / math.max(tiers, 1)      -- rise only as far as needed
+              + 0.06 * math.abs(try) / lim          -- and slide only if rising was not enough
+            if cost < best_cost then best_off, best_lift, best_cost = try, ly, cost end
+          end
+        end
+        off, lift = best_off, best_lift
+        worst = worst_at(off, lift)
+      elseif worst <= (cfg.relax or 0.05) and (off ~= 0 or lift ~= 0) then
+        -- Nothing is covering it any more, so come back down -- but ask what
+        -- coming down would look like before doing it. Testing the state it is
+        -- in rather than the state it would move to is how this oscillates: it
+        -- is clear *because* it is up, so it sinks, is covered again, rises
+        -- again, for ever. The step is only taken when the lower place is
+        -- clear too.
+        local back_y = (cfg.tier or 0.55) * 0.5
+        local back = (cfg.step or 0.2) * 0.5
+        local down = math.max(0, lift - back_y)
+        local home = (off > 0) and math.max(0, off - back) or math.min(0, off + back)
+        if worst_at(home, down) <= (cfg.relax or 0.05) then
+          off, lift = home, down
+          worst = worst_at(off, lift)
+        end
+      end
+      a.sp_y = lift
+      a.sp = off
+
+      local _, x0, y0, x1, y1 = worst_at(off, lift)
+      if x0 then
+        local o = n * 4
+        boxes[o + 1], boxes[o + 2], boxes[o + 3], boxes[o + 4] = x0, y0, x1, y1
+        n = n + 1
+      end
+    end
+  end
 end
 
 function M.place_hud(id, a, t)

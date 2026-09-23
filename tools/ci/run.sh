@@ -237,9 +237,13 @@ stage_package() {
   log "tools/package.sh"
   "$ROOT/tools/package.sh"
   rm -rf "$out" && mkdir -p "$out"
-  # whatever package.sh wrote under build/ this run: the plugin zip and the pluginmaster JSON
+  # whatever package.sh wrote under build/ this run: the plugin zip, the
+  # pluginmaster JSON, and the Linux agent packages when tools/ci/agent-rpm.sh
+  # has already put them there. A new artifact kind must be named here or it is
+  # silently left behind.
   find "$ROOT/build" -path "$out" -prune -o -type f -newer "$mark" \
-    \( -name '*.zip' -o -name 'pluginmaster*.json' -o -name 'repo.json' \) -print0 |
+    \( -name '*.zip' -o -name 'pluginmaster*.json' -o -name 'repo.json' \
+       -o -name '*.rpm' -o -name '*.tar.gz' \) -print0 |
     xargs -0 -r cp -t "$out"
   rm -f "$mark"
   compgen -G "$out/*.zip" >/dev/null || die "tools/package.sh produced no .zip under build/"

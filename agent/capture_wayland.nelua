@@ -677,10 +677,40 @@ global WAYLAND_GPU_MIN_FREE_MB: integer <comptime> = 1024
 --   'auto' (or '')           the GPU with the most free VRAM among those
 --                            driving no display and with at least
 --                            WAYLAND_GPU_MIN_FREE_MB free; pixman when there
---                            is none, or when VRAM cannot be read
+--                            is none, or when VRAM cannot be read. This is the
+--                            gaming PC's answer: never take the card the game
+--                            is drawing on.
+--   'gpu'                    the best GPU there is, a card driving a display
+--                            included, and one whose free VRAM cannot be read
+--                            included (nvidia without nvidia-smi reports
+--                            nothing, and every Intel GPU does). For a host
+--                            that is not running the game, where refusing the
+--                            only card means software rendering for nothing.
+--                            Prefers a card driving no display, then one with
+--                            room, then the one with the most free VRAM.
 global function wayland_pick_render_node(opt: string, nodes: *vector(RenderNode)): (string, string)
   if opt == 'none' or opt == 'pixman' or opt == 'off' then return (@string){}, string.copy('software rendering asked for') end
   if #opt > 0 and opt:byte(1) == 47 then return string.copy(opt), string.copy('as configured') end
+  if opt == 'gpu' then
+    local pick, pick_rank = -1, -1
+    for i = 0, < #nodes do
+      local n = &nodes[i]
+      local rank = 0
+      if not n.display then rank = rank + 2 end
+      if n.free_mb >= WAYLAND_GPU_MIN_FREE_MB then rank = rank + 1 end
+      local better = rank > pick_rank
+      if not better and rank == pick_rank and pick >= 0 and n.free_mb > nodes[pick].free_mb then better = true end
+      if better then pick, pick_rank = i, rank end
+    end
+    if pick < 0 then return (@string){}, string.copy('no render node: software rendering') end
+    local n = &nodes[pick]
+    local disp: string = ', no display'
+    if n.display then disp = ', drives a display' end
+    if n.free_mb < 0 then
+      return string.copy(n.path), string.format('%s (%s)%s, free VRAM unknown, asked for', n.pci, n.driver, disp)
+    end
+    return string.copy(n.path), string.format('%s (%s)%s, %d of %d MiB free, asked for', n.pci, n.driver, disp, n.free_mb, n.total_mb)
+  end
   if #opt > 0 and opt ~= 'auto' then return (@string){}, string.format('unknown render node "%s": software rendering', opt) end
   local best = -1
   local why: stringbuilder
@@ -701,7 +731,13 @@ global function wayland_pick_render_node(opt: string, nodes: *vector(RenderNode)
     local n = &nodes[best]
     return string.copy(n.path), string.format('%s (%s), no display, %d of %d MiB free', n.pci, n.driver, n.free_mb, n.total_mb)
   end
-  if #nodes == 0 then why:write('no render node; ') end
+  if #nodes == 0 then
+    why:write('no render node; ')
+  else
+    -- Every card was refused, which on a host that is not running the game is
+    -- a loss for nothing. Name the way out rather than leave it to be found.
+    why:write('--wayland-render-node gpu takes one anyway; ')
+  end
   why:write('software rendering')
   return (@string){}, why:promote()
 end

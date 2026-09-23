@@ -80,6 +80,8 @@ echo "--- python suites (portability, identity tooling)"
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'
 echo "--- test_defaults (shipped per-platform policy)"
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_defaults.lua
+echo "--- test_world_spread (panels keeping off each other on screen)"
+"$ROOT/vendor/nelua-lang/nelua-lua" tests/test_world_spread.lua
 if [[ "${SKIP_SHIM:-0}" != 1 ]] && command -v dotnet >/dev/null; then
   echo "--- native cache isolation (C#, no game)"
   DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 dotnet run --project tests/cache/CacheTests.csproj -c Release

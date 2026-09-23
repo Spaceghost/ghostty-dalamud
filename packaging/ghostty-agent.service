@@ -1,0 +1,29 @@
+# A systemd USER unit, never a system unit: every PTY, job and clip runs as the
+# player, the clipboard shells out to wl-copy or xclip which need that session,
+# and the Wayland compositor backend wants XDG_RUNTIME_DIR. A system unit would
+# look like it worked and quietly lose the clipboard and every remote window.
+#
+# WantedBy=default.target, not graphical-session.target: the point of running it
+# as a service is that shells survive the game and the desktop session, which
+# `loginctl enable-linger "$USER"` makes literal.
+#
+# To listen somewhere else, drop a file in rather than editing this one:
+#   systemctl --user edit ghostty-agent
+#   [Service]
+#   ExecStart=
+#   ExecStart=/usr/bin/ghostty-agent --listen 127.0.0.1:7788
+[Unit]
+Description=ghostty-agent, the PTY server the Ghostty Dalamud plugin talks to
+Documentation=https://github.com/Spaceghost/ghostty-dalamud#linux
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/ghostty-agent --listen 127.0.0.1:7777
+Restart=on-failure
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target
