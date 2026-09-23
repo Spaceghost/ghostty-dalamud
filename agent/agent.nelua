@@ -22,7 +22,12 @@
 --                      [--windows auto|off|test|wayland|win32|mac]
 --                      [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|gpu|none]
 --                      [--wayland-browser CMD] [--wayland-browser-profile NAME]
+--                      [--wireguard-config PATH]
 --        ghostty-agent [--listen HOST:PORT] [--token-file PATH] --open-url URL
+--
+-- --wireguard-config starts the embedded WireGuard (docs/WIREGUARD.md,
+-- agent/wg_service.nelua) from that wireguard.conf: a tunnel whose own
+-- address forwards this agent's port, and whatever else the file forwards.
 require 'string'
 require 'vector'
 require 'stringbuilder'
@@ -37,6 +42,7 @@ require 'agent.logic'
 require 'agent.windows'
 require 'agent.jobs'
 require 'agent.clips'
+require 'agent.wg_service'
 ## if ccinfo.is_windows then
 require 'agent.pty_windows'
 require 'agent.sys_windows'
@@ -99,6 +105,7 @@ local agent: Agent
 local windows: AgentWindows
 local jobs: AgentJobs
 local clips: AgentClips
+local wg: WgService
 
 local function log(msg: string): void
   io.stderr:write('[ghostty-agent] ', msg, '\n')
@@ -572,6 +579,8 @@ local function windows_cap(ms: integer): integer
   if w >= 0 and w < ms then ms = w end
   local j = jobs:wait_ms()
   if j >= 0 and j < ms then ms = j end
+  local g = wg:wait_ms(os.now())
+  if g >= 0 and g < ms then ms = g end
   return ms
 end
 
@@ -690,6 +699,7 @@ local function main(): integer
   local open_url: string = ''       -- --open-url: a client of the running agent, not an agent
   local has_open_url = false
   local listen_given = false
+  local wg_config: string = ''      -- --wireguard-config: start the embedded WireGuard from this file
   agent.replay_bytes = 256 * 1024
   agent.term = 'xterm-256color'
   agent.next_id = 1
@@ -708,8 +718,9 @@ local function main(): integer
     elseif a == '--wayland-socket' and i < #arg then wayland_socket = arg[i+1] i = i + 1 -- Linux compositor only
     elseif a == '--xkb-layout' and i < #arg then xkb_layout = arg[i+1] i = i + 1
     elseif a == '--wayland-render-node' and i < #arg then render_node = arg[i+1] i = i + 1 -- PATH, auto, gpu or none
+    elseif a == '--wireguard-config' and i < #arg then wg_config = arg[i+1] i = i + 1
     elseif a == '--help' or a == '-h' then
-      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME] [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|gpu|none] [--wayland-browser CMD] [--wayland-browser-profile NAME]\n',
+      io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME] [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|gpu|none] [--wayland-browser CMD] [--wayland-browser-profile NAME] [--wireguard-config PATH]\n',
                '       ghostty-agent [--listen HOST:PORT] [--token-file PATH] --open-url URL\n')
       return 0
     else
@@ -751,6 +762,18 @@ local function main(): integer
   end
   jobs:init(client_queue, log) -- raw jobs (docs/JOBS.md); they run as this user
   clips.queue_of, clips.log_fn, clips.next_cid = client_queue, log, 1 -- clips of the game (docs/CAPTURE.md)
+  if #wg_config > 0 then
+    -- the embedded WireGuard (docs/WIREGUARD.md): refuse to start rather
+    -- than run without the tunnel someone asked for
+    local cfg: WgConfig
+    local ok, why = cfg:load(wg_config)
+    if not ok then log(wg_config .. ': ' .. why) return 2 end
+    wg.log = log
+    local started, err = wg:start(&cfg, port)
+    cfg:destroy()
+    if not started then log('wireguard: ' .. err) return 2 end
+    wg:watch(wg_config) -- peers and forwards follow the file
+  end
 
   ## if ccinfo.is_windows then
   local listen_ev = winloop_watch(agent.listen_sock, true)
@@ -777,6 +800,7 @@ local function main(): integer
         if s.pty:exiting() then exiting = true end
       end
     end
+    wanted = wanted + wg:wait_handles(&handles, &n, WINLOOP_MAX_HANDLES) -- the tunnel and its forwards
     if wanted > WINLOOP_MAX_HANDLES and not overflow_logged then
       overflow_logged = true
       log('more handles than one wait takes; polling every 50 ms while that lasts')
@@ -785,6 +809,7 @@ local function main(): integer
     -- everything is pumped below: events from now on signal again
     winloop_reset(listen_ev)
     for ci = 0, < #agent.clients do winloop_reset(agent.clients[ci].ev) end
+    wg:reset_events()
 
     local c = net.accept(agent.listen_sock)
     while net.is_valid(c) do
@@ -797,6 +822,7 @@ local function main(): integer
       end
       c = net.accept(agent.listen_sock)
     end
+    wg:pump(os.now())
     for ci = 0, < #agent.clients do pump_client(ci) end
     for si = 0, < #agent.sessions do pump_session(si) end
     windows:pump()
@@ -838,6 +864,16 @@ local function main(): integer
         if n < 512 then fds[n] = { fd = jfds[k], events = POLLIN } n = n + 1 end
       end
     end
+    do -- the embedded WireGuard: its UDP socket and its forwards' sockets
+      local gfds: [256]WgPollFd
+      local gn = wg:poll_fds((@*[0]WgPollFd)(&gfds[0]), 256)
+      for k = 0, < gn do
+        local ev: cshort = 0
+        if gfds[k].read then ev = POLLIN end
+        if gfds[k].write then ev = ev | POLLOUT end
+        if n < 512 and ev ~= 0 then fds[n] = { fd = gfds[k].fd, events = ev } n = n + 1 end
+      end
+    end
     poll(&fds, n, windows_cap(250))
 
     local c = net.accept(agent.listen_sock)
@@ -846,6 +882,7 @@ local function main(): integer
       agent.clients:push(cl)
       c = net.accept(agent.listen_sock)
     end
+    wg:pump(os.now())
     for ci = 0, < #agent.clients do pump_client(ci) end
     for si = 0, < #agent.sessions do pump_session(si) end
     windows:pump()
@@ -856,6 +893,7 @@ local function main(): integer
     reap()
   end
   log('stopping')
+  wg:stop() -- keys wiped, forwards closed
   jobs:shutdown() -- jobs are not orphaned behind the agent, kept or not
   ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
   capture_wayland_shutdown() -- apps launched into the compositor are ended, not orphaned
