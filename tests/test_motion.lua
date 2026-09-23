@@ -282,16 +282,53 @@ local function foot(o)
   return ax, az, bx, bz, o.height / o.pixels_per_yalm / 2 / (1 + (o.squash or 0))
 end
 
+-- Whether a placement, as drawn (its size, squash and curve), has any part of
+-- its face inside a box: points every tenth of its width at five heights.
+-- Self-contained (no lua/motion.lua), so it measures any version of the code.
+local function inside(o)
+  local sq = o.squash or 0
+  local hw = o.width / o.pixels_per_yalm / 2 * (1 + sq)
+  local hh = o.height / o.pixels_per_yalm / 2 / (1 + sq)
+  local rx, rz, fx, fz = math.cos(o.yaw), -math.sin(o.yaw), math.sin(o.yaw), math.cos(o.yaw)
+  for i = -10, 10 do
+    local lat, fwd = hw * i / 10, 0
+    if o.curve and o.curve > 0.01 then
+      local ang = lat / o.curve
+      lat, fwd = o.curve * math.sin(ang), o.curve * (1 - math.cos(ang))
+    end
+    local px, pz = o.x + rx * lat + fx * fwd, o.z + rz * lat + fz * fwd
+    for j = -2, 2 do
+      local py = o.y + hh * 0.45 * j
+      for _, b in ipairs(boxes) do
+        if px > b[1] + 0.01 and px < b[4] - 0.01 and py > b[2] + 0.01 and py < b[5] - 0.01
+           and pz > b[3] + 0.01 and pz < b[6] - 0.01 then return true end
+      end
+    end
+  end
+  return false
+end
+local function shown(id) return not W.anchors[id].m_blink end
+-- Seen inside something: any part of it in a box, unless it has blinked out
+-- (a pet that is gone is drawn a fiftieth of its size and nearly clear, where
+-- it was; it is not seen there)
+local function seen_inside(id)
+  local a = W.anchors[id]
+  if a.m_blink == 'hidden' then return false end
+  return inside(outs[id])
+end
+
 -- 1. A wall close on your right: the pet on that side stops short of it,
---    easing in (never a jump), and never comes inside your personal space.
+--    easing in (never a jump while shown), and never comes inside your
+--    personal space. Its slot starts inside the wall: it is never seen there.
 do
   fresh(2)
   boxes = { { 2.0, -5, -10, 2.4, 5, 10 } }
   local worst_step, prev = 0, nil
   run(4, 1 / 60, nil, nil, function()
     local o = outs[ids[1]]
-    if prev then worst_step = math.max(worst_step, math.sqrt((o.x - prev[1]) ^ 2 + (o.z - prev[2]) ^ 2)) end
-    prev = { o.x, o.z }
+    assert(not seen_inside(ids[1]), 'never seen in the wall')
+    if prev and shown(ids[1]) then worst_step = math.max(worst_step, math.sqrt((o.x - prev[1]) ^ 2 + (o.z - prev[2]) ^ 2)) end
+    prev = shown(ids[1]) and { o.x, o.z } or nil
   end)
   local o = outs[ids[1]]
   local ax, _, bx = foot(o)
@@ -316,6 +353,85 @@ do
   assert(math.max(ax, bx, o.x) < 1.2, 'swung clear of the wall: ' .. math.max(ax, bx, o.x))
   W.pet.collide.swing = 1.2
   print('no room: pet swung to', o.x, o.z)
+end
+
+-- 2b. A pillar standing in the pet's face between the points the first
+--     version looked at (its middle and both edges, from your chest): those
+--     three rays miss it, and the pet sat in it. Now it is gone from the
+--     pillar at once and comes back clear of it.
+do
+  fresh(1)
+  boxes = {}
+  run(3, 1 / 60)
+  local o = outs[ids[1]]
+  local hw = o.width / o.pixels_per_yalm / 2
+  -- a pillar 0.3 across, centred on the face a little over halfway to the right edge
+  local ang = 0.55 * hw / o.curve
+  local lat, fwd = o.curve * math.sin(ang), o.curve * (1 - math.cos(ang))
+  local cx, cz = o.x + math.cos(o.yaw) * lat + math.sin(o.yaw) * fwd, o.z - math.sin(o.yaw) * lat + math.cos(o.yaw) * fwd
+  boxes = { { cx - 0.15, -5, cz - 0.15, cx + 0.15, 5, cz + 0.15 } }
+  assert(inside(o), 'the pillar is in the pet as placed')
+  assert(motion.pull_in(raycast, 0, 1.1, 0, o.x, o.y, o.z, o.yaw, hw, o.curve, 0.15) == 0,
+    'the three rays the first version cast (middle and edges) miss it')
+  local seen_in, back = 0, false
+  run(3, 1 / 60, nil, nil, function()
+    if seen_inside(ids[1]) then seen_in = seen_in + 1 end
+    if shown(ids[1]) then back = true end
+  end)
+  -- the rest check comes a few times a second: the frames before it are the
+  -- pillar appearing out of nowhere, which the game's world does not do
+  assert(seen_in <= 7, 'gone from the pillar within a tenth of a second: shown in it ' .. seen_in .. ' frames')
+  run(1, 1 / 60, nil, nil, function() assert(not seen_inside(ids[1]), 'and never in it again') end)
+  assert(back and shown(ids[1]), 'back, clear of the pillar')
+  print('pillar between the old rays OK')
+end
+
+-- 2c. Walking past a pillar: the pet's face would sweep through it. It is
+--     never seen inside it, not for one frame.
+do
+  fresh(1)
+  boxes = {}
+  player.x, player.z, player.rotation = 0, 0, 0
+  run(3, 1 / 60)
+  local o = outs[ids[1]]
+  boxes = { { o.x - 0.2, -5, 2.5, o.x + 0.2, 5, 2.9 } }
+  run(3, 1 / 60, nil, nil, function()
+    player.z = player.z + 2 / 60
+    assert(not seen_inside(ids[1]), 'never seen in the pillar while walking past it')
+  end)
+  run(2, 1 / 60, nil, nil, function() assert(not seen_inside(ids[1]), 'never in it') end)
+  assert(shown(ids[1]), 'shown again once past')
+  player.x, player.z = 0, 0
+  print('walking past a pillar OK, blinks', W.anchors[ids[1]].m_blinks or 0)
+end
+
+-- 2d. Through a doorway: you walk through, your pets on either side would
+--     float through the wall. They blink out on this side and back in on the
+--     other, never seen in the wall; they never slide through it.
+do
+  fresh(2)
+  boxes = {}
+  player.x, player.z, player.rotation = 0, 0, 0
+  run(3, 1 / 60)
+  boxes = { { -10, -5, 1.8, -0.7, 5, 2.1 }, { 0.7, -5, 1.8, 10, 5, 2.1 } }
+  assert(not inside(outs[ids[1]]) and not inside(outs[ids[2]]), 'the wall is clear of the pets to begin with')
+  local min_scale = { 1, 1 }
+  run(4, 1 / 60, nil, nil, function()
+    if player.z < 4.5 then player.z = player.z + 3 / 60 end
+    for i = 1, 2 do
+      assert(not seen_inside(ids[i]), 'never seen in the wall')
+      local a = W.anchors[ids[i]]
+      if a.m_blink then min_scale[i] = math.min(min_scale[i], a.m_bs or 0) end
+    end
+  end)
+  run(2, 1 / 60, nil, nil, function() for i = 1, 2 do assert(not seen_inside(ids[i]), 'never in the wall') end end)
+  for i = 1, 2 do
+    local a, o = W.anchors[ids[i]], outs[ids[i]]
+    assert((a.m_blinks or 0) >= 1 and min_scale[i] <= 0.05, 'blinked out to nothing')
+    assert(o.z > 2.1 and shown(ids[i]), 'and back in past the wall: z ' .. o.z)
+  end
+  player.x, player.z = 0, 0
+  print('doorway OK')
 end
 
 -- 3. A ledge under the pet's slot: it floats up over it rather than into it.
@@ -375,6 +491,9 @@ do
   run(3, 1 / 60, nil, pins, function() player.z = player.z - speed / 60 moving_check() end)
   player.rotation = 0
   print('frames with panels touching while running and turning', touching, 'of', frames)
+  for _, id in ipairs(ids) do
+    assert((W.anchors[id].m_blinks or 0) == 0, 'a clear path: plain spring motion, no blinks')
+  end
   assert(touching <= frames * 0.1, 'hardly ever touching while moving')
   run(3, 1 / 60, nil, pins)
   worst = math.huge
