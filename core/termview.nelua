@@ -152,6 +152,53 @@ function TermView:wheel_bytes(up: boolean, col: integer, row: integer, out: *[32
   return 0
 end
 
+-- Whether the program asked for mouse reports (X10 9, normal 1000, button
+-- motion 1002, any motion 1003).
+function TermView:mouse_tracking(): boolean
+  local t = self.term
+  if t == nilptr then return false end
+  return ghostty_terminal_mode_enabled(t, 1000, false) or ghostty_terminal_mode_enabled(t, 1002, false)
+    or ghostty_terminal_mode_enabled(t, 1003, false) or ghostty_terminal_mode_enabled(t, 9, false)
+end
+
+-- What a mouse button or motion sends the program, as bytes in `out` (0 =
+-- nothing: the mode does not report it). `button` 0 left, 1 middle, 2 right;
+-- `action` 0 press, 1 release, 2 motion (with `button` held, or 3 = none held);
+-- `mods` bits 4 Shift, 8 Alt, 16 Ctrl (X10 mode 9 reports presses only, with
+-- no modifiers). SGR 1006 when asked for, else the legacy form. `col` and
+-- `row` are 0-based cells.
+function TermView:mouse_bytes(button: integer, action: integer, col: integer, row: integer, mods: integer, out: *[32]byte): integer
+  local t = self.term
+  if t == nilptr then return 0 end
+  local x10 = ghostty_terminal_mode_enabled(t, 9, false)
+  local normal = ghostty_terminal_mode_enabled(t, 1000, false)
+  local drag = ghostty_terminal_mode_enabled(t, 1002, false)
+  local any = ghostty_terminal_mode_enabled(t, 1003, false)
+  if not (x10 or normal or drag or any) then return 0 end
+  if action == 2 then
+    if not (any or (drag and button >= 0 and button <= 2)) then return 0 end
+  elseif action == 1 then
+    if not (normal or drag or any) then return 0 end -- X10 reports presses only
+  end
+  local only_x10 = x10 and not (normal or drag or any)
+  local b = math.clamp(button, 0, 3)
+  if not only_x10 then b = b | (mods & 28) end
+  if action == 2 then b = b | 32 end
+  local n = 0
+  if ghostty_terminal_mode_enabled(t, 1006, false) then
+    local s = string.format('\27[<%d;%d;%d%s', b, col + 1, row + 1, action == 1 and 'm' or 'M')
+    for i = 0, < math.min(#s, 32) do n = put_byte(out, n, s.data[i]) end
+    s:destroy()
+    return math.min(n, 32)
+  end
+  if action == 1 then b = (b & ~3) | 3 end -- the legacy release names no button
+  n = put_byte(out, n, 27) n = put_byte(out, n, 91) n = put_byte(out, n, 77) -- ESC [ M
+  n = put_byte(out, n, 32 + b)
+  n = put_byte(out, n, math.min(32 + col + 1, 255))
+  n = put_byte(out, n, math.min(32 + row + 1, 255))
+  return n
+end
+
 function TermView:scroll_bottom(): void
   local sv: GhosttyTerminalScrollViewport = { tag = GHOSTTY_SCROLL_VIEWPORT_BOTTOM }
   ghostty_terminal_scroll_viewport(self.term, sv)
