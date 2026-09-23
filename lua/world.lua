@@ -1402,12 +1402,12 @@ local function make_room(a, t, p, tx, tz, base_y, hw, hh, curve, held)
   local ax0, az0, ax1, az1 = motion.footprint(tx, tz, tyaw, hw, curve) -- where it wants to be
   local bottom, top = base_y - hh, base_y + hh
   local recs = a.m_chr
-  local body = col.body or 0.55
+  local pad = col.body or 0.55 -- `body` is the shared character state
   local ahead = col.predict or 0.6
   local vel = M._chr_v or EMPTY
   for i = 1, list.n do
     local c = list[i]
-    local r = (c.r or 0.5) + body
+    local r = (c.r or 0.5) + pad
     local ch = c.h and c.h > 0.1 and c.h or 1.8
     -- beside it in height at all (a mob far below a floating pet is no matter)
     local beside = (c.y or 0) < top and (c.y or 0) + ch > bottom
@@ -2188,10 +2188,9 @@ spread = function(t, p)
       local off, lift = a.sp or 0, a.sp_y or 0
       if id == keep then off, lift = 0, 0 end
       local worst = worst_at(off, lift)
-      if id == keep then
-        -- nothing to decide: its box still goes in, so the others keep off it
-        worst = 0
-      elseif worst > (cfg.overlap or 0.12) then
+      -- the one kept still has nothing to decide: its box still goes in below,
+      -- so the others keep off it
+      if id ~= keep and worst > (cfg.overlap or 0.12) then
         -- Rising first, and as little as will do: a tier up is the move that
         -- survives everything downstream, and it reads as a shelf rather than
         -- as a pet wandering off. Sideways is tried too, but it is second and
@@ -2202,8 +2201,8 @@ spread = function(t, p)
         for li = 0, tiers do
           local ly = li * tier
           local k = math.floor(lim / step)
-          for i = -k, k do
-            local try = i * step
+          for si = -k, k do
+            local try = si * step
             local cost = worst_at(try, ly)
               + 0.03 * li / math.max(tiers, 1)      -- rise only as far as needed
               + 0.06 * math.abs(try) / lim          -- and slide only if rising was not enough
@@ -2211,8 +2210,7 @@ spread = function(t, p)
           end
         end
         off, lift = best_off, best_lift
-        worst = worst_at(off, lift)
-      elseif worst <= (cfg.relax or 0.05) and (off ~= 0 or lift ~= 0) then
+      elseif id ~= keep and worst <= (cfg.relax or 0.05) and (off ~= 0 or lift ~= 0) then
         -- Nothing is covering it any more, so come back down -- but ask what
         -- coming down would look like before doing it. Testing the state it is
         -- in rather than the state it would move to is how this oscillates: it
@@ -2225,7 +2223,6 @@ spread = function(t, p)
         local home = (off > 0) and math.max(0, off - back) or math.min(0, off + back)
         if worst_at(home, down) <= (cfg.relax or 0.05) then
           off, lift = home, down
-          worst = worst_at(off, lift)
         end
       end
       a.sp_y = lift

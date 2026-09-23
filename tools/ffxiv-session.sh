@@ -101,8 +101,8 @@ do_stop() {
     log 'nothing to stop'
     return 0
   fi
-  [[ -n "$l" ]] && kill -TERM "$l" 2>/dev/null || true
-  [[ -n "$g" ]] && kill -TERM "$g" 2>/dev/null || true
+  if [[ -n "$l" ]]; then kill -TERM "$l" 2>/dev/null || true; fi
+  if [[ -n "$g" ]]; then kill -TERM "$g" 2>/dev/null || true; fi
   log 'asked the game to close'
 }
 

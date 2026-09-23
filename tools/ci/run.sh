@@ -192,7 +192,19 @@ stage_fuzz() {
 
 stage_static() {
   [[ "${SKIP_DEPS:-0}" == 1 ]] || { ensure_dalamud; fetch_vendor; }
-  "$ROOT/tools/ci/static.sh"
+  # static.sh generates C with Nelua, so the Nelua compiler has to be built.
+  # tools/ci/in-fedora.sh has no Zig: build it with the container's cc, and
+  # take it away again afterwards, since vendor/ is cached across jobs and a
+  # compiler linked against Fedora's glibc must not be restored elsewhere.
+  local built=0 rc=0
+  if [[ ! -x "$ROOT/vendor/nelua-lang/nelua-lua" ]]; then
+    need make
+    (CC="${CC:-cc}"; source "$ROOT/tools/build-common.sh"; build_nelua)
+    built=1
+  fi
+  "$ROOT/tools/ci/static.sh" || rc=$?
+  if [[ "$built" == 1 ]]; then rm -f "$ROOT/vendor/nelua-lang/nelua-lua"; fi
+  return "$rc"
 }
 
 stage_massif() {

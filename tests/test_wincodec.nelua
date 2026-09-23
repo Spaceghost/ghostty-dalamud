@@ -313,6 +313,8 @@ local function roundtrip(w: integer, h: integer, seed: integer): (integer, usize
   end
   assert(ended, 'the last WFRAME is flagged END')
   assert(same_rgb((@*[0]uint8)(&src[0]), (@*[0]uint8)(&dst[0]), w * h), 'the frame arrives intact')
+  -- nogc: hand everything back, or the asan gate reports it leaked
+  src:destroy(); rects:destroy(); q:destroy(); scratch:destroy(); body:destroy(); dst:destroy()
   return frames, bytes
 end
 

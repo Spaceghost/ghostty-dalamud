@@ -25,6 +25,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$ROOT"
 log() { printf '== agent-rpm: %s\n' "$*"; }
 die() { printf 'agent-rpm: error: %s\n' "$*" >&2; exit 1; }
+# "ID VERSION_ID" of this machine, read without sourcing os-release (it sets VERSION)
+os_id() { local id ver; id="$(sed -n 's/^ID=//p' /etc/os-release | tr -d '"')"; ver="$(sed -n 's/^VERSION_ID=//p' /etc/os-release | tr -d '"')"; echo "$id $ver"; }
 usage() { sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 OUT="build/dist"
@@ -141,7 +143,7 @@ log "glibc needed: $GLIBC_NEED (highest symbol version $GLIBC_SYM, ceiling $AGEN
 
 {
   echo "ghostty-agent $VERSION"
-  echo "built on: $(. /etc/os-release && echo "$ID $VERSION_ID"), $(uname -m), gcc $(gcc -dumpversion 2>/dev/null || echo unknown)"
+  echo "built on: $(os_id), $(uname -m), gcc $(gcc -dumpversion 2>/dev/null || echo unknown)"
   echo "glibc at build time: $(ldd --version 2>/dev/null | head -n1)"
   echo "glibc needed to run this: $GLIBC_NEED or newer (measured)"
   echo "wayland compositor backend: no"
