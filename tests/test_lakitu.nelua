@@ -1,0 +1,243 @@
+-- The hovering camera against a fake game (core/app/lakitu.nelua): where the
+-- body goes on its orbit, that it turns to look back at the character, the
+-- lifecycle it shares with the other client-side props, and -- the part worth
+-- the most -- that the view is borrowed and handed back exactly, never taken
+-- while a world panel is being presented, and dropped the moment the scene
+-- cannot hold it.
+--
+-- The calibration against the live camera is not exercised here: it needs a
+-- real view-projection matrix, so with no get_camera the offset stays zero
+-- and the wanted dir_h is the body's azimuth. docs/CAMERA.md says the framing
+-- itself is unobserved until it is seen in game.
+require 'core.host'
+require 'string'
+require 'arg'
+require 'math'
+
+local function near(a: float64, b: float64, eps: float64): boolean return math.abs(a - b) < eps end
+
+-- Fake shim ------------------------------------------------------------------
+local MAX <comptime> = 64
+local objs: [MAX]boolean
+local loaded: [MAX]boolean
+local creates, destroys, live = 0, 0, 0
+local load_all = true
+local pose: [10]float32
+local placed = 0
+local scene: cint = 0
+local pc: GuObject = { x = 10, y = 2, z = 20, rotation = 0, entity_id = 7, territory = 132, found = 1, height = 1.75 }
+
+-- the game's camera, as the shim exposes it
+local dh: float32, dv: float32, dist: float32, dmin: float32 = 0.5, 0.2, 6, 1.5
+local cam_writes = 0
+
+local function index(obj: pointer): integer
+  local i = (@integer)((@usize)(obj) // 16)
+  assert(i >= 1 and i < MAX and (@usize)(obj) % 16 == 0, 'a pointer the fake made')
+  return i
+end
+local function fake_create(path: cstring): pointer
+  creates = creates + 1
+  assert(creates < MAX)
+  objs[creates], loaded[creates] = true, load_all
+  live = live + 1
+  return (@pointer)((@usize)(creates * 16))
+end
+local function fake_ready(obj: pointer): cint
+  local i = index(obj)
+  assert(objs[i], 'ready asked of a live object')
+  return loaded[i] and 1 or 0
+end
+local function fake_transform(obj: pointer, x: float32, y: float32, z: float32,
+                              qx: float32, qy: float32, qz: float32, qw: float32,
+                              sx: float32, sy: float32, sz: float32): cint
+  local i = index(obj)
+  assert(objs[i] and loaded[i], 'placed only once loaded')
+  assert(qx == 0 and qz == 0, 'turned about +Y only')
+  assert(sx == sy and sy == sz, 'scaled evenly')
+  pose = { x, y, z, qx, qy, qz, qw, sx, sy, sz }
+  placed = placed + 1
+  return 1
+end
+local function fake_destroy(obj: pointer): cint
+  local i = index(obj)
+  assert(objs[i], 'never destroyed twice')
+  objs[i] = false
+  destroys = destroys + 1
+  live = live - 1
+  return 1
+end
+local function fake_object(which: cint, id: uint64, out: *GuObject): cint
+  $out = pc
+  return 1
+end
+local function fake_flags(): cint return scene end
+local function fake_get_cam(h: *float32, v: *float32, d: *float32, mind: *float32): cint
+  $h, $v, $d, $mind = dh, dv, dist, dmin
+  return 1
+end
+local function fake_set_cam(h: float32, v: float32, d: float32): cint
+  dh, dv, dist = h, v, d
+  cam_writes = cam_writes + 1
+  return 1
+end
+local function quiet(level: cint, msg: cstring): void end
+
+local api: GuHostApi = {
+  size = #GuHostApi, log = quiet, get_object = fake_object, scene_flags = fake_flags,
+  bg_create = fake_create, bg_ready = fake_ready, bg_set_transform = fake_transform, bg_destroy = fake_destroy,
+  get_camera_state = fake_get_cam, set_camera_state = fake_set_cam,
+}
+local dir: string = arg[1]
+assert(gu_init(&api, (@cstring)(dir.data)) == 0)
+
+local clock: float64 = 100
+local function step(n: integer): void
+  for i = 1, n do
+    clock = clock + 1.0 / 60
+    lakitu_sync(clock)
+  end
+end
+
+local function set_model(m: string): void
+  for k = 0, < 256 do lakitu_want.model[k] = 0 end
+  for k = 0, < #m do lakitu_want.model[k] = (@cchar)(m.data[k]) end
+  lakitu_want.serial = lakitu_want.serial + 1
+end
+
+-- Off is off ------------------------------------------------------------------
+do
+  lakitu_want = lakitu_defaults()
+  step(10)
+  assert(live == 0 and cam_writes == 0, 'a camera nobody asked for makes nothing and moves nothing')
+  assert(not lakitu_live.placed and not lakitu_live.steering)
+  print('off OK')
+end
+
+-- The body on its orbit -------------------------------------------------------
+do
+  lakitu_want = lakitu_defaults()
+  lakitu_want.on = true
+  lakitu_want.ease = 1000 -- settle inside a frame: the easing has its own test
+  set_model('bgcommon/fake.mdl')
+  step(3)
+  assert(live == 1 and creates == 1, 'one body, made once')
+  assert(placed > 0 and lakitu_live.placed, 'and placed once its model loaded')
+
+  -- rotation 0 faces +Z, so yaw 0.6 puts it 0.6 radians round from straight ahead
+  local a = lakitu_want.yaw
+  assert(near(pose[0], pc.x + math.sin(a) * lakitu_want.distance, 1e-3), 'x on the orbit')
+  assert(near(pose[2], pc.z + math.cos(a) * lakitu_want.distance, 1e-3), 'z on the orbit')
+  assert(near(pose[1], pc.y + lakitu_want.height, 1e-3), 'height above the feet')
+  assert(near(pose[7], lakitu_want.scale, 1e-6), 'scaled as asked')
+
+  -- and it looks back at the character: facing is (sin, 0, cos) of az + pi
+  local want_qy, want_qw = desk_yaw_quat((@float32)(a + math.pi - 2 * math.pi))
+  assert(near(pose[4], want_qy, 1e-3) and near(pose[6], want_qw, 1e-3), 'turned to face the character')
+
+  -- the character turns and the body swings round with them
+  pc.rotation = 1.2
+  step(3)
+  assert(near(pose[0], pc.x + math.sin(1.2 + a) * lakitu_want.distance, 1e-2), 'the orbit turns with the character')
+  pc.rotation = 0
+  print('body OK')
+end
+
+-- Easing: it chases, it does not snap ------------------------------------------
+do
+  lakitu_want.ease = 4
+  pc.rotation = 3.0
+  step(1)
+  local first = lakitu_live.azimuth
+  assert(math.abs(first - (3.0 + lakitu_want.yaw)) > 0.5, 'one frame does not get there')
+  step(240)
+  assert(near(lakitu_live.azimuth, 3.0 + lakitu_want.yaw - 2 * math.pi, 0.05)
+      or near(lakitu_live.azimuth, 3.0 + lakitu_want.yaw, 0.05), 'four seconds does')
+  pc.rotation = 0
+  lakitu_want.ease = 1000
+  step(3)
+  print('easing OK')
+end
+
+-- Orbit winds the azimuth on -----------------------------------------------------
+do
+  local before = lakitu_live.azimuth
+  lakitu_want.orbit = 1.0 -- radians per second
+  step(60)
+  local moved = lakitu_live.azimuth - before
+  while moved < -math.pi do moved = moved + 2 * math.pi end
+  assert(near(moved, 1.0, 0.1), 'a second of orbit is a radian')
+  lakitu_want.orbit = 0
+  print('orbit OK')
+end
+
+-- The view: borrowed and handed back exactly ---------------------------------
+do
+  dh, dv, dist = 0.5, 0.2, 6
+  cam_writes = 0
+  lakitu_want.ease = 1000
+  step(3)
+  assert(cam_writes == 0, 'the body alone never touches the view')
+
+  lakitu_want.shot = true
+  step(3)
+  assert(cam_writes > 0 and lakitu_live.steering, 'the shot moves the view')
+  assert(near(dh, lakitu_live.azimuth, 1e-2), 'to the body azimuth (no calibration: offset 0)')
+  assert(near(dist, lakitu_want.distance, 1e-2), 'and the body distance')
+
+  lakitu_want.shot = false
+  step(20)
+  assert(not lakitu_live.steering, 'the view is let go')
+  assert(near(dh, 0.5, 1e-2) and near(dv, 0.2, 1e-2) and near(dist, 6, 1e-2),
+         'and handed back exactly as it was found')
+  local after = cam_writes
+  step(20)
+  assert(cam_writes == after, 'and then left alone')
+  print('view OK')
+end
+
+-- A presented panel outranks the camera --------------------------------------
+do
+  dh, dv, dist = 0.5, 0.2, 6
+  lakitu_want.shot = true
+  step(3)
+  assert(lakitu_live.steering)
+  host.cam_active = true
+  cam_writes = 0
+  step(10)
+  assert(cam_writes == 0 and not lakitu_live.steering, 'worldview has the camera; we do not fight it')
+  host.cam_active = false
+  step(3)
+  assert(lakitu_live.steering, 'and we take it back when the panel is done')
+  print('yielding OK')
+end
+
+-- A scene that cannot hold it -------------------------------------------------
+do
+  scene = 2 -- group pose
+  step(3)
+  assert(live == 0, 'the body goes')
+  assert(not lakitu_live.steering and lakitu_block ~= 0, 'and the view with it')
+  scene = 0
+  step(3)
+  assert(live == 1, 'and comes back')
+
+  pc.found = 0
+  step(3)
+  assert(live == 0 and (lakitu_block & LAKITU_BLOCK_NO_CHARACTER) ~= 0, 'no character, no camera')
+  pc.found = 1
+  step(3)
+  print('blocked OK')
+end
+
+-- Teardown --------------------------------------------------------------------
+do
+  lakitu_teardown()
+  assert(live == 0 and destroys == creates, 'every body made was freed')
+  assert(not lakitu_want.on and not lakitu_want.shot, 'and the wish is forgotten')
+  step(5)
+  assert(live == 0, 'a torn-down camera stays down')
+  print('teardown OK')
+end
+
+print('lakitu OK')

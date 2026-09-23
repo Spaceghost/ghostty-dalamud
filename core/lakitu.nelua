@@ -1,0 +1,148 @@
+-- The hovering camera as Lua asks for it (lua/lakitu.lua, docs/CAMERA.md): a
+-- small object that floats on an orbit around the character, and -- while the
+-- shot is on -- the real camera moved to where that object is.
+--
+-- FFXIV renders one view, so "the camera films me" can only mean the view is
+-- the camera's. That is the whole design, and everything here follows from
+-- it; docs/CAMERA.md says why at length.
+--
+-- Everything in this file is plain data, so the host tests drive it without a
+-- game. core/app/lakitu.nelua makes the object and moves the view.
+--
+--   ghostty.cam{ on = true, shot = false, model = 'bgcommon/...mdl',
+--                distance = 2.5, height = 1.4, yaw = 0.6, orbit = 0,
+--                ease = 6, scale = 1 }
+--   ghostty.cam(false)          -- put it away and give the view back
+--   ghostty.cam_state() -> table
+require 'core.lua'
+require 'math'
+require 'string'
+
+global LakituWish = @record{
+  on: boolean,          -- the body exists and follows the character
+  shot: boolean,        -- and the view is the body's view
+  model: [256]cchar,    -- '' = no body, which is still a working camera
+  distance: float32,    -- yalms from the character
+  height: float32,      -- yalms above its feet
+  yaw: float32,         -- radians around the character; 0 = in front of the face
+  orbit: float32,       -- radians per second added to `yaw` (a slow circle while you talk)
+  ease: float32,        -- how fast the body and the shot chase their marks (1/sec)
+  scale: float32,       -- of the body model
+  serial: uint32,       -- bumped whenever the body's model changes
+}
+
+-- Sane by itself: a shoulder-height camera a couple of yalms out, slightly to
+-- the side of the face, holding still.
+global function lakitu_defaults(): LakituWish
+  return LakituWish{ distance = 2.5, height = 1.4, yaw = 0.6, orbit = 0, ease = 6, scale = 1 }
+end
+
+global lakitu_want: LakituWish = lakitu_defaults()
+
+-- Why the camera cannot show now (core/app/lakitu.nelua sets it every frame).
+-- The first four are the shim's scene flags, and share DESK_BLOCK_*'s meaning.
+global LAKITU_BLOCK_NO_CHARACTER <comptime> = 32
+global lakitu_block: cint = 0
+
+-- What the body and the shot are actually at, as opposed to asked for: the
+-- easing lives in core/app/lakitu.nelua but is reported here so `/term cam`
+-- and the tests can see it.
+global LakituLive = @record{
+  placed: boolean,      -- the body exists and has been put somewhere
+  x: float32, y: float32, z: float32,
+  azimuth: float32,     -- world angle of the body around the character
+  steering: boolean,    -- the view is being moved right now
+  giving_back: boolean, -- and this is the handing back of it
+}
+global lakitu_live: LakituLive
+
+global function lakitu_off(): void
+  lakitu_want.on, lakitu_want.shot = false, false
+end
+
+local function set_model(w: *LakituWish, model: string): void
+  for k = 0, < 256 do w.model[k] = 0 end
+  if #model == 0 or #model >= 256 then return end
+  for k = 0, < #model do w.model[k] = (@cchar)(model.data[k]) end
+end
+
+local function same_model(a: *[256]cchar, b: *[256]cchar): boolean
+  for k = 0, < 256 do
+    if a[k] ~= b[k] then return false end
+    if a[k] == 0 then return true end
+  end
+  return true
+end
+
+-- ghostty.cam(table | boolean | nil). Fields left out keep their value, so
+-- `ghostty.cam{ yaw = 1.2 }` is a nudge and not a reset.
+local function l_cam(L: *lua_State): cint
+  local next = lakitu_want
+  if lua_type(L, 1) == LUA_TBOOLEAN then
+    next.on = lua_toboolean(L, 1) ~= 0
+    if not next.on then next.shot = false end
+  elseif lua_type(L, 1) == LUA_TTABLE then
+    next.on = lua_field_boolean(L, 1, 'on', next.on)
+    next.shot = lua_field_boolean(L, 1, 'shot', next.shot)
+    next.distance = (@float32)(lua_field_number(L, 1, 'distance', next.distance))
+    next.height = (@float32)(lua_field_number(L, 1, 'height', next.height))
+    next.yaw = (@float32)(lua_field_number(L, 1, 'yaw', next.yaw))
+    next.orbit = (@float32)(lua_field_number(L, 1, 'orbit', next.orbit))
+    next.ease = (@float32)(lua_field_number(L, 1, 'ease', next.ease))
+    next.scale = (@float32)(lua_field_number(L, 1, 'scale', next.scale))
+    if lua_type(L, 1) == LUA_TTABLE then
+      local m = lua_field_string(L, 1, 'model', '')
+      -- only when the key is there: an absent `model` is not "no body"
+      lua_getfield(L, 1, 'model')
+      if lua_type(L, -1) == LUA_TSTRING then set_model(&next, m) end
+      lua_pop(L, 1)
+      m:destroy()
+    end
+    -- the shot without the camera is not a thing
+    if not next.on then next.shot = false end
+  elseif lua_type(L, 1) == LUA_TNIL or lua_gettop(L) == 0 then
+    next.on, next.shot = false, false
+  end
+  -- The game refuses silly numbers less kindly than we do.
+  if next.distance < 0.5 then next.distance = 0.5 end
+  if next.distance > 20 then next.distance = 20 end
+  if next.height < -5 then next.height = -5 end
+  if next.height > 10 then next.height = 10 end
+  if next.ease <= 0 then next.ease = 6 end
+  if next.scale <= 0 then next.scale = 1 end
+
+  if not same_model(&next.model, &lakitu_want.model) then
+    next.serial = lakitu_want.serial + 1
+  end
+  lakitu_want = next
+  lua_pushboolean(L, (lakitu_want.on and lakitu_block == 0) and 1 or 0)
+  return 1
+end
+
+local function l_cam_state(L: *lua_State): cint
+  lua_createtable(L, 0, 12)
+  lua_pushboolean(L, lakitu_want.on and 1 or 0) lua_setfield(L, -2, 'on')
+  lua_pushboolean(L, lakitu_want.shot and 1 or 0) lua_setfield(L, -2, 'shot')
+  lua_pushboolean(L, lakitu_live.placed and 1 or 0) lua_setfield(L, -2, 'placed')
+  lua_pushboolean(L, lakitu_live.steering and 1 or 0) lua_setfield(L, -2, 'steering')
+  lua_pushinteger(L, lakitu_block) lua_setfield(L, -2, 'blocked')
+  lua_pushnumber(L, lakitu_want.distance) lua_setfield(L, -2, 'distance')
+  lua_pushnumber(L, lakitu_want.height) lua_setfield(L, -2, 'height')
+  lua_pushnumber(L, lakitu_want.yaw) lua_setfield(L, -2, 'yaw')
+  lua_pushnumber(L, lakitu_want.orbit) lua_setfield(L, -2, 'orbit')
+  lua_pushnumber(L, lakitu_live.x) lua_setfield(L, -2, 'x')
+  lua_pushnumber(L, lakitu_live.y) lua_setfield(L, -2, 'y')
+  lua_pushnumber(L, lakitu_live.z) lua_setfield(L, -2, 'z')
+  return 1
+end
+
+-- Adds cam/cam_state to the `ghostty` table (world_lua_register makes it).
+global function lakitu_lua_register(L: *lua_State): void
+  lakitu_want = lakitu_defaults()
+  lakitu_live = {}
+  lua_getglobal(L, 'ghostty')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return end
+  lua_pushcclosure(L, l_cam, 0) lua_setfield(L, -2, 'cam')
+  lua_pushcclosure(L, l_cam_state, 0) lua_setfield(L, -2, 'cam_state')
+  lua_pop(L, 1)
+end

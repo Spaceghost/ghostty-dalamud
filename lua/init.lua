@@ -14,6 +14,7 @@ local themes = require('themes')
 local tooltips = require('tooltips')
 local windows = require('windows')
 local adopt = require('adopt')
+local lakitu = require('lakitu')
 local gallery = require('gallery')
 
 -- The agent connection and profiles for where the game runs (native Windows,
@@ -155,6 +156,10 @@ local config = {
   -- uploaded until you click Share. Folders, timings: lua/gallery.lua; the
   -- prompt and credit toggles are in Settings, Gallery.
   gallery = gallery,
+  -- The hovering camera (/term cam, docs/CAMERA.md): an object that floats on
+  -- an orbit around you, and -- with the shot on -- the view itself, since the
+  -- game renders only the one. Shots and the body model: lua/lakitu.lua.
+  lakitu = lakitu,
   -- The settings window (/term config) and its saved overrides (settings.lua).
   settings = settings,
   world_pins = {},
