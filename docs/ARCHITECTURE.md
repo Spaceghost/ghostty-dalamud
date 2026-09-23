@@ -753,6 +753,7 @@ the agent compiles them in.
 | `test_netlab_agent` | netlab over the agent protocol against a real agent (`--windows test`): NLCTL answered by NLREPLY, NLSTAT to a watcher, `demo` with no relay, NLFRAMEs rebuilt into the test window, a second connection subscribing by ticket and `view off`, the slow subscription losing groups, stop, and agents without netlab or window capture refusing |
 | `test_netlab_panel` (`.nelua` + `test_netlab.lua`) | the netlab panel: lua/netlab.lua's commands, replies, model, animation (objects, skipped groups, the relay-to-direct switch) and drawing through a scripted ui; the core's NLCTL, NLREPLY and NLSTAT to Lua, NLFRAMEs rebuilt exactly, and the whole panel through the real ghostty.ui bindings (core/uidraw.nelua) into a fake ImGui |
 | `test_netlab_packaging.py` | netlab's offline Rust: the moq fork cut down to moq-iroh-c (path closure, members rewrite, no locked version moved), stubbing crates no build compiles, the pinned Rust dist checked by sha256 and the system-rust floor (fake toolchains), and every script the agent build and the spec reach being in the source tarball |
+| `test_container_packaging.py` | the atomic-desktop container: the Containerfile builds the RPM with `--network=none`, the quadlet runs the agent as the user on loopback without relabelling the home, and the image workflow runs only by hand, smoke-tests before keeping anything, and pushes only when asked |
 
 The last step checks that the core also compiles as a native host module.
 

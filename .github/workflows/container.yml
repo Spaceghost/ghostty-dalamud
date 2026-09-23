@@ -1,0 +1,105 @@
+# The ghostty-agent container image for the atomic desktops (docs/ATOMIC.md).
+# Only by hand: Actions -> Container image -> Run workflow. It builds the image
+# from the agent's source tarball (packaging/container/Containerfile, the RPM
+# built inside with no network), starts it and speaks the protocol to it
+# (tools/ci/container-smoke.sh), and keeps the image as an artifact. It pushes
+# to ghcr.io only when `push` is ticked, and nothing else ever pushes.
+name: Container image
+
+on:
+  workflow_dispatch:
+    inputs:
+      push:
+        description: 'push the tested image to ghcr.io/spaceghost/ghostty-agent'
+        type: boolean
+        default: false
+      tag:
+        description: 'image tag to push besides the version (e.g. latest, testing)'
+        type: string
+        default: testing
+
+permissions: {}
+
+concurrency:
+  group: container-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    if: github.repository == 'Spaceghost/ghostty-dalamud'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write # used only by the push step, and only when `push` is ticked
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Restore toolchains and vendor checkouts
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cache/ghostty-dalamud-ci
+            vendor
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+
+      # The Nelua compiler and netlab's offline Rust workspace; the library itself
+      # is built inside the image build, from the tarball, like the RPM's.
+      - name: Fetch the agent's pinned sources
+        env:
+          NETLAB_SOURCE_ONLY: '1'
+          SKIP_WAYLAND: '1'
+        run: tools/fetch-vendor.sh agent
+
+      - name: Pack the agent source tarball
+        id: src
+        run: |
+          set -euo pipefail
+          tools/package-agent.sh --out build/container
+          v="$(basename build/container/ghostty-agent-*-src.tar.gz)"; v="${v#ghostty-agent-}"; v="${v%-src.tar.gz}"
+          echo "version=$v" >>"$GITHUB_OUTPUT"
+
+      - name: Build the image
+        env:
+          VERSION: ${{ steps.src.outputs.version }}
+        run: |
+          podman build --pull=always -f packaging/container/Containerfile \
+            -t "localhost/ghostty-agent:$VERSION" build/container
+
+      - name: Start it and speak the protocol to it
+        env:
+          VERSION: ${{ steps.src.outputs.version }}
+        run: ENGINE=podman tools/ci/container-smoke.sh "localhost/ghostty-agent:$VERSION"
+
+      - name: Save the image
+        env:
+          VERSION: ${{ steps.src.outputs.version }}
+        run: podman save --format oci-archive -o "build/container/ghostty-agent-$VERSION.oci.tar" "localhost/ghostty-agent:$VERSION"
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ghostty-agent-image-${{ steps.src.outputs.version }}
+          path: build/container/ghostty-agent-*.oci.tar
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Push to ghcr.io
+        if: inputs.push
+        env:
+          VERSION: ${{ steps.src.outputs.version }}
+          TAG: ${{ inputs.tag }}
+          GH_ACTOR: ${{ github.actor }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^[A-Za-z0-9._-]{1,64}$ ]] || { echo "::error::bad tag: $TAG"; exit 1; }
+          repo=ghcr.io/spaceghost/ghostty-agent
+          printf '%s' "$GH_TOKEN" | podman login ghcr.io -u "$GH_ACTOR" --password-stdin
+          for t in "$VERSION" "$TAG"; do
+            podman tag "localhost/ghostty-agent:$VERSION" "$repo:$t"
+            podman push "$repo:$t"
+          done

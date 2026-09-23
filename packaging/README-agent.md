@@ -35,6 +35,10 @@ tools/build-agent.sh            # build/dist/ghostty-agent
 `fetch-vendor.sh agent` also builds netlab's Rust library, downloading the
 pinned Rust toolchain when you have none. `SKIP_NETLAB=1` skips it.
 
+On Silverblue, Kinoite, Sway Atomic or Bazzite, run it as a container with a
+Podman quadlet instead of layering the RPM: see
+[docs/ATOMIC.md](https://github.com/Spaceghost/ghostty-dalamud/blob/master/docs/ATOMIC.md).
+
 ## Run it
 
 ```sh
