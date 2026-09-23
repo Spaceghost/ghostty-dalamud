@@ -62,6 +62,17 @@ internal unsafe struct GuHostApi
     public delegate* unmanaged[Cdecl]<GuHudRect*, int, int> HudRects;
     public delegate* unmanaged[Cdecl]<int, byte*, byte*, byte*, byte*, byte*, nuint, int> HttpPost;
     public delegate* unmanaged[Cdecl]<int> Indoor;
+    public delegate* unmanaged[Cdecl]<byte*, byte*, nuint, nuint> GameLookup;
+    public delegate* unmanaged[Cdecl]<byte*, byte*, int> GameAction;
+    public delegate* unmanaged[Cdecl]<uint, uint*, uint*, nint> TextureIcon;
+    // a terminal in a game window (NativeWindows.cs, docs/NATIVE_UI.md)
+    public delegate* unmanaged[Cdecl]<int, byte*, float, float, float, float, int> NativeOpen;
+    public delegate* unmanaged[Cdecl]<int, int> NativeClose;
+    public delegate* unmanaged[Cdecl]<int, GuNativeState*, int> NativeState;
+    public delegate* unmanaged[Cdecl]<int, void*, int, int, int, int, float, float, float, float, int> NativeDraw;
+    public delegate* unmanaged[Cdecl]<int, float, float, int> NativeResize;
+    public delegate* unmanaged[Cdecl]<int, byte*, int> NativeTitle;
+    public delegate* unmanaged[Cdecl]<float, int> PushMonoFontPx;
     // characters near yours (players, NPCs, chocobos), for pets to make room
     public delegate* unmanaged[Cdecl]<GuCharacter*, int, int> NearbyCharacters;
     // the game's collision with a chosen filter (0 the helper's, 1 everything, 2 every layer)
@@ -76,6 +87,22 @@ internal struct GuCharacter
     public ulong EntityId;
     public float Height;          // model height in yalms
     public int Kind;              // 1 player, 2 battle NPC (mobs), 3 event NPC, 4 companion (chocobo)
+}
+
+// Mirrors GuNativeState in core/nativewin.nelua.
+[StructLayout(LayoutKind.Sequential)]
+internal struct GuNativeState
+{
+    public int Status;            // 0 none, 1 opening (id 0: starting), 2 open (id 0: ready), 3 closed, 4 failed
+    public float X, Y;            // the addon's screen position
+    public float W, H;            // its size in UI units
+    public float Scale;           // screen pixels per UI unit
+    public float Cx, Cy, Cw, Ch;  // the content area, UI units from the addon's origin
+    public int Hovered;           // the game's addon under the pointer: 1 this one, -1 another, 0 none
+    public int Focused;           // the game has it focused
+    public int UiHidden;          // the game's UI is hidden, or this addon is not shown
+    public int Closes;            // times the game closed it
+    public int Error;             // NATIVE_ERR_* of the last failure
 }
 
 // Mirrors GuHudRect in core/hudmask.nelua.

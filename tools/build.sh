@@ -193,12 +193,15 @@ if [[ "${SKIP_SHIM:-0}" != 1 ]]; then
     P=build/dist/GhosttyDalamud
     rm -rf "$P.tmp" && mkdir -p "$P.tmp/lua" "$P.tmp/themes" "$P.tmp/fonts"
     cp build/plugin/GhosttyDalamud/GhosttyDalamud.dll build/plugin/GhosttyDalamud/GhosttyDalamud.json "$P.tmp/"
+    # KamiToolKit (game windows, docs/NATIVE_UI.md) loads from beside the plugin
+    cp build/plugin/GhosttyDalamud/KamiToolKit.dll "$P.tmp/"
+    [[ -d build/plugin/GhosttyDalamud/Assets ]] && cp -r build/plugin/GhosttyDalamud/Assets "$P.tmp/" || true
     [[ -f build/plugin/GhosttyDalamud/GhosttyDalamud.pdb ]] && cp build/plugin/GhosttyDalamud/GhosttyDalamud.pdb "$P.tmp/" || true
     cp build/dist/ghostty_core.dll build/dist/ghostty_loader.dll "$P.tmp/"
     cp lua/*.lua "$P.tmp/lua/"
     cp themes/*.theme "$P.tmp/themes/"
     cp fonts/*.ttf fonts/LICENSE-* "$P.tmp/fonts/"
-    for f in GhosttyDalamud.dll GhosttyDalamud.json ghostty_core.dll ghostty_loader.dll lua/init.lua lua/migrate.lua themes/spaceghost.theme fonts/SymbolsNerdFontMono-Regular.ttf 'fonts/NotoEmoji[wght].ttf'; do
+    for f in GhosttyDalamud.dll GhosttyDalamud.json KamiToolKit.dll ghostty_core.dll ghostty_loader.dll lua/init.lua lua/migrate.lua themes/spaceghost.theme fonts/SymbolsNerdFontMono-Regular.ttf 'fonts/NotoEmoji[wght].ttf'; do
       [[ -f "$P.tmp/$f" ]] || { echo "error: $f missing from the plugin folder" >&2; exit 1; }
     done
     forbid_host_assemblies "$P.tmp"

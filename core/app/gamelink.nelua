@@ -1,0 +1,55 @@
+-- The /ask panel's game links (lua/asklinks.lua): three host calls handed to
+-- Lua as they are, and the icon hook of core/ui.nelua. What is a link and
+-- what a click does is Lua's; what the game allows is the shim's
+-- (shim/GhosttyDalamud/GameLinks.cs, which refuses every action in combat).
+--
+-- * ghostty.game_lookup(names) -> text: names the game knows, one per line in,
+--   "ok"/"pending" and a line per known name out (nil when the host answers nothing)
+-- * ghostty.game_action(verb, arg) -> code: 1 done or queued, 0 not possible,
+--   2 in combat, 3 not logged in
+-- * ui.icon_at / ui.tip_rich draw game icons through ui_icon_texture; Lua never
+--   sees a texture pointer.
+--
+-- With an older shim none of these exist, and answers link only https pages
+-- and slash commands.
+require 'core.app.state'
+require 'core.ui'
+
+local LOOKUP_MAX <comptime> = 65536
+local lookup_buf: [LOOKUP_MAX]cchar
+
+local function l_game_lookup(L: *lua_State): cint
+  local p = lua_tolstring(L, 1, nilptr)
+  if p == nilptr or host.api.game_lookup == nilptr then lua_pushnil(L) return 1 end
+  local n = host.api.game_lookup(p, (@*[0]cchar)(&lookup_buf), LOOKUP_MAX)
+  if n == 0 then lua_pushnil(L) return 1 end
+  if n >= LOOKUP_MAX then n = LOOKUP_MAX - 1 end
+  lua_pushlstring(L, (@cstring)(&lookup_buf), n)
+  return 1
+end
+
+local function l_game_action(L: *lua_State): cint
+  local verb = lua_tolstring(L, 1, nilptr)
+  local what: cstring = lua_tolstring(L, 2, nilptr)
+  if verb == nilptr or host.api.game_action == nilptr then lua_pushinteger(L, 0) return 1 end
+  if what == nilptr then what = '' end
+  lua_pushinteger(L, host.api.game_action(verb, what))
+  return 1
+end
+
+global function gamelink_icon(icon: uint32): pointer
+  if host.api.texture_icon == nilptr or icon == 0 then return nilptr end
+  local w: uint32 = 0
+  local h: uint32 = 0
+  return host.api.texture_icon(icon, &w, &h)
+end
+
+global function gamelink_lua_register(L: *lua_State): void
+  ui_icon_texture = nilptr
+  if host.api.texture_icon ~= nilptr then ui_icon_texture = gamelink_icon end
+  lua_getglobal(L, 'ghostty')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return end
+  if host.api.game_lookup ~= nilptr then lua_pushcclosure(L, l_game_lookup, 0) lua_setfield(L, -2, 'game_lookup') end
+  if host.api.game_action ~= nilptr then lua_pushcclosure(L, l_game_action, 0) lua_setfield(L, -2, 'game_action') end
+  lua_pop(L, 1)
+end

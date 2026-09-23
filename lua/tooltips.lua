@@ -15,6 +15,7 @@ M.delay = 0.45
 M['tab.new'] = 'New tab'
 M['tab.profiles'] = 'New tab from a profile'
 M['tab.window'] = 'Pop this tab out into a window'
+M['tab.native'] = 'Show this tab as a game window (it moves, scales and hides like one)'
 M['tab.pin'] = 'Pin this tab into the world where you stand'
 M['tab.pet'] = 'Let this tab float beside you as a pet'
 M['tab.min'] = 'Minimize this tab to the toolbar'
@@ -27,6 +28,7 @@ M['tab.close'] = 'Close this tab'
 
 -- A floating window's title bar.
 M['window.dock'] = 'Back into the dropdown as a tab'
+M['window.native'] = 'Show it as a game window (it moves, scales and hides like one)'
 M['window.pet'] = 'Let it float beside you as a pet'
 M['window.close'] = 'Close the terminal'
 
@@ -56,6 +58,8 @@ M['ask.game_actions'] = 'Let the assistant use game actions and chat (XivMcp sti
 M['ask.close'] = 'Hide the panel (/ask brings it back); the conversation stays'
 M['ask.send'] = 'Send (Enter); Shift+Enter starts a new line'
 M['ask.stop'] = 'Stop this answer'
+M['ask.copy'] = 'Copy the last answer, as written, to the clipboard'
+M['ask.run'] = 'Run this command now, as if you typed it in chat and pressed Enter'
 M['command./agent'] = 'ghostty-agent: /agent ask [question] asks the local AI assistant'
 
 -- The toolbar popup's taskbar chips.

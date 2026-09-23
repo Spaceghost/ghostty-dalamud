@@ -172,6 +172,18 @@
    `stream-json` mode above all. The agent passes its bytes through
    untouched; the events are rendered by XivDesktop, not by the plugin core.
 
+## Game windows
+
+`/term native` (or the tab bar's and window header's game window button)
+shows a terminal as a real game window: a KamiToolKit addon whose image node
+shows a texture the terminal is drawn into every frame, by the same renderer,
+through an offscreen draw list and Dalamud's `IDrawListTextureWrap`
+(`core/app/nativeview.nelua`, `core/nativewin.nelua`,
+`shim/GhosttyDalamud/NativeWindows.cs`). Where it cannot be made, the terminal
+opens as an ImGui window and the reason is said. Design, rejected
+alternatives and what is unproven: [NATIVE_UI.md](NATIVE_UI.md). Not yet
+observed in game; `/term selftest native` is the in-game check.
+
 ## HUD panels
 
 A world panel whose anchor is `hud` (lua/world.lua; `/term pin hud [X Y]
@@ -705,6 +717,8 @@ the agent compiles them in.
 | `test_worldhud` | HUD panels: roll in the panel basis, the camera frame, the docked spot and size at rest (within a pixel), the lag and settling on a synthetic camera turn, clamps under a wild spin, zoom, the bob, docking maths, the dock hook and persistence in screen fractions |
 | `test_remotewin` | remote window panels against a fake version 3 agent, a fake ImGui and a fake texture table: open, KEY and delta frames, dirty-box uploads, WACK (held while asleep), the textured quads over the letterboxed picture, pointer / button / wheel / key / text input with the chrome keeping its clicks, WEND, WCLOSE, an older shim, a version 2 agent refused |
 | `test_adopt` (`.nelua` + `.lua`) | flat windows in the world, pure parts ([ADOPT.md](ADOPT.md)): window ↔ panel mapping, CPU clipping and strips, the draw-list copy through a fake ImGui, snapshots, cover fitting with no gap, the window size for a pet box, cropping to textured content, the pointer remap and mouse event rewrite, keeping a window on screen, flags, the adopt/lose/give-up state machine, the pull grip, window names, the chat ring, wrapping, the input line and colours; lua/adopt.lua's names, sizes, saved list and colours |
+| `test_nativewin` | terminals in game windows, pure parts ([NATIVE_UI.md](NATIVE_UI.md)): the texture at every UI scale (one texel per screen pixel from a whole pixel), its allocation steps, the pointer and the resize grip, the focus rules, what a close means; mouse reports for programs that track the mouse (X10, normal, button and any motion; SGR and legacy) |
+| `test_native_app` | the same in an embedded core against a fake KamiToolKit shim and an offscreen draw list: the fallback to an ImGui window, waiting for KamiToolKit, opening at the saved size, the texture and the font at the window's scale, keyboard focus and typing only while focused, the mouse taken only over a focused window's text, selection and copy, Ctrl+wheel zoom, mouse reports, the grip, the title, the saved size, the UI hiding, failed draws, the game closing it or the UI taking it, `/term native off`, shutdown |
 | `test_hudmask` | panels beneath the game's HUD: which addon rectangles count (ignored names, full-screen layers, the viewport offset), a triangle minus a rectangle, cutting a hand-built draw list (a band, a corner, apart, covered, a command shared with earlier drawing, callbacks and textures kept, interpolated uvs and colours, ImGui's write cursors) |
 | `test_adopt_app` | the same in an embedded core against fake ImGui internals and a fake shim: hooks on and off, RenderPre snapshots emptying the window, click-through, moved on screen and back, the pet drawing it, the pointer remapped (queued events rewritten, the core still sees the real pointer), lost and regained, reload and restore, release, the chat pet (lines, addons hidden and shown, typing sent), the pull grip, Mappy adopted automatically (closed, reopened, given back, the settings switch), fitting (the window follows the pet's shape and resizes, asked once, kept on a screen too small for it, its size given back) and the HUD read from the shim (full-screen layers left out, the pointer not taken into the window over a HUD element) |
 | `test_host` | the exported host surface without ImGui: init, status, commands, the controller toggle's source and its foreground check, shutdown |

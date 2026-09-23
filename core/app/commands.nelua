@@ -6,6 +6,7 @@ require 'core.app.selftest'
 require 'core.app.rain'
 require 'core.app.lakitu'
 require 'core.app.capture'
+require 'core.app.nativeview'
 local strconv: type = require 'detail.strconv'
 
 -- A terminal or profile number, optionally written "#3". False for anything
@@ -220,6 +221,8 @@ global function run_command(cmd: string): cint
     host.dropdown_tabs:clear()
     host.windows:clear()
     host.minimized:clear()
+    host.native:clear()
+    native_shutdown() -- the game windows close; the layout brings them back
     host.world:clear()
     host.world_focus = 0
     host.world_pins_done = false
@@ -463,6 +466,8 @@ global function run_command(cmd: string): cint
       set_visible(true)
     end
     return 0
+  elseif verb == 'native' then
+    return native_command(arg) -- a terminal in a game window (docs/NATIVE_UI.md)
   elseif verb == 'adopt' or verb == 'release' or verb == 'adopted' then
     return panels_command(verb, arg) -- flat windows into the world and back (docs/ADOPT.md)
   elseif verb == 'new' then
