@@ -13,7 +13,7 @@
 #   IN_FEDORA_IMAGE  the image (default: the pinned registry.fedoraproject.org/fedora:44)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-PKGS="${IN_FEDORA_PKGS:-gcc clang clang-tools-extra cppcheck git curl python3 tar xz unzip findutils which}"
+PKGS="${IN_FEDORA_PKGS:-gcc make clang clang-tools-extra cppcheck git curl python3 tar xz unzip findutils which}"
 IMAGE="${IN_FEDORA_IMAGE:-registry.fedoraproject.org/fedora:44}"
 exec docker run --rm -v "$ROOT:/w" -w /w \
   -e HOME=/tmp/home -e SKIP_DEPS -e SOURCE_DATE_EPOCH -e RELEASE_TAG -e AGENT_GLIBC_MAX \

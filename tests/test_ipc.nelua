@@ -482,13 +482,14 @@ do
   -- toggle_pet from the minimized list: a pet; place a tab: a HUD panel; close a tab
   expect(string.format('{"method":"panel.toggle_pet","params":{"id":%d}}', pet), 'assert(r.ok)')
   expect(string.format('{"method":"panel.place","params":{"id":%d,"pin":"hud 0.5 0.3"}}', tab.id), 'assert(r.ok)')
-  expect(string.format('{"method":"panel.close","params":{"id":%d}}', mins.id), 'assert(r.ok)')
+  local mins_id = mins.id -- closing frees the session: only its id is read after
+  expect(string.format('{"method":"panel.close","params":{"id":%d}}', mins_id), 'assert(r.ok)')
   frame()
   expect('{"method":"panel.list"}', string.format([[
     local by = {}
     for _, p in ipairs(r.result.panels) do by[p.id] = p end
     assert(by[%d].view == 'pet' and by[%d].view == 'hud' and by[%d] == nil, RAW)
-]], pet, tab.id, mins.id))
+]], pet, tab.id, mins_id))
   expect('{"method":"window.list"}', 'for i = #r.result.requests - 2, #r.result.requests do assert(r.result.requests[i].ok, RAW) end')
   -- unknown panels
   expect('{"method":"panel.close","params":{"id":9999}}', 'assert(r.ok)')

@@ -143,7 +143,8 @@ assert(images == 0 and creates == 0, 'no device: no fallback')
 log:clear()
 
 -- With a device: the missing glyphs become images at their cells, tinted by the foreground
-glyphfb_set_dir(root .. '/fonts')
+-- nogc: glyphfb copies the paths it is given, so each joined one is freed here
+do local s = root .. '/fonts'; glyphfb_set_dir(s); s:destroy() end
 glyphfb_frame(FAKE_DEVICE)
 assert(creates == 1)
 -- the chain is read lazily: a Nerd Font icon opens only the first file
@@ -260,15 +261,15 @@ end
 -- With a fonts directory that holds none of the chain, only the added file can
 -- answer, which is what proves it is consulted.
 do
-  glyphfb_set_dir(root .. '/tests')
+  do local s = root .. '/tests'; glyphfb_set_dir(s); s:destroy() end
   glyphfb_frame(FAKE_DEVICE)
   assert(not glyphfb_has(0x2B1B, 8.0, 16.0, 1), 'no chain font in tests/')
   assert(glyphfb_stats.fonts == 0)
-  glyphfb_add_font(root .. '/fonts/NotoSansSymbols2-Regular.ttf')
+  do local s = root .. '/fonts/NotoSansSymbols2-Regular.ttf'; glyphfb_add_font(s); s:destroy() end
   glyphfb_frame(FAKE_DEVICE)
   assert(glyphfb_has(0x2B1B, 8.0, 16.0, 1), 'the added font answers')
   assert(glyphfb_stats.fonts == 1)
-  glyphfb_add_font(root .. '/fonts/NotoSansSymbols2-Regular.ttf') -- again: ignored
+  do local s = root .. '/fonts/NotoSansSymbols2-Regular.ttf'; glyphfb_add_font(s); s:destroy() end -- again: ignored
   glyphfb_frame(FAKE_DEVICE)
   assert(glyphfb_has(0x2B1B, 8.0, 16.0, 1))
   assert(glyphfb_stats.fonts == 1, 'the same path is not added twice')
@@ -305,7 +306,7 @@ do
   else
     print('  no CJK font given (GHOSTTY_TEST_CJK_FONT): the real-ideograph checks were skipped')
   end
-  glyphfb_set_dir(root .. '/fonts')
+  do local s = root .. '/fonts'; glyphfb_set_dir(s); s:destroy() end
   glyphfb_frame(FAKE_DEVICE)
 end
 -- Soak: fill the atlas past full, let the reset evict everything, again and

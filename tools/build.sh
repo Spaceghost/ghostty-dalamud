@@ -180,7 +180,7 @@ if [[ "${SKIP_SHIM:-0}" != 1 ]]; then
       "-p:DalamudLibPath=$DD/" "-p:UmbraLibPath=${UMBRA_LIB_PATH:-$ROOT/vendor/umbra-dist/dist}/" -v quiet
     forbid_host_assemblies build/shim
     cp build/shim/Umbra.Ghostty.dll build/dist/
-    [[ -f build/shim/Umbra.Ghostty.pdb ]] && cp build/shim/Umbra.Ghostty.pdb build/dist/ || true
+    if [[ -f build/shim/Umbra.Ghostty.pdb ]]; then cp build/shim/Umbra.Ghostty.pdb build/dist/; fi
   fi
 
   echo '== GhosttyDalamud.dll (Dalamud plugin)'
@@ -196,7 +196,7 @@ if [[ "${SKIP_SHIM:-0}" != 1 ]]; then
     # KamiToolKit (game windows, docs/NATIVE_UI.md) loads from beside the plugin
     cp build/plugin/GhosttyDalamud/KamiToolKit.dll "$P.tmp/"
     [[ -d build/plugin/GhosttyDalamud/Assets ]] && cp -r build/plugin/GhosttyDalamud/Assets "$P.tmp/" || true
-    [[ -f build/plugin/GhosttyDalamud/GhosttyDalamud.pdb ]] && cp build/plugin/GhosttyDalamud/GhosttyDalamud.pdb "$P.tmp/" || true
+    if [[ -f build/plugin/GhosttyDalamud/GhosttyDalamud.pdb ]]; then cp build/plugin/GhosttyDalamud/GhosttyDalamud.pdb "$P.tmp/"; fi
     cp build/dist/ghostty_core.dll build/dist/ghostty_loader.dll "$P.tmp/"
     cp lua/*.lua "$P.tmp/lua/"
     cp themes/*.theme "$P.tmp/themes/"
