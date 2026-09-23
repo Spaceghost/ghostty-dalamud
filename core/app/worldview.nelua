@@ -149,6 +149,7 @@ global function save_world_state(): void
   layout_push(&entries, &host.dropdown_tabs, 'tab')
   layout_push(&entries, &host.windows, 'window')
   layout_push(&entries, &host.minimized, 'min')
+  layout_push(&entries, &host.native, 'native')
   layout_push(&entries, &host.world, 'world')
   policy_world_save(&entries)
   entries:destroy()

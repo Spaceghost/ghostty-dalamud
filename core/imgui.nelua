@@ -30,10 +30,16 @@ global ImDrawCmdHeader <cimport, nodecl> = @record{ ClipRect: ImVec4, TextureId:
 -- /term selftest counts them), the texture of the next command, and the
 -- write cursors core/hudmask.nelua puts back after rewriting a list's tail.
 global ImDrawList <cimport, nodecl> = @record{
-  CmdBuffer: ImVector_ImDrawCmd, IdxBuffer: ImVector_ImDrawIdx, VtxBuffer: ImVector_ImDrawVert, _CmdHeader: ImDrawCmdHeader,
+  CmdBuffer: ImVector_ImDrawCmd, IdxBuffer: ImVector_ImDrawIdx, VtxBuffer: ImVector_ImDrawVert, Flags: cint, _CmdHeader: ImDrawCmdHeader,
   _VtxCurrentIdx: cuint, _VtxWritePtr: *ImDrawVert, _IdxWritePtr: *uint16,
 }
-global ImFont <cimport, nodecl> = @record{}
+-- The font's atlas and its textures (Dalamud's ImGui keeps several per atlas;
+-- TextureIndexCommon holds the white pixel shapes use): a game window's
+-- offscreen draw list starts on that texture (core/app/nativeview.nelua).
+global ImFontAtlasTexture <cimport, nodecl> = @record{ TexID: pointer, TexPixelsAlpha8: *uint8, TexPixelsRGBA32: *uint32 }
+global ImVector_ImFontAtlasTexture <cimport, nodecl> = @record{ Size: cint, Capacity: cint, Data: *[0]ImFontAtlasTexture }
+global ImFontAtlas <cimport, nodecl> = @record{ Textures: ImVector_ImFontAtlasTexture, TextureIndexCommon: cint }
+global ImFont <cimport, nodecl> = @record{ ContainerAtlas: *ImFontAtlas }
 global ImGuiViewport <cimport, nodecl> = @record{ ID: uint32, Flags: cint, Pos: ImVec2, Size: ImVec2, WorkPos: ImVec2, WorkSize: ImVec2 }
 global ImVector_ImWchar <cimport, nodecl> = @record{ Size: cint, Capacity: cint, Data: *[0]uint16 }
 
