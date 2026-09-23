@@ -14,7 +14,8 @@ From the RPM, on Fedora 44 or newer:
 sudo dnf install ./ghostty-agent-<version>-1.fc44.x86_64.rpm
 ```
 
-From the portable tarball, anywhere with glibc 2.36 or newer:
+From the portable tarball, anywhere with glibc 2.38 or newer (Fedora 39,
+Ubuntu 24.04, Debian 13, SteamOS 3.5 and later):
 
 ```sh
 tar -xzf ghostty-agent-<version>-linux-x86_64.tar.gz

@@ -17,7 +17,7 @@
 #   SOURCE_DATE_EPOCH   build time and file times (default: the last commit's time)
 #   HOST_UID, HOST_GID  who owns the output afterwards (default: this user)
 #   RELEASE_TAG         named in BUILD-INFO.txt (default: the commit)
-#   AGENT_GLIBC_MAX     the highest glibc this binary may need (default 2.36)
+#   AGENT_GLIBC_MAX     the highest glibc this binary may need (default 2.38)
 #
 # Exit codes: 0 done, 1 a build or an assertion failed, 2 bad argument, 127 rpmbuild missing.
 set -euo pipefail
@@ -50,7 +50,9 @@ command -v rpmbuild >/dev/null || {
 }
 SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 0)}"
 export SOURCE_DATE_EPOCH
-AGENT_GLIBC_MAX="${AGENT_GLIBC_MAX:-2.36}"
+# 2.38, not 2.36: netlab's aws-lc defines _GNU_SOURCE, so with glibc 2.38+
+# headers its strtol and sscanf become __isoc23_strtol and __isoc23_sscanf.
+AGENT_GLIBC_MAX="${AGENT_GLIBC_MAX:-2.38}"
 mkdir -p "$OUT"
 OUT="$(cd "$OUT" && pwd)"
 
@@ -140,11 +142,15 @@ if readelf -d "$STAGE/$TARNAME/ghostty-agent" | grep -q 'libwlroots'; then
   die 'the portable binary links wlroots; it must be the .fc43 build'
 fi
 # DT_RELR makes elfdeps emit GLIBC_ABI_DT_RELR, which only glibc 2.36 and newer
-# provides, so the floor is 2.36 however low the symbol versions go.
+# provides, so the floor is at least 2.36 however low the symbol versions go.
+# At least: a symbol version above it still wins (it used to replace it, which
+# hid a binary needing more than the ceiling).
 GLIBC_SYM="$(readelf -V "$STAGE/$TARNAME/ghostty-agent" 2>/dev/null |
   grep -o 'GLIBC_[0-9.]*' | sed 's/GLIBC_//' | sort -uV | tail -n1 || true)"
 GLIBC_NEED="${GLIBC_SYM:-0}"
-if readelf -d "$STAGE/$TARNAME/ghostty-agent" | grep -q 'RELR'; then GLIBC_NEED=2.36; fi
+if readelf -d "$STAGE/$TARNAME/ghostty-agent" | grep -q 'RELR'; then
+  GLIBC_NEED="$(printf '%s\n%s\n' "$GLIBC_NEED" 2.36 | sort -V | tail -n1)"
+fi
 log "glibc needed: $GLIBC_NEED (highest symbol version $GLIBC_SYM, ceiling $AGENT_GLIBC_MAX)"
 [[ "$(printf '%s\n%s\n' "$GLIBC_NEED" "$AGENT_GLIBC_MAX" | sort -V | tail -n1)" == "$AGENT_GLIBC_MAX" ]] ||
   die "the binary needs glibc $GLIBC_NEED, above the $AGENT_GLIBC_MAX ceiling"
