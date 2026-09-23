@@ -1,0 +1,14 @@
+# gitleaks (the secrets gate in .github/workflows/quality.yml): the default
+# rules, less two kinds of false positive its generic-api-key rule finds in
+# this history. Keep allowlists narrow; a real secret must still fail the gate.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "Cargo.lock: crate names and registry checksums, never credentials"
+paths = ['''(^|/)Cargo\.lock$''']
+
+[[allowlists]]
+description = "Dear ImGui enum names listed as strings (ImGuiKey_F9 and the like)"
+regexTarget = "match"
+regexes = ['''^ImGui\w+','ImGui\w+'$''']

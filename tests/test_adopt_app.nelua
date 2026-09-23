@@ -534,8 +534,9 @@ end
 -- Release ---------------------------------------------------------------------------------------------
 do
   local n_pos = #set_pos
+  local s_id = s.id -- releasing frees the session: only its id is read after
   assert(run_command('release') == 0, 'no name: the newest')
-  assert(#host.world == 0 and adopt_count() == 0 and find_session(s.id) == nilptr, 'closed at once')
+  assert(#host.world == 0 and adopt_count() == 0 and find_session(s_id) == nilptr, 'closed at once')
   assert((win.Flags & ImGuiWindowFlags_NoMouseInputs) == 0, 'its flags as they were')
   assert(#set_pos == n_pos, 'on screen from the start: not moved back')
   assert(live_hooks(ImGuiContextHookType_RenderPre) == 0 and imgui.GetMousePos == fake_mouse, 'hooks off')

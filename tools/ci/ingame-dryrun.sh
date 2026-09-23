@@ -97,7 +97,7 @@ start_mock() { # start_mock <dir> <mode>; echoes the URL
 stop_mock() { # stop_mock <dir>
   local p
   p="$(cat "$1/mock.pid" 2>/dev/null || true)"
-  [[ -n "$p" ]] && kill "$p" 2>/dev/null || true
+  if [[ -n "$p" ]]; then kill "$p" 2>/dev/null || true; fi
   wait "$p" 2>/dev/null || true
 }
 
