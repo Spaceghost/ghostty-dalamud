@@ -1,0 +1,372 @@
+-- The agent's embedded WireGuard as one piece for agent/agent.nelua
+-- (docs/WIREGUARD.md): the UDP socket, the WireGuard device, the tunnel's
+-- netstack and its forwards, started from a wireguard.conf and pumped from
+-- the agent's single loop. The agent's own port is always forwarded; the
+-- file's `Forward` lines add others.
+--
+-- The file is read again every two seconds. A new or changed peer is taken
+-- up as it is, a removed one is dropped and its keys wiped, forwards follow
+-- the file, and a new key, port or address restarts the device. A file that
+-- does not parse is reported once and changes nothing. What `wg list` shows
+-- comes from wireguard.conf.status, which the service writes (0600).
+require 'string'
+require 'stringbuilder'
+require 'vector'
+require 'os'
+require 'agent.crypto'
+require 'agent.blake2s'
+require 'agent.wg_device'
+require 'agent.wg_netstack'
+require 'agent.wg_udp'
+require 'agent.wg_config'
+## if ccinfo.is_windows then
+require 'agent.winloop'
+## end
+
+local WG_CHECK_EVERY: number <comptime> = 2
+local WG_STATUS_EVERY: number <comptime> = 5
+
+global WgService = @record{
+  on: boolean,
+  udp: WgUdp,
+  dev: WgDevice,
+  ns: WgNetstack,
+  log: function(msg: string): void,
+  agent_port: uint16,
+  ev: pointer,            -- Windows: the UDP socket's event
+  -- the file behind it
+  path: string,
+  digest: [32]uint8,      -- BLAKE2s of the text last applied (or refused)
+  check_at: number,
+  status_at: number,
+  status: string,         -- the status text last written
+  -- what a restart compares against
+  port: uint16,
+  addr4: WgCidr, addr6: WgCidr, has6: boolean,
+  forwards: vector(WgForward),
+}
+
+local function svc_log(svc: *WgService, msg: string): void
+  if svc.log ~= nilptr then svc.log(msg) end
+end
+
+local function carrier_send(ud: pointer, ep: *WgEndpoint, data: *[0]uint8, len: usize): void
+  local svc = (@*WgService)(ud)
+  svc.udp:send(ep, data, len)
+end
+
+local function to_netstack(ud: pointer, peer: *WgPeer, pkt: *[0]uint8, len: usize): void
+  local svc = (@*WgService)(ud)
+  svc.ns:input(pkt, len)
+end
+
+local function to_device(ud: pointer, pkt: *[0]uint8, len: usize): void
+  local svc = (@*WgService)(ud)
+  svc.dev:send_packet(pkt, len, os.now())
+end
+
+local function dev_log(ud: pointer, msg: string): void svc_log((@*WgService)(ud), msg) end
+local function ns_log(ud: pointer, msg: string): void svc_log((@*WgService)(ud), msg) end
+
+local function add_peer(svc: *WgService, pc: *WgPeerConf, now: number): void
+  local psk: *[0]uint8 = nilptr
+  if pc.has_psk then psk = &pc.psk end
+  local p = svc.dev:add_peer(pc.name, &pc.public, psk)
+  for k = 0, < #pc.allowed do p.allowed:push(pc.allowed[k]) end
+  p.endpoint = pc.endpoint
+  p.keepalive = pc.keepalive
+  if p.endpoint.family ~= 0 then svc.dev:connect(p, now) end
+end
+
+local function proto_name(f: WgForward): string
+  if f.udp then return 'udp' end
+  return 'tcp'
+end
+
+local function forward_text(sb: *stringbuilder, f: WgForward, ok: boolean): void
+  sb:writef(', %s %d', proto_name(f), (@integer)(f.port))
+  if not ok then sb:write(' (failed)') end
+end
+
+-- Bring the tunnel up from `cfg`, forwarding the agent's own `agent_port`.
+-- False and why when it cannot (no key, no address, the port taken).
+function WgService:start(cfg: *WgConfig, agent_port: uint16): (boolean, string)
+  if not cfg.has_private then return false, string.copy('wireguard.conf has no PrivateKey') end
+  if not cfg.has4 then return false, string.copy('wireguard.conf has no IPv4 Address') end
+  if not self.udp:open(cfg.port) then
+    local sb: stringbuilder
+    sb:writef('cannot use UDP port %d (another WireGuard, or another agent?)', (@integer)(cfg.port))
+    return false, sb:promote()
+  end
+  self.agent_port = agent_port
+  self.port, self.addr4, self.addr6, self.has6 = cfg.port, cfg.addr4, cfg.addr6, cfg.has6
+  self.dev.ud, self.dev.send, self.dev.deliver, self.dev.wall, self.dev.log = self, carrier_send, to_netstack, wg_wall, dev_log
+  self.dev:init(&cfg.private)
+  local now = os.now()
+  self.ns.ud, self.ns.output, self.ns.log = self, to_device, ns_log
+  local a6: *WgCidr = nilptr
+  if cfg.has6 then a6 = &cfg.addr6 end
+  if not self.ns:init(&cfg.addr4, a6, 1420) then
+    self.dev:destroy()
+    self.udp:close()
+    return false, string.copy('the tunnel interface did not come up')
+  end
+  local sb: stringbuilder
+  sb:writef('wireguard: UDP %d, tunnel address ', (@integer)(cfg.port))
+  local a4 = wgp.ip_tostring(4, &cfg.addr4.addr)
+  sb:write(a4)
+  a4:destroy()
+  if cfg.has6 then
+    local a6 = wgp.ip_tostring(6, &cfg.addr6.addr)
+    sb:write(' and ', a6)
+    a6:destroy()
+  end
+  sb:writef(', %d peer(s); forwarding tcp %d (this agent)', #cfg.peers, (@integer)(agent_port))
+  if not self.ns:forward({ port = agent_port, to = agent_port }) then sb:write(' (failed)') end
+  self.forwards:clear()
+  for i = 0, < #cfg.forwards do
+    local f = cfg.forwards[i]
+    if f.port ~= agent_port or f.udp then
+      forward_text(&sb, f, self.ns:forward(f))
+      self.forwards:push(f)
+    end
+  end
+  local msg = sb:promote()
+  svc_log(self, msg)
+  msg:destroy()
+  for i = 0, < #cfg.peers do add_peer(self, &cfg.peers[i], now) end
+  ## if ccinfo.is_windows then
+  self.ev = winloop_watch(self.udp.sock, false)
+  ## end
+  self.on = true
+  return true, (@string){}
+end
+
+-- Watch `path` from now on (the file `cfg` came from), as it is now.
+function WgService:watch(path: string): void
+  self.path = path:copy()
+  local ok, text = wg_read_file(path)
+  if ok then blake2s(&self.digest, 32, nilptr, 0, (@*[0]uint8)(text.data), text.size) end
+  crypto.wipe(text.data, text.size)
+  text:destroy()
+  self.check_at = os.now() + WG_CHECK_EVERY
+end
+
+function WgService:stop(): void
+  if not self.on then return end
+  self.ns:destroy()
+  self.dev:destroy()
+  ## if ccinfo.is_windows then
+  winloop_forget_socket(self.ev)
+  self.ev = nilptr
+  ## end
+  self.udp:close()
+  self.forwards:destroy()
+  self.on = false
+end
+
+local function same_cidr(a: *WgCidr, b: *WgCidr): boolean
+  return a.family == b.family and a.bits == b.bits and memory.equals(&a.addr, &b.addr, 16)
+end
+
+-- Bring the running device in line with `cfg`: peers and forwards.
+local function apply(svc: *WgService, cfg: *WgConfig, now: number): void
+  -- peers gone from the file, or whose key material changed: dropped, keys wiped
+  local i = 0
+  while i < #svc.dev.peers do
+    local p = svc.dev.peers[i]
+    local keep = false
+    for k = 0, < #cfg.peers do
+      local pc = &cfg.peers[k]
+      if crypto.equal32(&pc.public, &p.public) and memory.equals(&pc.psk, &p.psk, 32) then keep = true break end
+    end
+    if keep then
+      i = i + 1
+    else
+      local sb: stringbuilder
+      sb:write('wireguard: ', p.name, ' removed')
+      local msg = sb:promote()
+      svc_log(svc, msg)
+      msg:destroy()
+      svc.dev:remove_peer(p)
+    end
+  end
+  -- peers in the file: new ones added, known ones updated in place
+  for k = 0, < #cfg.peers do
+    local pc = &cfg.peers[k]
+    local p = svc.dev:find_peer(&pc.public)
+    if p == nilptr then
+      add_peer(svc, pc, now)
+      local sb: stringbuilder
+      sb:write('wireguard: ', pc.name, ' added')
+      local msg = sb:promote()
+      svc_log(svc, msg)
+      msg:destroy()
+    else
+      p.name:destroy()
+      p.name = pc.name:copy()
+      p.allowed:clear()
+      for a = 0, < #pc.allowed do p.allowed:push(pc.allowed[a]) end
+      if pc.endpoint.family ~= 0 then p.endpoint = pc.endpoint end
+      p.keepalive = pc.keepalive
+    end
+  end
+  -- forwards
+  for f = 0, < #svc.forwards do
+    local have = svc.forwards[f]
+    local still = false
+    for k = 0, < #cfg.forwards do
+      if cfg.forwards[k].udp == have.udp and cfg.forwards[k].port == have.port then still = true end
+    end
+    if not still then svc.ns:unforward(have) end
+  end
+  svc.forwards:clear()
+  for k = 0, < #cfg.forwards do
+    local w = cfg.forwards[k]
+    if w.udp or w.port ~= svc.agent_port then
+      if not svc.ns:forwarding(w) then
+        local ok = svc.ns:forward(w)
+        local sb: stringbuilder
+        sb:writef('wireguard: now forwarding %s %d', proto_name(w), (@integer)(w.port))
+        if not ok then sb:write(' (failed)') end
+        local msg = sb:promote()
+        svc_log(svc, msg)
+        msg:destroy()
+      end
+      svc.forwards:push(w)
+    end
+  end
+end
+
+-- The file changed: apply it, restart for a new key, port or address, or
+-- keep what runs when it does not parse.
+local function reload(svc: *WgService, now: number): void
+  local ok, text = wg_read_file(svc.path)
+  if not ok then return end
+  local digest: [32]uint8
+  blake2s(&digest, 32, nilptr, 0, (@*[0]uint8)(text.data), text.size)
+  if memory.equals(&digest, &svc.digest, 32) then crypto.wipe(text.data, text.size) text:destroy() return end
+  svc.digest = digest
+  local cfg: WgConfig
+  local good, why = cfg:parse(text)
+  crypto.wipe(text.data, text.size)
+  text:destroy()
+  if not good then
+    local sb: stringbuilder
+    sb:write('wireguard: ', svc.path, ': ', why, '; keeping what runs')
+    local msg = sb:promote()
+    svc_log(svc, msg)
+    msg:destroy()
+    why:destroy()
+    cfg:destroy()
+    return
+  end
+  if not crypto.equal32(&cfg.private, &svc.dev.private) or cfg.port ~= svc.port
+     or not same_cidr(&cfg.addr4, &svc.addr4) or cfg.has6 ~= svc.has6 or (cfg.has6 and not same_cidr(&cfg.addr6, &svc.addr6)) then
+    svc_log(svc, 'wireguard: key, port or address changed; restarting the tunnel')
+    local port = svc.agent_port
+    svc:stop()
+    local started, err = svc:start(&cfg, port)
+    if not started then
+      local sb: stringbuilder
+      sb:write('wireguard: ', err)
+      local msg = sb:promote()
+      svc_log(svc, msg)
+      msg:destroy()
+      err:destroy()
+    end
+  else
+    apply(svc, &cfg, now)
+  end
+  cfg:destroy()
+end
+
+-- wireguard.conf.status: one line per peer, what `wg list` shows.
+local function write_status(svc: *WgService): void
+  local sb: stringbuilder
+  for i = 0, < #svc.dev.peers do
+    local p = svc.dev.peers[i]
+    local key = crypto.key_to_base64(&p.public)
+    local ep = p.endpoint:tostring()
+    sb:writef('%s\t%d\t%d\t%d\t%s\n', key, p.last_handshake_wall, (@integer)(p.rx_bytes), (@integer)(p.tx_bytes), ep)
+    key:destroy() ep:destroy()
+  end
+  local text = sb:promote()
+  if text ~= svc.status then
+    local path = svc.path .. '.status'
+    wg_write_private(path, text)
+    path:destroy()
+    svc.status:destroy()
+    svc.status = text
+  else
+    text:destroy()
+  end
+end
+
+-- Descriptors to wake on (POSIX): the UDP socket and the forwards' sockets.
+function WgService:poll_fds(out: *[0]WgPollFd, max: integer): integer
+  if not self.on or max < 1 then return 0 end
+  out[0] = { fd = self.udp:fd(), read = true }
+  return self.ns:poll_fds(out, 1, max)
+end
+
+## if ccinfo.is_windows then
+-- Windows: the events to wait on, appended to `handles`; returns how many it
+-- wanted (more than fit means the loop polls on a short timeout instead).
+function WgService:wait_handles(handles: *[0]pointer, n: *usize, max: usize): usize
+  if not self.on then return 0 end
+  local wanted: usize = 1
+  if self.ev ~= nilptr and $n < max then handles[$n] = self.ev $n = $n + 1 end
+  wanted = wanted + self.ns:wait_handles(handles, n, max)
+  return wanted
+end
+
+function WgService:reset_events(): void
+  if not self.on then return end
+  if self.ev ~= nilptr then winloop_reset(self.ev) end
+  self.ns:reset_events()
+end
+## end
+
+-- One turn: every datagram waiting, the device's timers, the netstack, and
+-- now and then the file and the status.
+function WgService:pump(now: number): void
+  if not self.on then return end
+  local buf: [65536]uint8
+  for _ = 1, 512 do
+    local from: WgEndpoint
+    local n = self.udp:recv(&buf, 65536, &from)
+    if n < 0 then break end
+    if n > 0 then self.dev:receive(&from, &buf, (@usize)(n), now) end
+  end
+  self.dev:tick(now)
+  self.ns:pump(now)
+  if #self.path > 0 then
+    if now >= self.check_at then
+      self.check_at = now + WG_CHECK_EVERY
+      reload(self, now)
+    end
+    if self.on and now >= self.status_at then
+      self.status_at = now + WG_STATUS_EVERY
+      write_status(self)
+    end
+  end
+end
+
+-- The longest the loop may sleep (ms).
+function WgService:wait_ms(now: number): integer
+  if not self.on then return -1 end
+  local ms = (@integer)(self.dev:next_timer(now) * 1000.0) + 1
+  local l = self.ns:wait_ms()
+  if l < ms then ms = l end
+  if #self.path > 0 and ms > 2000 then ms = 2000 end
+  if ms < 1 then ms = 1 end
+  return ms
+end
+
+-- Everything, the watch included.
+function WgService:destroy(): void
+  self:stop()
+  self.path:destroy()
+  self.status:destroy()
+end

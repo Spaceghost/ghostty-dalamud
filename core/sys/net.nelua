@@ -60,6 +60,7 @@ local function listen(s: NetSocket, backlog: cint): cint <cimport, nodecl> end
 local function accept(s: NetSocket, addr: *sockaddr, len: *cint): NetSocket <cimport, nodecl> end
 local function send(s: NetSocket, buf: pointer, len: csize, flags: cint): isize <cimport, nodecl> end
 local function recv(s: NetSocket, buf: pointer, len: csize, flags: cint): isize <cimport, nodecl> end
+local function shutdown(s: NetSocket, how: cint): cint <cimport, nodecl> end
 local function setsockopt(s: NetSocket, level: cint, name: cint, val: pointer, len: cint): cint <cimport, nodecl> end
 local function getaddrinfo(node: cstring, service: cstring, hints: *addrinfo, res: **addrinfo): cint <cimport, nodecl> end
 local function freeaddrinfo(res: *addrinfo): void <cimport, nodecl> end
@@ -241,6 +242,15 @@ function net.send(s: NetSocket, buf: pointer, len: usize): integer
   if n >= 0 then return n end
   if would_block(last_error()) then return 0 end
   return -1
+end
+
+-- Half-close: no more sends (the peer reads EOF), receiving goes on.
+function net.shutdown_write(s: NetSocket): void
+  ## if ccinfo.is_windows then
+    shutdown(s, 1) -- SD_SEND
+  ## else
+    shutdown(s, 1) -- SHUT_WR
+  ## end
 end
 
 function net.socket_fd(s: NetSocket): cint
