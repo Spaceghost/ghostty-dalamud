@@ -8,18 +8,36 @@
 #                   `testing` prerelease, so .../releases/download/testing/latest.zip is
 #                   always the newest test build. It never touches a stable release.
 #
-# The job refuses a fork, a tag that is not on master, and a tag that does not name the
-# version in the manifest. Notes come from the changelog; see docs/RELEASING.md.
+# The testing channel also fills itself: after CI is green on a master commit,
+# testing-channel.yml cuts the next test tag with `tools/releasekit.py auto-test` and calls
+# this workflow for it (a tag pushed with the workflow token starts no workflow on its own).
+# workflow_dispatch publishes an existing tag again, for when a run failed part way.
+#
+# The job refuses a fork, a tag that is not on master (or, for a test build, not a
+# version-only commit on top of master), and a tag that does not name the version in the
+# manifest. Notes come from the changelog and the merged history; see docs/RELEASING.md.
 name: Release
 
 on:
   push:
     tags: ['v*']
+  workflow_call:
+    inputs:
+      tag:
+        description: the release tag to build and publish, already pushed
+        required: true
+        type: string
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: the release tag to build and publish again (vX.Y.Z or vX.Y.Z-test.N)
+        required: true
+        type: string
 
 permissions: {}
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -30,15 +48,18 @@ jobs:
     timeout-minutes: 90
     permissions:
       contents: write
+    env:
+      # the tag this run publishes, whichever way it was started
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.sha }}
+          ref: ${{ inputs.tag && format('refs/tags/{0}', inputs.tag) || github.sha }}
           fetch-depth: 0 # check-tag looks for the tag's commit on master, and at older tags
           persist-credentials: false
 
       - name: Check the tag against the manifest, the changelog and master
-        run: tools/releasekit.py check-tag "$GITHUB_REF_NAME"
+        run: tools/releasekit.py check-tag "$TAG"
 
       - name: Probe for the .NET SDK
         id: dotnet
@@ -73,16 +94,16 @@ jobs:
 
       - name: Test, build and package
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ env.TAG }}
           # a tag with a pre-release part (v0.2.1-test.1) is a testing build, and
           # tools/package.sh writes pluginmaster-testing.json instead
-          TESTING: ${{ contains(github.ref_name, '-') && '1' || '0' }}
+          TESTING: ${{ contains(env.TAG, '-') && '1' || '0' }}
         run: tools/ci/run.sh all
 
       - name: Build the Linux agent packages in a Fedora 44 container
         env:
           IN_FEDORA_PKGS: 'gcc make git rpm-build systemd-rpm-macros pkgconf-pkg-config wlroots-devel wayland-devel wayland-protocols-devel libxkbcommon-devel pixman-devel tar gzip cpio diffutils findutils which'
-          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_TAG: ${{ env.TAG }}
         run: |
           SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \
           HOST_UID=$(id -u) HOST_GID=$(id -g) \
@@ -100,12 +121,10 @@ jobs:
               tools/ci/agent-apk.sh --out build/release'
 
       - name: Check the release files, and write SHA256SUMS
-        env:
-          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           cd build/release
-          for f in latest.zip ${{ contains(github.ref_name, '-') && 'pluginmaster-testing.json' || 'pluginmaster.json' }}; do
+          for f in latest.zip ${{ contains(env.TAG, '-') && 'pluginmaster-testing.json' || 'pluginmaster.json' }}; do
             [[ -s "$f" ]] || { echo "::error::build/release/$f is missing"; exit 1; }
           done
           for g in 'ghostty-agent-*-src.tar.gz' 'ghostty-agent-src.tar.gz' \
@@ -128,7 +147,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
           title="$(cat "$RUNNER_TEMP/title.txt")"
@@ -147,14 +165,14 @@ jobs:
       # its notes say which tag and commit that is. A stable tag never runs this step, and
       # this step never touches a stable release.
       - name: Put this build on the testing channel
-        if: contains(github.ref_name, '-')
+        if: contains(env.TAG, '-')
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-          SHA: ${{ github.sha }}
-          TAG: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          # the tag's own commit: when this workflow is called, github.sha is the caller's
+          SHA="$(git rev-parse HEAD)"
           title="$(sed 's/ v[0-9].*//' "$RUNNER_TEMP/title.txt") testing channel"
           {
             printf '> [!NOTE]\n> **The rolling testing channel.** It always carries the newest test build: now [%s](https://github.com/%s/releases/tag/%s), commit %s.\n\n' \
@@ -180,7 +198,7 @@ jobs:
       - name: Upload build/release
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: ghostty-dalamud-${{ github.ref_name }}
+          name: ghostty-dalamud-${{ env.TAG }}
           path: build/release
           if-no-files-found: error
           retention-days: 30
