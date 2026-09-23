@@ -120,6 +120,14 @@ global GuHostApi = @record{
   -- 1 while the game has the character inside a housing interior; nilptr in
   -- older shims: the collision rays alone decide (core/app/rain.nelua)
   indoor: function(): cint,
+  -- the /ask panel's game links (core/app/gamelink.nelua, lua/asklinks.lua); nilptr
+  -- in older shims: answers link only https pages and slash commands.
+  -- Names the game knows, one per line in `request`, answered into buf: its length
+  game_lookup: function(request: cstring, buf: *[0]cchar, cap: usize): usize,
+  -- a click on a game link: 1 done or queued, 0 not possible, 2 in combat, 3 not logged in
+  game_action: function(verb: cstring, arg: cstring): cint,
+  -- a game icon (icon id) as an ImTextureID, nilptr until it has loaded
+  texture_icon: function(icon: uint32, w: *uint32, h: *uint32): pointer,
 }
 
 global LOG_INFO: cint <comptime> = 1

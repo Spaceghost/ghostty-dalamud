@@ -93,6 +93,9 @@ internal static unsafe class HostApi
         Api->HudRects       = &HudRects;
         Api->HttpPost       = &HttpPost;
         Api->Indoor         = &Indoor;
+        Api->GameLookup     = &GameLookup;
+        Api->GameAction     = &GameAction;
+        Api->TextureIcon    = &TextureIcon;
     }
 
     public static void Free()
@@ -231,6 +234,36 @@ internal static unsafe class HostApi
         try { Dalamud.Utility.Util.OpenLink(Str(url)); return 1; } catch { return 0; }
     }
 
+    // The /ask panel's game links (GameLinks.cs, lua/asklinks.lua) ----------------------------------
+
+    // Names the game knows, as text into buf (NUL terminated, cut to cap); its length.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static nuint GameLookup(byte* request, byte* buf, nuint cap)
+    {
+        if (buf == null || cap == 0) return 0;
+        try {
+            byte[] bytes = System.Text.Encoding.UTF8.GetBytes(GameLinks.Lookup(Str(request)));
+            int n = (int)Math.Min((nuint)bytes.Length, cap - 1);
+            // never half a line: cut back to the last line end that fits
+            if (n < bytes.Length) { while (n > 0 && bytes[n - 1] != (byte)'\n') n--; }
+            for (int i = 0; i < n; i++) buf[i] = bytes[i];
+            buf[n] = 0;
+            return (nuint)n;
+        } catch { buf[0] = 0; return 0; }
+    }
+
+    // One of the few things a click on a link may do: 1 done or queued, 0 not
+    // possible, 2 refused in combat, 3 not logged in.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int GameAction(byte* verb, byte* arg)
+    {
+        try { return GameLinks.Action(Str(verb), Str(arg)); } catch { return 0; }
+    }
+
+    // A game icon (by icon id) as an ImTextureID, 0 until Dalamud has loaded it.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static nint TextureIcon(uint icon, uint* w, uint* h) => GameLinks.Icon(icon, w, h);
+
     // Flat windows pulled into the world (docs/ADOPT.md) ------------------------------------------
 
     // A game addon's rectangle on the screen: 1 shown, 2 loaded but hidden, 0 not loaded.
@@ -272,6 +305,14 @@ internal static unsafe class HostApi
             Plugin.GameFramework.RunOnFrameworkThread(() => SubmitChat(line));
             return 1;
         } catch { return 0; }
+    }
+
+    // The same, for a slash command the /ask panel's confirm let through (GameLinks).
+    public static bool QueueChat(string line)
+    {
+        if (line.Length == 0 || System.Text.Encoding.UTF8.GetByteCount(line) > 500) return false;
+        Plugin.GameFramework.RunOnFrameworkThread(() => SubmitChat(line));
+        return true;
     }
 
     private static void SubmitChat(string line)

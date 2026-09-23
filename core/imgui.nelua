@@ -94,6 +94,7 @@ global ImGuiIO <cimport, nodecl> = @record{
 ##  'ImGuiInputTextFlags_EnterReturnsTrue','ImGuiCol_Button','ImGuiCol_ButtonHovered','ImGuiCol_ButtonActive',
 ##  'ImGuiCol_FrameBg','ImGuiCol_Header','ImGuiCol_HeaderHovered','ImGuiConfigFlags_NoMouseCursorChange',
 ##  'ImGuiInputTextFlags_CtrlEnterForNewLine','ImGuiCol_ScrollbarBg','ImGuiCol_ScrollbarGrab',
+##  'ImGuiMouseCursor_Hand',
 ## }
 ## for _, c in ipairs(consts) do
   global #|c|#: cint <cimport, nodecl, const>
@@ -216,6 +217,8 @@ global ImGuiApi = @record{
   SetScrollHereY: function(center_y_ratio: float32): void,
   GetScrollY: function(): float32,
   GetScrollMaxY: function(): float32,
+  -- the pointer shape for this frame (a hand over the /ask panel's links); optional
+  SetMouseCursor: function(cursor: cint): void,
 }
 
 -- Draw-list callback that makes the renderer restore its own state. Dalamud's
@@ -262,6 +265,7 @@ global imgui: ImGuiApi
 ##  {'InputText','igInputText',true},
 ##  {'InputTextMultiline','igInputTextMultiline',true},{'SetScrollHereY','igSetScrollHereY',true},
 ##  {'GetScrollY','igGetScrollY',true},{'GetScrollMaxY','igGetScrollMaxY',true},
+##  {'SetMouseCursor','igSetMouseCursor',true},
 ## }
 
 global ImGuiResolver = @function(name: cstring): pointer
