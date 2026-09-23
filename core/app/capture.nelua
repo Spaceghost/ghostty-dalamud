@@ -95,6 +95,27 @@ local Clip = @record{
   dropped: integer,
 }
 
+-- The result of the last shot, for whatever asked for one that was not a
+-- person: the camera (core/app/lakitu.nelua) and, through it, the MCP server.
+-- `serial` changes when a shot finishes, which is how a caller that queued one
+-- knows its own has landed without a callback into another thread.
+global CaptureShotResult = @record{
+  serial: uint32,
+  ok: boolean,
+  path: string,    -- owned here; copy it before the next shot
+  error: string,   -- owned here
+}
+global capture_shot: CaptureShotResult
+
+local function shot_done(ok: boolean, path: string, why: string): void
+  capture_shot.path:destroy()
+  capture_shot.error:destroy()
+  capture_shot.ok = ok
+  capture_shot.path = ok and path:copy() or (@string){}
+  capture_shot.error = ok and (@string){} or why:copy()
+  capture_shot.serial = capture_shot.serial + 1
+end
+
 local shot: Shot
 local clip: Clip
 local hud_hidden: boolean = false
@@ -294,6 +315,20 @@ global function capture_describe(): string
   return sb:promote()
 end
 
+-- Start a shot without a person typing one: the same stages /term shot uses,
+-- minus the argument parsing and minus the gallery prompt unless asked for.
+-- False when a capture is already in flight -- there is only one frame buffer,
+-- and the caller is expected to wait rather than queue.
+global function capture_shot_begin(panel: boolean, clean: boolean, share: boolean): (boolean, string)
+  if capture_app_busy() then return false, 'one capture at a time' end
+  shot = {}
+  shot.panel, shot.clean, shot.share = panel, clean, share
+  if clean and not hud_hide(host.last_time) then shot.clean = false end
+  shot.stage = shot.clean and ShotStage.Hiding or ShotStage.Arm
+  shot.settle = HUD_SETTLE_FRAMES
+  return true, (@string){}
+end
+
 global function shot_command(args: string): cint
   if args == 'status' or args == 'diag' then
     local line = capture_describe()
@@ -313,14 +348,14 @@ global function shot_command(args: string): cint
     sayf(LOG_WARN, 'shot: %s (/term shot [panel|full] [clean])', why)
     return 3
   end
-  shot = {}
-  shot.panel, shot.clean, shot.share = panel, clean, true
-  if clean and not hud_hide(host.last_time) then
-    say(LOG_WARN, 'shot: this plugin build cannot hide the game\'s UI; taking the shot as it is')
-    shot.clean = false
+  local started, why = capture_shot_begin(panel, clean, true)
+  if not started then
+    sayf(LOG_WARN, 'shot: %s; this one is still being written', why)
+    return 4
   end
-  shot.stage = shot.clean and ShotStage.Hiding or ShotStage.Arm
-  shot.settle = HUD_SETTLE_FRAMES
+  if clean and not shot.clean then
+    say(LOG_WARN, 'shot: this plugin build cannot hide the game\'s UI; taking the shot as it is')
+  end
   return 0
 end
 
@@ -378,6 +413,7 @@ end
 
 local function shot_fail(why: string): void
   hud_restore()
+  shot_done(false, (@string){}, why)
   sayf(LOG_WARN, 'shot: %s', why)
   shot.path:destroy()
   png_enc_destroy(&shot.enc)
@@ -433,6 +469,7 @@ local function shot_tick(now: float64): void
     shot.path = (@string){}
     shot.stage = ShotStage.None
     sayf(LOG_INFO, 'shot: %dx%d, %d KB', (@integer)(capture.w), (@integer)(capture.h), bytes // 1024)
+    shot_done(true, path, (@string){})
     if shot.share then offer(path) end
     path:destroy()
   end
