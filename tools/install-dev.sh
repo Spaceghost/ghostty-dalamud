@@ -94,6 +94,8 @@ put_changed "$SRC/GhosttyDalamud.json" "$DEST/GhosttyDalamud.json" && managed_ch
 if [[ -f "$SRC/GhosttyDalamud.pdb" ]] && ! cmp -s "$SRC/GhosttyDalamud.dll" "$DEST/GhosttyDalamud.dll" 2>/dev/null; then
   put "$SRC/GhosttyDalamud.pdb" "$DEST/GhosttyDalamud.pdb"
 fi
+# KamiToolKit (game windows, docs/NATIVE_UI.md) before the plugin that loads it
+if [[ -f "$SRC/KamiToolKit.dll" ]]; then put_changed "$SRC/KamiToolKit.dll" "$DEST/KamiToolKit.dll" && managed_changed=1; fi
 put_changed "$SRC/GhosttyDalamud.dll" "$DEST/GhosttyDalamud.dll" && managed_changed=1
 echo "staged $DEST"
 

@@ -155,6 +155,11 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     poll_toggle_key()
     draw_dropdown(now, dt)
     draw_windows()
+  end
+  -- terminals in game windows (core/app/nativeview.nelua): after the ImGui
+  -- terminals, so a focused one of those keeps the keyboard it already had
+  native_frame(now, live)
+  if live then
     draw_anchored_popup()
     draw_inventory() -- the info bar entry's list of every terminal
     draw_settings()
@@ -283,6 +288,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   showcase_stop() -- demo terminals never outlive the session; yours come back
   teardown_effects()
   panels_shutdown() -- pulled windows back to the flat UI, the hooks into ImGui off
+  native_shutdown() -- the game windows close; their shells stay for the next core
   ask_shutdown() -- /ask's hidden sessions end (before the others are left running)
   cursor_release() -- the game's cursor flag as it was before us
   capture_app_shutdown() -- a clip on the host is told to stop; the HUD comes back
@@ -303,6 +309,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   host.dropdown_tabs:destroy()
   host.windows:destroy()
   host.minimized:destroy()
+  host.native:destroy()
   host.world:destroy()
   host.world_covers:destroy()
   host.pending_open:destroy()

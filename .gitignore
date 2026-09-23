@@ -17,5 +17,6 @@ __pycache__/
 /animation-reset-done
 /settings.lua
 /adopted.lua
+/native-state.lua
 # This machine's Incus remote name and other local build settings.
 /build.env

@@ -22,7 +22,7 @@ do
   ok, mask, list, err = selftest_parse('list core')
   assert(not ok, 'list takes nothing')
   err:destroy()
-  local sel = selftest_selection_text((1 << 0) | (1 << 8))
+  local sel = selftest_selection_text((1 << 0) | (1 << 9))
   assert(sel == 'core loader', sel)
   sel:destroy()
   assert(selftest_suite_index('loader') == SELFTEST_SUITE_COUNT - 1, 'loader runs last')

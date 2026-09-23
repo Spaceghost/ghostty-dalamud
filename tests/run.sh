@@ -91,7 +91,7 @@ else
   echo "--- native cache isolation skipped (no dotnet, or SKIP_SHIM=1)"
 fi
 
-rm -f "$ROOT/animation-reset-done" "$ROOT/world-state.lua" "$ROOT/window-state.lua" "$ROOT/settings.lua" "$ROOT/adopted.lua" "$ROOT/ask-state.lua" # state files the Lua modules write next to lua/
+rm -f "$ROOT/animation-reset-done" "$ROOT/world-state.lua" "$ROOT/window-state.lua" "$ROOT/settings.lua" "$ROOT/adopted.lua" "$ROOT/ask-state.lua" "$ROOT/native-state.lua" # state files the Lua modules write next to lua/
 unset UMBRA_GHOSTTY_HOME GHOSTTY_HOME # the migration and config home read these
 rm -rf build/test-scratch && mkdir -p build/test-scratch/surface/config
 run test_ghostty
@@ -132,6 +132,7 @@ run test_worldhud "$ROOT"
 run test_remotewin "$ROOT"
 run test_adopt "$ROOT" "$ROOT/build/test-scratch"
 run test_hudmask
+run test_nativewin
 run test_adopt_app "$ROOT"
 run test_ipc "$ROOT"
 run test_host "$ROOT"
@@ -157,6 +158,7 @@ mkdir -p build/test-scratch/ask
 run test_ask "$ROOT" "$ROOT/build/test-scratch/ask"
 run test_ask_draw "$ROOT"
 run test_hostsurface "$ROOT" "$ROOT/build/test-scratch/surface"
+run test_native_app "$ROOT"
 run test_depthpass "$ROOT"
 run test_selftest
 # randomized VT streams, wire frames and agent strings; the seed makes a

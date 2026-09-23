@@ -15,6 +15,7 @@ M.delay = 0.45
 M['tab.new'] = 'New tab'
 M['tab.profiles'] = 'New tab from a profile'
 M['tab.window'] = 'Pop this tab out into a window'
+M['tab.native'] = 'Show this tab as a game window (it moves, scales and hides like one)'
 M['tab.pin'] = 'Pin this tab into the world where you stand'
 M['tab.pet'] = 'Let this tab float beside you as a pet'
 M['tab.min'] = 'Minimize this tab to the toolbar'
@@ -27,6 +28,7 @@ M['tab.close'] = 'Close this tab'
 
 -- A floating window's title bar.
 M['window.dock'] = 'Back into the dropdown as a tab'
+M['window.native'] = 'Show it as a game window (it moves, scales and hides like one)'
 M['window.pet'] = 'Let it float beside you as a pet'
 M['window.close'] = 'Close the terminal'
 

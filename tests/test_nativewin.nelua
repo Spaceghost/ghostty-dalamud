@@ -1,0 +1,240 @@
+-- A terminal in a game window (core/nativewin.nelua, docs/NATIVE_UI.md), the
+-- pure parts: the texture at the window's scale (one texel per screen pixel,
+-- from a whole pixel, at every UI scale the game offers and odd ones), the
+-- texture's allocation, the pointer in texture pixels, the resize grip and the
+-- size it drags to, which press focuses the terminal and which drops it, what
+-- a close means; and TermView:mouse_bytes, the reports a program tracking the
+-- mouse gets (core/termview.nelua).
+require 'core.nativewin'
+require 'core.termview'
+require 'string'
+require 'math'
+
+local function near(a: float32, b: float32, eps: float32): boolean return math.abs(a - b) <= eps end
+
+local function state(x: float32, y: float32, scale: float32, cx: float32, cy: float32, cw: float32, ch: float32): GuNativeState
+  return (@GuNativeState){ status = NATIVE_OPEN, x = x, y = y, w = cw + 16, h = ch + 48, scale = scale, cx = cx, cy = cy, cw = cw, ch = ch }
+end
+
+-- Layout ---------------------------------------------------------------------------------------
+do
+  -- scale 1 at a whole pixel: the texture is the content, the node is the content
+  local st = state(100, 50, 1, 8, 40, 704, 372)
+  local l = native_layout(&st, 15, 0)
+  assert(l.ok and l.tex_w == 704 and l.tex_h == 372, 'content x 1')
+  assert(l.sx == 108 and l.sy == 90 and near(l.node_x, 8, 1e-4) and near(l.node_y, 40, 1e-4), 'where the content starts')
+  assert(near(l.node_w, 704, 1e-4) and near(l.node_h, 372, 1e-4) and l.font_px == 15, 'node and font')
+
+  -- every scale the game's UI offers and some odd ones, at fractional positions
+  local scales: [9]float32 = { 0.75, 0.9, 1, 1.1, 1.25, 1.333, 1.5, 2, 3 }
+  local xs: [4]float32 = { 0, 100.4, 333.5, 1234.75 }
+  for i = 0, < 9 do
+    for k = 0, < 4 do
+      local s = scales[i]
+      local g = state(xs[k], xs[3 - k] * 0.5, s, 8, 40.5, 704, 371.25)
+      local m = native_layout(&g, 15, 1.1)
+      assert(m.ok, 'laid out')
+      -- the node starts on a whole screen pixel, and the texture is exactly its pixels
+      assert(near(g.x + m.node_x * s, (@float32)(m.sx), 1e-3) and near(g.y + m.node_y * s, (@float32)(m.sy), 1e-3), 'whole pixel origin')
+      assert(near(m.node_w * s, (@float32)(m.tex_w), 1e-3) and near(m.node_h * s, (@float32)(m.tex_h), 1e-3), 'one texel per screen pixel')
+      assert(math.abs(m.tex_w - g.cw * s) <= 1.5 and math.abs(m.tex_h - g.ch * s) <= 1.5, 'the content, give or take a pixel at each end')
+      -- it never pokes out of the content on screen
+      assert(m.sx + m.tex_w <= g.x + (g.cx + g.cw) * s + 1e-3 and m.sx >= g.x + g.cx * s - 0.5 - 1e-3, 'inside the content')
+      assert(m.font_px == native_font_px(15 * 1.1 * s) and m.font_px == math.floor(m.font_px), 'font at the drawn size, whole pixels')
+    end
+  end
+
+  -- nothing to draw
+  local zero: float32 = 0
+  local nan = zero / zero
+  local z = state(0, 0, 0, 8, 40, 704, 372)
+  assert(not native_layout(&z, 15, 1).ok, 'no scale')
+  z = state(0, 0, nan, 8, 40, 704, 372)
+  assert(not native_layout(&z, 15, 1).ok, 'NaN scale')
+  z = state(0, 0, 1, 8, 40, 0, 372)
+  assert(not native_layout(&z, 15, 1).ok, 'no content')
+  z = state(0, 0, 1, 8, 40, 0.3, 372)
+  assert(not native_layout(&z, 15, 1).ok, 'under a pixel wide')
+  z = state(0, 0, 4, 8, 40, 5000, 5000)
+  local big = native_layout(&z, 15, 1)
+  assert(big.ok and big.tex_w == NATIVE_MAX_TEX and big.tex_h == NATIVE_MAX_TEX, 'clamped to the texture limit')
+
+  assert(native_font_px(3) == NATIVE_FONT_MIN and native_font_px(500) == NATIVE_FONT_MAX and native_font_px(nan) == NATIVE_FONT_MIN, 'font range')
+  assert(native_font_px(16.4) == 16 and native_font_px(16.6) == 17, 'rounded')
+  print('layout OK')
+end
+
+-- Texture allocation --------------------------------------------------------------------------
+do
+  assert(native_capacity(0, 1056) == 1280 and native_capacity(0, 256) == 256 and native_capacity(0, 1) == 256, 'rounded up')
+  assert(native_capacity(1280, 1100) == 1280 and native_capacity(1280, 1280) == 1280, 'kept while it fits (shrinking too)')
+  assert(native_capacity(1280, 1281) == 1536, 'grows a step')
+  assert(native_capacity(0, 9000) == NATIVE_MAX_TEX, 'never past the limit')
+  print('capacity OK')
+end
+
+-- Pointer, grip, resize ------------------------------------------------------------------------
+do
+  local st = state(100, 50, 1.5, 8, 40, 400, 200)
+  local l = native_layout(&st, 15, 1)
+  local x, y, on = native_local(&l, (@float32)(l.sx) + 10, (@float32)(l.sy) + 20)
+  assert(on and x == 10 and y == 20, 'texture pixels')
+  x, y, on = native_local(&l, (@float32)(l.sx) - 1, (@float32)(l.sy))
+  assert(not on, 'left of it')
+  x, y, on = native_local(&l, (@float32)(l.sx + l.tex_w), (@float32)(l.sy))
+  assert(not on, 'right of it')
+  local g = native_grip_px(&l)
+  assert(g == 21, 'grip side at 1.5')
+  assert(native_grip_hit(&l, (@float32)(l.tex_w) - 1, (@float32)(l.tex_h) - 1), 'the corner')
+  assert(native_grip_hit(&l, (@float32)(l.tex_w) - g, (@float32)(l.tex_h) - g), 'its inner corner')
+  assert(not native_grip_hit(&l, (@float32)(l.tex_w) - g - 1, (@float32)(l.tex_h) - 1), 'left of it')
+  assert(not native_grip_hit(&l, (@float32)(l.tex_w), (@float32)(l.tex_h) - 1), 'off the texture')
+
+  -- 150 screen pixels at scale 1.5 is 100 UI units
+  local w, h = native_resize_size(720, 420, 500, 500, 650, 440, 1.5, 2560, 1440)
+  assert(w == 820 and h == 380, 'grows and shrinks by the pointer / scale')
+  w, h = native_resize_size(720, 420, 500, 500, -5000, -5000, 1.5, 2560, 1440)
+  assert(w == NATIVE_MIN_W and h == NATIVE_MIN_H, 'not below the smallest')
+  w, h = native_resize_size(720, 420, 500, 500, 99999, 99999, 2, 2560, 1440)
+  assert(w == 1280 and h == 720, 'not past the screen')
+  print('pointer and grip OK')
+end
+
+-- Focus ----------------------------------------------------------------------------------------
+do
+  local open: NativeFocusIn = { open = true }
+  local f, took = native_focus_step(false, open)
+  assert(not f and not took, 'nothing happens: nothing changes')
+  f, took = native_focus_step(true, open)
+  assert(f and not took, 'kept')
+  local e = open
+  e.press, e.on_window = true, true
+  f, took = native_focus_step(false, e)
+  assert(f and took, 'a press on the window takes it')
+  f, took = native_focus_step(true, e)
+  assert(f and not took, 'already had it')
+  e.on_window = false
+  f, took = native_focus_step(true, e)
+  assert(not f and not took, 'a press anywhere else drops it')
+  e = open
+  e.want = true
+  f, took = native_focus_step(false, e)
+  assert(f and took, 'asked for (opened by command, brought forward)')
+  e.claimed_by_other = true
+  f = native_focus_step(false, e)
+  assert(f, 'asking wins over another terminal the same frame')
+  e = open
+  e.claimed_by_other = true
+  f = native_focus_step(true, e)
+  assert(not f, 'another terminal took the keyboard')
+  e = open
+  e.drop, e.want = true, true
+  f = native_focus_step(true, e)
+  assert(not f, 'movement or combat gives the keys back to the game')
+  e = open
+  e.ui_hidden, e.press, e.on_window = true, true, true
+  f = native_focus_step(true, e)
+  assert(not f, 'hidden with the UI')
+  e = open
+  e.open, e.want = false, true
+  f = native_focus_step(true, e)
+  assert(not f, 'closed')
+  print('focus OK')
+end
+
+-- Hover, title, colour -------------------------------------------------------------------------
+do
+  assert(native_on_window(NATIVE_HOVER_OURS, false), 'the game says ours: ours')
+  assert(not native_on_window(NATIVE_HOVER_OTHER, true), 'another game window in front: not ours, even inside our rectangle')
+  assert(native_on_window(NATIVE_HOVER_NONE, true) and not native_on_window(NATIVE_HOVER_NONE, false),
+    'none (ImGui has the mouse): our rectangle decides')
+  local st = state(100, 50, 1.5, 8, 40, 704, 372) -- w 720, h 420 at 1.5: 1080 x 630 on screen
+  assert(native_in_window(&st, 100, 50) and native_in_window(&st, 1179, 679), 'corners in')
+  assert(not native_in_window(&st, 99, 60) and not native_in_window(&st, 1180, 60) and not native_in_window(&st, 150, 680), 'outside')
+
+  local t = native_title_fit('player@desktop:~', 720)
+  assert(t == 'player@desktop:~', t)
+  t:destroy()
+  t = native_title_fit('a very long title that a shell might set while it runs make -j16 in a deep directory', 400)
+  assert(t == 'a very long title that a shell mig…', t) -- (400 - 150) / 7: 35 characters, the ellipsis one of them
+  t:destroy()
+  t = native_title_fit('ééééééééééééé', 240)
+  assert(t == 'ééééééééééé…', t)
+  local n = 0
+  for i = 0, < #t do if (t.data[i] & 0xC0) ~= 0x80 then n = n + 1 end end
+  assert(n == 12, 'cut on a code point, 12 of them (ellipsis included)')
+  t:destroy()
+
+  assert(native_gamma_col(0xFF804020, 1) == 0xFF804020, 'gamma 1: unchanged')
+  local g = native_gamma_col(0x80000000 | 0x008080, 2.2)
+  assert((g >> 24) == 0x80, 'alpha kept')
+  assert((g & 0xFF) == 186 and ((g >> 8) & 0xFF) == 186 and ((g >> 16) & 0xFF) == 0, 'grey 128 encoded for sRGB: 186')
+  assert(native_gamma_col(0xFFFFFFFF, 2.2) == 0xFFFFFFFF and native_gamma_col(0xFF000000, 2.2) == 0xFF000000, 'white and black stay')
+  assert(native_pixel_diff(0xBE, 0xA2, 0x81, 0xFFBEA281) == 0, 'BGRA against IM_COL32 (spaceghost blue #81a2be)')
+  assert(native_pixel_diff(0xBE, 0xA2, 0x8F, 0xFFBEA281) == 14, 'the red channel off by 14')
+  assert(native_swatch_cols[5] == 0xFF6666CC, 'spaceghost red')
+  print('hover, title, colour OK')
+end
+
+-- Closing --------------------------------------------------------------------------------------
+do
+  assert(native_close_kind(true, true, true) == NativeClose.Ours, 'we asked')
+  assert(native_close_kind(false, true, false) == NativeClose.Suspend, 'the UI hid')
+  assert(native_close_kind(false, false, true) == NativeClose.Suspend, 'a cutscene or loading screen')
+  assert(native_close_kind(false, false, false) == NativeClose.User, 'its x, Esc or close-all')
+  assert(native_error_text(NATIVE_ERR_KAMI) == 'KamiToolKit did not start' and native_error_text(99) == 'unknown', 'reasons')
+  print('closing OK')
+end
+
+-- Mouse reports --------------------------------------------------------------------------------
+local v: TermView
+local out: [32]byte
+local function bytes(n: integer): string return string{ data = (@*[0]byte)(&out), size = (@usize)(n) } end
+local function feed(s: string) v:feed((@*[0]uint8)(s.data), s.size) end
+do
+  assert(v:init(80, 24))
+
+  assert(not v:mouse_tracking() and v:mouse_bytes(0, 0, 4, 2, 0, &out) == 0, 'no mode: nothing (the click selects)')
+
+  feed('\27[?1000h')
+  assert(v:mouse_tracking(), 'normal tracking')
+  local n = v:mouse_bytes(0, 0, 4, 2, 0, &out)
+  assert(bytes(n) == '\27[M\32\37\35', 'legacy press: button 0, cell 5,3')
+  n = v:mouse_bytes(0, 1, 4, 2, 0, &out)
+  assert(bytes(n) == '\27[M\35\37\35', 'legacy release names no button')
+  n = v:mouse_bytes(2, 0, 0, 0, 16, &out)
+  assert(bytes(n) == '\27[M\50\33\33', 'right button with Ctrl')
+  assert(v:mouse_bytes(0, 2, 5, 2, 0, &out) == 0, 'no motion in normal mode')
+  n = v:mouse_bytes(0, 0, 300, 2, 0, &out)
+  assert(n == 6 and out[4] == 255, 'the legacy form caps at 223')
+
+  feed('\27[?1006h')
+  n = v:mouse_bytes(0, 0, 4, 2, 0, &out)
+  assert(bytes(n) == '\27[<0;5;3M', 'SGR press')
+  n = v:mouse_bytes(0, 1, 4, 2, 0, &out)
+  assert(bytes(n) == '\27[<0;5;3m', 'SGR release keeps the button')
+  n = v:mouse_bytes(2, 0, 9, 9, 8, &out)
+  assert(bytes(n) == '\27[<10;10;10M', 'right with Alt')
+  n = v:mouse_bytes(0, 0, 299, 99, 0, &out)
+  assert(bytes(n) == '\27[<0;300;100M', 'SGR has no cap')
+
+  feed('\27[?1002h')
+  n = v:mouse_bytes(0, 2, 6, 2, 0, &out)
+  assert(bytes(n) == '\27[<32;7;3M', 'button motion')
+  assert(v:mouse_bytes(3, 2, 6, 2, 0, &out) == 0, 'no motion without a button in 1002')
+  feed('\27[?1003h')
+  n = v:mouse_bytes(3, 2, 6, 2, 0, &out)
+  assert(bytes(n) == '\27[<35;7;3M', 'any motion')
+
+  feed('\27[?1003l\27[?1002l\27[?1000l\27[?1006l\27[?9h')
+  assert(v:mouse_tracking(), 'X10')
+  n = v:mouse_bytes(0, 0, 0, 0, 16, &out)
+  assert(bytes(n) == '\27[M\32\33\33', 'X10 press, no modifiers')
+  assert(v:mouse_bytes(0, 1, 0, 0, 0, &out) == 0, 'X10 reports no release')
+  feed('\27[?9l')
+  assert(not v:mouse_tracking(), 'off again')
+  v:destroy()
+  print('mouse reports OK')
+end
+
+print('test_nativewin OK')

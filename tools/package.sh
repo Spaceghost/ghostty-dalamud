@@ -61,6 +61,8 @@ pack() {
 echo "== $PLUGIN_ZIP"
 rm -rf "$STAGE" && mkdir -p "$STAGE/plugin/lua" "$STAGE/plugin/themes" "$STAGE/agent"
 cp "$PLUGIN/GhosttyDalamud.dll" "$PLUGIN/GhosttyDalamud.json" "$PLUGIN/ghostty_loader.dll" "$PLUGIN/ghostty_core.dll" "$STAGE/plugin/"
+# KamiToolKit: game windows (docs/NATIVE_UI.md); without it they fall back to ImGui windows
+[[ -f "$PLUGIN/KamiToolKit.dll" ]] && cp "$PLUGIN/KamiToolKit.dll" "$STAGE/plugin/"
 cp "$PLUGIN"/lua/*.lua "$STAGE/plugin/lua/"
 cp "$PLUGIN"/themes/*.theme "$STAGE/plugin/themes/"
 pack "$STAGE/plugin" "$DIST/$PLUGIN_ZIP"

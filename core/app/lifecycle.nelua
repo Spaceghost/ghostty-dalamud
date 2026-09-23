@@ -18,7 +18,7 @@ global function update_status(): void
   else
     sb:write('ghostty')
   end
-  local total = #host.dropdown_tabs + #host.windows + #host.world + #host.minimized
+  local total = #host.dropdown_tabs + #host.windows + #host.world + #host.minimized + #host.native
   if total > 0 then sb:writef(' %d', total) end
   if #host.minimized > 0 then sb:writef(' (%d min)', #host.minimized) end
   host.status:destroy()
