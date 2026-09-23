@@ -86,6 +86,18 @@ remote_env() {
   epoch="$(git -C "$ROOT" log -1 --format=%ct 2>/dev/null || echo 1)"
   e+=(--env "SOURCE_DATE_EPOCH=$epoch")
   local v
+  # The stamp has to be computed HERE. tools/build.sh falls back to
+  # `git rev-parse HEAD`, and the container receives the source as a tarball
+  # with no .git, so every remote build came out commit=unknown and the
+  # selftest's "no build stamp" check failed on it.
+  if [[ -z "${BUILD_COMMIT:-}" ]]; then
+    BUILD_COMMIT="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
+    if [[ "$BUILD_COMMIT" != unknown ]] && ! git -C "$ROOT" diff --quiet HEAD -- core lua agent 2>/dev/null; then
+      BUILD_COMMIT="$BUILD_COMMIT-dirty"
+    fi
+    export BUILD_COMMIT
+  fi
+
   # SAN and its option strings travel too, so the sanitizer suites can run here
   # rather than on the machine the game is on.
   for v in SKIP_WIN SKIP_SHIM SKIP_UMBRA SKIP_DEPS SKIP_WAYLAND MAC BUILD_COMMIT BUILD_ID \
