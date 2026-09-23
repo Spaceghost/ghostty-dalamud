@@ -238,6 +238,22 @@ function M.world()
     end
     case('nearest wall', 'pass', near and string.format('%.2f yalms, %.1f degrees round from where you face; %d of 16 directions hit within 30 yalms', near, near_dir, hits)
       or 'no wall within 30 yalms in 16 directions')
+    -- at knee height, all round, with each filter: a post or a lamp base next to
+    -- you shows here, and whether the old filter (bg) would have seen it
+    for _, f in ipairs({ 'all', 'layers', 'bg' }) do
+      local n, best, dir = 0, nil, 0
+      for i = 0, 15 do
+        local ang = p.rotation + i * math.pi / 8
+        local d, _, _, _, used = rc(p.x, p.y + 0.5, p.z, math.sin(ang), 0, math.cos(ang), 6, f)
+        if d then
+          n = n + 1
+          if not best or d < best then best, dir = d, i * 22.5 end
+        end
+        if i == 0 and used and used ~= f then f = f .. ' (this shim answers ' .. used .. ')' end
+      end
+      case('ring at knee height, ' .. f, 'pass', best and string.format('%d of 16 directions hit within 6 yalms, nearest %.2f at %.1f degrees', n, best, dir)
+        or 'nothing within 6 yalms all round')
+    end
     local W = CONFIG and CONFIG.world
     if W and W.anchors then
       for id, a in pairs(W.anchors) do

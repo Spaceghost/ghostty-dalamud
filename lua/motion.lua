@@ -320,7 +320,8 @@ end
 
 -- Whether anything crosses a panel's face: rays along it, from its left edge
 -- through its middle to its right edge (two segments, following the curve),
--- at `rows` heights (1: the middle; 2: near its bottom and top edges), and back the
+-- at `rows` heights (1: the middle; 2: near its bottom and top edges; 3: all
+-- three, so a short post under its middle is seen too), and back the
 -- other way too when `both` (the game's collision is one-sided: a ray that
 -- starts inside a pillar does not see it). This is what catches a pillar
 -- standing in the panel between the points the rays from the chest look at.
@@ -332,7 +333,8 @@ function M.span_clear(cast, x, y, z, yaw, hw, hh, curve, rows, both)
   rows = rows or 1
   for r = 1, rows do
     local py = y
-    if rows >= 2 then py = y + (r == 1 and -0.9 or 0.9) * hh end
+    if rows == 2 then py = y + (r == 1 and -0.9 or 0.9) * hh
+    elseif rows >= 3 then py = y + (r - 2) * 0.9 * hh end
     for seg = 0, 1 do
       local ax, az, bx, bz = lx, lz, x, z
       if seg == 1 then ax, az, bx, bz = x, z, rx, rz end
