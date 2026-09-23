@@ -149,7 +149,11 @@ if [[ "${SKIP_WIN:-0}" != 1 ]]; then
     --cflags="-O2 $INC -L\"$ROOT/build/win/lib\" -L\"$ROOT/build/lua-win\"" --ldflags="$(iroh_win_ldflags)" \
     --cache-dir build/win/cache -L . -H -o build/dist/ghostty_loader.dll core/loader.nelua
   echo "== ghostty-agent.exe (windows x64)"
-  ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc "${IROH_WIN_DEF[@]}" --cflags="-O2" --ldflags="$(iroh_win_ldflags)" \
+  # netlab when vendor/moq-iroh has the Windows library (tools/netlab-flags.sh,
+  # sourced above); -s: the shipped exe carries no symbol table, as the RPM's
+  # binary does not (there is no separate debug file for it to point at)
+  [[ ${#NETLAB_WIN_DEFINE[@]} -gt 0 ]] && echo "with netlab (moq over iroh)"
+  ZIG="$ZIG" "$NELUA" --cc "$ROOT/tools/zig-cc-win.sh" -P nogc "${IROH_WIN_DEF[@]}" "${NETLAB_WIN_DEFINE[@]}" --cflags="-O2 -s $NETLAB_WIN_CFLAGS" --ldflags="$(iroh_win_ldflags)" \
     --cache-dir build/win/cache-agent -L . -o build/dist/ghostty-agent.exe agent/agent.nelua
 fi
 

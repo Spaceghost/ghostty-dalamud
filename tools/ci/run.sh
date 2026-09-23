@@ -150,7 +150,10 @@ ensure_umbra() {
 }
 
 fetch_vendor() {
-  # DALAMUD_LIB_PATH is exported, so fetch-vendor.sh reuses the pinned copy
+  # DALAMUD_LIB_PATH is exported, so fetch-vendor.sh reuses the pinned copy.
+  # The Windows agent gets netlab too: its libmoq_iroh.a is cross-built with the
+  # pinned Rust and Zig (tools/build-moq-iroh.sh), unless there is no Windows build.
+  if [[ "${SKIP_WIN:-0}" != 1 ]]; then export NETLAB_WINDOWS=1; fi
   "$ROOT/tools/fetch-vendor.sh"
 }
 

@@ -6,7 +6,7 @@
 # Darwin support remains experimental until tested there.
 #
 #   tools/fetch-vendor.sh agent && tools/build-agent.sh
-#   tools/build-agent.sh [--wayland|--no-wayland] [-o PATH] [-j N]
+#   tools/build-agent.sh [--wayland|--no-wayland] [--netlab|--no-netlab] [-o PATH] [-j N]
 #
 # Output:
 #   build/dist/ghostty-agent   the PTY server for the machine that runs your shells
@@ -17,6 +17,7 @@
 #   LDFLAGS   extra link flags, appended last
 #   JOBS      parallelism for the Nelua compiler build
 #   SKIP_WAYLAND  1 to leave the compositor backend out
+#   SKIP_NETLAB   1 to leave netlab (moq over iroh, vendor/moq-iroh) out
 #
 # Exit codes: 0 done, 1 a dependency is missing, 2 bad argument or unsupported
 # platform, 127 no C compiler.
@@ -25,14 +26,17 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 case "$(uname -s)" in Linux | Darwin) ;; *) echo 'The agent requires Linux or macOS.' >&2; exit 2 ;; esac
 
-usage() { sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,23p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 OUT="build/dist/ghostty-agent"
 WANT_WAYLAND=0
+WANT_NETLAB=0
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --wayland) WANT_WAYLAND=1 ;;
     --no-wayland) SKIP_WAYLAND=1 ;;
+    --netlab) WANT_NETLAB=1 ;;
+    --no-netlab) SKIP_NETLAB=1 ;;
     -o | --output) [[ $# -ge 2 ]] || { echo "error: $1 needs a path" >&2; exit 2; }; OUT="$2"; shift ;;
     -j | --jobs) [[ $# -ge 2 ]] || { echo "error: $1 needs a number" >&2; exit 2; }; JOBS="$2"; shift ;;
     -h | --help) usage; exit 0 ;;
@@ -40,7 +44,7 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
-export SKIP_WAYLAND="${SKIP_WAYLAND:-0}"
+export SKIP_WAYLAND="${SKIP_WAYLAND:-0}" SKIP_NETLAB="${SKIP_NETLAB:-0}"
 
 # The agent's own flags. The Nelua compiler is built without them: it is a build
 # tool, not a shipped artifact, and a distribution's hardening flags are for the
@@ -73,6 +77,10 @@ SKIP_WIN=1 iroh_probe
 build_iroh
 # shellcheck source=tools/netlab-flags.sh
 source "$ROOT/tools/netlab-flags.sh"
+if [[ "$WANT_NETLAB" == 1 && ${#NETLAB_DEFINE[@]} -eq 0 ]]; then
+  echo 'error: no netlab library: run tools/build-moq-iroh.sh (after tools/fetch-vendor.sh agent)' >&2
+  exit 1
+fi
 
 # Nelua takes one --cflags and keeps the last, so everything goes in one string.
 cflags="-I\"$ROOT/compat\""

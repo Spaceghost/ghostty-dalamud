@@ -22,7 +22,7 @@ cd ghostty-agent-<version>-linux-x86_64
 install -Dm0755 ghostty-agent ~/.local/bin/ghostty-agent
 ```
 
-From source, with a C compiler and `make` and nothing else:
+From source, with a C compiler, `make` and `git`:
 
 ```sh
 git clone https://github.com/Spaceghost/ghostty-dalamud
@@ -30,6 +30,9 @@ cd ghostty-dalamud
 tools/fetch-vendor.sh agent     # only what the agent needs
 tools/build-agent.sh            # build/dist/ghostty-agent
 ```
+
+`fetch-vendor.sh agent` also builds netlab's Rust library, downloading the
+pinned Rust toolchain when you have none. `SKIP_NETLAB=1` skips it.
 
 ## Run it
 
@@ -128,6 +131,10 @@ and not on Fedora 43.
 The `.fc43` package and the portable tarball have no compositor backend:
 terminals, jobs and clips work, remote desktop windows do not. The agent says
 which it is when it starts.
+
+Every package, the tarball and the Windows zip carry netlab (docs/NETLAB.md):
+a window published over iroh as a moq broadcast. Its Rust library is linked in
+statically, so it adds no dependency beyond glibc and libgcc.
 
 ## Optional helpers
 

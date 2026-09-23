@@ -1,6 +1,7 @@
 -- Bindings to moq_iroh (docs/NETLAB.md): Media over QUIC between iroh
 -- endpoints, from rs/moq-iroh-c in the owner's moq fork, linked statically
--- from vendor/moq-iroh (tools/fetch-vendor.sh, tools/netlab-flags.sh).
+-- from vendor/moq-iroh (tools/fetch-vendor.sh, tools/netlab-flags.sh), and
+-- for Windows from vendor/moq-iroh/x86_64-pc-windows-gnu.
 --
 -- The library never calls back: it queues what it has for the agent and makes
 -- moqi_wake_fd() readable. Handles are positive int32s, errors negative
@@ -10,12 +11,26 @@
 ## if NETLAB then
 ## cinclude '"moq_iroh.h"'
 ## linklib 'moq_iroh'
+-- What the Rust standard library and the crates under it call into, from
+-- `cargo rustc -- --print native-static-libs` (tools/build-moq-iroh.sh).
+## if ccinfo.is_windows then
+## linklib 'ws2_32'
+## linklib 'bcrypt'
+## linklib 'ntdll'
+## linklib 'userenv'
+## linklib 'iphlpapi'
+## linklib 'advapi32'
+## linklib 'kernel32'
+-- the unwinder the Rust standard library for windows-gnu expects from libgcc_eh
+## linklib 'unwind'
+## else
 ## linklib 'gcc_s'
 ## linklib 'util'
 ## linklib 'rt'
 ## linklib 'pthread'
 ## linklib 'm'
 ## linklib 'dl'
+## end
 
 global moqi_node_config <cimport, nodecl> = @record{
   secret_path: cstring,

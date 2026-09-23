@@ -6,7 +6,8 @@
 #     agent   only what tools/build-agent.sh needs: the Nelua compiler, the
 #             vendored C the agent's WireGuard compiles in (Monocypher, lwIP,
 #             the QR code generator), the Wayland SDK headers when this host
-#             can extract them, and moq-iroh (netlab) when cargo is there
+#             can extract them, and moq-iroh (netlab: the vendored workspace and
+#             libmoq_iroh.a, with the pinned Rust fetched if this host has none)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/toolchain.env"
@@ -16,7 +17,7 @@ mkdir -p "$V"
 MODE="${1:-all}"
 case "$MODE" in
   all | agent) ;;
-  -h | --help) sed -n '2,7p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+  -h | --help) sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
   *) echo 'usage: tools/fetch-vendor.sh [all|agent]' >&2; exit 2 ;;
 esac
 
@@ -153,24 +154,36 @@ if [[ "$(uname -s)" == Linux && "${SKIP_WAYLAND:-0}" != 1 && ! -f "$V/wayland-sd
 fi
 [[ -f "$V/wayland-sdk/.pinned" ]] && echo "wayland-sdk (wlroots 0.20)"
 
-# moq over iroh for the agent's netlab (docs/NETLAB.md; Linux only; SKIP_NETLAB=1
-# to skip). The fork's rs/moq-iroh-c at the pinned commit, built with cargo into
-# vendor/moq-iroh: libmoq_iroh.a and moq_iroh.h. Without it the agent builds
-# without netlab (tools/netlab-flags.sh).
-if [[ "$(uname -s)" == Linux && "${SKIP_NETLAB:-0}" != 1 ]] &&
-   [[ "$(cat "$V/moq-iroh/.pinned" 2>/dev/null)" != "$MOQ_IROH_COMMIT" ]]; then
-  if command -v cargo >/dev/null; then
+# moq over iroh for the agent's netlab (docs/NETLAB.md; SKIP_NETLAB=1 to skip).
+# The fork at the pinned commit, cut down to rs/moq-iroh-c with every crate
+# vendored (tools/moq-vendor.sh -> vendor/moq-iroh-src, which then builds with no
+# network), and libmoq_iroh.a built from that (tools/build-moq-iroh.sh ->
+# vendor/moq-iroh; NETLAB_WINDOWS=1 adds the Windows library, which needs zig).
+# The pinned Rust is fetched when this host has none (tools/rust-toolchain.sh).
+# Without it the agent builds without netlab (tools/netlab-flags.sh).
+if [[ "$(uname -s)" == Linux && "${SKIP_NETLAB:-0}" != 1 ]]; then
+  if [[ "$(cut -d' ' -f1 "$V/moq-iroh-src/.pinned" 2>/dev/null)" != "$MOQ_IROH_COMMIT" ||
+        ( -n "${MOQ_IROH_LOCK_SHA256:-}" && "$(cut -d' ' -f2 "$V/moq-iroh-src/.pinned" 2>/dev/null)" != "$MOQ_IROH_LOCK_SHA256" ) ]]; then
     clone_pin moq "$MOQ_IROH_REPOSITORY" "$MOQ_IROH_COMMIT"
-    ( cd "$V/moq" && cargo build --locked --release -p moq-iroh-c )
-    rm -rf "$V/moq-iroh"
-    mkdir -p "$V/moq-iroh"
-    cp "$V/moq/target/release/libmoq_iroh.a" "$V/moq/rs/moq-iroh-c/include/moq_iroh.h" "$V/moq-iroh/"
-    printf '%s' "$MOQ_IROH_COMMIT" > "$V/moq-iroh/.pinned"
-  else
-    echo "moq-iroh skipped: cargo is needed (the agent builds without netlab)"
+    "$ROOT/tools/moq-vendor.sh" "$V/moq" "$V/moq-iroh-src"
   fi
+  moq_targets=()
+  # NETLAB_SOURCE_ONLY=1: the offline workspace alone, for packing the source
+  # tarball (tools/package-agent.sh) where the library is built later, in rpmbuild
+  if [[ "${NETLAB_SOURCE_ONLY:-0}" != 1 ]]; then
+  [[ "$(cat "$V/moq-iroh/.pinned" 2>/dev/null)" == "$MOQ_IROH_COMMIT" && -f "$V/moq-iroh/libmoq_iroh.a" ]] || moq_targets+=(linux)
+  if [[ "${NETLAB_WINDOWS:-0}" == 1 && ! -f "$V/moq-iroh/x86_64-pc-windows-gnu/libmoq_iroh.a" ]]; then
+    if [[ -n "${ZIG:-}" ]] || command -v zig >/dev/null; then moq_targets+=(windows)
+    else echo 'moq-iroh for Windows skipped: zig is needed for its C parts (ghostty-agent.exe builds without netlab)'
+    fi
+  fi
+  if [[ ${#moq_targets[@]} -gt 0 ]]; then
+    [[ "$(cat "$V/moq-iroh/.pinned" 2>/dev/null)" == "$MOQ_IROH_COMMIT" ]] || rm -rf "$V/moq-iroh"
+    "$ROOT/tools/build-moq-iroh.sh" "${moq_targets[@]}"
+  fi
+  fi # NETLAB_SOURCE_ONLY
 fi
-[[ -f "$V/moq-iroh/.pinned" ]] && echo "moq-iroh @ $(cut -c1-9 "$V/moq-iroh/.pinned")"
+[[ -f "$V/moq-iroh/.pinned" ]] && echo "moq-iroh @ $(cut -c1-9 "$V/moq-iroh/.pinned")$([[ -f "$V/moq-iroh/x86_64-pc-windows-gnu/libmoq_iroh.a" ]] && echo ' (+ windows)')"
 
 if [[ "$MODE" == agent ]]; then
   echo 'agent: the Nelua compiler and the WireGuard sources are all tools/build-agent.sh needs'

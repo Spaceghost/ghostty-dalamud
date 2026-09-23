@@ -23,6 +23,16 @@ if [[ "$(uname -s)" == Linux && "${SKIP_NETLAB:-0}" != 1 && -z "${SAN:-}" &&
   NETLAB_CFLAGS="-I\"$ROOT/vendor/moq-iroh\" -L\"$ROOT/vendor/moq-iroh\" -Wl,--gc-sections"
   echo "note: netlab (moq over iroh) from vendor/moq-iroh"
 fi
+# The Windows agent (tools/build.sh, ghostty-agent.exe) links the same library
+# built for x86_64-pc-windows-gnu (tools/build-moq-iroh.sh windows) when it is
+# there: NETLAB_WIN_DEFINE and NETLAB_WIN_CFLAGS, used with tools/zig-cc-win.sh.
+NETLAB_WIN_DEFINE=()
+NETLAB_WIN_CFLAGS=""
+if [[ "${SKIP_NETLAB:-0}" != 1 && -z "${SAN:-}" &&
+      -f "$ROOT/vendor/moq-iroh/x86_64-pc-windows-gnu/libmoq_iroh.a" ]]; then
+  NETLAB_WIN_DEFINE=(-D NETLAB)
+  NETLAB_WIN_CFLAGS="-I\"$ROOT/vendor/moq-iroh\" -L\"$ROOT/vendor/moq-iroh/x86_64-pc-windows-gnu\" -Wl,--gc-sections"
+fi
 AGENT_NELUA=("${WAYLAND_DEFINE[@]}" "${NETLAB_DEFINE[@]}")
 if [[ -n "${WAYLAND_CFLAGS}${NETLAB_CFLAGS}" ]]; then
   AGENT_NELUA+=("--cflags=${WAYLAND_CFLAGS} ${NETLAB_CFLAGS}")

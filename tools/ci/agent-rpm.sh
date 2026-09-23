@@ -112,6 +112,12 @@ if rpm -qp --requires "$FC43" | grep -qE 'wlroots|wayland|xkbcommon|pixman'; the
 fi
 for r in "$FC44" "$FC43"; do
   rpm -qpl "$r" | grep -qx '/usr/bin/ghostty-agent' || die "$r does not carry /usr/bin/ghostty-agent"
+  if [[ "${SKIP_NETLAB:-0}" != 1 ]]; then
+    # the spec already checked the symbol before stripping; this is the shipped
+    # bytes: moq-iroh-c's source paths are remapped to moq-iroh-src/ in its panics
+    rpm2cpio "$r" | cpio -i --quiet --to-stdout ./usr/bin/ghostty-agent | grep -aq 'moq-iroh-src/' ||
+      die "$r carries no netlab (moq-iroh-c is not linked in)"
+  fi
   rpm -qpl "$r" | grep -qx '/usr/lib/systemd/user/ghostty-agent.service' || die "$r does not carry the user unit"
 done
 
@@ -147,6 +153,7 @@ log "glibc needed: $GLIBC_NEED (highest symbol version $GLIBC_SYM, ceiling $AGEN
   echo "glibc at build time: $(ldd --version 2>/dev/null | head -n1)"
   echo "glibc needed to run this: $GLIBC_NEED or newer (measured)"
   echo "wayland compositor backend: no"
+  echo "netlab (moq over iroh): $(if grep -aq 'moq-iroh-src/' "$STAGE/$TARNAME/ghostty-agent"; then echo yes; else echo no; fi)"
   echo "sha256: $(sha256sum "$STAGE/$TARNAME/ghostty-agent" | cut -d' ' -f1)"
   echo "source: https://github.com/Spaceghost/ghostty-dalamud/tree/${RELEASE_TAG:-$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || echo master)}"
 } >"$STAGE/$TARNAME/BUILD-INFO.txt"

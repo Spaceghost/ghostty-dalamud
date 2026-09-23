@@ -1,26 +1,31 @@
 #!/usr/bin/env bash
 # Pack the agent's own source: everything tools/build-agent.sh compiles, the
-# pinned Nelua compiler, and the RPM spec at the tree root, so
-# `rpmbuild -tb ghostty-agent-<version>-src.tar.gz` builds a package offline.
+# pinned Nelua compiler, netlab's offline Rust workspace (vendor/moq-iroh-src:
+# moq-iroh-c and every crate it builds from), and the RPM spec at the tree root,
+# so `rpmbuild -tb ghostty-agent-<version>-src.tar.gz` builds a package offline.
 #
 #   tools/package-agent.sh [--version V] [--out DIR]
 #
 # Output, under build/dist by default (<version> is AssemblyVersion from
 # shim/GhosttyDalamud/GhosttyDalamud.json):
 #   ghostty-agent-<version>-src.tar.gz   the agent's sources, vendor/nelua-lang
-#                                        at the pinned commit, and the spec
+#                                        at the pinned commit, vendor/moq-iroh-src,
+#                                        and the spec
+#
+# SKIP_NETLAB=1 packs without vendor/moq-iroh-src; the spec must then be built
+# `--without netlab`.
 #
 # Environment:
 #   SOURCE_DATE_EPOCH   file times in the tarball (default: the last commit's time)
 #
-# Exit codes: 0 done, 1 an input is missing, 2 bad argument, 127 GNU tar or gzip missing.
+# Exit codes: 0 done, 1 an input is missing, 2 bad argument, 127 GNU tar, gzip or python3 missing.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 # shellcheck disable=SC1091
 source "$ROOT/toolchain.env"
 
-usage() { sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; }
 
 VERSION=""
 OUT="build/dist"
@@ -35,6 +40,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 command -v gzip >/dev/null || { echo "error: gzip is required" >&2; exit 127; }
+command -v python3 >/dev/null || { echo "error: python3 is required" >&2; exit 127; }
 tar --version | head -n1 | grep -q GNU || { echo "error: GNU tar is required" >&2; exit 127; }
 
 if [[ -z "$VERSION" ]]; then
@@ -67,8 +73,9 @@ mkdir -p "$DST" "$OUT"
 while IFS= read -r -d '' f; do
   mkdir -p "$DST/$(dirname "$f")"
   cp -p "$f" "$DST/$f"
-done < <(git ls-files -z -- agent core compat \
+done < <(git ls-files -z -- agent core compat toolchain.env \
   tools/build-agent.sh tools/build-common.sh tools/wayland-flags.sh tools/zig-cc.sh \
+  tools/netlab-flags.sh tools/build-moq-iroh.sh tools/rust-toolchain.sh \
   packaging/ghostty-agent.service packaging/README-agent.md packaging/ghostty-agent.1)
 
 # git archive emits tracked files only, so a host-built nelua-lua never travels:
@@ -90,6 +97,30 @@ for dep in monocypher:MONOCYPHER_SHA256 lwip:LWIP_SHA256 qrcodegen:QRCODEGEN_C_S
   mkdir -p "$DST/vendor/$dir"
   cp -pR "vendor/$dir/." "$DST/vendor/$dir/"
 done
+# netlab's Rust, offline: the cut-down workspace and its vendored crates, never
+# a target/ directory. It is not in git (vendor/ is ignored), so its .pinned is
+# what says it is the one toolchain.env names.
+if [[ "${SKIP_NETLAB:-0}" != 1 ]]; then
+  MOQ="vendor/moq-iroh-src"
+  [[ -f "$MOQ/.pinned" && "$(cut -d' ' -f1 "$MOQ/.pinned")" == "$MOQ_IROH_COMMIT" ]] || {
+    echo "error: $MOQ is missing or not at $MOQ_IROH_COMMIT; run tools/fetch-vendor.sh agent (or SKIP_NETLAB=1)" >&2
+    exit 1
+  }
+  if [[ -n "${MOQ_IROH_LOCK_SHA256:-}" && "$(cut -d' ' -f2 "$MOQ/.pinned")" != "$MOQ_IROH_LOCK_SHA256" ]]; then
+    echo "error: $MOQ/Cargo.lock is not the one toolchain.env pins; run tools/fetch-vendor.sh agent" >&2
+    exit 1
+  fi
+  mkdir -p "$DST/$MOQ"
+  tar -C "$MOQ" --exclude=./target -cf - . | tar -x -C "$DST/$MOQ"
+  # This tarball only ever builds for Linux: the crates only the Windows
+  # library needs (the windows crate, winapi's import libraries) become stubs
+  # here too, the way tools/moq-vendor.sh already stubbed the other platforms'.
+  [[ -f "$MOQ/.keep-x86_64-unknown-linux-gnu" ]] || {
+    echo "error: $MOQ has no .keep-x86_64-unknown-linux-gnu; run tools/fetch-vendor.sh agent again" >&2
+    exit 1
+  }
+  python3 tools/moq_vendor.py stub "$DST/$MOQ/vendor" "$MOQ/.keep-x86_64-unknown-linux-gnu"
+fi
 
 cp -p packaging/ghostty-agent.spec "$DST/ghostty-agent.spec"
 cp -p packaging/README-agent.md "$DST/README-agent.md"
@@ -105,7 +136,9 @@ if find "$DST" -name .git -print -quit | grep -q .; then
   echo "error: a .git directory is in the tarball" >&2
   exit 1
 fi
-if find "$DST" \( -name '*.o' -o -name '*.a' \) -print -quit | grep -q .; then
+# Crates ship prebuilt import libraries (windows-sys and friends) that cargo
+# checks by sha256 against the lock; those are sources here, not our objects.
+if find "$DST" -path "$DST/vendor/moq-iroh-src/vendor" -prune -o \( -name '*.o' -o -name '*.a' \) -print -quit | grep -q .; then
   echo "error: object files are in the tarball" >&2
   exit 1
 fi

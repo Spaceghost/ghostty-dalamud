@@ -14,8 +14,9 @@ Tests); not yet seen in game.
 ## Seeing it in game
 
 1. Build the agent with netlab (`tools/fetch-vendor.sh` builds
-   `vendor/moq-iroh` when cargo is there; `tools/build-agent.sh` then says
-   `netlab: yes`) and restart it where your shells run.
+   `vendor/moq-iroh`, fetching the pinned Rust when the host has none;
+   `tools/build-agent.sh` then says `netlab: yes`), or install a release
+   package, which all carry it, and restart it where your shells run.
 2. `/netlab demo run:foot` (or any `/term window` match: a title, `run:CMD`,
    `app:NAME`). The panel opens; the relay pill turns amber once your
    endpoint has a home relay, the two viewers dial through it, and within a
@@ -133,9 +134,38 @@ becomes readable, the agent drains.
 | `moqi_last_error(buf, cap)` | why the last call failed |
 
 The agent links it statically (`agent/moqi.nelua`, `<cimport>` of
-`moq_iroh.h`). `tools/fetch-vendor.sh` builds it from the commit pinned in
-`toolchain.env` with cargo into `vendor/moq-iroh`; without it (no cargo, or
-`SKIP_NETLAB=1`) the agent builds without netlab and says so when asked.
+`moq_iroh.h`). Without it (`SKIP_NETLAB=1`, or a build that never fetched it)
+the agent builds without netlab and says so when asked.
+
+### Building it offline
+
+`tools/fetch-vendor.sh` does three things, and only the first needs the network:
+
+1. `tools/moq-vendor.sh` checks the fork out at `MOQ_IROH_COMMIT`, cuts the
+   workspace down to `rs/moq-iroh-c` and the crates it reaches by path, drops
+   every lock entry nothing there uses (proving no version moved), and
+   `cargo vendor`s the rest into `vendor/moq-iroh-src`. Crates that neither the
+   Linux nor the Windows build compiles (i686, ARM and MSVC import libraries,
+   wasm) stay as empty stubs, so the tree is tens of megabytes, not 800. The cut
+   lock's sha256 is `MOQ_IROH_LOCK_SHA256`, and cargo checks every crate against
+   the lock.
+2. `tools/rust-toolchain.sh` provides Rust `RUST_VERSION` (the fork's
+   `rust-toolchain.toml`): the standalone rustc, cargo and rust-std components
+   from static.rust-lang.org, each checked against its sha256 in
+   `toolchain.env`. No rustup.
+3. `tools/build-moq-iroh.sh linux [windows]` builds `libmoq_iroh.a` with
+   `--offline --locked`: fat LTO, one codegen unit, `panic=abort`, source paths
+   remapped to `moq-iroh-src/`. The Windows library (for `ghostty-agent.exe`,
+   which Zig links for `x86_64-windows-gnu`) is cross-built for
+   `x86_64-pc-windows-gnu`, with the pinned Zig compiling the C inside it
+   (aws-lc, ring). `NETLAB_WINDOWS=1` asks `fetch-vendor.sh` for it, and
+   `tools/ci/run.sh` sets that whenever Windows is built.
+
+The agent's source tarball (`tools/package-agent.sh`) carries
+`vendor/moq-iroh-src`, and the spec builds the library from it with the
+distribution's own rust and cargo (`RUST_SYSTEM=1`, at least
+`RUST_MIN_VERSION`). So `rpmbuild -tb` needs no network, and neither does mock
+or COPR. `--without netlab` leaves it out.
 
 ## Agent protocol (additive)
 
