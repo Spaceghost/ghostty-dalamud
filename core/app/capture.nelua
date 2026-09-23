@@ -86,7 +86,6 @@ local Clip = @record{
   req: uint32,
   cid: uint32,
   w: integer, h: integer,   -- the size frames are sent at
-  factor: integer,          -- downscale factor the first frame settled on
   started: float64,
   next_at: float64,
   asked_at: float64,
@@ -453,13 +452,13 @@ local function clip_send_frame(): void
   local w, h = (@integer)(capture.w), (@integer)(capture.h)
   local src = (@*[0]uint8)(&capture.pixels[0])
   local stride = (@usize)(capture.w) * 4
-  local f, sw, sh = wincodec_downscale(src, stride, w, h, CLIP_MAX_W, CLIP_MAX_H, &clip_small)
+  local scaled, sw, sh = wincodec_downscale_fit(src, stride, w, h, CLIP_MAX_W, CLIP_MAX_H, &clip_small)
   local fsrc, fstride = src, stride
-  if f > 1 then
+  if scaled then
     fsrc = (@*[0]uint8)(&clip_small[0])
     fstride = (@usize)(sw) * 4
   end
-  if clip.w == 0 then clip.w, clip.h, clip.factor = sw, sh, f end
+  if clip.w == 0 then clip.w, clip.h = sw, sh end
   if sw ~= clip.w or sh ~= clip.h then
     -- the frame changed size mid-clip (a resolution change): ffmpeg was told
     -- one size and must not be sent another, so the clip ends here
@@ -496,9 +495,9 @@ local function clip_tick(now: float64): void
       return
     end
     if st == CaptureState.Ready then
-      local f, sw, sh = wincodec_downscale((@*[0]uint8)(&capture.pixels[0]), (@usize)(capture.w) * 4,
+      local _, sw, sh = wincodec_downscale_fit((@*[0]uint8)(&capture.pixels[0]), (@usize)(capture.w) * 4,
         (@integer)(capture.w), (@integer)(capture.h), CLIP_MAX_W, CLIP_MAX_H, &clip_small)
-      clip.w, clip.h, clip.factor = sw, sh, f
+      clip.w, clip.h = sw, sh
       clip.req = clip.req + 1
       if clip.req == 0 then clip.req = 1 end
       if not host.local_agent.client:copen(clip.req, clip.kind, (@uint16)(sw), (@uint16)(sh), (@uint8)(clip.fps)) then
