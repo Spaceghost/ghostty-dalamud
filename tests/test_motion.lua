@@ -223,6 +223,7 @@ end
 
 -- lua/world.lua's pets in a fake game ---------------------------------------------------------------
 local player = { x = 0, y = 0, z = 0, rotation = 0, entity_id = 7 }
+local chars = nil -- characters near you (ghostty.nearby_characters)
 local target = nil
 -- the camera behind you, looking the way you face, as it follows a running character
 local cam = { 0, -0.2, 1 }
@@ -243,6 +244,19 @@ ghostty = {
   env = function() return nil end,
   set_rotation = function() end,
   raycast = raycast,
+  -- characters near you: nil until a test puts some there (then the
+  -- fallback, your target, is not used)
+  nearby_characters = function(buf)
+    if not chars then return nil end
+    buf = buf or {}
+    buf.n = #chars
+    for i, c in ipairs(chars) do
+      local e = buf[i] or {}
+      buf[i] = e
+      e.x, e.y, e.z, e.r, e.id = c.x, 0, c.z, 0.5, c.id
+    end
+    return buf
+  end,
 }
 
 local W = dofile('lua/world.lua')
@@ -386,8 +400,9 @@ do
   print('pillar between the old rays OK')
 end
 
--- 2c. Walking past a pillar: the pet's face would sweep through it. It is
---     never seen inside it, not for one frame.
+-- 2c. Walking past a pillar: the pet's face would sweep through it. It
+--     shuffles round it along a clear line instead, never seen inside it, not
+--     for one frame, and without a blink.
 do
   fresh(1)
   boxes = {}
@@ -400,14 +415,16 @@ do
     assert(not seen_inside(ids[1]), 'never seen in the pillar while walking past it')
   end)
   run(2, 1 / 60, nil, nil, function() assert(not seen_inside(ids[1]), 'never in it') end)
-  assert(shown(ids[1]), 'shown again once past')
+  assert(shown(ids[1]), 'shown once past')
+  assert((W.anchors[ids[1]].m_blinks or 0) == 0, 'round the pillar by a short clear shuffle, not a blink')
   player.x, player.z = 0, 0
-  print('walking past a pillar OK, blinks', W.anchors[ids[1]].m_blinks or 0)
+  print('walking past a pillar OK')
 end
 
 -- 2d. Through a doorway: you walk through, your pets on either side would
---     float through the wall. They blink out on this side and back in on the
---     other, never seen in the wall; they never slide through it.
+--     float through the wall, which is too thick and too tall to squeeze,
+--     shuffle or float past. They blink out on this side and back in on the
+--     other (the last resort), never seen in the wall.
 do
   fresh(2)
   boxes = {}
@@ -432,6 +449,101 @@ do
   end
   player.x, player.z = 0, 0
   print('doorway OK')
+end
+
+-- 2e. A tight gap: a low lintel over the pet's way, with a ceiling above it,
+--     so it can neither pass under it at its size nor float over. It squeezes
+--     smaller, slips under and springs back to size, without a blink and
+--     without touching anything.
+do
+  fresh(1)
+  boxes = {}
+  player.x, player.z, player.rotation = 0, 0, 0
+  run(3, 1 / 60)
+  local o = outs[ids[1]]
+  local top = o.y + o.height / o.pixels_per_yalm / 2
+  boxes = {
+    { o.x - 0.7, top - 0.3, 2.8, o.x + 0.7, top + 0.1, 3.4 },   -- the lintel: its top 0.3 yalms would hit
+    { o.x - 0.7, top + 0.45, 2.8, o.x + 0.7, top + 0.8, 3.4 },  -- a ceiling just above
+  }
+  local smallest = 1
+  run(3, 1 / 60, nil, nil, function()
+    if player.z < 5 then player.z = player.z + 2 / 60 end
+    assert(not seen_inside(ids[1]), 'never seen in the lintel')
+    smallest = math.min(smallest, W.anchors[ids[1]].m_sqz or 1)
+  end)
+  run(2, 1 / 60)
+  local a = W.anchors[ids[1]]
+  print('tight gap: smallest', smallest, 'blinks', a.m_blinks or 0, 'z', outs[ids[1]].z)
+  assert((a.m_blinks or 0) == 0, 'a tight gap: squeezed through, no blink')
+  assert(smallest < 0.8, 'it squeezed smaller')
+  assert(outs[ids[1]].z > 3.4 and math.abs((a.m_sqz or 1) - 1) < 0.05, 'through, and back to its size')
+  player.x, player.z = 0, 0
+end
+
+-- 2f. A low crate in the pet's way: it floats up and over it (no blink, never
+--     in it) and comes back down once past.
+do
+  fresh(1)
+  boxes = {}
+  player.x, player.z, player.rotation = 0, 0, 0
+  run(3, 1 / 60)
+  local o = outs[ids[1]]
+  local base_y = o.y
+  local bottom = o.y - o.height / o.pixels_per_yalm / 2
+  boxes = { { o.x - 0.6, -1, 2.8, o.x + 0.6, bottom + 0.35, 3.4 } } -- 0.35 higher than its bottom edge
+  local highest = base_y
+  run(3.5, 1 / 60, nil, nil, function()
+    if player.z < 5 then player.z = player.z + 2 / 60 end
+    assert(not seen_inside(ids[1]), 'never seen in the crate')
+    highest = math.max(highest, outs[ids[1]].y)
+  end)
+  local land = 0
+  run(3, 1 / 60, nil, nil, function() land = math.max(land, math.abs(outs[ids[1]].squash)) end)
+  print('landing squash', land)
+  assert(land <= 0.04 + 1e-9, 'a landing squashes no more than 4 %')
+  local a = W.anchors[ids[1]]
+  print('low crate: rose', highest - base_y, 'blinks', a.m_blinks or 0, 'z', outs[ids[1]].z, 'now', outs[ids[1]].y - base_y)
+  assert((a.m_blinks or 0) == 0, 'a low crate: floated over, no blink')
+  assert(highest - base_y > 0.3, 'it rose over the crate')
+  assert(outs[ids[1]].z > 3.4 and math.abs(outs[ids[1]].y - base_y) < 0.1, 'past it, and back down')
+  player.x, player.z = 0, 0
+end
+
+-- 2g. Characters: someone walking through a pet's place is let pass (the pet
+--     does not dodge), someone who stays in it for a couple of seconds gets
+--     room, and once they have gone the pet goes back.
+do
+  fresh(1)
+  boxes = {}
+  player.x, player.z, player.rotation = 0, 0, 0
+  run(3, 1 / 60)
+  local o = outs[ids[1]]
+  local rest_x, rest_z = o.x, o.z
+  chars = { { x = o.x - 3, z = o.z, id = 900 } }
+  local moved = 0
+  run(2, 1 / 60, nil, nil, function()
+    chars[1].x = chars[1].x + 3 / 60 -- walking straight through it at a walk
+    local q = outs[ids[1]]
+    moved = math.max(moved, math.sqrt((q.x - rest_x) ^ 2 + (q.z - rest_z) ^ 2))
+  end)
+  assert(moved < 0.05, 'a passer-by is let pass: moved ' .. moved)
+  -- someone stands in its place
+  chars[1].x, chars[1].z = rest_x, rest_z
+  run(0.8, 1 / 60)
+  local q = outs[ids[1]]
+  assert(math.sqrt((q.x - rest_x) ^ 2 + (q.z - rest_z) ^ 2) < 0.05, 'not at once: they may be passing')
+  run(2.2, 1 / 60)
+  q = outs[ids[1]]
+  local ax, az, bx, bz = motion.footprint(q.x, q.z, q.yaw, q.width / q.pixels_per_yalm / 2, q.curve)
+  local d = motion.point_seg(chars[1].x, chars[1].z, ax, az, bx, bz)
+  assert(d >= W.pet.collide.body, 'someone who stays gets room: ' .. d)
+  chars = {}
+  run(3, 1 / 60)
+  q = outs[ids[1]]
+  assert(math.sqrt((q.x - rest_x) ^ 2 + (q.z - rest_z) ^ 2) < 0.1, 'and it goes back once they have gone')
+  chars = nil
+  print('characters OK')
 end
 
 -- 3. A ledge under the pet's slot: it floats up over it rather than into it.
@@ -537,20 +649,38 @@ do
     rolls[#rolls + 1] = outs[ids[1]].roll
   end)
   local function spread_of(t) local lo, hi = math.huge, -math.huge for _, v in ipairs(t) do lo, hi = math.min(lo, v), math.max(hi, v) end return hi - lo end
-  assert(spread_of(ys[1]) > 0.02 and spread_of(ys[1]) < 0.2, 'a gentle bob: ' .. spread_of(ys[1]))
+  assert(spread_of(ys[1]) > 0.01 and spread_of(ys[1]) <= 0.045, 'a gentle bob, 2 cm at most each way: ' .. spread_of(ys[1]))
   local same = 0
   for k = 2, #ys[1] do
     if (ys[1][k] - ys[1][k - 1]) * (ys[2][k] - ys[2][k - 1]) > 0 then same = same + 1 end
   end
   assert(same < #ys[1] * 0.85, 'not in lockstep')
-  assert(math.abs(outs[ids[3]].roll) > 0.01, 'a stacked pet fans out')
+  assert(math.abs(outs[ids[3]].roll) > 0.004, 'a stacked pet fans out, a little')
   assert(spread_of(rolls) > 0.001, 'an idle sway')
-  for _, id in ipairs(ids) do assert(math.abs(outs[id].roll) < 0.25 and math.abs(outs[id].squash) <= 0.14, 'small tilts and squashes') end
+  for _, id in ipairs(ids) do assert(math.abs(outs[id].roll) <= 0.0351 and math.abs(outs[id].squash) <= 0.04 + 1e-9, 'tilts under 2 degrees, squashes under 4 %') end
   -- the focused pet holds still and straight
   run(3, 1 / 60, ids[2])
   local fy = {}
   run(2, 1 / 60, ids[2], nil, function() fy[#fy + 1] = outs[ids[2]].y end)
-  assert(spread_of(fy) < 0.02 and math.abs(outs[ids[2]].roll) < 0.005, 'focused: still and straight')
+  assert(spread_of(fy) < 1e-3 and math.abs(outs[ids[2]].roll) < 1e-3 and outs[ids[2]].squash == 0, 'focused: still and straight')
+  -- pointed at (the core passes `held`): the same, so its text can be read
+  do
+    local id = ids[1]
+    local hy, hr, hs = {}, 0, 0
+    for _ = 1, 60 do frame(1 / 60) end
+    for _ = 1, 120 do
+      clock = clock + 1 / 60
+      for _, other in ipairs(ids) do outs[other] = W.place(other, clock, false, other == id) end
+      hy[#hy + 1] = outs[id].y
+      hr, hs = math.max(hr, math.abs(outs[id].roll)), math.max(hs, math.abs(outs[id].squash))
+    end
+    local tail = {}
+    for k = 60, #hy do tail[#tail + 1] = hy[k] end
+    assert(spread_of(tail) < 1e-3 and hr < 0.036 and hs <= 0.04, 'pointed at: held still')
+    local _, lr = nil, 0
+    lr = math.abs(outs[id].roll)
+    assert(lr < 1e-3 and outs[id].squash == 0, 'pointed at: straight, unsquashed')
+  end
   -- a run that stops: they lean, settle with a squash, and trail like a
   -- procession: with follow.stagger the third pet (softer on its spring) falls
   -- further behind the first than it does without it
@@ -583,8 +713,8 @@ do
   local lag, peak_sq, peak_lean = run_and_stop(0.08)
   print('trailing along x without and with stagger: first', lag0[1], lag[1], 'third', lag0[3], lag[3])
   assert(lag[3] - lag[1] > lag0[3] - lag0[1] + 0.05, 'a procession: the third trails further behind the first')
-  assert(peak_sq > 0.005, 'a stop settles with a squash: ' .. peak_sq)
-  assert(peak_lean > 0.02, 'they bank as they swing after you: ' .. peak_lean)
+  assert(peak_sq <= 0.04 + 1e-9, 'stops do not squash (bumps and landings only), and never past 4 %: ' .. peak_sq)
+  assert(peak_lean > 0.004 and peak_lean <= 0.036, 'a slight bank as they swing after you: ' .. peak_lean)
   -- reduce: no bob, sway, tilt or squash
   W.motion.reduce = true
   run(4, 1 / 60)
@@ -610,12 +740,37 @@ do
         assert(math.abs(o.x - player.x) < 12 and math.abs(o.z - player.z) < 12 and math.abs(o.y) < 8, 'bounded')
         local a = W.anchors[id]
         assert(math.abs(a.x_v or 0) < 40 and math.abs(a.z_v or 0) < 40, 'no runaway speed')
-        assert(math.abs(o.squash) <= 0.14 and math.abs(o.roll) < 0.4, 'no runaway wobble')
+        assert(math.abs(o.squash) <= 0.04 + 1e-9 and math.abs(o.roll) <= 0.036, 'no runaway wobble')
       end
     end)
   end
   player.x, player.z, player.rotation = 0, 0, 0
   print('motion OK')
+end
+
+-- 6b. Calm, not flubbery: a step change (you appear a yalm to the side) is
+--     followed without overshooting by more than 2 %, and so is the spring on
+--     its own with the default damping.
+do
+  local x, v, peak = 0, 0, 0
+  for _ = 1, 600 do
+    x, v = motion.step(x, v, 1, 1 / 60, W.pet.stiffness, W.pet.damping)
+    peak = math.max(peak, x)
+  end
+  assert(peak <= 1.02, 'the default spring overshoots under 2 %: ' .. peak)
+  fresh(1)
+  boxes = {}
+  player.x, player.z, player.rotation = 0, 0, 0
+  run(4, 1 / 60)
+  local x0 = outs[ids[1]].x
+  player.x = 1
+  local most = -math.huge
+  run(4, 1 / 60, nil, nil, function() most = math.max(most, outs[ids[1]].x - x0) end)
+  local final = outs[ids[1]].x - x0
+  print('a 1 yalm step: went', most, 'settled', final)
+  assert(math.abs(final - 1) < 0.02 and most <= final + 0.02, 'no overshoot past 2 % on a step: ' .. most)
+  player.x = 0
+  print('calm OK')
 end
 
 -- 7. Rays per frame stay within the budget, and placing makes no garbage.

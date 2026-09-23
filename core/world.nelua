@@ -25,6 +25,14 @@ global GuObject = @record{
   mounted: cint,
 }
 
+-- A character near yours (GuHostApi.nearby_characters). Layout must match
+-- GuCharacter in shim/Native.cs.
+global GuCharacter = @record{
+  x: float32, y: float32, z: float32,
+  radius: float32,        -- hitbox radius in yalms
+  entity_id: uint64,
+}
+
 -- A character in screen space: a capsule from feet to head, and its depth.
 -- Panel pixels farther away than the character inside the capsule are faded
 -- out, so the character is never drawn behind a panel it stands in front of.

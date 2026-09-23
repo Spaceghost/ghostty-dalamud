@@ -120,6 +120,10 @@ global GuHostApi = @record{
   -- 1 while the game has the character inside a housing interior; nilptr in
   -- older shims: the collision rays alone decide (core/app/rain.nelua)
   indoor: function(): cint,
+  -- characters near yours (players, NPCs, chocobos; not you), nearest first,
+  -- at most `cap`: how many were written. nilptr in older shims: pets make
+  -- room for your target only (lua/world.lua)
+  nearby_characters: function(out: *[0]GuCharacter, cap: cint): cint,
 }
 
 global LOG_INFO: cint <comptime> = 1
@@ -176,6 +180,8 @@ global Host = @record{
   -- terminals pinned into the game world (placement from lua/world.lua)
   world: vector(*Session),
   world_focus: integer,             -- session id with keyboard focus, 0 = none
+  world_hover: integer,             -- world panel under the pointer last frame (held still to be read), 0 = none
+  world_hover_now: integer,         -- the same, being found this frame
   world_visible: boolean,           -- world/pet terminals shown (own toggle)
   -- mouse resize of a world panel (core/app/resize.nelua): its id, 0 none; the mode is WORLD_GRIP_* bits
   world_drag_id: integer,
