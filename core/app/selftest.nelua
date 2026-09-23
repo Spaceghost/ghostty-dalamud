@@ -29,7 +29,8 @@ local SUITE_THEMES <comptime> = 5
 local SUITE_BELL <comptime> = 6
 local SUITE_AGENT <comptime> = 7
 local SUITE_NATIVE <comptime> = 8
-local SUITE_LOADER <comptime> = 9
+local SUITE_NETLAB <comptime> = 9
+local SUITE_LOADER <comptime> = 10
 
 local AGENT_OUTPUT_MS: uint64 <comptime> = 10000   -- the marker must show up within this
 local AGENT_EXIT_MS: uint64 <comptime> = 5000
@@ -1234,7 +1235,7 @@ global function selftest_tick(in_world: boolean): void
   elseif i == SUITE_TERMINAL then suite_terminal()
   elseif i == SUITE_RENDER then suite_render()
   elseif i == SUITE_WORLD then suite_world(in_world)
-  elseif i == SUITE_SETTINGS or i == SUITE_THEMES or i == SUITE_BELL then suite_lua(i)
+  elseif i == SUITE_SETTINGS or i == SUITE_THEMES or i == SUITE_BELL or i == SUITE_NETLAB then suite_lua(i)
   elseif i == SUITE_AGENT then done = suite_agent()
   elseif i == SUITE_NATIVE then done = suite_native()
   elseif i == SUITE_LOADER then done = suite_loader()

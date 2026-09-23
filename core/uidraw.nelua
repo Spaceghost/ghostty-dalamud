@@ -1,0 +1,207 @@
+-- Drawing for Lua (ghostty.ui.*, next to core/ui.nelua's widgets): shapes and
+-- text on the current window's draw list, in screen pixels, for panels whose
+-- look Lua decides (lua/netlab.lua first). Only valid while the core is
+-- drawing a window. Colours are ImGui's packed ABGR integers: ui.color(name,
+-- alpha) gives the theme's (core/theme.nelua, CHROME_COLOR_KEYS), ui.rgba(r,
+-- g, b, a) any other.
+--
+--   ui.canvas(id, w, h)                 -> x, y, hovered, clicked, mouse_x, mouse_y
+--   ui.line(x1, y1, x2, y2, col[, thickness])
+--   ui.rect(x0, y0, x1, y1, col[, rounding])            filled
+--   ui.frame(x0, y0, x1, y1, col[, rounding, thickness]) outline
+--   ui.circle(x, y, r, col)                             filled
+--   ui.ring(x, y, r, col[, thickness])                  outline
+--   ui.poly({x1, y1, x2, y2, ...}, col[, thickness])    open polyline
+--   ui.text_at(x, y, text, col[, scale])
+--   ui.text_size(text[, scale])         -> w, h
+--   ui.clip(x0, y0, x1, y1) / ui.unclip()
+--   ui.color(name[, alpha]), ui.rgba(r, g, b[, a])
+--   ui.copy(text)                       onto the clipboard
+require 'core.lua'
+require 'core.imgui'
+require 'core.theme'
+require 'string'
+
+local UIDRAW_POLY_MAX <comptime> = 256
+
+-- Clip rectangles pushed and not yet popped: a Lua error between ui.clip and
+-- ui.unclip must not leave the window's clip stack unbalanced.
+local clips: integer = 0
+
+local function num(L: *lua_State, idx: cint, default: float32): float32
+  if lua_type(L, idx) == LUA_TNUMBER then return (@float32)(lua_tonumberx(L, idx, nilptr)) end
+  return default
+end
+
+local function col(L: *lua_State, idx: cint): uint32
+  return (@uint32)(lua_tointegerx(L, idx, nilptr) & 0xffffffff)
+end
+
+local function drawing(): boolean
+  return imgui.GetWindowDrawList ~= nilptr and imgui.DrawListAddLine ~= nilptr
+end
+
+-- ui.canvas(id, w, h) -> x, y, hovered, clicked, mouse_x, mouse_y: w x h
+-- reserved at the cursor (an invisible button, so it takes the mouse).
+local function l_canvas(L: *lua_State): cint
+  if not drawing() or imgui.InvisibleButton == nilptr then return 0 end
+  local at: ImVec2
+  imgui.GetCursorScreenPos(&at)
+  local w, h = math.max(num(L, 2, 1), 1), math.max(num(L, 3, 1), 1)
+  local id: cstring = lua_tolstring(L, 1, nilptr)
+  if id == nilptr then id = '##canvas' end
+  local clicked = imgui.InvisibleButton(id, vec2(w, h), 0)
+  local mouse: ImVec2
+  imgui.GetMousePos(&mouse)
+  lua_pushnumber(L, at.x) lua_pushnumber(L, at.y)
+  lua_pushboolean(L, imgui.IsItemHovered(0) and 1 or 0)
+  lua_pushboolean(L, clicked and 1 or 0)
+  lua_pushnumber(L, mouse.x) lua_pushnumber(L, mouse.y)
+  return 6
+end
+
+local function l_line(L: *lua_State): cint
+  if not drawing() then return 0 end
+  imgui.DrawListAddLine(imgui.GetWindowDrawList(), vec2(num(L, 1, 0), num(L, 2, 0)), vec2(num(L, 3, 0), num(L, 4, 0)), col(L, 5), num(L, 6, 1))
+  return 0
+end
+
+local function l_rect(L: *lua_State): cint
+  if not drawing() then return 0 end
+  imgui.DrawListAddRectFilled(imgui.GetWindowDrawList(), vec2(num(L, 1, 0), num(L, 2, 0)), vec2(num(L, 3, 0), num(L, 4, 0)), col(L, 5), num(L, 6, 0), 0)
+  return 0
+end
+
+local function l_frame(L: *lua_State): cint
+  if not drawing() then return 0 end
+  imgui.DrawListAddRect(imgui.GetWindowDrawList(), vec2(num(L, 1, 0), num(L, 2, 0)), vec2(num(L, 3, 0), num(L, 4, 0)), col(L, 5), num(L, 6, 0), 0, num(L, 7, 1))
+  return 0
+end
+
+local function l_circle(L: *lua_State): cint
+  if not drawing() then return 0 end
+  imgui.DrawListAddCircleFilled(imgui.GetWindowDrawList(), vec2(num(L, 1, 0), num(L, 2, 0)), num(L, 3, 1), col(L, 4), 0)
+  return 0
+end
+
+local function l_ring(L: *lua_State): cint
+  if not drawing() then return 0 end
+  imgui.DrawListAddCircle(imgui.GetWindowDrawList(), vec2(num(L, 1, 0), num(L, 2, 0)), num(L, 3, 1), col(L, 4), 0, num(L, 5, 1))
+  return 0
+end
+
+local function l_poly(L: *lua_State): cint
+  if not drawing() or lua_type(L, 1) ~= LUA_TTABLE then return 0 end
+  local pts: [UIDRAW_POLY_MAX]ImVec2
+  local n = (@integer)(lua_rawlen(L, 1)) // 2
+  if n > UIDRAW_POLY_MAX then n = UIDRAW_POLY_MAX end
+  if n < 2 then return 0 end
+  for i = 0, < n do
+    lua_rawgeti(L, 1, i * 2 + 1)
+    lua_rawgeti(L, 1, i * 2 + 2)
+    pts[i] = vec2((@float32)(lua_tonumberx(L, -2, nilptr)), (@float32)(lua_tonumberx(L, -1, nilptr)))
+    lua_pop(L, 2)
+  end
+  imgui.DrawListAddPolyline(imgui.GetWindowDrawList(), &pts[0], (@cint)(n), col(L, 2), 0, num(L, 3, 1))
+  return 0
+end
+
+local function l_text_at(L: *lua_State): cint
+  if not drawing() then return 0 end
+  local len: usize = 0
+  local p = lua_tolstring(L, 3, &len)
+  if p == nilptr or len == 0 then return 0 end
+  local size = imgui.GetFontSize() * num(L, 5, 1)
+  imgui.DrawListAddText(imgui.GetWindowDrawList(), imgui.GetFont(), size, vec2(num(L, 1, 0), num(L, 2, 0)), col(L, 4),
+    p, (@cstring)(&(@*[0]cchar)(p)[len]), 0, nilptr)
+  return 0
+end
+
+local function l_text_size(L: *lua_State): cint
+  local len: usize = 0
+  local p = lua_tolstring(L, 1, &len)
+  if p == nilptr or imgui.FontCalcTextSizeA == nilptr then
+    lua_pushnumber(L, 0) lua_pushnumber(L, 0)
+    return 2
+  end
+  local sz: ImVec2
+  imgui.FontCalcTextSizeA(&sz, imgui.GetFont(), imgui.GetFontSize() * num(L, 2, 1), 1e9, 0, p, (@cstring)(&(@*[0]cchar)(p)[len]), nilptr)
+  lua_pushnumber(L, sz.x) lua_pushnumber(L, sz.y)
+  return 2
+end
+
+local function l_clip(L: *lua_State): cint
+  if not drawing() then return 0 end
+  imgui.DrawListPushClipRect(imgui.GetWindowDrawList(), vec2(num(L, 1, 0), num(L, 2, 0)), vec2(num(L, 3, 0), num(L, 4, 0)), true)
+  clips = clips + 1
+  return 0
+end
+
+local function l_unclip(L: *lua_State): cint
+  if not drawing() or clips <= 0 then return 0 end
+  imgui.DrawListPopClipRect(imgui.GetWindowDrawList())
+  clips = clips - 1
+  return 0
+end
+
+-- ui.color(name, alpha) -> the theme's colour `name` (CHROME_COLOR_KEYS), accent when unknown.
+local function l_color(L: *lua_State): cint
+  local name: cstring = lua_tolstring(L, 1, nilptr)
+  local a = (@uint8)(math.clamp((@integer)(num(L, 2, 255)), 0, 255))
+  local which = ChromeColor.Accent
+  if name ~= nilptr then
+    local s = string.copy(name)
+    for i = 0, < CHROME_COLOR_COUNT do
+      if CHROME_COLOR_KEYS[i] == s then which = (@ChromeColor)(i) break end
+    end
+    s:destroy()
+  end
+  lua_pushinteger(L, (@integer)(chrome_col(which, a)))
+  return 1
+end
+
+local function byte(v: float32): uint8 return (@uint8)(math.clamp((@integer)(v), 0, 255)) end
+
+local function l_rgba(L: *lua_State): cint
+  lua_pushinteger(L, (@integer)(im_col32(byte(num(L, 1, 0)), byte(num(L, 2, 0)), byte(num(L, 3, 0)), byte(num(L, 4, 255)))))
+  return 1
+end
+
+-- ui.copy(text): onto the system clipboard (through ImGui, as the game's own copy does).
+local function l_copy(L: *lua_State): cint
+  local p: cstring = lua_tolstring(L, 1, nilptr)
+  if p ~= nilptr and imgui.SetClipboardText ~= nilptr then imgui.SetClipboardText(p) end
+  return 0
+end
+
+-- Pop what a failed draw left pushed; the window is about to end.
+global function uidraw_close(): void
+  while clips > 0 and drawing() do
+    imgui.DrawListPopClipRect(imgui.GetWindowDrawList())
+    clips = clips - 1
+  end
+  clips = 0
+end
+
+-- Adds the drawing calls to ghostty.ui (made by core/world.nelua).
+global function uidraw_lua_register(L: *lua_State): void
+  lua_getglobal(L, 'ghostty')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return end
+  lua_getfield(L, -1, 'ui')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return end
+  lua_pushcclosure(L, l_canvas, 0) lua_setfield(L, -2, 'canvas')
+  lua_pushcclosure(L, l_line, 0) lua_setfield(L, -2, 'line')
+  lua_pushcclosure(L, l_rect, 0) lua_setfield(L, -2, 'rect')
+  lua_pushcclosure(L, l_frame, 0) lua_setfield(L, -2, 'frame')
+  lua_pushcclosure(L, l_circle, 0) lua_setfield(L, -2, 'circle')
+  lua_pushcclosure(L, l_ring, 0) lua_setfield(L, -2, 'ring')
+  lua_pushcclosure(L, l_poly, 0) lua_setfield(L, -2, 'poly')
+  lua_pushcclosure(L, l_text_at, 0) lua_setfield(L, -2, 'text_at')
+  lua_pushcclosure(L, l_text_size, 0) lua_setfield(L, -2, 'text_size')
+  lua_pushcclosure(L, l_clip, 0) lua_setfield(L, -2, 'clip')
+  lua_pushcclosure(L, l_unclip, 0) lua_setfield(L, -2, 'unclip')
+  lua_pushcclosure(L, l_color, 0) lua_setfield(L, -2, 'color')
+  lua_pushcclosure(L, l_rgba, 0) lua_setfield(L, -2, 'rgba')
+  lua_pushcclosure(L, l_copy, 0) lua_setfield(L, -2, 'copy')
+  lua_pop(L, 2)
+end

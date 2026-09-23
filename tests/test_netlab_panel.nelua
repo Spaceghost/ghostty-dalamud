@@ -1,0 +1,258 @@
+-- The netlab panel (docs/NETLAB.md): tests/test_netlab.lua drives
+-- lua/netlab.lua on its own (a scripted ghostty.ui); here the core's side
+-- through the exported host surface: the panel's Lua is loaded with its
+-- calls, /term netlab reaches it, commands go to the agent as NLCTL (and
+-- say why not while no agent is connected), NLREPLY and NLSTAT reach Lua,
+-- NLFRAMEs rebuild the publisher's pictures exactly (a key frame, then
+-- deltas; deltas before any key frame are dropped) and Lua hears of each
+-- object, and shutdown lets the pictures go.
+require 'core.host'
+require 'core.netlab_wire'
+require 'core.wincodec'
+require 'agent.capture' -- capture_test_render
+require 'string'
+require 'io'
+require 'os'
+require 'arg'
+
+local root: string = arg[1]
+
+do
+  local L = luaL_newstate()
+  luaL_openlibs(L)
+  local script = root .. '/tests/test_netlab.lua'
+  if luaL_loadfilex(L, (@cstring)(script.data), nilptr) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_pushlstring(L, (@cstring)(root.data), root.size)
+  if lua_pcall(L, 1, 0, 0) ~= LUA_OK then
+    io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+  lua_close(L)
+  script:destroy()
+end
+
+local function log_cb(level: cint, msg: cstring): void io.write('[log ', level, '] ', msg, '\n') end
+local api: GuHostApi = { size = #GuHostApi, log = log_cb }
+assert(gu_init(&api, (@cstring)(root.data)) == 0)
+
+local function lua_run(code: cstring): void
+  if luaL_loadstring(policy.L, code) ~= LUA_OK or lua_pcall(policy.L, 0, 0, 0) ~= LUA_OK then
+    io.stderr:write(code, '\n', (@cstring)(lua_tolstring(policy.L, -1, nilptr)), '\n')
+    os.exit(1)
+  end
+end
+
+lua_run("assert(CONFIG.netlab and ghostty.netlab_send and ghostty.netlab_image and ghostty.netlab_video and ghostty.ui.canvas and ghostty.ui.poly and ghostty.ui.copy)")
+
+-- no agent connected: the panel opens and says why nothing is sent
+assert(gu_command('netlab') == 0)
+netlab_frame(1.0, false)
+lua_run("local N = CONFIG.netlab.state assert(N.shown and N.note_bad and N.note:find('agent', 1, true), N.note)")
+
+-- an agent: the demo goes out as NLCTL
+host.local_agent.enabled = true
+host.local_agent.client.state = AgentState.Ready
+host.local_agent.client.version = 4
+host.local_agent.client.outq:consume(host.local_agent.client.outq:len())
+assert(gu_command('netlab demo pattern one') == 0)
+local req: uint32 = 0
+do
+  local ok, typ, payload, len = proto.read_frame(&host.local_agent.client.outq)
+  assert(ok and typ == PROTO_NLCTL)
+  local cok, r, cmd = netlab_wire.parse_ctl(payload, len)
+  assert(cok and cmd == 'demo relay=default slow=120 age=500 window=pattern one', cmd)
+  req = r
+  proto.frame_consume(&host.local_agent.client.outq, len)
+end
+
+local function event(typ: uint8, q: *ByteQueue): void
+  local ok, t, payload, len = proto.read_frame(q)
+  assert(ok and t == typ)
+  local ev: AgentEvent = { typ = typ, data = payload, len = len }
+  agent_event(nilptr, &ev)
+  proto.frame_consume(q, len)
+end
+
+do -- NLREPLY
+  local q: ByteQueue
+  netlab_wire.write_reply(&q, req, true, 'running')
+  event(PROTO_NLREPLY, &q)
+  q:destroy()
+  lua_run("assert(CONFIG.netlab.state.note == 'demo running', CONFIG.netlab.state.note)")
+end
+
+do -- NLSTAT
+  local q: ByteQueue
+  local js: string = '{"t_ms":5,"built":true,"started":true,"backend":"test","relay":"off","nodes":[],"pubs":[{"name":"netlab","source":"","h":2,"live":true,"w":320,"h_px":200,"fps":30.0,"objects":3,"groups":1,"bytes":9,"group":0,"group_ms":1000,"why":""}],"subs":[{"id":7,"node":3,"name":"netlab","viewed":true,"slow_ms":0,"delivered":0,"dropped":0,"ended":false,"why":""}],"demo":{"pending":false,"fast":7,"slow":0}}'
+  proto.write_frame(&q, PROTO_NLSTAT, (@*[0]uint8)(js.data), js.size)
+  event(PROTO_NLSTAT, &q)
+  q:destroy()
+  lua_run("local m = CONFIG.netlab.state.model assert(m.pub.w == 320 and #m.subs == 1 and CONFIG.netlab.state.view_sub == 7)")
+end
+
+-- NLFRAME: pictures of the test window as the agent would send them, each
+-- a delta from `prev` (what the last one showed) unless it is a key frame
+local prev: vector(uint8)
+local function nlframe(sub: uint32, group: uint64, index: uint32, n: integer, key: boolean): void
+  local pix: vector(uint8)
+  capture_test_render(1, n, 320, 200, &pix)
+  local rects: vector(WinRect)
+  if key then wincodec_diff(nilptr, 0, (@*[0]uint8)(&pix[0]), 1280, 320, 200, &rects)
+  else wincodec_diff((@*[0]uint8)(&prev[0]), 1280, (@*[0]uint8)(&pix[0]), 1280, 320, 200, &rects) end
+  local body: ByteQueue
+  local scratch: vector(uint8)
+  local tmp: vector(uint8)
+  wincodec_write_frames(&body, 0, (@uint32)(n), (@*[0]uint8)(&pix[0]), 1280, 320, 200, key, &rects, &scratch, &tmp)
+  local q: ByteQueue
+  netlab_wire.write_frame_head(&q, NetlabFrameHead{ sub = sub, group = group, index = index, flags = key and NETLAB_FLAG_GROUP_START or 0, lat_us = 250 }, body:len())
+  q:push(body:peek(), body:len())
+  event(PROTO_NLFRAME, &q)
+  prev:resize(#pix)
+  memory.copy(&prev[0], &pix[0], #pix)
+  pix:destroy() rects:destroy() body:destroy() scratch:destroy() tmp:destroy() q:destroy()
+end
+
+do
+  prev:resize(320 * 200 * 4)
+  -- a delta before any key frame: nothing to apply it to
+  nlframe(9, 0, 1, 1, false)
+  local v9 = netlab_find_video(9)
+  assert(v9 ~= nilptr and v9.w == 0 and v9.pictures == 0)
+  nlframe(7, 3, 0, 10, true)
+  nlframe(7, 3, 1, 11, false)
+  nlframe(7, 3, 2, 12, false)
+  local v = netlab_find_video(7)
+  assert(v ~= nilptr and v.w == 320 and v.h == 200 and v.pictures == 3 and v.keys == 1 and v.group == 3 and v.index == 2)
+  local want: vector(uint8)
+  capture_test_render(1, 12, 320, 200, &want)
+  for i = 0, < #want do assert(want[i] == v.pix[i], 'the picture is the publisher\'s') end
+  assert(v.dirty_all, 'the whole picture waits for its first upload')
+  want:destroy() prev:destroy()
+  lua_run("local w, h, pictures, keys, g, i, lat = ghostty.netlab_video(7) assert(w == 320 and h == 200 and pictures == 3 and keys == 1 and g == 3 and i == 2 and lat == 250)")
+  lua_run("local o = CONFIG.netlab.state.last_object assert(o.sub == 7 and o.group == 3 and o.index == 2 and o.lat_us == 250)")
+  lua_run("assert(ghostty.netlab_video(12345) == nil and ghostty.netlab_image(7, 0, 0, 100, 100) == nil, 'no texture on the host')")
+  lua_run("ghostty.netlab_forget(9)")
+  assert(netlab_find_video(9) == nilptr and netlab_video_count() == 1)
+end
+
+-- a frame while the panel is up draws nothing on the host (no ImGui) and does not fail
+netlab_frame(2.0, false)
+
+-- The panel drawn by lua/netlab.lua through the real ghostty.ui bindings
+-- (core/ui.nelua, core/uidraw.nelua) into a fake ImGui: every shape inside
+-- the window, no NaN, the texts it should have, clip rectangles balanced.
+local Fake = @record{ prims: integer, texts: string, cursor: ImVec2, bad: integer, clips: integer, copied: string }
+local fake: Fake
+fake.cursor = vec2(100, 100)
+local function seen(p: ImVec2): void
+  fake.prims = fake.prims + 1
+  if p.x ~= p.x or p.y ~= p.y or p.x < 90 or p.x > 1100 or p.y < 90 or p.y > 1400 then fake.bad = fake.bad + 1 end
+end
+local dl_storage: ImDrawList
+local function f_dl(): *ImDrawList return &dl_storage end
+local function f_line(dl: *ImDrawList, a: ImVec2, b: ImVec2, c: uint32, t: float32): void seen(a) seen(b) end
+local function f_rect(dl: *ImDrawList, a: ImVec2, b: ImVec2, c: uint32, r: float32, f: cint, t: float32): void seen(a) seen(b) end
+local function f_rect_filled(dl: *ImDrawList, a: ImVec2, b: ImVec2, c: uint32, r: float32, f: cint): void seen(a) seen(b) end
+local function f_circle(dl: *ImDrawList, c: ImVec2, r: float32, col: uint32, n: cint, t: float32): void seen(c) end
+local function f_circle_filled(dl: *ImDrawList, c: ImVec2, r: float32, col: uint32, n: cint): void seen(c) end
+local function f_poly(dl: *ImDrawList, pts: *ImVec2, n: cint, col: uint32, fl: cint, t: float32): void
+  local p = (@*[0]ImVec2)(pts)
+  for i = 0, < n do seen(p[i]) end
+end
+local function f_text(dl: *ImDrawList, font: *ImFont, size: float32, pos: ImVec2, col: uint32, b: cstring, e: cstring, ww: float32, clip: *ImVec4): void
+  seen(pos)
+  local sb: stringbuilder
+  sb:write(fake.texts, string{ data = (@*[0]byte)(b), size = (@usize)((@isize)((@pointer)(e)) - (@isize)((@pointer)(b))) }, '\n')
+  fake.texts:destroy()
+  fake.texts = sb:promote()
+end
+local function f_push_clip(dl: *ImDrawList, a: ImVec2, b: ImVec2, i: boolean): void fake.clips = fake.clips + 1 end
+local function f_pop_clip(dl: *ImDrawList): void fake.clips = fake.clips - 1 end
+local function f_calc(out: *ImVec2, font: *ImFont, size: float32, mw: float32, ww: float32, b: cstring, e: cstring, rem: *cstring): void
+  $out = vec2((@float32)((@isize)((@pointer)(e)) - (@isize)((@pointer)(b))) * size * 0.5, size)
+end
+local function f_cursor(out: *ImVec2): void $out = fake.cursor end
+local function f_avail(out: *ImVec2): void $out = vec2(900, 1200) end
+local function f_invisible(id: cstring, size: ImVec2, flags: cint): boolean
+  fake.cursor.y = fake.cursor.y + size.y
+  return false
+end
+local function f_false_flags(flags: cint): boolean return false end
+local function f_mouse(out: *ImVec2): void $out = vec2(0, 0) end
+local function f_font(): *ImFont return nilptr end
+local function f_font_size(): float32 return 13 end
+local function f_small_button(label: cstring): boolean
+  fake.cursor.y = fake.cursor.y + 0 -- on one row with the others
+  return false
+end
+local function f_same_line(o: float32, s: float32): void end
+local function f_spacing(): void fake.cursor.y = fake.cursor.y + 4 end
+local function f_text_unformatted(b: cstring, e: cstring): void end
+local function f_key(k: cint, r: boolean): boolean return false end
+local function f_copy(t: cstring): void fake.copied:destroy() fake.copied = string.copy(t) end
+local function resolver(name: cstring): pointer
+  local n: string = name
+  if n == 'igGetWindowDrawList' then return (@pointer)(f_dl) end
+  if n == 'ImDrawList_AddLine' then return (@pointer)(f_line) end
+  if n == 'ImDrawList_AddRect' then return (@pointer)(f_rect) end
+  if n == 'ImDrawList_AddRectFilled' then return (@pointer)(f_rect_filled) end
+  if n == 'ImDrawList_AddCircle' then return (@pointer)(f_circle) end
+  if n == 'ImDrawList_AddCircleFilled' then return (@pointer)(f_circle_filled) end
+  if n == 'ImDrawList_AddPolyline' then return (@pointer)(f_poly) end
+  if n == 'ImDrawList_AddText_FontPtr' then return (@pointer)(f_text) end
+  if n == 'ImDrawList_PushClipRect' then return (@pointer)(f_push_clip) end
+  if n == 'ImDrawList_PopClipRect' then return (@pointer)(f_pop_clip) end
+  if n == 'ImFont_CalcTextSizeA' then return (@pointer)(f_calc) end
+  if n == 'igGetCursorScreenPos' then return (@pointer)(f_cursor) end
+  if n == 'igGetContentRegionAvail' then return (@pointer)(f_avail) end
+  if n == 'igInvisibleButton' then return (@pointer)(f_invisible) end
+  if n == 'igIsItemHovered' then return (@pointer)(f_false_flags) end
+  if n == 'igIsWindowFocused' then return (@pointer)(f_false_flags) end
+  if n == 'igGetMousePos' then return (@pointer)(f_mouse) end
+  if n == 'igGetFont' then return (@pointer)(f_font) end
+  if n == 'igGetFontSize' then return (@pointer)(f_font_size) end
+  if n == 'igSmallButton' then return (@pointer)(f_small_button) end
+  if n == 'igSameLine' then return (@pointer)(f_same_line) end
+  if n == 'igSpacing' then return (@pointer)(f_spacing) end
+  if n == 'igTextUnformatted' then return (@pointer)(f_text_unformatted) end
+  if n == 'igIsKeyPressed' then return (@pointer)(f_key) end
+  if n == 'igSetClipboardText' then return (@pointer)(f_copy) end
+  return nilptr
+end
+imgui_bind(resolver, nilptr)
+do
+  -- a model with a relay, both paths and a subscriber that skipped groups
+  local js: string = '{"t_ms":9,"built":true,"started":true,"backend":"test","relay":"default","nodes":[{"role":"main","name":"main","h":1,"stats":{"id":"aaaa","id_short":"aaaa","ticket":"iroh://aaaa","relays":[{"url":"https://relay.example.net./","connected":true}],"addrs":[],"conns":[],"events":[],"pubs":[{"group":4,"index":2}],"subs":[]}},{"role":"viewer","name":"viewer 1","h":3,"stats":{"id":"bbbb","conns":[{"n":1,"dir":"out","peer":"aaaa","open":true,"paths":[{"kind":"relay","addr":"https://relay.example.net./","selected":false,"rtt_us":31000},{"kind":"direct","addr":"ip:192.0.2.4:4433","selected":true,"rtt_us":400}]}],"events":[{"t_ms":1,"conn":1,"what":"opened","kind":"relay","addr":"r"},{"t_ms":800,"conn":1,"what":"selected","kind":"direct","addr":"d"}],"subs":[{"state":"live","group":4,"index":2,"latest":4,"behind":0,"objects":40,"skipped":2,"cut":1,"lat_us":300}]}}],"pubs":[{"name":"netlab","source":"","h":2,"live":true,"w":320,"h_px":200,"fps":30.0,"objects":40,"groups":5,"bytes":9,"group":4,"group_ms":1000,"why":""}],"subs":[{"id":7,"node":3,"name":"netlab","viewed":true,"slow_ms":0,"delivered":40,"dropped":0,"ended":false,"why":""}],"demo":{"pending":false,"fast":7,"slow":0}}'
+  local q: ByteQueue
+  proto.write_frame(&q, PROTO_NLSTAT, (@*[0]uint8)(js.data), js.size)
+  event(PROTO_NLSTAT, &q)
+  q:destroy()
+  lua_run("CONFIG.netlab.state.now = 3.0 CONFIG.netlab.on_object(7, 4, 0, 1, 300) CONFIG.netlab.draw()")
+  assert(fake.prims > 100, 'the panel draws')
+  assert(fake.bad == 0, 'every shape inside the window, no NaN')
+  ## for _, want in ipairs{'NETLAB', 'relay.example.net', 'broadcast netlab', 'fast', 'holepunched in 799 ms', 'iroh paths', 'what the fast subscriber sees'} do
+    assert(fake.texts:find(#[want]#, 1, true) > 0, #[want]#)
+  ## end
+  -- a draw that fails half way leaves a clip pushed; closing the window pops it
+  lua_run("pcall(function() ghostty.ui.clip(0, 0, 10, 10) error('boom') end)")
+  assert(fake.clips == 1)
+  uidraw_close()
+  assert(fake.clips == 0)
+  lua_run("ghostty.ui.unclip()") -- nothing pushed: nothing popped
+  assert(fake.clips == 0)
+  lua_run("assert(ghostty.ui.color('accent', 255) ~= ghostty.ui.color('close', 255) and ghostty.ui.rgba(255, 0, 0) == 0xff0000ff)")
+  lua_run("ghostty.ui.copy('iroh://copied')")
+  assert(fake.copied == 'iroh://copied')
+  fake.texts:destroy() fake.copied:destroy()
+end
+assert(gu_command('netlab') == 0) -- hide
+lua_run("assert(not CONFIG.netlab.state.shown)")
+
+netlab_shutdown()
+assert(netlab_video_count() == 0)
+host.local_agent.enabled = false
+gu_shutdown()
+print('OK')

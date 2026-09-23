@@ -167,6 +167,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     draw_agents()        -- /term agents (core/app/agentpanel.nelua)
   end
   ask_frame(now, live) -- /ask: answers arriving, and the panel while it is up (core/app/ask.nelua)
+  netlab_frame(now, live) -- /term netlab: the panel while it is up (core/app/netlab.nelua)
   reap_exited(now)
   -- only after the layout came back: saving earlier (or while the agent is
   -- unreachable) would overwrite the state we are about to restore
@@ -290,6 +291,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   panels_shutdown() -- pulled windows back to the flat UI, the hooks into ImGui off
   native_shutdown() -- the game windows close; their shells stay for the next core
   ask_shutdown() -- /ask's hidden sessions end (before the others are left running)
+  netlab_shutdown() -- the netlab panel's textures
   cursor_release() -- the game's cursor flag as it was before us
   capture_app_shutdown() -- a clip on the host is told to stop; the HUD comes back
   depthpass_shutdown()
