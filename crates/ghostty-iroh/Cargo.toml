@@ -9,9 +9,11 @@ license = "MIT"
 
 [lib]
 name = "ghostty_iroh"
-# staticlib for the zig cc link lines (host agent + windows-gnu core/agent.exe),
-# cdylib only so the crate can be loaded from a test harness without relinking.
-crate-type = ["staticlib", "cdylib", "rlib"]
+# staticlib for the zig cc link lines (host agent + windows-gnu core), rlib for
+# the crate's own tests. No cdylib: it is the crate type that forces a real
+# link during the cross build, which is where the Windows build failed, and
+# nothing here loads the crate as a shared object.
+crate-type = ["staticlib", "rlib"]
 
 [dependencies]
 # Exact pins: docs/IROH.md requires the tree to be vendored and built
@@ -44,3 +46,11 @@ opt-level = 2
 # cross-module path entirely (docs/IROH.md: no callbacks, no unwinding, across
 # the boundary).
 panic = "abort"
+
+# iroh-quinn-udp queries IPV6_V6ONLY on every socket, including AF_INET ones,
+# and treats a failure as fatal. Wine answers WSAEOPNOTSUPP there, so the
+# plugin core could not open an iroh endpoint at all: "bind IPv4 failed: OS
+# Error 10045". The vendored copy takes false for an IPv4 socket, which is
+# what the answer would have been, and is otherwise unmodified 0.5.7.
+[patch.crates-io]
+iroh-quinn-udp = { path = "../patched/iroh-quinn-udp" }

@@ -31,7 +31,10 @@ IROH_CRATE_DIR="${IROH_CRATE_DIR:-$ROOT/crates/ghostty-iroh}"
 IROH_WIN_TARGET="${RUST_WINDOWS_TARGET:-x86_64-pc-windows-gnu}"
 # Windows system libraries the crate's objects need, named AFTER -lghostty_iroh
 # because the MinGW link is single pass (docs/IROH.md, "The two risks").
-IROH_WIN_SYSLIBS="-lws2_32 -lbcrypt -lntdll -luserenv -ladvapi32 -liphlpapi -lsecur32 -lcrypt32"
+# oleaut32/propsys: the ipconfig crate (hickory-resolver's Windows DNS config)
+# calls SafeArray*, Variant{Clear,Copy} and the VariantTo* family through COM.
+# -lgcc_eh stays last: the MinGW link is single pass.
+IROH_WIN_SYSLIBS="-lws2_32 -lbcrypt -lntdll -luserenv -ladvapi32 -liphlpapi -lsecur32 -lcrypt32 -loleaut32 -lpropsys -lole32 -lgcc_eh"
 # Resolved by iroh_probe; empty means "no iroh in this build".
 IROH_HOST_LIBDIR=""
 IROH_WIN_LIBDIR=""
@@ -106,10 +109,14 @@ build_iroh() {
   fi
   if [[ -n "$IROH_WIN_LIBDIR" ]]; then
     echo "== ghostty-iroh ($IROH_WIN_TARGET)"
-    # One toolchain across the Windows link: cargo compiles, tools/zig-cc-win.sh
-    # links, so the mingw-w64 in the archive is the one every other Windows
-    # object here was built against. Untested (docs/IROH.md, "The two risks").
-    CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$BUILD_COMMON_DIR/zig-cc-win.sh" \
+    # zig-cc-win.sh cannot serve as rustc's linker here: rustc's own link line
+    # carries mingw-isms zig does not resolve (-lwindows.0.52.0, -lgcc_eh,
+    # -l:libpthread.a), and the cross build died in iroh-relay on them. Use
+    # mingw-w64's gcc, which is what the crate was proved to cross-compile
+    # with. It only links cargo's own intermediate artifacts; the staticlib is
+    # an archive of rustc-compiled objects, and tools/zig-cc-win.sh still does
+    # the link that matters, into the PE core.
+    CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="${MINGW_CC:-x86_64-w64-mingw32-gcc}" \
       "$cargo" build "${flags[@]}" --target "$IROH_WIN_TARGET"
     mkdir -p "$IROH_WIN_LIBDIR"
     cp "$CARGO_TARGET_DIR/$IROH_WIN_TARGET/release/libghostty_iroh.a" "$IROH_WIN_LIBDIR/"

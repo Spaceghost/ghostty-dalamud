@@ -74,7 +74,7 @@ void gi_shutdown(void);
 
 /* ---- identity -------------------------------------------------------- */
 
-/* Writes this endpoint's z-base-32 NodeId + NUL. cap >= 64. Bytes written
+/* Writes this endpoint's z-base-32 NodeId + NUL. cap >= 65: the id is 64 characters and needs room for the NUL. Bytes written
  * excluding the NUL, or <0. */
 int32_t gi_node_id(char *out, size_t cap);
 
@@ -111,7 +111,7 @@ gi_handle gi_listen(const char *allowlist_path);
 /* 0 when nothing is pending — same loop termination as net.accept. */
 gi_handle gi_accept(gi_handle listener);
 
-/* Writes the peer's z-base-32 NodeId + NUL. cap >= 64. */
+/* Writes the peer's NodeId + NUL. cap >= 65 (64 characters plus the NUL). */
 int32_t gi_peer_id(gi_handle h, char *out, size_t cap);
 
 /* ---- data ------------------------------------------------------------ */

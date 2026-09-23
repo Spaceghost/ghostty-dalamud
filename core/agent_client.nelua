@@ -111,7 +111,19 @@ function AgentClient:connect(now: float64): void
   end
   if not net.is_valid(self.conn.sock) then
     self.state = AgentState.Failed
-    set_error(self, 'connect failed')
+    -- say why when the transport knows: 'connect failed' alone sends the
+    -- reader to the network when the answer is usually at the ABI boundary
+    local detail = net.last_error()
+    if #detail > 0 then
+      local sb: stringbuilder
+      sb:write('connect failed: ', detail)
+      local msg = sb:promote()
+      set_error(self, msg)
+      msg:destroy()
+    else
+      set_error(self, 'connect failed')
+    end
+    detail:destroy()
     return
   end
   self.sock = self.conn.sock
