@@ -11,6 +11,7 @@ require 'core.app.lights'
 require 'core.app.occluders'
 require 'core.app.rain'
 require 'core.app.deskprops'
+require 'core.app.lakitu'
 require 'core.app.reactions'
 require 'core.app.resize'
 require 'core.app.cursor'
@@ -330,6 +331,7 @@ global function teardown_effects(): void
   anim_err:destroy()
   host.anim_out = false
   desk_props_teardown() -- after the toggle: Lua has let the desk scene go
+  lakitu_teardown()     -- and the hovering camera, with the view handed back
   reactions_reset()
   release_walk() -- stop steering before the hook can call a core that is gone
   release_look_at()

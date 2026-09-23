@@ -293,7 +293,11 @@ do -- the keep flag: the job survives, and JATTACH replays what it missed
   assert(jopened_jid > 0)
   local jid = jopened_jid
   for _ = 1, 200 do keeper:pump() if out_bytes > 0 then break end end
-  assert(out_text == 'keep-me-1', 'the kept job started: ' .. out_text)
+  -- A prefix, not equality: the job prints 'keep-me-1', sleeps 0.4s and prints
+  -- 'keep-me-2', and on a loaded machine the pumps above can outlast that
+  -- sleep, so both arrive. What this checks is that the kept job started and
+  -- its output arrived in order; the exact replay is asserted after JATTACH.
+  assert(out_text:find('keep-me-1', 1, true) == 1, 'the kept job started: ' .. out_text)
   keeper:close() -- the game went away; the job keeps running
 
   reset_events()

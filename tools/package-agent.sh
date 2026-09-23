@@ -76,6 +76,21 @@ done < <(git ls-files -z -- agent core compat \
 # to exec inside the container.
 git -C vendor/nelua-lang archive --format=tar --prefix=vendor/nelua-lang/ "$NELUA_COMMIT" | tar -x -C "$DST"
 
+# The embedded WireGuard's vendored C (docs/WIREGUARD.md), exactly as
+# tools/fetch-vendor.sh checked it against toolchain.env: the package builds
+# offline, so it must travel in the tarball.
+for dep in monocypher:MONOCYPHER_SHA256 lwip:LWIP_SHA256 qrcodegen:QRCODEGEN_C_SHA256; do
+  dir="${dep%%:*}" pin_var="${dep##*:}"
+  want="${!pin_var}"
+  [[ "$dir" == qrcodegen ]] && want="$QRCODEGEN_C_SHA256$QRCODEGEN_H_SHA256"
+  [[ -f "vendor/$dir/.pinned" && "$(cat "vendor/$dir/.pinned")" == "$want" ]] || {
+    echo "error: vendor/$dir is missing or not at its pin; run tools/fetch-vendor.sh agent" >&2
+    exit 1
+  }
+  mkdir -p "$DST/vendor/$dir"
+  cp -pR "vendor/$dir/." "$DST/vendor/$dir/"
+done
+
 cp -p packaging/ghostty-agent.spec "$DST/ghostty-agent.spec"
 cp -p packaging/README-agent.md "$DST/README-agent.md"
 printf '%s\n' "$VERSION" >"$DST/VERSION"
