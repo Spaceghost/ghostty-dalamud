@@ -69,7 +69,7 @@ end
 global function agent_random(n: usize): string
   local rf = io.open('/dev/urandom', 'rb')
   local raw: string
-  if rf:isopen() then raw = rf:read(n) rf:close() end
+  if rf:isopen() then raw = rf:read(n) rf:destroy() end
   return raw
 end
 
@@ -98,7 +98,7 @@ global function agent_write_private(path: string, content: string): boolean
   umask(old)
   if not wf:isopen() then return false end
   wf:write(content)
-  wf:close()
+  wf:destroy()
   return true
 end
 

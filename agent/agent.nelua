@@ -190,6 +190,12 @@ local wg: WgService
 local function log(msg: string): void
   io.stderr:write('[ghostty-agent] ', msg, '\n')
 end
+-- A log line from pieces (strings and integers), written one after another:
+-- `log('a ' .. b)` would allocate a string that nothing frees.
+local function log_parts(...: varargs): void
+  io.stderr:write('[ghostty-agent] ', ...)
+  io.stderr:write('\n')
+end
 
 local function send_frame(c: *Client, typ: uint8, payload: *[0]uint8, len: usize): void
   proto.write_frame(&c.outq, typ, payload, len)
@@ -350,7 +356,7 @@ local function clipboard_set(data: *[0]uint8, len: usize): boolean
     local f = io.open(agent.clip_file, 'wb')
     if not f:isopen() then return false end
     f:write(string{data=(@*[0]byte)(data), size=len})
-    f:close()
+    f:destroy()
     return true
   end
   return agent_clipboard_set(data, len)
@@ -361,7 +367,7 @@ local function clipboard_get(): (boolean, string)
     local f = io.open(agent.clip_file, 'rb')
     if not f:isopen() then return true, string.copy('') end
     local content = f:read('a')
-    f:close()
+    f:destroy()
     return true, content
   end
   return agent_clipboard_get()
@@ -417,7 +423,7 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     local ok, pty, why = AgentPty.spawn(agent.term, &argv, &env, cols, rows)
     if not ok then
       send_opened_error(c, why)
-      log('open failed: ' .. why)
+      log_parts('open failed: ', why)
       for i = 0, < #argv do argv[i]:destroy() end
       for i = 0, < #env do env[i]:destroy() end
       argv:destroy()
@@ -437,7 +443,7 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
     local idb: [4]uint8
     proto.put_u32(&idb, s.id)
     send_frame(c, PROTO_OPENED, &idb, 4)
-    log('opened session ' .. tostring(s.id) .. ': ' .. s.command)
+    log_parts('opened session ', s.id, ': ', s.command)
     for i = 0, < #argv do argv[i]:destroy() end
     for i = 0, < #env do env[i]:destroy() end
     argv:destroy()
@@ -635,7 +641,7 @@ local function pump_session(si: usize): void
     proto.put_u32(&st, (@uint32)(s.exit_status))
     broadcast(s, PROTO_EXIT, &st, 4)
     s.pty:close()
-    log('session ' .. tostring(s.id) .. ' exited with ' .. tostring(s.exit_status))
+    log_parts('session ', s.id, ' exited with ', s.exit_status)
   end
 end
 
@@ -689,19 +695,23 @@ local function read_token_file(path: string): string
   local f = io.open(path, 'rb')
   if f:isopen() then
     local content = f:read('a')
-    f:close()
-    return agent_trim(content)
+    f:destroy()
+    local tok = agent_trim(content)
+    content:destroy()
+    return tok
   end
   -- generate
   local raw = agent_random(24)
   if #raw < 24 then log('WARNING: no random source for a new token') end
   local tok = agent_hex(raw)
   raw:destroy()
-  if agent_write_private(path, tok .. '\n') then
-    log('wrote new token to ' .. path)
+  local line = tok .. '\n'
+  if agent_write_private(path, line) then
+    log_parts('wrote new token to ', path)
   else
-    log('WARNING: could not write token file ' .. path)
+    log_parts('WARNING: could not write token file ', path)
   end
+  line:destroy()
   return tok
 end
 
@@ -797,7 +807,7 @@ local function iroh_accept_all(): void
     local pbuf: [80]uint8
     local pn = gi_peer_id(h, (@cstring)((@pointer)(&pbuf)), #pbuf)
     if pn > 0 then
-      log('iroh: connection from ' .. string{data = (@*[0]byte)(&pbuf), size = (@usize)(pn)})
+      log_parts('iroh: connection from ', string{data = (@*[0]byte)(&pbuf), size = (@usize)(pn)})
     else
       log('iroh: connection from an unnamed peer')
     end
@@ -813,8 +823,10 @@ end
 -- (WOPEN "url:URL"), and wait for the answer. 0 when the browser has it, else
 -- 1 and one line on stderr saying why. $BROWSER of the compositor's apps
 -- (docs/REMOTE_WINDOWS.md "Opening URLs").
-local function open_url_fail(why: string): integer
-  io.stderr:write('ghostty-agent --open-url: ', why, '\n')
+-- the reason in pieces, so none of them has to be concatenated (and leaked) first
+local function open_url_fail(...: varargs): integer
+  io.stderr:write('ghostty-agent --open-url: ', ...)
+  io.stderr:write('\n')
   return 1
 end
 
@@ -829,19 +841,22 @@ local function open_url_client(listen_spec: string, token_path: string, url: str
   local token: string
   do
     local f = io.open(token_path, 'rb')
-    if not f:isopen() then return open_url_fail('no token file ' .. token_path .. ' (is the agent running?)') end
-    token = agent_trim(f:read('a'))
-    f:close()
+    if not f:isopen() then return open_url_fail('no token file ', token_path, ' (is the agent running?)') end
+    local content = f:read('a')
+    f:destroy()
+    token = agent_trim(content)
+    content:destroy()
   end
   local host, port = agent_parse_hostport(listen_spec)
+  defer token:destroy() host:destroy() end
   local conn = net.connect(host, port)
-  if not net.is_valid(conn.sock) then return open_url_fail('cannot connect to ' .. listen_spec) end
+  if not net.is_valid(conn.sock) then return open_url_fail('cannot connect to ', listen_spec) end
   local fds: [1]pollfd
   local deadline = os.now() + 5.0
   while true do
     local st = net.connect_poll(&conn)
     if st == 1 then break end
-    if st < 0 or os.now() > deadline then net.close(conn.sock) return open_url_fail('no agent at ' .. listen_spec) end
+    if st < 0 or os.now() > deadline then net.close(conn.sock) return open_url_fail('no agent at ', listen_spec) end
     fds[0] = { fd = net.socket_fd(conn.sock), events = POLLOUT }
     poll(&fds, 1, 100)
   end
@@ -1002,34 +1017,34 @@ local function main(): integer
           '--allow-insecure-listen listens there anyway.\n')
         return 2
       end
-      log('WARNING: listening on ' .. listen_spec .. ' in the clear (--allow-insecure-listen): ' .. why ..
+      log_parts('WARNING: listening on ', listen_spec, ' in the clear (--allow-insecure-listen): ', why,
           '. Anyone who can reach it and read the token has a shell as you.')
     end
   end
   agent.token = read_token_file(token_path)
   agent.listen_sock = net.listen(host, port)
   if not net.is_valid(agent.listen_sock) then
-    log('cannot listen on ' .. listen_spec)
+    log_parts('cannot listen on ', listen_spec)
     return 1
   end
   local pid = agent_pid()
-  log('listening on ' .. listen_spec .. ' (pid ' .. tostring(pid) .. ')')
+  log_parts('listening on ', listen_spec, ' (pid ', pid, ')')
   if iroh_on then
     ## if IROH_BUILT then
     local v = gi_abi_version()
     if v ~= IROH_ABI_VERSION then
-      log('iroh: ABI mismatch, this agent speaks ' .. tostring(IROH_ABI_VERSION) .. ' and the library reports ' .. tostring(v))
+      log_parts('iroh: ABI mismatch, this agent speaks ', IROH_ABI_VERSION, ' and the library reports ', v)
       return 1
     end
     local sbuf: [4096]uint8
     local abuf: [4096]uint8
     if gi_init(iroh_path_c(iroh_secret, &sbuf)) < 0 then
-      log('iroh: cannot start the endpoint: ' .. iroh_last_error())
+      log_parts('iroh: cannot start the endpoint: ', iroh_last_error())
       return 1
     end
     iroh_listener = gi_listen(iroh_path_c(iroh_allowlist, &abuf))
     if iroh_listener == 0 then
-      log('iroh: cannot listen: ' .. iroh_last_error())
+      log_parts('iroh: cannot listen: ', iroh_last_error())
       gi_shutdown()
       return 1
     end
@@ -1037,12 +1052,12 @@ local function main(): integer
       local idbuf: [80]uint8
       local idn = gi_node_id((@cstring)((@pointer)(&idbuf)), #idbuf)
       if idn > 0 then
-        log('iroh: listening as ' .. string{data = (@*[0]byte)(&idbuf), size = (@usize)(idn)})
+        log_parts('iroh: listening as ', string{data = (@*[0]byte)(&idbuf), size = (@usize)(idn)})
       else
-        log('iroh: listening, but the node id is unavailable: ' .. iroh_last_error())
+        log_parts('iroh: listening, but the node id is unavailable: ', iroh_last_error())
       end
       if #iroh_allowlist > 0 then
-        log('iroh: allowlist ' .. iroh_allowlist)
+        log_parts('iroh: allowlist ', iroh_allowlist)
       else
         log('iroh: no allowlist -- any peer may connect, and the PROTO_HELLO token is the only authorisation')
       end
@@ -1091,7 +1106,7 @@ local function main(): integer
   ## end
   do
     local ok, why = windows:init(windows_name, client_queue)
-    if ok then log('windows: ' .. windows.backend.name) else log('windows unavailable: ' .. why) end
+    if ok then log_parts('windows: ', windows.backend.name) else log_parts('windows unavailable: ', why) end
   end
   jobs:init(client_queue, log) -- raw jobs (docs/JOBS.md); they run as this user
   clips.queue_of, clips.log_fn, clips.next_cid = client_queue, log, 1 -- clips of the game (docs/CAPTURE.md)
@@ -1102,7 +1117,7 @@ local function main(): integer
   local wg_start = false
   if wg_mode == 'always' then
     wg_start = true
-    if ts.detected then log('wireguard: starting although Tailscale is here (' .. ts.why .. '), as --wireguard always asks') end
+    if ts.detected then log_parts('wireguard: starting although Tailscale is here (', ts.why, '), as --wireguard always asks') end
   elseif wg_mode ~= 'off' then
     local have, text = wg_read_file(wg_path)
     local peers = have and text:find('[Peer]', 1, true) > 0
@@ -1110,18 +1125,18 @@ local function main(): integer
     text:destroy()
     if ts.detected and (wg_mode == 'on' or peers) then
       local addr = ts:address()
-      log('Tailscale detected (' .. ts.why .. '): WireGuard not started. To reach this agent from another machine, listen on your tailnet address: --listen ' ..
-          (#addr > 0 and addr or 'YOUR-TAILNET-ADDRESS') .. ':' .. tostring(port) .. ' (or --wireguard always)')
+      log_parts('Tailscale detected (', ts.why, '): WireGuard not started. To reach this agent from another machine, listen on your tailnet address: --listen ',
+          (#addr > 0 and addr or 'YOUR-TAILNET-ADDRESS'), ':', port, ' (or --wireguard always)')
       addr:destroy()
     elseif wg_mode == 'on' then
       wg_start = true
       if not have then -- a key and addresses to start from; `ghostty-agent wg add` adds peers
         local fresh: WgConfig
         if not wg_init_config(&fresh, WG_DEFAULT_PORT) or not fresh:save(wg_path) then
-          log('wireguard: cannot make ' .. wg_path) return 2
+          log_parts('wireguard: cannot make ', wg_path) return 2
         end
         fresh:destroy()
-        log('wireguard: made ' .. wg_path .. '; add a peer with `ghostty-agent wg add NAME`')
+        log_parts('wireguard: made ', wg_path, '; add a peer with `ghostty-agent wg add NAME`')
       end
     elseif peers then
       wg_start = true
@@ -1131,11 +1146,11 @@ local function main(): integer
     -- refuse to start rather than run without the tunnel someone asked for
     local cfg: WgConfig
     local ok, why = cfg:load(wg_path)
-    if not ok then log(wg_path .. ': ' .. why) return 2 end
+    if not ok then log_parts(wg_path, ': ', why) return 2 end
     wg.log = log
     local started, err = wg:start(&cfg, port)
     cfg:destroy()
-    if not started then log('wireguard: ' .. err) return 2 end
+    if not started then log_parts('wireguard: ', err) return 2 end
     wg:watch(wg_path) -- peers and forwards follow the file
   end
   wg_path:destroy()
