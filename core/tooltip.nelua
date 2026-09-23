@@ -83,6 +83,52 @@ global function tooltip_show(text: string, swatch: *[0]uint32, n: integer): void
   imgui.PopStyleVar(3)
 end
 
+-- A tooltip with a heading: `title` in the accent colour (after `icon`, an
+-- ImTextureID, when there is one), `body` under it and `hint` (what a click
+-- does) dimmed at the bottom. Any of them may be empty. The /ask panel's links.
+global function tooltip_show_rich(title: string, body: string, hint: string, icon: pointer): void
+  if #title == 0 and #body == 0 and #hint == 0 then return end
+  tooltip_shown = tooltip_shown + 1
+  tooltip_last_len = math.min(#title, 160)
+  if tooltip_last_len > 0 then memory.copy(&tooltip_last, title.data, tooltip_last_len) end
+  if imgui.BeginTooltip == nilptr or imgui.PushStyleVarVec2 == nilptr or imgui.PushStyleColorU32 == nilptr
+     or imgui.TextUnformatted == nilptr or imgui.PushTextWrapPos == nilptr then return end -- a partial ImGui (tests)
+  imgui.PushStyleVarVec2(ImGuiStyleVar_WindowPadding, vec2(10, 7))
+  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowRounding, 7)
+  imgui.PushStyleVarFloat(ImGuiStyleVar_PopupBorderSize, 1)
+  imgui.PushStyleColorU32(ImGuiCol_PopupBg, chrome_col(ChromeColor.Tooltip, 245))
+  imgui.PushStyleColorU32(ImGuiCol_Border, chrome_col(ChromeColor.Accent, 110))
+  imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.Ink, 255))
+  imgui.BeginTooltip()
+  local fs = imgui.GetFontSize()
+  imgui.PushTextWrapPos(fs * 24)
+  if icon ~= nilptr and imgui.DrawListAddImage ~= nilptr and imgui.Dummy ~= nilptr then
+    local p: ImVec2
+    imgui.GetCursorScreenPos(&p)
+    local s: float32 = math.floor(fs * 1.6)
+    imgui.DrawListAddImage(imgui.GetWindowDrawList(), icon, p, vec2(p.x + s, p.y + s), vec2(0, 0), vec2(1, 1), 0xFFFFFFFF)
+    imgui.Dummy(vec2(s, s))
+    imgui.SameLine(0, 8)
+  end
+  if #title > 0 then
+    imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.Accent2, 255))
+    imgui.TextUnformatted((@cstring)(title.data), (@cstring)(&title.data[title.size]))
+    imgui.PopStyleColor(1)
+  end
+  if #body > 0 then
+    imgui.TextUnformatted((@cstring)(body.data), (@cstring)(&body.data[body.size]))
+  end
+  if #hint > 0 then
+    imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkDim, 255))
+    imgui.TextUnformatted((@cstring)(hint.data), (@cstring)(&hint.data[hint.size]))
+    imgui.PopStyleColor(1)
+  end
+  imgui.PopTextWrapPos()
+  imgui.EndTooltip()
+  imgui.PopStyleColor(3)
+  imgui.PopStyleVar(3)
+end
+
 -- tooltip_due and tooltip_show in one, for plain text.
 global function tooltip_hover(key: uint64, hot: boolean, now: float64, text: string): void
   if tooltip_due(key, hot, now) then tooltip_show(text, nilptr, 0) end

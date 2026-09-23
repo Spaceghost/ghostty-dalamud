@@ -14,13 +14,23 @@
 --   /ask term [question] the old way: a terminal running the assistant
 --
 -- In the panel: Enter sends, Shift+Enter (or Ctrl+Enter) starts a new line,
--- Esc closes. Links (https only) open in your browser. Game actions stay off
--- unless you tick them, and XivMcp still asks you in game before each one.
+-- Esc closes. Answers are markdown, drawn rich (lua/askview.lua): headings,
+-- lists, tables, quotes, code blocks with a copy button, and links
+-- (lua/asklinks.lua) -- https pages open in your browser, map coordinates,
+-- zones, items, quests and duties open the game's own map, chat input,
+-- journal or Duty Finder, slash commands go into the chat input (running one
+-- asks first), and follow-up chips ask on click (right-click: in a new
+-- conversation linked back to this one). Nothing is sent, run or opened
+-- without a click. Game actions for the assistant stay off unless you tick
+-- them, and XivMcp still asks you in game before each one.
 --
 -- What runs and how is configured in lua/assistant.lua (CONFIG.assistant):
 -- `ui` ('panel' | 'terminal'), `stream`, `threads`, `game_actions`, `echo`.
 
 local json = require('json')
+local md = require('askmd')
+local links = require('asklinks')
+local view = require('askview')
 
 local M = {}
 
@@ -43,6 +53,10 @@ function M.reset()
     dirty = false,
     now = 0,
     loaded = false,
+    parents = {},           -- thread id -> { id =, title = } of the conversation it was branched from
+    pending_parent = nil,   -- the parent of the thread the next answer starts
+    note = nil,             -- what the last click did (shown for a few seconds)
+    confirm = nil,          -- a slash command waiting for Run
   }
   M.state = S
 end
@@ -75,10 +89,18 @@ local function state_path() return (GHOSTTY_PLUGIN_DIR or '.') .. '/ask-state.lu
 local function save_thread()
   local f = io.open(state_path(), 'w')
   if not f then return end
+  local parents, n = {}, 0
+  for id, p in pairs(S.parents) do
+    n = n + 1
+    if n > 200 then break end
+    parents[#parents + 1] = string.format('[%q] = { id = %q, title = %q }', id, p.id, p.title or '')
+  end
+  table.sort(parents)
+  local ps = #parents > 0 and (', parents = { ' .. table.concat(parents, ', ') .. ' }') or ''
   if S.thread then
-    f:write(string.format('return { thread = %q, title = %q }\n', S.thread.id, S.thread.title or ''))
+    f:write(string.format('return { thread = %q, title = %q%s }\n', S.thread.id, S.thread.title or '', ps))
   else
-    f:write('return {}\n')
+    f:write(string.format('return { %s }\n', (ps:gsub('^, ', ''))))
   end
   f:close()
 end
@@ -91,6 +113,13 @@ local function load_thread()
   local ok, t = pcall(chunk)
   if ok and type(t) == 'table' and type(t.thread) == 'string' and t.thread ~= '' then
     S.thread = { id = t.thread, title = type(t.title) == 'string' and t.title or '' }
+  end
+  if ok and type(t) == 'table' and type(t.parents) == 'table' then
+    for id, p in pairs(t.parents) do
+      if type(id) == 'string' and type(p) == 'table' and type(p.id) == 'string' then
+        S.parents[id] = { id = p.id, title = type(p.title) == 'string' and p.title or '' }
+      end
+    end
   end
 end
 
@@ -108,11 +137,11 @@ local function strip_url_tail(url)
 end
 
 local function text_block(lines)
-  local links, seen = {}, {}
+  local found, seen = {}, {}
   local function add(label, url)
     if url:match('^https://%S') and not seen[url] then
       seen[url] = true
-      links[#links + 1] = { label = label, url = url }
+      found[#found + 1] = { label = label, url = url }
     end
   end
   local out = {}
@@ -133,7 +162,7 @@ local function text_block(lines)
     out[#out + 1] = line
   end
   local text = trim(table.concat(out, '\n'))
-  return { kind = 'text', text = text, links = links }
+  return { kind = 'text', text = text, links = found }
 end
 
 function M.blocks(answer)
@@ -276,8 +305,21 @@ end
 function M.new_thread()
   cancel_job()
   S.thread, S.messages, S.view, S.status = nil, {}, 'chat', ''
+  S.confirm, S.pending_parent = nil, nil
   S.focus_input = true
   save_thread()
+end
+
+-- Ask `question` in a new thread that remembers this one as where it came from.
+function M.branch(question)
+  if M.busy() then
+    S.status = 'Still answering; Stop it or wait.'
+    return false
+  end
+  local parent = S.thread and { id = S.thread.id, title = S.thread.title or '' }
+  M.new_thread()
+  S.pending_parent = parent
+  return M.send(question)
 end
 
 function M.refresh_threads()
@@ -345,6 +387,8 @@ local function on_ask_event(job, ev)
   local reply = job.reply
   if ev.type == 'thread' and type(ev.id) == 'string' then
     S.thread = { id = ev.id, title = type(ev.title) == 'string' and ev.title or '' }
+    if S.pending_parent and S.pending_parent.id ~= ev.id then S.parents[ev.id] = S.pending_parent end
+    S.pending_parent = nil
     save_thread()
   elseif ev.type == 'text' and type(ev.text) == 'string' then
     reply.text = reply.text .. ev.text
@@ -499,6 +543,10 @@ function M.tick(now)
 end
 
 -- Drawing (ghostty.ui) --------------------------------------------------------------------
+-- An answer is drawn rich (lua/askmd.lua, lua/asklinks.lua, lua/askview.lua):
+-- parsed and linked once per change of its text, laid out once per width,
+-- drawn with draw-list primitives only. A core without those primitives (or a
+-- message whose rich drawing fails) gets the plain bubbles of before.
 
 local function tip(key)
   local ui = ghostty.ui
@@ -513,10 +561,115 @@ local function open_link(url)
   if not ok then S.status = 'Link: ' .. tostring(err) end
 end
 
-local function draw_reply(ui, m)
+-- A short line under the conversation for what a click did; it fades after a while.
+local function note(text)
+  if text and text ~= '' then S.note, S.note_at = text, S.now end
+end
+
+local function rich_ui(ui)
+  return ui.measure and ui.text_at and ui.rect_at and ui.frame_at and ui.line_at and ui.origin and ui.advance
+    and ui.mouse and ui.font_size
+end
+
+local measure, measure_ui
+local function measurer(ui)
+  if measure_ui ~= ui then measure, measure_ui = view.measurer(ui), ui end
+  return measure
+end
+
+-- The document of message `m`, parsed and linked again only when its text
+-- changed (or the game was still indexing its names last time).
+local function prepare(m)
+  local now = S.now or 0
+  if m.doc_src ~= m.text or (m.unlinked and now >= links.resolver.retry_at) then
+    m.doc = md.parse(m.text)
+    m.unlinked = not links.link(m.doc, now)
+    m.doc_src = m.text
+    m.lay = nil
+    m.sources = nil
+    m.followups = nil
+  end
+  if not m.streaming and not m.sources then
+    m.sources = links.sources(m.doc)
+    m.followups = links.followups(m.doc)
+  end
+  return m.doc
+end
+
+local FADE = 0.35
+
+-- The alpha of text ending at character `cum` of a message still streaming in.
+local function fader(m, now)
+  local f = m.fade
+  if not f or #f == 0 or now - f[#f].t > FADE then return nil end
+  return function(cum)
+    for i = #f, 1, -1 do
+      local s = f[i]
+      if now - s.t > FADE then return 1 end
+      if cum > (f[i - 1] and f[i - 1].upto or 0) and cum <= s.upto then
+        return math.max(0.15, math.min(1, (now - s.t) / FADE))
+      end
+    end
+    return 1
+  end
+end
+
+local function describe_tip(ui, l)
+  local title, body, hint = links.describe(l)
+  if ui.tip_rich then
+    ui.tip_rich(title or '', body or '', hint or '', l.icon or 0)
+  elseif ui.tip then
+    ui.tip(table.concat({ title or '', body or '', hint or '' }, '\n'):gsub('\n+', '\n'):gsub('^\n', ''), nil, true)
+  end
+end
+
+-- One answer, rich. Returns the link under the pointer, if any.
+local function draw_rich(ui, m, frame, extra_followups)
+  prepare(m)
+  local x, y, w, c0, c1 = ui.origin()
+  local pad = 11
+  local inner = math.max(w - 2 * pad, 40)
+  local fs = ui.font_size()
+  local fups = extra_followups and m.followups or nil
+  local key = string.format('%d:%.1f:%d:%s', math.floor(inner), fs, fups and #fups or 0, m.sources and #m.sources or '-')
+  if not m.lay or m.lay_key ~= key then
+    m.lay = view.layout(m.doc, inner, fs, measurer(ui), {
+      icons = ui.icons and ui.icons() or false,
+      sources = m.sources,
+      followups = fups,
+    })
+    m.lay_key = key
+    if m.streaming then
+      m.fade = m.fade or {}
+      local last = m.fade[#m.fade]
+      if m.lay.chars > (last and last.upto or 0) then m.fade[#m.fade + 1] = { upto = m.lay.chars, t = S.now or 0 } end
+    end
+  end
+  local L = m.lay
+  local h = L.h + 2 * pad
+  local hot
+  if y + h >= c0 and y <= c1 then
+    if frame.hovered then hot = view.hit(L, x + pad, y + pad, frame.mx, frame.my) end
+    ui.rect_at(x, y, x + w, y + h, view.C.glass_top, 225, 10)
+    ui.frame_at(x, y, x + w, y + h, view.C.accent2, 55, 10)
+    view.draw(ui, L, x + pad, y + pad, {
+      clip0 = c0, clip1 = c1, hot = hot or frame.hot, fade = fader(m, S.now or 0),
+      icon = ui.icon_at and function(id, x0, y0, x1, y1) return ui.icon_at(id, x0, y0, x1, y1) end,
+      copied = S.copied_at and (S.now or 0) - S.copied_at < 2 and S.copied or nil,
+    })
+  end
+  ui.advance(h)
+  return hot
+end
+
+local function draw_tools(ui, m)
   for _, t in ipairs(m.tools or {}) do
     ui.bubble('\u{2192} ' .. t.name .. (t.lines and string.format('  (%d lines)', t.lines) or ''), 'note')
   end
+end
+
+-- The plain answer of before: text bubbles, code blocks, links under them.
+local function draw_plain(ui, m)
   local blocks = M.blocks(m.text)
   for _, b in ipairs(blocks) do
     if b.kind == 'code' then
@@ -529,21 +682,88 @@ local function draw_reply(ui, m)
       if ui.link('\u{2197} ' .. l.label, l.url) then open_link(l.url) end
     end
   end
+  return #blocks
+end
+
+local function draw_reply(ui, m, frame, last)
+  draw_tools(ui, m)
+  local shown = m.text ~= ''
+  if shown then
+    if frame.rich and not m.rich_error then
+      local ok, hot = pcall(draw_rich, ui, m, frame, last)
+      if ok then
+        if hot and not frame.hot then frame.hot, frame.hot_msg = hot, m end
+      else
+        -- never again for this message: the plain bubbles instead, and say why once
+        m.rich_error = tostring(hot)
+        S.status = 'This answer is shown plain: ' .. m.rich_error:sub(1, 160)
+        draw_plain(ui, m)
+      end
+    else
+      draw_plain(ui, m)
+    end
+  end
   if m.streaming then
     local dots = string.rep('.', 1 + math.floor((S.now or 0) * 3) % 3)
-    ui.bubble(#blocks == 0 and ('thinking' .. dots) or dots, 'note')
+    ui.bubble(not shown and ('thinking' .. dots) or dots, 'note')
   end
+end
+
+-- What a click on link `l` does (lua/asklinks.lua), with the panel's side of it.
+local function click(ui, l, right)
+  if l.kind == 'copy' then
+    if ui.copy then ui.copy(l.text) end
+    S.copied, S.copied_at = l.text, S.now
+    return
+  end
+  local said = links.activate(l, {
+    open_url = function(url) open_link(url) return nil end,
+    copy = ui.copy,
+    open_thread = function(id) M.open_thread(id, '') end,
+    ask = function(q, new_thread)
+      if new_thread then M.branch(q) else M.send(q) end
+    end,
+    confirm = function(cmd) S.confirm = cmd end,
+  }, right and 'right' or 'left')
+  note(said)
 end
 
 local INPUT_H = 64
 
+local function draw_confirm(ui)
+  local cmd = S.confirm
+  if not cmd then return 0 end
+  ui.bubble('Run ' .. cmd .. ' now?', 'note')
+  if ui.small_button('Run##ask_run') then
+    local ok, err = links.run_command(cmd)
+    note(ok and ('Ran ' .. cmd) or ('Not run: ' .. tostring(err)))
+    S.confirm = nil
+  end
+  tip('ask.run')
+  ui.same_line()
+  if ui.small_button('Cancel##ask_run_cancel') then S.confirm = nil end
+  return 1
+end
+
 local function draw_chat(ui)
-  local visible = ui.child('##ask_log', INPUT_H + 44)
+  local extra = 0
+  if S.confirm then extra = extra + 30 end
+  local show_note = S.note and (S.now or 0) - (S.note_at or 0) < 6
+  if show_note then extra = extra + 22 end
+  local visible = ui.child('##ask_log', INPUT_H + 44 + extra)
   local follow = S.stick and S.dirty
+  local frame = { rich = rich_ui(ui) and true or false }
   if visible then
+    if frame.rich then
+      frame.mx, frame.my, frame.hovered, frame.clicked, frame.right = ui.mouse()
+    end
     if #S.messages == 0 then
       ui.bubble(S.job and 'loading the conversation...' or
         'Ask anything: the knowledge base, your machines, the game. Follow-ups keep the conversation.', 'note')
+    end
+    local last_assistant
+    for i = #S.messages, 1, -1 do
+      if S.messages[i].role == 'assistant' then last_assistant = S.messages[i] break end
     end
     for _, m in ipairs(S.messages) do
       if m.role == 'user' then
@@ -551,14 +771,22 @@ local function draw_chat(ui)
       elseif m.role == 'error' then
         ui.bubble(m.text, 'error')
       else
-        draw_reply(ui, m)
+        draw_reply(ui, m, frame, m == last_assistant and not M.busy())
       end
       ui.spacing()
+    end
+    local hot = frame.hot
+    if hot then
+      if ui.hand then ui.hand() end
+      describe_tip(ui, hot)
+      if frame.clicked or frame.right then click(ui, hot, frame.right) end
     end
     S.stick = ui.at_bottom() or follow
   end
   ui.end_child(follow)
   S.dirty = false
+  if show_note then ui.bubble(S.note, 'note') end
+  draw_confirm(ui)
   -- the input box
   if S.focus_input then
     ui.focus_next()
@@ -595,12 +823,22 @@ local function draw_threads(ui)
       ui.bubble('No threads yet: ask something.', 'note')
     else
       for _, t in ipairs(S.threads) do
-        local label = (t.title ~= '' and t.title or t.id) .. string.format('   \u{b7} %d', t.turns) .. '##' .. t.id
+        local from = S.parents[t.id]
+        local label = (t.title ~= '' and t.title or t.id) .. string.format('   \u{b7} %d', t.turns)
+          .. (from and ('   \u{b7} from ' .. (from.title ~= '' and from.title or from.id)) or '') .. '##' .. t.id
         if ui.selectable(label, S.thread ~= nil and S.thread.id == t.id) then M.open_thread(t.id, t.title) end
       end
     end
   end
   ui.end_child(false)
+end
+
+-- The newest answer on screen, as written (for Copy).
+local function last_answer()
+  for i = #S.messages, 1, -1 do
+    local m = S.messages[i]
+    if m.role == 'assistant' and m.text ~= '' then return m.text end
+  end
 end
 
 function M.draw()
@@ -613,6 +851,11 @@ function M.draw()
   end
   local title = S.thread and S.thread.title ~= '' and S.thread.title or (S.thread and 'Ask' or 'Ask \u{b7} new thread')
   ui.text(title)
+  -- the conversation this one was branched from
+  local from = S.thread and S.parents[S.thread.id]
+  if from and ui.link then
+    if ui.link('from: ' .. (from.title ~= '' and from.title or from.id), 'thread ' .. from.id) then M.open_thread(from.id, from.title) end
+  end
   if ui.small_button('New##ask_new') then M.new_thread() end
   tip('ask.new')
   ui.same_line()
@@ -625,6 +868,15 @@ function M.draw()
   end
   if S.view ~= 'threads' then tip('ask.threads') end
   ui.same_line()
+  local answer = last_answer()
+  if answer and ui.copy then
+    if ui.small_button('Copy##ask_copy') then
+      ui.copy(answer)
+      note('The last answer is on the clipboard')
+    end
+    tip('ask.copy')
+    ui.same_line()
+  end
   if ui.small_button('Pin##ask_pin') then M.pin() end
   tip('ask.pin')
   ui.same_line()

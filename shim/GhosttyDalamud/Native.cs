@@ -62,6 +62,9 @@ internal unsafe struct GuHostApi
     public delegate* unmanaged[Cdecl]<GuHudRect*, int, int> HudRects;
     public delegate* unmanaged[Cdecl]<int, byte*, byte*, byte*, byte*, byte*, nuint, int> HttpPost;
     public delegate* unmanaged[Cdecl]<int> Indoor;
+    public delegate* unmanaged[Cdecl]<byte*, byte*, nuint, nuint> GameLookup;
+    public delegate* unmanaged[Cdecl]<byte*, byte*, int> GameAction;
+    public delegate* unmanaged[Cdecl]<uint, uint*, uint*, nint> TextureIcon;
 }
 
 // Mirrors GuHudRect in core/hudmask.nelua.
