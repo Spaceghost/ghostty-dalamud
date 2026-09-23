@@ -1,0 +1,575 @@
+-- Netlab in ghostty-agent (docs/NETLAB.md): a window published as a moq
+-- broadcast over iroh, subscribers to it, and what both look like, for the
+-- in-game panel.
+--
+-- The main node is one iroh endpoint serving one moq origin (agent/moqi.nelua,
+-- vendor/moq-iroh). A publisher reads a capture backend (agent/capture.nelua)
+-- exactly as a window stream does: downscale, tile diff, QOI (core/wincodec.nelua)
+-- into WFRAME frames. Each picture is one moq object; a KEY picture starts a
+-- group (every `group_ms`, and on a size change), so a subscriber that joins
+-- late or loses a group starts again at the next key frame.
+--
+-- Each subscription gets a node of its own (its own endpoint id and UDP
+-- socket), so a subscriber in this same agent is a real iroh peer of the main
+-- node, and one on another machine is the same thing with a ticket carried
+-- over. What a subscription receives goes to `sink` (the agent sends it to the
+-- connection viewing it, docs/NETLAB.md NLFRAME).
+--
+-- Without -D NETLAB (no vendor/moq-iroh) every call answers "netlab not built".
+require 'vector'
+require 'string'
+require 'stringbuilder'
+require 'memory'
+require 'math'
+require 'os'
+require 'core.protocol'
+require 'core.wincodec'
+require 'agent.capture'
+require 'agent.moqi'
+
+global NETLAB_BUILT: boolean <comptime> = #[NETLAB and true or false]#
+global NETLAB_NOT_BUILT: string <comptime> = 'netlab not built (this agent has no vendor/moq-iroh; see docs/NETLAB.md)'
+global NETLAB_TRACK: string <comptime> = 'frames'
+
+-- One object as a subscription hands it over (moqi_object, without the library).
+global NetlabObject = @record{
+  group: uint64,
+  index: uint64,
+  sent_us: uint64,
+  recv_us: uint64,
+  flags: uint32,
+}
+global NETLAB_OBJ_GROUP_START: uint32 <comptime> = 1
+global NETLAB_OBJ_GAP: uint32 <comptime> = 2
+
+local NetlabNode = @record{
+  h: int32,
+  role: string,  -- 'main' or 'viewer'
+  name: string,
+}
+
+global NetlabPub = @record{
+  h: int32,               -- moqi publisher
+  name: string,           -- the broadcast
+  source: string,         -- what the capture backend was asked for
+  cap: pointer,           -- the capture handle; nilptr once it ended
+  why: string,            -- why it ended
+  interval: float64,      -- seconds between pictures
+  group_s: float64,       -- seconds between key frames (groups)
+  due: float64,
+  group_at: float64,      -- when the current group started
+  serial: uint64,
+  max_w: integer, max_h: integer,
+  pw: integer, ph: integer,
+  prev: vector(uint8), scaled: vector(uint8), rects: vector(WinRect),
+  scratch: vector(uint8), body: vector(uint8), q: ByteQueue,
+  seq: uint32,
+  group: int32,           -- the group the last object went into
+  objects: uint64, groups: uint64, bytes: uint64,
+  fps_n: integer, fps_at: float64, fps: float64,
+}
+
+global NetlabSub = @record{
+  id: uint32,             -- the moqi subscription handle, as the protocol names it
+  node: int32,            -- its own node
+  name: string,           -- the broadcast
+  ticket: string,
+  view: integer,          -- the connection its objects go to, -1 for none
+  slow_ms: uint32,
+  need_group: boolean,    -- dropping until a group start (the viewer fell behind)
+  delivered: uint64,
+  dropped: uint64,        -- objects not handed to the viewer
+  ended: boolean,
+  why: string,
+}
+
+global NetlabSink = @function(ctx: pointer, sub: *NetlabSub, o: *NetlabObject, data: *[0]uint8, len: usize): boolean
+
+global AgentNetlab = @record{
+  started: boolean,
+  main: int32,
+  relay: string,
+  port: uint16,
+  key_path: string,       -- the main node's secret key file ('' : a new id every start)
+  backend_ok: boolean,
+  backend: CaptureBackend,
+  nodes: vector(NetlabNode),
+  pubs: vector(NetlabPub),
+  subs: vector(NetlabSub),
+  buf: vector(uint8),
+  -- where a subscription's objects go: true when taken, false to count them dropped
+  sink: NetlabSink,
+  sink_ctx: pointer,
+  log_fn: function(msg: string): void,
+  t0: float64,
+}
+
+local NETLAB_OBJECT_MAX: usize <comptime> = 8 * 1024 * 1024
+
+local function say(self: *AgentNetlab, msg: string): void
+  if self.log_fn ~= nilptr then self.log_fn('netlab: ' .. msg) end
+end
+
+-- moq_iroh's reason for the last failure on this thread.
+local function last_error(): string
+  ## if NETLAB then
+  local b: [512]cchar
+  moqi_last_error((@cstring)(&b), 512)
+  return string.copy((@cstring)(&b))
+  ## else
+  return string.copy(NETLAB_NOT_BUILT)
+  ## end
+end
+
+function AgentNetlab:init(backend_ok: boolean, backend: CaptureBackend, key_path: string, log_fn: function(msg: string): void): void
+  self.backend_ok, self.backend = backend_ok, backend
+  self.key_path = key_path:copy()
+  self.log_fn = log_fn
+  self.main = 0
+  self.t0 = os.now()
+end
+
+-- A node of our own; its handle, or 0 and why.
+local function new_node(self: *AgentNetlab, role: string, name: string, key_path: string): (int32, string)
+  ## if NETLAB then
+  local relay = self.relay:copy()
+  defer relay:destroy() end
+  local key = key_path:copy()
+  defer key:destroy() end
+  local cfg: moqi_node_config = {
+    secret_path = #key > 0 and (@cstring)(key.data) or nilptr,
+    relay = (@cstring)(relay.data),
+    port = role == 'main' and self.port or 0,
+  }
+  local h = moqi_node_new(&cfg)
+  if h <= 0 then return 0, last_error() end
+  self.nodes:push(NetlabNode{ h = h, role = role:copy(), name = name:copy() })
+  return h, ''
+  ## else
+  return 0, string.copy(NETLAB_NOT_BUILT)
+  ## end
+end
+
+local function close_node(self: *AgentNetlab, h: int32): void
+  for i = 0, < #self.nodes do
+    if self.nodes[i].h == h then
+      ## if NETLAB then
+      moqi_node_close(h)
+      ## end
+      self.nodes[i].role:destroy()
+      self.nodes[i].name:destroy()
+      self.nodes:remove(i)
+      return
+    end
+  end
+end
+
+-- Bind the main node. `relay`: 'default', 'off' or a relay URL.
+function AgentNetlab:start(relay: string, port: uint16): (boolean, string)
+  if not NETLAB_BUILT then return false, string.copy(NETLAB_NOT_BUILT) end
+  if self.started then return true, '' end
+  self.relay:destroy()
+  self.relay = #relay > 0 and relay:copy() or string.copy('default')
+  self.port = port
+  local h, why = new_node(self, 'main', 'main', self.key_path)
+  if h == 0 then return false, why end
+  self.main = h
+  self.started = true
+  say(self, 'started (relay ' .. self.relay .. ')')
+  return true, ''
+end
+
+-- The main node's ticket ('' before start).
+function AgentNetlab:ticket(): string
+  ## if NETLAB then
+  if not self.started then return (@string){} end
+  local b: [2048]cchar
+  if moqi_node_ticket(self.main, (@cstring)(&b), 2048) <= 0 then return (@string){} end
+  return string.copy((@cstring)(&b))
+  ## else
+  return (@string){}
+  ## end
+end
+
+local function pub_destroy(p: *NetlabPub): void
+  p.name:destroy() p.source:destroy() p.why:destroy()
+  p.prev:destroy() p.scaled:destroy() p.rects:destroy() p.scratch:destroy() p.body:destroy() p.q:destroy()
+end
+
+local function find_pub(self: *AgentNetlab, name: string): integer
+  for i = 0, < #self.pubs do
+    if self.pubs[i].name == name then return i end
+  end
+  return -1
+end
+
+-- Publish the window `source` names (the capture backend's match text: a
+-- title, `run:CMD` on Linux, '' for the first) as broadcast `name`.
+function AgentNetlab:publish(name: string, source: string, fps: integer, max_w: integer, max_h: integer, group_ms: integer): (boolean, string)
+  if not NETLAB_BUILT then return false, string.copy(NETLAB_NOT_BUILT) end
+  if not self.backend_ok then return false, string.copy('no window capture in this agent (--windows)') end
+  if #name == 0 then return false, string.copy('a broadcast needs a name') end
+  if find_pub(self, name) >= 0 then return false, 'already publishing ' .. name end
+  if not self.started then
+    local ok, why = self:start('default', 0)
+    if not ok then return false, why end
+  end
+  local cap, cwhy = self.backend.open(0, source)
+  if cap == nilptr then
+    local msg = 'capture: ' .. (#cwhy > 0 and cwhy or 'open failed')
+    cwhy:destroy()
+    return false, msg
+  end
+  cwhy:destroy()
+  ## if NETLAB then
+  local cname = name:copy()
+  defer cname:destroy() end
+  local h = moqi_publish(self.main, (@cstring)(cname.data), NETLAB_TRACK)
+  if h <= 0 then
+    self.backend.close(cap)
+    return false, last_error()
+  end
+  if fps <= 0 then fps = 30 end
+  if group_ms <= 0 then group_ms = 1000 end
+  self.pubs:push(NetlabPub{
+    h = h, name = name:copy(), source = source:copy(), cap = cap,
+    interval = 1.0 / math.clamp(fps, 1, 60), group_s = group_ms / 1000.0,
+    max_w = max_w > 0 and max_w or 1280, max_h = max_h > 0 and max_h or 720,
+    group = -1, fps_at = os.now(),
+  })
+  say(self, 'publishing ' .. name .. ' from ' .. (#source > 0 and source or '(first window)'))
+  return true, ''
+  ## else
+  return false, string.copy(NETLAB_NOT_BUILT)
+  ## end
+end
+
+function AgentNetlab:unpublish(name: string): boolean
+  local i = find_pub(self, name)
+  if i < 0 then return false end
+  local p = &self.pubs[i]
+  ## if NETLAB then
+  moqi_publish_close(p.h)
+  ## end
+  if p.cap ~= nilptr then self.backend.close(p.cap) end
+  pub_destroy(p)
+  self.pubs:remove(i)
+  return true
+end
+
+-- Subscribe to broadcast `name` of the node a ticket names, from a new node
+-- of our own. `max_age_ms`: moq skips groups further behind than that.
+-- The subscription's id, or 0 and why.
+function AgentNetlab:subscribe(ticket: string, name: string, max_age_ms: uint32, slow_ms: uint32, view: integer): (uint32, string)
+  if not NETLAB_BUILT then return 0, string.copy(NETLAB_NOT_BUILT) end
+  if #ticket == 0 or #name == 0 then return 0, string.copy('subscribe needs a ticket and a broadcast name') end
+  if not self.started then
+    local ok, why = self:start('default', 0)
+    if not ok then return 0, why end
+  end
+  ## if NETLAB then
+  local label: string
+  do
+    local sb: stringbuilder
+    sb:writef('viewer %d', #self.subs + 1)
+    label = sb:promote()
+  end
+  defer label:destroy() end
+  local node, why = new_node(self, 'viewer', label, '')
+  if node == 0 then return 0, why end
+  local t, n = ticket:copy(), name:copy()
+  defer t:destroy() n:destroy() end
+  local h = moqi_subscribe(node, (@cstring)(t.data), (@cstring)(n.data), NETLAB_TRACK, max_age_ms)
+  if h <= 0 then
+    local err = last_error()
+    close_node(self, node)
+    return 0, err
+  end
+  if slow_ms > 0 then moqi_subscribe_throttle(h, slow_ms) end
+  self.subs:push(NetlabSub{
+    id = (@uint32)(h), node = node, name = name:copy(), ticket = ticket:copy(),
+    view = view, slow_ms = slow_ms, need_group = true,
+  })
+  say(self, 'subscribed ' .. tostring(h) .. ' to ' .. name)
+  return (@uint32)(h), ''
+  ## else
+  return 0, string.copy(NETLAB_NOT_BUILT)
+  ## end
+end
+
+global function netlab_find_sub(self: *AgentNetlab, id: uint32): *NetlabSub
+  for i = 0, < #self.subs do
+    if self.subs[i].id == id then return &self.subs[i] end
+  end
+  return nilptr
+end
+
+function AgentNetlab:throttle(id: uint32, ms: uint32): boolean
+  local s = netlab_find_sub(self, id)
+  if s == nilptr then return false end
+  s.slow_ms = ms
+  ## if NETLAB then
+  moqi_subscribe_throttle((@int32)(id), ms)
+  ## end
+  return true
+end
+
+function AgentNetlab:unsubscribe(id: uint32): boolean
+  for i = 0, < #self.subs do
+    local s = &self.subs[i]
+    if s.id == id then
+      ## if NETLAB then
+      moqi_subscribe_close((@int32)(id))
+      ## end
+      close_node(self, s.node)
+      s.name:destroy() s.ticket:destroy() s.why:destroy()
+      self.subs:remove(i)
+      return true
+    end
+  end
+  return false
+end
+
+-- Everything ends; the main node too.
+function AgentNetlab:stop(): void
+  while #self.pubs > 0 do self:unpublish(self.pubs[#self.pubs - 1].name) end
+  while #self.subs > 0 do self:unsubscribe(self.subs[#self.subs - 1].id) end
+  while #self.nodes > 0 do close_node(self, self.nodes[#self.nodes - 1].h) end
+  self.main = 0
+  self.started = false
+end
+
+function AgentNetlab:destroy(): void
+  self:stop()
+  self.nodes:destroy() self.pubs:destroy() self.subs:destroy() self.buf:destroy()
+  self.relay:destroy() self.key_path:destroy()
+end
+
+-- A connection went (agent/agent.nelua's reap): it views nothing any more,
+-- and the connections after it move down one.
+function AgentNetlab:client_gone(ci: usize): void
+  for i = 0, < #self.subs do
+    local s = &self.subs[i]
+    if s.view == (@integer)(ci) then s.view = -1
+    elseif s.view > (@integer)(ci) then s.view = s.view - 1 end
+  end
+end
+
+-- One picture of publisher `p`, if one is due and anything changed.
+local function pub_frame(self: *AgentNetlab, p: *NetlabPub, now: float64): void
+  if p.cap == nilptr or now < p.due then return end
+  p.due = now + p.interval
+  local st, why = self.backend.state(p.cap)
+  if st == CAPTURE_ENDED then
+    p.why:destroy()
+    p.why = #why > 0 and why:copy() or string.copy('the window closed')
+    self.backend.close(p.cap)
+    p.cap = nilptr
+    say(self, p.name .. ' ended: ' .. p.why)
+    return
+  end
+  if st ~= CAPTURE_LIVE then return end
+  local fr: CaptureFrame
+  if not self.backend.frame(p.cap, &fr) or fr.serial == 0 then return end
+  local f, w, h = wincodec_downscale(fr.pixels, fr.stride, fr.w, fr.h, p.max_w, p.max_h, &p.scaled)
+  local src, stride = fr.pixels, fr.stride
+  if f > 1 then src, stride = (@*[0]uint8)(&p.scaled[0]), (@usize)(w * 4) end
+  -- a key frame starts a group: the first, a new size, or the group is old enough
+  local key = w ~= p.pw or h ~= p.ph or p.group < 0 or now - p.group_at >= p.group_s
+  if not key and fr.serial == p.serial then return end
+  p.serial = fr.serial
+  if key then
+    wincodec_diff(nilptr, 0, src, stride, w, h, &p.rects)
+  else
+    wincodec_diff((@*[0]uint8)(&p.prev[0]), (@usize)(w * 4), src, stride, w, h, &p.rects)
+    if #p.rects == 0 then return end
+  end
+  p.seq = p.seq + 1
+  p.q:consume(p.q:len())
+  wincodec_write_frames(&p.q, 0, p.seq, src, stride, w, h, key, &p.rects, &p.scratch, &p.body)
+  ## if NETLAB then
+  local g = moqi_publish_object(p.h, p.q:peek(), p.q:len(), key)
+  if g < 0 then
+    local err = last_error()
+    say(self, p.name .. ': ' .. err)
+    err:destroy()
+    return
+  end
+  p.group = g
+  ## end
+  p.objects = p.objects + 1
+  p.bytes = p.bytes + p.q:len()
+  if key then
+    p.groups = p.groups + 1
+    p.group_at = now
+  end
+  -- keep what subscribers now have, for the next diff
+  local row = (@usize)(w * 4)
+  if key then
+    p.prev:resize(row * (@usize)(h))
+    for y = 0, < h do memory.copy(&p.prev[(@usize)(y) * row], &src[(@usize)(y) * stride], row) end
+    p.pw, p.ph = w, h
+  else
+    for k = 0, < #p.rects do
+      local r = p.rects[k]
+      for y = (@integer)(r.y), < (@integer)(r.y) + (@integer)(r.h) do
+        memory.copy(&p.prev[(@usize)(y) * row + (@usize)(r.x) * 4], &src[(@usize)(y) * stride + (@usize)(r.x) * 4], (@usize)(r.w) * 4)
+      end
+    end
+  end
+  p.fps_n = p.fps_n + 1
+  if now - p.fps_at >= 1 then
+    p.fps = p.fps_n / (now - p.fps_at)
+    p.fps_n, p.fps_at = 0, now
+  end
+end
+
+-- Hand what a subscription received to its viewer. A viewer that did not
+-- take an object (it is behind) gets nothing more until a group start.
+local function sub_drain(self: *AgentNetlab, s: *NetlabSub): void
+  ## if NETLAB then
+  if s.ended then return end
+  if #self.buf < 65536 then self.buf:resize(65536) end
+  while true do
+    local o: moqi_object
+    local r = moqi_read((@int32)(s.id), &o, (@*[0]uint8)(&self.buf[0]), #self.buf)
+    if r == MOQI_ERR_SMALL and o.len <= NETLAB_OBJECT_MAX then
+      self.buf:resize((@usize)(o.len))
+      r = moqi_read((@int32)(s.id), &o, (@*[0]uint8)(&self.buf[0]), #self.buf)
+    end
+    if r == 0 then return end
+    if r < 0 then
+      s.ended = true
+      s.why:destroy()
+      s.why = last_error()
+      say(self, 'subscription ' .. tostring(s.id) .. ' ' .. s.why)
+      return
+    end
+    local ob: NetlabObject = { group = o.group, index = o.index, sent_us = o.sent_us, recv_us = o.recv_us, flags = (@uint32)(o.flags) }
+    local start = (ob.flags & NETLAB_OBJ_GROUP_START) ~= 0
+    if (ob.flags & NETLAB_OBJ_GAP) ~= 0 and not start then s.need_group = true end
+    if start then s.need_group = false end
+    local taken = false
+    if not s.need_group and self.sink ~= nilptr then
+      taken = self.sink(self.sink_ctx, s, &ob, (@*[0]uint8)(&self.buf[0]), (@usize)(o.len))
+    end
+    if taken then
+      s.delivered = s.delivered + 1
+    else
+      s.dropped = s.dropped + 1
+      if s.view >= 0 then s.need_group = true end
+    end
+  end
+  ## end
+end
+
+-- Once per main loop turn.
+function AgentNetlab:tick(now: float64): void
+  if not self.started then return end
+  for i = 0, < #self.pubs do pub_frame(self, &self.pubs[i], now) end
+  ## if NETLAB then
+  moqi_wake_clear()
+  ## end
+  for i = 0, < #self.subs do sub_drain(self, &self.subs[i]) end
+end
+
+-- The descriptor that wakes the loop when a subscription has something, -1 for none.
+function AgentNetlab:wake_fd(): cint
+  ## if NETLAB then
+  if self.started then return moqi_wake_fd() end
+  ## end
+  return -1
+end
+
+-- The longest the main loop may sleep (ms), -1 for no limit.
+function AgentNetlab:wait_ms(now: float64): integer
+  local best = -1
+  for i = 0, < #self.pubs do
+    local p = &self.pubs[i]
+    if p.cap ~= nilptr then
+      local ms = math.max(0, math.ceil((p.due - now) * 1000))
+      if best < 0 or ms < best then best = ms end
+    end
+  end
+  -- a subscription that has not woken the loop yet: moq_iroh has no fd on Windows
+  if #self.subs > 0 and (best < 0 or best > 50) and self:wake_fd() < 0 then best = 50 end
+  return best
+end
+
+local function json_str(sb: *stringbuilder, s: string): void
+  sb:writebyte('"'_b)
+  for i = 0, < s.size do
+    local c = s.data[i]
+    if c == '"'_b or c == '\\'_b then sb:writebyte('\\'_b) sb:writebyte(c)
+    elseif c < 0x20 then sb:writef('\\u%04x', c)
+    else sb:writebyte(c) end
+  end
+  sb:writebyte('"'_b)
+end
+
+-- A node's moq_iroh stats (JSON) into sb, or null.
+local function node_stats(sb: *stringbuilder, h: int32): void
+  ## if NETLAB then
+  local need = moqi_stats(h, nilptr, 0)
+  if need == MOQI_ERR_SMALL then
+    local cap: usize = 65536
+    while true do
+      local b = (@*[0]cchar)(default_allocator:alloc(cap))
+      if b == nilptr then break end
+      local n = moqi_stats(h, (@cstring)(b), cap)
+      if n > 0 then
+        sb:write(string{data=(@*[0]byte)(b), size=(@usize)(n)})
+        default_allocator:dealloc(b)
+        return
+      end
+      default_allocator:dealloc(b)
+      if n ~= MOQI_ERR_SMALL or cap >= 16 * 1024 * 1024 then break end
+      cap = cap * 4
+    end
+  end
+  ## end
+  sb:write('null')
+end
+
+-- What the panel draws, as JSON (docs/NETLAB.md NLSTAT).
+function AgentNetlab:stats_json(now: float64): string
+  local sb: stringbuilder
+  sb:writef('{"t_ms":%d,"built":%s,"started":%s,"backend":',
+    (@int64)((now - self.t0) * 1000), NETLAB_BUILT and 'true' or 'false', self.started and 'true' or 'false')
+  json_str(&sb, self.backend_ok and self.backend.name or '')
+  sb:write(',"relay":') json_str(&sb, self.relay)
+  sb:write(',"nodes":[')
+  for i = 0, < #self.nodes do
+    local n = &self.nodes[i]
+    if i > 0 then sb:writebyte(','_b) end
+    sb:write('{"role":') json_str(&sb, n.role)
+    sb:write(',"name":') json_str(&sb, n.name)
+    sb:writef(',"h":%d,"stats":', n.h)
+    node_stats(&sb, n.h)
+    sb:writebyte('}'_b)
+  end
+  sb:write('],"pubs":[')
+  for i = 0, < #self.pubs do
+    local p = &self.pubs[i]
+    if i > 0 then sb:writebyte(','_b) end
+    sb:write('{"name":') json_str(&sb, p.name)
+    sb:write(',"source":') json_str(&sb, p.source)
+    sb:writef(',"h":%d,"live":%s,"w":%d,"h_px":%d,"fps":%.1f,"objects":%d,"groups":%d,"bytes":%d,"group":%d,"group_ms":%d,"why":',
+      p.h, p.cap ~= nilptr and 'true' or 'false', p.pw, p.ph, p.fps, p.objects, p.groups, p.bytes, p.group, (@integer)(p.group_s * 1000))
+    json_str(&sb, p.why)
+    sb:writebyte('}'_b)
+  end
+  sb:write('],"subs":[')
+  for i = 0, < #self.subs do
+    local s = &self.subs[i]
+    if i > 0 then sb:writebyte(','_b) end
+    sb:writef('{"id":%d,"node":%d,"name":', s.id, s.node)
+    json_str(&sb, s.name)
+    sb:writef(',"viewed":%s,"slow_ms":%d,"delivered":%d,"dropped":%d,"ended":%s,"why":',
+      s.view >= 0 and 'true' or 'false', s.slow_ms, s.delivered, s.dropped, s.ended and 'true' or 'false')
+    json_str(&sb, s.why)
+    sb:writebyte('}'_b)
+  end
+  sb:write(']}')
+  return sb:promote()
+end

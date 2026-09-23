@@ -122,11 +122,11 @@ source "$ROOT/tools/wayland-flags.sh" # the Wayland compositor backend when its 
 [[ ${#WAYLAND_NELUA[@]} -gt 0 ]] && echo "with the Wayland compositor (wlroots 0.20)"
 # ONE --cflags. Nelua keeps the last it is given, so passing a second here
 # silently dropped every Wayland link flag and the agent failed to find
-# xkbcommon, wayland-server and pixman-1.
-AGENT_CFLAGS="$WAYLAND_CFLAGS"
-AGENT_NELUA=("${WAYLAND_DEFINE[@]}")
+# xkbcommon, wayland-server and pixman-1. tools/netlab-flags.sh builds
+# AGENT_NELUA with the Wayland and netlab defines and that one --cflags.
+# shellcheck source=tools/netlab-flags.sh
+source "$ROOT/tools/netlab-flags.sh" # netlab (moq over iroh) when vendor/moq-iroh is there
 [[ -n "$(iroh_host_ldflags)" ]] && AGENT_NELUA+=(-D IROH)
-[[ -n "$AGENT_CFLAGS" ]] && AGENT_NELUA+=("--cflags=$AGENT_CFLAGS")
 [[ -n "$(iroh_host_ldflags)" ]] && AGENT_NELUA+=("--ldflags=$(iroh_host_ldflags)")
 "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc "${AGENT_NELUA[@]}" --cache-dir build/nelua-cache -L . -o build/dist/ghostty-agent -b agent/agent.nelua
 mkdir -p build/dist/lua && cp lua/*.lua build/dist/lua/

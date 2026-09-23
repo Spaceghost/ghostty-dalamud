@@ -5,8 +5,8 @@
 #     all     everything the full plugin build needs (the default)
 #     agent   only what tools/build-agent.sh needs: the Nelua compiler, the
 #             vendored C the agent's WireGuard compiles in (Monocypher, lwIP,
-#             the QR code generator), and the Wayland SDK headers when this
-#             host can extract them
+#             the QR code generator), the Wayland SDK headers when this host
+#             can extract them, and moq-iroh (netlab) when cargo is there
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/toolchain.env"
@@ -152,6 +152,25 @@ if [[ "$(uname -s)" == Linux && "${SKIP_WAYLAND:-0}" != 1 && ! -f "$V/wayland-sd
   fi
 fi
 [[ -f "$V/wayland-sdk/.pinned" ]] && echo "wayland-sdk (wlroots 0.20)"
+
+# moq over iroh for the agent's netlab (docs/NETLAB.md; Linux only; SKIP_NETLAB=1
+# to skip). The fork's rs/moq-iroh-c at the pinned commit, built with cargo into
+# vendor/moq-iroh: libmoq_iroh.a and moq_iroh.h. Without it the agent builds
+# without netlab (tools/netlab-flags.sh).
+if [[ "$(uname -s)" == Linux && "${SKIP_NETLAB:-0}" != 1 ]] &&
+   [[ "$(cat "$V/moq-iroh/.pinned" 2>/dev/null)" != "$MOQ_IROH_COMMIT" ]]; then
+  if command -v cargo >/dev/null; then
+    clone_pin moq "$MOQ_IROH_REPOSITORY" "$MOQ_IROH_COMMIT"
+    ( cd "$V/moq" && cargo build --locked --release -p moq-iroh-c )
+    rm -rf "$V/moq-iroh"
+    mkdir -p "$V/moq-iroh"
+    cp "$V/moq/target/release/libmoq_iroh.a" "$V/moq/rs/moq-iroh-c/include/moq_iroh.h" "$V/moq-iroh/"
+    printf '%s' "$MOQ_IROH_COMMIT" > "$V/moq-iroh/.pinned"
+  else
+    echo "moq-iroh skipped: cargo is needed (the agent builds without netlab)"
+  fi
+fi
+[[ -f "$V/moq-iroh/.pinned" ]] && echo "moq-iroh @ $(cut -c1-9 "$V/moq-iroh/.pinned")"
 
 if [[ "$MODE" == agent ]]; then
   echo 'agent: the Nelua compiler and the WireGuard sources are all tools/build-agent.sh needs'

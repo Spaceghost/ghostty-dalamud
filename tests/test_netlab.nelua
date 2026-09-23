@@ -1,0 +1,189 @@
+-- The agent's netlab (agent/netlab.nelua, docs/NETLAB.md) against the test
+-- capture backend. Built twice by tests/run.sh: without -D NETLAB every call
+-- says netlab is not built; with it (vendor/moq-iroh), a window is published
+-- over iroh and two subscriptions in this process receive it through real
+-- iroh connections: the fast one's pictures decode back to exactly what the
+-- backend drew, the slow one (reading 150 ms an object at 30 fps, no age budget) loses whole
+-- groups and says so, and the stats show a selected direct path with its
+-- round-trip time.
+require 'agent.netlab'
+require 'agent.capture'
+require 'core.wincodec'
+require 'core.protocol'
+require 'string'
+require 'vector'
+require 'os'
+
+## cinclude '<unistd.h>'
+local function usleep(us: cuint): cint <cimport, nodecl> end
+
+local ok, backend, bwhy = capture_test_backend()
+assert(ok, bwhy)
+
+## if not NETLAB then
+do
+  local nl: AgentNetlab
+  nl:init(true, backend, '', nilptr)
+  local sok, why = nl:start('off', 0)
+  assert(not sok and why == NETLAB_NOT_BUILT, why)
+  why:destroy()
+  local pok, pwhy = nl:publish('netlab', '', 30, 0, 0, 1000)
+  assert(not pok and pwhy == NETLAB_NOT_BUILT)
+  pwhy:destroy()
+  local id, swhy = nl:subscribe('iroh://x', 'netlab', 500, 0, -1)
+  assert(id == 0 and swhy == NETLAB_NOT_BUILT)
+  swhy:destroy()
+  local t = nl:ticket()
+  assert(#t == 0)
+  local js = nl:stats_json(os.now())
+  assert(js:find('"built":false', 1, true) > 0, js)
+  js:destroy()
+  nl:destroy()
+end
+print('OK (netlab not built)')
+## else
+
+-- What arrived, per subscription.
+local Seen = @record{
+  pictures: integer,  -- complete pictures decoded (the fast one)
+  exact: integer,     -- ... that matched the backend's frame exactly
+  keys: integer,
+  objects: integer,
+  gaps: integer,      -- objects flagged: groups were skipped or cut before them
+  jumps: integer,     -- groups that never arrived
+  last_group: int64,
+  pix: vector(uint8),
+  w: integer, h: integer,
+  n: integer,         -- the backend frame number the last picture showed
+  expect: vector(uint8),
+}
+local State = @record{ fast: uint32, slow: uint32, f: Seen, s: Seen }
+
+-- The test window's frame number is in its top-left block (capture_test_render).
+local function frame_matches(seen: *Seen): boolean
+  local w, h = seen.w, seen.h
+  for n = math.max(1, seen.n), seen.n + 400 do
+    capture_test_render(1, n, w, h, &seen.expect)
+    -- compare the numbered block first: it tells the frames apart
+    if seen.expect[0] == seen.pix[0] and seen.expect[1] == seen.pix[1] and seen.expect[2] == seen.pix[2] then
+      local same = true
+      for i = 0, < w * h * 4 do
+        if i % 4 ~= 3 and seen.expect[i] ~= seen.pix[i] then same = false break end
+      end
+      if same then seen.n = n return true end
+    end
+  end
+  return false
+end
+
+local function take(ctx: pointer, sub: *NetlabSub, o: *NetlabObject, data: *[0]uint8, len: usize): boolean
+  local st = (@*State)(ctx)
+  local seen = sub.id == st.fast and &st.f or &st.s
+  seen.objects = seen.objects + 1
+  if (o.flags & NETLAB_OBJ_GAP) ~= 0 then seen.gaps = seen.gaps + 1 end
+  if seen.last_group >= 0 and (@int64)(o.group) > seen.last_group + 1 then
+    seen.jumps = seen.jumps + (@integer)((@int64)(o.group) - seen.last_group - 1)
+  end
+  seen.last_group = (@int64)(o.group)
+  -- the object is one picture: WFRAME frames, each with its protocol header
+  local pos: usize = 0
+  while pos + PROTO_HEADER <= len do
+    local typ = data[pos]
+    local flen = (@usize)(proto.get_u32((@*[0]uint8)(&data[pos + 1])))
+    assert(typ == PROTO_WFRAME and pos + PROTO_HEADER + flen <= len)
+    local fok, fr = wincodec_parse((@*[0]uint8)(&data[pos + PROTO_HEADER]), flen)
+    assert(fok)
+    local w, h = (@integer)(fr.w), (@integer)(fr.h)
+    if (fr.flags & WINCODEC_FLAG_KEY) ~= 0 then
+      seen.keys = seen.keys + 1
+      seen.w, seen.h = w, h
+      seen.pix:resize((@usize)(w * h * 4))
+    end
+    assert(seen.w == w and seen.h == h, 'a delta for a picture of another size')
+    while true do
+      local rok, rect = wincodec_next_rect(&fr)
+      if not rok then break end
+      assert(wincodec_apply_rect(&rect, (@*[0]uint8)(&seen.pix[0]), (@usize)(w * 4)))
+    end
+    if (fr.flags & WINCODEC_FLAG_END) ~= 0 then
+      seen.pictures = seen.pictures + 1
+      if frame_matches(seen) then seen.exact = seen.exact + 1 end
+    end
+    pos = pos + PROTO_HEADER + flen
+  end
+  assert(pos == len, 'trailing bytes in an object')
+  return true
+end
+
+local function count(js: string, needle: string): integer
+  local n, at = 0, 1
+  while true do
+    local i = js:find(needle, at, true)
+    if i <= 0 then return n end
+    n, at = n + 1, i + #needle
+  end
+  return n
+end
+
+do
+  local st: State
+  st.f.last_group, st.s.last_group = -1, -1
+  local nl: AgentNetlab
+  nl:init(true, backend, '', nilptr)
+  nl.sink, nl.sink_ctx = take, &st
+
+  local sok, swhy = nl:start('off', 0)
+  assert(sok, swhy)
+  -- a group every 300 ms: 9 pictures each at 30 fps
+  local pok, pwhy = nl:publish('netlab', 'pattern one', 30, 0, 0, 300)
+  assert(pok, pwhy)
+  local again, awhy = nl:publish('netlab', 'pattern one', 30, 0, 0, 300)
+  assert(not again and awhy:find('already', 1, true) > 0)
+  awhy:destroy()
+  local ticket = nl:ticket()
+  assert(ticket:find('iroh://', 1, true) == 1 and ticket:find('addr=', 1, true) > 0, ticket)
+
+  local fwhy: string
+  st.fast, fwhy = nl:subscribe(ticket, 'netlab', 300, 0, 0)
+  assert(st.fast ~= 0, fwhy)
+  local slow_why: string
+  st.slow, slow_why = nl:subscribe(ticket, 'netlab', 0, 150, -1)
+  assert(st.slow ~= 0, slow_why)
+  assert(nl:wake_fd() >= 0)
+
+  local deadline = os.now() + 25
+  while os.now() < deadline and (st.f.exact < 45 or st.s.jumps + st.s.gaps == 0) do
+    nl:tick(os.now())
+    local ms = nl:wait_ms(os.now())
+    usleep((@cuint)(math.clamp(ms, 1, 20) * 1000))
+  end
+  print(('fast: %d pictures (%d exact, %d keys), slow: %d objects, %d groups missed, %d gaps'):format(
+    st.f.pictures, st.f.exact, st.f.keys, st.s.objects, st.s.jumps, st.s.gaps))
+  assert(st.f.exact >= 45, 'the fast subscription did not see the window')
+  assert(st.f.exact == st.f.pictures, 'a picture did not decode to what the backend drew')
+  assert(st.f.keys >= 3 and st.f.gaps == 0 and st.f.jumps == 0)
+  assert(st.s.objects > 0, 'the slow subscription got nothing')
+  assert(st.s.jumps + st.s.gaps > 0, 'the slow subscription never fell behind')
+
+  local js = nl:stats_json(os.now())
+  -- three nodes: main and one per subscription; the main one serves two peers
+  assert(count(js, '"role":"main"') == 1 and count(js, '"role":"viewer"') == 2, js)
+  assert(count(js, '"dir":"in"') == 2 and count(js, '"dir":"out"') == 2, js)
+  assert(js:find('"kind":"direct"', 1, true) > 0 and js:find('"selected":true', 1, true) > 0, js)
+  assert(js:find('"rtt_us":', 1, true) > 0, js)
+  assert(js:find('"name":"netlab","source":"pattern one"', 1, true) > 0, js)
+  assert(js:find('"skipped":0', 1, true) > 0, 'the fast one skipped something')
+  js:destroy()
+
+  -- slower still, then back to full speed
+  assert(nl:throttle(st.slow, 0) and not nl:throttle(999999, 5))
+  assert(nl:unsubscribe(st.slow) and not nl:unsubscribe(st.slow))
+  assert(nl:unpublish('netlab') and not nl:unpublish('netlab'))
+  nl:stop()
+  assert(not nl.started and #nl.nodes == 0)
+  ticket:destroy()
+  nl:destroy()
+  st.f.pix:destroy() st.f.expect:destroy() st.s.pix:destroy() st.s.expect:destroy()
+end
+print('OK')
+## end
