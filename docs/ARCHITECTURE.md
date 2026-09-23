@@ -486,6 +486,7 @@ core/sys/     net (POSIX + Winsock), conpty (Windows), procguard, fs / fsbase, p
 core/shaders/ HLSL sources and the committed DXBC the core embeds
 agent/        ghostty-agent PTY server (Nelua): agent.nelua, logic, pty_posix / sys_posix, pty_windows / sys_windows / winloop
 agent/        raw jobs (docs/JOBS.md): jobs.nelua, job_posix / job_windows, claude.nelua (the Claude Code command line)
+agent/        embedded WireGuard (docs/WIREGUARD.md): crypto.nelua (Monocypher), blake2s.nelua
 lua/          shipped policy: init.lua, keymap.lua, migrate.lua, assistant.lua (/term ask), selftest.lua (/term selftest), ...
 themes/       shipped colour themes (Ghostty theme files, read by lua/themes.lua)
 shim/         GhosttyDalamud (plugin) and Umbra.Ghostty (widget) C# projects
@@ -517,6 +518,11 @@ them (`tools/wayland-flags.sh`); without them it builds without the Linux
 window backend. Dalamud's ImGui uses 16-bit
 `ImWchar` (verified against `Dalamud.Bindings.ImGui`'s generated `ImGuiIO`),
 so `InputQueueCharacters` holds BMP code points.
+
+The agent's embedded WireGuard (docs/WIREGUARD.md) adds three vendored C
+libraries, each pinned by sha256: Monocypher 4.0.2, lwIP 2.2.1 and Nayuki's QR
+Code generator 1.8.0. `tools/fetch-vendor.sh` fetches them in both modes, since
+the agent compiles them in.
 
 ## Contributing constraints and tests
 
@@ -559,6 +565,7 @@ so `InputQueueCharacters` holds BMP code points.
 | `test_agent_logic` | the agent's pure parts: OPEN parsing, replay plans, ring indexes, CRLF for the Windows clipboard, env entries, default shells, the Windows wait timeout, command line quoting |
 | `test_capture_win32` | the Win32 window capture backend's pure parts: USB HID → virtual key, key message lParams, the characters keys stand for, mouse and wheel words, SendInput absolute coordinates, blank (all-black) captures, UTF-8 → UTF-16 for WM_CHAR, WLISTR lines, window matching |
 | `test_agent` | `ghostty-agent` end to end over TCP |
+| `test_wg_crypto` | the embedded WireGuard's primitives (docs/WIREGUARD.md): BLAKE2s against RFC 7693 (Appendix B and the Appendix E self-test), HMAC-BLAKE2s and the KDF against Python's hashlib/hmac, X25519 against RFC 7748 (and the all-zero result refused), ChaCha20-Poly1305 against RFC 8439 (tampering, in place, WireGuard's nonce form, empty messages), XChaCha20-Poly1305 against draft-irtf-cfrg-xchacha, base64 keys as wg(8) writes them |
 | `test_wincodec` | remote window frames: changed tiles, QOI both ways, banding, WFRAME write/parse/apply, malformed input, downscaling |
 | `test_capture_mac` | the macOS capture backend's pure parts: HID to kVK keycodes, key flags, mouse event types and click counts, frame pixels to global points, the Block literal layout, `run:APP`, window picking and WLISTR lines, UTF-16 text chunks, CGImage layouts to BGRA (the backend itself has never run on a Mac) |
 | `test_agent_windows` | remote windows end to end over TCP against `--windows test`: list, open by id and match, KEY and delta frames rebuilt, scaling, flow control, every input kind, close, WEND, failures, streams per connection, `--windows off` |

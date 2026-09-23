@@ -88,6 +88,7 @@ unset UMBRA_GHOSTTY_HOME GHOSTTY_HOME # the migration and config home read these
 rm -rf build/test-scratch && mkdir -p build/test-scratch/surface/config
 run test_ghostty
 run test_wincodec
+run test_wg_crypto # the embedded WireGuard's primitives against published vectors
 run test_pngenc
 run test_capture
 run test_capture_win32
