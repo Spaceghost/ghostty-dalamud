@@ -310,6 +310,7 @@ local function ffmpeg_argv(self: *AgentClips, c: *AgentClip, argv: *vector(strin
   local size: stringbuilder
   size:writef('%dx%d', c.w, c.h)
   local fps: stringbuilder
+  defer fps:destroy() end -- copied into argv, so it is freed on every return
   fps:writef('%d', c.fps)
   argv:push(self.ffmpeg:copy())
   argv:push(string.copy('-y'))
@@ -335,7 +336,7 @@ local function ffmpeg_argv(self: *AgentClips, c: *AgentClip, argv: *vector(strin
     argv:push(string.copy('-pix_fmt'))
     argv:push(string.copy('yuv420p'))
     argv:push(string.copy('-r'))
-    argv:push(fps:promote())
+    argv:push(string.copy(fps:view()))
     argv:push(string.copy('-f'))
     argv:push(string.copy('v4l2'))
     argv:push(c.device:copy())
@@ -429,10 +430,13 @@ local function handle_copen(self: *AgentClips, ci: usize, q: *ByteQueue, payload
   end
   if not self.looked then
     self.looked = true
-    self.ffmpeg = find_ffmpeg()
-    self.dir = clips_dir()
+    -- a second look (the encoder was installed since) replaces the first one's
+    self.ffmpeg:destroy() self.ffmpeg = find_ffmpeg()
+    self.dir:destroy() self.dir = clips_dir()
     if #self.ffmpeg > 0 then
-      say(self, 'clips: ffmpeg is ' .. self.ffmpeg)
+      local msg = 'clips: ffmpeg is ' .. self.ffmpeg
+      say(self, msg)
+      msg:destroy()
     end
   end
   if #self.ffmpeg == 0 then
