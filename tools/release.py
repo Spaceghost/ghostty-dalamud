@@ -15,19 +15,37 @@ import zipfile
 
 NAME = "GhosttyDalamud"
 REPOSITORY = "https://github.com/Spaceghost/ghostty-dalamud"
-LUA_FILES = {
-    "animation.lua", "bell.lua", "changelog.lua", "init.lua", "keymap.lua",
-    "migrate.lua", "settings.lua", "showcase.lua", "vote.lua", "world.lua",
-}
+# the public author the manifest names (shim/GhosttyDalamud/GhosttyDalamud.json)
+AUTHOR = "Johnneylee Jack Rollins"
+
+
+class ReleaseError(ValueError):
+    """An artifact is unsafe, incomplete, or inconsistent."""
+
+
+ROOT = Path(__file__).resolve().parents[1]
+
+
+def shipped_lua(root: Path = ROOT) -> set[str]:
+    """The Lua modules the package carries: GhosttyDalamud.csproj packs lua/*.lua.
+
+    Only committed files count, so a stray untracked lua/private.lua in a working
+    tree is still rejected if it ends up in the zip.
+    """
+    listed = subprocess.run(["git", "-C", str(root), "ls-files", "-z", "--", "lua/*.lua"],
+                            capture_output=True, text=True, check=True).stdout
+    names = {PurePosixPath(p).name for p in listed.split("\0") if p and p.count("/") == 1}
+    if "init.lua" not in names:
+        raise ReleaseError(f"no committed lua/*.lua under {root}")
+    return names
+
+
+LUA_FILES = shipped_lua()
 PAYLOAD = {f"{NAME}.dll", f"{NAME}.json", "ghostty_core.dll"} | {
     f"lua/{name}" for name in LUA_FILES
 }
 MAX_FILE = 128 * 1024 * 1024
 MAX_TOTAL = 256 * 1024 * 1024
-
-
-class ReleaseError(ValueError):
-    """An artifact is unsafe, incomplete, or inconsistent."""
 
 
 def validate_manifest(manifest: dict) -> dict:
@@ -38,7 +56,7 @@ def validate_manifest(manifest: dict) -> dict:
             raise ReleaseError(f"missing manifest field: {key}")
     if manifest.get("InternalName") != NAME:
         raise ReleaseError("InternalName must be GhosttyDalamud")
-    if manifest["Author"] != "Spaceghost" or manifest["RepoUrl"] != REPOSITORY:
+    if manifest["Author"] != AUTHOR or manifest["RepoUrl"] != REPOSITORY:
         raise ReleaseError("unexpected public author or source repository")
     version = manifest.get("AssemblyVersion", "")
     if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", version):
@@ -153,7 +171,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("command", choices=("check", "repo", "submission"))
     parser.add_argument("--package", type=Path)
-    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parents[1])
+    parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--download-url")
     parser.add_argument("--timestamp", type=int, help="release/source commit Unix timestamp")

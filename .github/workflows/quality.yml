@@ -61,7 +61,7 @@ jobs:
           path: |
             ~/.cache/ghostty-dalamud-ci
             vendor
-          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ runner.environment }}-${{ hashFiles('toolchain.env', 'tools/build-common.sh', 'tools/zig-cc.sh') }}
       - name: ${{ matrix.kind }}
         id: check
         env:
