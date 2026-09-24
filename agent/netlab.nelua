@@ -128,8 +128,15 @@ global AgentNetlab = @record{
 
 local NETLAB_OBJECT_MAX: usize <comptime> = 8 * 1024 * 1024
 
-local function say(self: *AgentNetlab, msg: string): void
-  if self.log_fn ~= nilptr then self.log_fn('netlab: ' .. msg) end
+-- A log line from pieces (strings and integers): built here and freed after
+-- the log takes it, since `say(self, 'a ' .. b)` would leak the concatenation.
+local function say(self: *AgentNetlab, ...: varargs): void
+  if self.log_fn == nilptr then return end
+  local sb: stringbuilder
+  sb:write('netlab: ', ...)
+  local line = sb:promote()
+  self.log_fn(line)
+  line:destroy()
 end
 
 -- moq_iroh's reason for the last failure on this thread.
@@ -197,7 +204,7 @@ function AgentNetlab:start(relay: string, port: uint16): (boolean, string)
   if h == 0 then return false, why end
   self.main = h
   self.started = true
-  say(self, 'started (relay ' .. self.relay .. ')')
+  say(self, 'started (relay ', self.relay, ')')
   return true, ''
 end
 
@@ -259,16 +266,14 @@ function AgentNetlab:publish(name: string, source: string, fps: integer, max_w: 
     max_w = max_w > 0 and max_w or 1280, max_h = max_h > 0 and max_h or 720,
     group = -1, fps_at = os.now(),
   })
-  say(self, 'publishing ' .. name .. ' from ' .. (#source > 0 and source or '(first window)'))
+  say(self, 'publishing ', name, ' from ', #source > 0 and source or '(first window)')
   return true, ''
   ## else
   return false, string.copy(NETLAB_NOT_BUILT)
   ## end
 end
 
-function AgentNetlab:unpublish(name: string): boolean
-  local i = find_pub(self, name)
-  if i < 0 then return false end
+local function pub_close(self: *AgentNetlab, i: integer): void
   local p = &self.pubs[i]
   ## if NETLAB then
   moqi_publish_close(p.h)
@@ -276,6 +281,12 @@ function AgentNetlab:unpublish(name: string): boolean
   if p.cap ~= nilptr then self.backend.close(p.cap) end
   pub_destroy(p)
   self.pubs:remove(i)
+end
+
+function AgentNetlab:unpublish(name: string): boolean
+  local i = find_pub(self, name)
+  if i < 0 then return false end
+  pub_close(self, i)
   return true
 end
 
@@ -312,7 +323,7 @@ function AgentNetlab:subscribe(ticket: string, name: string, max_age_ms: uint32,
     id = (@uint32)(h), node = node, name = name:copy(), ticket = ticket:copy(),
     view = view, slow_ms = slow_ms, need_group = true,
   })
-  say(self, 'subscribed ' .. tostring(h) .. ' to ' .. name)
+  say(self, 'subscribed ', h, ' to ', name)
   return (@uint32)(h), ''
   ## else
   return 0, string.copy(NETLAB_NOT_BUILT)
@@ -354,7 +365,7 @@ end
 
 -- Everything ends; the main node too.
 function AgentNetlab:stop(): void
-  while #self.pubs > 0 do self:unpublish(self.pubs[#self.pubs - 1].name) end
+  while #self.pubs > 0 do pub_close(self, #self.pubs - 1) end
   while #self.subs > 0 do self:unsubscribe(self.subs[#self.subs - 1].id) end
   while #self.nodes > 0 do close_node(self, self.nodes[#self.nodes - 1].h) end
   self.main = 0
@@ -396,7 +407,7 @@ local function pub_frame(self: *AgentNetlab, p: *NetlabPub, now: float64): void
     p.why = #why > 0 and why:copy() or string.copy('the window closed')
     self.backend.close(p.cap)
     p.cap = nilptr
-    say(self, p.name .. ' ended: ' .. p.why)
+    say(self, p.name, ' ended: ', p.why)
     return
   end
   if st ~= CAPTURE_LIVE then return end
@@ -422,7 +433,7 @@ local function pub_frame(self: *AgentNetlab, p: *NetlabPub, now: float64): void
   local g = moqi_publish_object(p.h, p.q:peek(), p.q:len(), key)
   if g < 0 then
     local err = last_error()
-    say(self, p.name .. ': ' .. err)
+    say(self, p.name, ': ', err)
     err:destroy()
     return
   end
@@ -450,7 +461,7 @@ local function pub_frame(self: *AgentNetlab, p: *NetlabPub, now: float64): void
   end
   p.fps_n = p.fps_n + 1
   if now - p.fps_at >= 1 then
-    p.fps = p.fps_n / (now - p.fps_at)
+    p.fps = (@float64)(p.fps_n) / (now - p.fps_at)
     p.fps_n, p.fps_at = 0, now
   end
 end
@@ -473,7 +484,7 @@ local function sub_drain(self: *AgentNetlab, s: *NetlabSub): void
       s.ended = true
       s.why:destroy()
       s.why = last_error()
-      say(self, 'subscription ' .. tostring(s.id) .. ' ' .. s.why)
+      say(self, 'subscription ', s.id, ' ', s.why)
       return
     end
     local ob: NetlabObject = { group = o.group, index = o.index, sent_us = o.sent_us, recv_us = o.recv_us, flags = (@uint32)(o.flags) }
@@ -550,7 +561,7 @@ function AgentNetlab:stats_json(now: float64): string
     if i > 0 then sb:writebyte(','_b) end
     sb:write('{"role":') json_str(&sb, n.role)
     sb:write(',"name":') json_str(&sb, n.name)
-    sb:writef(',"h":%d,"stats":', n.h)
+    sb:writef(',"h":%d,"stats":', (@integer)(n.h))
     node_stats(&sb, n.h)
     sb:writebyte('}'_b)
   end
@@ -560,8 +571,12 @@ function AgentNetlab:stats_json(now: float64): string
     if i > 0 then sb:writebyte(','_b) end
     sb:write('{"name":') json_str(&sb, p.name)
     sb:write(',"source":') json_str(&sb, p.source)
-    sb:writef(',"h":%d,"live":%s,"w":%d,"h_px":%d,"fps":%.1f,"objects":%d,"groups":%d,"bytes":%d,"group":%d,"group_ms":%d,"why":',
-      p.h, p.cap ~= nilptr and 'true' or 'false', p.pw, p.ph, p.fps, p.objects, p.groups, p.bytes, p.group, (@integer)(p.group_s * 1000))
+    -- every number as an integer (fps in tenths): each other type writef
+    -- takes is one more instance of its formatter in the agent
+    local fps10 = (@integer)(p.fps * 10 + 0.5)
+    sb:writef(',"h":%d,"live":%s,"w":%d,"h_px":%d,"fps":%d.%d,"objects":%d,"groups":%d,"bytes":%d,"group":%d,"group_ms":%d,"why":',
+      (@integer)(p.h), p.cap ~= nilptr and 'true' or 'false', p.pw, p.ph, fps10 // 10, fps10 % 10,
+      (@integer)(p.objects), (@integer)(p.groups), (@integer)(p.bytes), (@integer)(p.group), (@integer)(p.group_s * 1000))
     json_str(&sb, p.why)
     sb:writebyte('}'_b)
   end
@@ -569,10 +584,10 @@ function AgentNetlab:stats_json(now: float64): string
   for i = 0, < #self.subs do
     local s = &self.subs[i]
     if i > 0 then sb:writebyte(','_b) end
-    sb:writef('{"id":%d,"node":%d,"name":', s.id, s.node)
+    sb:writef('{"id":%d,"node":%d,"name":', s.id, (@integer)(s.node))
     json_str(&sb, s.name)
     sb:writef(',"viewed":%s,"slow_ms":%d,"delivered":%d,"dropped":%d,"ended":%s,"why":',
-      s.view >= 0 and 'true' or 'false', s.slow_ms, s.delivered, s.dropped, s.ended and 'true' or 'false')
+      s.view >= 0 and 'true' or 'false', s.slow_ms, (@integer)(s.delivered), (@integer)(s.dropped), s.ended and 'true' or 'false')
     json_str(&sb, s.why)
     sb:writebyte('}'_b)
   end
@@ -677,12 +692,12 @@ local function watch(self: *AgentNetlab, ci: integer, ms: integer): void
   for i = 0, < #self.watchers do
     if self.watchers[i].client == ci then
       if ms <= 0 then self.watchers:remove(i) return end
-      self.watchers[i].every = ms / 1000.0
+      self.watchers[i].every = (@float64)(ms) / 1000.0
       self.watchers[i].due = 0
       return
     end
   end
-  if ms > 0 then self.watchers:push(NetlabWatch{ client = ci, every = math.max(ms, 20) / 1000.0 }) end
+  if ms > 0 then self.watchers:push(NetlabWatch{ client = ci, every = (@float64)(math.max(ms, 20)) / 1000.0 }) end
 end
 
 -- The demo's two subscriptions, once the main node's ticket names its relay
@@ -699,10 +714,10 @@ local function demo_step(self: *AgentNetlab, now: float64): void
   defer dial:destroy() end
   local why: string
   d.fast, why = self:subscribe(dial, 'netlab', d.age_ms, 0, d.client)
-  if d.fast == 0 then say(self, 'demo: ' .. why) end
+  if d.fast == 0 then say(self, 'demo: ', why) end
   why:destroy()
   d.slow, why = self:subscribe(dial, 'netlab', 0, d.slow_ms, -1)
-  if d.slow == 0 then say(self, 'demo: ' .. why) end
+  if d.slow == 0 then say(self, 'demo: ', why) end
   why:destroy()
 end
 
