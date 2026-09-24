@@ -55,7 +55,9 @@ do -- the first three words are never capabilities, and hostile words are refuse
   local c = agent_caps.parse('ghostty-agent netlab=on compositor=on')
   assert(not c.known, 'words 2 and 3 are the version and the nonce')
   c:destroy()
-  local long: string = 'ghostty-agent 4 1 version=' .. string.rep('9', 200)
+  local nines = string.rep('9', 200)
+  local long: string = 'ghostty-agent 4 1 version=' .. nines
+  nines:destroy()
   c = agent_caps.parse(long)
   assert(c.known and #c.version == 0, 'an over-long version is dropped')
   c:destroy()
