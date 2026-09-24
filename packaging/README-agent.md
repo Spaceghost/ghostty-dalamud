@@ -14,7 +14,8 @@ From the RPM, on Fedora 44 or newer:
 sudo dnf install ./ghostty-agent-<version>-1.fc44.x86_64.rpm
 ```
 
-From the portable tarball, anywhere with glibc 2.36 or newer:
+From the portable tarball, anywhere with glibc 2.38 or newer (Fedora 39,
+Ubuntu 24.04, Debian 13, SteamOS 3.5 and later):
 
 ```sh
 tar -xzf ghostty-agent-<version>-linux-x86_64.tar.gz
@@ -22,7 +23,7 @@ cd ghostty-agent-<version>-linux-x86_64
 install -Dm0755 ghostty-agent ~/.local/bin/ghostty-agent
 ```
 
-From source, with a C compiler and `make` and nothing else:
+From source, with a C compiler, `make` and `git`:
 
 ```sh
 git clone https://github.com/Spaceghost/ghostty-dalamud
@@ -30,6 +31,13 @@ cd ghostty-dalamud
 tools/fetch-vendor.sh agent     # only what the agent needs
 tools/build-agent.sh            # build/dist/ghostty-agent
 ```
+
+`fetch-vendor.sh agent` also builds netlab's Rust library, downloading the
+pinned Rust toolchain when you have none. `SKIP_NETLAB=1` skips it.
+
+On Silverblue, Kinoite, Sway Atomic or Bazzite, run it as a container with a
+Podman quadlet instead of layering the RPM: see
+[docs/ATOMIC.md](https://github.com/Spaceghost/ghostty-dalamud/blob/master/docs/ATOMIC.md).
 
 ## Run it
 
@@ -128,6 +136,10 @@ and not on Fedora 43.
 The `.fc43` package and the portable tarball have no compositor backend:
 terminals, jobs and clips work, remote desktop windows do not. The agent says
 which it is when it starts.
+
+Every package, the tarball and the Windows zip carry netlab (docs/NETLAB.md):
+a window published over iroh as a moq broadcast. Its Rust library is linked in
+statically, so it adds no dependency beyond glibc and libgcc.
 
 ## Optional helpers
 

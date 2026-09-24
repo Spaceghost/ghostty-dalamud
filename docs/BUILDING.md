@@ -272,9 +272,17 @@ and nothing else: no Zig, no .NET SDK, no Dalamud reference assemblies, no
 `vendor/ghostty`.
 
 ```sh
-tools/fetch-vendor.sh agent     # the pinned Nelua compiler, and nothing more
+tools/fetch-vendor.sh agent     # the pinned Nelua compiler, and netlab's Rust library
 tools/build-agent.sh            # build/dist/ghostty-agent
 ```
+
+Netlab (docs/NETLAB.md) is the one part written in Rust. `fetch-vendor.sh agent`
+vendors its crates and builds `vendor/moq-iroh/libmoq_iroh.a` with the pinned
+Rust, which it downloads and checks against its sha256 if this machine has no
+rustc of that version. That takes a few minutes the first time.
+`SKIP_NETLAB=1 tools/fetch-vendor.sh agent` skips it, and the agent then builds
+without netlab. `--netlab` makes `build-agent.sh` fail rather than silently
+leave it out.
 
 It takes about ten seconds: nine to build the Nelua compiler, two to compile the
 agent. `--wayland` builds the compositor backend in, which needs wlroots 0.20

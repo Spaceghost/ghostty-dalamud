@@ -102,7 +102,7 @@ jobs:
 
       - name: Build the Linux agent packages in a Fedora 44 container
         env:
-          IN_FEDORA_PKGS: 'gcc make git rpm-build systemd-rpm-macros pkgconf-pkg-config wlroots-devel wayland-devel wayland-protocols-devel libxkbcommon-devel pixman-devel tar gzip cpio diffutils findutils which'
+          IN_FEDORA_PKGS: 'gcc make git rust cargo binutils rpm-build systemd-rpm-macros pkgconf-pkg-config wlroots-devel wayland-devel wayland-protocols-devel libxkbcommon-devel pixman-devel tar gzip cpio diffutils findutils which'
           RELEASE_TAG: ${{ env.TAG }}
         run: |
           SOURCE_DATE_EPOCH=$(git log -1 --format=%ct) \

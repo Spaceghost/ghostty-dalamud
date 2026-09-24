@@ -32,6 +32,11 @@
 %else
 %bcond_with wayland
 %endif
+# Netlab (moq over iroh, docs/NETLAB.md) is in every build: its Rust library is
+# built here from vendor/moq-iroh-src, the moq fork cut down to moq-iroh-c with
+# every crate vendored (tools/moq-vendor.sh), with the distribution's own rust
+# and cargo and no network. `--without netlab` leaves it out.
+%bcond_without netlab
 
 # Two builds of the same source agree: the build time comes from
 # SOURCE_DATE_EPOCH and tools/ci/agent-rpm.sh pins _buildhost.
@@ -57,6 +62,11 @@ ExclusiveArch:  x86_64
 BuildRequires:  gcc
 BuildRequires:  make
 BuildRequires:  systemd-rpm-macros
+%if %{with netlab}
+# moq-iroh-c's rust-version (RUST_MIN_VERSION in toolchain.env)
+BuildRequires:  rust >= 1.91
+BuildRequires:  cargo
+%endif
 %if %{with wayland}
 BuildRequires:  pkgconfig(wlroots-0.20)
 BuildRequires:  pkgconfig(wayland-server)
@@ -101,6 +111,10 @@ browser integration need.
 This build has no Wayland compositor backend: terminals, jobs and clips work,
 remote desktop windows are not in it. It depends on glibc alone.
 %endif
+%if %{with netlab}
+It carries netlab: a window published as Media over QUIC over an iroh
+connection, with the Rust library that does it linked in statically.
+%endif
 
 %prep
 %autosetup -n %{name}-%{version}
@@ -111,16 +125,27 @@ cp -p vendor/qrcodegen/LICENSE qrcodegen-LICENSE
 
 %build
 %set_build_flags
+%if %{with netlab}
+# Fedora's rust, offline, from the vendored crates (tools/build-moq-iroh.sh).
+# %%set_build_flags' RUSTFLAGS keep full debug info, so it lands in -debuginfo
+# with the rest of the agent's.
+RUST_SYSTEM=1 JOBS=%{?_smp_build_ncpus} ./tools/build-moq-iroh.sh linux
+%endif
 # tools/build-agent.sh appends $CFLAGS and $LDFLAGS to the single --cflags that
 # Nelua takes, so Fedora's hardening flags reach the generated C. The Nelua
 # compiler itself is built without them.
 CC=gcc JOBS=%{?_smp_build_ncpus} ./tools/build-agent.sh \
     %{?with_wayland:--wayland}%{!?with_wayland:--no-wayland} \
+    %{?with_netlab:--netlab}%{!?with_netlab:--no-netlab} \
     -o build/dist/ghostty-agent
 %if %{with wayland}
 # A silently degraded package would carry none of the sonames that keep it off an
 # older Fedora, so prove the backend really linked.
 readelf -d build/dist/ghostty-agent | grep -q 'libwlroots-0.20\.so'
+%endif
+%if %{with netlab}
+# and that netlab did (the binary is not stripped yet)
+nm build/dist/ghostty-agent | grep -q ' T moqi_node_new$'
 %endif
 
 %install

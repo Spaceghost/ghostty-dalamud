@@ -1,0 +1,55 @@
+# ghostty-agent as a Podman quadlet user unit, for the atomic desktops
+# (docs/ATOMIC.md). Install it as you, not as root:
+#
+#   install -Dm0644 ghostty-agent.container ~/.config/containers/systemd/ghostty-agent.container
+#   systemctl --user daemon-reload
+#   systemctl --user start ghostty-agent
+#
+# Quadlet turns this file into ghostty-agent.service; [Install] below starts it
+# with your session from then on. `loginctl enable-linger "$USER"` keeps your
+# shells alive after you log out, as for the RPM's unit.
+[Unit]
+Description=ghostty-agent (container): terminals and windows for the Ghostty Dalamud plugin
+Documentation=https://github.com/Spaceghost/ghostty-dalamud/blob/master/docs/ATOMIC.md
+Wants=network-online.target
+After=network-online.target
+
+[Container]
+# The image you built (docs/ATOMIC.md). A published image goes here instead,
+# once there is one: ghcr.io/spaceghost/ghostty-agent:latest.
+Image=localhost/ghostty-agent:latest
+ContainerName=ghostty-agent
+# You, inside as outside: your uid, your home at the same path, so the token
+# lands in ~/.config/ghostty-agent/token where the plugin looks, and your shells
+# start in your own files.
+UserNS=keep-id
+# and your groups, so /dev/dri (video, render) opens as it does for you
+GroupAdd=keep-groups
+Volume=%h:%h
+WorkingDir=%h
+Environment=HOME=%h
+# Your home keeps its SELinux labels: no :z relabel of your whole home, so the
+# container runs unconfined by the container policy instead.
+SecurityLabelDisable=true
+# The host's network: the agent listens on the desktop's own 127.0.0.1:7777,
+# which is where the game (Wine or Proton on this machine) connects.
+Network=host
+# The runtime directory and the session's display, so wl-copy/wl-paste reach
+# your desktop's clipboard and apps can open windows on it.
+Volume=%t:%t
+PodmanArgs=--env=XDG_RUNTIME_DIR --env=WAYLAND_DISPLAY --env=DISPLAY
+# A GPU for the headless compositor when there is one (the leading - makes it
+# optional); without it the compositor renders in software.
+AddDevice=-/dev/dri
+# Shells and jobs are processes of this container: stopping it ends them, the
+# same as stopping the RPM's unit.
+Exec=--listen 127.0.0.1:7777
+
+[Service]
+# Never restart on upgrade or on a config reload: that would kill every live
+# terminal, the one thing the agent exists to prevent. Restart only after a crash.
+Restart=on-failure
+TimeoutStartSec=120
+
+[Install]
+WantedBy=default.target
