@@ -27,7 +27,7 @@ def pe():
 
 
 def manifest():
-    return {"Author": "Spaceghost", "Name": "Ghostty", "Description": "fixture",
+    return {"Author": release.AUTHOR, "Name": "Ghostty", "Description": "fixture",
             "Punchline": "fixture", "InternalName": "GhosttyDalamud",
             "AssemblyVersion": "0.2.0.0", "DalamudApiLevel": 15,
             "RepoUrl": release.REPOSITORY}

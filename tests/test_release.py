@@ -18,7 +18,7 @@ SPEC.loader.exec_module(release)
 
 
 def manifest():
-    return {"Author": "Spaceghost", "Name": "Ghostty", "Description": "Terminal",
+    return {"Author": release.AUTHOR, "Name": "Ghostty", "Description": "Terminal",
             "Punchline": "Terminal", "InternalName": "GhosttyDalamud",
             "AssemblyVersion": "0.2.0.0", "DalamudApiLevel": 15,
             "RepoUrl": release.REPOSITORY}

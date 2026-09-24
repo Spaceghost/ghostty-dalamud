@@ -15,6 +15,8 @@ import zipfile
 
 NAME = "GhosttyDalamud"
 REPOSITORY = "https://github.com/Spaceghost/ghostty-dalamud"
+# the public author the manifest names (shim/GhosttyDalamud/GhosttyDalamud.json)
+AUTHOR = "Johnneylee Jack Rollins"
 
 
 class ReleaseError(ValueError):
@@ -54,7 +56,7 @@ def validate_manifest(manifest: dict) -> dict:
             raise ReleaseError(f"missing manifest field: {key}")
     if manifest.get("InternalName") != NAME:
         raise ReleaseError("InternalName must be GhosttyDalamud")
-    if manifest["Author"] != "Spaceghost" or manifest["RepoUrl"] != REPOSITORY:
+    if manifest["Author"] != AUTHOR or manifest["RepoUrl"] != REPOSITORY:
         raise ReleaseError("unexpected public author or source repository")
     version = manifest.get("AssemblyVersion", "")
     if not isinstance(version, str) or not re.fullmatch(r"\d+\.\d+\.\d+\.\d+", version):
