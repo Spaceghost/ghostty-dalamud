@@ -108,6 +108,8 @@ run test_capture
 run test_capture_win32
 # shellcheck source=tools/wayland-flags.sh
 source "$ROOT/tools/wayland-flags.sh" # the agent's Wayland compositor, when vendor/wayland-sdk is there
+# shellcheck source=tools/netlab-flags.sh
+source "$ROOT/tools/netlab-flags.sh" # the agent's netlab (moq over iroh), when vendor/moq-iroh is there
 wlrun() { only_agent && return 0; echo "--- $1"; "$NELUA" --cc "$CC" -P nogc "${WAYLAND_DEFINE[@]}" --cflags="$INC $LIBS $WAYLAND_CFLAGS" --cache-dir "$NCACHE" -L . -b "tests/$1.nelua"; "${SAN_PREFIX[@]}" "$NCACHE/$1" "${@:2}"; }
 # a test whose heap must not grow: compiled with mallinfo2 accounting and run
 # with the allocator caches off (tests/heapcheck.nelua)
@@ -173,8 +175,15 @@ hrun test_reinit "$ROOT"
 
 run test_agent_logic
 
+# netlab (docs/NETLAB.md): without moq_iroh every call says so; with it, a window
+# over real iroh connections in this process. The Rust library is not
+# instrumented, so sanitizer runs keep to the first.
+nlrun() { only_agent && return 0; echo "--- $1 (netlab)"; "$NELUA" --cc "$CC" -P nogc "${NETLAB_DEFINE[@]}" --cflags="$INC $LIBS $NETLAB_CFLAGS" --cache-dir "$NCACHE-netlab" -L . -b "tests/$1.nelua"; "${SAN_PREFIX[@]}" "$NCACHE-netlab/$1" "${@:2}"; }
+run test_netlab
+if [[ ${#NETLAB_DEFINE[@]} -gt 0 && -z "${SAN:-}" ]]; then nlrun test_netlab; else echo "--- test_netlab (netlab) skipped (no vendor/moq-iroh, or a sanitizer run)"; fi
+
 echo "--- test_agent"
-"$NELUA" --cc "$CC" -P nogc "${WAYLAND_NELUA[@]}" --cache-dir "$NCACHE" -L . -o "build/ghostty-agent$SAN_SUFFIX" -b agent/agent.nelua
+"$NELUA" --cc "$CC" -P nogc "${AGENT_NELUA[@]}" --cache-dir "$NCACHE" -L . -o "build/ghostty-agent$SAN_SUFFIX" -b agent/agent.nelua
 "$NELUA" --cc "$CC" -P nogc --cache-dir "$NCACHE" -L . -b tests/test_agent.nelua
 echo "testtoken123" > build/agent-token
 # a port per run, so test runs at the same time never share an agent

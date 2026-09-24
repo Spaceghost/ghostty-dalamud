@@ -1,0 +1,57 @@
+-- Bindings to moq_iroh (docs/NETLAB.md): Media over QUIC between iroh
+-- endpoints, from rs/moq-iroh-c in the owner's moq fork, linked statically
+-- from vendor/moq-iroh (tools/fetch-vendor.sh, tools/netlab-flags.sh).
+--
+-- The library never calls back: it queues what it has for the agent and makes
+-- moqi_wake_fd() readable. Handles are positive int32s, errors negative
+-- (MOQI_ERR_*), the reason from moqi_last_error on the same thread. Only
+-- compiled with -D NETLAB; agent/netlab.nelua checks NETLAB before using any
+-- of this.
+## if NETLAB then
+## cinclude '"moq_iroh.h"'
+## linklib 'moq_iroh'
+## linklib 'gcc_s'
+## linklib 'util'
+## linklib 'rt'
+## linklib 'pthread'
+## linklib 'm'
+## linklib 'dl'
+
+global moqi_node_config <cimport, nodecl> = @record{
+  secret_path: cstring,
+  relay: cstring,
+  port: uint16,
+}
+
+global moqi_object <cimport, nodecl> = @record{
+  group: uint64,
+  index: uint64,
+  sent_us: uint64,
+  recv_us: uint64,
+  len: uint64,
+  flags: uint32,
+}
+
+global MOQI_ERR_ARG: cint <cimport, nodecl>
+global MOQI_ERR_HANDLE: cint <cimport, nodecl>
+global MOQI_ERR_SMALL: cint <cimport, nodecl>
+global MOQI_ERR_IO: cint <cimport, nodecl>
+global MOQI_ERR_ENDED: cint <cimport, nodecl>
+global MOQI_OBJ_GROUP_START: cuint <cimport, nodecl>
+global MOQI_OBJ_GAP: cuint <cimport, nodecl>
+
+global function moqi_node_new(config: *moqi_node_config): int32 <cimport, nodecl> end
+global function moqi_node_close(node: int32): int32 <cimport, nodecl> end
+global function moqi_node_ticket(node: int32, buf: cstring, cap: csize): int32 <cimport, nodecl> end
+global function moqi_stats(node: int32, buf: cstring, cap: csize): int32 <cimport, nodecl> end
+global function moqi_publish(node: int32, broadcast: cstring, track: cstring): int32 <cimport, nodecl> end
+global function moqi_publish_object(publisher: int32, data: *[0]uint8, len: csize, new_group: boolean): int32 <cimport, nodecl> end
+global function moqi_publish_close(publisher: int32): int32 <cimport, nodecl> end
+global function moqi_subscribe(node: int32, ticket: cstring, broadcast: cstring, track: cstring, max_age_ms: uint32): int32 <cimport, nodecl> end
+global function moqi_subscribe_throttle(subscription: int32, delay_ms: uint32): int32 <cimport, nodecl> end
+global function moqi_read(subscription: int32, out: *moqi_object, buf: *[0]uint8, cap: csize): int32 <cimport, nodecl> end
+global function moqi_subscribe_close(subscription: int32): int32 <cimport, nodecl> end
+global function moqi_wake_fd(): int32 <cimport, nodecl> end
+global function moqi_wake_clear(): void <cimport, nodecl> end
+global function moqi_last_error(buf: cstring, cap: csize): int32 <cimport, nodecl> end
+## end
