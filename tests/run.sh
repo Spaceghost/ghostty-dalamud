@@ -193,7 +193,7 @@ rm -rf build/test-scratch/wgcli && mkdir -p build/test-scratch/wgcli
 
 echo "--- test_jobs"
 "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -b tests/test_jobs.nelua
-build/nelua-cache/test_jobs "$PORT" testtoken123 "$AGENT"
+build/nelua-cache/test_jobs "$PORT" testtoken123 "$AGENT" || { echo "--- agent log (test_jobs failed)"; tail -n 60 build/agent.log; exit 1; }
 
 echo "--- test_jobclient"
 "$NELUA" --cc "$ROOT/tools/zig-cc.sh" -P nogc --cache-dir build/nelua-cache -L . -b tests/test_jobclient.nelua
