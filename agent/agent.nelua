@@ -56,6 +56,7 @@ require 'agent.wg_service'
 require 'agent.wg_cli'
 require 'agent.tailscale'
 require 'agent.netlab'
+require 'agent.caps'
 ## if ccinfo.is_windows then
 require 'agent.pty_windows'
 require 'agent.sys_windows'
@@ -178,7 +179,7 @@ local Agent = @record{
   clip_file: string,   -- tests: use this file instead of the desktop clipboard
   replay_bytes: usize,
   term: string,
-  hello: string,       -- "ghostty-agent <version> <nonce>": the nonce tells clients a restart happened
+  hello: string,       -- "ghostty-agent <version> <nonce> key=value...": the nonce tells clients a restart happened, the words what this build can do
 }
 
 local INBUF_MAX: usize <comptime> = 8 * 1024 * 1024  -- input waiting for a PTY, per session
@@ -1095,22 +1096,6 @@ local function main(): integer
   -- its session ids still mean the same shells
   local nonce: int64 = ((@int64)(os.time()) & 0xffffffff) << 20 | (pid & 0xfffff)
   if nonce == 0 then nonce = 1 end
-  do
-    local sb: stringbuilder
-    -- The platform is the agent's, and the client cannot infer it: under Wine
-    -- the plugin is Windows while the agent it talks to is the Linux or macOS
-    -- host, so anything chosen from the plugin's own platform runs the wrong
-    -- command here (tools that did picked cmd.exe and got status 127).
-    ## if ccinfo.is_windows then
-    local plat: string <comptime> = 'windows'
-    ## elseif ccinfo.is_apple then
-    local plat: string <comptime> = 'macos'
-    ## else
-    local plat: string <comptime> = 'linux'
-    ## end
-    sb:writef('ghostty-agent %d %d %s', PROTO_VERSION, nonce, plat)
-    agent.hello = sb:promote()
-  end
   ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
   capture_wayland_configure(wayland_socket, xkb_layout)
   capture_wayland_set_render_node(render_node)
@@ -1178,6 +1163,19 @@ local function main(): integer
     netlab:init(windows.ok, windows.backend, key, log)
     key:destroy()
     netlab.queue_of, netlab.sink, netlab.sink_ctx = client_queue, netlab_frame_sink, &netlab
+  end
+  do -- the greeting, after the backends so it can say which came up (core/agent_caps.nelua)
+    local sb: stringbuilder
+    -- The bare platform word stays fourth: clients that predate the key=value
+    -- words read it from there. The platform is the agent's, and the client
+    -- cannot infer it: under Wine the plugin is Windows while the agent it
+    -- talks to is the Linux or macOS host, so anything chosen from the
+    -- plugin's own platform runs the wrong command here (tools that did
+    -- picked cmd.exe and got status 127).
+    sb:writef('ghostty-agent %d %d %s', PROTO_VERSION, nonce, AGENT_PLATFORM)
+    agent_caps.write(&sb, agent_capabilities(windows.ok, windows.backend.name, wg.on))
+    agent.hello = sb:promote()
+    log('greeting: ' .. agent.hello)
   end
 
   ## if ccinfo.is_windows then
