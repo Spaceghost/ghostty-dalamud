@@ -79,6 +79,16 @@ check(c:ready(), 'agent handshake: ', c.last_error)
 print('handshake ok:', first_ok, 'version', c.version, 'nonce', c.nonce)
 assert(first_ok:find('ghostty-agent 4 ', 1, true) == 1, 'the greeting carries protocol version 4 and a nonce')
 assert(c.version == 4 and c.nonce ~= 0)
+-- its capabilities (core/agent_caps.nelua): run with --windows off, so a
+-- compositor it may have is not running; WireGuard is reserved and absent
+assert(c.caps.known, 'the greeting carries capabilities')
+assert(#c.caps.version > 0 and #c.caps.platform > 0, 'and the agent version and platform')
+assert(c.caps.compositor == AGENT_CAP_OFF or c.caps.compositor == AGENT_CAP_ABSENT, '--windows off: no compositor running')
+assert(c.caps.netlab == AGENT_CAP_ON or c.caps.netlab == AGENT_CAP_ABSENT)
+assert(c.caps.wg == AGENT_CAP_OFF and first_ok:find(' wg=off', 1, true) > 0, 'wg is built in, and off with no wireguard.conf')
+assert(c.platform == c.caps.platform, 'the bare fourth word and platform= agree')
+print('capabilities: version', c.caps.version, 'platform', c.caps.platform,
+  'compositor', agent_caps.state_name(c.caps.compositor), 'netlab', agent_caps.state_name(c.caps.netlab))
 
 local argv: vector(string)
 argv:push('/bin/sh')

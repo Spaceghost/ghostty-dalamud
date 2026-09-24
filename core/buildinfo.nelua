@@ -15,6 +15,8 @@
 global BUILD_COMMIT: string <comptime> = #[BUILDINFO_COMMIT]#
 global BUILD_ID: string <comptime> = #[BUILDINFO_ID]#
 global BUILD_VERSION: string <comptime> = #[BUILDINFO_VERSION]#
+-- The release alone, '0.3.1': what the agent's greeting carries (agent/caps.nelua).
+global BUILD_VERSION_NUMBER: string <comptime> = #[BUILDINFO_VERSION:match('(%S+)$')]#
 
 -- gu_version's text: 'ghostty-dalamud 0.3.1 (<commit>, build <id>)'; the
 -- loader logs it for every core it loads.

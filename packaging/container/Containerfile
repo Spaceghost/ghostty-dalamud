@@ -1,0 +1,60 @@
+# ghostty-agent as a container image, for the atomic desktops (Silverblue,
+# Kinoite, Sway Atomic, Bazzite) where layering an RPM is not how you want to
+# install things. docs/ATOMIC.md is the install page; this is how it is made.
+#
+#   tools/package-agent.sh --out build/container          # the source tarball
+#   podman build -f packaging/container/Containerfile -t ghostty-agent build/container
+#
+# The build context is the agent's source tarball and nothing else, and the
+# image is built from it exactly as the release RPM is: `rpmbuild -tb`, which
+# decides the Wayland compositor for itself (Fedora 44: in) and builds netlab
+# from the vendored crates. That step runs with no network at all, which is the
+# proof that the tarball is complete; the package is then installed into the
+# runtime image with dnf, so its Requires and Recommends come along.
+#
+# Build arguments:
+#   FEDORA   the Fedora release for both stages (default 44; the compositor needs 44+)
+#   BASE     the runtime image (default fedora:$FEDORA). The shells the agent
+#            opens run in here, so a bigger base is a richer shell:
+#            registry.fedoraproject.org/fedora-toolbox:44 gives the toolbox set.
+
+ARG FEDORA=44
+ARG BASE=registry.fedoraproject.org/fedora:${FEDORA}
+
+FROM registry.fedoraproject.org/fedora:${FEDORA} AS build
+# The same set tools/ci/agent-rpm.sh builds with in the release workflow.
+RUN dnf -y -q install gcc make rust cargo binutils rpm-build systemd-rpm-macros \
+      pkgconf-pkg-config wlroots-devel wayland-devel wayland-protocols-devel \
+      libxkbcommon-devel pixman-devel tar gzip findutils diffutils which \
+    && dnf clean all
+COPY ghostty-agent-*-src.tar.gz /src/
+# --network=none: nothing in the tarball may reach for the network.
+RUN --network=none set -eu; \
+    src="$(ls /src/ghostty-agent-*-src.tar.gz)"; \
+    rpmbuild -tb --define '_topdir /rpm' --define '_buildhost reproducible' "$src"; \
+    mkdir /out; \
+    find /rpm/RPMS -name 'ghostty-agent-[0-9]*.rpm' ! -name '*debug*' -exec cp {} /out/ \;; \
+    ls -la /out
+
+FROM ${BASE}
+ARG FEDORA
+LABEL org.opencontainers.image.title="ghostty-agent" \
+      org.opencontainers.image.description="The host half of Ghostty for Final Fantasy XIV: terminals, jobs, a headless Wayland compositor and netlab" \
+      org.opencontainers.image.source="https://github.com/Spaceghost/ghostty-dalamud" \
+      org.opencontainers.image.licenses="MIT"
+COPY --from=build /out/ /tmp/agent/
+# The package's Recommends are what make the optional features work (clipboard,
+# clips, Xwayland, icons, links); mesa gives the compositor a GPU when the
+# quadlet hands it /dev/dri, and it falls back to software without one. The rest
+# is what a shell is expected to have.
+RUN dnf -y -q install --setopt=install_weak_deps=True /tmp/agent/ghostty-agent-*.rpm \
+      mesa-dri-drivers mesa-libEGL \
+      bash-completion procps-ng less ncurses git-core openssh-clients hostname \
+    && dnf clean all && rm -rf /tmp/agent \
+    && ghostty-agent --help >/dev/null
+# The listener speaks a token-authenticated but unencrypted protocol: loopback
+# by default, as on the host. The quadlet runs this with the host's network, so
+# 127.0.0.1 here is the desktop's own loopback.
+EXPOSE 7777
+ENTRYPOINT ["/usr/bin/ghostty-agent"]
+CMD ["--listen", "127.0.0.1:7777"]
