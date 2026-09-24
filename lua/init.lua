@@ -10,6 +10,7 @@ local showcase = require('showcase')
 local platform = require('platform')
 local assistant = require('assistant')
 local ask = require('ask')
+local netlab = require('netlab')
 local themes = require('themes')
 local tooltips = require('tooltips')
 local windows = require('windows')
@@ -73,10 +74,10 @@ local config = {
     commands = { '/term', '/tomestone', '/tome' },
     -- Commands of their own, each standing for one /term verb (the same
     -- functions): /window pull | run CMD | list | close, /ask [question],
-    -- /agent ask [question]. Their /help lines are in lua/tooltips.lua.
+    -- /agent ask [question], /netlab. Their /help lines are in lua/tooltips.lua.
     -- A name another plugin holds is retried; {} registers none.
-    verb_commands = { ['/window'] = 'window', ['/ask'] = 'ask', ['/agent'] = 'agent', ['/cam'] = 'cam' },
-    help = 'Show/hide the terminal. window [n|list|pull [match]|close] | new [n] | native [new [n]|off|status] | pin [here|me|target|orbit] | unpin | ask [question] | theme [name] | shot [panel] [clean] | clip [seconds] | share | config | reload',
+    verb_commands = { ['/window'] = 'window', ['/ask'] = 'ask', ['/agent'] = 'agent', ['/cam'] = 'cam', ['/netlab'] = 'netlab' },
+    help = 'Show/hide the terminal. window [n|list|pull [match]|close] | new [n] | native [new [n]|off|status] | pin [here|me|target|orbit] | unpin | ask [question] | netlab [demo] | theme [name] | shot [panel] [clean] | clip [seconds] | share | config | reload',
     -- Server info bar entry. 'auto' shows it only while no Umbra toolbar
     -- widget is showing ghostty's status; 'always' | 'never'.
     dtr = {
@@ -143,6 +144,10 @@ local config = {
   -- a new thread, /ask term the terminal. Behaviour: lua/ask.lua; what runs:
   -- lua/assistant.lua (ui = 'terminal' turns the panel off).
   ask = ask,
+  -- /term netlab (or /netlab): iroh and moq shown live, a window from the
+  -- agent's host streamed over them (docs/NETLAB.md). demo, sub TICKET,
+  -- slow MS, relay MODE, ticket, stop; the defaults are netlab.config.
+  netlab = netlab,
   -- Desktop windows streamed by ghostty-agent onto world panels: /term window
   -- list | pull [match|#wid|run CMD] | close. Sizes, frame rate and windows
   -- pulled at login: lua/windows.lua.

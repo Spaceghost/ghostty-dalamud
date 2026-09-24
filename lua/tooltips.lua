@@ -61,6 +61,7 @@ M['ask.stop'] = 'Stop this answer'
 M['ask.copy'] = 'Copy the last answer, as written, to the clipboard'
 M['ask.run'] = 'Run this command now, as if you typed it in chat and pressed Enter'
 M['command./agent'] = 'ghostty-agent: /agent ask [question] asks the local AI assistant'
+M['command./netlab'] = 'iroh and moq, live: /netlab (show/hide) | demo [window] | sub TICKET | slow MS | relay MODE | ticket | stop'
 
 -- The toolbar popup's taskbar chips.
 M['chip.min'] = 'Minimized: click to bring it back'

@@ -1,0 +1,362 @@
+-- The netlab panel's core half (docs/NETLAB.md). lua/netlab.lua decides
+-- everything the panel shows and does; this runs what it asks for and hands
+-- it what the agent says:
+--
+-- * ghostty.netlab_send(command) -> req | nil, why: an NLCTL to the agent.
+--   Its NLREPLY comes back as CONFIG.netlab.on_reply(req, ok, text).
+-- * NLSTAT: CONFIG.netlab.on_stats(json), as the agent sent it.
+-- * NLFRAME: decoded (core/wincodec.nelua) into a picture per subscription
+--   and uploaded to a texture (core/wintex.nelua) before the panel draws;
+--   CONFIG.netlab.on_object(sub, group, index, flags, lat_us) per object, for
+--   the pipeline's animation. ghostty.netlab_image(sub, x0, y0, x1, y1) draws
+--   the picture letterboxed into a rectangle; ghostty.netlab_video(sub) says
+--   what it has; ghostty.netlab_forget(sub) drops it.
+-- * ghostty.netlab_agent() -> 'ready' | 'connecting' | 'down' | 'off', version.
+-- * Per frame, while CONFIG.netlab.tick(now) says the panel is up, a Ghostty
+--   glass window ('###ghostty_netlab') whose contents CONFIG.netlab.draw()
+--   draws with ghostty.ui (core/ui.nelua, core/uidraw.nelua).
+require 'core.app.worldview'
+require 'core.netlab_wire'
+require 'core.wincodec'
+require 'core.wintex'
+require 'core.uidraw'
+
+global NetlabVideo = @record{
+  sub: uint32,
+  w: integer, h: integer,
+  pix: vector(uint8),       -- BGRA, w * 4 a row
+  dirty: vector(WinRect),   -- changed since the last upload
+  dirty_all: boolean,
+  tex: WinTex,
+  keyed: boolean,           -- a key picture arrived: deltas apply from here
+  pictures: integer, keys: integer,
+  group: uint64, index: uint32, lat_us: uint32,
+}
+
+local videos: vector(NetlabVideo)
+local next_req: uint32 = 0
+local netlab_rect: ImVec4
+local netlab_drawn = false
+local last_error: string -- the last Lua error logged (each distinct text once)
+
+local function video_of(sub: uint32, make: boolean): *NetlabVideo
+  for i = 0, < #videos do
+    if videos[i].sub == sub then return &videos[i] end
+  end
+  if not make then return nilptr end
+  videos:push(NetlabVideo{ sub = sub })
+  return &videos[#videos - 1]
+end
+
+local function video_free(v: *NetlabVideo): void
+  wintex_release(&v.tex)
+  v.pix:destroy()
+  v.dirty:destroy()
+end
+
+-- Lua ------------------------------------------------------------------------------------
+
+local function log_lua_error(L: *lua_State, what: string): void
+  local len: usize = 0
+  local p = lua_tolstring(L, -1, &len)
+  local msg: string = p ~= nilptr and string{data=(@*[0]byte)(p), size=len} or 'error object is not a string'
+  if msg ~= last_error then
+    last_error:destroy()
+    last_error = msg:copy()
+    logf(LOG_WARN, 'lua netlab.%s: %s', what, last_error)
+  end
+end
+
+-- CONFIG.netlab[name] on the stack (under CONFIG and netlab); false without it.
+local function push_fn(L: *lua_State, name: cstring): boolean
+  if L == nilptr or not policy.loaded then return false end
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return false end
+  lua_getfield(L, -1, 'netlab')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return false end
+  lua_getfield(L, -1, name)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return false end
+  return true
+end
+
+-- Call what push_fn left with `nargs` arguments pushed after it; `nres` results
+-- stay on the stack on success (true), nothing on failure.
+local function call(L: *lua_State, name: cstring, nargs: cint, nres: cint): boolean
+  if lua_pcall(L, nargs, nres, 0) ~= LUA_OK then
+    log_lua_error(L, name)
+    lua_pop(L, 3) -- the error, netlab, CONFIG
+    return false
+  end
+  return true
+end
+
+local function pop_call(L: *lua_State, nres: cint): void
+  lua_pop(L, nres + 2)
+end
+
+-- ghostty.netlab_send(command) -> req | nil, why
+local function l_send(L: *lua_State): cint
+  local len: usize = 0
+  local p = lua_tolstring(L, 1, &len)
+  local why: cstring = nilptr
+  if p == nilptr or len == 0 then why = 'no command'
+  elseif not host.local_agent.enabled then why = 'no agent is configured'
+  elseif not host.local_agent.client:ready() then why = 'the agent is not connected'
+  elseif host.local_agent.client.version < 4 then why = 'the agent is too old for netlab (update ghostty-agent)' end
+  if why ~= nilptr then
+    lua_pushnil(L)
+    lua_pushstring(L, why)
+    return 2
+  end
+  next_req = next_req + 1
+  if next_req == 0 then next_req = 1 end
+  netlab_wire.write_ctl(&host.local_agent.client.outq, next_req, string{data=(@*[0]byte)(p), size=len})
+  lua_pushinteger(L, next_req)
+  return 1
+end
+
+-- ghostty.netlab_agent() -> state, version
+local function l_agent(L: *lua_State): cint
+  local state: cstring = 'off'
+  if host.local_agent.enabled then
+    if host.local_agent.client:ready() then state = 'ready'
+    elseif host.local_agent.down then state = 'down'
+    else state = 'connecting' end
+  end
+  lua_pushstring(L, state)
+  lua_pushinteger(L, host.local_agent.client.version)
+  return 2
+end
+
+-- ghostty.netlab_video(sub) -> w, h, pictures, keys, group, index, lat_us | nil
+local function l_video(L: *lua_State): cint
+  local v = video_of((@uint32)(lua_tointegerx(L, 1, nilptr)), false)
+  if v == nilptr or v.w == 0 then lua_pushnil(L) return 1 end
+  lua_pushinteger(L, v.w) lua_pushinteger(L, v.h)
+  lua_pushinteger(L, v.pictures) lua_pushinteger(L, v.keys)
+  lua_pushinteger(L, (@integer)(v.group)) lua_pushinteger(L, v.index) lua_pushinteger(L, v.lat_us)
+  return 7
+end
+
+-- ghostty.netlab_image(sub, x0, y0, x1, y1) -> x, y, w, h drawn | nil:
+-- the subscription's picture, as large as fits, centred.
+local function l_image(L: *lua_State): cint
+  local v = video_of((@uint32)(lua_tointegerx(L, 1, nilptr)), false)
+  if v == nilptr or v.w == 0 or v.tex.srv == nilptr or imgui.DrawListAddImage == nilptr then lua_pushnil(L) return 1 end
+  local x0, y0 = (@float32)(lua_tonumberx(L, 2, nilptr)), (@float32)(lua_tonumberx(L, 3, nilptr))
+  local x1, y1 = (@float32)(lua_tonumberx(L, 4, nilptr)), (@float32)(lua_tonumberx(L, 5, nilptr))
+  local bw, bh = x1 - x0, y1 - y0
+  if bw <= 1 or bh <= 1 then lua_pushnil(L) return 1 end
+  local vw, vh = (@float32)(v.w), (@float32)(v.h)
+  local s = math.min(bw / vw, bh / vh)
+  local w, h = vw * s, vh * s
+  local x, y = x0 + (bw - w) * 0.5_f32, y0 + (bh - h) * 0.5_f32
+  imgui.DrawListAddImage(imgui.GetWindowDrawList(), v.tex.srv, vec2(x, y), vec2(x + w, y + h), vec2(0, 0), vec2(1, 1), 0xffffffff)
+  lua_pushnumber(L, x) lua_pushnumber(L, y) lua_pushnumber(L, w) lua_pushnumber(L, h)
+  return 4
+end
+
+-- ghostty.netlab_forget(sub)
+local function l_forget(L: *lua_State): cint
+  local sub = (@uint32)(lua_tointegerx(L, 1, nilptr))
+  for i = 0, < #videos do
+    if videos[i].sub == sub then
+      video_free(&videos[i])
+      videos:remove(i)
+      break
+    end
+  end
+  return 0
+end
+
+local function netlab_event(ev: *AgentEvent): void <forwarddecl> end
+
+global function netlab_lua_register(L: *lua_State): void
+  agent_netlab_event = netlab_event -- NLREPLY, NLSTAT and NLFRAME come here (core/app/agent.nelua)
+  uidraw_lua_register(L)
+  lua_getglobal(L, 'ghostty')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) return end
+  lua_pushcclosure(L, l_send, 0) lua_setfield(L, -2, 'netlab_send')
+  lua_pushcclosure(L, l_agent, 0) lua_setfield(L, -2, 'netlab_agent')
+  lua_pushcclosure(L, l_video, 0) lua_setfield(L, -2, 'netlab_video')
+  lua_pushcclosure(L, l_image, 0) lua_setfield(L, -2, 'netlab_image')
+  lua_pushcclosure(L, l_forget, 0) lua_setfield(L, -2, 'netlab_forget')
+  lua_pop(L, 1)
+end
+
+-- The agent's netlab messages -------------------------------------------------------------
+
+-- One NLFRAME: its pictures into the subscription's pixels, then Lua hears of it.
+local function on_frame(p: *[0]uint8, len: usize): void
+  local ok, h, body, blen = netlab_wire.parse_frame(p, len)
+  if not ok then return end
+  local v = video_of(h.sub, true)
+  v.group, v.index, v.lat_us = h.group, h.index, h.lat_us
+  local pos: usize = 0
+  while pos < blen do
+    local wok, wp, wl, next = netlab_wire.next_wframe(body, blen, pos)
+    if not wok then break end
+    pos = next
+    local fok, fr = wincodec_parse(wp, wl)
+    if not fok then break end
+    if (fr.flags & WINCODEC_FLAG_KEY) ~= 0 then
+      v.w, v.h = fr.w, fr.h
+      v.pix:resize((@usize)(v.w * v.h * 4))
+      v.dirty_all, v.keyed = true, true
+      v.dirty:clear()
+      v.keys = v.keys + 1
+    end
+    if not v.keyed or v.w ~= (@integer)(fr.w) or v.h ~= (@integer)(fr.h) then continue end
+    while true do
+      local rok, rect = wincodec_next_rect(&fr)
+      if not rok then break end
+      if wincodec_apply_rect(&rect, (@*[0]uint8)(&v.pix[0]), (@usize)(v.w * 4)) and not v.dirty_all then v.dirty:push(rect.r) end
+    end
+    if (fr.flags & WINCODEC_FLAG_END) ~= 0 then v.pictures = v.pictures + 1 end
+  end
+  local L = policy.L
+  if not push_fn(L, 'on_object') then return end
+  lua_pushinteger(L, h.sub)
+  lua_pushinteger(L, (@integer)(h.group))
+  lua_pushinteger(L, h.index)
+  lua_pushinteger(L, h.flags)
+  lua_pushinteger(L, h.lat_us)
+  if call(L, 'on_object', 5, 0) then pop_call(L, 0) end
+end
+
+function netlab_event(ev: *AgentEvent): void
+  local L = policy.L
+  if ev.typ == PROTO_NLFRAME then
+    on_frame(ev.data, ev.len)
+  elseif ev.typ == PROTO_NLREPLY then
+    local ok, req, done, text = netlab_wire.parse_reply(ev.data, ev.len)
+    if not ok or not push_fn(L, 'on_reply') then return end
+    lua_pushinteger(L, req)
+    lua_pushboolean(L, done and 1 or 0)
+    lua_pushlstring(L, (@cstring)(text.data), text.size)
+    if call(L, 'on_reply', 3, 0) then pop_call(L, 0) end
+  elseif ev.typ == PROTO_NLSTAT then
+    if not push_fn(L, 'on_stats') then return end
+    lua_pushlstring(L, (@cstring)(ev.data), ev.len)
+    if call(L, 'on_stats', 1, 0) then pop_call(L, 0) end
+  end
+end
+
+-- /term netlab [...]: CONFIG.netlab.command(args); 0 when it took it.
+global function netlab_command(args: string): cint
+  local L = policy.L
+  if not push_fn(L, 'command') then
+    logf(LOG_WARN, 'netlab: lua/netlab.lua is not loaded')
+    return 4
+  end
+  lua_pushlstring(L, (@cstring)(args.data), args.size)
+  if not call(L, 'command', 1, 1) then return 4 end
+  local handled = lua_toboolean(L, -1) ~= 0
+  pop_call(L, 1)
+  return handled and 0 or 4
+end
+
+-- Per frame ---------------------------------------------------------------------------------
+
+-- Counted style colours, as core/app/ask.nelua does: a pop deeper than the
+-- stack writes into ImGui's style at a junk index.
+local cols: cint = 0
+local function push_col(idx: cint, col: uint32): void
+  imgui.PushStyleColorU32(idx, col)
+  cols = cols + 1
+end
+local function pop_cols(): void
+  if cols > 0 then imgui.PopStyleColor(cols) end
+  cols = 0
+end
+
+-- The pictures that changed, to their textures, once a frame before drawing.
+local function upload(): void
+  local device = ui_device()
+  if device == nilptr then return end
+  for i = 0, < #videos do
+    local v = &videos[i]
+    if v.w <= 0 or (not v.dirty_all and #v.dirty == 0) then continue end
+    local ok, fresh = wintex_ensure(&v.tex, device, (@uint32)(v.w), (@uint32)(v.h))
+    if not ok then continue end
+    local stride = (@usize)(v.w) * 4
+    local px = (@*[0]uint8)(&v.pix[0])
+    if fresh or v.dirty_all then
+      wintex_upload(&v.tex, WinRect{ x = 0, y = 0, w = (@uint16)(v.w), h = (@uint16)(v.h) }, px, stride)
+    else
+      for k = 0, < #v.dirty do wintex_upload(&v.tex, v.dirty[k], px, stride) end
+    end
+    v.dirty_all = false
+    v.dirty:clear()
+  end
+end
+
+local function draw_panel(focus: boolean): void
+  local vp = imgui.GetMainViewport()
+  imgui.SetNextWindowPos(vec2(vp.Pos.x + vp.Size.x * 0.5_f32, vp.Pos.y + vp.Size.y * 0.5_f32), ImGuiCond_FirstUseEver, vec2(0.5, 0.5))
+  imgui.SetNextWindowSize(vec2(900, 660), ImGuiCond_FirstUseEver)
+  if focus then imgui.SetNextWindowFocus() end
+  local rounding = (@float32)(math.max(policy.dropdown.rounding, 8))
+  imgui.PushStyleVarVec2(ImGuiStyleVar_WindowPadding, vec2(16, 12))
+  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowRounding, rounding)
+  imgui.PushStyleVarFloat(ImGuiStyleVar_WindowBorderSize, 0)
+  push_col(ImGuiCol_Text, chrome_col(ChromeColor.Ink, 255))
+  push_col(ImGuiCol_Button, chrome_col(ChromeColor.Chip, 220))
+  push_col(ImGuiCol_ButtonHovered, chrome_col(ChromeColor.ChipHot, 235))
+  push_col(ImGuiCol_ButtonActive, chrome_col(ChromeColor.Accent, 200))
+  push_col(ImGuiCol_FrameBg, chrome_col(ChromeColor.GlassFlat, 235))
+  push_col(ImGuiCol_ResizeGrip, chrome_col(ChromeColor.Accent, 60))
+  push_col(ImGuiCol_ResizeGripHovered, chrome_col(ChromeColor.Accent, 160))
+  push_col(ImGuiCol_ResizeGripActive, chrome_col(ChromeColor.Accent, 230))
+  local flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoBackground | ImGuiWindowFlags_NoDocking |
+    ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse
+  local visible = imgui.Begin('Netlab###ghostty_netlab', nilptr, flags)
+  imgui.PopStyleVar(3)
+  if visible then
+    if host.lmb_pressed and imgui.IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows) then host.click_used = true end
+    local wp: ImVec2
+    local wsz: ImVec2
+    imgui.GetWindowPos(&wp)
+    imgui.GetWindowSize(&wsz)
+    local mvp = imgui.GetMainViewport().Pos
+    netlab_rect = ImVec4{ wp.x - mvp.x, wp.y - mvp.y, wp.x - mvp.x + wsz.x, wp.y - mvp.y + wsz.y }
+    netlab_drawn = true
+    dropdown_glass(imgui.GetWindowDrawList(), wp.x, wp.y, wp.x + wsz.x, wp.y + wsz.y, rounding, 36)
+    ui_push_mono, ui_pop_font = host.api.push_mono_font, host.api.pop_font
+    local L = policy.L
+    if push_fn(L, 'draw') and call(L, 'draw', 0, 0) then pop_call(L, 0) end
+    -- a failed draw unwound Lua, not ImGui: close what it left open
+    uidraw_close()
+    ui_close_children()
+  end
+  imgui.End()
+  pop_cols()
+end
+
+-- Per frame: the panel while Lua has it up. Pictures keep decoding while it
+-- is down (the agent only sends them to a viewer the panel asked for).
+global function netlab_frame(now: float64, live: boolean): void
+  local L = policy.L
+  if not push_fn(L, 'tick') then netlab_drawn = false return end
+  lua_pushnumber(L, now)
+  if not call(L, 'tick', 1, 2) then netlab_drawn = false return end
+  local shown, focus = lua_toboolean(L, -2) ~= 0, lua_toboolean(L, -1) ~= 0
+  pop_call(L, 2)
+  if not shown then netlab_drawn = false return end
+  if live and imgui.BeginChild ~= nilptr then
+    upload()
+    draw_panel(focus)
+  end
+end
+
+-- Shutdown and /term reload: the textures go with the device's frame; a
+-- reloaded Lua asks for what it wants again.
+global function netlab_shutdown(): void
+  for i = 0, < #videos do video_free(&videos[i]) end
+  videos:destroy()
+  netlab_drawn = false
+  last_error:destroy()
+end
+
+global function netlab_video_count(): integer return #videos end
+global function netlab_find_video(sub: uint32): *NetlabVideo return video_of(sub, false) end

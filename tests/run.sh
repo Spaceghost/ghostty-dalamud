@@ -161,6 +161,7 @@ run test_assistant "$ROOT"
 mkdir -p build/test-scratch/ask
 run test_ask "$ROOT" "$ROOT/build/test-scratch/ask"
 run test_ask_draw "$ROOT"
+run test_netlab_panel "$ROOT"
 run test_hostsurface "$ROOT" "$ROOT/build/test-scratch/surface"
 run test_native_app "$ROOT"
 run test_depthpass "$ROOT"

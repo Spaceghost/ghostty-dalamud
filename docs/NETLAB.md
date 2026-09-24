@@ -8,7 +8,27 @@ skips what it is too late for instead of queueing it). The payload is a window
 from the agent's host, published as a moq broadcast over iroh and played back
 into the game beside the view of how it got there.
 
-Status: design. Nothing here has been seen in game yet.
+Status: built and tested on the host and between Incus containers (see
+Tests); not yet seen in game.
+
+## Seeing it in game
+
+1. Build the agent with netlab (`tools/fetch-vendor.sh` builds
+   `vendor/moq-iroh` when cargo is there; `tools/build-agent.sh` then says
+   `netlab: yes`) and restart it where your shells run.
+2. `/netlab demo run:foot` (or any `/term window` match: a title, `run:CMD`,
+   `app:NAME`). The panel opens; the relay pill turns amber once your
+   endpoint has a home relay, the two viewers dial through it, and within a
+   second or two their pipes turn from amber (relay) to cyan (direct) with
+   "relay → direct" over them and the holepunch time on the timeline.
+3. The fast viewer's picture plays bottom right; "Slower" makes the slow
+   viewer fall further behind and crossed-out groups start dropping off its
+   pipe.
+4. `/term selftest netlab` records what it saw (paths, rtt, latency, groups
+   skipped) in `selftest/latest.json`.
+
+Another machine: `/netlab ticket` copies this agent's ticket; on the other
+side `/netlab sub TICKET` subscribes to it (the panel there shows its side).
 
 ## What the panel shows
 

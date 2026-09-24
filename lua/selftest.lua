@@ -267,11 +267,59 @@ function M.world()
   end)
 end
 
+-- netlab ------------------------------------------------------------------------
+-- The panel's model from a known report, and, while `/term netlab demo` runs,
+-- what iroh and moq are doing right now (from the panel's last NLSTAT), so a
+-- run in game records it in selftest/latest.json.
+function M.netlab()
+  return suite('netlab', function(case)
+    local N = CONFIG and CONFIG.netlab
+    if type(N) ~= 'table' or type(N.model) ~= 'function' then
+      case('panel', 'skip', 'lua/netlab.lua is not loaded')
+      return
+    end
+    local m = N.model({ built = true, started = true, relay = 'default',
+      nodes = { { role = 'viewer', name = 'viewer 1', h = 3, stats = { id = 'b',
+        conns = { { n = 1, dir = 'out', open = true, paths = {
+          { kind = 'relay', addr = 'r', selected = false, rtt_us = 30000 },
+          { kind = 'direct', addr = 'd', selected = true, rtt_us = 500 } } } },
+        events = {}, subs = { { state = 'live', skipped = 2, cut = 1, lat_us = 400 } } } } },
+      pubs = {}, subs = { { id = 4, node = 3, viewed = true } }, demo = { fast = 4, slow = 0 } })
+    local s = m and m.subs[1]
+    case('panel', s ~= nil and s.label == 'fast' and s.conn.kind == 'direct' and s.conn.relay_rtt_ms == 30 and s.skipped == 2,
+      'the model of a known report')
+    case('drawing calls', type(ghostty) == 'table' and type(ghostty.ui) == 'table' and type(ghostty.ui.canvas) == 'function'
+      and type(ghostty.netlab_send) == 'function', 'ghostty.ui.canvas and ghostty.netlab_send')
+    local state, version = 'off', 0
+    if ghostty and ghostty.netlab_agent then state, version = ghostty.netlab_agent() end
+    if state ~= 'ready' then
+      case('agent', 'skip', 'no agent connected (' .. tostring(state) .. ')')
+      return
+    end
+    case('agent', version >= 4, 'protocol version ' .. tostring(version))
+    local live = N.state and N.state.model
+    if not live or not live.started then
+      case('live', 'skip', 'run /term netlab demo first, then this suite')
+      return
+    end
+    if not live.built then case('live', false, 'the agent has no netlab') return end
+    local parts = {}
+    for _, sub in ipairs(live.subs) do
+      local c = sub.conn
+      parts[#parts + 1] = string.format('%s: %s, %s path rtt %.2f ms, latency %.2f ms, %d objects, %d groups skipped, %d cut',
+        sub.label, sub.state, c and c.kind or 'no', c and c.rtt_ms or 0, sub.lat_ms, sub.objects, sub.skipped, sub.cut)
+    end
+    local any = #live.subs > 0 and live.subs[1].objects > 0
+    case('live', any, table.concat(parts, '; '))
+  end)
+end
+
 function M.run(name, scratch)
   if name == 'settings' then return M.settings(scratch) end
   if name == 'themes' then return M.themes() end
   if name == 'bell' then return M.bell() end
   if name == 'world' then return M.world() end
+  if name == 'netlab' then return M.netlab() end
   return 'suite\tfail\tno Lua suite named ' .. clean(name)
 end
 

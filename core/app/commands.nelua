@@ -206,6 +206,7 @@ global function run_command(cmd: string): cint
     teardown_effects()
     panels_shutdown() -- pulled windows back to the flat UI; the new policy pulls them in again
     ask_shutdown() -- /ask's hidden sessions end; the reloaded Lua knows nothing of them
+    netlab_shutdown() -- the netlab panel's textures; the reloaded Lua asks again
     -- DETACH, never CLOSE: the shells survive, and a reload that fails before
     -- agent_setup must not leave CLOSE frames queued for every one of them
     for i = 0, < #host.sessions do host.sessions[i].keep_on_agent = true end
@@ -417,6 +418,9 @@ global function run_command(cmd: string): cint
     logf(LOG_INFO, 'world %s: %s', kind, msg)
     msg:destroy()
     return 0
+  elseif verb == 'netlab' then
+    -- /term netlab [demo | sub TICKET | slow MS | ticket | relay MODE | stop]: iroh and moq, live (docs/NETLAB.md)
+    return netlab_command(arg)
   elseif cmd == 'depth' or cmd == 'depth retry' or cmd == 'depth show' then
     -- /term depth [retry|show]: how world panels are occluded, and why (retry
     -- forgets a latched failure; show toggles colouring panels by the test)

@@ -71,11 +71,17 @@ global agent_window_event: function(link: *AgentLink, ev: *AgentEvent): void
 -- this before it asks for its first clip.
 global agent_clip_event: function(ev: *AgentEvent): void
 
+-- Netlab's NLREPLY, NLSTAT and NLFRAME (core/app/netlab.nelua sets it; docs/NETLAB.md).
+global agent_netlab_event: function(ev: *AgentEvent): void
+
 global function agent_event(ctx: pointer, ev: *AgentEvent): void
   -- every link sets ctx to itself; the local one leaves it nilptr
   local link: *AgentLink = ctx ~= nilptr and (@*AgentLink)(ctx) or &host.local_agent
   if ev.typ >= PROTO_WLISTR and ev.typ <= PROTO_WGEOM then
     if agent_window_event ~= nilptr then agent_window_event(link, ev) end
+  elseif ev.typ >= PROTO_NLREPLY and ev.typ <= PROTO_NLFRAME then
+    -- the panel speaks NLCTL to the local agent only (core/app/netlab.nelua)
+    if agent_netlab_event ~= nilptr and link == &host.local_agent then agent_netlab_event(ev) end
   elseif ev.typ == PROTO_COPENED or ev.typ == PROTO_CDONE then
     if agent_clip_event ~= nilptr then agent_clip_event(ev) end
   elseif ev.typ == PROTO_OPENED then
