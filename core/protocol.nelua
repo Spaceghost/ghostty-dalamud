@@ -41,6 +41,9 @@
 -- a Claude Code session in stream-json mode above all. JOPEN, JDATA, JCLOSE,
 -- JSIG, JATTACH from the client; JOPENED, JOUT, JEXIT from the agent.
 -- Clients send them only to agents greeting with version 4+.
+--
+-- Netlab (docs/NETLAB.md), additive to version 4: NLCTL from the client;
+-- NLREPLY, NLSTAT and NLFRAME from the agent.
 
 global proto = @record{}
 
@@ -69,6 +72,10 @@ global PROTO_JATTACH: uint8 <comptime> = 33   -- jid: take over a kept job, with
 global PROTO_COPEN: uint8 <comptime> = 37    -- req u32, kind u8 (0 gif, 1 mp4), w u16, h u16, fps u8
 global PROTO_CFRAME: uint8 <comptime> = 38   -- cid u32, seq u32, enc u8, pixels of the whole frame
 global PROTO_CEND: uint8 <comptime> = 39     -- cid u32, flags u8 (1: cancel, write nothing)
+-- Netlab (docs/NETLAB.md): iroh and moq, shown live. Additive; an agent that
+-- does not know NLCTL answers ERR "unknown frame". core/netlab_wire.nelua
+-- builds and parses the payloads.
+global PROTO_NLCTL: uint8 <comptime> = 48    -- req u32, a command line (UTF-8)
 
 global PROTO_OK: uint8 <comptime> = 16
 global PROTO_ERR: uint8 <comptime> = 17
@@ -88,6 +95,9 @@ global PROTO_JOUT: uint8 <comptime> = 35      -- jid, stream u8 (1 stdout, 2 std
 global PROTO_JEXIT: uint8 <comptime> = 36     -- jid, status i32 (128 + signal when killed)
 global PROTO_COPENED: uint8 <comptime> = 40   -- req u32, cid u32, text (cid 0: refused, the text says why)
 global PROTO_CDONE: uint8 <comptime> = 41     -- cid u32, status i32 (0 ok), the file's path or why not
+global PROTO_NLREPLY: uint8 <comptime> = 49   -- req u32, ok u8, text (a subscription id, a ticket, or why not)
+global PROTO_NLSTAT: uint8 <comptime> = 50    -- JSON: what the netlab panel draws, to connections that asked (watch)
+global PROTO_NLFRAME: uint8 <comptime> = 51   -- sub u32, group u64, index u32, flags u8, lat_us u32, then WFRAME frames: one picture
 
 -- JOPEN flags
 global JOB_FLAG_KEEP: uint8 <comptime> = 1    -- bit 0: outlive the connection; JATTACH picks it up again

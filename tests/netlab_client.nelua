@@ -1,0 +1,228 @@
+-- A small netlab client for tests (docs/NETLAB.md): one agent connection over
+-- raw protocol frames, NLCTL commands and their NLREPLY, the newest NLSTAT,
+-- NLFRAMEs rebuilt into pictures of the test capture backend, and a few
+-- readers for the stats JSON. Used by tests/test_netlab_agent.nelua and
+-- tests/netlab_probe.nelua.
+require 'core.sys.net'
+require 'core.protocol'
+require 'core.wincodec'
+require 'core.netlab_wire'
+require 'agent.capture' -- capture_test_render
+require 'string'
+require 'vector'
+require 'memory'
+require 'os'
+
+## cinclude '<unistd.h>'
+global function nlc_usleep(us: cuint): cint <cimport 'usleep', nodecl> end
+
+global NlcMsg = @record{ typ: uint8, data: vector(uint8) }
+global NlcConn = @record{ sock: NetSocket, inq: ByteQueue, outq: ByteQueue, msgs: vector(NlcMsg), closed: boolean, req: uint32 }
+
+function NlcConn:pump(): void
+  while self.outq:len() > 0 do
+    local n = net.send(self.sock, self.outq:peek(), self.outq:len())
+    if n <= 0 then break end
+    self.outq:consume((@usize)(n))
+  end
+  local buf: [65536]uint8
+  for _ = 1, 64 do
+    local n = net.recv(self.sock, &buf, #buf)
+    if n > 0 then self.inq:push(&buf, (@usize)(n))
+    elseif n == 0 then break
+    else self.closed = true break end
+  end
+  while true do
+    local ok, typ, payload, len = proto.read_frame(&self.inq)
+    if not ok then break end
+    local m: NlcMsg = { typ = typ }
+    m.data:resize(len)
+    if len > 0 then memory.copy(&m.data[0], payload, len) end
+    self.msgs:push(m)
+    proto.frame_consume(&self.inq, len)
+  end
+end
+
+-- Connect and say HELLO; asserts on failure.
+global function nlc_open(host: string, port: uint16, token: string): NlcConn
+  local c: NlcConn
+  local nc = net.connect(host, port)
+  assert(net.is_valid(nc.sock), 'connect')
+  for _ = 1, 1000 do
+    if net.connect_poll(&nc) == 1 then break end
+    nlc_usleep(5000)
+  end
+  assert(nc.connected, 'connected')
+  c.sock = nc.sock
+  proto.write_frame(&c.outq, PROTO_HELLO, (@*[0]uint8)(token.data), token.size)
+  for _ = 1, 1000 do
+    c:pump()
+    if #c.msgs > 0 then break end
+    nlc_usleep(5000)
+  end
+  assert(#c.msgs > 0 and c.msgs[0].typ == PROTO_OK, 'handshake')
+  c.msgs[0].data:destroy()
+  c.msgs:remove(0)
+  return c
+end
+
+function NlcConn:close(): void
+  net.close(self.sock)
+  for i = 0, < #self.msgs do self.msgs[i].data:destroy() end
+  self.msgs:destroy() self.inq:destroy() self.outq:destroy()
+end
+
+-- Send a command and wait for its NLREPLY: (ok, text).
+function NlcConn:ctl(cmd: string): (boolean, string)
+  self.req = self.req + 1
+  netlab_wire.write_ctl(&self.outq, self.req, cmd)
+  for _ = 1, 3000 do
+    self:pump()
+    for i = 0, < #self.msgs do
+      local m = &self.msgs[i]
+      if m.typ == PROTO_NLREPLY then
+        local ok, req, done, text = netlab_wire.parse_reply((@*[0]uint8)(&m.data[0]), #m.data)
+        assert(ok)
+        if req == self.req then
+          local t = text:copy()
+          m.data:destroy()
+          self.msgs:remove(i)
+          return done, t
+        end
+      end
+    end
+    nlc_usleep(5000)
+  end
+  error('no NLREPLY for ' .. cmd)
+  return false, (@string){}
+end
+
+-- The newest NLSTAT, waiting up to `secs`; older ones are dropped.
+function NlcConn:stat(secs: number): string
+  for _ = 1, (@integer)(secs * 200) do
+    self:pump()
+    local js: string
+    local i = 0
+    while i < #self.msgs do
+      if self.msgs[i].typ == PROTO_NLSTAT then
+        js:destroy()
+        js = string{data=(@*[0]byte)(&self.msgs[i].data[0]), size=#self.msgs[i].data}:copy()
+        self.msgs[i].data:destroy()
+        self.msgs:remove(i)
+      else
+        i = i + 1
+      end
+    end
+    if #js > 0 then return js end
+    nlc_usleep(5000)
+  end
+  error('no NLSTAT')
+  return (@string){}
+end
+
+-- The largest number after `key` in `js` (-1 when there is none).
+global function nlc_max(js: string, key: string): integer
+  local best, at = -1, 1
+  while true do
+    local i = js:find(key, at, true)
+    if i <= 0 then return best end
+    local v, k = 0, i + #key
+    while k <= #js and js.data[k - 1] >= '0'_b and js.data[k - 1] <= '9'_b do v = v * 10 + (js.data[k - 1] - '0'_b) k = k + 1 end
+    if v > best then best = v end
+    at = k
+  end
+  return best
+end
+
+-- The earliest t_ms of a path event of `kind` ('relay' or 'direct') and
+-- `what` ('opened', 'selected', ...) anywhere in `js`, -1 when there is none.
+-- Events are {"addr","conn","kind","t_ms","what"} (keys in that order).
+global function nlc_event_ms(js: string, kind: string, what: string): integer
+  local needle = '"kind":"' .. kind .. '","t_ms":'
+  defer needle:destroy() end
+  local tail = ',"what":"' .. what .. '"'
+  defer tail:destroy() end
+  local best, at = -1, 1
+  while true do
+    local i = js:find(needle, at, true)
+    if i <= 0 then return best end
+    local v, k = 0, i + #needle
+    while k <= #js and js.data[k - 1] >= '0'_b and js.data[k - 1] <= '9'_b do v = v * 10 + (js.data[k - 1] - '0'_b) k = k + 1 end
+    if k + #tail - 1 <= #js and js:subview(k, k + #tail - 1) == tail and (best < 0 or v < best) then best = v end
+    at = k
+  end
+  return best
+end
+
+-- Pictures rebuilt from one subscription's NLFRAMEs.
+global NlcView = @record{
+  sub: uint32, frames: integer, pictures: integer, exact: integer, keys: integer,
+  lat_us: uint32, pix: vector(uint8), w: integer, h: integer, n: integer, expect: vector(uint8),
+}
+
+-- The picture is test window 1's frame `n` for some n (capture_test_render).
+local function view_matches(v: *NlcView): boolean
+  for n = math.max(1, v.n), v.n + 400 do
+    capture_test_render(1, n, v.w, v.h, &v.expect)
+    if v.expect[0] == v.pix[0] and v.expect[1] == v.pix[1] and v.expect[2] == v.pix[2] then
+      local same = true
+      for i = 0, < v.w * v.h * 4 do
+        if i % 4 ~= 3 and v.expect[i] ~= v.pix[i] then same = false break end
+      end
+      if same then v.n = n return true end
+    end
+  end
+  return false
+end
+
+function NlcView:destroy(): void
+  self.pix:destroy() self.expect:destroy()
+end
+
+-- Take this connection's NLFRAMEs of `v.sub` into its picture; returns how
+-- many NLFRAMEs of other subscriptions there were.
+function NlcConn:frames(v: *NlcView): integer
+  local others = 0
+  self:pump()
+  local i = 0
+  while i < #self.msgs do
+    local m = &self.msgs[i]
+    if m.typ ~= PROTO_NLFRAME then i = i + 1 continue end
+    local ok, h, body, blen = netlab_wire.parse_frame((@*[0]uint8)(&m.data[0]), #m.data)
+    assert(ok, 'NLFRAME header')
+    if h.sub ~= v.sub then
+      others = others + 1
+    else
+      v.frames = v.frames + 1
+      v.lat_us = h.lat_us
+      local pos: usize = 0
+      while pos < blen do
+        local wok, wp, wl, next = netlab_wire.next_wframe(body, blen, pos)
+        assert(wok, 'a WFRAME in the NLFRAME')
+        local fok, fr = wincodec_parse(wp, wl)
+        assert(fok)
+        if (fr.flags & WINCODEC_FLAG_KEY) ~= 0 then
+          assert((h.flags & NETLAB_FLAG_GROUP_START) ~= 0, 'a key picture outside a group start')
+          v.keys = v.keys + 1
+          v.w, v.h = fr.w, fr.h
+          v.pix:resize((@usize)(v.w * v.h * 4))
+        end
+        if v.w > 0 then
+          while true do
+            local rok, rect = wincodec_next_rect(&fr)
+            if not rok then break end
+            assert(wincodec_apply_rect(&rect, (@*[0]uint8)(&v.pix[0]), (@usize)(v.w * 4)))
+          end
+          if (fr.flags & WINCODEC_FLAG_END) ~= 0 then
+            v.pictures = v.pictures + 1
+            if view_matches(v) then v.exact = v.exact + 1 end
+          end
+        end
+        pos = next
+      end
+    end
+    m.data:destroy()
+    self.msgs:remove(i)
+  end
+  return others
+end

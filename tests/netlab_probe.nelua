@@ -1,0 +1,103 @@
+-- Netlab between two machines (tools/netlab-containers.sh, docs/NETLAB.md):
+-- agent A publishes its test window, agent B subscribes to it over iroh
+-- through the relay, and this checks what the panel reads from both:
+--
+--   * B's connection starts on the relay and moves to a direct path
+--     (the path events, in that order), which then has an rtt;
+--   * B's viewed subscription rebuilds A's pictures exactly, with a latency;
+--   * B's slow subscription loses groups (skipped or cut) instead of queueing;
+--   * A serves both of B's subscriptions (two incoming connections) with
+--     moq traffic counted on them.
+--
+--   netlab_probe A_HOST A_PORT B_HOST B_PORT TOKEN RELAY_URL
+-- One PASS or FAIL line; exit status 0 or 1.
+require 'tests.netlab_client'
+require 'arg'
+require 'io'
+require 'stringbuilder'
+
+local a_host: string = arg[1]
+local a_port: uint16 = (@uint16)(tointeger(arg[2]))
+local b_host: string = arg[3]
+local b_port: uint16 = (@uint16)(tointeger(arg[4]))
+local token: string = arg[5]
+local relay: string = arg[6]
+
+local function must(c: *NlcConn, cmd: string): string
+  local ok, text = c:ctl(cmd)
+  if not ok then
+    io.stderr:write('FAIL: ', cmd, ': ', text, '\n')
+    os.exit(1)
+  end
+  return text
+end
+
+local function fail(why: string): void
+  io.stdout:write('FAIL ', why, '\n')
+  io.stdout:flush()
+  os.exit(1)
+end
+
+local a = nlc_open(a_host, a_port, token)
+local b = nlc_open(b_host, b_port, token)
+must(&a, 'watch 200'):destroy()
+must(&b, 'watch 100'):destroy()
+must(&a, 'start relay=' .. relay):destroy()
+must(&b, 'start relay=' .. relay):destroy()
+must(&a, 'publish netlab group=500 window=pattern one'):destroy()
+
+-- A's ticket once it names its home relay
+local ticket: string
+local deadline = os.now() + 20
+while os.now() < deadline do
+  ticket = must(&a, 'ticket')
+  if ticket:find('relay=', 1, true) > 0 then break end
+  ticket:destroy()
+  nlc_usleep(100000)
+end
+if ticket:find('relay=', 1, true) <= 0 then fail('A never reached the relay') end
+
+local fast_id = must(&b, 'subscribe ' .. ticket .. ' netlab view age=500 via=relay')
+local slow_id = must(&b, 'subscribe ' .. ticket .. ' netlab age=0 slow=150 via=relay')
+local v: NlcView = { sub = (@uint32)(tointeger(fast_id)) }
+
+local relay_opened, direct_selected, behind, rtt, a_in, a_frames = -1, -1, -1, -1, -1, -1
+deadline = os.now() + 60
+while os.now() < deadline do
+  b:frames(&v)
+  local jb = b:stat(5)
+  relay_opened = nlc_event_ms(jb, 'relay', 'opened')
+  direct_selected = nlc_event_ms(jb, 'direct', 'selected')
+  behind = math.max(nlc_max(jb, '"skipped":'), nlc_max(jb, '"cut":'))
+  rtt = nlc_max(jb, '"rtt_us":')
+  jb:destroy()
+  local ja = a:stat(5)
+  local n, at = 0, 1
+  while true do
+    local i = ja:find('"dir":"in"', at, true)
+    if i <= 0 then break end
+    n, at = n + 1, i + 1
+  end
+  a_in = n
+  a_frames = nlc_max(ja, '"frames":')
+  ja:destroy()
+  if relay_opened >= 0 and direct_selected > relay_opened and v.exact >= 60 and behind > 0 and a_in >= 2 and a_frames > 0 then break end
+  nlc_usleep(20000)
+end
+
+local sb: stringbuilder
+sb:writef('relay opened at %d ms, direct selected at %d ms; fast: %d pictures (%d exact), latency %d us; slow: %d groups lost; rtt %d us; A serves %d, sent %d objects',
+  relay_opened, direct_selected, v.pictures, v.exact, v.lat_us, behind, rtt, a_in, a_frames)
+local summary = sb:promote()
+if relay_opened < 0 then fail('no relay path: ' .. summary) end
+if direct_selected <= relay_opened then fail('never went direct after the relay: ' .. summary) end
+if v.exact < 60 or v.exact ~= v.pictures then fail('pictures: ' .. summary) end
+if behind <= 0 then fail('the slow subscription lost nothing: ' .. summary) end
+if a_in < 2 or a_frames <= 0 then fail('A: ' .. summary) end
+must(&b, 'stop'):destroy()
+must(&a, 'stop'):destroy()
+io.stdout:write('PASS ', summary, '\n')
+io.stdout:flush()
+a:close() b:close()
+v:destroy()
+fast_id:destroy() slow_id:destroy() ticket:destroy() summary:destroy()

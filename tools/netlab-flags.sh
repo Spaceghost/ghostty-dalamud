@@ -11,9 +11,13 @@
 # the agent builds that pass no --cflags of their own use it in place of
 # WAYLAND_NELUA.
 # shellcheck disable=SC2034 # used by the scripts that source this
+#
+# Sanitizer runs (SAN, tests/run.sh) leave it out: the Rust library and its
+# threads are not instrumented, and would be what TSan and valgrind report.
 NETLAB_DEFINE=()
 NETLAB_CFLAGS=""
-if [[ "$(uname -s)" == Linux && "${SKIP_NETLAB:-0}" != 1 && -f "$ROOT/vendor/moq-iroh/libmoq_iroh.a" ]]; then
+if [[ "$(uname -s)" == Linux && "${SKIP_NETLAB:-0}" != 1 && -z "${SAN:-}" &&
+      -f "$ROOT/vendor/moq-iroh/libmoq_iroh.a" ]]; then
   NETLAB_DEFINE=(-D NETLAB)
   # the library is a whole Rust program's worth of objects: keep what is used
   NETLAB_CFLAGS="-I\"$ROOT/vendor/moq-iroh\" -L\"$ROOT/vendor/moq-iroh\" -Wl,--gc-sections"

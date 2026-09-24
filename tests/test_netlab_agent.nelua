@@ -1,0 +1,137 @@
+-- End to end: netlab (docs/NETLAB.md) through a running ghostty-agent over
+-- raw protocol frames: NLCTL answered by NLREPLY, NLSTAT pushed to a watcher,
+-- and with netlab built, `demo` publishing the agent's test window over iroh
+-- to two subscriptions of its own: the fast one's NLFRAMEs rebuild exactly
+-- the pictures the test backend drew, a second connection subscribes with
+-- the ticket and views its own, the slow one falls behind and moq skips
+-- groups for it, and the stats name the direct path with its rtt.
+--
+--   test_netlab_agent PORT TOKEN BUILT(0|1) PORT_OFF
+-- PORT is an agent with --windows test, PORT_OFF one with --windows off.
+require 'tests.netlab_client'
+require 'arg'
+
+local port: uint16 = (@uint16)(tointeger(arg[1]))
+local token: string = arg[2]
+local built = arg[3] == '1'
+local port_off: uint16 = (@uint16)(tointeger(arg[4]))
+
+local function expect(c: *NlcConn, cmd: string, want_ok: boolean, prefix: string): void
+  local ok, text = c:ctl(cmd)
+  assert(ok == want_ok, text)
+  assert(#prefix == 0 or text:find(prefix, 1, true) == 1, text)
+  text:destroy()
+end
+
+do
+  local c = nlc_open('127.0.0.1', port, token)
+  expect(&c, 'watch 50', true, '')
+  local js = c:stat(3)
+  assert(js:find(built and '"built":true' or '"built":false', 1, true) > 0, 'built flag')
+  assert(js:find('"backend":"test"', 1, true) > 0, 'backend name')
+  js:destroy()
+
+  if not built then
+    local ok, text = c:ctl('start relay=off')
+    assert(not ok and text:find('not built', 1, true) > 0, text)
+    text:destroy()
+    c:close()
+    print('OK (netlab not built)')
+    os.exit(0)
+  end
+
+  expect(&c, 'bogus', false, 'unknown netlab command: bogus')
+  expect(&c, 'ticket', false, 'not started')
+  expect(&c, 'subscribe', false, 'subscribe TICKET')
+  -- no relay: nothing outside this host is needed, the subscriptions dial at once
+  expect(&c, 'demo relay=off group=300 slow=150 window=pattern one', true, 'running')
+  expect(&c, 'demo', false, 'a demo is running')
+
+  js = c:stat(3)
+  local fast = (@uint32)(nlc_max(js, '"fast":'))
+  local slow = (@uint32)(nlc_max(js, '"slow":'))
+  js:destroy()
+  assert(fast > 0 and slow > 0 and fast ~= slow, 'the demo subscriptions')
+
+  -- the fast subscription's frames come to this connection
+  local v: NlcView = { sub = fast }
+  local deadline = os.now() + 20
+  while v.exact < 30 and os.now() < deadline do
+    assert(c:frames(&v) == 0, 'frames of a subscription this connection does not view')
+    nlc_usleep(5000)
+  end
+  assert(v.exact >= 30 and v.exact == v.pictures, 'the fast subscription did not rebuild the window')
+  assert(v.keys >= 2 and v.lat_us < 5000000)
+
+  -- a second connection subscribes with the ticket and views its own
+  local ok, ticket = c:ctl('ticket')
+  assert(ok and ticket:find('iroh://', 1, true) == 1, ticket)
+  local c2 = nlc_open('127.0.0.1', port, token)
+  local cmd = 'subscribe ' .. ticket .. ' netlab view age=500'
+  ticket:destroy()
+  local id: string
+  ok, id = c2:ctl(cmd)
+  cmd:destroy()
+  assert(ok and tointeger(id) > 0, id)
+  local v2: NlcView = { sub = (@uint32)(tointeger(id)) }
+  deadline = os.now() + 20
+  while v2.exact < 10 and os.now() < deadline do
+    c2:frames(&v2)
+    c:frames(&v)
+    nlc_usleep(5000)
+  end
+  assert(v2.exact >= 10 and v2.exact == v2.pictures, 'the second connection did not see its subscription')
+  local off = 'view ' .. id .. ' off'
+  expect(&c2, off, true, '')
+  off:destroy()
+  c2:frames(&v2)
+  local seen = v2.frames
+  for _ = 1, 60 do c2:frames(&v2) c:frames(&v) nlc_usleep(5000) end
+  assert(v2.frames == seen, 'frames after view off')
+  id:destroy()
+  v2:destroy()
+  c2:close() -- the agent forgets it as a viewer
+
+  -- the slow one falls behind: moq skips or cuts groups rather than queue them
+  deadline = os.now() + 20
+  local behind, direct, rtt = -1, false, false
+  while os.now() < deadline do
+    c:frames(&v)
+    js = c:stat(3)
+    behind = math.max(nlc_max(js, '"skipped":'), nlc_max(js, '"cut":'))
+    direct = nlc_event_ms(js, 'direct', 'selected') >= 0
+    rtt = nlc_max(js, '"rtt_us":') > 0
+    js:destroy()
+    if behind > 0 and direct and rtt then break end
+  end
+  assert(behind > 0, 'the slow subscription never lost a group')
+  assert(direct and rtt, 'no selected direct path with an rtt')
+
+  local s = tostring(slow)
+  local c_slow = 'slow ' .. s .. ' 0'
+  expect(&c, c_slow, true, '')
+  expect(&c, 'slow 999999 5', false, 'slow SUB MS')
+  local c_uns = 'unsubscribe ' .. s
+  expect(&c, c_uns, true, '')
+  expect(&c, c_uns, false, 'no such subscription')
+  c_slow:destroy() c_uns:destroy() s:destroy()
+  expect(&c, 'stop', true, '')
+  local stopped = false
+  for _ = 1, 20 do -- an NLSTAT from before the stop may still be on its way
+    js = c:stat(3)
+    stopped = js:find('"started":false', 1, true) > 0 and js:find('"nodes":[]', 1, true) > 0
+    js:destroy()
+    if stopped then break end
+  end
+  assert(stopped, 'still running after stop')
+  expect(&c, 'watch 0', true, '')
+  c:close()
+  v:destroy()
+end
+
+do -- an agent with no window capture cannot publish
+  local c = nlc_open('127.0.0.1', port_off, token)
+  expect(&c, 'publish x', false, 'no window capture')
+  c:close()
+end
+print('OK')
