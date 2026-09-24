@@ -1,0 +1,113 @@
+-- What an agent can do, carried in its greeting (core/protocol.nelua, HELLO).
+-- The agent appends key=value words after its nonce:
+--
+--   ghostty-agent 4 <nonce> linux version=0.3.1 platform=linux compositor=on netlab=absent wg=off
+--
+-- A feature is `on` (in this build and working), `off` (in this build, not
+-- running: see the agent's log), or `absent` (not in this build). The bare
+-- fourth word is the platform alone, for clients that read only that; an older
+-- client still reads only the version and the nonce and stops at the next
+-- space, so the words are additive; an older agent sends none, and its features stay
+-- `unknown` (AgentCaps.known false) rather than being guessed. Unknown keys and
+-- values are ignored, so a later agent can add a feature without breaking this
+-- parser. Built by agent/caps.nelua, parsed by core/agent_client.nelua, shown
+-- by lua/agentcaps.lua.
+require 'string'
+require 'stringbuilder'
+
+global AGENT_CAP_UNKNOWN: uint8 <comptime> = 0 -- the agent did not say
+global AGENT_CAP_ABSENT: uint8 <comptime> = 1  -- not in this build
+global AGENT_CAP_OFF: uint8 <comptime> = 2     -- in this build, not running
+global AGENT_CAP_ON: uint8 <comptime> = 3      -- in this build and working
+
+-- The longest version or platform word kept; anything longer is not ours.
+global AGENT_CAP_WORD_MAX: usize <comptime> = 48
+
+global AgentCaps = @record{
+  known: boolean,    -- the greeting carried capability words at all
+  version: string,   -- the agent's release, '0.3.1'; empty when not said
+  platform: string,  -- 'linux', 'windows', 'macos'; empty when not said
+  compositor: uint8, -- the Wayland compositor backend (remote desktop windows on Linux)
+  netlab: uint8,     -- moq over iroh (docs/NETLAB.md)
+  wg: uint8,         -- embedded WireGuard (docs/WIREGUARD.md)
+}
+
+global agent_caps = @record{}
+
+function agent_caps.state_name(s: uint8): string
+  if s == AGENT_CAP_ON then return 'on'
+  elseif s == AGENT_CAP_OFF then return 'off'
+  elseif s == AGENT_CAP_ABSENT then return 'absent'
+  end
+  return 'unknown'
+end
+
+function agent_caps.state_of(word: string): uint8
+  if word == 'on' then return AGENT_CAP_ON
+  elseif word == 'off' then return AGENT_CAP_OFF
+  elseif word == 'absent' then return AGENT_CAP_ABSENT
+  end
+  return AGENT_CAP_UNKNOWN
+end
+
+-- A word the greeting can carry: printable, no space, no '=', not too long.
+local function word_ok(w: string): boolean
+  if w.size == 0 or w.size > AGENT_CAP_WORD_MAX then return false end
+  for i = 0, < w.size do
+    local b = w.data[i]
+    if b <= ' '_b or b >= 127 or b == '='_b then return false end
+  end
+  return true
+end
+
+-- Append the capability words (each preceded by a space) to a greeting.
+function agent_caps.write(sb: *stringbuilder, c: AgentCaps): void
+  if word_ok(c.version) then sb:write(' version=', c.version) end
+  if word_ok(c.platform) then sb:write(' platform=', c.platform) end
+  sb:write(' compositor=', agent_caps.state_name(c.compositor))
+  sb:write(' netlab=', agent_caps.state_name(c.netlab))
+  sb:write(' wg=', agent_caps.state_name(c.wg))
+end
+
+local function set_word(dst: *string, v: string): void
+  if not word_ok(v) then return end
+  dst:destroy()
+  $dst = v:copy()
+end
+
+-- The capability words of a whole greeting ("ghostty-agent <version> <nonce>
+-- key=value..."): everything after the third word. Owns its strings.
+function agent_caps.parse(text: string): AgentCaps
+  local c: AgentCaps = {}
+  local i: usize = 0
+  local nword = 0
+  while i < text.size do
+    while i < text.size and text.data[i] == ' '_b do i = i + 1 end
+    if i >= text.size then break end
+    local s = i
+    while i < text.size and text.data[i] ~= ' '_b do i = i + 1 end
+    nword = nword + 1
+    if nword > 3 then
+      local eq = s
+      while eq < i and text.data[eq] ~= '='_b do eq = eq + 1 end
+      if eq > s and eq < i then
+        local key = string{data=(@*[0]byte)(&text.data[s]), size=eq - s}
+        local val: string = {}
+        if i > eq + 1 then val = string{data=(@*[0]byte)(&text.data[eq + 1]), size=i - eq - 1} end
+        if key == 'version' then set_word(&c.version, val) c.known = true
+        elseif key == 'platform' then set_word(&c.platform, val) c.known = true
+        elseif key == 'compositor' then c.compositor = agent_caps.state_of(val) c.known = true
+        elseif key == 'netlab' then c.netlab = agent_caps.state_of(val) c.known = true
+        elseif key == 'wg' then c.wg = agent_caps.state_of(val) c.known = true
+        end
+      end
+    end
+  end
+  return c
+end
+
+function AgentCaps:destroy(): void
+  self.version:destroy()
+  self.platform:destroy()
+  $self = {}
+end

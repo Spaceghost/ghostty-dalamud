@@ -11,6 +11,7 @@ local vote = require('vote')
 local themes = require('themes')
 local tooltips = require('tooltips')
 local gallery = require('gallery')
+local agentcaps = require('agentcaps')
 
 local S = {}
 
@@ -423,6 +424,7 @@ function S.draw_settings(ui)
     end
   end
   S.draw_status(ui)
+  S.draw_agent(ui)
   ui.separator()
   local reset = ui.button('Reset all to defaults')
   tip(tips.reset)
@@ -503,6 +505,13 @@ local function lua_files(dir)
   end
   table.sort(out)
   return #out > 0 and table.concat(out, ', ') or 'none'
+end
+
+-- What the connected agent can do (lua/agentcaps.lua); an older core has no
+-- ghostty.agent_status and draws nothing here.
+function S.draw_agent(ui)
+  if not (ghostty and ghostty.agent_status) then return end
+  agentcaps.draw(ui, ghostty.agent_status())
 end
 
 function S.draw_status(ui)

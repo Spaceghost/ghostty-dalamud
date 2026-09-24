@@ -4,6 +4,7 @@ require 'string'
 require 'vector'
 require 'core.sys.net'
 require 'core.protocol'
+require 'core.agent_caps'
 require 'core.wincodec'
 
 global AgentState = @enum(cint){ Disconnected = 0, Connecting, Handshake, Ready, Failed }
@@ -52,6 +53,7 @@ global AgentClient = @record{
   -- per connection, from the handshake reply "ghostty-agent <version> <nonce>"
   version: integer,            -- 1 for agents that send no version 2 frames
   nonce: uint64,               -- changes when the agent restarts; 0 = unknown (version 1)
+  caps: AgentCaps,             -- what the agent says it can do (core/agent_caps.nelua); known false: it did not say
   attach_fifo: vector(uint32), -- version 1: ATTACH ids waiting for OK "attached" / ERR "no such session"
   clip_fifo: vector(uint8),    -- CLIP_SET / CLIP_GET waiting for their reply
   clip_off: boolean,           -- the agent does not know clipboard frames: stop sending them
@@ -84,6 +86,7 @@ function AgentClient:destroy(): void
   self.last_error:destroy()
   self.attach_fifo:destroy()
   self.clip_fifo:destroy()
+  self.caps:destroy()
   self.state = AgentState.Disconnected
 end
 
@@ -106,6 +109,7 @@ function AgentClient:connect(now: float64): void
   self.outq:destroy()
   self.version = 0
   self.nonce = 0
+  self.caps:destroy()
   self.attach_fifo:clear()
   self.clip_fifo:clear()
   self.clip_off = false
@@ -479,12 +483,14 @@ local function parse_digits(text: string, i: usize): (uint64, usize)
   return v, i
 end
 
--- "ghostty-agent <version> [<nonce>]"; anything else counts as version 1.
+-- "ghostty-agent <version> [<nonce> [key=value...]]"; anything else counts as
+-- version 1. The key=value words are the agent's capabilities (core/agent_caps.nelua).
 local function parse_greeting(self: *AgentClient, text: string): void
   self.version = 1
   self.nonce = 0
   self.platform:destroy()
   self.platform = (@string){}
+  self.caps:destroy()
   local prefix: string = 'ghostty-agent '
   if text.size <= prefix.size or text:subview(1, prefix.size) ~= prefix then return end
   local v, i = parse_digits(text, prefix.size)
@@ -501,6 +507,7 @@ local function parse_greeting(self: *AgentClient, text: string): void
       if e > 1 then self.platform = rest:subview(1, e - 1):copy() end
     end
   end
+  self.caps = agent_caps.parse(text)
 end
 
 -- A clipboard request got its reply: which kind it was (0 when none waited).

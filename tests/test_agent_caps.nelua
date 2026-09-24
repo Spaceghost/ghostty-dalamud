@@ -1,0 +1,74 @@
+-- The agent's capability words (core/agent_caps.nelua): what the greeting
+-- carries, what the plugin reads back, and that older greetings stay unknown.
+require 'string'
+require 'stringbuilder'
+require 'core.agent_caps'
+
+local function greet(c: AgentCaps): string
+  local sb: stringbuilder
+  sb:write('ghostty-agent 4 12345')
+  agent_caps.write(&sb, c)
+  return sb:promote()
+end
+
+do -- round trip
+  local text = greet(AgentCaps{ known = true, version = '0.3.1', platform = 'linux',
+    compositor = AGENT_CAP_ON, netlab = AGENT_CAP_ABSENT, wg = AGENT_CAP_ABSENT })
+  assert(text == 'ghostty-agent 4 12345 version=0.3.1 platform=linux compositor=on netlab=absent wg=absent', text)
+  local c = agent_caps.parse(text)
+  assert(c.known and c.version == '0.3.1' and c.platform == 'linux')
+  assert(c.compositor == AGENT_CAP_ON and c.netlab == AGENT_CAP_ABSENT and c.wg == AGENT_CAP_ABSENT)
+  c:destroy()
+  text:destroy()
+end
+
+do -- every state survives the wire
+  for s: uint8 = AGENT_CAP_ABSENT, AGENT_CAP_ON do
+    local text = greet(AgentCaps{ compositor = s, netlab = s, wg = s })
+    local c = agent_caps.parse(text)
+    assert(c.compositor == s and c.netlab == s and c.wg == s, agent_caps.state_name(s))
+    assert(#c.version == 0 and #c.platform == 0, 'an empty version or platform is not sent')
+    c:destroy()
+    text:destroy()
+  end
+end
+
+do -- older agents greet without capabilities: unknown, never guessed
+  local olds: [5]string = {'ghostty-agent 1', 'ghostty-agent 2 42', 'ghostty-agent 4 42', 'ghostty-agent 4 42 ', ''}
+  for k = 0, < #olds do
+    local old = olds[k]
+    local c = agent_caps.parse(old)
+    assert(not c.known and c.compositor == AGENT_CAP_UNKNOWN and c.netlab == AGENT_CAP_UNKNOWN
+      and c.wg == AGENT_CAP_UNKNOWN and #c.version == 0, old)
+    c:destroy()
+  end
+end
+
+do -- a newer agent: unknown keys and values are skipped, known ones still read
+  local c = agent_caps.parse('ghostty-agent 5 7 speed=fast netlab=sideways  compositor=off =x wg= version=0.4.0 junk')
+  assert(c.known and c.compositor == AGENT_CAP_OFF and c.netlab == AGENT_CAP_UNKNOWN and c.wg == AGENT_CAP_UNKNOWN)
+  assert(c.version == '0.4.0')
+  c:destroy()
+end
+
+do -- the first three words are never capabilities, and hostile words are refused
+  local c = agent_caps.parse('ghostty-agent netlab=on compositor=on')
+  assert(not c.known, 'words 2 and 3 are the version and the nonce')
+  c:destroy()
+  local long: string = 'ghostty-agent 4 1 version=' .. string.rep('9', 200)
+  c = agent_caps.parse(long)
+  assert(c.known and #c.version == 0, 'an over-long version is dropped')
+  c:destroy()
+  long:destroy()
+  c = agent_caps.parse('ghostty-agent 4 1 version=1 version=2')
+  assert(c.version == '2', 'the last word wins, without a leak')
+  c:destroy()
+end
+
+do -- write never emits a word the parser would split
+  local text = greet(AgentCaps{ version = 'a b', platform = 'x=y', netlab = AGENT_CAP_ON })
+  assert(text:find('version=', 1, true) == 0 and text:find('platform=', 1, true) == 0, text)
+  text:destroy()
+end
+
+print('test_agent_caps ok')
