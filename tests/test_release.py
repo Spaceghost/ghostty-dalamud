@@ -59,6 +59,12 @@ class ReleaseTests(unittest.TestCase):
         self.assertEqual(set(hashes), release.PAYLOAD)
         self.assertTrue(all(len(h) == 64 for h in hashes.values()))
 
+    def test_payload_is_every_committed_lua_module(self):
+        root = Path(__file__).resolve().parents[1]
+        committed = {f"lua/{p.name}" for p in (root / "lua").glob("*.lua")}
+        self.assertIn("lua/adopt.lua", release.PAYLOAD)
+        self.assertEqual({n for n in release.PAYLOAD if n.startswith("lua/")}, committed)
+
     def test_missing_core(self):
         del self.files["ghostty_core.dll"]
         with self.assertRaisesRegex(release.ReleaseError, "missing payload"):

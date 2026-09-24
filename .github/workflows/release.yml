@@ -82,7 +82,7 @@ jobs:
           path: |
             ~/.cache/ghostty-dalamud-ci
             vendor
-          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ runner.environment }}-${{ hashFiles('toolchain.env', 'tools/build-common.sh', 'tools/zig-cc.sh') }}
       - name: Restore Zig build caches
         uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -90,7 +90,7 @@ jobs:
             ~/.cache/zig-global
             build/zig-cache-linux
             build/zig-cache-win
-          key: zig-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+          key: zig-build-${{ runner.os }}-${{ runner.arch }}-${{ runner.environment }}-${{ hashFiles('toolchain.env') }}
 
       - name: Test, build and package
         env:

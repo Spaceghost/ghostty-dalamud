@@ -45,7 +45,7 @@ jobs:
           path: |
             ~/.cache/ghostty-dalamud-ci
             vendor
-          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ runner.environment }}-${{ hashFiles('toolchain.env', 'tools/build-common.sh', 'tools/zig-cc.sh') }}
 
       # The Nelua compiler and netlab's offline Rust workspace; the library itself
       # is built inside the image build, from the tarball, like the RPM's.

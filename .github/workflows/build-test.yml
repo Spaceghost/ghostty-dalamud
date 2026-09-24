@@ -75,9 +75,11 @@ jobs:
           path: |
             ~/.cache/ghostty-dalamud-ci
             vendor
-          # build-common.sh builds the cached Nelua compiler: a change to how it
-          # is built must not reuse a compiler built the old way
-          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env', 'tools/build-common.sh') }}
+          # build-common.sh and zig-cc.sh build the cached Nelua compiler: a
+          # change to how it is built must not reuse a compiler built the old
+          # way. runner.environment: a self-hosted runner's ~ sits at another
+          # depth from its checkout, so its archives do not restore on a hosted one.
+          key: toolchains-${{ runner.os }}-${{ runner.arch }}-${{ runner.environment }}-${{ hashFiles('toolchain.env', 'tools/build-common.sh', 'tools/zig-cc.sh') }}
       - name: Cache Zig build caches
         if: inputs.cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -86,7 +88,7 @@ jobs:
             ~/.cache/zig-global
             build/zig-cache-linux
             build/zig-cache-win
-          key: zig-build-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('toolchain.env') }}
+          key: zig-build-${{ runner.os }}-${{ runner.arch }}-${{ runner.environment }}-${{ hashFiles('toolchain.env') }}
 
       - name: Test and build
         run: tools/ci/run.sh ${{ inputs.stages }}
