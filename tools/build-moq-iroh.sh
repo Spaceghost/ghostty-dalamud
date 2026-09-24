@@ -12,7 +12,8 @@
 # The staticlib alone (`cargo rustc --crate-type staticlib`): the crate also
 # declares a cdylib, and linking that for Windows would need a MinGW linker we do
 # not otherwise have. The C parts of the dependency tree (ring) are compiled for
-# Windows with the pinned Zig, the same compiler that builds ghostty-agent.exe.
+# Windows with the pinned Zig, the same compiler that builds ghostty-agent.exe,
+# and Zig's llvm-dlltool makes the import libraries, so no MinGW is needed.
 #
 # Size: fat LTO and one codegen unit, so the archive is one object the agent's
 # --gc-sections can cut down; no debug info (the agent's own release builds are
@@ -112,11 +113,30 @@ for w in "${WANT[@]}"; do
         printf 'exec "%s" cc -target x86_64-windows-gnu -fno-sanitize=undefined "$@"\n' "$zig"
       } >"$wrap/cc"
       printf '#!/bin/sh\nexec "%s" ar "$@"\n' "$zig" >"$wrap/ar"
-      chmod +x "$wrap/cc" "$wrap/ar"
+      # rustc makes the import libraries of raw-dylib crates (windows-sys) with
+      # dlltool, by default MinGW's x86_64-w64-mingw32-dlltool, which a runner
+      # need not have. zig's is llvm-dlltool; it takes GNU dlltool's arguments
+      # except --temp-prefix, which only names GNU's scratch files.
+      # shellcheck disable=SC2016 # the wrapper's own $a and $@, written literally
+      {
+        echo '#!/bin/sh'
+        echo 'skip=0'
+        echo 'for a; do'
+        echo '  shift'
+        echo '  if [ "$skip" = 1 ]; then skip=0; continue; fi'
+        echo '  case "$a" in'
+        echo '    --temp-prefix) skip=1 ;;'
+        echo '    --temp-prefix=*) ;;'
+        echo '    *) set -- "$@" "$a" ;;'
+        echo '  esac'
+        echo 'done'
+        printf 'exec "%s" dlltool "$@"\n' "$zig"
+      } >"$wrap/dlltool"
+      chmod +x "$wrap/cc" "$wrap/ar" "$wrap/dlltool"
       export CC_x86_64_pc_windows_gnu="$wrap/cc" AR_x86_64_pc_windows_gnu="$wrap/ar"
       export CARGO_TARGET_X86_64_PC_WINDOWS_GNU_LINKER="$wrap/cc"
       # the linker is zig, not a MinGW gcc: rustc must not add MinGW's own crt
-      RUSTFLAGS="$RUSTFLAGS -C link-self-contained=no" build x86_64-pc-windows-gnu "$OUT/x86_64-pc-windows-gnu"
+      RUSTFLAGS="$RUSTFLAGS -C link-self-contained=no -C dlltool=$wrap/dlltool" build x86_64-pc-windows-gnu "$OUT/x86_64-pc-windows-gnu"
       ;;
   esac
 done
