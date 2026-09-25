@@ -1,17 +1,52 @@
 -- Which platform the code runs on, as Lua sees it through ghostty.platform():
 -- 'windows' (native Windows), 'wine' (a Windows build running under Wine or
--- Proton: ntdll exports wine_get_version), 'linux', 'macos' or 'posix'.
+-- Proton on another host), 'linux', 'macos' or 'posix'.
 -- The name is a static string; callers never free it.
 require 'string'
 
 ## if ccinfo.is_windows then
 ## cinclude '<windows.h>'
+## linklib 'advapi32'
 local function GetModuleHandleA(name: cstring): pointer <cimport, nodecl> end
 local function GetProcAddress(mod: pointer, name: cstring): pointer <cimport, nodecl> end
+local function GetFileAttributesA(path: cstring): uint32 <cimport, nodecl> end
+local function RegOpenKeyExA(key: pointer, subkey: cstring, options: uint32, sam: uint32, result: *pointer): clong <cimport, nodecl> end
+local function RegCloseKey(key: pointer): clong <cimport, nodecl> end
+local HKEY_LOCAL_MACHINE: pointer <cimport, nodecl, const>
+local KEY_READ: uint32 <cimport, nodecl, const>
+local INVALID_FILE_ATTRIBUTES: uint32 <cimport, nodecl, const>
+
+-- Asking Wine is not enough: wine-staging based builds (XIVLauncher's wine-xiv,
+-- many Proton forks) hide ntdll's wine_* exports from GetProcAddress although
+-- the export table still has them. There the plugin took Linux for Windows
+-- and opened its local PowerShell - Wine's stub, which exits at once - instead
+-- of the host's shells through ghostty-agent. So also look for what a build
+-- cannot hide:
+--   \\?\unix\          Wine's path into the host filesystem, on Linux and
+--                      macOS alike; Windows has no such device
+--   HKLM\Software\Wine  written into every Wine prefix
+local function detect_wine(): boolean
+  local ntdll = GetModuleHandleA('ntdll.dll')
+  if ntdll ~= nilptr and GetProcAddress(ntdll, 'wine_get_version') ~= nilptr then return true end
+  if GetFileAttributesA('\\\\?\\unix\\') ~= INVALID_FILE_ATTRIBUTES then return true end
+  local key: pointer = nilptr
+  if RegOpenKeyExA(HKEY_LOCAL_MACHINE, 'Software\\Wine', 0, KEY_READ, &key) == 0 then
+    RegCloseKey(key)
+    return true
+  end
+  return false
+end
+
+-- The answer cannot change while the process runs; ask the system once.
+local wine_known: boolean = false
+local wine_cached: boolean = false
 
 global function platform_is_wine(): boolean
-  local ntdll = GetModuleHandleA('ntdll.dll')
-  return ntdll ~= nilptr and GetProcAddress(ntdll, 'wine_get_version') ~= nilptr
+  if not wine_known then
+    wine_cached = detect_wine()
+    wine_known = true
+  end
+  return wine_cached
 end
 
 global function platform_name(): string
