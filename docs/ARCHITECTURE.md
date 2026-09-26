@@ -289,57 +289,43 @@ snapped back every frame.
   rest, then lets its hem down 0.35 s after it is no longer needed. Taller
   ones are stepped aside from. A pet held still to be read makes no room, and
   keeps a hike under way as it is.
-* **The world: open space, not collision solving.** (Rebuilt after the
-  in-game try of a5f1bf7, where pets "jumped around waaaay too much": 12 s of
-  walking logged 50 frames of blinking and the chosen place flicking between
-  -1.2 and +1.2 rad.) `ghostty.raycast` is the shim's `raycast_mode`, through
+* **The world: walls are hung on like paintings.** (Replaced the open-space
+  ring, squeezing, floating over and blinking, which was a lot of machinery
+  for a pet to vanish and reappear; the game's depth test already draws a
+  post or a crate across a panel, so what matters is walls.)
+  `ghostty.raycast` is the shim's `raycast_mode`, through
   `BGCollisionModule.RaycastMaterialFilter` with every collision layer and any
-  material; ClientStructs' helper (layer 1, material bit 0x4000, what
-  ScreenToWorld wants) missed props on other layers, and the wider filter hits
-  grass too, so what counts is decided here, by size:
-  * *The open map* (`open_tick`): a ring of rays from where you stand,
-    `collide.open_dirs` (36) directions at three heights (0.6, 1.3 and 2.0
-    yalms), out to `open_reach` (7), swept `open_rays` (24) rays a frame and
-    again every `open_every` (0.4 s). A hit counts only if it is *tall* (the
-    same direction hits at another height within 0.6 yalm) and *wide or close*
-    (a neighbouring direction hits too, or it is within 4 yalms, where a post
-    can fall between two directions): grass, kerbs, knee-high stones and thin
-    stalks do not count (`motion.classify_ring`). Each direction's open
-    distance is smoothed: closing quickly (0.15 s), opening slowly (0.9 s).
-  * *Where a pet goes* (`place_open`): its slot while that has room
-    (`motion.clearance`: every ring direction its face spans open past its face
-    plus `margin`); else the open place nearest its slot, up to `swing` round
-    you, outside the no-go cones and away from where another pet has moved;
-    nowhere open, the roomiest, brought in as far as your personal space
-    allows. Decided every 0.5 s (0.8 s while you move) with hysteresis: a place
-    is left only after `bad_for` (0.3 s) without room, and it goes back to its
-    slot only after staying `stay` (1.5 s). It drifts there over `drift` (0.9 s)
-    through the animation layer; nothing jumps. A place the pet found blocked
-    itself (something too thin for the ring, a pillar between its rays) counts
-    as having no room for two or three seconds.
-  * *Never seen inside anything large* (end of `M.place_pet`). Each time a
-    pet moves `recheck` (3 cm) its face is looked at along three rows (near the
-    bottom, the middle, near the top; `motion.face_rows`) and its way at two
-    heights (`motion.path_rows`). The middle and top count when a ray each way
-    hits, or one does and a second ray a little higher agrees (one stray answer
-    is not a wall); the bottom row alone is clutter under it (grass tips, a
-    crate, a short post): it floats over it if it can and never stops for it.
-    Something large and it holds where it was clear, tries to squeeze through or
-    float over (`find_way`), and after three blocked looks lets the open map
-    choose again. It blinks only after `blink_after` (5) blocked looks and
-    `stuck` (1 s), and never more than once every `blink_every` (4 s): a
-    smootherstep shrink over `blink` (0.2 s; with Reduce motion a fade), a jump
-    while hidden to the place the open map chose, once that is itself clear,
-    and the same back in. At rest its face is looked at four times a second;
-    something large there three looks running hides it at once. The first
-    frame also looks from your chest (a face buried in a thick wall has nothing
-    to hit along it). A pet with no rays left this frame holds still.
-  All pets together cast at most `collide.rays` (96) rays a frame.
-  `/term world rays [SECONDS]` logs per pet and frame the rays and hits (and
-  those only the wide filter makes) and the place decided; `/term world anim
-  [SECONDS]` the animations still moving. The `world` selftest reports a ring
-  of 16 rays at knee height with each filter. None of this has been seen in
-  game yet.
+  material (ClientStructs' helper, layer 1 and material bit 0x4000, missed
+  props on other layers).
+  * *A wall in its way* (`wall_in_way`, `motion.wall`): every `look` (0.1 s),
+    or sooner when its place has moved `recheck`, three level rays from your
+    position at the pet's height, toward its place's middle and both edges.
+    A hit is a wall only when two more rays alongside it, `probe` either side,
+    meet the same flat face (a post or stalk thinner than that, a corner, or a
+    stray answer from the collision is not). A wall counts when the pet's face
+    (its nearest edge, and `margin`) would reach it.
+  * *Hung* (`motion.hang`): its place flattened onto the wall plane, `margin`
+    in front, turned to face out from the wall (yaw from the wall's normal),
+    flat (no curve), and within `slide` of where the ray found the wall. Rays
+    along the wall from in front of that point keep it `margin` clear of a
+    corner each way; between two corners closer than it is wide it hangs in
+    the middle. Your personal space slides it along the wall, never off it or
+    into a corner. Its place moving slides it along the wallpaper: the springs
+    follow the hung point.
+  * *Peeling off*: it lets go once its place is `peel` clear of the wall, or
+    the wall has gone unseen for `hold` (0.3 s: one look through a gap or onto
+    a corner is not enough). Flattening and peeling are one smootherstep turn
+    (`hang`, 0.25 s) of its yaw and curve; it lands with a small squash, stops
+    bobbing and does not sway into the wall.
+  A pet crossing a wall to get to where it hangs (going through a doorway,
+  the wall behind you) is not stopped: the depth test hides the part behind
+  the wall, as for a door in Paper Mario. All pets together cast at most
+  `collide.rays` (96) rays a frame; a look costs at most 11 (21 a frame with
+  four pets against a wall in the host test). `/term world rays [SECONDS]` logs
+  per pet and frame the rays and hits and the wall it hangs on; `/term world
+  anim [SECONDS]` the animations still moving. The `world` selftest reports a
+  ring of 16 rays at knee height with each filter. None of this has been seen
+  in game yet.
 * **The view.** The existing no-go cones stay as they were: no pet centre
   between the camera and you, or straight behind you. A wide pet's edge may
   still reach into the camera cone; the cones were not widened, because the
@@ -352,9 +338,9 @@ How they move (`CONFIG.world.pet.cute`, `pet.follow`, `CONFIG.world.motion`):
   taken as at most 0.1 s. It never gains energy, whatever the stiffness or the
   frame rate, and 30, 60, 144 fps and a ragged frame rate trace the same curve.
 * One animation layer (`motion.anim`, `motion.tween`): everything a pet
-  shows besides the follow spring (its drift to a new place, the pull in, the
-  floor and ceiling lift, a float over something, a hop, the tuck and the hike,
-  squeezing, the row's size, its tilt, being held still, a blink) is either a
+  shows besides the follow spring (the floor and ceiling lift, a hop, the tuck
+  and the hike, the row's size, its tilt, being held still, flattening onto a
+  wall and peeling off it) is either a
   critically damped glide that reaches its goal in a stated time with no
   overshoot, capped at a stated speed, with a dead zone so noise in the goal
   never makes it twitch; or a smootherstep tween that starts and stops with no
@@ -382,8 +368,8 @@ How they move (`CONFIG.world.pet.cute`, `pet.follow`, `CONFIG.world.motion`):
   `held` to `CONFIG.world.place`) eases in a few frames to no bob, no tilt
   and no squash, so its text never moves while you read it.
 * Squash: a spring of its own (`m_sq`), kicked only by real events (a
-  contact, at most every quarter second; a fall that stops; popping back
-  after a squeeze or a blink), never by stops or turns, and never past 4 %
+  contact, at most every quarter second; a fall that stops; flattening onto
+  a wall), never by stops or turns, and never past 4 %
   (`SQUASH_MAX`). The placement carries it as `squash`; `world_basis` makes
   the panel wider by 1 + squash and shorter by the same factor, and
   everything that works from the basis (projection, hit tests, the depth test)
@@ -393,8 +379,8 @@ How they move (`CONFIG.world.pet.cute`, `pet.follow`, `CONFIG.world.motion`):
   another.
 * `CONFIG.world.motion.reduce` (Settings, Pets: Reduce motion) is a true
   zero: no bob, sway, tilt, fan, lean, squash or procession, and the springs
-  settle without overshoot. Collision, squeezing and blinking stay, since they
-  are what keeps a pet out of walls.
+  settle without overshoot. Collision and hanging on walls stay (flattening
+  onto one is quicker, 0.15 s), since they are what keeps a pet out of walls.
 
 State kept on an anchor for this starts with `m_` and is never saved.
 
