@@ -1521,8 +1521,8 @@ function M.place_pet(id, a, p, t, focused, held)
     local wx, wz = w.nz, -w.nx
     local along, out = dx * wx + dz * wz, dx * w.nx + dz * w.nz
     local need = math.sqrt(math.max(min_r * min_r - out * out, 0))
-    local s = clamp((along >= 0 and need or -need) - along, -(a.m_room_lo or 0), a.m_room_hi or 0)
-    x, z = x + wx * s, z + wz * s
+    local slide = clamp((along >= 0 and need or -need) - along, -(a.m_room_lo or 0), a.m_room_hi or 0)
+    x, z = x + wx * slide, z + wz * slide
   elseif r < min_r then
     if r < 1e-3 then dx, dz, r = sin(ang), cos(ang), 1 end
     x, z = contact(a, dx / r, dz / r, min_r - r, x, z, t)
