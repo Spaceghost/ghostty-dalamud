@@ -290,6 +290,8 @@ global Host = @record{
   voice_at: float64,
   voice_out: stringbuilder,         -- what the job printed
   voice_err: stringbuilder,         -- and said on stderr
+  voice_note: stringbuilder,        -- why it last did not work, shown a while (core/app/voice.nelua)
+  voice_note_at: float64,
   dualsense: DualSenseReader,       -- toggle_gamepad_button = 'create': the controller read over HID
   select_idx: integer,
   -- raw mouse buttons (Dalamud only forwards clicks to ImGui while it wants the mouse)

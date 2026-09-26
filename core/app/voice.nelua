@@ -13,6 +13,16 @@ require 'stringbuilder'
 require 'core.app.state'
 
 local VOICE_OUT_MAX: integer <comptime> = 64 * 1024 -- more than anyone says in one go
+local VOICE_NOTE_S: float64 <comptime> = 8.0         -- how long a reason it did not work stays up
+
+-- Why voice input did not work, on screen for VOICE_NOTE_S (and in the log):
+-- no agent, the script failing, no room anywhere to write it down.
+local function voice_note(msg: string): void
+  host.voice_note:destroy()
+  host.voice_note = {}
+  host.voice_note:write('Voice input: ', msg)
+  host.voice_note_at = host.last_time
+end
 
 local function voice_reset(): void
   host.voice_on, host.voice_stopping, host.voice_req, host.voice_jid = false, false, 0, 0
@@ -47,6 +57,7 @@ global function voice_toggle(): void
   local c = &host.local_agent.client
   if not (host.local_agent.enabled and c:jobs_ok()) then
     logf(LOG_WARN, 'voice: needs the agent connected (ghostty-agent with jobs, protocol 4)')
+    voice_note('needs the agent connected')
     return
   end
   local argv: vector(string)
@@ -63,10 +74,11 @@ global function voice_toggle(): void
   argv:destroy() env:destroy()
   if not sent then
     logf(LOG_WARN, 'voice: the agent would not take the job')
+    voice_note('the agent would not start it')
     return
   end
   voice_reset()
-  host.voice_on, host.voice_req, host.voice_target, host.voice_at = true, req, host.typing_session, imgui.GetTime()
+  host.voice_on, host.voice_req, host.voice_target, host.voice_at = true, req, host.typing_session, host.last_time
   logf(LOG_INFO, 'voice: listening')
 end
 
@@ -75,6 +87,7 @@ global function voice_on_opened(req: uint32, jid: uint32, why: string): boolean
   if not host.voice_on or req == 0 or req ~= host.voice_req then return false end
   if jid == 0 then
     logf(LOG_WARN, 'voice: the agent could not start %s: %s', policy.voice_command, why)
+    voice_note('the agent could not start it')
     voice_reset()
     return true
   end
@@ -118,12 +131,24 @@ global function voice_on_exit(jid: uint32, status: int32, paste: VoicePasteFn): 
     local why: stringbuilder
     one_line(host.voice_err:view(), &why)
     logf(LOG_WARN, 'voice: %s exited with %d: %s', policy.voice_command, status, why:view())
+    -- the script's last line on stderr says why, for people
+    local all = why:view()
+    local cut = #all
+    local p = all:find('ghostty-voice: ', 1, true)
+    while p > 0 do
+      cut = p
+      local q = all:find('ghostty-voice: ', p + 1, true)
+      if q <= 0 then break end
+      p = q
+    end
+    voice_note(cut < #all and all:subview(cut + 15, #all) or 'it did not work (see the log)')
     why:destroy()
   elseif text:view().size > 0 and target ~= nilptr then
     paste(target, text:view())
     logf(LOG_INFO, 'voice: typed %d bytes into session %d', text:view().size, target.id)
   else
     logf(LOG_INFO, 'voice: nothing heard')
+    voice_note('nothing heard')
   end
   text:destroy()
   voice_reset()
@@ -132,16 +157,26 @@ end
 
 -- While listening or transcribing: a small label at the top of the screen.
 global function voice_draw(): void
-  if not host.voice_on then return end
+  local now = host.last_time
+  local note = not host.voice_on and host.voice_note:view().size > 0 and now - host.voice_note_at < VOICE_NOTE_S
+  if not host.voice_on and not note then return end
   local dl = imgui.GetForegroundDrawList()
   local vp = imgui.GetMainViewport()
   local label: cstring = host.voice_stopping and '... writing it down' or '\u{25CF} Listening (PS twice: stop)'
+  local label_end: cstring = nilptr
+  if note then
+    local v = host.voice_note:view()
+    label = (@cstring)(v.data)
+    label_end = (@cstring)(&v.data[v.size]) -- a builder is not NUL-terminated
+  end
   local font = imgui.GetFont()
   local size = imgui.GetFontSize()
   local sz: ImVec2
-  imgui.FontCalcTextSizeA(&sz, font, size, 1e9, 0, label, nilptr, nilptr)
+  imgui.FontCalcTextSizeA(&sz, font, size, 1e9, 0, label, label_end, nilptr)
   local x = vp.Pos.x + (vp.Size.x - sz.x) * 0.5
   local y = vp.Pos.y + 48
   imgui.DrawListAddRectFilled(dl, ImVec2{ x - 10, y - 6 }, ImVec2{ x + sz.x + 10, y + sz.y + 6 }, 0xC0101010, 6, 0)
-  imgui.DrawListAddText(dl, font, size, ImVec2{ x, y }, host.voice_stopping and 0xFFE0E0E0 or 0xFF6060FF, label, nilptr, 0, nilptr)
+  local col: uint32 = host.voice_stopping and 0xFFE0E0E0 or 0xFF6060FF
+  if note then col = 0xFF60C0FF end
+  imgui.DrawListAddText(dl, font, size, ImVec2{ x, y }, col, label, label_end, 0, nilptr)
 end

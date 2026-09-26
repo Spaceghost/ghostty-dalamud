@@ -304,6 +304,7 @@ do
   local why: string = 'ghostty-voice: no speech to text\n'
   assert(voice_on_out(6, JOB_ERR, (@*[0]uint8)(why.data), #why))
   assert(voice_on_exit(6, 3, fake_paste) and #pasted == 0 and logged_has('no speech to text'), 'a failure: nothing typed, the reason logged')
+  assert(host.voice_note:view() == 'Voice input: no speech to text', 'and shown: the script\'s last word, not its name')
   -- refused by the agent: over at once
   host.voice_on, host.voice_req = true, 79
   assert(voice_on_opened(79, 0, 'no such command') and not host.voice_on)
