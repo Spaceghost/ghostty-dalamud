@@ -62,7 +62,15 @@ local function assert_classic(d, home)
 end
 assert_classic(platform.defaults('wine', env({ HOME = '/home/player' })), '/home/player')
 assert_classic(platform.defaults('linux', env({ HOME = '/home/player' })), '/home/player')
-assert_classic(platform.defaults('wine', env({ USERPROFILE = 'C:\\users\\player' })), 'C:\\users\\player')
+-- Under Wine the home is WINEHOMEDIR (a Windows process there has no HOME), as a
+-- path the plugin can open; USERPROFILE is the prefix's C:\users\<name>, not it.
+local wine = platform.defaults('wine', env({ WINEHOMEDIR = '\\??\\Z:\\home\\player', USERPROFILE = 'C:\\users\\player', HOME = '/ignored' }))
+assert(wine.agent.token_file == 'Z:\\home\\player\\.config\\ghostty-agent\\token', wine.agent.token_file)
+assert(wine.profiles[1].name == 'shell' and wine.profiles[1].transport == 'agent')
+local nozdrive = platform.defaults('wine', env({ WINEHOMEDIR = '\\??\\unix\\home\\player' }))
+assert(nozdrive.agent.token_file == '\\\\?\\unix\\home\\player\\.config\\ghostty-agent\\token', nozdrive.agent.token_file)
+-- WINEHOMEDIR only means something under Wine
+assert_classic(platform.defaults('linux', env({ WINEHOMEDIR = '\\??\\Z:\\x', HOME = '/home/player' })), '/home/player')
 assert_classic(platform.defaults('unknown', env({})), '')
 
 -- the shipped init.lua follows ghostty.platform()

@@ -1,5 +1,6 @@
 -- Lua 5.4 C API subset (vendor/lua compiled into the same binary).
 require 'string'
+require 'core.sys.platform'
 ## cinclude '<lua.h>'
 ## cinclude '<lauxlib.h>'
 ## cinclude '<lualib.h>'
@@ -56,20 +57,15 @@ global function lua_createtable(L: *lua_State, narr: cint, nrec: cint): void <ci
 global function lua_pushvalue(L: *lua_State, idx: cint): void <cimport, nodecl> end
 global function lua_isstring(L: *lua_State, idx: cint): cint <cimport, nodecl> end
 
-## if ccinfo.is_windows then
-local function platform_GetModuleHandleA(name: cstring): pointer <cimport 'GetModuleHandleA', cinclude '<windows.h>', nodecl> end
-local function platform_GetProcAddress(mod: pointer, name: cstring): pointer <cimport 'GetProcAddress', cinclude '<windows.h>', nodecl> end
-## end
-
 -- Publish runtime capability information before any configuration is evaluated.
--- Wine also compiles as Windows; its native marker distinguishes the two.
+-- Wine also compiles as Windows; platform_is_wine() (core/sys/platform.nelua)
+-- tells the two apart, including under builds that hide Wine's own marker.
 global function luaL_openlibs(L: *lua_State): void <codename 'ghostty_lua_openlibs'>
   lua_open_standard_libraries(L)
   local platform: cstring = 'posix'
   ## if ccinfo.is_windows then
     platform = 'windows'
-    local ntdll = platform_GetModuleHandleA('ntdll.dll')
-    if ntdll ~= nilptr and platform_GetProcAddress(ntdll, 'wine_get_version') ~= nilptr then platform = 'wine' end
+    if platform_is_wine() then platform = 'wine' end
   ## end
   lua_pushstring(L, platform)
   lua_setglobal(L, 'GHOSTTY_PLATFORM')
