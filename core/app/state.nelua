@@ -160,6 +160,9 @@ global GuHostApi = @record{
   -- ghostty.raycast falls back to `raycast`
   raycast_mode: function(ox: float32, oy: float32, oz: float32, dx: float32, dy: float32, dz: float32,
                          max: float32, mode: cint, hx: *float32, hy: *float32, hz: *float32): cint,
+  -- what your character is casting: action id, seconds in, seconds long; 0
+  -- when not casting. nilptr in older shims: pets do not follow a teleport in
+  cast_info: function(action: *uint32, current: *float32, total: *float32): cint,
 }
 
 global LOG_INFO: cint <comptime> = 1

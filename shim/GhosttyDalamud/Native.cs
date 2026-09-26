@@ -77,6 +77,8 @@ internal unsafe struct GuHostApi
     public delegate* unmanaged[Cdecl]<GuCharacter*, int, int> NearbyCharacters;
     // the game's collision with a chosen filter (0 the helper's, 1 everything, 2 every layer)
     public delegate* unmanaged[Cdecl]<float, float, float, float, float, float, float, int, float*, float*, float*, int> RaycastMode;
+    // what your character is casting (action id, seconds in, seconds long), for pets to follow a teleport
+    public delegate* unmanaged[Cdecl]<uint*, float*, float*, int> CastInfo;
 }
 
 // Mirrors GuCharacter in core/world.nelua.

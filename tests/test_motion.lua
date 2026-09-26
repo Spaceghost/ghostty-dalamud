@@ -1065,4 +1065,63 @@ do
   print('no raycast OK')
 end
 
+-- 9. Teleport: the pets are drawn in after you over the cast's last moments,
+--    gone by the time the screen goes black, and pop back out after.
+do
+  fresh(2)
+  boxes = {}
+  player.x, player.z, player.rotation = 0, 0, 0
+  run(3, 1 / 60)
+  local rest = { outs[ids[1]].x, outs[ids[1]].z, outs[ids[1]].opacity, outs[ids[1]].pixels_per_yalm }
+  local casting, between = nil, false
+  ghostty.cast = function() if casting then return casting[1], casting[2], casting[3] end return nil end
+  ghostty.between_areas = function() return between end
+  local function dist(o) return math.sqrt((o.x - player.x) ^ 2 + (o.z - player.z) ^ 2) end
+  local d0 = dist(outs[ids[1]])
+  -- a 5 s Teleport: nothing for most of it
+  local cur = 0
+  while cur < 3.9 do casting = { 5, cur, 5 } frame(1 / 60) cur = cur + 1 / 60 end
+  assert(math.abs(dist(outs[ids[1]]) - d0) < 0.05 and outs[ids[1]].opacity == rest[3], 'early in the cast: where they were')
+  -- the last 0.9 s: drawn in, shrinking and fading, spiralling
+  local mid
+  while cur < 5 do
+    casting = { 5, cur, 5 } frame(1 / 60) cur = cur + 1 / 60
+    if not mid and cur >= 4.55 then mid = { dist(outs[ids[1]]), outs[ids[1]].opacity, outs[ids[1]].pixels_per_yalm } end
+  end
+  local o = outs[ids[1]]
+  print('teleport: halfway', mid[1], 'at the end', dist(o), 'opacity', o.opacity)
+  assert(mid[1] < d0 * 0.8 and mid[1] > 0.05, 'halfway in')
+  assert(dist(o) < 0.1 and o.opacity < 0.05, 'at the end of the cast: in you and gone')
+  assert(mid[3] > rest[4] * 1.5, 'shrinking on the way')
+  -- the black screen: gone
+  casting, between = nil, true
+  run(1, 1 / 60, nil, nil, function() assert(outs[ids[1]].opacity < 0.01, 'gone between areas') end)
+  -- arrived: out again within the pop-out time
+  between = false
+  run(W.teleport.out + 0.3, 1 / 60)
+  o = outs[ids[1]]
+  assert(math.abs(dist(o) - d0) < 0.1 and math.abs(o.opacity - rest[3]) < 0.01, 'back out after arriving')
+  -- a cast cut short (you moved): they ease back instead of vanishing
+  cur = 4.5
+  for _ = 1, 20 do casting = { 5, cur, 5 } frame(1 / 60) cur = cur + 1 / 60 end
+  local partway = dist(outs[ids[1]])
+  casting = nil
+  run(1, 1 / 60)
+  assert(partway < d0 - 0.05 and math.abs(dist(outs[ids[1]]) - d0) < 0.1, 'an interrupted cast: back to their places')
+  -- other casts leave them alone
+  cur = 0
+  for _ = 1, 400 do casting = { 7, math.min(cur, 5), 5 } frame(1 / 60) cur = cur + 1 / 60 end
+  assert(math.abs(dist(outs[ids[1]]) - d0) < 0.05, 'another cast: nothing')
+  -- Reduce motion: in, without the spiral or the shrinking
+  W.motion.reduce = true
+  cur = 4.3
+  while cur < 5 do casting = { 6, cur, 5 } frame(1 / 60) cur = cur + 1 / 60 end
+  assert(outs[ids[1]].opacity < 0.05 and outs[ids[1]].pixels_per_yalm < rest[4] * 1.2, 'reduced: a fade in to you, not shrunk')
+  W.motion.reduce = false
+  casting, between = nil, false
+  ghostty.cast, ghostty.between_areas = nil, nil
+  run(1, 1 / 60)
+  print('teleport OK')
+end
+
 print('test_motion OK')

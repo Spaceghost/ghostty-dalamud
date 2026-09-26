@@ -1629,6 +1629,70 @@ function M.place_pet(id, a, p, t, focused, held)
   return out
 end
 
+-- Pets follow you into a teleport ---------------------------------------------------
+-- Casting Teleport or Return, the pets are drawn in after you over the cast's
+-- last `pull` seconds: they spiral in to your chest, shrinking and fading, so
+-- they are gone by the time the screen goes black. Between areas they stay
+-- gone; once you are there they pop back out over `out` seconds. A cast that
+-- stops short (moved, interrupted) lets them ease back to where they were.
+-- Reduce motion: no spiral, a plain fade in to you.
+M.teleport = {
+  enabled = true,
+  actions = { [5] = true, [6] = true }, -- Teleport, Return
+  pull = 0.9,    -- seconds of the cast's end they spend being drawn in
+  turns = 1.25,  -- times round you on the way in
+  out = 0.6,     -- seconds to pop back out after arriving
+}
+
+-- How far in the pets are this frame: 0 in their places, 1 gone into you.
+-- Worked out once per frame time.
+local function teleport_amount(t)
+  if M._tp_t == t then return M._tp end
+  local cfg = M.teleport or EMPTY
+  local goal, time = 0, cfg.out or 0.6
+  if cfg.enabled ~= false then
+    if ghostty.between_areas and ghostty.between_areas() then
+      goal, time = 1, 0
+    elseif ghostty.cast then
+      local action, cur, total = ghostty.cast()
+      if action and (cfg.actions or EMPTY)[action] and total and total > 0 then
+        local pull = math.min(cfg.pull or 0.9, total)
+        goal, time = clamp((cur - (total - pull)) / pull, 0, 1), 0 -- the cast drives it
+      end
+    end
+  end
+  local st = M._tpst or {}
+  M._tpst = st
+  local dt = M._tp_prev and math.max(0, math.min(t - M._tp_prev, 0.1)) or 0
+  M._tp_prev = t
+  -- following the cast exactly; easing out after arriving or a cast cut short
+  local v = time > 0 and motion.anim(st, 'tp', goal, dt, time, 4, 0.001) or goal
+  if time == 0 then motion.anim_set(st, 'tp', goal) end
+  M._tp_t, M._tp = t, v
+  return v
+end
+
+function M.teleport_pull(a, p, t, out)
+  if not out then return out end
+  local s = teleport_amount(t)
+  if s <= 0.0005 then return out end
+  local reduce = M.motion and M.motion.reduce
+  local e = s * s * (3 - 2 * s) -- smoothstep: starts and ends gently
+  local cx, cy, cz = p.x, p.y + 1.1, p.z
+  local dx, dz = out.x - cx, out.z - cz
+  if not reduce then
+    local ang = e * e * 2 * pi * ((M.teleport or EMPTY).turns or 1.25) -- faster as it nears you
+    local c, sn = cos(ang), sin(ang)
+    dx, dz = dx * c - dz * sn, dx * sn + dz * c
+    out.yaw = out.yaw + ang
+    out.pixels_per_yalm = out.pixels_per_yalm / math.max(1 - e, 0.02) -- shrinking into you
+  end
+  out.x, out.z = cx + dx * (1 - e), cz + dz * (1 - e)
+  out.y = out.y + (cy - out.y) * e
+  out.opacity = out.opacity * math.max(1 - e * e, 0)
+  return out
+end
+
 -- The camera once per frame time, and how fast it turns (rad/s toward its
 -- right and its up, from the last frame; 0 after a hitch or a gap).
 local view_prev = { t = nil }
@@ -1966,7 +2030,7 @@ function M.place(id, t, focused, held)
   end
 
   if a.kind == 'pet' then
-    return M.place_pet(id, a, p, t, focused, held)
+    return M.teleport_pull(a, p, t, M.place_pet(id, a, p, t, focused, held))
   end
 
   if a.kind == 'orbit' then
