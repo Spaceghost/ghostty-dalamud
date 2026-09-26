@@ -105,6 +105,7 @@ internal static unsafe class HostApi
         Api->PushMonoFontPx = &PushMonoFontPx;
         Api->NearbyCharacters = &NearbyCharacters;
         Api->RaycastMode    = &RaycastMode;
+        Api->CastInfo       = &CastInfo;
     }
 
     public static void Free()
@@ -780,6 +781,21 @@ internal static unsafe class HostApi
             if (c[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedInEvent]
                 || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedInQuestEvent]) f |= 8;
             return f;
+        } catch { return 0; }
+    }
+
+    // What your character is casting: the action id and how far along it is
+    // (seconds in, seconds long), so pets can follow a Teleport or Return in
+    // before the screen goes black. 0 when not casting.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int CastInfo(uint* action, float* current, float* total)
+    {
+        try {
+            if (Plugin.Objects.LocalPlayer is not { } p || !p.IsCasting) return 0;
+            *action = p.CastActionId;
+            *current = p.CurrentCastTime;
+            *total = p.TotalCastTime;
+            return 1;
         } catch { return 0; }
     }
 

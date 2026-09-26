@@ -407,6 +407,23 @@ local function l_voice_muted(L: *lua_State): cint
   return 1
 end
 
+-- ghostty.cast() -> action id, seconds in, seconds long: what your character is
+-- casting (Teleport is 5, Return 6), or nil when not casting or with an older
+-- shim. ghostty.between_areas() -> true while the game changes areas (the
+-- black screen of a teleport or a zone line).
+local function l_cast(L: *lua_State): cint
+  if host.api.cast_info == nilptr then lua_pushnil(L) return 1 end
+  local a: uint32, cur: float32, tot: float32 = 0, 0, 0
+  if host.api.cast_info(&a, &cur, &tot) == 0 then lua_pushnil(L) return 1 end
+  lua_pushinteger(L, a) lua_pushnumber(L, cur) lua_pushnumber(L, tot)
+  return 3
+end
+
+local function l_between_areas(L: *lua_State): cint
+  lua_pushboolean(L, host.api.scene_flags ~= nilptr and (host.api.scene_flags() & 4) ~= 0 and 1 or 0)
+  return 1
+end
+
 -- ghostty.raycast(ox, oy, oz, dx, dy, dz, max[, filter]) -> distance, hx, hy, hz, filter
 -- The game's own collision along a direction that need not be normalised: the
 -- distance to the first hit within `max` yalms and where it is, or nil when
@@ -824,6 +841,8 @@ global function ipc_lua_register(L: *lua_State): void
   lua_pushcclosure(L, l_voice_mics, 0) lua_setfield(L, -2, 'voice_mics')
   lua_pushcclosure(L, l_voice_mics_refresh, 0) lua_setfield(L, -2, 'voice_mics_refresh')
   lua_pushcclosure(L, l_voice_muted, 0) lua_setfield(L, -2, 'voice_muted')
+  lua_pushcclosure(L, l_cast, 0) lua_setfield(L, -2, 'cast')
+  lua_pushcclosure(L, l_between_areas, 0) lua_setfield(L, -2, 'between_areas')
   lua_pushcclosure(L, l_nearby_characters, 0) lua_setfield(L, -2, 'nearby_characters')
   lua_pushcclosure(L, l_panel_focus, 0) lua_setfield(L, -2, 'panel_focus')
   lua_pushcclosure(L, l_panel_hide, 0) lua_setfield(L, -2, 'panel_hide')
