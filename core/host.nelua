@@ -296,6 +296,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   capture_app_shutdown() -- a clip on the host is told to stop; the HUD comes back
   depthpass_shutdown()
   dualsense_reader_close(&host.dualsense) -- no handle or pending read may outlive this module
+  voice_shutdown()
   -- Leave agent shells running so the next start reattaches to them.
   for i = 0, < #host.sessions do host.sessions[i].keep_on_agent = true end
   if host.layout_restored then save_world_state() end

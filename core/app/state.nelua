@@ -276,6 +276,29 @@ global Host = @record{
   settings_open: boolean,
   settings_badge: boolean,          -- CONFIG.settings.badge(): a dot on the settings button (unseen vote ideas)
   pad: PadGestureState,             -- toggle button: tap / double tap / hold
+  touch_click: PadGestureState,     -- the DualSense touchpad pressed: Enter / delete a word / keep deleting
+  touch_swipe: TouchSwipeState,     -- the finger on it: arrows
+  pad_keys: PadKeyQueue,            -- what they typed, for the focused terminal (core/app/terminal.nelua)
+  pad_deleting: boolean,            -- the touchpad is held down: deleting
+  pad_delete_at: float64,           -- the last delete while held
+  typing_session: integer,          -- the session that last had the keyboard (its id)
+  voice_on: boolean,                -- voice input under way (core/app/voice.nelua)
+  voice_stopping: boolean,          -- stopped listening, the text is on its way
+  voice_req: uint32,                -- its JOPEN, then its job
+  voice_jid: uint32,
+  voice_target: integer,            -- the session the text goes to
+  voice_at: float64,
+  voice_out: stringbuilder,         -- what the job printed
+  voice_err: stringbuilder,         -- and said on stderr
+  voice_note: stringbuilder,        -- why it last did not work, shown a while (core/app/voice.nelua)
+  voice_note_at: float64,
+  mic_live: boolean,                -- the microphone unmuted; false (muted) whenever the game starts
+  mute_down: boolean,               -- the controller's mute button, last frame
+  voice_list_req: uint32,           -- `ghostty-voice --list` for the settings, while asked
+  voice_list_jid: uint32,
+  voice_mics_out: stringbuilder,    -- what it printed so far
+  voice_mics: string,               -- and in the end: a line per microphone
+  voice_mics_known: boolean,
   dualsense: DualSenseReader,       -- toggle_gamepad_button = 'create': the controller read over HID
   select_idx: integer,
   -- raw mouse buttons (Dalamud only forwards clicks to ImGui while it wants the mouse)

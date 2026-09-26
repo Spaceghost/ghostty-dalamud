@@ -228,7 +228,9 @@ global function draw_terminal(s: *Session, dl: *ImDrawList, origin: ImVec2, widt
     local io = imgui.GetIO()
     input_claim_keyboard(io)
     local actx: ActionCtx = { s = s, in_dropdown = in_dropdown }
+    host.typing_session = s.id
     input_poll(io, s.encoder, s.event, sink_write, s, key_action, &actx)
+    if host.pad_keys.n > 0 then pad_keys_send(&host.pad_keys, s.encoder, s.event, sink_write, s) end -- the touchpad (core/app/hotkeys.nelua)
   end
   -- the wheel scrolls a hovered dropdown or window terminal even unfocused
   -- (ImGui owns the mouse over its windows); world panels call terminal_wheel

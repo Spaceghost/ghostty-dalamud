@@ -7,10 +7,14 @@ require 'os'
 require 'arg'
 
 local logged: integer = 0
+local last_log: string
 local function log_cb(level: cint, msg: cstring): void
   logged = logged + 1
+  last_log:destroy()
+  last_log = string.copy(msg)
   io.write('[log ', level, '] ', msg, '\n')
 end
+local function logged_has(sub: string): boolean return last_log:find(sub, 1, true) > 0 end
 local consumed: cint = 0
 local function consume_cb(vk: cint): void consumed = vk end
 
@@ -249,7 +253,89 @@ do
   pad_bits = 0
   have, down = poll_toggle_pad(1.14, fake_foreground)
   assert(have and not down and hid_is_open(&host.dualsense.dev), 'create again')
+  -- ps: the PS button instead of Create, from the same reports
+  policy.toggle_gamepad_ps = true
+  local ps_report: [64]uint8
+  ps_report[0] = 0x01
+  ps_report[8] = 0x08
+  ps_report[10] = 0x01 -- PS
+  hid_fake_push(&ps_report, 64)
+  have, down = poll_toggle_pad(1.16, fake_foreground)
+  assert(have and down, 'ps: the PS button toggles')
+  local create_only: [64]uint8
+  create_only[0] = 0x01
+  create_only[8] = 0x08
+  create_only[9] = 0x10 -- Create
+  hid_fake_push(&create_only, 64)
+  have, down = poll_toggle_pad(1.18, fake_foreground)
+  assert(have and not down, 'ps: Create does not')
+  policy.toggle_gamepad_ps = false
   host.api.gamepad_down = nilptr
+end
+
+-- Voice input's job (core/app/voice.nelua): its JOPENED, stdout and stderr,
+-- and at its exit the text pasted into the terminal it began in.
+local pasted: string
+local pasted_into: integer = 0
+local function fake_paste(s: *Session, text: string): void
+  pasted:destroy()
+  pasted = text:copy()
+  pasted_into = s.id
+end
+do
+  local s = session_new(0, 80, 24)
+  assert(s ~= nilptr)
+  host.voice_on, host.voice_req, host.voice_target = true, 77, s.id
+  assert(not voice_on_opened(78, 5, ''), 'another JOPEN is not ours')
+  assert(voice_on_opened(77, 5, '') and host.voice_jid == 5, 'ours: its job')
+  assert(not voice_on_out(6, JOB_OUT, nilptr, 0), 'another job is not ours')
+  local said: string = '  hello there\n'
+  local more: string = 'general kenobi\n'
+  local noise: string = 'ghostty-voice: listening on dualsense\n'
+  assert(voice_on_out(5, JOB_ERR, (@*[0]uint8)(noise.data), #noise))
+  assert(voice_on_out(5, JOB_OUT, (@*[0]uint8)(said.data), #said))
+  assert(voice_on_out(5, JOB_OUT, (@*[0]uint8)(more.data), #more))
+  assert(voice_on_exit(5, 0, fake_paste) and not host.voice_on, 'done')
+  assert(pasted == 'hello there general kenobi' and pasted_into == s.id, 'stdout only, on one line, into the terminal it began in')
+  -- a failure pastes nothing and says why
+  pasted:destroy() pasted = ''
+  host.voice_on, host.voice_req, host.voice_target = true, 78, s.id
+  assert(voice_on_opened(78, 6, ''))
+  local why: string = 'ghostty-voice: no speech to text\n'
+  assert(voice_on_out(6, JOB_ERR, (@*[0]uint8)(why.data), #why))
+  assert(voice_on_exit(6, 3, fake_paste) and #pasted == 0 and logged_has('no speech to text'), 'a failure: nothing typed, the reason logged')
+  assert(host.voice_note:view() == 'Voice input: no speech to text', 'and shown: the script\'s last word, not its name')
+  -- refused by the agent: over at once
+  host.voice_on, host.voice_req = true, 79
+  assert(voice_on_opened(79, 0, 'no such command') and not host.voice_on)
+  -- muted (as every game starts): voice_toggle says so and starts nothing
+  assert(not host.mic_live, 'the microphone starts muted')
+  voice_toggle()
+  assert(not host.voice_on and host.voice_note:view() == 'Voice input: the microphone is muted: press the mute button on the controller', 'muted: nothing starts')
+  voice_mute_toggle()
+  assert(host.mic_live and host.voice_note:view() == 'Voice input: microphone on', 'the mute button unmutes')
+  -- no agent: voice_toggle says so and starts nothing
+  voice_toggle()
+  assert(not host.voice_on, 'no agent: nothing starts')
+  -- muting mid-sentence drops it: nothing typed
+  pasted:destroy() pasted = ''
+  host.voice_on, host.voice_req, host.voice_target = true, 80, s.id
+  assert(voice_on_opened(80, 7, ''))
+  local half: string = 'half a sen'
+  assert(voice_on_out(7, JOB_OUT, (@*[0]uint8)(half.data), #half))
+  voice_mute_toggle()
+  assert(not host.mic_live and not host.voice_on and host.voice_note:view() == 'Voice input: microphone muted', 'muting cancels')
+  assert(not voice_on_exit(7, 0, fake_paste) and #pasted == 0, 'and what was said is dropped')
+  -- the microphones for the settings: `ghostty-voice --list` as a job
+  host.voice_list_req = 81
+  assert(voice_on_opened(81, 8, '') and host.voice_list_jid == 8)
+  local mics: string = 'alienware-dualsense-mic\tDualSense microphone (alienware)\nusb-headset\tHeadset\n'
+  assert(voice_on_out(8, JOB_OUT, (@*[0]uint8)(mics.data), #mics))
+  assert(voice_on_exit(8, 0, fake_paste) and host.voice_mics_known and host.voice_list_req == 0)
+  assert(host.voice_mics == mics, 'the list, for ghostty.voice_mics()')
+  pasted:destroy()
+  session_remove(s)
+  print('voice OK')
 end
 gu_toggle()
 gu_shutdown()

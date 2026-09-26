@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+# ghostty-voice: listen, and print what was said as one line on stdout.
+#
+# Ghostty for FFXIV runs this through ghostty-agent as a raw job when you
+# press the DualSense PS button twice (CONFIG.voice_command); pressing it twice
+# again closes this script's stdin, which ends the recording. It also ends at
+# GHOSTTY_VOICE_MAX seconds (60). Everything else goes to stderr; its last
+# line there is what the game shows when this fails.
+#
+# Settings come from the environment or ~/.config/ghostty/voice.conf (shell
+# assignments), so they live on the machine the agent runs on:
+#
+#   GHOSTTY_VOICE_MIC      a PipeWire/PulseAudio source (chosen in the game's
+#                          settings); empty: a game controller's microphone,
+#                          and only that: with none, nothing is recorded
+#
+# `ghostty-voice --list` prints the microphones there are instead, one a line:
+# the source name, a tab, its description (the game's settings show them).
+#   GHOSTTY_VOICE_SERVERS  whisper.cpp servers (whisper-server) to transcribe
+#                          on, in order, e.g. a desktop with a GPU beside the
+#                          controller that has opted in by running one. The
+#                          first that answers is used, and it is woken as
+#                          soon as the recording starts, so a server started
+#                          on demand has its model loaded by the time you stop
+#   GHOSTTY_VOICE_LOCAL    auto (default): transcribe here when no server
+#                          answers and this machine has room (GHOSTTY_VOICE_NEED_MB
+#                          free, 700; a core idle); always; never
+#   GHOSTTY_VOICE_MODEL    the whisper.cpp model for transcribing here, default
+#                          ~/.local/share/ghostty/whisper/ggml-base.en.bin
+#                          (fetched on first use: 142 MB)
+#   GHOSTTY_VOICE_LANG     the language (en)
+#   GHOSTTY_VOICE_FILE     a recording to use instead of the microphone
+set -uo pipefail
+
+# The file, under what the environment already says.
+conf=${XDG_CONFIG_HOME:-$HOME/.config}/ghostty/voice.conf
+if [[ -f "$conf" ]]; then
+  keep=()
+  for v in $(compgen -A variable GHOSTTY_VOICE_); do keep+=("$v=${!v}"); done
+  # shellcheck source=/dev/null
+  . "$conf"
+  for kv in "${keep[@]}"; do printf -v "${kv%%=*}" '%s' "${kv#*=}"; done
+fi
+
+MAX=${GHOSTTY_VOICE_MAX:-60}
+LANG_=${GHOSTTY_VOICE_LANG:-en}
+LOCAL=${GHOSTTY_VOICE_LOCAL:-auto}
+SERVERS=${GHOSTTY_VOICE_SERVERS:-}
+MODEL=${GHOSTTY_VOICE_MODEL:-${XDG_DATA_HOME:-$HOME/.local/share}/ghostty/whisper/ggml-base.en.bin}
+MODEL_URL=${GHOSTTY_VOICE_MODEL_URL:-https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin}
+NEED_MB=${GHOSTTY_VOICE_NEED_MB:-700}   # free memory transcribing here needs (base.en uses ~400 MB)
+
+say() { printf 'ghostty-voice: %s\n' "$*" >&2; }
+
+# A controller's microphone, by the names PipeWire gives them.
+is_controller() {
+  case "${1,,}" in
+    *dualsense*|*wireless_controller*|*054c*|*dualshock*|*controller*|*gamepad*) return 0 ;;
+  esac
+  return 1
+}
+
+# The sources with nothing plugged into their active port (an empty mic jack).
+unplugged_sources() {
+  pactl list sources 2>/dev/null | awk '
+    /^[[:space:]]*Name: / { name = $2 }
+    /^[[:space:]]*Active Port: / { active = $3 }
+    /^[[:space:]]*Ports:/ { inports = 1; next }
+    inports && /^[[:space:]]*Active Port:/ { inports = 0 }
+    inports && /not available/ { split($1, a, ":"); if (a[1] == active || active == "") bad[name] = 1 }
+    END { for (n in bad) print n }'
+}
+
+# The microphone: the one chosen, else the first game controller's. Only a
+# controller's is ever picked by itself: a desk or webcam microphone is never
+# listened to unless chosen.
+pick_source() {
+  if [[ -n "${GHOSTTY_VOICE_MIC:-}" ]]; then printf '%s' "$GHOSTTY_VOICE_MIC"; return; fi
+  command -v pactl >/dev/null || return 0
+  local name unplugged
+  unplugged=$(unplugged_sources)
+  while read -r _ name _; do
+    [[ -z "$name" || "$name" == *.monitor ]] && continue
+    grep -qxF "$name" <<<"$unplugged" && continue
+    if is_controller "$name"; then printf '%s' "$name"; return; fi
+  done < <(pactl list short sources 2>/dev/null)
+}
+
+# --list: every microphone (not the monitors of outputs), name and description.
+if [[ "${1:-}" == --list ]]; then
+  command -v pactl >/dev/null || { say "no pactl here (pulseaudio-utils)"; exit 2; }
+  pactl list sources 2>/dev/null | awk '
+    /^[[:space:]]*Name: / { name = $2 }
+    /^[[:space:]]*Description: / { sub(/^[[:space:]]*Description: /, ""); if (name !~ /\.monitor$/) print name "\t" $0 }'
+  exit 0
+fi
+
+# Whether this machine has room to transcribe: enough free memory, and whole
+# cores idle right now (the game runs here), measured over 0.5 s from
+# /proc/stat rather than the load average, which counts waiting threads. Sets
+# THREADS: the idle cores, at most 4.
+cpu_sample() { awk '/^cpu / { t = 0; for (i = 2; i <= NF; i++) t += $i; print $5 + $6, t }' /proc/stat; }
+room_here() {
+  local avail_kb cores i0 t0 i1 t1 idle
+  avail_kb=$(awk '/^MemAvailable:/ {print $2}' /proc/meminfo)
+  cores=$(nproc)
+  read -r i0 t0 < <(cpu_sample)
+  sleep 0.5
+  read -r i1 t1 < <(cpu_sample)
+  idle=$(awk -v di=$((i1 - i0)) -v dt=$((t1 - t0)) -v c="$cores" 'BEGIN { if (dt <= 0) print 0; else print int(di / dt * c + 0.5) }')
+  WHY="$(( ${avail_kb:-0} / 1024 )) MB free, $idle of $cores cores idle"
+  (( ${avail_kb:-0} / 1024 >= NEED_MB )) || return 1
+  (( idle >= 1 )) || return 1
+  THREADS=$(( idle > 4 ? 4 : idle ))
+  return 0
+}
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/ghostty-voice.XXXXXX") || exit 1
+trap 'rm -rf "$tmp"' EXIT
+wav=$tmp/said.wav
+
+# Wake the servers now: one started on demand loads its model while you talk.
+for s in $SERVERS; do curl -s -o /dev/null --max-time 20 "$s/" & done
+
+src=$(pick_source)
+if [[ -z "$src" && -z "${GHOSTTY_VOICE_FILE:-}" ]]; then
+  say "no controller microphone here: plug one in, or choose a microphone in the settings"
+  exit 4
+fi
+if [[ -n "${GHOSTTY_VOICE_FILE:-}" ]]; then
+  # a recording instead of the microphone (tests, and trying a setup out)
+  cp "$GHOSTTY_VOICE_FILE" "$wav" || exit 4
+  say "using $GHOSTTY_VOICE_FILE instead of the microphone"
+  sleep infinity &
+elif command -v pw-record >/dev/null; then
+  say "listening on $src"
+  pw-record ${src:+--target "$src"} --rate 16000 --channels 1 --format s16 "$wav" &
+elif command -v parecord >/dev/null; then
+  parecord ${src:+--device="$src"} --rate=16000 --channels=1 --format=s16le --file-format=wav "$wav" &
+else
+  say "no recorder here: install pipewire-utils (pw-record) or pulseaudio-utils (parecord)"
+  exit 2
+fi
+rec=$!
+
+# Until stdin closes (stopped in game) or the time limit.
+timeout "$MAX" cat >/dev/null
+kill -TERM "$rec" 2>/dev/null # not INT: a background job of a script ignores it
+wait "$rec" 2>/dev/null
+# a header alone (44 bytes) is nothing heard
+if [[ ! -f "$wav" || $(stat -c %s "$wav") -le 1024 ]]; then
+  say "the microphone ${src:-(default)} gave no sound"
+  exit 4
+fi
+
+one_line() { tr '\n' ' ' | sed 's/^ *//; s/ *$//; s/  */ /g'; }
+
+# 1. a server that has opted in (a desktop's GPU beside the controller)
+for s in $SERVERS; do
+  if text=$(curl -sf --max-time 60 -F "file=@$wav" -F response_format=text -F "language=$LANG_" "$s/inference"); then
+    printf '%s\n' "$text" | one_line
+    echo
+    exit 0
+  fi
+  say "$s did not answer; trying the next way"
+done
+
+# 2. here, if there is room
+case "$LOCAL" in
+  never)
+    say "no voice server answered (${SERVERS:-none set}) and transcribing here is off"
+    exit 5 ;;
+  always) room_here; THREADS=${THREADS:-2} ;;
+  *)
+    if ! room_here; then
+      say "no room to transcribe: no voice server answered (${SERVERS:-none set}) and this machine is busy ($WHY)"
+      exit 5
+    fi ;;
+esac
+if ! command -v whisper-cli >/dev/null; then
+  say "no voice server answered and whisper.cpp (whisper-cli) is not installed here"
+  exit 3
+fi
+if [[ ! -f "$MODEL" ]]; then
+  command -v curl >/dev/null || { say "no speech model at $MODEL (and no curl to fetch one)"; exit 3; }
+  say "fetching the speech model once: $MODEL_URL"
+  mkdir -p "$(dirname "$MODEL")" && curl -fsSL -o "$MODEL.part" "$MODEL_URL" && mv "$MODEL.part" "$MODEL" \
+    || { say "could not fetch the speech model"; exit 3; }
+fi
+# from its own directory: whisper.cpp looks for backend libraries in the
+# working one, and throws when it cannot read it
+if ! text=$(cd "$tmp" && whisper-cli -m "$MODEL" -l "$LANG_" -t "$THREADS" -nt -np -f "$wav" 2>"$tmp/err"); then
+  say "whisper.cpp failed: $(tail -n1 "$tmp/err")"
+  exit 3
+fi
+printf '%s\n' "$text" | one_line
+echo

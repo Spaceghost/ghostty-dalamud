@@ -106,7 +106,11 @@ global Policy = @record{
   world_toggle_shift: boolean,
   world_toggle_alt: boolean,
   toggle_gamepad_mask: integer, -- Dalamud GamepadButtons flags; 0 = no gamepad toggle
-  toggle_gamepad_hid: boolean,  -- 'create': the DualSense Create button, read from the controller's HID reports
+  toggle_gamepad_hid: boolean,  -- 'create' or 'ps': a DualSense button, read from the controller's HID reports
+  toggle_gamepad_ps: boolean,   -- 'ps': the PS button (double press: voice input) rather than Create
+  touchpad_keys: boolean,       -- the DualSense touchpad types arrows, Enter and deletes into a focused terminal
+  voice_command: string,        -- voice input: the command the agent runs (core/app/voice.nelua)
+  voice_mic: string,            -- and the microphone it is told to use ('' = its own choice)
   cursor_blink: boolean,
   close_on_exit: boolean,   -- close a terminal when its shell exits (ctrl+d)
   copy_on_select: boolean,  -- releasing a mouse selection copies it to the clipboard
@@ -228,10 +232,11 @@ global function policy_gamepad_mask(name: string): integer
   return 0
 end
 
--- "create": the DualSense Create button, which Dalamud's gamepad state does
--- not have; the core reads it from the controller (core/sys/dualsense_reader.nelua).
+-- "create" and "ps": the DualSense Create and PS buttons, which Dalamud's
+-- gamepad state does not have; the core reads them from the controller
+-- (core/sys/dualsense_reader.nelua).
 global function policy_gamepad_hid(name: string): boolean
-  return name == 'create'
+  return name == 'create' or name == 'ps'
 end
 
 -- Themes (core/theme.nelua) ----------------------------------------------------------
@@ -344,7 +349,13 @@ local function read_settings(L: *lua_State, t: cint): void
   local pad = lua_field_string(L, t, 'toggle_gamepad_button', '')
   policy.toggle_gamepad_mask = policy_gamepad_mask(pad)
   policy.toggle_gamepad_hid = policy_gamepad_hid(pad)
+  policy.toggle_gamepad_ps = pad == 'ps'
   pad:destroy()
+  policy.touchpad_keys = lua_field_boolean(L, t, 'touchpad_keys', true)
+  policy.voice_command:destroy()
+  policy.voice_command = lua_field_string(L, t, 'voice_command', 'ghostty-voice')
+  policy.voice_mic:destroy()
+  policy.voice_mic = lua_field_string(L, t, 'voice_mic', '')
   policy.default_profile = lua_field_integer(L, t, 'default_profile', 1)
   policy.cursor_blink = lua_field_boolean(L, t, 'cursor_blink', true)
   policy.close_on_exit = lua_field_boolean(L, t, 'close_on_exit', true)
@@ -469,6 +480,8 @@ global function policy_unload(): void
   policy.world_pins:destroy()
   policy.error:destroy()
   policy.toggle_key:destroy()
+  policy.voice_command:destroy()
+  policy.voice_mic:destroy()
   policy.dropdown.align:destroy()
   clear_hook_errors()
   policy.agent.host:destroy()

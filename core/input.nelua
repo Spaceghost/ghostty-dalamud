@@ -410,3 +410,157 @@ global function pad_gesture_update(st: *PadGestureState, down: boolean, t: float
   st.down = down
   return ev
 end
+
+-- Touchpad swipes as arrow keys ------------------------------------------------------
+-- The DualSense touchpad as four arrow keys, for a terminal: a swipe gives one
+-- arrow per TOUCH_STEP_X across (TOUCH_STEP_Y up or down) in the direction it
+-- mostly went, so a long swipe gives several and a short flick one. Held at
+-- the edge the last step went toward, after TOUCH_HOLD_S, the arrow repeats
+-- every TOUCH_REPEAT_S; a finger laid on an edge and held still does the same
+-- after TOUCH_EDGE_HOLD_S. Coordinates are the controller's (x 0..1919 from
+-- the left, y 0..1079 from the top).
+global TouchDir = @enum{ None = 0, Up, Down, Left, Right }
+
+global TouchSwipeState = @record{
+  touching: boolean,
+  ax: integer, ay: integer, -- where the next step is measured from
+  dir: TouchDir,            -- the last step's direction (None: none yet this touch)
+  step_at: float64,         -- when the last step was (or the touch began)
+  repeat_at: float64,       -- when the last arrow was given
+}
+
+global TOUCH_STEP_X: integer <comptime> = 240     -- an eighth of the pad across
+global TOUCH_STEP_Y: integer <comptime> = 180     -- a sixth of it up or down
+global TOUCH_HOLD_S: float64 <comptime> = 0.35
+global TOUCH_EDGE_HOLD_S: float64 <comptime> = 0.5
+global TOUCH_REPEAT_S: float64 <comptime> = 0.08
+global TOUCH_EDGE_X: integer <comptime> = 384     -- the outer fifth each side
+global TOUCH_EDGE_Y: integer <comptime> = 270     -- the outer quarter top and bottom
+
+-- The edge (x, y) is at, horizontal ones first; `want` asks for that one only.
+local function touch_edge(x: integer, y: integer, want: TouchDir): TouchDir
+  local d = TouchDir.None
+  if x < TOUCH_EDGE_X then d = TouchDir.Left
+  elseif x >= 1920 - TOUCH_EDGE_X then d = TouchDir.Right
+  elseif y < TOUCH_EDGE_Y then d = TouchDir.Up
+  elseif y >= 1080 - TOUCH_EDGE_Y then d = TouchDir.Down end
+  if want ~= TouchDir.None then
+    if want == TouchDir.Left and x < TOUCH_EDGE_X then return want end
+    if want == TouchDir.Right and x >= 1920 - TOUCH_EDGE_X then return want end
+    if want == TouchDir.Up and y < TOUCH_EDGE_Y then return want end
+    if want == TouchDir.Down and y >= 1080 - TOUCH_EDGE_Y then return want end
+    return TouchDir.None
+  end
+  return d
+end
+
+-- Start over from where the finger is (the pad was pressed: a finger moves
+-- as it clicks, which is not a swipe).
+global function touch_swipe_reset(st: *TouchSwipeState, x: integer, y: integer, t: float64): void
+  st.ax, st.ay, st.dir, st.step_at, st.repeat_at = x, y, TouchDir.None, t, t
+end
+
+-- One sample of the first finger; at most one arrow a call (a swipe faster
+-- than that gives the rest on the next frames).
+global function touch_swipe_update(st: *TouchSwipeState, touching: boolean, x: integer, y: integer, t: float64): TouchDir
+  if not touching then
+    st.touching, st.dir = false, TouchDir.None
+    return TouchDir.None
+  end
+  if not st.touching then
+    st.touching = true
+    touch_swipe_reset(st, x, y, t)
+    return TouchDir.None
+  end
+  local dx, dy = x - st.ax, y - st.ay
+  local fx = (@float64)(math.abs(dx)) / TOUCH_STEP_X
+  local fy = (@float64)(math.abs(dy)) / TOUCH_STEP_Y
+  if fx >= 1 or fy >= 1 then
+    local d: TouchDir
+    if fx >= fy then
+      d = dx > 0 and TouchDir.Right or TouchDir.Left
+      st.ax = st.ax + (dx > 0 and TOUCH_STEP_X or -TOUCH_STEP_X)
+      st.ay = y
+    else
+      d = dy > 0 and TouchDir.Down or TouchDir.Up
+      st.ay = st.ay + (dy > 0 and TOUCH_STEP_Y or -TOUCH_STEP_Y)
+      st.ax = x
+    end
+    st.dir, st.step_at, st.repeat_at = d, t, t
+    return d
+  end
+  if st.dir ~= TouchDir.None then
+    -- held at the edge it went toward
+    if t - st.step_at >= TOUCH_HOLD_S and t - st.repeat_at >= TOUCH_REPEAT_S and touch_edge(x, y, st.dir) ~= TouchDir.None then
+      st.repeat_at = t
+      return st.dir
+    end
+  elseif t - st.step_at >= TOUCH_EDGE_HOLD_S and t - st.repeat_at >= TOUCH_REPEAT_S then
+    -- laid on an edge and held still
+    local d = touch_edge(x, y, TouchDir.None)
+    if d ~= TouchDir.None then
+      st.repeat_at = t
+      return d
+    end
+  end
+  return TouchDir.None
+end
+
+-- Keys from the controller -------------------------------------------------------
+-- What the touchpad types into the focused terminal (core/app/hotkeys.nelua):
+-- arrows from swipes, Enter from a click, and deleting from a double click or
+-- a held one. Encoded like keys from the keyboard, so a program in application
+-- cursor mode or the kitty keyboard protocol gets what it expects.
+global PadKey = @enum{ None = 0, Up, Down, Left, Right, Enter, Backspace, DeleteWord }
+
+global PAD_KEYS_MAX: integer <comptime> = 32
+
+global PadKeyQueue = @record{
+  n: integer,
+  k: [PAD_KEYS_MAX]PadKey,
+}
+
+global function pad_keys_push(q: *PadKeyQueue, k: PadKey): void
+  if k == PadKey.None or q.n >= PAD_KEYS_MAX then return end
+  q.k[q.n] = k
+  q.n = q.n + 1
+end
+
+global function pad_key_of_dir(d: TouchDir): PadKey
+  if d == TouchDir.Up then return PadKey.Up
+  elseif d == TouchDir.Down then return PadKey.Down
+  elseif d == TouchDir.Left then return PadKey.Left
+  elseif d == TouchDir.Right then return PadKey.Right end
+  return PadKey.None
+end
+
+-- Every queued key through `encoder` into `sink`, then the queue empty.
+-- Deleting a word is Ctrl+W (readline, zsh's line editor, most prompts).
+global function pad_keys_send(q: *PadKeyQueue, encoder: GhosttyKeyEncoder, event: GhosttyKeyEvent,
+                              sink: InputSink, sink_ctx: pointer): void
+  local buf: [64]cchar
+  for i = 0, < q.n do
+    local k = q.k[i]
+    local key, mods, cp = GHOSTTY_KEY_UNIDENTIFIED, (@uint16)(0), (@uint32)(0)
+    if k == PadKey.Up then key = GHOSTTY_KEY_ARROW_UP
+    elseif k == PadKey.Down then key = GHOSTTY_KEY_ARROW_DOWN
+    elseif k == PadKey.Left then key = GHOSTTY_KEY_ARROW_LEFT
+    elseif k == PadKey.Right then key = GHOSTTY_KEY_ARROW_RIGHT
+    elseif k == PadKey.Enter then key, cp = GHOSTTY_KEY_ENTER, 13
+    elseif k == PadKey.Backspace then key = GHOSTTY_KEY_BACKSPACE
+    elseif k == PadKey.DeleteWord then key, mods, cp = GHOSTTY_KEY_W, GHOSTTY_MODS_CTRL, 119 end
+    if key ~= GHOSTTY_KEY_UNIDENTIFIED then
+      ghostty_key_event_set_action(event, GHOSTTY_KEY_ACTION_PRESS)
+      ghostty_key_event_set_key(event, key)
+      ghostty_key_event_set_mods(event, mods)
+      ghostty_key_event_set_consumed_mods(event, 0)
+      ghostty_key_event_set_unshifted_codepoint(event, cp)
+      ghostty_key_event_set_utf8(event, nilptr, 0)
+      local outlen: usize = 0
+      if ghostty_key_encoder_encode(encoder, event, &buf, 64, &outlen) == GHOSTTY_SUCCESS and outlen > 0 then
+        sink(sink_ctx, (@*[0]uint8)(&buf), outlen)
+      end
+    end
+  end
+  q.n = 0
+end

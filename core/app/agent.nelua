@@ -3,6 +3,7 @@
 -- The ghostty-agent connection and session lifetime: open, reattach (LIST /
 -- ATTACH after a reload), and removal.
 require 'core.app.state'
+require 'core.app.voice'
 require 'core.sys.conpty'
 
 -- A character is loaded (not the title screen or character select): pets and
@@ -126,6 +127,8 @@ global function agent_event(ctx: pointer, ev: *AgentEvent): void
         s:mark_exited(ev.status)
       end
     end
+  elseif ev.typ == PROTO_JOPENED and voice_on_opened(ev.req, ev.id, string{data=(@*[0]byte)(ev.data), size=ev.len}) then
+    -- voice input's job (core/app/voice.nelua)
   elseif ev.typ == PROTO_JOPENED then
     -- JOPENED answers by the req its JOPEN carried, not in order
     local s: *Session = nilptr
@@ -154,6 +157,8 @@ global function agent_event(ctx: pointer, ev: *AgentEvent): void
       drop_pending(s)
       s:agent_opened(ev.id)
     end
+  elseif ev.typ == PROTO_JOUT and voice_on_out(ev.id, ev.stream, ev.data, ev.len) then
+  elseif ev.typ == PROTO_JEXIT and voice_on_exit(ev.id, ev.status, paste_text) then
   elseif ev.typ == PROTO_JOUT then
     local s = find_job_session(ev.id)
     if s ~= nilptr then s:feed(ev.data, ev.len) end -- stdout and stderr, in the order they came
