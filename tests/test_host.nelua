@@ -308,9 +308,31 @@ do
   -- refused by the agent: over at once
   host.voice_on, host.voice_req = true, 79
   assert(voice_on_opened(79, 0, 'no such command') and not host.voice_on)
+  -- muted (as every game starts): voice_toggle says so and starts nothing
+  assert(not host.mic_live, 'the microphone starts muted')
+  voice_toggle()
+  assert(not host.voice_on and host.voice_note:view() == 'Voice input: the microphone is muted: press the mute button on the controller', 'muted: nothing starts')
+  voice_mute_toggle()
+  assert(host.mic_live and host.voice_note:view() == 'Voice input: microphone on', 'the mute button unmutes')
   -- no agent: voice_toggle says so and starts nothing
   voice_toggle()
   assert(not host.voice_on, 'no agent: nothing starts')
+  -- muting mid-sentence drops it: nothing typed
+  pasted:destroy() pasted = ''
+  host.voice_on, host.voice_req, host.voice_target = true, 80, s.id
+  assert(voice_on_opened(80, 7, ''))
+  local half: string = 'half a sen'
+  assert(voice_on_out(7, JOB_OUT, (@*[0]uint8)(half.data), #half))
+  voice_mute_toggle()
+  assert(not host.mic_live and not host.voice_on and host.voice_note:view() == 'Voice input: microphone muted', 'muting cancels')
+  assert(not voice_on_exit(7, 0, fake_paste) and #pasted == 0, 'and what was said is dropped')
+  -- the microphones for the settings: `ghostty-voice --list` as a job
+  host.voice_list_req = 81
+  assert(voice_on_opened(81, 8, '') and host.voice_list_jid == 8)
+  local mics: string = 'alienware-dualsense-mic\tDualSense microphone (alienware)\nusb-headset\tHeadset\n'
+  assert(voice_on_out(8, JOB_OUT, (@*[0]uint8)(mics.data), #mics))
+  assert(voice_on_exit(8, 0, fake_paste) and host.voice_mics_known and host.voice_list_req == 0)
+  assert(host.voice_mics == mics, 'the list, for ghostty.voice_mics()')
   pasted:destroy()
   session_remove(s)
   print('voice OK')

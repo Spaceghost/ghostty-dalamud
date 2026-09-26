@@ -38,8 +38,9 @@ local config = {
   -- deletes a word and a held click keeps deleting.
   touchpad_keys = true,
   -- Voice input (ps pressed twice): the command the agent runs to listen and
-  -- write down what was said, and the microphone it uses ('' = any that is not
-  -- a controller's, else the controller's).
+  -- write down what was said, and the microphone it uses ('' = a controller's;
+  -- Settings lists the others). The controller's mute button mutes it, and
+  -- every game starts muted.
   voice_command = 'ghostty-voice',
   voice_mic = '',
 

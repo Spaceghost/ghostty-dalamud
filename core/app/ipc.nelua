@@ -369,6 +369,44 @@ end
 
 -- World panels (terminals and windows) ----------------------------------------------------
 
+-- ghostty.voice_mics() -> the microphones voice input can use, as { name,
+-- description } pairs, or nil until asked (ghostty.voice_mics_refresh(), which
+-- runs `ghostty-voice --list` on the agent's machine). ghostty.voice_muted() ->
+-- whether the controller's mute button has the microphone muted.
+local function l_voice_mics(L: *lua_State): cint
+  if not host.voice_mics_known then lua_pushnil(L) return 1 end
+  lua_createtable(L, 0, 0)
+  local s = host.voice_mics
+  local n: cint = 0
+  local i = 0
+  while i < #s do
+    local j = i
+    while j < #s and s.data[j] ~= '\n'_b do j = j + 1 end
+    if j > i then
+      local tab = i
+      while tab < j and s.data[tab] ~= '\t'_b do tab = tab + 1 end
+      n = n + 1
+      lua_createtable(L, 2, 0)
+      lua_pushlstring(L, (@cstring)(&s.data[i]), (@usize)(tab - i)) lua_rawseti(L, -2, 1)
+      if tab < j then lua_pushlstring(L, (@cstring)(&s.data[tab + 1]), (@usize)(j - tab - 1)) else lua_pushstring(L, '') end
+      lua_rawseti(L, -2, 2)
+      lua_rawseti(L, -2, n)
+    end
+    i = j + 1
+  end
+  return 1
+end
+
+local function l_voice_mics_refresh(L: *lua_State): cint
+  voice_mics_refresh()
+  return 0
+end
+
+local function l_voice_muted(L: *lua_State): cint
+  lua_pushboolean(L, host.mic_live and 0 or 1)
+  return 1
+end
+
 -- ghostty.raycast(ox, oy, oz, dx, dy, dz, max[, filter]) -> distance, hx, hy, hz, filter
 -- The game's own collision along a direction that need not be normalised: the
 -- distance to the first hit within `max` yalms and where it is, or nil when
@@ -783,6 +821,9 @@ global function ipc_lua_register(L: *lua_State): void
   lua_pushcclosure(L, l_status, 0) lua_setfield(L, -2, 'status')
   lua_pushcclosure(L, l_world_panels, 0) lua_setfield(L, -2, 'world_panels')
   lua_pushcclosure(L, l_raycast, 0) lua_setfield(L, -2, 'raycast')
+  lua_pushcclosure(L, l_voice_mics, 0) lua_setfield(L, -2, 'voice_mics')
+  lua_pushcclosure(L, l_voice_mics_refresh, 0) lua_setfield(L, -2, 'voice_mics_refresh')
+  lua_pushcclosure(L, l_voice_muted, 0) lua_setfield(L, -2, 'voice_muted')
   lua_pushcclosure(L, l_nearby_characters, 0) lua_setfield(L, -2, 'nearby_characters')
   lua_pushcclosure(L, l_panel_focus, 0) lua_setfield(L, -2, 'panel_focus')
   lua_pushcclosure(L, l_panel_hide, 0) lua_setfield(L, -2, 'panel_hide')

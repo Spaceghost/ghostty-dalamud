@@ -10,9 +10,12 @@
 # Settings come from the environment or ~/.config/ghostty/voice.conf (shell
 # assignments), so they live on the machine the agent runs on:
 #
-#   GHOSTTY_VOICE_MIC      a PipeWire/PulseAudio source; empty: the first
-#                          microphone with something plugged in that is not a
-#                          game controller's, else a controller's
+#   GHOSTTY_VOICE_MIC      a PipeWire/PulseAudio source (chosen in the game's
+#                          settings); empty: a game controller's microphone,
+#                          and only that: with none, nothing is recorded
+#
+# `ghostty-voice --list` prints the microphones there are instead, one a line:
+# the source name, a tab, its description (the game's settings show them).
 #   GHOSTTY_VOICE_SERVERS  whisper.cpp servers (whisper-server) to transcribe
 #                          on, in order, e.g. a desktop with a GPU beside the
 #                          controller that has opted in by running one. The
@@ -68,23 +71,29 @@ unplugged_sources() {
     END { for (n in bad) print n }'
 }
 
+# The microphone: the one chosen, else the first game controller's. Only a
+# controller's is ever picked by itself: a desk or webcam microphone is never
+# listened to unless chosen.
 pick_source() {
   if [[ -n "${GHOSTTY_VOICE_MIC:-}" ]]; then printf '%s' "$GHOSTTY_VOICE_MIC"; return; fi
   command -v pactl >/dev/null || return 0
-  local name controller= unplugged
+  local name unplugged
   unplugged=$(unplugged_sources)
   while read -r _ name _; do
     [[ -z "$name" || "$name" == *.monitor ]] && continue
     grep -qxF "$name" <<<"$unplugged" && continue
-    if is_controller "$name"; then
-      [[ -z "$controller" ]] && controller=$name
-    else
-      printf '%s' "$name"
-      return
-    fi
+    if is_controller "$name"; then printf '%s' "$name"; return; fi
   done < <(pactl list short sources 2>/dev/null)
-  printf '%s' "$controller"
 }
+
+# --list: every microphone (not the monitors of outputs), name and description.
+if [[ "${1:-}" == --list ]]; then
+  command -v pactl >/dev/null || { say "no pactl here (pulseaudio-utils)"; exit 2; }
+  pactl list sources 2>/dev/null | awk '
+    /^[[:space:]]*Name: / { name = $2 }
+    /^[[:space:]]*Description: / { sub(/^[[:space:]]*Description: /, ""); if (name !~ /\.monitor$/) print name "\t" $0 }'
+  exit 0
+fi
 
 # Whether this machine has room to transcribe: enough free memory, and whole
 # cores idle right now (the game runs here), measured over 0.5 s from
@@ -114,13 +123,17 @@ wav=$tmp/said.wav
 for s in $SERVERS; do curl -s -o /dev/null --max-time 20 "$s/" & done
 
 src=$(pick_source)
+if [[ -z "$src" && -z "${GHOSTTY_VOICE_FILE:-}" ]]; then
+  say "no controller microphone here: plug one in, or choose a microphone in the settings"
+  exit 4
+fi
 if [[ -n "${GHOSTTY_VOICE_FILE:-}" ]]; then
   # a recording instead of the microphone (tests, and trying a setup out)
   cp "$GHOSTTY_VOICE_FILE" "$wav" || exit 4
   say "using $GHOSTTY_VOICE_FILE instead of the microphone"
   sleep infinity &
 elif command -v pw-record >/dev/null; then
-  say "listening on ${src:-the default microphone}"
+  say "listening on $src"
   pw-record ${src:+--target "$src"} --rate 16000 --channels 1 --format s16 "$wav" &
 elif command -v parecord >/dev/null; then
   parecord ${src:+--device="$src"} --rate=16000 --channels=1 --format=s16le --file-format=wav "$wav" &

@@ -41,6 +41,7 @@ global DS_CREATE: uint32 <comptime> = 0x01
 global DS_OPTIONS: uint32 <comptime> = 0x02
 global DS_PS: uint32 <comptime> = 0x04
 global DS_TOUCHPAD: uint32 <comptime> = 0x08
+global DS_MUTE: uint32 <comptime> = 0x10     -- the microphone button (Moonlight sends it as the pad's misc button)
 
 global DsLayout = @enum{ None = 0, Usb, Bluetooth, Simple }
 global DsEdge = @enum{ None = 0, Press, Release }
@@ -103,6 +104,7 @@ global function dualsense_parse(data: *[0]uint8, n: usize, buttons: *uint32): Ds
   if (b1 & 0x20) ~= 0 then b = b | DS_OPTIONS end
   if (b2 & 0x01) ~= 0 then b = b | DS_PS end
   if (b2 & 0x02) ~= 0 then b = b | DS_TOUCHPAD end
+  if (b2 & 0x04) ~= 0 then b = b | DS_MUTE end
   if buttons ~= nilptr then $buttons = b end
   return layout
 end

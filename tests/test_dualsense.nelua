@@ -85,10 +85,10 @@ do
   assert(b == DS_TOUCHPAD, 'USB touchpad click: byte 10 bit 0x02')
   r = usb_report(0xF0, 0xCF, 0x04) -- face buttons, L1 R1 L2 R2 L3 R3, mute
   l, b = parse(&r, 64)
-  assert(l == DsLayout.Usb and b == 0, 'every other button reads as nothing')
+  assert(l == DsLayout.Usb and b == DS_MUTE, 'every other button reads as nothing; mute is the microphone')
   r = usb_report(0xF0, 0xFF, 0x07)
   l, b = parse(&r, 64)
-  assert(b == DS_CREATE | DS_OPTIONS | DS_PS | DS_TOUCHPAD)
+  assert(b == DS_CREATE | DS_OPTIONS | DS_PS | DS_TOUCHPAD | DS_MUTE)
   print('usb OK')
 end
 
@@ -471,7 +471,10 @@ do
   -- PS and the touchpad click among the buttons
   local ps = usb_report(0, 0, 0x03)
   local _, bits = parse(&ps, 64)
-  assert((bits & DS_PS) ~= 0 and (bits & DS_TOUCHPAD) ~= 0, 'PS and the touchpad click')
+  assert((bits & DS_PS) ~= 0 and (bits & DS_TOUCHPAD) ~= 0 and (bits & DS_MUTE) == 0, 'PS and the touchpad click')
+  local mute = usb_report(0, 0, 0x04)
+  _, bits = parse(&mute, 64)
+  assert(bits == DS_MUTE, 'the microphone button')
   print('touch parsing OK')
 end
 

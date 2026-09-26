@@ -2,8 +2,8 @@
 -- starts listening, twice again stops. The listening and the speech to text
 -- happen on the agent's machine, as a raw job (docs/JOBS.md) running
 -- CONFIG.voice_command (ghostty-voice by default, shipped with the agent): it
--- records from CONFIG.voice_mic (empty: the first microphone that is not a
--- controller's, else the controller's), stops when its stdin closes or at its
+-- records from CONFIG.voice_mic (empty: a controller's microphone; the settings
+-- list what there is, from `ghostty-voice --list`), stops when its stdin closes or at its
 -- time limit, and prints what was said on stdout (its stderr says why not). That text is
 -- pasted into the terminal that had the keyboard when it began, bracketed, so
 -- nothing runs until you press Enter (the touchpad: one click).
@@ -50,6 +50,10 @@ global function voice_shutdown(): void
   voice_reset()
   host.voice_note:destroy()
   host.voice_note = {}
+  host.voice_mics_out:destroy()
+  host.voice_mics_out = {}
+  host.voice_mics:destroy()
+  host.voice_mics = ''
 end
 
 -- Stop listening: the job's stdin closes and it goes on to transcribe.
@@ -60,18 +64,20 @@ global function voice_stop(): void
   logf(LOG_INFO, 'voice: stopped listening')
 end
 
-global function voice_toggle(): void
-  if host.voice_on then voice_stop() return end
+-- CONFIG.voice_command as a job, with `extra` after its words when not empty.
+-- -> its request id, 0 when nothing was sent (the reason noted).
+local function voice_job(extra: string): uint32
   local c = &host.local_agent.client
   if not (host.local_agent.enabled and c:jobs_ok()) then
     logf(LOG_WARN, 'voice: needs the agent connected (ghostty-agent with jobs, protocol 4)')
     voice_note('needs the agent connected')
-    return
+    return 0
   end
   local argv: vector(string)
   local env: vector(string)
   split_words(policy.voice_command, &argv)
   if #argv == 0 then argv:push(string.copy('ghostty-voice')) end
+  if #extra > 0 then argv:push(extra:copy()) end
   local sb: stringbuilder
   sb:write('GHOSTTY_VOICE_MIC=', policy.voice_mic)
   env:push(sb:promote())
@@ -83,15 +89,57 @@ global function voice_toggle(): void
   if not sent then
     logf(LOG_WARN, 'voice: the agent would not take the job')
     voice_note('the agent would not start it')
+    return 0
+  end
+  return req
+end
+
+-- Muting. The microphone starts muted every time the game starts (the core's
+-- state is fresh then) and keeps whatever the controller's mute button last
+-- made it while you play. Muting mid-sentence drops what was said: nothing is
+-- written down or typed.
+global function voice_cancel(): void
+  if not host.voice_on then return end
+  if host.voice_jid ~= 0 then host.local_agent.client:jclose(host.voice_jid) end
+  logf(LOG_INFO, 'voice: cancelled')
+  voice_reset()
+end
+
+global function voice_mute_toggle(): void
+  host.mic_live = not host.mic_live
+  if not host.mic_live then voice_cancel() end
+  logf(LOG_INFO, 'voice: microphone %s', host.mic_live and 'on' or 'muted')
+  voice_note(host.mic_live and 'microphone on' or 'microphone muted')
+end
+
+global function voice_toggle(): void
+  if host.voice_on then voice_stop() return end
+  if not host.mic_live then
+    voice_note('the microphone is muted: press the mute button on the controller')
     return
   end
+  local req = voice_job('')
+  if req == 0 then return end
   voice_reset()
   host.voice_on, host.voice_req, host.voice_target, host.voice_at = true, req, host.typing_session, host.last_time
   logf(LOG_INFO, 'voice: listening')
 end
 
+-- The microphones there are to choose from, for the settings: `ghostty-voice
+-- --list` run as a job, one per line (name, a tab, a description).
+global function voice_mics_refresh(): void
+  if host.voice_list_req ~= 0 then return end -- already asking
+  host.voice_mics_out:destroy()
+  host.voice_mics_out = {}
+  host.voice_list_req = voice_job('--list')
+end
+
 -- The agent's answers (core/app/agent.nelua): true when they were the voice job's.
 global function voice_on_opened(req: uint32, jid: uint32, why: string): boolean
+  if req ~= 0 and req == host.voice_list_req then
+    if jid == 0 then host.voice_list_req = 0 else host.voice_list_jid = jid end
+    return true
+  end
   if not host.voice_on or req == 0 or req ~= host.voice_req then return false end
   if jid == 0 then
     logf(LOG_WARN, 'voice: the agent could not start %s: %s', policy.voice_command, why)
@@ -105,6 +153,12 @@ global function voice_on_opened(req: uint32, jid: uint32, why: string): boolean
 end
 
 global function voice_on_out(jid: uint32, stream: uint8, data: *[0]uint8, len: usize): boolean
+  if jid ~= 0 and jid == host.voice_list_jid then
+    if stream ~= JOB_ERR and host.voice_mics_out:view().size + len <= VOICE_OUT_MAX then
+      host.voice_mics_out:write(string{data=(@*[0]byte)(data), size=len})
+    end
+    return true
+  end
   if not host.voice_on or jid == 0 or jid ~= host.voice_jid then return false end
   local sb = stream == JOB_ERR and &host.voice_err or &host.voice_out
   if sb:view().size + len <= VOICE_OUT_MAX then sb:write(string{data=(@*[0]byte)(data), size=len}) end
@@ -128,6 +182,13 @@ end
 global VoicePasteFn = @function(s: *Session, text: string): void
 
 global function voice_on_exit(jid: uint32, status: int32, paste: VoicePasteFn): boolean
+  if jid ~= 0 and jid == host.voice_list_jid then
+    host.voice_mics:destroy()
+    host.voice_mics = host.voice_mics_out:promote()
+    host.voice_mics_known = true
+    host.voice_list_req, host.voice_list_jid = 0, 0
+    return true
+  end
   if not host.voice_on or jid == 0 or jid ~= host.voice_jid then return false end
   local text: stringbuilder
   one_line(host.voice_out:view(), &text)

@@ -35,6 +35,7 @@ global DualSenseReader = @record{
   button: DsButtonState,     -- Create
   ps: DsButtonState,         -- PS
   click: DsButtonState,      -- the touchpad pressed down
+  mute: DsButtonState,       -- the microphone button
   touching: boolean,         -- a finger on the touchpad in the newest report
   touch_x: integer,          -- where (0..1919 from the left, 0..1079 from the top)
   touch_y: integer,
@@ -98,6 +99,7 @@ global function dualsense_reader_poll(r: *DualSenseReader, now: float64, logfn: 
   if not hid_is_open(&r.dev) then
     r.button.down, r.button.pressed = false, false
     r.ps.down, r.ps.pressed, r.click.down, r.click.pressed, r.touching = false, false, false, false, false
+    r.mute.down, r.mute.pressed = false, false
     if arrived then r.arrived, r.wait_s = true, 0 end
     if r.scan.info == nilptr then
       if r.scanned and now >= r.scanned_at then
@@ -126,7 +128,7 @@ global function dualsense_reader_poll(r: *DualSenseReader, now: float64, logfn: 
     elseif step ~= HidStep.Opened then
       return
     end
-    r.button, r.ps, r.click = {}, {}, {}
+    r.button, r.ps, r.click, r.mute = {}, {}, {}, {}
     r.touching = false
     r.failed_again = false
     r.logged_layout, r.logged_ignored = DsLayout.None, false
@@ -145,6 +147,7 @@ global function dualsense_reader_poll(r: *DualSenseReader, now: float64, logfn: 
       hid_close(&r.dev)
       r.button.down, r.button.pressed = false, false
       r.ps.down, r.ps.pressed, r.click.down, r.click.pressed, r.touching = false, false, false, false, false
+      r.mute.down, r.mute.pressed = false, false
       search_later(r, now) -- DS_RESCAN_MIN_S after a device that worked, longer each time one fails before its first report
       return
     elseif n == 0 then
@@ -155,6 +158,7 @@ global function dualsense_reader_poll(r: *DualSenseReader, now: float64, logfn: 
     if r.button.reports ~= reports then -- a DualSense input report: the rest of it too
       dualsense_feed(&r.ps, &r.dev.buf, (@usize)(n), DS_PS)
       dualsense_feed(&r.click, &r.dev.buf, (@usize)(n), DS_TOUCHPAD)
+      dualsense_feed(&r.mute, &r.dev.buf, (@usize)(n), DS_MUTE)
       r.touching, r.touch_x, r.touch_y = dualsense_touch(&r.dev.buf, (@usize)(n), r.button.layout)
     end
     if reports == 0 and r.button.reports > 0 then
@@ -183,4 +187,8 @@ end
 
 global function dualsense_reader_take_click(r: *DualSenseReader): boolean
   return dualsense_take(&r.click)
+end
+
+global function dualsense_reader_take_mute(r: *DualSenseReader): boolean
+  return dualsense_take(&r.mute)
 end

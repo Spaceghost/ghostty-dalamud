@@ -292,6 +292,13 @@ global Host = @record{
   voice_err: stringbuilder,         -- and said on stderr
   voice_note: stringbuilder,        -- why it last did not work, shown a while (core/app/voice.nelua)
   voice_note_at: float64,
+  mic_live: boolean,                -- the microphone unmuted; false (muted) whenever the game starts
+  mute_down: boolean,               -- the controller's mute button, last frame
+  voice_list_req: uint32,           -- `ghostty-voice --list` for the settings, while asked
+  voice_list_jid: uint32,
+  voice_mics_out: stringbuilder,    -- what it printed so far
+  voice_mics: string,               -- and in the end: a line per microphone
+  voice_mics_known: boolean,
   dualsense: DualSenseReader,       -- toggle_gamepad_button = 'create': the controller read over HID
   select_idx: integer,
   -- raw mouse buttons (Dalamud only forwards clicks to ImGui while it wants the mouse)

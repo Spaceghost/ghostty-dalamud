@@ -137,6 +137,12 @@ global function poll_toggle_key(): void
     pressed = true
   end
   if pressed then toggle_visible() end
+  -- the controller's mute button: the microphone voice input listens to
+  if policy.toggle_gamepad_hid then
+    local mute = dualsense_reader_take_mute(&host.dualsense)
+    if mute and not host.mute_down and game_foreground() then voice_mute_toggle() end
+    host.mute_down = mute
+  end
   poll_touchpad(now)
   voice_draw()
 end

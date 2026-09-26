@@ -29,6 +29,7 @@ S.schema = {
     { 'world_toggle_mods', 'combo', MODS, 'World terminals toggle modifiers (+ `)' },
     { 'toggle_gamepad_button', 'combo', PAD, 'Controller button (tap / hold / double tap; create, ps = DualSense over HID)' },
     { 'touchpad_keys', 'checkbox', 'DualSense touchpad types into a focused terminal (create or ps)' },
+    { 'voice_mic', 'mic', 'Voice input listens to' },
   } },
   { 'Dropdown', {
     { 'dropdown.height', 'slider', 0.15, 1.0, 'Height (fraction of screen)' },
@@ -402,6 +403,8 @@ function S.draw_settings(ui)
           c, v = ui.combo(e[4] .. '##' .. path, tostring(cur or ''), e[3])
         elseif kind == 'list' then
           c, v = S.draw_list(ui, path, e[3], cur)
+        elseif kind == 'mic' then
+          c, v = S.draw_mic(ui, path, e[3], cur)
         elseif kind == 'argv' then
           -- a command line, read-only here: edit it in the Lua module
           local words = {}
@@ -438,6 +441,38 @@ end
 -- A list of strings: each with a remove button, and a box to add one
 -- (Enter or Add). Returns changed and the new list (a copy).
 S.drafts = {}
+-- Voice input's microphone: the controller's (the default), or one of those
+-- the agent's machine has (ghostty.voice_mics, from `ghostty-voice --list`,
+-- asked for the first time this is drawn and again with Refresh).
+S.CONTROLLER_MICS = 'Controller microphones'
+function S.draw_mic(ui, path, label, cur)
+  local g = ghostty
+  local mics = g and g.voice_mics and g.voice_mics()
+  if not mics and g and g.voice_mics_refresh and not S.mics_asked then
+    S.mics_asked = true
+    g.voice_mics_refresh()
+  end
+  local names, choices = { S.CONTROLLER_MICS }, { [S.CONTROLLER_MICS] = '' }
+  for _, m in ipairs(mics or {}) do
+    local shown = (m[2] ~= '' and m[2] or m[1])
+    if choices[shown] then shown = shown .. ' (' .. m[1] .. ')' end
+    names[#names + 1], choices[shown] = shown, m[1]
+  end
+  local now = S.CONTROLLER_MICS
+  for shown, name in pairs(choices) do if name == (cur or '') and name ~= '' then now = shown end end
+  if (cur or '') ~= '' and now == S.CONTROLLER_MICS then -- set, but not among those listed (yet)
+    now = cur
+    names[#names + 1], choices[cur] = cur, cur
+  end
+  local c, v = ui.combo(label .. '##' .. path, now, names)
+  if ui.small_button and g and g.voice_mics_refresh then
+    ui.same_line()
+    if ui.small_button('Refresh##' .. path) then g.voice_mics_refresh() end
+  end
+  if c then return true, choices[v] or '' end
+  return false, cur
+end
+
 function S.draw_list(ui, path, label, cur)
   local list = type(cur) == 'table' and cur or {}
   ui.text(label)
