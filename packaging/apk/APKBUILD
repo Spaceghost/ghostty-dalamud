@@ -57,6 +57,7 @@ check() {
 
 package() {
 	install -Dm0755 build/dist/ghostty-agent "$pkgdir"/usr/bin/ghostty-agent
+	install -Dm0755 packaging/ghostty-voice "$pkgdir"/usr/bin/ghostty-voice
 	install -Dm0644 packaging/README-agent.md \
 		"$pkgdir"/usr/share/doc/$pkgname/README-agent.md
 	install -Dm0644 LICENSE "$pkgdir"/usr/share/licenses/$pkgname/LICENSE

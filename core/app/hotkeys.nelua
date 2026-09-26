@@ -3,6 +3,7 @@
 -- Input the game does not hand to ImGui: the toggle keys (Win32 key state),
 -- the controller button gestures.
 require 'core.app.worldview'
+require 'core.app.voice'
 require 'core.sys.dualsense_reader'
 
 global ForegroundFn = @function(): boolean
@@ -20,8 +21,8 @@ global function game_foreground(): boolean
 end
 
 -- The controller toggle button this frame, from the source toggle_gamepad_button
--- names: the DualSense Create button read from the controller's HID reports
--- ('create'), or a Dalamud GamepadButtons flag through the shim. Returns
+-- names: the DualSense Create or PS button read from the controller's HID
+-- reports ('create', 'ps'), or a Dalamud GamepadButtons flag through the shim. Returns
 -- whether the button's state is known (then `down` is it) and, from a shim
 -- without gamepad_down, whether it was pressed this frame. The HID reports
 -- arrive whichever window is in front, and Create captures screenshots and
@@ -31,7 +32,9 @@ end
 global function poll_toggle_pad(now: float64, foreground: ForegroundFn): (boolean, boolean, boolean)
   if policy.toggle_gamepad_hid then
     dualsense_reader_poll(&host.dualsense, now, log)
-    local down = dualsense_reader_take(&host.dualsense)
+    local down: boolean
+    if policy.toggle_gamepad_ps then down = dualsense_reader_take_ps(&host.dualsense)
+    else down = dualsense_reader_take(&host.dualsense) end
     if down and not foreground() then down = false end
     return true, down, false
   end
@@ -41,6 +44,38 @@ global function poll_toggle_pad(now: float64, foreground: ForegroundFn): (boolea
   if host.api.gamepad_down ~= nilptr then return true, host.api.gamepad_down(mask) ~= 0, false end
   if host.api.gamepad_pressed ~= nilptr then return false, false, host.api.gamepad_pressed(mask) ~= 0 end
   return false, false, false
+end
+
+global PAD_DELETE_EVERY_S: float64 <comptime> = 0.05 -- held down: a character this often
+
+-- The DualSense touchpad as keys for the focused terminal (policy.touchpad_keys,
+-- with the controller read over HID): swipes and edge holds are arrows
+-- (touch_swipe_update), a click is Enter, a double click deletes a word and a
+-- held click keeps deleting, a character every PAD_DELETE_EVERY_S. Only while a
+-- terminal has the keyboard; otherwise the touchpad stays the game's.
+local function poll_touchpad(now: float64): void
+  local r = &host.dualsense
+  if not (policy.toggle_gamepad_hid and policy.touchpad_keys) then return end
+  local mine = host.terminal_focused and game_foreground()
+  local click = dualsense_reader_take_click(r)
+  local ev = pad_gesture_update(&host.touch_click, click, now)
+  if click then
+    touch_swipe_reset(&host.touch_swipe, r.touch_x, r.touch_y, now) -- a finger moves as it clicks
+  else
+    local d = touch_swipe_update(&host.touch_swipe, r.touching, r.touch_x, r.touch_y, now)
+    if mine then pad_keys_push(&host.pad_keys, pad_key_of_dir(d)) end
+  end
+  if not click then host.pad_deleting = false end
+  if not mine then host.pad_keys.n = 0 return end
+  if ev == PadGesture.Tap then pad_keys_push(&host.pad_keys, PadKey.Enter)
+  elseif ev == PadGesture.DoubleTap then pad_keys_push(&host.pad_keys, PadKey.DeleteWord)
+  elseif ev == PadGesture.HoldStep and not host.pad_deleting then
+    host.pad_deleting, host.pad_delete_at = true, now
+    pad_keys_push(&host.pad_keys, PadKey.Backspace)
+  elseif host.pad_deleting and now - host.pad_delete_at >= PAD_DELETE_EVERY_S then
+    host.pad_delete_at = now
+    pad_keys_push(&host.pad_keys, PadKey.Backspace)
+  end
 end
 
 -- Global hotkey while the drop-down is not focused.
@@ -85,15 +120,25 @@ global function poll_toggle_key(): void
   local now = imgui.GetTime()
   local have_state, down, pad_pressed = poll_toggle_pad(now, game_foreground)
   if have_state then
-    -- tap: show/hide the dropdown; hold: next terminal; double tap: previous
+    -- tap: show/hide the dropdown; hold: next terminal; double tap: previous,
+    -- or with the PS button voice input into the terminal (core/app/voice.nelua)
     local ev = pad_gesture_update(&host.pad, down, now)
     if ev == PadGesture.Tap then pressed = true
     elseif ev == PadGesture.HoldStep then select_terminal(1)
-    elseif ev == PadGesture.DoubleTap then select_terminal(-1) end
+    elseif ev == PadGesture.DoubleTap then
+      if policy.toggle_gamepad_ps then
+        if not host.voice_on and not host.dropdown_open and not host.terminal_focused then set_visible(true) end
+        voice_toggle()
+      else
+        select_terminal(-1)
+      end
+    end
   elseif pad_pressed then
     pressed = true
   end
   if pressed then toggle_visible() end
+  poll_touchpad(now)
+  voice_draw()
 end
 
 global function resolve_toggle_key(): void

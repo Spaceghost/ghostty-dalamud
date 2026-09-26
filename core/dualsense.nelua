@@ -8,15 +8,20 @@
 --   USB, report 0x01, 64 bytes. data[1..] is the controller state; its button
 --     bytes are data[8] (hat, square, cross, circle, triangle), data[9] (L1 0x01,
 --     R1 0x02, L2 0x04, R2 0x08, Create 0x10, Options 0x20, L3 0x40, R3 0x80)
---     and data[10] (PS 0x01, touchpad click 0x02, mute 0x04).
+--     and data[10] (PS 0x01, touchpad click 0x02, mute 0x04). The touchpad's
+--     first finger is data[33] (bit 0x80 set: not touching; the rest its id)
+--     and data[34..36]: x in 12 bits (data[34] and the low half of data[35],
+--     0..1919), y in 12 bits (the high half of data[35] and data[36], 0..1079);
+--     the second finger follows in data[37..40].
 --   Bluetooth, report 0x31, 78 bytes. One more byte in front, so the same
---     buttons are data[9], data[10], data[11]. Bytes 74..77 are a CRC-32
+--     buttons are data[9], data[10], data[11], and the first finger
+--     data[34..37]. Bytes 74..77 are a CRC-32
 --     (little endian) over the byte 0xA1 followed by data[0..73].
 --   Bluetooth simple, report 0x01 of 10 bytes: what the controller sends over
 --     Bluetooth until a program enables its full reports, and what Wine's
 --     winebus turns report 0x31 into until a program talks to the controller.
 --     Buttons are data[5], data[6] (Create 0x10, Options 0x20) and data[7]
---     (PS 0x01, touchpad click 0x02).
+--     (PS 0x01, touchpad click 0x02). It has no touchpad positions.
 --
 -- Windows and Wine's hidclass hand out every report padded to the longest
 -- input report of the device, so over Bluetooth a simple report arrives as 78
@@ -100,6 +105,23 @@ global function dualsense_parse(data: *[0]uint8, n: usize, buttons: *uint32): Ds
   if (b2 & 0x02) ~= 0 then b = b | DS_TOUCHPAD end
   if buttons ~= nilptr then $buttons = b end
   return layout
+end
+
+global DS_TOUCH_W: integer <comptime> = 1920 -- the touchpad's x runs 0..1919
+global DS_TOUCH_H: integer <comptime> = 1080 -- and y 0..1079, from the top
+
+-- The first finger on the touchpad, from a report `dualsense_parse` read as
+-- `layout`. -> touching, x, y (0, 0 when not touching, or for a simple
+-- report, which has no positions).
+global function dualsense_touch(data: *[0]uint8, n: usize, layout: DsLayout): (boolean, integer, integer)
+  local at: usize = 0
+  if layout == DsLayout.Usb and n >= DS_USB_REPORT_SIZE then at = 33
+  elseif layout == DsLayout.Bluetooth and n >= DS_BT_REPORT_SIZE then at = 34
+  else return false, 0, 0 end
+  if (data[at] & 0x80) ~= 0 then return false, 0, 0 end
+  local x = (@integer)(data[at + 1]) | (((@integer)(data[at + 2]) & 0x0F) << 8)
+  local y = ((@integer)(data[at + 2]) >> 4) | ((@integer)(data[at + 3]) << 4)
+  return true, x, y
 end
 
 -- Whether the `mask` buttons went down or up between the last state and `buttons`.

@@ -132,6 +132,7 @@ rm -rf "$STAGE"
 mkdir -p "$STAGE/$TARNAME" "$STAGE/x"
 ( cd "$STAGE/x" && rpm2cpio "$FC43" | cpio -idm --quiet )
 cp -p "$STAGE/x/usr/bin/ghostty-agent" "$STAGE/$TARNAME/ghostty-agent"
+cp -p "$STAGE/x/usr/bin/ghostty-voice" "$STAGE/$TARNAME/ghostty-voice"
 chmod 0755 "$STAGE/$TARNAME/ghostty-agent"
 sed 's|^ExecStart=/usr/bin/ghostty-agent |ExecStart=%h/.local/bin/ghostty-agent |' \
   "$STAGE/x/usr/lib/systemd/user/ghostty-agent.service" >"$STAGE/$TARNAME/ghostty-agent.service"

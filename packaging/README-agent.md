@@ -154,6 +154,7 @@ time it needs one, and does without politely when it is not there.
 | `xdg-open` (`xdg-utils`) | opening a link in your desktop browser |
 | `rsvg-convert`, or ImageMagick | SVG icons for the apps the compositor lists |
 | `tmux` | nothing; it is just a shell you may want |
+| `whisper-cli` (whisper.cpp), or `openai-whisper`; and `pw-record` (PipeWire) or `parecord` | voice input (the DualSense PS button pressed twice): `ghostty-voice`, installed beside the agent, records and writes down what was said |
 
 ## Licence
 

@@ -150,6 +150,7 @@ nm build/dist/ghostty-agent | grep -q ' T moqi_node_new$'
 
 %install
 install -Dpm0755 build/dist/ghostty-agent %{buildroot}%{_bindir}/ghostty-agent
+install -Dpm0755 packaging/ghostty-voice %{buildroot}%{_bindir}/ghostty-voice
 install -Dpm0644 packaging/ghostty-agent.service %{buildroot}%{_userunitdir}/ghostty-agent.service
 install -Dpm0644 packaging/ghostty-agent.1 %{buildroot}%{_mandir}/man1/ghostty-agent.1
 
@@ -184,5 +185,6 @@ wait "$agent" || true
 %license LICENSE lwip-COPYING monocypher-LICENCE.md qrcodegen-LICENSE
 %doc README-agent.md
 %{_bindir}/ghostty-agent
+%{_bindir}/ghostty-voice
 %{_userunitdir}/ghostty-agent.service
 %{_mandir}/man1/ghostty-agent.1*

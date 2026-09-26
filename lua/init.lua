@@ -30,8 +30,18 @@ local config = {
   toggle_mods = 'ctrl',
   world_toggle_mods = 'ctrl+shift',
   toggle_consume_vk = 0xC0,
-  -- select is Xbox View / DualSense touchpad click. Optional create uses HID.
+  -- select is Xbox View / DualSense touchpad click. create and ps read a
+  -- DualSense over HID: ps taps the dropdown and a double press is voice input.
   toggle_gamepad_button = 'select',
+  -- With create or ps: the touchpad types into a focused terminal. Swipes are
+  -- arrows (held at an edge they repeat), a click is Enter, a double click
+  -- deletes a word and a held click keeps deleting.
+  touchpad_keys = true,
+  -- Voice input (ps pressed twice): the command the agent runs to listen and
+  -- write down what was said, and the microphone it uses ('' = any that is not
+  -- a controller's, else the controller's).
+  voice_command = 'ghostty-voice',
+  voice_mic = '',
 
   -- Colour theme for the terminals and the glass UI: a name from themes/
   -- beside the plugin or themes/ in the config directory (yours win). Ships

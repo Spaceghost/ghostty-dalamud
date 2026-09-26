@@ -1,0 +1,147 @@
+-- Voice input into a terminal: the PS button pressed twice (core/app/hotkeys.nelua)
+-- starts listening, twice again stops. The listening and the speech to text
+-- happen on the agent's machine, as a raw job (docs/JOBS.md) running
+-- CONFIG.voice_command (ghostty-voice by default, shipped with the agent): it
+-- records from CONFIG.voice_mic (empty: the first microphone that is not a
+-- controller's, else the controller's), stops when its stdin closes or at its
+-- time limit, and prints what was said on stdout (its stderr says why not). That text is
+-- pasted into the terminal that had the keyboard when it began, bracketed, so
+-- nothing runs until you press Enter (the touchpad: one click).
+require 'string'
+require 'vector'
+require 'stringbuilder'
+require 'core.app.state'
+
+local VOICE_OUT_MAX: integer <comptime> = 64 * 1024 -- more than anyone says in one go
+
+local function voice_reset(): void
+  host.voice_on, host.voice_stopping, host.voice_req, host.voice_jid = false, false, 0, 0
+  host.voice_out:destroy()
+  host.voice_out = {}
+  host.voice_err:destroy()
+  host.voice_err = {}
+end
+
+-- Words of `s` split on spaces (the command line; no quoting).
+local function split_words(s: string, out: *vector(string)): void
+  local i = 1
+  while i <= #s do
+    while i <= #s and s.data[i - 1] == ' '_b do i = i + 1 end
+    local j = i
+    while j <= #s and s.data[j - 1] ~= ' '_b do j = j + 1 end
+    if j > i then out:push(s:subview(i, j - 1):copy()) end
+    i = j
+  end
+end
+
+-- Stop listening: the job's stdin closes and it goes on to transcribe.
+global function voice_stop(): void
+  if not host.voice_on or host.voice_stopping then return end
+  host.voice_stopping = true
+  if host.voice_jid ~= 0 then host.local_agent.client:jdata(host.voice_jid, nilptr, 0) end
+  logf(LOG_INFO, 'voice: stopped listening')
+end
+
+global function voice_toggle(): void
+  if host.voice_on then voice_stop() return end
+  local c = &host.local_agent.client
+  if not (host.local_agent.enabled and c:jobs_ok()) then
+    logf(LOG_WARN, 'voice: needs the agent connected (ghostty-agent with jobs, protocol 4)')
+    return
+  end
+  local argv: vector(string)
+  local env: vector(string)
+  split_words(policy.voice_command, &argv)
+  if #argv == 0 then argv:push(string.copy('ghostty-voice')) end
+  local sb: stringbuilder
+  sb:write('GHOSTTY_VOICE_MIC=', policy.voice_mic)
+  env:push(sb:promote())
+  local req = c:job_req()
+  local sent = c:jopen(req, 0, &argv, &env)
+  for i = 0, < #argv do argv[i]:destroy() end
+  for i = 0, < #env do env[i]:destroy() end
+  argv:destroy() env:destroy()
+  if not sent then
+    logf(LOG_WARN, 'voice: the agent would not take the job')
+    return
+  end
+  voice_reset()
+  host.voice_on, host.voice_req, host.voice_target, host.voice_at = true, req, host.typing_session, imgui.GetTime()
+  logf(LOG_INFO, 'voice: listening')
+end
+
+-- The agent's answers (core/app/agent.nelua): true when they were the voice job's.
+global function voice_on_opened(req: uint32, jid: uint32, why: string): boolean
+  if not host.voice_on or req == 0 or req ~= host.voice_req then return false end
+  if jid == 0 then
+    logf(LOG_WARN, 'voice: the agent could not start %s: %s', policy.voice_command, why)
+    voice_reset()
+    return true
+  end
+  host.voice_jid = jid
+  if host.voice_stopping then host.local_agent.client:jdata(jid, nilptr, 0) end -- stopped before it started
+  return true
+end
+
+global function voice_on_out(jid: uint32, stream: uint8, data: *[0]uint8, len: usize): boolean
+  if not host.voice_on or jid == 0 or jid ~= host.voice_jid then return false end
+  local sb = stream == JOB_ERR and &host.voice_err or &host.voice_out
+  if sb:view().size + len <= VOICE_OUT_MAX then sb:write(string{data=(@*[0]byte)(data), size=len}) end
+  return true
+end
+
+-- `s` without the spaces and line ends around it, and lines joined by spaces.
+local function one_line(s: string, sb: *stringbuilder): void
+  local space = false
+  for i = 0, < #s do
+    local c = s.data[i]
+    if c == '\n'_b or c == '\r'_b or c == ' '_b or c == '\t'_b then
+      space = sb:view().size > 0
+    else
+      if space then sb:writebyte(' '_b) space = false end
+      sb:writebyte(c)
+    end
+  end
+end
+
+global VoicePasteFn = @function(s: *Session, text: string): void
+
+global function voice_on_exit(jid: uint32, status: int32, paste: VoicePasteFn): boolean
+  if not host.voice_on or jid == 0 or jid ~= host.voice_jid then return false end
+  local text: stringbuilder
+  one_line(host.voice_out:view(), &text)
+  local target: *Session = nilptr
+  for i = 0, < #host.sessions do
+    if host.sessions[i].id == host.voice_target then target = host.sessions[i] break end
+  end
+  if status ~= 0 then
+    local why: stringbuilder
+    one_line(host.voice_err:view(), &why)
+    logf(LOG_WARN, 'voice: %s exited with %d: %s', policy.voice_command, status, why:view())
+    why:destroy()
+  elseif text:view().size > 0 and target ~= nilptr then
+    paste(target, text:view())
+    logf(LOG_INFO, 'voice: typed %d bytes into session %d', text:view().size, target.id)
+  else
+    logf(LOG_INFO, 'voice: nothing heard')
+  end
+  text:destroy()
+  voice_reset()
+  return true
+end
+
+-- While listening or transcribing: a small label at the top of the screen.
+global function voice_draw(): void
+  if not host.voice_on then return end
+  local dl = imgui.GetForegroundDrawList()
+  local vp = imgui.GetMainViewport()
+  local label: cstring = host.voice_stopping and '... writing it down' or '\u{25CF} Listening (PS twice: stop)'
+  local font = imgui.GetFont()
+  local size = imgui.GetFontSize()
+  local sz: ImVec2
+  imgui.FontCalcTextSizeA(&sz, font, size, 1e9, 0, label, nilptr, nilptr)
+  local x = vp.Pos.x + (vp.Size.x - sz.x) * 0.5
+  local y = vp.Pos.y + 48
+  imgui.DrawListAddRectFilled(dl, ImVec2{ x - 10, y - 6 }, ImVec2{ x + sz.x + 10, y + sz.y + 6 }, 0xC0101010, 6, 0)
+  imgui.DrawListAddText(dl, font, size, ImVec2{ x, y }, host.voice_stopping and 0xFFE0E0E0 or 0xFF6060FF, label, nilptr, 0, nilptr)
+end
