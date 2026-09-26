@@ -19,9 +19,9 @@
     <OutputPath>../../build/plugin/GhosttyDalamud/</OutputPath>
     <RootNamespace>GhosttyDalamud</RootNamespace>
     <AssemblyName>GhosttyDalamud</AssemblyName>
-    <Version>0.3.1.4</Version>
-    <AssemblyVersion>0.3.1.4</AssemblyVersion>
-    <FileVersion>0.3.1.4</FileVersion>
+    <Version>0.3.1.12</Version>
+    <AssemblyVersion>0.3.1.12</AssemblyVersion>
+    <FileVersion>0.3.1.12</FileVersion>
     <Authors>Johnneylee Jack Rollins</Authors>
     <RepositoryUrl>https://github.com/Spaceghost/ghostty-dalamud</RepositoryUrl>
     <Description>Ghostty terminal inside FFXIV (libghostty-vt core written in Nelua, policy in Lua).</Description>
