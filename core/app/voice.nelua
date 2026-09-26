@@ -44,6 +44,14 @@ local function split_words(s: string, out: *vector(string)): void
   end
 end
 
+-- Everything voice input holds, let go at shutdown (the job itself dies with
+-- the agent connection).
+global function voice_shutdown(): void
+  voice_reset()
+  host.voice_note:destroy()
+  host.voice_note = {}
+end
+
 -- Stop listening: the job's stdin closes and it goes on to transcribe.
 global function voice_stop(): void
   if not host.voice_on or host.voice_stopping then return end
@@ -173,7 +181,7 @@ global function voice_draw(): void
   local size = imgui.GetFontSize()
   local sz: ImVec2
   imgui.FontCalcTextSizeA(&sz, font, size, 1e9, 0, label, label_end, nilptr)
-  local x = vp.Pos.x + (vp.Size.x - sz.x) * 0.5
+  local x = vp.Pos.x + (vp.Size.x - sz.x) / 2
   local y = vp.Pos.y + 48
   imgui.DrawListAddRectFilled(dl, ImVec2{ x - 10, y - 6 }, ImVec2{ x + sz.x + 10, y + sz.y + 6 }, 0xC0101010, 6, 0)
   local col: uint32 = host.voice_stopping and 0xFFE0E0E0 or 0xFF6060FF
