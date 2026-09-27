@@ -248,6 +248,9 @@ M.defaults = {
   opacity = 0.92,
 }
 
+-- Ground panels hover just above the feet to avoid z-fighting with the floor.
+M.ground = { lift = 0.04 }
+
 -- What hides a panel where the game world is in front of it:
 --   'depth'   the game's own depth buffer, per pixel: your character, other
 --             characters, walls and props all cover the panel exactly
@@ -418,6 +421,7 @@ end
 --   target [up]     follows your target, floating above it, facing you
 --   orbit [r] [spd] circles you (radius yalms, radians per second)
 --   pet             floats behind you facing the camera and trails after you
+--   ground          lies at your feet, with its top pointing into the camera's view
 --   hud [X Y] [DIST] [SCALE]
 --                   docked to the screen: its centre at X, Y (fractions of
 --                   the screen, 0..1 from the top left; default where it
@@ -478,10 +482,12 @@ function M.command(id, args)
     M.anchors[id] = { kind = 'follow', entity_id = t.entity_id, forward = 0, up = tonumber(a[2]) or 3.2, face_player = true }
   elseif how == 'pet' then
     M.anchors[id] = { kind = 'pet', phase = math.random() * 2 * pi, since = nil }
+  elseif how == 'ground' then
+    M.anchors[id] = { kind = 'ground' }
   elseif how == 'orbit' then
     M.anchors[id] = { kind = 'orbit', radius = tonumber(a[2]) or 3.5, speed = tonumber(a[3]) or 0.25, up = 1.8, phase = p.rotation }
   else
-    return 'usage: /term pin [here|me|target|orbit|pet|hud] ...'
+    return 'usage: /term pin [here|me|target|orbit|pet|ground|hud] ...'
   end
   return nil
 end
@@ -1984,7 +1990,7 @@ function M.trace(seconds, kind)
   return string.format('%s; %d pets, logging each for %g s', seen, n, M._trace_for)
 end
 
--- The kind of terminal `id`'s anchor ('pet', 'world', 'follow', 'orbit',
+-- The kind of terminal `id`'s anchor ('pet', 'world', 'follow', 'orbit', 'ground',
 -- 'hud'), nil without one: the info bar's list names pets and pins apart.
 function M.kind(id)
   local a = M.anchors[id]
@@ -2018,6 +2024,21 @@ function M.place(id, t, focused, held)
   end
   local p = M._p
   if not p then return nil end
+
+  if a.kind == 'ground' then
+    -- Pitch +pi/2 lays the readable face upward. Its top edge points opposite
+    -- yaw, so yaw faces back toward the camera's horizontal view direction.
+    if M._vt ~= t then
+      M._vbuf = M._vbuf or {}
+      M._vt, M._v = t, ghostty.view and ghostty.view(M._vbuf) or nil
+    end
+    local v = M._v
+    local yaw = v and v.yaw or p.rotation
+    local lift = (M.ground and M.ground.lift) or 0.04
+    return placement(a, p.x, p.y + lift, p.z, yaw + pi, pi / 2,
+      a.width or M.defaults.width, a.height or M.defaults.height,
+      a.pixels_per_yalm or M.defaults.pixels_per_yalm, a.opacity or M.defaults.opacity, 0, t)
+  end
 
   if a.kind == 'follow' then
     local o = a.player and p or ghostty.object(a.entity_id)
