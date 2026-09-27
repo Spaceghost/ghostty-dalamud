@@ -131,18 +131,6 @@ S.schema = {
     { 'world.light.shadows', 'checkbox', 'Cast light throws shadows (expensive)' },
     { 'world.shadows.enabled', 'checkbox', 'Screens cast shadows (experimental)' },
   } },
-  { 'Character animation', {
-    { 'animation.enabled', 'checkbox', 'Hold a pose while a terminal is out or focused' },
-    { 'animation.style', 'combo', { 'phone', 'desk' }, 'Style (phone in hand, or working at a desk)' },
-    { 'animation.desk.scale', 'combo', { 'normal', 'fit', '0.75', '1.25', '1.5', '2' }, 'Desk size (normal = sized for a Midlander)' },
-    { 'animation.desk.chair_scale', 'combo', { 'fit', 'normal', '0.75', '1.25', '1.5', '2' }, 'Chair size' },
-    { 'animation.reactions', 'checkbox', 'React to bells, failed and long commands, output and idling' },
-    { 'animation.preset', 'combo', { 'device', 'book', 'pen', 'photograph', 'think', 'lookout' }, 'Pose' },
-    { 'animation.custom_timeline', 'slider_int', 0, 40000, 'Custom ActionTimeline id (0 = use the pose)' },
-    { 'animation.typing_speed', 'slider', 1, 4, 'Pose animation speed while typing' },
-    { 'animation.energy_decay', 'slider', 0.5, 6, 'How fast typing energy fades' },
-    { 'animation.lock_movement', 'checkbox', 'Lock movement while holding (not recommended)' },
-  } },
   { 'Bell', {
     { 'bell.enabled', 'checkbox', 'Visual bell when a program rings (BEL)' },
     { 'bell.preset', 'combo', { 'ripple', 'sonar', 'burst', 'aura', 'calm', 'custom' }, 'Style (custom uses the values below)' },

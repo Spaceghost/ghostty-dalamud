@@ -1,19 +1,19 @@
 
 
 -- Where terminals live and whether they show: dropdown tabs, floating windows,
--- minimized, world panels; visibility toggles, focus stepping and the
--- character animation that follows them.
+-- minimized and world panels; visibility toggles and focus stepping.
 require 'core.app.agent'
 
 -- Visibility -----------------------------------------------------------------------
 
--- The device animation matches state every frame: out while the dropdown is
--- out or any terminal (tab, window, world panel) has keyboard focus.
+-- Terminal focus must never alter or pause the player's character. One call
+-- with false lets an upgrade release a pose left by an older build; after
+-- that, visibility and focus have no character-animation side effects.
 global function sync_animation(): void
-  local want = host.dropdown_open or host.terminal_focused or host.world_focus ~= 0
-  if want == host.anim_out then return end
-  host.anim_out = want
-  local err = policy_anim_toggle(want)
+  if host.animation_cleanup_done then return end
+  host.animation_cleanup_done = true
+  host.anim_out = false
+  local err = policy_anim_toggle(false)
   if #err > 0 then logf(LOG_WARN, 'animation: %s', err) end
   err:destroy()
 end

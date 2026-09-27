@@ -36,6 +36,12 @@ Quake-style drop-down, floating windows, world panels, selection and keyboard
 handling, controller input, and configurable appearance. Some game-facing
 features remain experimental and unverified on their target environment.
 
+Terminal images use the [Kitty graphics protocol](https://sw.kovidgoyal.net/kitty/graphics-protocol/),
+including inline RGB/RGBA and PNG images, source cropping and Kitty's three
+z-layers. The decoded pixels are uploaded to a bounded D3D11 texture cache, so
+the same support is available in the dropdown, floating windows, native game
+windows and world panels. Sixels are not required or currently implemented.
+
 | Component | Purpose |
 | --- | --- |
 | `GhosttyDalamud.dll` | Dalamud plugin adapter and game facilities |

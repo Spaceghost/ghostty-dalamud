@@ -277,6 +277,7 @@ global Host = @record{
   world_rez: float32,               -- 1 shown, 0 derezzed (combat)
   world_covers: vector(WorldCover), -- panels drawn this frame, for light behind them (the bell)
   anim_out: boolean,                -- last state sent to lua/animation.lua
+  animation_cleanup_done: boolean,  -- legacy pose was released; focus never controls the character again
   world_saved_at: float64,
   drawing_world: boolean,           -- draw_terminal uses the world font
   -- terminals in game windows (core/app/nativeview.nelua, docs/NATIVE_UI.md)

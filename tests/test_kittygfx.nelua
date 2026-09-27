@@ -1,0 +1,70 @@
+-- Kitty graphics: libghostty parses inline RGBA, the renderer uploads BGRA to
+-- the GPU cache and draws the placement at terminal-cell coordinates.
+require 'core.ghostty'
+require 'core.imgui'
+require 'core.termview'
+require 'core.render'
+
+local images, creates, uploads, releases = 0, 0, 0, 0
+local function calc(out: *ImVec2, font: *ImFont, size: float32, maxw: float32, wrap: float32, b: cstring, e: cstring, remain: *cstring): void out.x, out.y = 8, 16 end
+local function rect(dl: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint): void end
+local function outline(dl: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, rounding: float32, flags: cint, thickness: float32): void end
+local function line(dl: *ImDrawList, a: ImVec2, b: ImVec2, col: uint32, thickness: float32): void end
+local function text(dl: *ImDrawList, font: *ImFont, size: float32, pos: ImVec2, col: uint32, b: cstring, e: cstring, wrap: float32, clip: *ImVec4): void end
+local function image(dl: *ImDrawList, tex: pointer, a: ImVec2, b: ImVec2, ua: ImVec2, ub: ImVec2, col: uint32): void
+  images = images + 1
+  assert(a.x == 10 and a.y == 20 and b.x == 26 and b.y == 36, 'two-cell placement geometry')
+  assert(ua.x == 0 and ua.y == 0 and ub.x == 1 and ub.y == 1, 'whole source image')
+end
+local function resolver(name: cstring): pointer
+  local n: string = name
+  if n == 'ImFont_CalcTextSizeA' then return (@pointer)(calc) end
+  if n == 'ImDrawList_AddRectFilled' then return (@pointer)(rect) end
+  if n == 'ImDrawList_AddRect' then return (@pointer)(outline) end
+  if n == 'ImDrawList_AddLine' then return (@pointer)(line) end
+  if n == 'ImDrawList_AddText_FontPtr' then return (@pointer)(text) end
+  if n == 'ImDrawList_AddImage' then return (@pointer)(image) end
+  return nilptr
+end
+imgui_bind(resolver, nilptr)
+
+local DEVICE: pointer = (@pointer)(0x1111)
+local function create(device: pointer, w: uint32, h: uint32, tex: *pointer, srv: *pointer): clong
+  assert(device == DEVICE)
+  if w == GLYPHFB_ATLAS and h == GLYPHFB_ATLAS then
+    $tex, $srv = (@pointer)(0x4444), (@pointer)(0x5555)
+    return 0
+  end
+  assert(w == 2 and h == 1)
+  creates = creates + 1
+  $tex, $srv = (@pointer)(0x2222), (@pointer)(0x3333)
+  return 0
+end
+local function update(device: pointer, tex: pointer, r: WinRect, src: pointer, pitch: uint32): void
+  assert(r.w == 2 and r.h == 1 and pitch == 8)
+  local p = (@*[0]uint8)(src)
+  assert(p[0] == 0 and p[1] == 0 and p[2] == 255 and p[3] == 255, 'red RGBA became BGRA')
+  assert(p[4] == 0 and p[5] == 255 and p[6] == 0 and p[7] == 255, 'green RGBA became BGRA')
+  uploads = uploads + 1
+end
+local function release(tex: pointer, srv: pointer): void releases = releases + 1 end
+local api: WinTexApi = { create = create, update = update, release = release }
+wintex_fake = &api
+glyphfb_frame(DEVICE)
+
+local v: TermView
+assert(v:init(10, 2))
+assert(ghostty_terminal_resize(v.term, 10, 2, 8, 16) == GHOSTTY_SUCCESS)
+local cmd: string = '\27_Ga=T,f=32,s=2,v=1,c=2,r=1,i=1,q=2;/wAA/wD/AP8=\27\\'
+v:feed((@*[0]uint8)(cmd.data), cmd.size)
+assert(v:update())
+local m = render_measure(nilptr, 16)
+local dl: ImDrawList
+render_termview(&dl, &v, vec2(10, 20), m, true, true, 255, 0)
+assert(images == 1 and creates == 1 and uploads == 1)
+render_termview(&dl, &v, vec2(10, 20), m, true, true, 255, 0)
+assert(images == 2 and creates == 1 and uploads == 1, 'unchanged generation reuses texture')
+v:destroy()
+assert(releases == 1)
+wintex_fake = nilptr
+print('kitty graphics OK')

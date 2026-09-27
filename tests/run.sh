@@ -124,6 +124,7 @@ run test_capture_mac
 run test_desktop_entries "$ROOT/build/test-scratch"
 run test_agent_browser
 run test_render
+run test_kittygfx
 hrun test_glyphfb "$ROOT" "${GHOSTTY_TEST_CJK_FONT:-}"
 run test_session
 run test_procpipe

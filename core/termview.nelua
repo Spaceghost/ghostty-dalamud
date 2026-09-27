@@ -2,6 +2,8 @@
 -- needed to read it back for drawing. Sessions embed one of these.
 require 'core.ghostty'
 require 'core.theme'
+require 'core.kittygfx'
+require 'core.kittypng'
 require 'vector'
 require 'string'
 require 'math'
@@ -32,6 +34,7 @@ global TermView = @record{
   glyphs: vector(GlyphDraw),
   glyph_bytes: vector(byte),
   theme_gen: integer,       -- theme_generation last applied (0: none yet, libghostty's defaults)
+  kitty: KittyGraphicsCache,
 }
 
 function TermView:init(cols: uint16, rows: uint16): boolean
@@ -41,6 +44,10 @@ function TermView:init(cols: uint16, rows: uint16): boolean
   if ghostty_render_state_new(nilptr, &self.state) ~= GHOSTTY_SUCCESS then return false end
   if ghostty_render_state_row_iterator_new(nilptr, &self.iter) ~= GHOSTTY_SUCCESS then return false end
   if ghostty_render_state_row_cells_new(nilptr, &self.cells) ~= GHOSTTY_SUCCESS then return false end
+  kitty_png_init()
+  local kitty_limit: uint64 = 64 * 1024 * 1024
+  if ghostty_terminal_set(self.term, GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT, &kitty_limit) ~= GHOSTTY_SUCCESS then return false end
+  if not kitty_cache_init(&self.kitty) then return false end
   self.cols = cols
   self.rows = rows
   self.ok = true
@@ -48,6 +55,7 @@ function TermView:init(cols: uint16, rows: uint16): boolean
 end
 
 function TermView:destroy(): void
+  kitty_cache_destroy(&self.kitty)
   if self.cells ~= nilptr then ghostty_render_state_row_cells_free(self.cells) end
   if self.iter ~= nilptr then ghostty_render_state_row_iterator_free(self.iter) end
   if self.state ~= nilptr then ghostty_render_state_free(self.state) end

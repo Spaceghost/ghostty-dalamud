@@ -56,7 +56,9 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
 
   local total_w = m.cell_w * v.cols
   local total_h = m.cell_h * v.rows
+  kitty_draw_layer(dl, v.term, &v.kitty, origin, m.cell_w, m.cell_h, GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_BG)
   imgui.DrawListAddRectFilled(dl, origin, vec2(origin.x + total_w, origin.y + total_h), rgb(colors.background, bg_alpha), rounding, 0)
+  kitty_draw_layer(dl, v.term, &v.kitty, origin, m.cell_w, m.cell_h, GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_TEXT)
 
   local iter = v.iter
   if ghostty_render_state_get(v.state, GHOSTTY_RENDER_STATE_DATA_ROW_ITERATOR, &iter) ~= GHOSTTY_SUCCESS then return end
@@ -284,4 +286,5 @@ global function render_termview(dl: *ImDrawList, v: *TermView, origin: ImVec2, m
       end
     end
   end
+  kitty_draw_layer(dl, v.term, &v.kitty, origin, m.cell_w, m.cell_h, GHOSTTY_KITTY_PLACEMENT_LAYER_ABOVE_TEXT)
 end

@@ -32,11 +32,23 @@ global GhosttyRenderStateRowCells <cimport, nodecl> = @pointer
 global GhosttyKeyEncoder <cimport, nodecl> = @pointer
 global GhosttyKeyEvent <cimport, nodecl> = @pointer
 global GhosttyAllocator <cimport, nodecl> = @record{ ctx: pointer, vtable: pointer }
+global GhosttyKittyGraphics <cimport, nodecl> = @pointer
+global GhosttyKittyGraphicsImage <cimport, nodecl> = @pointer
+global GhosttyKittyGraphicsPlacementIterator <cimport, nodecl> = @pointer
 
 -- Plain data types ---------------------------------------------------------
 global GhosttyColorRgb <cimport, nodecl> = @record{ r: uint8, g: uint8, b: uint8 }
 global GhosttyString <cimport, nodecl> = @record{ ptr: *[0]uint8, len: usize }
 global GhosttyBuffer <cimport, nodecl> = @record{ ptr: *[0]uint8, cap: usize, len: usize }
+global GhosttySysImage <cimport, nodecl> = @record{ width: uint32, height: uint32, data: *[0]uint8, data_len: usize }
+global GhosttyKittyGraphicsPlacementRenderInfo <cimport, nodecl> = @record{
+  size: usize,
+  pixel_width: uint32, pixel_height: uint32,
+  grid_cols: uint32, grid_rows: uint32,
+  viewport_col: int32, viewport_row: int32,
+  viewport_visible: boolean,
+  source_x: uint32, source_y: uint32, source_width: uint32, source_height: uint32,
+}
 
 global GhosttyStyleColorValue <cimport, nodecl> = @union{
   palette: uint8,
@@ -104,6 +116,7 @@ global GHOSTTY_TERMINAL_OPT_COLOR_FOREGROUND: cint <cimport, nodecl, const>
 global GHOSTTY_TERMINAL_OPT_COLOR_BACKGROUND: cint <cimport, nodecl, const>
 global GHOSTTY_TERMINAL_OPT_COLOR_CURSOR: cint <cimport, nodecl, const>
 global GHOSTTY_TERMINAL_OPT_COLOR_PALETTE: cint <cimport, nodecl, const>
+global GHOSTTY_TERMINAL_OPT_KITTY_IMAGE_STORAGE_LIMIT: cint <cimport, nodecl, const>
 
 global GHOSTTY_TERMINAL_DATA_COLS: cint <cimport, nodecl, const>
 global GHOSTTY_TERMINAL_DATA_ROWS: cint <cimport, nodecl, const>
@@ -112,6 +125,27 @@ global GHOSTTY_TERMINAL_DATA_CURSOR_Y: cint <cimport, nodecl, const>
 global GHOSTTY_TERMINAL_DATA_SCROLLBAR: cint <cimport, nodecl, const>
 global GHOSTTY_TERMINAL_DATA_TITLE: cint <cimport, nodecl, const>
 global GHOSTTY_TERMINAL_DATA_COLOR_PALETTE_DEFAULT: cint <cimport, nodecl, const>
+global GHOSTTY_TERMINAL_DATA_KITTY_GRAPHICS: cint <cimport, nodecl, const>
+
+global GHOSTTY_SYS_OPT_DECODE_PNG: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_GRAPHICS_DATA_PLACEMENT_ITERATOR: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_GRAPHICS_PLACEMENT_ITERATOR_OPTION_LAYER: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_IMAGE_ID: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_X_OFFSET: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_GRAPHICS_PLACEMENT_DATA_Y_OFFSET: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_IMAGE_DATA_WIDTH: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_IMAGE_DATA_HEIGHT: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_IMAGE_DATA_FORMAT: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_IMAGE_DATA_DATA_PTR: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_IMAGE_DATA_DATA_LEN: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_IMAGE_DATA_GENERATION: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_IMAGE_FORMAT_RGB: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_IMAGE_FORMAT_RGBA: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_IMAGE_FORMAT_GRAY_ALPHA: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_IMAGE_FORMAT_GRAY: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_BG: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_PLACEMENT_LAYER_BELOW_TEXT: cint <cimport, nodecl, const>
+global GHOSTTY_KITTY_PLACEMENT_LAYER_ABOVE_TEXT: cint <cimport, nodecl, const>
 
 global GHOSTTY_RENDER_STATE_DATA_COLS: cint <cimport, nodecl, const>
 global GHOSTTY_RENDER_STATE_DATA_ROWS: cint <cimport, nodecl, const>
@@ -207,6 +241,19 @@ global function ghostty_render_state_row_cells_free(cells: GhosttyRenderStateRow
 global function ghostty_render_state_row_cells_next(cells: GhosttyRenderStateRowCells): boolean <cimport, nodecl> end
 global function ghostty_render_state_row_cells_get(cells: GhosttyRenderStateRowCells, data: cint, out: pointer): GhosttyResult <cimport, nodecl> end
 global function ghostty_cell_get(cell: GhosttyCell, data: cint, out: pointer): GhosttyResult <cimport, nodecl> end
+
+global function ghostty_sys_set(option: cint, value: pointer): GhosttyResult <cimport, nodecl> end
+global function ghostty_alloc(allocator: *GhosttyAllocator, len: usize): *[0]uint8 <cimport, nodecl> end
+global function ghostty_free(allocator: *GhosttyAllocator, p: *[0]uint8, len: usize): void <cimport, nodecl> end
+global function ghostty_kitty_graphics_get(graphics: GhosttyKittyGraphics, data: cint, out: pointer): GhosttyResult <cimport, nodecl> end
+global function ghostty_kitty_graphics_image(graphics: GhosttyKittyGraphics, image_id: uint32): GhosttyKittyGraphicsImage <cimport, nodecl> end
+global function ghostty_kitty_graphics_image_get(image: GhosttyKittyGraphicsImage, data: cint, out: pointer): GhosttyResult <cimport, nodecl> end
+global function ghostty_kitty_graphics_placement_iterator_new(allocator: *GhosttyAllocator, out: *GhosttyKittyGraphicsPlacementIterator): GhosttyResult <cimport, nodecl> end
+global function ghostty_kitty_graphics_placement_iterator_free(iter: GhosttyKittyGraphicsPlacementIterator): void <cimport, nodecl> end
+global function ghostty_kitty_graphics_placement_iterator_set(iter: GhosttyKittyGraphicsPlacementIterator, option: cint, value: pointer): GhosttyResult <cimport, nodecl> end
+global function ghostty_kitty_graphics_placement_next(iter: GhosttyKittyGraphicsPlacementIterator): boolean <cimport, nodecl> end
+global function ghostty_kitty_graphics_placement_get(iter: GhosttyKittyGraphicsPlacementIterator, data: cint, out: pointer): GhosttyResult <cimport, nodecl> end
+global function ghostty_kitty_graphics_placement_render_info(iter: GhosttyKittyGraphicsPlacementIterator, image: GhosttyKittyGraphicsImage, terminal: GhosttyTerminal, out: *GhosttyKittyGraphicsPlacementRenderInfo): GhosttyResult <cimport, nodecl> end
 
 global function ghostty_key_encoder_new(allocator: *GhosttyAllocator, encoder: *GhosttyKeyEncoder): GhosttyResult <cimport, nodecl> end
 global function ghostty_key_encoder_free(encoder: GhosttyKeyEncoder): void <cimport, nodecl> end

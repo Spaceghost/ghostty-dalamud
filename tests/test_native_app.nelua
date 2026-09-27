@@ -503,7 +503,7 @@ end
 do
   feed(s, '\27]0;vim\7')
   frame(false)
-  check(fw[id].title == 'vim', 'retitled: ', fw[id].title)
+  check(fw[id].title == s:display_name(), 'retitled with host decoration: ', fw[id].title)
   local saved = read(state_file)
   check(saved:find('last = { w = 720, h = 420 }', 1, true) > 0, 'the size is kept for the next window: ', saved)
   saved:destroy()

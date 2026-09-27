@@ -12,7 +12,6 @@ local ImGuiHoveredFlags_AllowWhenBlockedByActiveItem: cint <cimport, nodecl, con
 global function sink_write(ctx: pointer, data: *[0]uint8, len: usize): void
   local s = (@*Session)(ctx)
   s:write(data, len)
-  policy_anim_key(imgui.GetTime())
   s.view:scroll_bottom()
   selection_clear(&s.view, &s.sel) -- typing ends the selection, as in any terminal
 end

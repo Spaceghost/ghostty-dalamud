@@ -144,9 +144,14 @@
    enabled elsewhere is never cleared, and gamepad-driven mouse positioning is
    suppressed during focus and restored afterward.
 6. `render_termview` walks the render-state rows/cells: merged background
-   runs, one `AddText` per glyph cell, underline/strike lines, cursor.
-7. World panels, pets, the character animation and world pins only once a
-   character is loaded.
+   runs, one `AddText` per glyph cell, underline/strike lines and cursor. Kitty
+   graphics placements are read from libghostty-vt and drawn through bounded
+   D3D11 textures around those passes at their below-background, below-text or
+   above-text layer. PNG payloads use Windows Imaging Component under Wine or
+   native Windows; raw RGB/RGBA works on every build.
+7. World panels, pets and world pins only once a character is loaded. Terminal
+   visibility and focus never drive character animation; startup performs one
+   compatibility cleanup for a pose an older build may have left behind.
 8. The popup terminal is drawn from our own anchored window (info bar
    right-click), or on demand from the Umbra popup node's `OnDraw` through
    IPC. The info bar's left click lists every terminal in another anchored
