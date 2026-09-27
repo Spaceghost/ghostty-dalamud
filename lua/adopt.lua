@@ -22,6 +22,8 @@
 local world = require('world')
 
 local M = {}
+local attached = {} -- live panel id -> stable adopted window name
+local placements -- name -> 'ground'; loaded on first use
 
 -- Known windows by the name used in /window adopt. `title` is the ImGui window
 -- name; everything after '###' is its id, which stays the same whatever the
@@ -159,6 +161,64 @@ end
 
 local function state_path()
   return (GHOSTTY_PLUGIN_DIR or '.') .. '/adopted.lua'
+end
+
+local function placement_path()
+  return (GHOSTTY_PLUGIN_DIR or '.') .. '/adopted-placements.lua'
+end
+
+local function saved_placements()
+  if placements then return placements end
+  placements = {}
+  local chunk = loadfile(placement_path()) or loadfile(placement_path() .. '.tmp')
+  if not chunk then return placements end
+  local ok, saved = pcall(chunk)
+  if ok and type(saved) == 'table' then
+    for name, kind in pairs(saved) do
+      if type(name) == 'string' and name ~= '' and kind == 'ground' then placements[name] = kind end
+    end
+  end
+  return placements
+end
+
+local function save_placements()
+  local names, out = {}, { 'return {\n' }
+  for name in pairs(placements) do names[#names + 1] = name end
+  table.sort(names)
+  for _, name in ipairs(names) do out[#out + 1] = string.format('  [%q] = %q,\n', name, placements[name]) end
+  out[#out + 1] = '}\n'
+  local tmp = placement_path() .. '.tmp'
+  local f = io.open(tmp, 'w')
+  if not f then return end
+  local wok = f:write(table.concat(out))
+  local cok = f:close()
+  if not wok or not cok then os.remove(tmp) return end
+  os.remove(placement_path())
+  os.rename(tmp, placement_path())
+end
+
+-- Adopted sessions have no agent-session key for world.save_state. Remember
+-- just the opt-in ground preference by window name, including automatic Mappy,
+-- so closing and reopening a window or reloading the plugin keeps its pose.
+function M.attach(id, name)
+  if M.windows[name:lower()] then name = name:lower() end
+  attached[id] = name
+  if saved_placements()[name] == 'ground' then return world.command(id, 'ground') end
+  return nil
+end
+
+world.anchor_changed = function(id, kind)
+  local name = attached[id]
+  if not name then return end
+  local saved = saved_placements()
+  local want = kind == 'ground' and 'ground' or nil
+  if saved[name] == want then return end
+  saved[name] = want
+  save_placements()
+end
+
+world.anchor_forgotten = function(id)
+  attached[id] = nil
 end
 
 -- `names`: the pulled names, one per line.

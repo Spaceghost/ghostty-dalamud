@@ -175,6 +175,23 @@ global function adopt_lua_resolve(name: string): (string, string, string, string
 end
 
 -- CONFIG.adopt.size(id, w, h, chrome_w, chrome_h): the pet takes the window's size.
+-- CONFIG.adopt.attach(id, name): restore a saved ground placement after make_pet.
+global function adopt_lua_attach(id: integer, name: string): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded or not push_adopt(L) then return end
+  lua_getfield(L, -1, 'attach')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return end
+  lua_pushinteger(L, id)
+  lua_pushlstring(L, (@cstring)(name.data), name.size)
+  if lua_pcall(L, 2, 1, 0) ~= LUA_OK or lua_type(L, -1) == LUA_TSTRING then
+    local err = to_string(L, -1)
+    logf(LOG_WARN, 'adopt %s: could not restore placement: %s', name, err)
+    err:destroy()
+  end
+  lua_pop(L, 3)
+end
+
+-- CONFIG.adopt.size(id, w, h, chrome_w, chrome_h): the pet takes the window's size.
 global function adopt_lua_size(id: integer, w: float32, h: float32, chrome_w: float32, chrome_h: float32): void
   local L = policy.L
   if L == nilptr or not policy.loaded or not push_adopt(L) then return end
