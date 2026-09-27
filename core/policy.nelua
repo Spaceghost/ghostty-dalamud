@@ -21,6 +21,7 @@ global Profile = @record{
   host: string,             -- transport-specific target (agent host, superlogical url)
   port: integer,
   cwd: string,
+  agent: string,            -- agent/job transport: named CONFIG.agents link; empty = local
   fallback: string,         -- agent profiles: the profile (by name) to open instead while no agent answers
 }
 
@@ -43,6 +44,7 @@ global DropdownCfg = @record{
 }
 
 global AgentCfg = @record{
+  label: string,         -- user-facing name; routing still uses local/the CONFIG.agents key
   host: string,
   port: integer,
   node: string,          -- an iroh NodeId; set, it is used instead of host:port
@@ -69,6 +71,20 @@ global WindowsCfg = @record{
   auto_open: string,        -- CONFIG.windows.auto_open: new windows of the agent's compositor as panels: 'all', 'related', 'none'
   links: string,            -- CONFIG.windows.links: where terminal links open: 'game' (the agent's compositor, a panel) or 'host'
   reserved_chords: vector(string), -- CONFIG.windows.reserved_chords: keys never sent to a window or typed into a terminal (core/keychords.nelua)
+}
+
+global ControllerBinding = @record{
+  mask: integer,             -- Dalamud GamepadButtons flag
+  slot: integer,             -- stable state slot, 0..15
+  action: string,            -- key:<name>, text:<bytes>, or an ActionCtx action
+  repeatable: boolean,
+}
+
+global ControllerCfg = @record{
+  enabled: boolean,
+  capture: boolean,         -- keep mapped input out of the game while focused
+  layout: string,
+  bindings: vector(ControllerBinding),
 }
 
 -- Per-frame Lua hooks; each remembers its own last logged error.
@@ -107,6 +123,7 @@ global Policy = @record{
   world_toggle_alt: boolean,
   toggle_gamepad_mask: integer, -- Dalamud GamepadButtons flags; 0 = no gamepad toggle
   toggle_gamepad_hid: boolean,  -- 'create': the DualSense Create button, read from the controller's HID reports
+  controller: ControllerCfg,    -- full focused-terminal controller mapping
   cursor_blink: boolean,
   close_on_exit: boolean,   -- close a terminal when its shell exits (ctrl+d)
   copy_on_select: boolean,  -- releasing a mouse selection copies it to the clipboard
@@ -183,6 +200,7 @@ local function read_profile(L: *lua_State, idx: cint): Profile
   p.host = lua_field_string(L, idx, 'host', '')
   p.port = lua_field_integer(L, idx, 'port', 0)
   p.cwd = lua_field_string(L, idx, 'cwd', '')
+  p.agent = lua_field_string(L, idx, 'agent', '')
   p.fallback = lua_field_string(L, idx, 'fallback', '')
   lua_getfield(L, idx, 'command')
   if lua_type(L, -1) == LUA_TTABLE then
@@ -201,7 +219,7 @@ end
 
 -- Free what a profile owns (the configured ones, and ones the core builds).
 global function profile_free(p: *Profile): void
-  p.name:destroy() p.transport:destroy() p.host:destroy() p.cwd:destroy() p.fallback:destroy()
+  p.name:destroy() p.transport:destroy() p.host:destroy() p.cwd:destroy() p.agent:destroy() p.fallback:destroy()
   for k = 0, < #p.argv do p.argv[k]:destroy() end
   p.argv:destroy()
   for k = 0, < #p.env do p.env[k]:destroy() end
@@ -232,6 +250,68 @@ end
 -- not have; the core reads it from the controller (core/sys/dualsense_reader.nelua).
 global function policy_gamepad_hid(name: string): boolean
   return name == 'create'
+end
+
+local function clear_controller_bindings(): void
+  for i = 0, < #policy.controller.bindings do policy.controller.bindings[i].action:destroy() end
+  policy.controller.bindings:clear()
+end
+
+-- CONFIG.controller: a direct `mapping` wins; otherwise select
+-- `layouts[layout].mapping`. Each button is a string action or
+-- { action = string, repeat = bool }. Unknown buttons never enter the native
+-- policy because this fixed list is the same one Dalamud exposes.
+local function read_controller(L: *lua_State, t: cint): void
+  clear_controller_bindings()
+  policy.controller.layout:destroy()
+  policy.controller.layout = string.copy('terminal')
+  policy.controller.enabled, policy.controller.capture = false, true
+  local top = lua_gettop(L)
+  lua_getfield(L, t, 'controller')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_settop(L, top) return end
+  local c = lua_gettop(L)
+  policy.controller.enabled = lua_field_boolean(L, c, 'enabled', true)
+  policy.controller.capture = lua_field_boolean(L, c, 'capture', true)
+  policy.controller.layout:destroy()
+  policy.controller.layout = lua_field_string(L, c, 'layout', 'terminal')
+
+  lua_getfield(L, c, 'mapping')
+  if lua_type(L, -1) ~= LUA_TTABLE then
+    lua_pop(L, 1)
+    lua_getfield(L, c, 'layouts')
+    if lua_type(L, -1) == LUA_TTABLE then
+      lua_getfield(L, -1, (@cstring)(policy.controller.layout.data))
+      if lua_type(L, -1) == LUA_TTABLE then lua_getfield(L, -1, 'mapping') end
+    end
+  end
+  if lua_type(L, -1) == LUA_TTABLE then
+    local map = lua_gettop(L)
+    local names: [16]string = {
+      'dpad_up', 'dpad_down', 'dpad_left', 'dpad_right', 'north', 'south', 'west', 'east',
+      'l1', 'l2', 'l3', 'r1', 'r2', 'r3', 'select', 'start',
+    }
+    for i = 0, < 16 do
+      lua_getfield(L, map, (@cstring)(names[i].data))
+      local action: string
+      local repeatable = false
+      if lua_type(L, -1) == LUA_TSTRING then
+        local n: usize = 0
+        local p = lua_tolstring(L, -1, &n)
+        action = string.copy(string{data=(@*[0]byte)(p), size=n})
+        repeatable = action:find('key:', 1, true) == 1 or action:find('text:', 1, true) == 1
+      elseif lua_type(L, -1) == LUA_TTABLE then
+        action = lua_field_string(L, lua_gettop(L), 'action', '')
+        repeatable = lua_field_boolean(L, lua_gettop(L), 'repeat', false)
+      end
+      lua_pop(L, 1)
+      if #action > 0 then
+        policy.controller.bindings:push(ControllerBinding{mask = 1 << i, slot = i, action = action, repeatable = repeatable})
+      else
+        action:destroy()
+      end
+    end
+  end
+  lua_settop(L, top)
 end
 
 -- Themes (core/theme.nelua) ----------------------------------------------------------
@@ -345,6 +425,7 @@ local function read_settings(L: *lua_State, t: cint): void
   policy.toggle_gamepad_mask = policy_gamepad_mask(pad)
   policy.toggle_gamepad_hid = policy_gamepad_hid(pad)
   pad:destroy()
+  read_controller(L, t)
   policy.default_profile = lua_field_integer(L, t, 'default_profile', 1)
   policy.cursor_blink = lua_field_boolean(L, t, 'cursor_blink', true)
   policy.close_on_exit = lua_field_boolean(L, t, 'close_on_exit', true)
@@ -469,15 +550,20 @@ global function policy_unload(): void
   policy.world_pins:destroy()
   policy.error:destroy()
   policy.toggle_key:destroy()
+  policy.controller.layout:destroy()
+  clear_controller_bindings()
+  policy.controller.bindings:destroy()
   policy.dropdown.align:destroy()
   clear_hook_errors()
   policy.agent.host:destroy()
+  policy.agent.label:destroy()
   policy.agent.token:destroy()
   policy.agent.token_file:destroy()
   policy.agent.node:destroy()
   for i = 0, < #policy.agents do
     policy.agents[i].name:destroy()
     policy.agents[i].cfg.host:destroy()
+    policy.agents[i].cfg.label:destroy()
     policy.agents[i].cfg.token:destroy()
     policy.agents[i].cfg.token_file:destroy()
     policy.agents[i].cfg.node:destroy()
@@ -588,7 +674,23 @@ end
   lua_setglobal(L, 'CONFIG')
   -- an init.lua from before a module existed (the user's copy in the config
   -- home is never replaced) gets the shipped module's defaults
-  if luaL_loadstring(L, "for _, n in ipairs({ 'themes', 'tooltips', 'assistant', 'ask', 'windows', 'adopt', 'rain', 'gallery' }) do if CONFIG[n] == nil then local ok, m = pcall(require, n) if ok then CONFIG[n] = m end end end") == LUA_OK then
+  if luaL_loadstring(L, [[
+for _, n in ipairs({ 'themes', 'tooltips', 'assistant', 'ask', 'windows', 'adopt', 'rain', 'gallery' }) do
+  if CONFIG[n] == nil then local ok, m = pcall(require, n) if ok then CONFIG[n] = m end end
+end
+if CONFIG.controller == nil then
+  local ok, m = pcall(require, 'controllers')
+  if ok then CONFIG.controller = m.config('terminal') end
+else
+  local ok, m = pcall(require, 'controllers')
+  if ok then
+    if CONFIG.controller.enabled == nil then CONFIG.controller.enabled = true end
+    if CONFIG.controller.capture == nil then CONFIG.controller.capture = true end
+    if CONFIG.controller.layout == nil then CONFIG.controller.layout = 'terminal' end
+    if CONFIG.controller.layouts == nil then CONFIG.controller.layouts = m.layouts end
+  end
+end
+]]) == LUA_OK then
     if lua_pcall(L, 0, 0, 0) ~= LUA_OK then lua_pop(L, 1) end
   else
     lua_pop(L, 1)
@@ -600,7 +702,8 @@ end
   lua_getfield(L, t, 'agent')
   if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 1) lua_createtable(L, 0, 0) end
   local a: cint = lua_gettop(L)
-  policy.agent.host:destroy() policy.agent.token:destroy() policy.agent.token_file:destroy() -- a reload replaces them
+  policy.agent.host:destroy() policy.agent.label:destroy() policy.agent.token:destroy() policy.agent.token_file:destroy() -- a reload replaces them
+  policy.agent.label = lua_field_string(L, a, 'label', 'local')
   policy.agent.host = lua_field_string(L, a, 'host', '127.0.0.1')
   policy.agent.port = lua_field_integer(L, a, 'port', 7777)
   policy.agent.token = lua_field_string(L, a, 'token', '')
@@ -609,12 +712,13 @@ end
   policy.agent.node = lua_field_string(L, a, 'node', '')
   lua_pop(L, 1)
 
-  -- CONFIG.agents = { fedora = { host = ..., port = ..., token_file = ... } }
+  -- CONFIG.agents = { workstation = { host = ..., port = ..., token_file = ... } }
   -- Keys are the link names used by `/window ... @name`. 'local' is reserved
   -- for CONFIG.agent and an entry using it is ignored, with a line in the log.
   for i = 0, < #policy.agents do
     policy.agents[i].name:destroy()
     policy.agents[i].cfg.host:destroy()
+    policy.agents[i].cfg.label:destroy()
     policy.agents[i].cfg.token:destroy()
     policy.agents[i].cfg.token_file:destroy()
     policy.agents[i].cfg.node:destroy()
@@ -642,6 +746,7 @@ end
         else
           local entry: NamedAgentCfg
           entry.name = key
+          entry.cfg.label = lua_field_string(L, e, 'label', entry.name)
           entry.cfg.host = lua_field_string(L, e, 'host', '127.0.0.1')
           entry.cfg.port = lua_field_integer(L, e, 'port', 7777)
           entry.cfg.token = lua_field_string(L, e, 'token', '')

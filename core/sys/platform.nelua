@@ -8,10 +8,16 @@ require 'string'
 ## cinclude '<windows.h>'
 local function GetModuleHandleA(name: cstring): pointer <cimport, nodecl> end
 local function GetProcAddress(mod: pointer, name: cstring): pointer <cimport, nodecl> end
+local function GetFileAttributesA(path: cstring): uint32 <cimport, nodecl> end
+local INVALID_FILE_ATTRIBUTES: uint32 <comptime> = 0xffffffff_u32
 
 global function platform_is_wine(): boolean
   local ntdll = GetModuleHandleA('ntdll.dll')
-  return ntdll ~= nilptr and GetProcAddress(ntdll, 'wine_get_version') ~= nilptr
+  if ntdll ~= nilptr and GetProcAddress(ntdll, 'wine_get_version') ~= nilptr then return true end
+  -- Some staging/Proton builds keep wine_get_version out of GetProcAddress's
+  -- view even though it is in the PE export table. Wine's default Z: mapping
+  -- exposes the Linux process filesystem; native Windows does not have it.
+  return GetFileAttributesA('Z:\\proc\\self\\status') ~= INVALID_FILE_ATTRIBUTES
 end
 
 global function platform_name(): string

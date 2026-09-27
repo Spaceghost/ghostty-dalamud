@@ -36,6 +36,8 @@ global Session = @record{
   pipe: ProcPipe,
   title: string,
   label: string,
+  origin: string,           -- agent host shown persistently in tabs/window titles
+  display: string,          -- cached "[origin] title" decoration
   exited: boolean,
   exit_status: int32,
   process_exited: boolean,  -- the shell itself ended (e.g. ctrl+d), not a connect failure
@@ -118,6 +120,25 @@ function Session:write_string(s: string): void
   self:write((@*[0]uint8)(s.data), s.size)
 end
 
+-- Keep the machine visible even when a shell or application replaces its
+-- terminal title. This is deliberately chrome decoration, not text written
+-- into the PTY, so it cannot affect prompts, copying or terminal programs.
+function Session:refresh_display(): void
+  self.display:destroy()
+  if #self.origin == 0 then return end
+  local name = #self.title > 0 and self.title or self.label
+  local sb: stringbuilder
+  sb:write('[', self.origin, ']')
+  if #name > 0 then sb:write('  ', name) end
+  self.display = sb:promote()
+end
+
+function Session:set_origin(name: string): void
+  self.origin:destroy()
+  self.origin = name:copy()
+  self:refresh_display()
+end
+
 -- libghostty answering the terminal (cursor position, mode and device reports).
 -- Replayed output asked those questions long ago: answering them now would
 -- type the answers into whatever runs in the shell today.
@@ -135,6 +156,7 @@ local function on_title(terminal: GhosttyTerminal, userdata: pointer): void
   if ghostty_terminal_get(terminal, GHOSTTY_TERMINAL_DATA_TITLE, &t) ~= GHOSTTY_SUCCESS then return end
   s.title:destroy()
   s.title = string{data=t.ptr, size=t.len}:copy()
+  s:refresh_display()
 end
 
 -- BEL: only counted here; the host notices the change and rings (core/app/bell.nelua).
@@ -279,7 +301,8 @@ function Session:init(id: integer, profile: *Profile, cols: uint16, rows: uint16
       if not self:reopen() then
         -- no `..` chains: without a GC every intermediate string would leak
         local sb: stringbuilder
-        sb:writef('[ghostty] connecting to agent %s:%d ...\r\n', policy.agent.host, policy.agent.port)
+        if #agent.node > 0 then sb:write('[ghostty] connecting to agent ', agent.node, ' ...\r\n')
+        else sb:writef('[ghostty] connecting to agent %s:%d ...\r\n', agent.host, agent.port) end
         local msg = sb:promote()
         self:feed_text(msg)
         msg:destroy()
@@ -465,6 +488,8 @@ function Session:destroy(): void
   self.view:destroy()
   self.title:destroy()
   self.label:destroy()
+  self.origin:destroy()
+  self.display:destroy()
   self.pending_out:destroy()
   self.captured:destroy()
   free_open_request(self)
@@ -472,8 +497,9 @@ function Session:destroy(): void
   $self = {}
 end
 
--- Tab label: title if the app set one, else the profile name.
+-- Tab label: decorated host plus title if the app set one, else profile name.
 function Session:display_name(): string
+  if #self.display > 0 then return self.display end
   if #self.title > 0 then return self.title end
   return self.label
 end

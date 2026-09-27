@@ -12,6 +12,8 @@ local themes = require('themes')
 local tooltips = require('tooltips')
 local gallery = require('gallery')
 local agentcaps = require('agentcaps')
+local agenthosts = require('agenthosts')
+local controllers = require('controllers')
 
 local S = {}
 
@@ -28,6 +30,9 @@ S.schema = {
     { 'toggle_mods', 'combo', MODS, 'Dropdown toggle modifiers (+ `)' },
     { 'world_toggle_mods', 'combo', MODS, 'World terminals toggle modifiers (+ `)' },
     { 'toggle_gamepad_button', 'combo', PAD, 'Controller button (tap / hold / double tap; create = DualSense Create)' },
+    { 'controller.enabled', 'checkbox', 'Controller input in a focused terminal' },
+    { 'controller.layout', 'combo', controllers.order, 'Controller layout (custom uses controller.mapping)' },
+    { 'controller.capture', 'checkbox', 'Keep controller input out of the game while focused (never moves the mouse)' },
   } },
   { 'Dropdown', {
     { 'dropdown.height', 'slider', 0.15, 1.0, 'Height (fraction of screen)' },
@@ -253,6 +258,7 @@ function S.apply(config)
   -- ...and the gallery prompt, whose saved choices land in its module
   if config.gallery == nil then config.gallery = gallery end
   if type(config.theme) ~= 'string' or config.theme == '' then config.theme = themes.DEFAULT end
+  agenthosts.apply(config)
   capture_defaults(config)
   local chunk = loadfile(file())
   if chunk then
@@ -512,6 +518,7 @@ end
 function S.draw_agent(ui)
   if not (ghostty and ghostty.agent_status) then return end
   agentcaps.draw(ui, ghostty.agent_status())
+  agenthosts.draw(ui)
 end
 
 function S.draw_status(ui)

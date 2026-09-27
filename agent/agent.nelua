@@ -27,6 +27,7 @@
 --                      [--iroh [--iroh-secret PATH] [--iroh-allowlist PATH]]
 --                      [--wireguard-config PATH]
 --        ghostty-agent [--listen HOST:PORT] [--token-file PATH] --open-url URL
+--        ghostty-agent pair [--host SAFE_ADDRESS] [--port N] [--token-file PATH]
 --
 -- --iroh adds a second listener beside the TCP one, over iroh/QUIC
 -- (docs/IROH.md). It does not replace --listen: the Wayland capture helper
@@ -728,6 +729,18 @@ local function read_token_file(path: string): string
   return tok
 end
 
+-- Pairing must describe the running service, not quietly create a different
+-- token when its configured file was mistyped.
+local function read_existing_token_file(path: string): string
+  local f = io.open(path, 'rb')
+  if not f:isopen() then f:destroy() return (@string){} end
+  local content = f:read('a')
+  f:destroy()
+  local tok = agent_trim(content)
+  content:destroy()
+  return tok
+end
+
 -- Where agent/windows.nelua queues frames for connection `ci`.
 local function client_queue(ci: usize): *ByteQueue
   if ci < #agent.clients and agent.clients[ci].alive then return &agent.clients[ci].outq end
@@ -957,6 +970,54 @@ local function main(): integer
     default_token:destroy()
     return r
   end
+  if #arg >= 1 and arg[1] == 'pair' then
+    local host: string = ''
+    local token_path = agent_default_token_path()
+    local port = 7777
+    local i = 2
+    while i <= #arg do
+      local a = arg[i]
+      if a == '--host' and i < #arg then host:destroy() host = arg[i+1]:copy() i = i + 1
+      elseif a == '--port' and i < #arg then port = tointeger(arg[i+1]) i = i + 1
+      elseif a == '--token-file' and i < #arg then token_path:destroy() token_path = arg[i+1]:copy() i = i + 1
+      else
+        io.stderr:write('usage: ghostty-agent pair [--host SAFE_ADDRESS] [--port N] [--token-file PATH]\n')
+        token_path:destroy()
+        return 2
+      end
+      i = i + 1
+    end
+    local ts: Tailscale
+    ts:detect()
+    if #host == 0 then
+      -- The plugin's TCP client currently accepts IPv4 literals (and
+      -- localhost), not an arbitrary IPv6/DNS endpoint.
+      for k = 0, < #ts.addrs do
+        if ts.addrs[k].family == 4 then host = wgp.ip_tostring(4, &ts.addrs[k].addr) break end
+      end
+    end
+    local allowed, why = listen_allowed(host, &ts)
+    ts:destroy()
+    if #host == 0 then
+      io.stderr:write('pair: no Tailscale IPv4 address; say --host with the private IPv4 address where the agent listens\n')
+      token_path:destroy()
+      return 2
+    end
+    if not allowed or port < 1 or port > 65535 then
+      io.stderr:write('pair: refusing unsafe or invalid address: ', host)
+      if #why > 0 then io.stderr:write(': ', why) end
+      io.stderr:write('\n')
+      why:destroy() token_path:destroy()
+      return 2
+    end
+    why:destroy()
+    local token = read_existing_token_file(token_path)
+    token_path:destroy()
+    if #token == 0 then io.stderr:write('pair: token file is empty or unreadable\n') host:destroy() token:destroy() return 1 end
+    io.write('GHOSTTY_PAIR_V1\t', host, '\t', port, '\t', token, '\n')
+    token:destroy() host:destroy()
+    return 0
+  end
   local listen_spec: string = '127.0.0.1:7777'
   local token_path: string = ''
   local windows_name: string = 'auto'
@@ -1002,6 +1063,7 @@ local function main(): integer
       io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME] [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|gpu|none] [--wayland-browser CMD] [--wayland-browser-profile NAME] [--wireguard auto|on|off|always] [--wireguard-config PATH] [--allow-insecure-listen]\n',
                '                     [--iroh] [--iroh-secret PATH] [--iroh-allowlist PATH]\n',
                '       ghostty-agent [--listen HOST:PORT] [--token-file PATH] --open-url URL\n',
+               '       ghostty-agent pair [--host SAFE_ADDRESS] [--port N] [--token-file PATH]\n',
                '       ghostty-agent wg add NAME [--endpoint HOST[:PORT]] | list | show | remove NAME | forward ... | unforward ...\n')
       return 0
     else

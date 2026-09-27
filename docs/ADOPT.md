@@ -21,6 +21,16 @@ exactly where it came from.
 /term adopt ... / /term release ...   the same
 ```
 
+To lay chat or Mappy on the ground, pull it into the world, focus that panel,
+then use `/term pin ground`. For example, `/window adopt chat`, click its
+panel, `/term pin ground`; Mappy is adopted automatically when open, so focus
+its panel and use `/term pin ground`. The panel stays centered at your feet,
+flat and just above the floor. Its top points along the camera's horizontal
+view, not your character's heading, and turns as the camera turns. It follows
+you while walking. `/term pin pet` restores the floating placement. Ground
+placement works for any world panel, including terminals, and is available as
+`panel.place` with `{"pin":"ground"}`.
+
 Hold **Alt** (`CONFIG.adopt.pull_modifier`) over a flat window: a glowing
 "pull into world" grip shows above its top edge (drawn on ImGui's foreground
 list). Click it and the window flies out of its flat place into the world:

@@ -135,6 +135,14 @@
    focus; if focused, `SetNextFrameWantCaptureKeyboard(true)` and
    `input_poll` translates ImGui named keys + the character queue into
    libghostty key events, encoded by the key encoder (kitty/legacy aware).
+   The focused terminal also polls the configured `CONFIG.controller` button
+   map through the shim's raw Dalamud gamepad state. `key:` mappings take the
+   same encoder path; terminal actions share the keyboard action dispatcher.
+   When capture is enabled, the shim owns Dalamud's `EnableGamepadNav` only for
+   the focused interval. Its poll detour zeros both analogue sticks before
+   FFXIV sees them; changing ImGui's navigation flag alone does not. A capture
+   enabled elsewhere is never cleared, and gamepad-driven mouse positioning is
+   suppressed during focus and restored afterward.
 6. `render_termview` walks the render-state rows/cells: merged background
    runs, one `AddText` per glyph cell, underline/strike lines, cursor.
 7. World panels, pets, the character animation and world pins only once a
@@ -707,11 +715,11 @@ the agent compiles them in.
 | `test_ghostty` | libghostty-vt binding: sized-struct sizes against `ghostty_type_json()` |
 | `test_render` | a terminal rendered through a fake ImGui, checked by its draw calls |
 | `test_glyphfb` | fallback glyphs (`core/glyphfb.nelua`, docs/GLYPHS.md): code points above U+FFFF (emoji included) and BMP glyphs the ImGui font lacks rasterized with stb_truetype from `fonts/` into a fake D3D11 atlas and drawn as tinted images at their cells (2D snapped, world unsnapped), wide glyphs over exactly two cells, the lazily read font chain and a font added behind it, the tofu box with hex digits for a code point no font has, `ImFont_FindGlyph` in place of `ImFont_FindGlyphNoFallback`, the cache, a full atlas starting over, device changes |
-| `test_session` | session behaviour without a transport, local sessions, agent LIST parsing, `/term send` escapes, gamepad gestures, key repeat |
+| `test_session` | session behaviour without a transport, local sessions, agent LIST parsing, `/term send` escapes, gamepad gestures, mapped controller repeat/key encoding/capture ownership, key repeat |
 | `test_dualsense` | DualSense input reports (USB, Bluetooth with its CRC, Bluetooth simple, short and foreign reports), Create edges, ids in HID interface paths, the HID reader against fake devices: scan, devices passed over by their path, open, report queue, unplug, rescans backing off, device arrivals, close |
 | `test_selection` | mouse selection: hit mapping, click counting, word and line units, copied text |
 | `test_bell` | the visual bell: BEL counting, ring and glow maths, the Lua style, its triangles |
-| `test_policy` | loading `lua/init.lua`: defaults, profiles, key actions, showcase entries |
+| `test_policy` | loading `lua/init.lua`: defaults, profiles, key actions, controller layouts and custom mappings, showcase entries |
 | `test_world`, `test_worldpanel`, `test_worlddrag` | world panels: projection and hit testing, the presented pose and walk-up, drag placement and snapping, resize grips (screen-pixel size near and far, every edge and corner with the opposite edge fixed, pets, HUD panels, Alt still moving, release off the panel), the pet order (`order swap`) and the title drag that asks for it, the game-cursor flag over ghostty UI, all against a fake game |
 | `test_remotewin` | remote window panels against a fake version 3 agent, a fake ImGui and a fake texture table: open, KEY and delta frames, dirty-box uploads, WACK (held while asleep), the textured quads over the letterboxed picture, pointer / button / wheel / key / text input with the chrome keeping its clicks, WEND, WCLOSE, an older shim, a version 2 agent refused; WGEOM popups past the panel's edge and their input, window keys saved and restored across `/term reload`, refused keys and reconnects, reserved chords, WLIST watch opening new windows and dialogs beside their panels, `CONFIG.windows.never`, late app icons, resizing keeping the window's aspect (Shift frees it) |
 | `test_worldhud` | HUD panels: roll in the panel basis, the camera frame, the docked spot and size at rest (within a pixel), the lag and settling on a synthetic camera turn, clamps under a wild spin, zoom, the bob, docking maths, the dock hook and persistence in screen fractions |

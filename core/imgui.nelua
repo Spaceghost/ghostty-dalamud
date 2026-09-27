@@ -52,6 +52,7 @@ global ImGuiIO <cimport, nodecl> = @record{
   WantCaptureMouse: boolean,
   WantCaptureKeyboard: boolean,
   WantTextInput: boolean,
+  WantSetMousePos: boolean,
   MouseWheel: float32,
   MouseWheelH: float32,
   KeyCtrl: boolean,
@@ -98,7 +99,7 @@ global ImGuiIO <cimport, nodecl> = @record{
 ##  'ImGuiStyleVar_PopupRounding','ImGuiStyleVar_PopupBorderSize','ImGuiSliderFlags_AlwaysClamp',
 ##  'ImGuiCol_CheckMark','ImGuiCol_SliderGrab','ImGuiCol_SliderGrabActive',
 ##  'ImGuiInputTextFlags_EnterReturnsTrue','ImGuiCol_Button','ImGuiCol_ButtonHovered','ImGuiCol_ButtonActive',
-##  'ImGuiCol_FrameBg','ImGuiCol_Header','ImGuiCol_HeaderHovered','ImGuiConfigFlags_NoMouseCursorChange',
+##  'ImGuiCol_FrameBg','ImGuiCol_Header','ImGuiCol_HeaderHovered','ImGuiConfigFlags_NoMouseCursorChange','ImGuiConfigFlags_NavEnableGamepad','ImGuiConfigFlags_NavEnableSetMousePos',
 ##  'ImGuiInputTextFlags_CtrlEnterForNewLine','ImGuiCol_ScrollbarBg','ImGuiCol_ScrollbarGrab',
 ##  'ImGuiMouseCursor_Hand',
 ## }

@@ -59,6 +59,7 @@ global function lua_isstring(L: *lua_State, idx: cint): cint <cimport, nodecl> e
 ## if ccinfo.is_windows then
 local function platform_GetModuleHandleA(name: cstring): pointer <cimport 'GetModuleHandleA', cinclude '<windows.h>', nodecl> end
 local function platform_GetProcAddress(mod: pointer, name: cstring): pointer <cimport 'GetProcAddress', cinclude '<windows.h>', nodecl> end
+local function platform_GetFileAttributesA(path: cstring): uint32 <cimport 'GetFileAttributesA', cinclude '<windows.h>', nodecl> end
 ## end
 
 -- Publish runtime capability information before any configuration is evaluated.
@@ -69,7 +70,8 @@ global function luaL_openlibs(L: *lua_State): void <codename 'ghostty_lua_openli
   ## if ccinfo.is_windows then
     platform = 'windows'
     local ntdll = platform_GetModuleHandleA('ntdll.dll')
-    if ntdll ~= nilptr and platform_GetProcAddress(ntdll, 'wine_get_version') ~= nilptr then platform = 'wine' end
+    if (ntdll ~= nilptr and platform_GetProcAddress(ntdll, 'wine_get_version') ~= nilptr)
+       or platform_GetFileAttributesA('Z:\\proc\\self\\status') ~= 0xffffffff_u32 then platform = 'wine' end
   ## end
   lua_pushstring(L, platform)
   lua_setglobal(L, 'GHOSTTY_PLATFORM')

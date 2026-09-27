@@ -555,16 +555,84 @@ a copy of the shipped file:
 
 ```lua
 agent = {
+  label = 'Game PC', -- shown in tab/window decorations; its routing name is always "local"
   host = '127.0.0.1',
   port = 7777,
   token = '',
   token_file = home .. '/.config/ghostty-agent/token',
 },
 profiles = {
-  { name = 'shell', transport = 'agent', command = { '/bin/bash', '-l' } },
+  { name = 'shell', transport = 'agent', agent = 'local', command = { '/bin/bash', '-l' } },
   { name = 'ssh',   transport = 'agent', command = { 'ssh', '-t', 'example-host' } },
 },
 ```
+
+For several Linux hosts, keep machine-specific addresses and token paths only
+in that private override. Keys are stable routing IDs; labels are cosmetic and
+may be changed without editing profiles:
+
+```lua
+agent = {
+  label = 'Game PC', host = '127.0.0.1', port = 7777,
+  token_file = home .. '/.config/ghostty-agent/token',
+},
+agents = {
+  workstation = { label = 'Workstation', host = '100.64.0.10', port = 7777,
+                  token_file = '/private/path/workstation-token' },
+  server = { label = 'Home server', host = '100.64.0.20', port = 7777,
+             token_file = '/private/path/server-token' },
+},
+profiles = {
+  { name = 'Game PC / bash', transport = 'agent', agent = 'local',
+    command = { '/bin/bash', '-l' } },
+  { name = 'Game PC / tmux', transport = 'agent', agent = 'local',
+    command = { 'tmux', 'new-session', '-A', '-s', 'ghostty' } },
+  { name = 'Workstation / bash', transport = 'agent', agent = 'workstation',
+    command = { '/bin/bash', '-l' } },
+  { name = 'Workstation / tmux', transport = 'agent', agent = 'workstation',
+    command = { 'tmux', 'new-session', '-A', '-s', 'ghostty' } },
+  { name = 'Home server / bash', transport = 'agent', agent = 'server',
+    command = { '/bin/bash', '-l' } },
+  { name = 'Home server / tmux', transport = 'agent', agent = 'server',
+    command = { 'tmux', 'new-session', '-A', '-s', 'ghostty' } },
+},
+default_profile = 1, -- the real/local game host, not whichever remote link connects first
+```
+
+The public mod contains none of these hostnames, addresses, or token paths.
+The `+` menu and launcher discover the configured links automatically, and a
+new window inherits the current terminal's link unless a profile explicitly
+names another one.
+
+### Add a host in game
+
+Open `/term config` and expand **Agent hosts**. Enter a short routing ID, a
+display name and an SSH target such as `user@workstation`, then choose **Pair
+over SSH**. The target needs `ghostty-agent` installed and SSH key or
+`ssh-agent` authentication; pairing is deliberately non-interactive, so the
+plugin never sees or stores an SSH password. When the remote machine has
+Tailscale, its tailnet IPv4 address is selected automatically. Otherwise enter
+the private address on which its agent listens.
+`Run SSH from` defaults to `local`; choose another already-connected agent ID
+when that machine holds the SSH keys (for example, when the game itself runs
+in a container).
+If that service was started with a non-default `--token-file`, enter the same
+remote path in the optional token-file box; the pairing command refuses a
+missing file rather than generating a token that the running service does not use.
+
+The SSH command asks `ghostty-agent pair` for one machine-readable line. The
+token travels only inside SSH, is never placed in an argument, and is saved in
+`agent-hosts.lua` under the plugin config directory with owner-only
+permissions. Run `/term reload` after pairing. The host then appears in the
+`+` menu with generated bash and tmux profiles. Hosts created this way can be
+removed from the same settings section; manually configured hosts remain
+owned by `lua/init.lua` and are not rewritten.
+
+QR codes remain useful for the agent's embedded WireGuard setup
+(`ghostty-agent wg add NAME`), particularly for importing a tunnel into a
+phone or another WireGuard client. They are not used as a substitute for SSH
+pairing: a QR code cannot by itself make a machine reachable or authenticate
+the user approving remote shell access.
 
 Reload with `/term reload`.
 
@@ -672,7 +740,7 @@ return {
 |---|---|
 | `/term`, `/term toggle` | show or hide the drop-down |
 | `/term new [n]`, `/term window [n]` | a new tab, or a floating window, with profile *n* |
-| `/term pin [here\|me\|target\|orbit]` | pin the active tab (or a new terminal) into the world |
+| `/term pin [here\|me\|target\|orbit\|ground]` | place the focused world panel or active tab; `ground` lays it at your feet and rotates its top with the camera's view |
 | `/term unpin` | the focused world terminal goes back to the drop-down |
 | `/term pet` | a terminal that floats beside your character |
 | `/term order left\|right\|first\|last\|N\|swap ID` | move the focused pet in the pet order: its slot beside you, and its place in the row the other pets form beside a focused panel (the ◀ ▶ arrows on a hovered pet's edges swap it with its neighbour; dragging a pet by its title bar onto another swaps those two, `swap ID`) |
@@ -847,6 +915,54 @@ the drop-down; hold steps to the next terminal and repeats while held; double
 tap goes to the previous one. Valid names: `dpad_up dpad_down dpad_left
 dpad_right north south west east l1 l2 l3 r1 r2 r3 select start create`. An
 empty string disables it.
+
+Controller input inside a focused terminal is enabled by default. Settings →
+Keys & controller selects one of these layouts:
+
+| Layout | Intended use |
+|---|---|
+| `terminal` | Default: D-pad arrows, A/Cross Enter, B/Circle Escape, X/Square Tab, bumpers change tabs, triggers scroll |
+| `steamdeck` | The default adapted for Steam Deck; rear buttons remain available to Steam Input |
+| `community-emacs` | Readline/Emacs movement on the D-pad |
+| `community-vim` | Vim h/j/k/l movement on the D-pad |
+| `custom` | `CONFIG.controller.mapping` from your config |
+
+Mapped buttons repeat for `key:` and `text:` bindings; terminal actions such
+as `new_tab`, `paste` and `next_tab` fire once unless a mapping explicitly
+sets `repeat = true`. While a terminal has focus, `controller.capture = true`
+uses Dalamud's `IGamepadState.EnableGamepadNav` service to prevent mapped input,
+including both analogue sticks, from reaching FFXIV. It releases capture as
+soon as focus leaves the terminal and never clears capture it did not enable.
+While the terminal is focused, ImGui gamepad navigation is also explicitly
+prevented from positioning the mouse cursor; any pre-existing preference is
+restored afterward.
+
+Layouts and their metadata live in `lua/controllers.lua`. A file with that
+name in the plugin config directory takes precedence over the shipped module,
+or a copied `init.lua` can register and select a layout:
+
+```lua
+local controllers = require('controllers')
+controllers.add('mine', {
+  name = 'My layout', author = 'Name', community = true,
+  mapping = {
+    dpad_up = 'key:up', dpad_down = 'key:down',
+    south = 'key:enter', east = 'key:escape',
+    l1 = 'prev_tab', r1 = 'next_tab',
+    start = { action = 'new_tab', ['repeat'] = false },
+  },
+})
+config.controller = controllers.config('mine')
+```
+
+Valid button names are the same as the global-toggle list above except
+`create`, which is available only for the global toggle. Mapping values may be
+`key:<key>` (with optional
+`ctrl+`, `shift+`, `alt+` or `super+` modifiers), `text:<text>`, or any action
+listed in `lua/keymap.lua`. Steam community layouts remain attached to FFXIV's
+Steam app ID rather than to a Dalamud plugin; choose `steamdeck` here and use
+Steam Input for rear-button or trackpad bindings. Community Lua layouts are
+local configuration and are never downloaded or executed automatically.
 
 `create` is the Create button of a DualSense or DualSense Edge, which the game
 leaves unused. Dalamud's gamepad state has no such button, so the core reads
@@ -1142,7 +1258,7 @@ and token file explicitly when the agent runs elsewhere.
 | --- | --- |
 | `/term`, `/term toggle` | Show or hide the drop-down |
 | `/term new [n]`, `/term window [n]` | New tab or floating window using profile n |
-| `/term pin [here\|me\|target\|orbit]`, `/term unpin` | Place or remove a world panel |
+| `/term pin [here\|me\|target\|orbit\|ground]`, `/term unpin` | Place or remove a world panel |
 | `/term pet` | Create a following world panel |
 | `/term occluded on\|off` | Control whether a hidden world terminal keeps running |
 | `/term min [id]`, `/term restore [id]`, `/term focus id` | Manage terminal visibility |

@@ -184,8 +184,13 @@ do
   out, ok = run(c11)
   assert(not ok and out:find('auto, on, off or always', 1, true) > 0)
   out:destroy()
+  local c12 = join(agent_bin, ' pair --host 127.0.0.1 --port 7788 --token-file ', tok)
+  out, ok = run(c12)
+  assert(ok and out:find('GHOSTTY_PAIR_V1\t127.0.0.1\t7788\tclitoken\n', 1, true) == 1,
+    'SSH pairing has one machine-readable line')
+  out:destroy()
   c1:destroy() c2:destroy() c3:destroy() c4:destroy() c5:destroy() c6:destroy()
-  c7:destroy() c8:destroy() c9:destroy() c10:destroy() c11:destroy()
+  c7:destroy() c8:destroy() c9:destroy() c10:destroy() c11:destroy() c12:destroy()
   base:destroy() conf:destroy() tok:destroy()
 end
 

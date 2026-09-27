@@ -13,6 +13,11 @@ local seq: string = '\27]2;hello from osc\7\27]0;second\27\\'
 s:feed((@*[0]uint8)(seq.data), seq.size)
 print('title', s.title)
 assert(s.title == 'second', 'title read back from libghostty')
+s:set_origin('Workstation')
+assert(s:display_name() == '[Workstation]  second', 'the host decorates a terminal title')
+local retitle: string = '\27]2;working\7'
+s:feed((@*[0]uint8)(retitle.data), retitle.size)
+assert(s:display_name() == '[Workstation]  working', 'host decoration survives application title changes')
 assert(not s.process_exited)
 s.exited = false -- superlogical placeholder sessions start exited
 s:mark_exited(0)
@@ -95,6 +100,22 @@ do
   assert(pad_gesture_update(&st, false, 1.0) == PadGesture.None)
   assert(pad_gesture_update(&st, false, 1.5) == PadGesture.Tap)
   print('pad gestures OK')
+end
+
+-- focused-terminal controller buttons: a held button is ignored when focus
+-- arrives, a new press fires once, repeating mappings repeat, actions do not.
+do
+  local r: ControllerRepeat
+  assert(not controller_repeat_step(&r, true, true, 1 / 60), 'already-held controller button is not stolen')
+  assert(not controller_repeat_step(&r, false, true, 1 / 60))
+  assert(controller_repeat_step(&r, true, true, 1 / 60), 'new controller press')
+  local repeated = false
+  for _ = 1, 90 do repeated = controller_repeat_step(&r, true, true, 1 / 60) or repeated end
+  assert(repeated, 'terminal keys repeat while held')
+  controller_repeat_step(&r, false, false, 1 / 60)
+  assert(controller_repeat_step(&r, true, false, 1 / 60))
+  for _ = 1, 90 do assert(not controller_repeat_step(&r, true, false, 1 / 60), 'actions do not repeat') end
+  print('controller repeat OK')
 end
 
 -- Key repeat counts held frames, not wall time: a tap across a game hitch
@@ -239,6 +260,14 @@ do
   assert(frame(&io, enc, ev, ImGuiKey_A, false, true, false, 65, false, eat_a) == '', 'a consumed shift+a drops its A')
   assert(frame(&io, enc, ev, ImGuiKey_Q, true, false, true, 64, true, nilptr) == '@', 'AltGr+q types @')
   assert(frame(&io, enc, ev, ImGuiKey_Q, true, false, true, 64, false, nilptr) == '\27\17', 'ctrl+alt+q is a chord')
+  typed:clear()
+  assert(input_send_named('ctrl+p', enc, ev, typed_sink, nilptr) and typed:view() == '\16', 'controller ctrl+p')
+  typed:clear()
+  assert(input_send_named('up', enc, ev, typed_sink, nilptr) and typed:view() == '\27[A', 'controller arrow key')
+  typed:clear()
+  assert(input_send_named('space', enc, ev, typed_sink, nilptr) and typed:view() == ' ', 'controller printable key')
+  typed:clear()
+  assert(not input_send_named('not-a-key', enc, ev, typed_sink, nilptr) and #typed == 0, 'unknown controller key is ignored')
   ks:destroy()
   typed:destroy()
   imgui.GetFrameCount, imgui.IsKeyDown, imgui.IsKeyPressed = nilptr, nilptr, nilptr
@@ -269,6 +298,53 @@ do
   assert(#host.sessions == 0 and #host.dropdown_tabs == 0, 'no tab from a malformed profile number')
   delete(w)
   print('close_tab OK')
+end
+
+-- Controller capture owns only the ImGui flag it set. It temporarily suppresses
+-- gamepad-driven mouse positioning, then restores that pre-existing preference.
+-- A pre-existing gamepad capture belongs to Dalamud/the user and remains alone.
+local controller_io: ImGuiIO
+local function fake_controller_io(): *ImGuiIO return &controller_io end
+local controller_nav = false
+local controller_nav_sets = 0
+local function fake_controller_nav(enabled: cint): cint
+  if enabled >= 0 then controller_nav, controller_nav_sets = enabled ~= 0, controller_nav_sets + 1 end
+  return controller_nav and 1 or 0
+end
+do
+  imgui.GetIO = fake_controller_io
+  host.imgui_ok = true
+  host.api.gamepad_nav = fake_controller_nav
+  policy.controller.enabled, policy.controller.capture = true, true
+  controller_io.ConfigFlags = ImGuiConfigFlags_NavEnableSetMousePos
+  controller_io.WantSetMousePos = true
+  controller_capture_sync(true)
+  assert(controller_nav and controller_nav_sets == 1 and host.controller_capture_owned,
+    'capture uses the Dalamud service, not only its ImGui flag')
+  assert((controller_io.ConfigFlags & ImGuiConfigFlags_NavEnableSetMousePos) == 0
+    and not controller_io.WantSetMousePos and host.controller_mouse_nav_suppressed,
+    'terminal controller capture never drives the mouse')
+  controller_capture_sync(false)
+  assert(not controller_nav and controller_nav_sets == 2
+    and (controller_io.ConfigFlags & ImGuiConfigFlags_NavEnableSetMousePos) ~= 0
+    and not host.controller_capture_owned and not host.controller_mouse_nav_suppressed)
+  controller_nav = true -- capture belonging to Dalamud or another plugin
+  controller_io.ConfigFlags = ImGuiConfigFlags_NavEnableSetMousePos
+  controller_io.WantSetMousePos = true
+  controller_capture_sync(true)
+  assert(not host.controller_capture_owned, 'pre-existing controller capture is not claimed')
+  assert((controller_io.ConfigFlags & ImGuiConfigFlags_NavEnableSetMousePos) == 0
+    and host.controller_mouse_nav_suppressed, 'mouse navigation is suppressed with external capture too')
+  controller_capture_sync(false)
+  assert(controller_nav and controller_nav_sets == 2
+    and (controller_io.ConfigFlags & ImGuiConfigFlags_NavEnableSetMousePos) ~= 0,
+    'pre-existing controller settings are restored')
+  controller_io.ConfigFlags = 0
+  controller_nav = false
+  host.api.gamepad_nav = nilptr
+  host.imgui_ok = false
+  imgui.GetIO = nilptr
+  print('controller capture OK')
 end
 
 -- One keyboard owner: showing the dropdown unfocuses world panels, bringing a
@@ -307,6 +383,36 @@ local chord_io: ImGuiIO
 local function fake_get_io(): *ImGuiIO return &chord_io end
 do
   assert(policy_load('.'))
+  -- Host-specific commands stay on their host. A portable Linux agent shell
+  -- may run on every Linux agent, while ConPTY belongs only beside Wine.
+  local remote = new(@AgentLink)
+  remote.name = string.copy('workstation')
+  remote.label = string.copy('Workstation')
+  host.agents:push(remote)
+  local portable: Profile = { name = 'portable', transport = 'agent' }
+  local local_only: Profile = { name = 'local helper', transport = 'agent', agent = string.copy('local') }
+  local remote_only: Profile = { name = 'workstation helper', transport = 'agent', agent = string.copy('workstation') }
+  local conpty: Profile = { name = 'wine shell', transport = 'conpty' }
+  assert(profile_runs_on(&portable, &host.local_agent) and profile_runs_on(&portable, remote))
+  assert(profile_runs_on(&local_only, &host.local_agent) and not profile_runs_on(&local_only, remote))
+  assert(agent_by_name('local') == &host.local_agent and agent_by_name('Workstation') == nilptr,
+    'display labels never become routing aliases')
+  assert(not profile_runs_on(&remote_only, &host.local_agent) and profile_runs_on(&remote_only, remote))
+  assert(profile_runs_on(&conpty, &host.local_agent) and not profile_runs_on(&conpty, remote))
+  local local_idx = #policy.profiles
+  policy.profiles:push(local_only)
+  local exact = #policy.profiles
+  policy.profiles:push(remote_only)
+  assert(profile_for_link(remote, local_idx) == exact, 'an incompatible local default selects the pinned remote profile')
+  policy.profiles:remove(exact)
+  policy.profiles:remove(local_idx)
+  local_only.agent:destroy()
+  remote_only.agent:destroy()
+  host.agents:clear()
+  remote.name:destroy()
+  remote.label:destroy()
+  delete(remote)
+  print('agent profile placement OK')
   local buf: [64]cchar
   assert(policy_key_action('grave', true, false, false, false, &buf, 64) == 0, 'the keymap has no hard-coded ctrl+`')
   assert(policy_key_action('grave', true, true, false, false, &buf, 64) == 0, 'nor ctrl+shift+`')

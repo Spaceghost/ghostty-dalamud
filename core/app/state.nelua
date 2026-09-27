@@ -160,6 +160,10 @@ global GuHostApi = @record{
   -- ghostty.raycast falls back to `raycast`
   raycast_mode: function(ox: float32, oy: float32, oz: float32, dx: float32, dy: float32, dz: float32,
                          max: float32, mode: cint, hx: *float32, hy: *float32, hz: *float32): cint,
+  -- Dalamud IGamepadState.EnableGamepadNav: -1 query, 0 off, 1 on. Unlike
+  -- changing ImGui ConfigFlags directly, this activates the detour that keeps
+  -- both analogue sticks and buttons out of FFXIV. nilptr in older shims.
+  gamepad_nav: function(enabled: cint): cint,
 }
 
 global LOG_INFO: cint <comptime> = 1
@@ -170,7 +174,8 @@ global LOG_ERROR: cint <comptime> = 3
 -- Links are heap allocated and never move: a Session holds `*AgentClient` into
 -- one of them, so growing host.agents must not invalidate those pointers.
 global AgentLink = @record{
-  name: string,                     -- 'local' for index 0, then the config's key
+  name: string,                     -- stable route id: 'local', then the CONFIG.agents key
+  label: string,                    -- user-facing decoration; defaults to name
   client: AgentClient,
   enabled: boolean,
   last_try: float64,
@@ -188,12 +193,13 @@ global Host = @record{
   initialized: boolean,
   imgui_ok: boolean,
   imgui_missing: integer,
-  local_agent: AgentLink,           -- the agent on this machine; terminals always use it
-  agents: vector(*AgentLink),       -- extra links, by name; see docs/MULTI_AGENT.md
+  local_agent: AgentLink,           -- CONFIG.agent, always routed as "local"
+  agents: vector(*AgentLink),       -- extra terminal/window links, by name
   reattach_done: boolean,           -- LISTR handled (or no agent): the dropdown may open a fresh tab
   layout_restored: boolean,         -- LISTR put the saved layout back: saving it now keeps it
   sessions: vector(*Session),
   pending_open: vector(*Session),   -- FIFO awaiting agent OPENED; nilptr = closed while waiting
+  pending_agents: vector(*AgentClient), -- parallel owner for replies, including nil tombstones
   next_session_id: integer,
   -- drop-down
   dropdown_open: boolean,
@@ -251,6 +257,7 @@ global Host = @record{
   walk_time: float64,
   walk_user_moved: boolean,         -- the game's walk input saw the player steering
   paste_target: integer,            -- session waiting for the system clipboard (agent CLIP reply)
+  paste_agent: *AgentClient,        -- link whose CLIP reply paste_target awaits
   -- /term bell demo: steps through the bell styles
   -- /term showcase: demo terminals around the character, the player's own hidden
   showcase_ids: vector(integer),    -- demo sessions it opened
@@ -277,6 +284,10 @@ global Host = @record{
   settings_badge: boolean,          -- CONFIG.settings.badge(): a dot on the settings button (unseen vote ideas)
   pad: PadGestureState,             -- toggle button: tap / double tap / hold
   dualsense: DualSenseReader,       -- toggle_gamepad_button = 'create': the controller read over HID
+  controller_buttons: [16]ControllerRepeat, -- focused-terminal mapped buttons
+  controller_frame: cint,          -- last frame mappings were polled (a gap resets them)
+  controller_capture_owned: boolean, -- this core set ImGui's gamepad capture flag
+  controller_mouse_nav_suppressed: boolean, -- restore a pre-existing gamepad-moves-mouse flag after capture
   select_idx: integer,
   -- raw mouse buttons (Dalamud only forwards clicks to ImGui while it wants the mouse)
   lmb_down: boolean, rmb_down: boolean,
@@ -317,13 +328,7 @@ global Host = @record{
 
 global host: Host
 
--- The 'local' link: the agent on the machine running the game. Terminals always
--- use this one (a shell must not move because a window panel came from
--- elsewhere); windows may name another. Created by agent_links_init before
--- anything reads it, so this never returns nilptr after startup.
--- The local link: the agent on the machine running the game. Terminals always
--- use this one (a shell must not move because a window panel came from
--- elsewhere); windows may name another. It is a field of `host`, not a heap
+-- The local link is a field of `host`, not a heap
 -- allocation behind a call, because nelua copies a record read through a
 -- function result: `host.local_agent.client.sock = fd` would write to a temporary.
 global function agent_local(): *AgentLink <inline>
@@ -332,8 +337,18 @@ end
 
 -- The link named `name`, or nilptr when there is none.
 global function agent_by_name(name: string): *AgentLink
+  if #name == 0 or name == 'local' then return &host.local_agent end
   for i = 0, < #host.agents do
     if host.agents[i].name == name then return host.agents[i] end
+  end
+  return nilptr
+end
+
+-- The stable link record owning a client pointer held by a Session.
+global function agent_by_client(client: *AgentClient): *AgentLink
+  if client == &host.local_agent.client then return &host.local_agent end
+  for i = 0, < #host.agents do
+    if client == &host.agents[i].client then return host.agents[i] end
   end
   return nilptr
 end

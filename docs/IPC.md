@@ -96,7 +96,7 @@ adopted plugin windows (Mappy …) and the chat. What a keyboard palette lists.
 {"ok": true, "result": {
   "rev": 9,
   "panels": [
-    {"id": 3, "kind": "terminal", "title": "bash", "profile": "bash", "running": true, "view": "tab", "focused": true},
+    {"id": 3, "kind": "terminal", "title": "bash", "profile": "bash", "agent": "workstation", "running": true, "view": "tab", "focused": true},
     {"id": 4, "kind": "terminal", "title": "htop", "profile": "bash", "running": true, "view": "pet", "focused": false, "order": 2},
     {"id": 5, "kind": "terminal", "title": "zsh", "profile": "zsh", "running": false, "view": "min", "focused": false},
     {"id": 12, "kind": "window", "title": "Yad Window", "app": "yad", "icon": "/home/me/.cache/ghostty-agent/icons/yad.png",
@@ -118,8 +118,9 @@ adopted plugin windows (Mappy …) and the chat. What a keyboard palette lists.
 * `app`: a window's program (`window.list`'s `app`, else the agent's list
   entry with its title); an adopted window's plugin (its InternalName, else
   the name it was adopted by). Absent when unknown and for terminals and chat.
-* `profile`, `running` (terminals only): the profile's name; false once the
-  shell has exited (the panel shows why until it closes).
+* `profile`, `agent`, `running` (terminals only): the profile's name, its named
+  agent link (`local` or a `CONFIG.agents` key), and false once the shell has
+  exited (the panel shows why until it closes).
 * `icon` (windows only, when known): the icon path of the agent app
   (`agent.apps`) whose id or name is the window's `app`.
 * `view`: where it is:
@@ -194,7 +195,7 @@ minimized becomes a pet.
 {"method": "panel.place", "params": {"id": 4, "pin": "hud 0.85 0.2"}}
 ```
 
-`pin` as `/term pin` takes it: `here`, `me 2 1.7`, `target`, `orbit 3.5`,
+`pin` as `/term pin` takes it: `here`, `me 2 1.7`, `target`, `orbit 3.5`, `ground`,
 `pet`, `hud [X Y [DIST]]`, `hide`, `hide off`. A window, adopted panel or
 the chat keeps its size (as `window.place`); a terminal in the dropdown, a
 floating window or minimized moves into the world there.
@@ -357,14 +358,15 @@ panel into a pet. Not yet observed in game.
 ### terminal.new
 
 ```json
-{"method": "terminal.new", "params": {"profile": "pwsh", "pin": "here"}, "caller": "XivDesktop"}
+{"method": "terminal.new", "params": {"profile": "pwsh", "agent": "workstation", "pin": "here"}, "caller": "XivDesktop"}
 ```
 
 Opens a world terminal, as `/term pet` does. Optional: `profile`, a name from
 `CONFIG.profiles` or its place there counting from 1 (default: the default
-profile); `pin`, as `window.open` takes it (default: a pet). The result in
+profile); `agent`, `local` or a name from `CONFIG.agents` (default: the
+profile's `agent`, then `local`); `pin`, as `window.open` takes it (default: a pet). The result in
 `requests`: `{"id": panel}`, or why not: `no player (log in first)`, `no such
-profile: …`, `pin: …`.
+profile: …`, `no such agent: …`, `pin: …`.
 
 ### focus.get
 
@@ -529,12 +531,18 @@ renders icons in the background): look for it again later.
 {"method": "agent.status"}
 ```
 ```json
-{"ok": true, "result": {"connected": true, "version": 3, "windows_ok": true, "agent": "127.0.0.1:7777", "window_lists": 2}}
+{"ok": true, "result": {"connected": true, "version": 3, "windows_ok": true, "client_platform":"wine", "agent": "127.0.0.1:7777", "window_lists": 2,
+  "links": [{"name":"local","label":"Game PC","connected":true,"platform":"linux","address":"127.0.0.1:7777"},
+            {"name":"workstation","label":"Workstation","connected":true,"platform":"linux","address":"127.0.0.1:7788"}]}}
 ```
 
 `windows_ok`: connected to an agent that streams windows (protocol version 3).
+`client_platform` is where the game plugin runs (`wine` here); each link's
+`platform` is where commands actually run (`linux` for these native agents).
 `agent` is `""` when no agent is configured. `window_lists`: how many window
 lists (WLISTR) have arrived.
+`links` is the discoverable host list for a launcher. Show `label`, but pass
+the stable `name` to `terminal.new.agent`.
 
 ### status
 

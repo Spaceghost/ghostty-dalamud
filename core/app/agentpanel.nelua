@@ -10,6 +10,7 @@
 
 require 'core.app.state'
 require 'core.app.remotewin'
+require 'core.sys.platform'
 
 local AGENTS_WIDTH: float32 <comptime> = 560
 
@@ -59,7 +60,7 @@ local function link_row(link: *AgentLink, i: integer): void
   imgui.PushIDInt((@cint)(i))
   local word, col = state_word(link.client.state)
   imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(col, 255))
-  text(#link.name > 0 and link.name or 'local')
+  text(link.label)
   imgui.PopStyleColor(1)
   imgui.SameLine(0, -1)
   imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkDim, 255))
@@ -84,7 +85,12 @@ local function link_row(link: *AgentLink, i: integer): void
   if #link.client.platform > 0 then
     imgui.SameLine(0, -1)
     imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkFaint, 255))
-    local p = '  ' .. link.client.platform
+    local p: string
+    if link == &host.local_agent and platform_is_wine() then
+      p = '  ' .. link.client.platform .. ' agent; game via Wine'
+    else
+      p = '  ' .. link.client.platform .. ' agent'
+    end
     text(p)
     p:destroy()
     imgui.PopStyleColor(1)
@@ -96,6 +102,11 @@ local function link_row(link: *AgentLink, i: integer): void
     imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.Close, 255))
     wrapped(link.client.last_error)
     imgui.PopStyleColor(1)
+  end
+  if imgui.Button('New terminal', vec2(0, 0)) then
+    local profile = profile_for_link(link, policy.default_profile - 1)
+    local s = profile >= 0 and session_new_on(profile, 80, 24, &link.client) or nilptr
+    if s ~= nilptr then host.windows:push(s) end
   end
   imgui.Separator()
   imgui.PopID()
@@ -131,7 +142,7 @@ global function draw_agents(): void
 
     imgui.Spacing()
     imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkFaint, 255))
-    wrapped('A link with a NodeId is on QUIC. Terminals always run on the local agent, whichever link a window comes from.')
+    wrapped('A link with a NodeId is on QUIC. New terminal launches on that row; new windows created inside a terminal inherit its agent.')
     imgui.PopStyleColor(1)
   end
   imgui.End()

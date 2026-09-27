@@ -151,6 +151,29 @@ local function shown(pl: WorldPlacement): (float64, float64, float64, float64, f
   return cx, cy, w, h, math.atan(-(q[1].y - q[0].y), q[1].x - q[0].x)
 end
 
+-- A ground panel follows the feet, but its readable top follows the viewing
+-- cone rather than the character's heading. Chat and Mappy use this same pin.
+do
+  assert(#policy_world_command(41, 'ground') == 0)
+  cam_now = game_camera(10, 5, 14, 0.6, -0.4, 0.78)
+  local ok, pl = policy_world_place(41, 0.1, false)
+  local axes = world_axes(pl.yaw, pl.pitch)
+  assert(ok and near(pl.x, 10, 1e-4) and near(pl.y, 0.04, 1e-4) and near(pl.z, 20, 1e-4), 'ground centred at the feet')
+  assert(near(axes.ny, 1, 1e-4) and near(axes.ux, math.sin(0.6), 1e-4)
+    and near(axes.uz, math.cos(0.6), 1e-4), 'ground face up, top into the view')
+  assert(not world_lua_walkable(policy.L, 41), 'following ground is not a walk target')
+  cam_now = game_camera(10, 5, 14, -0.8, -0.7, 0.78)
+  ok, pl = policy_world_place(41, 0.2, false)
+  axes = world_axes(pl.yaw, pl.pitch)
+  assert(ok and near(axes.ux, math.sin(-0.8), 1e-4) and near(axes.uz, math.cos(-0.8), 1e-4), 'turns with the camera')
+  world_host.get_camera = nilptr
+  ok, pl = policy_world_place(41, 0.3, false)
+  axes = world_axes(pl.yaw, pl.pitch)
+  assert(ok and near(axes.ux, 0, 1e-4) and near(axes.uz, 1, 1e-4), 'character-heading fallback without a camera')
+  world_host.get_camera = fake_camera
+  print('ground pose OK')
+end
+
 do
   local t = world_read_tuning(policy.L)
   assert(t.hud_dock and t.hud_edge == 40 and t.hud_margin == 16, 'lua/world.lua dock tuning read')

@@ -9,6 +9,7 @@ require 'core.app.gallery'
 require 'core.app.ask'
 require 'core.app.gamelink'
 require 'core.app.netlab'
+require 'core.sys.platform'
 
 global function update_status(): void
   local sb: stringbuilder
@@ -95,6 +96,7 @@ global function load_policy(): boolean
   host.popup_font_size = policy.popup_font_size
   resolve_toggle_key()
   agent_setup()
-  logf(LOG_INFO, 'config loaded: %d profiles, toggle key "%s"', #policy.profiles, policy.toggle_key)
+  logf(LOG_INFO, 'config loaded: %d profiles, client %s, toggle key "%s"',
+    #policy.profiles, platform_name(), policy.toggle_key)
   return true
 end

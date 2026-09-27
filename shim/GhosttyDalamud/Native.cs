@@ -77,6 +77,8 @@ internal unsafe struct GuHostApi
     public delegate* unmanaged[Cdecl]<GuCharacter*, int, int> NearbyCharacters;
     // the game's collision with a chosen filter (0 the helper's, 1 everything, 2 every layer)
     public delegate* unmanaged[Cdecl]<float, float, float, float, float, float, float, int, float*, float*, float*, int> RaycastMode;
+    // query/set IGamepadState.EnableGamepadNav (-1 query, 0 off, 1 on)
+    public delegate* unmanaged[Cdecl]<int, int> GamepadNav;
 }
 
 // Mirrors GuCharacter in core/world.nelua.
