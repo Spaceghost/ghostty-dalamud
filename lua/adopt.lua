@@ -203,22 +203,26 @@ end
 function M.attach(id, name)
   if M.windows[name:lower()] then name = name:lower() end
   attached[id] = name
-  if saved_placements()[name] == 'ground' then return world.command(id, 'ground') end
+  if saved_placements()[name] == 'ground' and type(world) == 'table' and type(world.command) == 'function' then
+    return world.command(id, 'ground')
+  end
   return nil
 end
 
-world.anchor_changed = function(id, kind)
-  local name = attached[id]
-  if not name then return end
-  local saved = saved_placements()
-  local want = kind == 'ground' and 'ground' or nil
-  if saved[name] == want then return end
-  saved[name] = want
-  save_placements()
-end
+if type(world) == 'table' then
+  world.anchor_changed = function(id, kind)
+    local name = attached[id]
+    if not name then return end
+    local saved = saved_placements()
+    local want = kind == 'ground' and 'ground' or nil
+    if saved[name] == want then return end
+    saved[name] = want
+    save_placements()
+  end
 
-world.anchor_forgotten = function(id)
-  attached[id] = nil
+  world.anchor_forgotten = function(id)
+    attached[id] = nil
+  end
 end
 
 -- `names`: the pulled names, one per line.
