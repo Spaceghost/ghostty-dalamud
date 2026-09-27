@@ -151,8 +151,7 @@ local function shown(pl: WorldPlacement): (float64, float64, float64, float64, f
   return cx, cy, w, h, math.atan(-(q[1].y - q[0].y), q[1].x - q[0].x)
 end
 
--- A ground panel follows the feet, but its readable top follows the viewing
--- cone rather than the character's heading. Chat and Mappy use this same pin.
+-- Ground placement follows the feet, but rotates with the viewing cone.
 do
   assert(#policy_world_command(41, 'ground') == 0)
   cam_now = game_camera(10, 5, 14, 0.6, -0.4, 0.78)
@@ -166,8 +165,11 @@ do
   ok, pl = policy_world_place(41, 0.2, false)
   axes = world_axes(pl.yaw, pl.pitch)
   assert(ok and near(axes.ux, math.sin(-0.8), 1e-4) and near(axes.uz, math.cos(-0.8), 1e-4), 'turns with the camera')
-  world_host.get_camera = nilptr
+  cam_now = game_camera(10, 5, 14, -0.75, -0.7, 0.78)
   ok, pl = policy_world_place(41, 0.3, false)
+  assert(ok and lua_ok('assert(math.abs(CONFIG.world._turn_r or 0) > 0.2)'), 'ground updates shared camera turn rate for HUD panels')
+  world_host.get_camera = nilptr
+  ok, pl = policy_world_place(41, 0.4, false)
   axes = world_axes(pl.yaw, pl.pitch)
   assert(ok and near(axes.ux, 0, 1e-4) and near(axes.uz, 1, 1e-4), 'character-heading fallback without a camera')
   world_host.get_camera = fake_camera

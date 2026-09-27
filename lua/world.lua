@@ -248,8 +248,7 @@ M.defaults = {
   opacity = 0.92,
 }
 
--- A panel laid flat under the character. Keep it just above the floor so the
--- depth test does not z-fight with it; the character can still occlude it.
+-- Ground panels hover just above the feet to avoid z-fighting with the floor.
 M.ground = { lift = 0.04 }
 
 -- What hides a panel where the game world is in front of it:
@@ -490,6 +489,7 @@ function M.command(id, args)
   else
     return 'usage: /term pin [here|me|target|orbit|pet|ground|hud] ...'
   end
+  if M.anchor_changed then M.anchor_changed(id, M.anchors[id].kind) end
   return nil
 end
 
@@ -524,6 +524,7 @@ function M.toggle(id, x, y, z, yaw, pitch)
   for _, k in ipairs(KEEP) do a[k] = old[k] end
   M.anchors[id] = a
   M._pet_ids = nil
+  if M.anchor_changed then M.anchor_changed(id, a.kind) end
   return nil
 end
 
@@ -576,6 +577,7 @@ function M.dock(id, x, y, scale, dist, new)
   for _, k in ipairs(KEEP) do a[k] = old[k] end
   M.anchors[id] = a
   M._pet_ids = nil
+  if M.anchor_changed then M.anchor_changed(id, a.kind) end
   return nil
 end
 
@@ -645,6 +647,7 @@ function M.drop(id, p)
   a.height = math.max(MIN_H, math.min(MAX_H, a.height or M.defaults.height))
   M.anchors[id] = a
   M._pet_ids = nil -- a dropped pet is a pin now
+  if M.anchor_changed then M.anchor_changed(id, a.kind) end
   return nil
 end
 
@@ -725,6 +728,7 @@ end
 function M.forget(id)
   M.anchors[id] = nil
   M._pet_ids = nil
+  if M.anchor_forgotten then M.anchor_forgotten(id) end
 end
 
 -- The pet order: each pet anchor keeps `order` (saved with it), smaller first.
@@ -2027,15 +2031,9 @@ function M.place(id, t, focused, held)
   if not p then return nil end
 
   if a.kind == 'ground' then
-    -- Pitch +pi/2 makes the readable face point upward. At that pitch its
-    -- top edge points opposite yaw, so yaw faces back toward the camera.
-    -- Use view heading (not the character's rotation), including while the
-    -- camera is looking steeply down; retain character heading if unavailable.
-    if M._vt ~= t then
-      M._vbuf = M._vbuf or {}
-      M._vt, M._v = t, ghostty.view and ghostty.view(M._vbuf) or nil
-    end
-    local v = M._v
+    -- Pitch +pi/2 lays the readable face upward. Its top edge points opposite
+    -- yaw, so yaw faces back toward the camera's horizontal view direction.
+    local v = view_at(t)
     local yaw = v and v.yaw or p.rotation
     local lift = (M.ground and M.ground.lift) or 0.04
     return placement(a, p.x, p.y + lift, p.z, yaw + pi, pi / 2,

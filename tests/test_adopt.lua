@@ -6,6 +6,7 @@ local dir = SCRATCH .. '/adopt'
 assert(ghostty.mkdir(dir), 'mkdir ' .. dir)
 GHOSTTY_PLUGIN_DIR = dir
 os.remove(dir .. '/adopted.lua')
+os.remove(dir .. '/adopted-placements.lua')
 package.path = ROOT .. '/lua/?.lua;' .. package.path
 
 local world = require('world')
@@ -33,6 +34,19 @@ assert(a.pixels_per_yalm == adopt.pixels_per_yalm and a.opacity == adopt.opacity
 adopt.size(5, 100000, 100000, 0, 0)
 assert(a.width == 5200 and a.height == 3600, 'clamped')
 adopt.size(99, 400, 300, 0, 0) -- no such panel: nothing happens
+
+-- A ground choice for an adopted name is saved separately from the pulled
+-- names, so automatic Mappy can keep it even while its window is closed.
+assert(adopt.attach(5, 'chat') == nil)
+world.anchor_changed(5, 'ground')
+local pf = assert(io.open(dir .. '/adopted-placements.lua'))
+assert(pf:read('*a'):find('ground', 1, true), 'ground preference saved')
+pf:close()
+world.forget(5)
+world.anchor_changed(5, 'pet') -- forgotten id must not erase the preference
+pf = assert(io.open(dir .. '/adopted-placements.lua'))
+assert(pf:read('*a'):find('ground', 1, true), 'preference outlives the panel')
+pf:close()
 
 -- the pulled list
 assert(adopt.saved() == '', 'nothing saved yet')

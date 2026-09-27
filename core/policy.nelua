@@ -913,7 +913,7 @@ global function policy_world_trace(seconds: float64, kind: string): string
 end
 
 -- CONFIG.world.kind(terminal_id) -> its anchor's kind ('pet', 'world', 'follow',
--- 'orbit', 'hud'); '' without an anchor or an older lua/world.lua.
+-- 'orbit', 'ground', 'hud'); '' without an anchor or an older lua/world.lua.
 global function policy_world_kind(id: integer): string
   local L = policy.L
   if L == nilptr or not policy.loaded then return string.copy('') end
