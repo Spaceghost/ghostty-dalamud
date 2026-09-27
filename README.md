@@ -672,7 +672,7 @@ return {
 |---|---|
 | `/term`, `/term toggle` | show or hide the drop-down |
 | `/term new [n]`, `/term window [n]` | a new tab, or a floating window, with profile *n* |
-| `/term pin [here\|me\|target\|orbit]` | pin the active tab (or a new terminal) into the world |
+| `/term pin [here\|me\|target\|orbit\|ground]` | place the focused world panel or active tab; `ground` lays it at your feet and rotates its top with the camera's view |
 | `/term unpin` | the focused world terminal goes back to the drop-down |
 | `/term pet` | a terminal that floats beside your character |
 | `/term order left\|right\|first\|last\|N\|swap ID` | move the focused pet in the pet order: its slot beside you, and its place in the row the other pets form beside a focused panel (the ◀ ▶ arrows on a hovered pet's edges swap it with its neighbour; dragging a pet by its title bar onto another swaps those two, `swap ID`) |
@@ -1142,7 +1142,7 @@ and token file explicitly when the agent runs elsewhere.
 | --- | --- |
 | `/term`, `/term toggle` | Show or hide the drop-down |
 | `/term new [n]`, `/term window [n]` | New tab or floating window using profile n |
-| `/term pin [here\|me\|target\|orbit]`, `/term unpin` | Place or remove a world panel |
+| `/term pin [here\|me\|target\|orbit\|ground]`, `/term unpin` | Place or remove a world panel |
 | `/term pet` | Create a following world panel |
 | `/term occluded on\|off` | Control whether a hidden world terminal keeps running |
 | `/term min [id]`, `/term restore [id]`, `/term focus id` | Manage terminal visibility |

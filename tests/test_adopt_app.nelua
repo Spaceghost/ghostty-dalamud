@@ -371,6 +371,7 @@ local function panel_screen(id: integer, u: float32, v: float32): ImVec2
   return vec2(sx, sy)
 end
 local adopted_file = dir .. '/adopted.lua'
+local placements_file = dir .. '/adopted-placements.lua'
 -- adopted.lua as it is now. The text stays owned here and is freed by the next
 -- call, so callers use it at once and never free it.
 local saved_text: string
@@ -389,6 +390,7 @@ end
 
 -- Setup ------------------------------------------------------------------------------------------
 os.remove(adopted_file)
+os.remove(placements_file)
 assert(gu_init(&api, (@cstring)(dir.data)) == 0, 'init')
 host.local_agent.last_try = 1e9 -- never dial out
 assert(imgui_bind(resolver, nilptr) > 0)
@@ -662,6 +664,21 @@ do
   assert(#sent == 1 and sent[0] == 'hi', 'sent through the game\'s chat box')
   assert(io_state.InputQueueCharacters.Size == 0, 'the characters were ours')
   assert(saved():find('"chat"', 1, true) > 0, 'saved')
+  assert(run_command('pin ground') == 0, 'focused chat can be put on the ground')
+  local ground_kind = policy_world_kind(cs.id)
+  assert(ground_kind == 'ground', 'chat has a ground anchor')
+  ground_kind:destroy()
+  assert(run_command('release chat') == 0)
+  assert(run_command('adopt chat') == 0, 'chat can be pulled again')
+  cs = host.world[0]
+  ground_kind = policy_world_kind(cs.id)
+  assert(ground_kind == 'ground', 'chat ground placement survives release and re-adoption')
+  ground_kind:destroy()
+  host.world_focus = cs.id
+  assert(run_command('pin pet') == 0, 'chat can return to its default pet placement')
+  ground_kind = policy_world_kind(cs.id)
+  assert(ground_kind == 'pet', 'chat pet placement clears the saved ground preference')
+  ground_kind:destroy()
   -- back to the flat UI
   assert(run_command('release chat') == 0)
   assert(not chatpanel_open() and #host.world == 0, 'closed')
@@ -730,12 +747,24 @@ do
   assert(luaL_loadstring(policy.L, "CONFIG.adopt.auto = { mappy = true }") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
   -- ghostty drawing before Mappy is what the game did: Mappy was never seen open
   local m = mappy_opens(true)
+  host.world_focus = m.s.id
+  assert(run_command('pin ground') == 0, 'focused Mappy can be put on the ground')
+  local ground_kind = policy_world_kind(m.s.id)
+  assert(ground_kind == 'ground', 'Mappy has a ground anchor')
+  ground_kind:destroy()
+  host.world_focus = 0
   assert(saved():find('mappy', 1, true) == 0, 'automatic windows are not in the saved list')
   -- its plugin closes the map: the pet goes quietly
   for _ = 1, 60 do frame(false, false) end
   assert(adopt_count() == 0 and #host.world == 0, 'gone with its window')
   -- and the other order, Mappy drawing first
   m = mappy_opens(false)
+  ground_kind = policy_world_kind(m.s.id)
+  assert(ground_kind == 'ground', 'Mappy ground placement survives closing and reopening')
+  ground_kind:destroy()
+  host.world_focus = m.s.id
+  assert(run_command('pin pet') == 0, 'Mappy can return to its default pet placement')
+  host.world_focus = 0
   -- back to UI by hand: stays flat while it stays open
   assert(run_command('release mappy') == 0)
   assert(adopt_count() == 0 and adopt_declined('mappy'), 'given back and remembered')

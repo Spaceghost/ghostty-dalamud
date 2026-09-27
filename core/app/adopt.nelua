@@ -532,6 +532,7 @@ global function adopt_window(name: string, title: string, plugin: string, label:
     hooks_maybe_off()
     return 0, 'the pet could not be placed'
   end
+  adopt_lua_attach(s.id, name)
   -- an automatic window RenderPre already claimed: it has been off the flat
   -- UI since the frame it appeared, and its capture is the pet's first picture
   local aw = take_claim(title)

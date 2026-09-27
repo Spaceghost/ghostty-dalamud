@@ -15,7 +15,11 @@ Statuses mean exactly what they mean in the Changelog tab in game:
 
 ## [Unreleased] — In the workshop
 
-BETA is built and merged but has not been seen working in game yet; SOON is still being built. Entries move into a release once they have been verified in game.
+NEW and FIX have been seen working in game and await a release. BETA is built and merged but has not been verified in game yet; SOON is still being built.
+
+### Added
+
+* Ground placement for chat, Mappy and other world panels: /term pin ground lays the focused panel flat at your feet and keeps its top pointed along the camera's horizontal view as you turn and walk. Chat and Mappy remember this placement when reopened or reloaded; /term pin pet returns them to floating pets. Seen working in game with chat and Mappy. Look down or use third-person view to read a panel under your feet.
 
 ### Merged, not yet verified in game
 

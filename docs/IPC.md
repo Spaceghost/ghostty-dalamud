@@ -194,7 +194,7 @@ minimized becomes a pet.
 {"method": "panel.place", "params": {"id": 4, "pin": "hud 0.85 0.2"}}
 ```
 
-`pin` as `/term pin` takes it: `here`, `me 2 1.7`, `target`, `orbit 3.5`,
+`pin` as `/term pin` takes it: `here`, `me 2 1.7`, `target`, `orbit 3.5`, `ground`,
 `pet`, `hud [X Y [DIST]]`, `hide`, `hide off`. A window, adopted panel or
 the chat keeps its size (as `window.place`); a terminal in the dropdown, a
 floating window or minimized moves into the world there.

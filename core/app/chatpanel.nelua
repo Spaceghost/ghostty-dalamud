@@ -155,6 +155,7 @@ global function chatpanel_pull(): (integer, string)
     session_remove(s)
     return 0, 'the pet could not be placed'
   end
+  adopt_lua_attach(s.id, 'chat')
   s.title:destroy()
   s.title = string.copy('Chat')
   local cp = new(@ChatPanel)

@@ -22,6 +22,9 @@ require 'core.tooltip'
 -- The camera DirH that looks along (dx, dz): DirH is calibrated against the
 -- real view direction, since its zero is not the world's.
 local function camera_heading_to(cam: *GuCamera, dir_h: float32, dx: float32, dz: float32): float32
+  -- A panel at the player's feet has no horizontal bearing. Keep the current
+  -- heading instead of turning toward atan(0, 0) when it is clicked or focused.
+  if dx * dx + dz * dz < 1e-4 then return dir_h end
   local fx, _, fz = world_camera_forward(cam)
   return dir_h - (@float32)(math.atan(fx, fz)) + (@float32)(math.atan(dx, dz))
 end
