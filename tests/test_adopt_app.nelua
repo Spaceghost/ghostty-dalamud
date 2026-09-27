@@ -663,8 +663,9 @@ do
   assert(io_state.InputQueueCharacters.Size == 0, 'the characters were ours')
   assert(saved():find('"chat"', 1, true) > 0, 'saved')
   assert(run_command('pin ground') == 0, 'focused chat can be put on the ground')
-  assert(luaL_loadstring(policy.L, "assert(CONFIG.world.anchors[" .. tostring(cs.id) .. "].kind == 'ground')") == LUA_OK
-    and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, 'chat has a ground anchor')
+  local ground_kind = policy_world_kind(cs.id)
+  assert(ground_kind == 'ground', 'chat has a ground anchor')
+  ground_kind:destroy()
   -- back to the flat UI
   assert(run_command('release chat') == 0)
   assert(not chatpanel_open() and #host.world == 0, 'closed')
@@ -735,8 +736,9 @@ do
   local m = mappy_opens(true)
   host.world_focus = m.s.id
   assert(run_command('pin ground') == 0, 'focused Mappy can be put on the ground')
-  assert(luaL_loadstring(policy.L, "assert(CONFIG.world.anchors[" .. tostring(m.s.id) .. "].kind == 'ground')") == LUA_OK
-    and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, 'Mappy has a ground anchor')
+  local ground_kind = policy_world_kind(m.s.id)
+  assert(ground_kind == 'ground', 'Mappy has a ground anchor')
+  ground_kind:destroy()
   host.world_focus = 0
   assert(saved():find('mappy', 1, true) == 0, 'automatic windows are not in the saved list')
   -- its plugin closes the map: the pet goes quietly
