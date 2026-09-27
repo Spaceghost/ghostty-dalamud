@@ -12,7 +12,6 @@ local ImGuiHoveredFlags_AllowWhenBlockedByActiveItem: cint <cimport, nodecl, con
 global function sink_write(ctx: pointer, data: *[0]uint8, len: usize): void
   local s = (@*Session)(ctx)
   s:write(data, len)
-  policy_anim_key(imgui.GetTime())
   s.view:scroll_bottom()
   selection_clear(&s.view, &s.sel) -- typing ends the selection, as in any terminal
 end
@@ -28,9 +27,10 @@ global terminal_close_request: integer = 0
 -- the desktop (wl-paste / xclip) and lands when the reply arrives; without it,
 -- Dalamud's clipboard (Windows / Wine) is used.
 global function paste_into(s: *Session): void
-  if host.local_agent.enabled and host.local_agent.client:ready() then
+  if s.agent ~= nilptr and s.agent:ready() then
     host.paste_target = s.id
-    host.local_agent.client:clip_get()
+    host.paste_agent = s.agent
+    s.agent:clip_get()
     return
   end
   local txt = imgui.GetClipboardText()
@@ -42,7 +42,7 @@ global function copy_from(s: *Session): void
   local text = selection_text(&s.view)
   if #text > 0 then
     imgui.SetClipboardText((@cstring)(text.data)) -- the game's (Wine) clipboard
-    if host.local_agent.enabled and host.local_agent.client:ready() then host.local_agent.client:clip_set(text) end -- the desktop's
+    if s.agent ~= nilptr and s.agent:ready() then s.agent:clip_set(text) end -- that terminal host's desktop
   end
   text:destroy()
 end
@@ -93,9 +93,14 @@ global function do_action(ctx: pointer, action: string, key: *KeyInfo): boolean
   elseif action == 'copy' then
     copy_from(s) return true
   elseif action == 'new_tab' then
+    local link = s.agent ~= nilptr and agent_by_client(s.agent) or &host.local_agent
+    local profile = profile_for_link(link, policy.default_profile - 1)
     if a.in_dropdown then
-      local ns = session_new(policy.default_profile - 1, s.cols, s.rows)
+      local ns = profile >= 0 and session_new_on(profile, s.cols, s.rows, s.agent) or nilptr
       if ns ~= nilptr then host.dropdown_tabs:push(ns) host.dropdown_active = #host.dropdown_tabs - 1 end
+    else
+      local ns = profile >= 0 and session_new_on(profile, s.cols, s.rows, s.agent) or nilptr
+      if ns ~= nilptr then host.windows:push(ns) end
     end
     return true
   elseif action == 'close_tab' then
@@ -124,8 +129,11 @@ global function do_action(ctx: pointer, action: string, key: *KeyInfo): boolean
     local ok, n = strconv.str2int(action:subview(9), 10) -- tointeger aborts on a word
     if not ok then return true end
     if a.in_dropdown then
-      local ns = session_new(n - 1, s.cols, s.rows)
+      local ns = session_new_on(n - 1, s.cols, s.rows, s.agent)
       if ns ~= nilptr then host.dropdown_tabs:push(ns) host.dropdown_active = #host.dropdown_tabs - 1 end
+    else
+      local ns = session_new_on(n - 1, s.cols, s.rows, s.agent)
+      if ns ~= nilptr then host.windows:push(ns) end
     end
     return true
   end
@@ -151,6 +159,79 @@ global function key_action(ctx: pointer, name: string, key: *KeyInfo): boolean
   local n = policy_key_action(name, io.KeyCtrl, io.KeyShift, io.KeyAlt, io.KeySuper, &buf, 64)
   if n == 0 then return false end
   return do_action(ctx, string{data=(@*[0]byte)(&buf), size=n}, key)
+end
+
+-- A mapped controller button into the focused terminal. Mappings deliberately
+-- share ActionCtx with keyboard chords, so tabs, clipboard and scrolling have
+-- one implementation.
+local function controller_action(ctx: *ActionCtx, action: string): void
+  if action:find('key:', 1, true) == 1 then
+    input_send_named(action:subview(5), ctx.s.encoder, ctx.s.event, sink_write, ctx.s)
+  elseif action:find('text:', 1, true) == 1 then
+    local text = action:subview(6)
+    if #text > 0 then sink_write(ctx.s, (@*[0]uint8)(text.data), text.size) end
+  else
+    do_action(ctx, action, nilptr)
+  end
+end
+
+global function controller_poll(ctx: *ActionCtx, dt: float32): void
+  if not policy.controller.enabled or host.api.gamepad_down == nilptr then return end
+  local frame = imgui.GetFrameCount()
+  if host.controller_frame + 1 ~= frame then
+    for i = 0, < 16 do host.controller_buttons[i] = {} end
+  end
+  host.controller_frame = frame
+  for i = 0, < #policy.controller.bindings do
+    local b = &policy.controller.bindings[i]
+    local down = host.api.gamepad_down((@cint)(b.mask)) ~= 0
+    if controller_repeat_step(&host.controller_buttons[b.slot], down, b.repeatable, dt) then
+      controller_action(ctx, b.action)
+    end
+  end
+end
+
+-- Dalamud documents IGamepadState.EnableGamepadNav as its controller-input
+-- block. Its setter also changes NavEnableGamepad, but setting that ImGui flag
+-- ourselves is insufficient: only the service property activates the poll
+-- detour that zeros both analogue sticks before FFXIV sees them.
+-- NavEnableSetMousePos is deliberately suppressed while we own that capture:
+-- a controller is terminal input here, never a mouse. Restore a pre-existing
+-- mouse-navigation preference when focus leaves. A gamepad-capture flag set by
+-- somebody else remains theirs and is not cleared.
+global function controller_capture_sync(focused: boolean): void
+  if not host.imgui_ok then return end
+  local io = imgui.GetIO()
+  local want = focused and policy.controller.enabled and policy.controller.capture
+  if want then
+    if not host.controller_capture_owned then
+      if host.api.gamepad_nav ~= nilptr then
+        if host.api.gamepad_nav(-1) == 0 then
+          host.controller_capture_owned = host.api.gamepad_nav(1) ~= 0
+        end
+      elseif (io.ConfigFlags & ImGuiConfigFlags_NavEnableGamepad) == 0 then
+        -- Compatibility with an older shim. It can capture buttons on older
+        -- Dalamud builds, but current builds need gamepad_nav above for sticks.
+        io.ConfigFlags = io.ConfigFlags | ImGuiConfigFlags_NavEnableGamepad
+        host.controller_capture_owned = true
+      end
+    end
+    if (io.ConfigFlags & ImGuiConfigFlags_NavEnableSetMousePos) ~= 0 then
+      io.ConfigFlags = io.ConfigFlags & ~ImGuiConfigFlags_NavEnableSetMousePos
+      io.WantSetMousePos = false
+      host.controller_mouse_nav_suppressed = true
+    end
+  else
+    if host.controller_capture_owned then
+      if host.api.gamepad_nav ~= nilptr then host.api.gamepad_nav(0)
+      else io.ConfigFlags = io.ConfigFlags & ~ImGuiConfigFlags_NavEnableGamepad end
+      host.controller_capture_owned = false
+    end
+    if host.controller_mouse_nav_suppressed then
+      io.ConfigFlags = io.ConfigFlags | ImGuiConfigFlags_NavEnableSetMousePos
+      host.controller_mouse_nav_suppressed = false
+    end
+  end
 end
 
 -- One wheel movement over a terminal at (x, y) in its pixels: ctrl zooms the
@@ -230,6 +311,7 @@ global function draw_terminal(s: *Session, dl: *ImDrawList, origin: ImVec2, widt
     local actx: ActionCtx = { s = s, in_dropdown = in_dropdown }
     host.typing_session = s.id
     input_poll(io, s.encoder, s.event, sink_write, s, key_action, &actx)
+    controller_poll(&actx, io.DeltaTime)
     if host.pad_keys.n > 0 then pad_keys_send(&host.pad_keys, s.encoder, s.event, sink_write, s) end -- the touchpad (core/app/hotkeys.nelua)
   end
   -- the wheel scrolls a hovered dropdown or window terminal even unfocused

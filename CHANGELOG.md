@@ -17,6 +17,13 @@ Statuses mean exactly what they mean in the Changelog tab in game:
 
 NEW and FIX have been seen working in game and await a release. BETA is built and merged but has not been verified in game yet; SOON is still being built.
 
+### Merged, not yet verified in game
+
+* Terminal graphics use the Kitty graphics protocol: inline RGB/RGBA and PNG images are decoded, kept in a bounded GPU cache and drawn in Kitty's below-background, below-text and above-text layers. It works in every Ghostty terminal surface; sixels are not needed. Host renderer and Windows cross-build tests pass; not yet tried in game.
+* Focusing or typing in a terminal never changes, holds or pauses your character animation. An upgrade clears a pose left by an older build once, then terminal focus has no character-animation side effects at all. Host tests only; not yet tried in game.
+* Add another terminal host without editing Lua: Settings, Agent hosts pairs with a machine over SSH key authentication, keeps its token in an owner-only generated file, and adds bash and tmux to the + menu after /term reload. The default link is the actual game host, named from its hostname; every terminal and game-window title carries its host decoration, and a new window inherits the host of the window that created it. Passwords are never captured and manually configured hosts are left alone. Host tests only; not yet tried in game.
+* Controller: focused terminals on any local or remote agent accept the same configurable mappings, with an enabled terminal default, a Steam Deck layout and community-style Emacs and Vim layouts. Input follows the focused terminal to its owning host and can be kept out of the game, without ever letting gamepad navigation move the mouse cursor. Host tests only; not yet tried in game.
+
 ### Added
 
 * Ground placement for chat, Mappy and other world panels: /term pin ground lays the focused panel flat at your feet and keeps its top pointed along the camera's horizontal view as you turn and walk. Chat and Mappy remember this placement when reopened or reloaded; /term pin pet returns them to floating pets. Seen working in game with chat and Mappy. Look down or use third-person view to read a panel under your feet.

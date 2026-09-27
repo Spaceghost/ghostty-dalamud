@@ -349,6 +349,67 @@ global function input_poll(io: *ImGuiIO, encoder: GhosttyKeyEncoder, event: Ghos
   input_poll_keys(io, encoder, event, sink, sink_ctx, on_action, action_ctx, right_alt)
 end
 
+-- Send one named key from a controller mapping. `chord` uses the same names as
+-- lua/keymap.lua, optionally prefixed by ctrl+/shift+/alt+/super+.
+global function input_send_named(chord: string, encoder: GhosttyKeyEncoder, event: GhosttyKeyEvent,
+                                 sink: InputSink, sink_ctx: pointer): boolean
+  ensure_keys()
+  local mods: uint16 = 0
+  local name = chord
+  local again = true
+  while again do
+    again = false
+    if name:find('ctrl+', 1, true) == 1 then mods = mods | GHOSTTY_MODS_CTRL name = name:subview(6) again = true
+    elseif name:find('shift+', 1, true) == 1 then mods = mods | GHOSTTY_MODS_SHIFT name = name:subview(7) again = true
+    elseif name:find('alt+', 1, true) == 1 then mods = mods | GHOSTTY_MODS_ALT name = name:subview(5) again = true
+    elseif name:find('super+', 1, true) == 1 then mods = mods | GHOSTTY_MODS_SUPER name = name:subview(7) again = true end
+  end
+  local k: *KeyInfo = nilptr
+  for i = 0, < #input_keys do if input_keys[i].name == name then k = &input_keys[i] break end end
+  if k == nilptr then return false end
+  ghostty_key_event_set_action(event, GHOSTTY_KEY_ACTION_PRESS)
+  ghostty_key_event_set_key(event, k.gkey)
+  ghostty_key_event_set_mods(event, mods)
+  ghostty_key_event_set_consumed_mods(event, 0)
+  ghostty_key_event_set_unshifted_codepoint(event, k.codepoint)
+  local u: [8]uint8
+  local n: usize = 0
+  if k.codepoint >= 32 and k.codepoint ~= 127 and (mods & (GHOSTTY_MODS_CTRL | GHOSTTY_MODS_SUPER)) == 0 then
+    local cp = k.codepoint
+    if (mods & GHOSTTY_MODS_SHIFT) ~= 0 and k.shifted ~= 0 then
+      cp = k.shifted
+      ghostty_key_event_set_consumed_mods(event, GHOSTTY_MODS_SHIFT)
+    end
+    n = encode_utf8(cp, &u)
+    ghostty_key_event_set_utf8(event, (@cstring)(&u), n)
+  else
+    ghostty_key_event_set_utf8(event, nilptr, 0)
+  end
+  local buf: [64]cchar
+  local outlen: usize = 0
+  if ghostty_key_encoder_encode(encoder, event, &buf, 64, &outlen) ~= GHOSTTY_SUCCESS or outlen == 0 then return false end
+  sink(sink_ctx, (@*[0]uint8)(&buf), outlen)
+  return true
+end
+
+-- Controller repeat is deliberately frame-time based with a capped step, like
+-- keyboard repeat: a hitch cannot turn one tap into a burst of terminal keys.
+global ControllerRepeat = @record{ down: boolean, armed: boolean, held: float32, next_at: float32 }
+global CONTROLLER_REPEAT_DELAY <comptime> = 0.35
+global CONTROLLER_REPEAT_RATE <comptime> = 0.08
+
+global function controller_repeat_step(r: *ControllerRepeat, down: boolean, repeatable: boolean, dt: float32): boolean
+  if not down then r.down, r.armed, r.held = false, true, 0 return false end
+  if not r.down then
+    r.down, r.held, r.next_at = true, 0, CONTROLLER_REPEAT_DELAY
+    return r.armed
+  end
+  if not repeatable or not r.armed then return false end
+  r.held = r.held + math.clamp(dt, 0, KEY_REPEAT_MAX_STEP)
+  if r.held >= r.next_at then r.next_at = r.held + CONTROLLER_REPEAT_RATE return true end
+  return false
+end
+
 -- Gamepad button gestures ----------------------------------------------------------
 -- One button, three meanings: a quick press, a double tap, and a hold that
 -- repeats while held. A single tap is only reported once the double-tap window

@@ -82,6 +82,7 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
       teardown_effects()
       panels_let_go() -- pulled windows back to the flat UI (they come back when switched on again)
       dualsense_reader_close(&host.dualsense)
+      controller_capture_sync(false)
       host.world_focus = 0
       cursor_release() -- the in-game cursor rule is off with the rest
       agent_hold_sessions() -- the connection goes unread from here on
@@ -176,10 +177,9 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     save_world_state()
   end
   if live and in_world then
+    local clean_legacy_animation = not host.animation_cleanup_done
     sync_animation()
-    reactions_tick(now) -- bells, finished commands, output: the character's reactions
-    policy_anim_frame(now)
-    desk_props_sync() -- the desk scene's furniture, as lua/desk.lua asked for it
+    if clean_legacy_animation then desk_props_destroy_all() end
     lakitu_sync(now) -- the hovering camera and, while the shot is on, the view (docs/CAMERA.md)
     apply_world_pins(now)
     local under = world_under_ui_begin() -- beneath other plugins' overlays (Umbra's toolbar)
@@ -204,6 +204,9 @@ global function gu_frame(): void <cexport, codename 'gu_frame'>
     host.world_full_id = 0
     imgui.SetWindowFocusNil()
   end
+  -- Set during draw and left for Dalamud's next input pass. It is released as
+  -- soon as no terminal claimed focus, and on reload/shutdown below.
+  controller_capture_sync(live and host.terminal_focused_now)
   update_status()
   -- last of all: /term shot and /term clip arm their frame grab here, so the
   -- callback that copies the back buffer lands after everything drew into it
@@ -287,6 +290,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   surface_shutdown() -- commands, info bar entry and IPC go first
   selftest_shutdown() -- a run not handing over to the next core reports itself interrupted
   showcase_stop() -- demo terminals never outlive the session; yours come back
+  controller_capture_sync(false)
   teardown_effects()
   panels_shutdown() -- pulled windows back to the flat UI, the hooks into ImGui off
   native_shutdown() -- the game windows close; their shells stay for the next core
@@ -316,6 +320,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   host.world:destroy()
   host.world_covers:destroy()
   host.pending_open:destroy()
+  host.pending_agents:destroy()
   bell_reset()
   host.local_agent.client:destroy()
   net.shutdown()
@@ -325,6 +330,7 @@ global function gu_shutdown(): void <cexport, codename 'gu_shutdown'>
   host.world_diag:destroy()
   host.local_agent.error_shown:destroy()
   agent_extras_teardown() -- the CONFIG.agents links; the local one is a field of host
+  host.local_agent.label:destroy()
   host.local_agent.name:destroy()
   host.local_agent.name = (@string){}
   host.agents:destroy()   -- the loader starts a fresh core: leave no allocation behind
@@ -368,4 +374,3 @@ global function gu_walk_input(left: *float32, forward: *float32, allowed: cint, 
     $forward = f
   end
 end
-

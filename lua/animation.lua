@@ -49,7 +49,10 @@ local PRESETS = {
 }
 
 local M = {
-  enabled = true,
+  -- Character control must never be a side effect of focusing a terminal.
+  -- The old opt-out setting still loads for compatibility, but animations are
+  -- disabled by default and no focus path enables them implicitly.
+  enabled = false,
   preset = 'device',      -- one of the preset names above
   custom_timeline = 0,    -- any ActionTimeline id; overrides the preset when > 0
   -- with custom_timeline: its seated variant, one id for every sit or

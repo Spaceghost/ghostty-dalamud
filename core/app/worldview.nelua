@@ -640,7 +640,7 @@ end
 -- A new world terminal of `profile` ('' the default; a number: its place in
 -- CONFIG.profiles counting from 1; else its name), a pet or at `pin`'s place
 -- (as /term pin takes it), as /term pet opens one. Its id, or 0 and why (owned).
-global function world_terminal_new(profile: string, pin: string): (integer, string)
+global function world_terminal_new(profile: string, pin: string, agent_name: string): (integer, string)
   if not player_loaded() then return 0, string.copy('no player (log in first)') end
   local idx: integer = policy.default_profile - 1
   if #profile > 0 then
@@ -665,7 +665,19 @@ global function world_terminal_new(profile: string, pin: string): (integer, stri
       return 0, sb:promote()
     end
   end
-  local s = session_new(idx, 80, 24)
+  local agent: *AgentClient = nilptr
+  if #agent_name > 0 then
+    local link = agent_by_name(agent_name)
+    if link == nilptr then
+      local sb: stringbuilder
+      sb:write('no such agent: ', agent_name)
+      return 0, sb:promote()
+    end
+    agent = &link.client
+    if #profile == 0 then idx = profile_for_link(link, idx) end
+    if idx < 0 then return 0, string.copy('that agent has no compatible terminal profile') end
+  end
+  local s = session_new_on(idx, 80, 24, agent)
   if s == nilptr then return 0, string.copy('no terminal could be opened') end
   if #pin == 0 then
     if not make_pet(s) then

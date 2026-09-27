@@ -18,6 +18,7 @@ local adopt = require('adopt')
 local lakitu = require('lakitu')
 local gallery = require('gallery')
 local native = require('native')
+local controllers = require('controllers')
 
 -- The agent connection and profiles for where the game runs (native Windows,
 -- or Wine/Proton on Linux): see lua/platform.lua. The token authenticates the
@@ -33,6 +34,10 @@ local config = {
   -- select is Xbox View / DualSense touchpad click. create and ps read a
   -- DualSense over HID: ps taps the dropdown and a double press is voice input.
   toggle_gamepad_button = 'select',
+  -- Full controller input while a terminal is focused. Layouts live in
+  -- lua/controllers.lua; a controllers.lua in the config directory wins, so
+  -- community layouts can be installed without modifying the plugin.
+  controller = controllers.config('terminal'),
   -- With create or ps: the touchpad types into a focused terminal. Swipes are
   -- arrows (held at an edge they repeat), a click is Enter, a double click
   -- deletes a word and a held click keeps deleting.
@@ -115,8 +120,14 @@ local config = {
   -- 127.0.0.1:7777 with the token read from the agent's token file:
   -- %APPDATA%\ghostty-agent\token on native Windows,
   -- ~/.config/ghostty-agent/token otherwise. To set your own:
-  --   agent = { host = '127.0.0.1', port = 7777, token = '', token_file = '/path/to/token' },
+  --   agent = { label = 'Game PC', host = '127.0.0.1', port = 7777, token = '', token_file = '/path/to/token' },
   agent = defaults.agent,
+  -- More hosts appear beside local in the + menu and in /term agents. A
+  -- launcher may pass the same name as terminal.new's `agent` parameter.
+  -- agents = {
+  --   workstation = { label = 'Workstation', host = '100.64.0.1', port = 7777, token_file = '/path/to/token' },
+  --   server = { label = 'Home server', host = '100.64.0.2', port = 7777, token_file = '/path/to/token' },
+  -- },
 
   -- Profiles appear in the new-tab menu. `transport` is one of:
   --   "agent"        run `command` on the ghostty-agent host (Linux/macOS or Windows)
@@ -128,7 +139,7 @@ local config = {
   -- Windows, powershell and cmd through the agent with local fallbacks; under
   -- Wine, bash and tmux through the agent plus pwsh and cmd over ConPTY. E.g.:
   --   profiles = {
-  --     { name = 'shell', transport = 'agent', command = { '/bin/sh' } },
+  --     { name = 'workstation / shell', transport = 'agent', agent = 'workstation', command = { '/bin/sh' } },
   --     { name = 'ssh',   transport = 'agent', command = { 'ssh', '-t', 'user@example-host' } },
   --     { name = 'cmd',   transport = 'agent', command = { 'cmd.exe' }, fallback = 'cmd (local)' },
   --     { name = 'cmd (local)', transport = 'conpty', command = { 'cmd.exe' } },

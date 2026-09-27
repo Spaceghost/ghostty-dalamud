@@ -2,7 +2,7 @@
 -- panel"). The core only runs what Lua asks for and draws the window Lua
 -- fills:
 --
--- * ghostty.ask_spawn(argv, transport, local_fallback) -> job id: the argv
+-- * ghostty.ask_spawn(argv, transport, local_fallback[, agent]) -> job id: the argv
 --   runs like an assistant terminal (through ghostty-agent, or over ConPTY on
 --   native Windows while no agent answers), but on a hidden session whose
 --   output never reaches a screen: every line of it goes to
@@ -34,7 +34,7 @@ local function job_index(id: integer): integer
 end
 
 -- Run `argv` on a hidden session. The job id, or 0 and why.
-global function ask_spawn(argv: *vector(string), transport: string, local_fallback: boolean): (integer, string)
+global function ask_spawn(argv: *vector(string), transport: string, local_fallback: boolean, link: *AgentLink): (integer, string)
   if #$argv == 0 then return 0, 'empty command' end
   local p: Profile = { name = 'ask', transport = transport }
   -- Local means pipes, never a pseudo console: this output is parsed as one
@@ -45,16 +45,18 @@ global function ask_spawn(argv: *vector(string), transport: string, local_fallba
   -- pipes too, so a Windows agent's ConPTY never sees these lines. An agent
   -- below version 4 has no jobs and gets the old PTY open instead.
   if transport == 'agent' or transport == 'job' then p.transport = 'job' end
-  if p.transport == 'job' and local_fallback and (not host.local_agent.enabled or host.local_agent.down) then
+  if link == nilptr then link = &host.local_agent end
+  if p.transport == 'job' and local_fallback and link == &host.local_agent
+    and (not link.enabled or link.down) then
     p.transport = 'pipe'
   end
   p.argv = $argv -- borrowed: Session:init copies what it keeps
-  local s = session_open(&p, 200, 50)
+  local s = session_open_on(&p, 200, 50, link)
   if s == nilptr then return 0, 'could not start it (no agent configured?)' end
   s.capture = true
   s.run_occluded = true
   s.keep_on_agent = false -- a reload ends it rather than leave it for a tab
-  s.local_fallback = local_fallback and s.kind == TransportKind.Agent
+  s.local_fallback = local_fallback and link == &host.local_agent and s.kind == TransportKind.Agent
   next_job = next_job + 1
   jobs:push(AskJob{ id = next_job, s = s })
   return next_job, ''
@@ -137,7 +139,7 @@ local function read_argv(L: *lua_State, idx: cint, out: *vector(string)): boolea
   return n > 0
 end
 
--- ghostty.ask_spawn(argv, transport, local_fallback) -> id | nil, why
+-- ghostty.ask_spawn(argv, transport, local_fallback[, agent]) -> id | nil, why
 local function l_ask_spawn(L: *lua_State): cint
   local argv: vector(string)
   local ok = read_argv(L, 1, &argv)
@@ -147,7 +149,14 @@ local function l_ask_spawn(L: *lua_State): cint
   if tp ~= nilptr and tlen > 0 then transport = string{data = (@*[0]byte)(tp), size = tlen} end
   local id: integer = 0
   local err: string = 'argv must be a list of non-empty strings'
-  if ok then id, err = ask_spawn(&argv, transport, lua_toboolean(L, 3) ~= 0) end
+  local link: *AgentLink = &host.local_agent
+  if lua_type(L, 4) == LUA_TSTRING then
+    local alen: usize = 0
+    local ap = lua_tolstring(L, 4, &alen)
+    link = agent_by_name(string{data=(@*[0]byte)(ap), size=alen})
+    if link == nilptr then ok = false err = 'no such agent for job' end
+  end
+  if ok then id, err = ask_spawn(&argv, transport, lua_toboolean(L, 3) ~= 0, link) end
   for i = 0, < #argv do argv[i]:destroy() end
   argv:destroy()
   if id == 0 then

@@ -18,6 +18,11 @@ assert(policy.dropdown.width == 0.5 and policy.dropdown.min_width == 1200 and po
 assert(policy.toggle_gamepad_mask == 0x4000, 'select -> GamepadButtons.Select')
 assert(policy.toggle_ctrl and not policy.toggle_shift and not policy.toggle_alt, 'toggle is ctrl+grave')
 assert(policy_gamepad_mask('start') == 0x8000 and policy_gamepad_mask('l1') == 0x100 and policy_gamepad_mask('nope') == 0)
+assert(policy.controller.enabled and policy.controller.capture and policy.controller.layout == 'terminal')
+assert(#policy.controller.bindings >= 14, 'default focused-terminal controller mapping')
+assert(policy.controller.bindings[0].mask == 1 and policy.controller.bindings[0].action == 'key:up'
+  and policy.controller.bindings[0].repeatable, 'dpad up maps to a repeating terminal key')
+assert(#policy.profiles > 0 and #policy.profiles[0].agent == 0, 'profiles default to the local agent')
 assert(not policy.toggle_gamepad_hid, 'the DualSense is not read by default')
 assert(policy_gamepad_mask('create') == 0 and policy_gamepad_hid('create') and not policy_gamepad_hid('select') and not policy_gamepad_hid(''))
 print('agent', policy.agent.host, policy.agent.port, 'token_file', policy.agent.token_file)
@@ -28,6 +33,7 @@ for i = 0, < #policy.profiles do
   for k = 0, < #p.argv do io.write(p.argv[k], ' ') end
   io.write('\n')
 end
+
 assert(policy.profiles[0].transport == 'agent')
 assert(policy.profiles[0].argv[0] == '/bin/sh', 'POSIX default does not require Bash')
 local buf: [64]cchar
@@ -83,6 +89,25 @@ do
   assert(not policy.toggle_gamepad_hid and policy.toggle_gamepad_mask == 0x4000, 'and back')
 end
 
+do
+  assert(luaL_loadstring(policy.L, "CONFIG.controller.layout = 'community-vim'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  assert(policy.controller.layout == 'community-vim' and policy.controller.bindings[0].action == 'text:k',
+    'selecting a community layout refreshes its mapping')
+  assert(luaL_loadstring(policy.L, [[CONFIG.controller.mapping = {
+    south = 'key:enter', start = { action = 'toggle', ['repeat'] = true }, nope = 'text:ignored'
+  }]]) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  assert(#policy.controller.bindings == 2, 'a direct custom mapping accepts only known controller buttons')
+  assert(policy.controller.bindings[0].mask == 0x20 and policy.controller.bindings[0].action == 'key:enter'
+    and policy.controller.bindings[0].repeatable, 'custom key binding defaults to repeat')
+  assert(policy.controller.bindings[1].mask == 0x8000 and policy.controller.bindings[1].action == 'toggle'
+    and policy.controller.bindings[1].repeatable, 'custom binding can opt an action into repeat')
+  assert(luaL_loadstring(policy.L, "CONFIG.controller.enabled = false") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  policy_refresh()
+  assert(not policy.controller.enabled, 'controller mapping can be disabled')
+end
+
 local function lua_run(code: cstring): boolean
   return luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK
 end
@@ -127,10 +152,19 @@ local function write_min_init(text: string): void
   path:destroy()
   luadir:destroy()
 end
-write_min_init("return { popup = 3, profiles = { { name = 'sh' } } }\n")
+write_min_init([[return {
+  popup = 3,
+  agent = { label = 'Game PC' },
+  agents = { workstation = { label = 'Workstation' } },
+  profiles = { { name = 'sh' } },
+}
+]])
 assert(policy_load(mindir), 'minimal config loads')
 assert(policy.dropdown.height == 0.45 and policy.popup_width == 900 and policy.agent.port == 7777, 'defaults')
 assert(#policy.profiles == 1 and policy.profiles[0].name == 'sh')
+assert(policy.agent.label == 'Game PC' and #policy.agents == 1
+  and policy.agents[0].name == 'workstation' and policy.agents[0].cfg.label == 'Workstation',
+  'routing names and display labels are parsed separately')
 write_min_init('return {\n')
 assert(not policy_load(mindir) and #policy.error > 0, 'load error has text')
 print('load error:', policy.error)

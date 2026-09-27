@@ -228,8 +228,9 @@ global chrome_tab_buttons: [CHROME_TAB_BUTTONS]ChromeButton = {
   { id = 'hide', action = ChromeAction.Hide, icon = ChromeIcon.Hide, group = 2, tip = 'Hide the dropdown' },
 }
 
-global CHROME_WINDOW_BUTTONS <comptime> = 4
+global CHROME_WINDOW_BUTTONS <comptime> = 5
 global chrome_window_buttons: [CHROME_WINDOW_BUTTONS]ChromeButton = {
+  { id = 'new', action = ChromeAction.NewTab, icon = ChromeIcon.Plus, group = 0, tip = 'New window on this terminal\'s agent' },
   { id = 'dock', action = ChromeAction.Dock, icon = ChromeIcon.Dock, group = 0, tip = 'Back into the dropdown as a tab' },
   { id = 'native', action = ChromeAction.Native, icon = ChromeIcon.Game, group = 0, tip = 'Show it as a game window' },
   { id = 'pet', action = ChromeAction.Pet, icon = ChromeIcon.Paw, group = 0, tip = 'Let it float beside you as a pet' },

@@ -42,11 +42,24 @@ global function dropdown_new_tab(profile: integer): void
   if ns ~= nilptr then host.dropdown_tabs:push(ns) host.dropdown_active = #host.dropdown_tabs - 1 end
 end
 
+global function dropdown_new_tab_on(profile: integer, link: *AgentLink): void
+  local ns = session_new_on(profile, 80, 24, link ~= nilptr and &link.client or nilptr)
+  if ns ~= nilptr then host.dropdown_tabs:push(ns) host.dropdown_active = #host.dropdown_tabs - 1 end
+end
+
+global function dropdown_new_default_on(link: *AgentLink): void
+  local profile = profile_for_link(link, policy.default_profile - 1)
+  if profile >= 0 then dropdown_new_tab_on(profile, link) end
+end
+
 -- A tab bar button: acts on the dropdown and its active tab.
 global function dropdown_run(action: ChromeAction): void
   local s = active_tab()
   if action == ChromeAction.NewTab then
-    dropdown_new_tab(policy.default_profile - 1)
+    -- The + is also a quick launcher: with named agents configured it opens
+    -- the host/profile choices; otherwise it retains the one-click default.
+    if #host.agents > 0 then host.show_profiles = not host.show_profiles
+    else dropdown_new_default_on(&host.local_agent) end
   elseif action == ChromeAction.Profiles then
     host.show_profiles = not host.show_profiles
   elseif action == ChromeAction.Hide then
@@ -128,7 +141,12 @@ end
 global function window_run(i: integer, action: ChromeAction): boolean
   if i < 0 or i >= #host.windows then return false end
   local s = host.windows[i]
-  if action == ChromeAction.Close then
+  if action == ChromeAction.NewTab then
+    local link = s.agent ~= nilptr and agent_by_client(s.agent) or &host.local_agent
+    local profile = profile_for_link(link, policy.default_profile - 1)
+    local ns = profile >= 0 and session_new_on(profile, s.cols, s.rows, s.agent) or nilptr
+    if ns ~= nilptr then host.windows:push(ns) end
+  elseif action == ChromeAction.Close then
     host.windows:remove(i)
     if host.popup_session == s then host.popup_session = nilptr end
     session_remove(s)
@@ -459,17 +477,39 @@ end
 -- beneath never sees its clicks.
 local function draw_profiles_menu(bar: TabBar, pal: ChromePalette, light: ChromeLight, fade: float32): void
   if not host.show_profiles then return end
-  local n = #policy.profiles
-  if not host.dropdown_open or n == 0 then host.show_profiles = false return end
+  local choice_profiles: vector(integer)
+  local choice_links: vector(*AgentLink)
+  -- A pinned profile appears only on its named host. Portable agent profiles
+  -- appear on every agent; ConPTY/pipe appear only beside the Wine game.
+  for pi = 0, < #policy.profiles do
+    local p = policy_profile(pi)
+    if profile_runs_on(p, &host.local_agent) then choice_profiles:push(pi); choice_links:push(&host.local_agent) end
+  end
+  for ai = 0, < #host.agents do
+    for pi = 0, < #policy.profiles do
+      local p = policy_profile(pi)
+      if profile_runs_on(p, host.agents[ai]) then
+        choice_profiles:push(pi); choice_links:push(host.agents[ai])
+      end
+    end
+  end
+  local n = #choice_profiles
+  if not host.dropdown_open or n == 0 then
+    choice_profiles:destroy(); choice_links:destroy()
+    host.show_profiles = false
+    return
+  end
   local font = imgui.GetFont()
   local fs = imgui.GetFontSize()
   local row_h = math.floor(fs + 12)
   local pad: float32 = 6
   local name_w: float32, kind_w: float32 = 0, 0
-  for pi = 0, < n do
-    local p = policy_profile(pi)
+  for ri = 0, < n do
+    local p = policy_profile(choice_profiles[ri])
+    local link = choice_links[ri]
+    local link_name = link.label
     name_w = math.max(name_w, text_width(font, fs, p.name))
-    kind_w = math.max(kind_w, text_width(font, fs, p.transport))
+    kind_w = math.max(kind_w, text_width(font, fs, link_name))
   end
   local w = math.floor(math.max(name_w + kind_w + 60 + pad * 2, 220))
   local h = row_h * n + pad * 2
@@ -493,25 +533,29 @@ local function draw_profiles_menu(bar: TabBar, pal: ChromePalette, light: Chrome
     draw_window_glass(dl, wp.x, wp.y, wp.x + w, wp.y + h, rounding, pal, light, row_h)
     local mouse: ImVec2
     imgui.GetMousePos(&mouse)
-    for pi = 0, < n do
+    for ri = 0, < n do
+      local pi = choice_profiles[ri]
       local p = policy_profile(pi)
+      local link = choice_links[ri]
+      local link_name = link.label
       local rx0, rx1 = wp.x + pad, wp.x + w - pad
-      local ry = wp.y + pad + row_h * pi
+      local ry = wp.y + pad + row_h * ri
       imgui.SetCursorScreenPos(vec2(rx0, ry))
-      imgui.PushIDInt((@cint)(pi))
+      imgui.PushIDInt((@cint)(ri))
       local picked = imgui.InvisibleButton('##profile', vec2(rx1 - rx0, row_h), 0)
       local hot = imgui.IsItemHovered(0)
       imgui.PopID()
       if hot then imgui.DrawListAddRectFilled(dl, vec2(rx0, ry + 1), vec2(rx1, ry + row_h - 1), pal.pill, (row_h - 2) * 0.5, 0) end
-      -- the gold dot marks the profile + opens
-      if pi == policy.default_profile - 1 then
+      -- the gold dot marks the default profile on the local link
+      if pi == policy.default_profile - 1 and link == &host.local_agent then
         imgui.DrawListAddCircleFilled(dl, vec2(rx0 + 10, ry + row_h * 0.5), 3, chrome_col(ChromeColor.Accent, 255), 12)
       end
       local ty = ry + (row_h - fs) * 0.5
       add_text(dl, font, fs, rx0 + 22, ty, hot and chrome_col(ChromeColor.Ink, 255) or chrome_col(ChromeColor.InkDim, 255), p.name)
-      add_text(dl, font, fs, rx1 - 10 - text_width(font, fs, p.transport), ty, chrome_col(ChromeColor.InkFaint, 255), p.transport)
+      local acol = link.client:ready() and chrome_col(ChromeColor.Ok, 255) or chrome_col(ChromeColor.InkFaint, 255)
+      add_text(dl, font, fs, rx1 - 10 - text_width(font, fs, link_name), ty, acol, link_name)
       if picked then
-        dropdown_new_tab(pi)
+        dropdown_new_tab_on(pi, link)
         host.show_profiles = false
         host.dropdown_focus_next = true
       end
@@ -526,6 +570,8 @@ local function draw_profiles_menu(bar: TabBar, pal: ChromePalette, light: Chrome
     world_fade_vertices(dl, first, fade)
   end
   imgui.End()
+  choice_profiles:destroy()
+  choice_links:destroy()
 end
 
 -- Dropdown -------------------------------------------------------------------------------

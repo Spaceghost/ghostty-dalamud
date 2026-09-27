@@ -142,6 +142,8 @@ changes['terminal.new'] = function(p)
   local out, err = {}
   out.pin, err = opt_string(p, 'pin', true)
   if out.pin == false then return false, err end
+  out.agent, err = opt_string(p, 'agent', true)
+  if out.agent == false then return false, err end
   local prof = p.profile
   if prof == nil or prof == json.null then
     out.profile = nil
@@ -389,7 +391,7 @@ function M.run(text)
     result, err = ghostty.agent_windows_refresh()
   elseif req.method == 'terminal.new' then
     local id
-    id, err = ghostty.terminal_new({ profile = p.profile and tostring(p.profile) or nil, pin = p.pin })
+    id, err = ghostty.terminal_new({ profile = p.profile and tostring(p.profile) or nil, pin = p.pin, agent = p.agent })
     if id then result = { id = id } end
   elseif req.method == 'focus.cycle' then
     result, err = cycle(p.dir)

@@ -19,8 +19,9 @@ end
 
 -- native Windows
 do
-  local d = platform.defaults('windows', env({ APPDATA = 'C:\\Users\\player\\AppData\\Roaming', HOME = '/should/not/be/used' }))
+  local d = platform.defaults('windows', env({ APPDATA = 'C:\\Users\\player\\AppData\\Roaming', HOME = '/should/not/be/used', COMPUTERNAME = 'GAMING-PC' }))
   assert(d.agent.host == '127.0.0.1' and d.agent.port == 7777 and d.agent.token == '')
+  assert(d.agent.label == 'GAMING-PC')
   assert(d.agent.token_file == 'C:\\Users\\player\\AppData\\Roaming\\ghostty-agent\\token', d.agent.token_file)
   assert(d.profiles[1].transport == 'agent', 'the default profile goes through the agent')
   local agents = 0
@@ -60,6 +61,9 @@ local function assert_classic(d, home)
     assert(table.concat(p.command, ' ') == table.concat(w[3], ' '), 'command ' .. i)
   end
 end
+assert(platform.host_label(env({ HOSTNAME = 'fedora', COMPUTERNAME = 'ignored' })) == 'fedora')
+assert(platform.host_label(env({ HOSTNAME = 'bad host', COMPUTERNAME = 'ALIENWARE' })) == 'ALIENWARE')
+assert(platform.host_label(env({ HOSTNAME = '' })) == 'this host')
 assert_classic(platform.defaults('wine', env({ HOME = '/home/player' })), '/home/player')
 assert_classic(platform.defaults('linux', env({ HOME = '/home/player' })), '/home/player')
 -- Under Wine the home is WINEHOMEDIR (a Windows process there has no HOME), as a

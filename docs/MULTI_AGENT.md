@@ -1,18 +1,20 @@
 # Many agents, and the transport under them
 
-> Status: this is the required direction. Nothing here is implemented yet, and
-> nothing has been observed in game. What is true today is in the first section.
+> Status: named links, remote terminal sessions, per-link reconnect/routing,
+> profile selection, the dropdown/Agents launchers and IPC discovery are
+> implemented. The iroh stream split and moq work described later remain future
+> work. Multi-host terminals still need an in-game observation pass.
 
-Today the plugin talks to exactly one `ghostty-agent`, over one TCP connection,
-and everything that says "agent" means that one. `lua/windows.lua:22` says so
-outright, and `core/app/state.nelua:135-145` is the shape of it: a single
-`agent: AgentClient` with nine sibling scalars tracking that connection.
+The plugin keeps `CONFIG.agent` as the link named `local` and opens every entry
+of `CONFIG.agents` as another independently pumped link. Terminal session ids,
+job ids, pending OPEN replies, clipboard replies and streamed data are all
+scoped to the link that produced them.
 
 The consequence the owner hit: pointing `CONFIG.agent` at another machine to
 get its GPU moved the *terminals* there too, because a profile with
 `transport = 'agent'` means "the agent", and there is only one.
 
-Three changes, in this order. Each is useful on its own.
+The implemented shape and remaining transport work are below.
 
 ## 1. An agent is a named link, not the connection
 
@@ -20,7 +22,8 @@ Three changes, in this order. Each is useful on its own.
 
 ```
 AgentLink = @record{
-  name: string,           -- 'local', 'fedora', … ; 'local' always exists
+  name: string,           -- 'local', 'workstation', … ; 'local' always exists
+  label: string,          -- display only; defaults to name
   client: AgentClient,
   enabled: boolean,
   last_try: float64,
@@ -46,11 +49,22 @@ per-link loops.
 Config:
 
 ```lua
-agent = { host = '127.0.0.1', port = 7777, token_file = … }   -- still works: the 'local' link
+agent = { label = 'Game PC', host = '127.0.0.1', port = 7777, token_file = … }
 agents = {
-  fedora = { host = '100.100.1.10', port = 7788, token_file = … },
+  workstation = { label = 'Workstation', host = '100.100.1.10', port = 7788, token_file = … },
 }
 ```
+
+`local` and `workstation` are stable routing IDs. Labels are only for menus,
+tabs and window titles, so users can choose friendly names without making
+those names part of the protocol or the shipped defaults.
+
+The Settings window's **Agent hosts** section writes a separate private
+`agent-hosts.lua` overlay. Pairing runs `ghostty-agent pair` through
+non-interactive SSH, so the bearer token crosses the encrypted SSH connection
+but never an argv or the game log. The overlay is applied after `init.lua`;
+manually configured keys win, and generated hosts receive bash and tmux
+profiles when no pinned profiles already exist for that key.
 
 ## 2. Shells are local unless they say otherwise
 
@@ -60,10 +74,10 @@ A terminal profile gains `agent`:
 { name = 'shell', transport = 'agent', agent = 'local', command = { '/bin/bash', '-l' } },
 ```
 
-**`agent` defaults to `'local'`.** That is the rule the owner asked for: where
-window panels come from must never decide where a shell runs. A profile that
-wants a remote shell names the link, which is clearer than the ssh profiles
-that do it by hand today.
+An empty `agent` makes an agent profile portable and offers it on every link.
+Use `agent = 'local'` or a `CONFIG.agents` key for host-specific commands and
+for a deterministic default. Where a window panel came from does not silently
+retarget an explicitly pinned profile.
 
 `M.agent` in `lua/windows.lua` becomes the *window* default, and
 `/window run --agent NAME CMD`, `/window pull --agent NAME` pick per call.
@@ -97,7 +111,7 @@ A Rust `staticlib`, `ghostty-iroh`, exposing the same eight-function C ABI, so
 QUIC with hole punching, a relay fallback, and TLS identity by public key.
 
 * The agent gets `--iroh` and prints its NodeId; `--listen` keeps working.
-* Config: `agents = { fedora = { node = 'k51q…' } }` beside `host`/`port`.
+* Config: `agents = { workstation = { node = 'k51q…' } }` beside `host`/`port`.
 * The token stays. iroh authenticates the *machine*; the token authorises the
   connection, and dropping it would make a NodeId a bearer credential.
 * Under Wine: the plugin core is a PE DLL, so the crate cross-compiles to
@@ -190,8 +204,8 @@ anything today, and adding it does not need a new transport.
 ## Order, and what proves each step
 
 1. `AgentLink` + `host.agents`, one link, no behaviour change. Green tests.
-2. A second link from config; `/window --agent`; profiles default to `local`.
-   Proof: a shell on `local` while a panel streams from `fedora`.
+2. A second link from config; `/window --agent`; profiles can be portable or pinned.
+   Proof: a shell on `local` while a panel streams from `workstation`.
 3. iroh backend behind `net.nelua`, both ends, still one stream. Proof: a panel
    from a machine with no tailnet route and no port forward.
 4. Per-window QUIC streams. Proof: a KEY frame on one panel not stalling typing

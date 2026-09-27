@@ -12,6 +12,8 @@ local themes = require('themes')
 local tooltips = require('tooltips')
 local gallery = require('gallery')
 local agentcaps = require('agentcaps')
+local agenthosts = require('agenthosts')
+local controllers = require('controllers')
 
 local S = {}
 
@@ -28,6 +30,9 @@ S.schema = {
     { 'toggle_mods', 'combo', MODS, 'Dropdown toggle modifiers (+ `)' },
     { 'world_toggle_mods', 'combo', MODS, 'World terminals toggle modifiers (+ `)' },
     { 'toggle_gamepad_button', 'combo', PAD, 'Controller button (tap / hold / double tap; create, ps = DualSense over HID)' },
+    { 'controller.enabled', 'checkbox', 'Controller input in a focused terminal' },
+    { 'controller.layout', 'combo', controllers.order, 'Controller layout (custom uses controller.mapping)' },
+    { 'controller.capture', 'checkbox', 'Keep controller input out of the game while focused (never moves the mouse)' },
     { 'touchpad_keys', 'checkbox', 'DualSense touchpad types into a focused terminal (create or ps)' },
     { 'voice_mic', 'mic', 'Voice input listens to' },
   } },
@@ -125,18 +130,6 @@ S.schema = {
     { 'world.light.light_color_from_tint', 'checkbox', 'Cast light takes the time-of-day tint' },
     { 'world.light.shadows', 'checkbox', 'Cast light throws shadows (expensive)' },
     { 'world.shadows.enabled', 'checkbox', 'Screens cast shadows (experimental)' },
-  } },
-  { 'Character animation', {
-    { 'animation.enabled', 'checkbox', 'Hold a pose while a terminal is out or focused' },
-    { 'animation.style', 'combo', { 'phone', 'desk' }, 'Style (phone in hand, or working at a desk)' },
-    { 'animation.desk.scale', 'combo', { 'normal', 'fit', '0.75', '1.25', '1.5', '2' }, 'Desk size (normal = sized for a Midlander)' },
-    { 'animation.desk.chair_scale', 'combo', { 'fit', 'normal', '0.75', '1.25', '1.5', '2' }, 'Chair size' },
-    { 'animation.reactions', 'checkbox', 'React to bells, failed and long commands, output and idling' },
-    { 'animation.preset', 'combo', { 'device', 'book', 'pen', 'photograph', 'think', 'lookout' }, 'Pose' },
-    { 'animation.custom_timeline', 'slider_int', 0, 40000, 'Custom ActionTimeline id (0 = use the pose)' },
-    { 'animation.typing_speed', 'slider', 1, 4, 'Pose animation speed while typing' },
-    { 'animation.energy_decay', 'slider', 0.5, 6, 'How fast typing energy fades' },
-    { 'animation.lock_movement', 'checkbox', 'Lock movement while holding (not recommended)' },
   } },
   { 'Bell', {
     { 'bell.enabled', 'checkbox', 'Visual bell when a program rings (BEL)' },
@@ -253,6 +246,7 @@ function S.apply(config)
   -- ...and the gallery prompt, whose saved choices land in its module
   if config.gallery == nil then config.gallery = gallery end
   if type(config.theme) ~= 'string' or config.theme == '' then config.theme = themes.DEFAULT end
+  agenthosts.apply(config)
   capture_defaults(config)
   local chunk = loadfile(file())
   if chunk then
@@ -546,6 +540,7 @@ end
 function S.draw_agent(ui)
   if not (ghostty and ghostty.agent_status) then return end
   agentcaps.draw(ui, ghostty.agent_status())
+  agenthosts.draw(ui)
 end
 
 function S.draw_status(ui)

@@ -311,7 +311,7 @@ says:
 
 ```lua
 agents = {
-  fedora = { node = 'k51q…', token_file = … },      -- iroh
+  workstation = { node = 'k51q…', token_file = … }, -- iroh
   nuc    = { host = '100.100.1.10', port = 7788 }, -- TCP, unchanged
 }
 ```

@@ -8,6 +8,19 @@
 --   'linux', 'macos', 'posix'  a host build (the tests)
 local M = {}
 
+-- Human-facing name for the agent beside the game. Under Wine, HOSTNAME is
+-- inherited from the Linux machine, so the default link says e.g. "fedora"
+-- instead of the ambiguous "local". Native Windows normally supplies
+-- COMPUTERNAME. Configuration may still override agent.label explicitly.
+function M.host_label(getenv)
+  getenv = getenv or os.getenv
+  for _, key in ipairs({ 'HOSTNAME', 'COMPUTERNAME' }) do
+    local value = getenv(key)
+    if value and value ~= '' and #value <= 64 and value:match('^[%w_.%-]+$') then return value end
+  end
+  return 'this host'
+end
+
 function M.name()
   if type(ghostty) == 'table' and type(ghostty.platform) == 'function' then return ghostty.platform() end
   return 'unknown'
@@ -50,6 +63,7 @@ function M.defaults(platform, getenv)
     if not appdata or appdata == '' then appdata = (getenv('USERPROFILE') or '') .. '\\AppData\\Roaming' end
     return {
       agent = {
+        label = M.host_label(getenv),
         host = '127.0.0.1',
         port = 7777,
         token = '',
@@ -69,6 +83,7 @@ function M.defaults(platform, getenv)
   end
   return {
     agent = {
+      label = M.host_label(getenv),
       host = '127.0.0.1',
       port = 7777,
       token = '',

@@ -1,0 +1,92 @@
+-- PNG decoding for Kitty graphics. libghostty owns the returned RGBA bytes;
+-- WIC is present on every Windows version Dalamud supports and under Wine, so
+-- the plugin does not ship another image codec.
+require 'core.ghostty'
+
+## if ccinfo.is_windows then
+## cdefine 'COBJMACROS'
+## cinclude '<windows.h>'
+## cinclude '<objbase.h>'
+## cinclude '<wincodec.h>'
+## linklib 'ole32'
+## linklib 'windowscodecs'
+
+local HRESULT <cimport, nodecl> = @clong
+local GUID <cimport, nodecl> = @record{ Data1: uint32, Data2: uint16, Data3: uint16, Data4: [8]uint8 }
+local IWICImagingFactory <cimport, nodecl, forwarddecl> = @record{}
+local IWICStream <cimport, nodecl, forwarddecl> = @record{}
+local IWICBitmapDecoder <cimport, nodecl, forwarddecl> = @record{}
+local IWICBitmapFrameDecode <cimport, nodecl, forwarddecl> = @record{}
+local IWICFormatConverter <cimport, nodecl, forwarddecl> = @record{}
+local CLSID_WICImagingFactory: GUID <cimport, nodecl, const>
+local IID_IWICImagingFactory: GUID <cimport, nodecl, const>
+local GUID_WICPixelFormat32bppRGBA: GUID <cimport, nodecl, const>
+local CLSCTX_INPROC_SERVER: uint32 <cimport, nodecl, const>
+local COINIT_MULTITHREADED: uint32 <cimport, nodecl, const>
+local WICDecodeMetadataCacheOnLoad: cint <cimport, nodecl, const>
+local WICBitmapDitherTypeNone: cint <cimport, nodecl, const>
+local WICBitmapPaletteTypeCustom: cint <cimport, nodecl, const>
+
+local function CoInitializeEx(reserved: pointer, coinit: uint32): HRESULT <cimport, nodecl> end
+local function CoCreateInstance(clsid: *GUID, outer: pointer, context: uint32, iid: *GUID, out: *pointer): HRESULT <cimport, nodecl> end
+local function IWICImagingFactory_CreateStream(self: *IWICImagingFactory, out: **IWICStream): HRESULT <cimport, nodecl> end
+local function IWICImagingFactory_CreateDecoderFromStream(self: *IWICImagingFactory, stream: *IWICStream, vendor: *GUID, cache: cint, out: **IWICBitmapDecoder): HRESULT <cimport, nodecl> end
+local function IWICImagingFactory_CreateFormatConverter(self: *IWICImagingFactory, out: **IWICFormatConverter): HRESULT <cimport, nodecl> end
+local function IWICStream_InitializeFromMemory(self: *IWICStream, data: *[0]uint8, len: uint32): HRESULT <cimport, nodecl> end
+local function IWICBitmapDecoder_GetFrame(self: *IWICBitmapDecoder, index: uint32, out: **IWICBitmapFrameDecode): HRESULT <cimport, nodecl> end
+local function IWICFormatConverter_Initialize(self: *IWICFormatConverter, source: pointer, format: *GUID, dither: cint, palette: pointer, alpha: float64, paltype: cint): HRESULT <cimport, nodecl> end
+local function IWICFormatConverter_GetSize(self: *IWICFormatConverter, w: *uint32, h: *uint32): HRESULT <cimport, nodecl> end
+local function IWICFormatConverter_CopyPixels(self: *IWICFormatConverter, rect: pointer, stride: uint32, len: uint32, pixels: *[0]uint8): HRESULT <cimport, nodecl> end
+local function IWICImagingFactory_Release(self: *IWICImagingFactory): culong <cimport, nodecl> end
+local function IWICStream_Release(self: *IWICStream): culong <cimport, nodecl> end
+local function IWICBitmapDecoder_Release(self: *IWICBitmapDecoder): culong <cimport, nodecl> end
+local function IWICBitmapFrameDecode_Release(self: *IWICBitmapFrameDecode): culong <cimport, nodecl> end
+local function IWICFormatConverter_Release(self: *IWICFormatConverter): culong <cimport, nodecl> end
+
+local function kitty_decode_png(userdata: pointer, allocator: *GhosttyAllocator, data: *[0]uint8, len: usize, out: *GhosttySysImage): boolean
+  if data == nilptr or out == nilptr or len == 0 or len > 0xffffffff_u64 then return false end
+  CoInitializeEx(nilptr, COINIT_MULTITHREADED) -- S_OK, S_FALSE and changed-mode all permit WIC on this thread
+  local factory: *IWICImagingFactory = nilptr
+  if CoCreateInstance(&CLSID_WICImagingFactory, nilptr, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, (@*pointer)(&factory)) < 0 then return false end
+  local stream: *IWICStream = nilptr
+  local decoder: *IWICBitmapDecoder = nilptr
+  local frame: *IWICBitmapFrameDecode = nilptr
+  local conv: *IWICFormatConverter = nilptr
+  local ok = IWICImagingFactory_CreateStream(factory, &stream) >= 0
+  if ok then ok = IWICStream_InitializeFromMemory(stream, data, (@uint32)(len)) >= 0 end
+  if ok then ok = IWICImagingFactory_CreateDecoderFromStream(factory, stream, nilptr, WICDecodeMetadataCacheOnLoad, &decoder) >= 0 end
+  if ok then ok = IWICBitmapDecoder_GetFrame(decoder, 0, &frame) >= 0 end
+  if ok then ok = IWICImagingFactory_CreateFormatConverter(factory, &conv) >= 0 end
+  if ok then ok = IWICFormatConverter_Initialize(conv, frame, &GUID_WICPixelFormat32bppRGBA, WICBitmapDitherTypeNone, nilptr, 0, WICBitmapPaletteTypeCustom) >= 0 end
+  local w: uint32, h: uint32 = 0, 0
+  if ok then ok = IWICFormatConverter_GetSize(conv, &w, &h) >= 0 end
+  local bytes: usize = 0
+  if ok and w > 0 and h > 0 and w <= 16384 and h <= 16384 then
+    bytes = (@usize)(w) * (@usize)(h) * 4
+    ok = bytes <= 0xffffffff_u64 and bytes // 4 // w == h
+  else ok = false end
+  local pixels: *[0]uint8 = nilptr
+  if ok then pixels = ghostty_alloc(allocator, bytes); ok = pixels ~= nilptr end
+  if ok then ok = IWICFormatConverter_CopyPixels(conv, nilptr, w * 4, (@uint32)(bytes), pixels) >= 0 end
+  if not ok and pixels ~= nilptr then ghostty_free(allocator, pixels, bytes); pixels = nilptr end
+  if conv ~= nilptr then IWICFormatConverter_Release(conv) end
+  if frame ~= nilptr then IWICBitmapFrameDecode_Release(frame) end
+  if decoder ~= nilptr then IWICBitmapDecoder_Release(decoder) end
+  if stream ~= nilptr then IWICStream_Release(stream) end
+  IWICImagingFactory_Release(factory)
+  if not ok then return false end
+  $out = GhosttySysImage{ width = w, height = h, data = pixels, data_len = bytes }
+  return true
+end
+## else
+local function kitty_decode_png(userdata: pointer, allocator: *GhosttyAllocator, data: *[0]uint8, len: usize, out: *GhosttySysImage): boolean
+  return false
+end
+## end
+
+local kitty_png_ready: boolean = false
+global function kitty_png_init(): void
+  if kitty_png_ready then return end
+  local cb = kitty_decode_png
+  kitty_png_ready = ghostty_sys_set(GHOSTTY_SYS_OPT_DECODE_PNG, (@pointer)(cb)) == GHOSTTY_SUCCESS
+end

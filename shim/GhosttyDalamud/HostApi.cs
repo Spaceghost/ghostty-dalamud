@@ -105,6 +105,7 @@ internal static unsafe class HostApi
         Api->PushMonoFontPx = &PushMonoFontPx;
         Api->NearbyCharacters = &NearbyCharacters;
         Api->RaycastMode    = &RaycastMode;
+        Api->GamepadNav     = &GamepadNav;
         Api->CastInfo       = &CastInfo;
     }
 
@@ -579,6 +580,18 @@ internal static unsafe class HostApi
     private static int GamepadDown(int mask)
     {
         try { return Plugin.Gamepad.Raw((GamepadButtons)mask) > 0 ? 1 : 0; } catch { return 0; }
+    }
+
+    // EnableGamepadNav, rather than the ImGui flag alone, activates Dalamud's
+    // poll detour. That detour snapshots input for plugins and then zeros both
+    // sticks and gamepad buttons before FFXIV sees them.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int GamepadNav(int enabled)
+    {
+        try {
+            if (enabled >= 0) Plugin.Gamepad.EnableGamepadNav = enabled != 0;
+            return Plugin.Gamepad.EnableGamepadNav ? 1 : 0;
+        } catch { return 0; }
     }
 
     // The game's walk input (same hook as vnavmesh's OverrideMovement) --------------------------

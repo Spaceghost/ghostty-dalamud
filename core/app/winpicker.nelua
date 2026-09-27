@@ -125,7 +125,7 @@ end
 
 -- What the Run: box says right now, split the way the commands split it: the
 -- text to match, and the machine to match it on. Typing narrows the list, so
--- "foot @fedora" shows fedora's rows that mention foot.
+-- "foot @workstation" shows that link's rows which mention foot.
 local function picker_query(): (string, string)
   local n: usize = 0
   while n < #run_buf and run_buf[n] ~= 0 do n = n + 1 end

@@ -364,6 +364,9 @@ global function glyphfb_frame(device: pointer): void
   end
 end
 
+-- Shared by terminal image protocols: the current Dalamud D3D11 device.
+global function terminal_image_device(): pointer return fb.device end
+
 -- Whether `cp` can be drawn from here in a cell of this size, `span` cells
 -- wide (rasterizing and uploading it on first use).
 global function glyphfb_has(cp: uint32, cell_w: float32, cell_h: float32, span: integer): boolean

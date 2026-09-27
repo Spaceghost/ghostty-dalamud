@@ -88,6 +88,8 @@ echo "--- test_ask_rich (the /ask answer: markdown, links, layout, drawing)"
 GHOSTTY_TEST_SCRATCH="$ROOT/build/test-scratch/ask-rich" "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_ask_rich.lua "$ROOT"
 echo "--- test_agentcaps (what the Settings tab says about the agent's features)"
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_agentcaps.lua
+echo "--- test_agenthosts (private host overlay and pairing line)"
+"$ROOT/vendor/nelua-lang/nelua-lua" tests/test_agenthosts.lua
 if [[ "${SKIP_SHIM:-0}" != 1 ]] && command -v dotnet >/dev/null; then
   echo "--- native cache isolation (C#, no game)"
   DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 dotnet run --project tests/cache/CacheTests.csproj -c Release
@@ -122,6 +124,7 @@ run test_capture_mac
 run test_desktop_entries "$ROOT/build/test-scratch"
 run test_agent_browser
 run test_render
+run test_kittygfx
 hrun test_glyphfb "$ROOT" "${GHOSTTY_TEST_CJK_FONT:-}"
 run test_session
 run test_procpipe
