@@ -1,9 +1,10 @@
 # Flat windows in the world ("adopt")
 
-**Status: host tests only. Not yet observed in game.** Nothing below has run
-inside FFXIV; the frame ordering, the hooks and the shim forwarders are
-designed against Dear ImGui 1.88 (Dalamud's cimgui) and Dalamud's API, and
-checked only against fakes (`tests/test_adopt.nelua`, `tests/test_adopt_app.nelua`).
+**Status:** Game chat and Mappy adoption, ground placement, release/reopen,
+and saved placement were observed in FFXIV on 2026-09-27. Other window paths
+and the detailed frame-ordering behavior below remain host-tested against
+Dear ImGui 1.88 (Dalamud's cimgui) and Dalamud's API
+(`tests/test_adopt.nelua`, `tests/test_adopt_app.nelua`).
 
 Other plugins' ImGui windows (Mappy's map, ChatTwo, any window) and the
 game's own chat log can leave the flat UI and become world panels: a pet by
@@ -30,8 +31,10 @@ view, not your character's heading, and turns as the camera turns. It follows
 you while walking. `/term pin pet` restores the floating placement. Ground
 placement works for any world panel, including terminals, and is available as
 `panel.place` with `{"pin":"ground"}`. Chat and Mappy remember the ground choice
-when released, reopened or reloaded; choosing pet clears that preference. Host
-tests only; not yet tried in game.
+when released, reopened or reloaded; choosing pet clears that preference. A
+level first-person camera can look over a panel centered at your feet. Look
+down or zoom out to third person to see it; your character may cover its
+center from above.
 
 Hold **Alt** (`CONFIG.adopt.pull_modifier`) over a flat window: a glowing
 "pull into world" grip shows above its top edge (drawn on ImGui's foreground
