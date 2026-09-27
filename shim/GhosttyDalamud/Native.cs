@@ -79,6 +79,8 @@ internal unsafe struct GuHostApi
     public delegate* unmanaged[Cdecl]<float, float, float, float, float, float, float, int, float*, float*, float*, int> RaycastMode;
     // query/set IGamepadState.EnableGamepadNav (-1 query, 0 off, 1 on)
     public delegate* unmanaged[Cdecl]<int, int> GamepadNav;
+    // what your character is casting (action id, seconds in, seconds long), for pets to follow a teleport
+    public delegate* unmanaged[Cdecl]<uint*, float*, float*, int> CastInfo;
 }
 
 // Mirrors GuCharacter in core/world.nelua.

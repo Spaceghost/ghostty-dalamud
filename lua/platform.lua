@@ -13,6 +13,25 @@ function M.name()
   return 'unknown'
 end
 
+-- The Linux/macOS agent's token file as this build can open it.
+--
+-- Under Wine the plugin reads files through Windows APIs, and a Windows
+-- process there has no HOME: Wine hands it WINEHOMEDIR instead, the host home
+-- as an NT path ("\??\Z:\home\player", or "\??\unix\home\player" in a prefix
+-- without a Z: drive). HOME and then USERPROFILE are for host builds, and for
+-- Wines too old to set WINEHOMEDIR; USERPROFILE under Wine is the prefix's own
+-- C:\users\<name>, never where the agent writes its token.
+function M.agent_token_file(platform, getenv)
+  getenv = getenv or os.getenv
+  local wine_home = platform == 'wine' and getenv('WINEHOMEDIR') or nil
+  if wine_home and wine_home ~= '' then
+    local path = wine_home:gsub('^\\%?%?\\', '')
+    if path:sub(1, 5) == 'unix\\' then path = '\\\\?\\' .. path end
+    return path .. '\\.config\\ghostty-agent\\token'
+  end
+  return (getenv('HOME') or getenv('USERPROFILE') or '') .. '/.config/ghostty-agent/token'
+end
+
 -- The ghostty-agent connection and profiles for `platform`. `getenv` reads
 -- environment variables (os.getenv; the tests pass their own).
 --
@@ -48,13 +67,12 @@ function M.defaults(platform, getenv)
       },
     }
   end
-  local home = getenv('HOME') or getenv('USERPROFILE') or ''
   return {
     agent = {
       host = '127.0.0.1',
       port = 7777,
       token = '',
-      token_file = home .. '/.config/ghostty-agent/token',
+      token_file = M.agent_token_file(platform, getenv),
     },
     profiles = {
       -- /bin/sh is the one shell a POSIX agent host is guaranteed to have, so

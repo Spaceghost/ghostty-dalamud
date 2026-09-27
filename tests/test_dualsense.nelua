@@ -1,5 +1,6 @@
 -- The DualSense Create button: report parsing (USB, Bluetooth, Bluetooth
--- simple), edge detection, ids in HID interface paths, and the reader against
+-- simple), the touchpad's finger and swipes as arrow keys, the keys it types,
+-- edge detection, ids in HID interface paths, and the reader against
 -- the fake HID devices of core/sys/hid.nelua (scan, devices passed over by
 -- their path, open, reads, unplug, rescans backing off, device arrivals,
 -- close).
@@ -84,10 +85,10 @@ do
   assert(b == DS_TOUCHPAD, 'USB touchpad click: byte 10 bit 0x02')
   r = usb_report(0xF0, 0xCF, 0x04) -- face buttons, L1 R1 L2 R2 L3 R3, mute
   l, b = parse(&r, 64)
-  assert(l == DsLayout.Usb and b == 0, 'every other button reads as nothing')
+  assert(l == DsLayout.Usb and b == DS_MUTE, 'every other button reads as nothing; mute is the microphone')
   r = usb_report(0xF0, 0xFF, 0x07)
   l, b = parse(&r, 64)
-  assert(b == DS_CREATE | DS_OPTIONS | DS_PS | DS_TOUCHPAD)
+  assert(b == DS_CREATE | DS_OPTIONS | DS_PS | DS_TOUCHPAD | DS_MUTE)
   print('usb OK')
 end
 
@@ -437,5 +438,150 @@ do
   hid_fake.watch_fails, hid_fake.arrived = false, false
   for i = 0, < math.min(nlogs, 64) do logs[i]:destroy() end
   print('reader OK')
+end
+-- The touchpad: the first finger in USB and Bluetooth reports ------------------------
+do
+  local function with_touch(r: *[0]uint8, at: usize, touching: boolean, x: integer, y: integer): void
+    r[at] = touching and 0x05 or 0x85 -- finger id 5; bit 0x80: lifted
+    r[at + 1] = (@uint8)(x & 0xff)
+    r[at + 2] = (@uint8)(((x >> 8) & 0x0f) | ((y & 0x0f) << 4))
+    r[at + 3] = (@uint8)(y >> 4)
+  end
+  local u = usb_report(0, 0, 0)
+  with_touch(&u, 33, true, 1919, 1079)
+  local l, _ = parse(&u, 64)
+  local on, x, y = dualsense_touch(&u, 64, l)
+  assert(l == DsLayout.Usb and on and x == 1919 and y == 1079, 'USB: the far corner')
+  with_touch(&u, 33, true, 300, 17)
+  on, x, y = dualsense_touch(&u, 64, l)
+  assert(on and x == 300 and y == 17, 'USB: 12 bits each')
+  with_touch(&u, 33, false, 300, 17)
+  on = dualsense_touch(&u, 64, l)
+  assert(not on, 'USB: lifted')
+  -- Bluetooth: one byte later, and the CRC over it
+  local b = bt_report(0, 0, 0)
+  with_touch(&b, 34, true, 960, 540)
+  local crc = dualsense_bt_crc(&b)
+  b[74], b[75], b[76], b[77] = (@uint8)(crc & 0xff), (@uint8)((crc >> 8) & 0xff), (@uint8)((crc >> 16) & 0xff), (@uint8)(crc >> 24)
+  l = parse(&b, 78)
+  on, x, y = dualsense_touch(&b, 78, l)
+  assert(l == DsLayout.Bluetooth and on and x == 960 and y == 540, 'Bluetooth: the middle')
+  local sr = simple_report(0, 0, 0)
+  assert(not dualsense_touch(&sr, 10, DsLayout.Simple), 'a simple report has no positions')
+  -- PS and the touchpad click among the buttons
+  local ps = usb_report(0, 0, 0x03)
+  local _, bits = parse(&ps, 64)
+  assert((bits & DS_PS) ~= 0 and (bits & DS_TOUCHPAD) ~= 0 and (bits & DS_MUTE) == 0, 'PS and the touchpad click')
+  local mute = usb_report(0, 0, 0x04)
+  _, bits = parse(&mute, 64)
+  assert(bits == DS_MUTE, 'the microphone button')
+  print('touch parsing OK')
+end
+
+-- Swipes as arrows ---------------------------------------------------------------------
+do
+  -- a finger drawn from (fx, fy) to (tx, ty) over `frames` frames at 60 fps from t,
+  -- counting the arrows it gives
+  local function swipe(st: *TouchSwipeState, t: float64, fx: integer, fy: integer, tx: integer, ty: integer, frames: integer): (float64, integer, integer, integer, integer)
+    local up, down, left, right = 0, 0, 0, 0
+    for i = 0, frames do
+      local x = fx + (tx - fx) * i // frames
+      local y = fy + (ty - fy) * i // frames
+      local d = touch_swipe_update(st, true, x, y, t)
+      if d == TouchDir.Up then up = up + 1 elseif d == TouchDir.Down then down = down + 1
+      elseif d == TouchDir.Left then left = left + 1 elseif d == TouchDir.Right then right = right + 1 end
+      t = t + 1 / 60
+    end
+    return t, up, down, left, right
+  end
+  local st: TouchSwipeState
+  local t: float64 = 10
+  -- a short flick right: one arrow; lifting gives nothing
+  local u, d, l, r
+  t, u, d, l, r = swipe(&st, t, 900, 500, 1180, 520, 6)
+  assert(r == 1 and u + d + l == 0, 'a flick: one arrow right')
+  assert(touch_swipe_update(&st, false, 0, 0, t) == TouchDir.None)
+  -- a long swipe left, slightly slanted: several arrows left, none up or down
+  t, u, d, l, r = swipe(&st, t, 1500, 400, 300, 470, 20)
+  assert(l == 5 and u + d + r == 0, 'a long swipe: five left, no slant arrows')
+  touch_swipe_update(&st, false, 0, 0, t)
+  -- down, then up: one each (y grows downward)
+  t, u, d, l, r = swipe(&st, t, 960, 300, 960, 500, 5)
+  assert(d == 1 and u + l + r == 0, 'down')
+  touch_swipe_update(&st, false, 0, 0, t)
+  t, u, d, l, r = swipe(&st, t, 960, 700, 960, 500, 5)
+  assert(u == 1 and d + l + r == 0, 'up')
+  -- a finger resting in the middle gives nothing, however long
+  local n = 0
+  for i = 0, 120 do if touch_swipe_update(&st, true, 960, 540, t) ~= TouchDir.None then n = n + 1 end t = t + 1 / 60 end
+  assert(n == 0, 'a resting finger types nothing')
+  touch_swipe_update(&st, false, 0, 0, t)
+  -- a swipe right that stays at the right edge: repeats after the hold time
+  local x0: integer = 1500
+  t, u, d, l, r = swipe(&st, t, x0, 540, 1800, 540, 4)
+  assert(r == 1)
+  local reps, first = 0, -1.0
+  local start = t
+  for i = 0, 60 do
+    if touch_swipe_update(&st, true, 1800, 540, t) == TouchDir.Right then
+      reps = reps + 1
+      if first < 0 then first = t - start end
+    end
+    t = t + 1 / 60
+  end
+  assert(first >= TOUCH_HOLD_S - 0.1 and reps >= 6 and reps <= 10, 'held at the edge: repeats after the hold')
+  touch_swipe_update(&st, false, 0, 0, t)
+  -- the same swipe stopping short of the edge: no repeats
+  t, u, d, l, r = swipe(&st, t, 700, 540, 1000, 540, 4)
+  reps = 0
+  for i = 0, 60 do if touch_swipe_update(&st, true, 1000, 540, t) ~= TouchDir.None then reps = reps + 1 end t = t + 1 / 60 end
+  assert(r == 1 and reps == 0, 'held in the middle: no repeats')
+  touch_swipe_update(&st, false, 0, 0, t)
+  -- laid on the top edge and held still: up, repeating, after the edge hold
+  reps, first, start = 0, -1.0, t
+  for i = 0, 60 do
+    if touch_swipe_update(&st, true, 960, 100, t) == TouchDir.Up then
+      reps = reps + 1
+      if first < 0 then first = t - start end
+    end
+    t = t + 1 / 60
+  end
+  assert(first >= TOUCH_EDGE_HOLD_S - 0.02 and reps >= 3, 'held on the top edge: up, repeating')
+  touch_swipe_update(&st, false, 0, 0, t)
+  -- a click: the finger moves as it presses, which is not a swipe
+  touch_swipe_update(&st, true, 960, 540, t)
+  touch_swipe_reset(&st, 1300, 540, t)
+  assert(touch_swipe_update(&st, true, 1300, 540, t + 0.02) == TouchDir.None, 'reset: measured from where it is')
+  assert(pad_key_of_dir(TouchDir.Left) == PadKey.Left and pad_key_of_dir(TouchDir.None) == PadKey.None)
+  print('swipes OK')
+end
+
+local sink_got: [64]uint8
+local sink_n: usize = 0
+local function sink_collect(ctx: pointer, data: *[0]uint8, len: usize): void
+  for i: usize = 0, < len do sink_got[sink_n] = data[i] sink_n = sink_n + 1 end
+end
+
+-- The keys the touchpad types ---------------------------------------------------------
+do
+  local q: PadKeyQueue
+  for i = 1, PAD_KEYS_MAX + 5 do pad_keys_push(&q, PadKey.Up) end
+  assert(q.n == PAD_KEYS_MAX, 'the queue never overflows')
+  pad_keys_push(&q, PadKey.None)
+  q.n = 0
+  pad_keys_push(&q, PadKey.Up) pad_keys_push(&q, PadKey.Left) pad_keys_push(&q, PadKey.Enter)
+  pad_keys_push(&q, PadKey.Backspace) pad_keys_push(&q, PadKey.DeleteWord)
+  local enc: GhosttyKeyEncoder
+  local ev: GhosttyKeyEvent
+  assert(ghostty_key_encoder_new(nilptr, &enc) == GHOSTTY_SUCCESS and ghostty_key_event_new(nilptr, &ev) == GHOSTTY_SUCCESS)
+  pad_keys_send(&q, enc, ev, sink_collect, nilptr)
+  local got, ng = &sink_got, sink_n
+  local want: string = '\x1b[A\x1b[D\r\x7f\x17'
+  local have: string = string{data=(@*[0]byte)(got), size=ng}
+  assert(have == want, 'up, left, Enter, Backspace, Ctrl+W as a terminal types them')
+  assert(q.n == 0, 'sent and emptied')
+  ghostty_key_event_free(ev)
+  ghostty_key_encoder_free(enc)
+  print('touchpad keys OK')
 end
 print('OK')

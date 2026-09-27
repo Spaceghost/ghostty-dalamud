@@ -258,9 +258,9 @@ function M.world()
     if W and W.anchors then
       for id, a in pairs(W.anchors) do
         if a.kind == 'pet' and not a.hidden then
-          case('pet ' .. tostring(id), 'pass', string.format('swing %.2f, in %.2f, up %.2f, %s; %s; %d blinks',
-            a.m_off or 0, a.m_pull or 0, a.m_dy or 0, a.m_fit == false and 'no room found' or 'room',
-            a.m_blink or 'shown', a.m_blinks or 0))
+          local w = a.m_wall
+          case('pet ' .. tostring(id), 'pass', string.format('up %.2f; %s', a.m_dy or 0,
+            w and string.format('hung on a wall (its place %.2f clear of it)', w.clear) or 'free'))
         end
       end
     end

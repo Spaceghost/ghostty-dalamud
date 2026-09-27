@@ -106,6 +106,7 @@ internal static unsafe class HostApi
         Api->NearbyCharacters = &NearbyCharacters;
         Api->RaycastMode    = &RaycastMode;
         Api->GamepadNav     = &GamepadNav;
+        Api->CastInfo       = &CastInfo;
     }
 
     public static void Free()
@@ -387,6 +388,10 @@ internal static unsafe class HostApi
     // The game's HUD (core/hudmask.nelua): the rectangle and name of every
     // loaded addon that is shown, in AtkStage's order, at most `cap`. The core
     // decides which ones count. Returns how many were written.
+    // Shown means drawn, not only flagged visible: an addon the HUD layout or
+    // another plugin hides by hiding or fading out its root node (or the whole
+    // unit), or one moved entirely off the screen, still has IsVisible set,
+    // and cutting a panel for it left see-through squares where nothing is.
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static int HudRects(GuHudRect* rects, int cap)
     {
@@ -400,7 +405,7 @@ internal static unsafe class HostApi
                 var unit = list.Entries[i].Value;
                 if (unit == null) continue;
                 var a = new Dalamud.Game.NativeWrapper.AtkUnitBasePtr((nint)unit);
-                if (!a.IsVisible) continue;
+                if (!a.IsVisible || !Drawn(unit)) continue;
                 GuHudRect* r = &rects[n++];
                 r->X = a.X; r->Y = a.Y; r->W = a.ScaledWidth; r->H = a.ScaledHeight;
                 string name = a.Name ?? string.Empty; // addon names are ASCII
@@ -410,6 +415,22 @@ internal static unsafe class HostApi
             }
             return n;
         } catch { return 0; }
+    }
+
+    // Whether an addon puts anything on the screen: its root node shown and
+    // not faded out (the unit's own alpha too), and some of it on the screen.
+    private static bool Drawn(FFXIVClientStructs.FFXIV.Component.GUI.AtkUnitBase* unit)
+    {
+        var root = unit->RootNode;
+        if (root == null || !root->IsVisible() || root->Color.A == 0) return false;
+        if (unit->Alpha == 0 || root->ScaleX <= 0 || root->ScaleY <= 0) return false;
+        var dev = FFXIVClientStructs.FFXIV.Client.Graphics.Kernel.Device.Instance();
+        if (dev != null && dev->Width > 0 && dev->Height > 0) {
+            float x = unit->X, y = unit->Y;
+            float w = root->Width * root->ScaleX, h = root->Height * root->ScaleY;
+            if (x >= dev->Width || y >= dev->Height || x + w <= 0 || y + h <= 0) return false;
+        }
+        return true;
     }
 
     // The Noto Sans CJK file in Dalamud's asset folder, the same one the
@@ -773,6 +794,21 @@ internal static unsafe class HostApi
             if (c[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedInEvent]
                 || c[Dalamud.Game.ClientState.Conditions.ConditionFlag.OccupiedInQuestEvent]) f |= 8;
             return f;
+        } catch { return 0; }
+    }
+
+    // What your character is casting: the action id and how far along it is
+    // (seconds in, seconds long), so pets can follow a Teleport or Return in
+    // before the screen goes black. 0 when not casting.
+    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
+    private static int CastInfo(uint* action, float* current, float* total)
+    {
+        try {
+            if (Plugin.Objects.LocalPlayer is not { } p || !p.IsCasting) return 0;
+            *action = p.CastActionId;
+            *current = p.CurrentCastTime;
+            *total = p.TotalCastTime;
+            return 1;
         } catch { return 0; }
     }
 

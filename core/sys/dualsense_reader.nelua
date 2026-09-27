@@ -1,6 +1,6 @@
--- The Create button of a DualSense read straight from its HID input reports,
--- once per frame on the render thread: Dalamud's gamepad state has no Create
--- button. Reading never waits (core/sys/hid.nelua). Finding the controller
+-- A DualSense read straight from its HID input reports, once per frame on the
+-- render thread: the Create and PS buttons, the touchpad's click and its
+-- first finger, none of which Dalamud's gamepad state has. Reading never waits (core/sys/hid.nelua). Finding the controller
 -- makes synchronous calls, so it is kept rare: a pass looks at a few HID
 -- device interfaces per frame and opens only those whose path does not name
 -- another device; after a pass that found nothing the next one waits
@@ -33,6 +33,12 @@ global DualSenseReader = @record{
   dev: HidDevice,
   scan: HidScan,
   button: DsButtonState,     -- Create
+  ps: DsButtonState,         -- PS
+  click: DsButtonState,      -- the touchpad pressed down
+  mute: DsButtonState,       -- the microphone button
+  touching: boolean,         -- a finger on the touchpad in the newest report
+  touch_x: integer,          -- where (0..1919 from the left, 0..1079 from the top)
+  touch_y: integer,
   scanned: boolean,          -- a pass finished (or could not start), or the device closed, at `scanned_at`
   scanned_at: float64,
   wait_s: float64,           -- from `scanned_at` to the next pass; 0 once a device worked
@@ -92,6 +98,8 @@ global function dualsense_reader_poll(r: *DualSenseReader, now: float64, logfn: 
   local arrived = r.watching and hid_arrived() -- taken every frame: one that came while open is stale
   if not hid_is_open(&r.dev) then
     r.button.down, r.button.pressed = false, false
+    r.ps.down, r.ps.pressed, r.click.down, r.click.pressed, r.touching = false, false, false, false, false
+    r.mute.down, r.mute.pressed = false, false
     if arrived then r.arrived, r.wait_s = true, 0 end
     if r.scan.info == nilptr then
       if r.scanned and now >= r.scanned_at then
@@ -120,12 +128,13 @@ global function dualsense_reader_poll(r: *DualSenseReader, now: float64, logfn: 
     elseif step ~= HidStep.Opened then
       return
     end
-    r.button = {}
+    r.button, r.ps, r.click, r.mute = {}, {}, {}, {}
+    r.touching = false
     r.failed_again = false
     r.logged_layout, r.logged_ignored = DsLayout.None, false
     hid_set_input_buffers(&r.dev, DS_INPUT_BUFFERS) -- a failure only costs latency
     if not r.quiet then
-      ds_log(logfn, 1, 'DualSense %04x:%04x opened for the Create button (%d byte reports)', r.dev.vid, r.dev.pid, r.dev.input_len)
+      ds_log(logfn, 1, 'DualSense %04x:%04x opened for its Create and PS buttons and touchpad (%d byte reports)', r.dev.vid, r.dev.pid, r.dev.input_len)
     end
   end
   for _ = 1, DS_READS_PER_FRAME do
@@ -137,6 +146,8 @@ global function dualsense_reader_poll(r: *DualSenseReader, now: float64, logfn: 
       r.quiet = r.button.reports == 0 -- reopened and failing again: say it once
       hid_close(&r.dev)
       r.button.down, r.button.pressed = false, false
+      r.ps.down, r.ps.pressed, r.click.down, r.click.pressed, r.touching = false, false, false, false, false
+      r.mute.down, r.mute.pressed = false, false
       search_later(r, now) -- DS_RESCAN_MIN_S after a device that worked, longer each time one fails before its first report
       return
     elseif n == 0 then
@@ -144,6 +155,12 @@ global function dualsense_reader_poll(r: *DualSenseReader, now: float64, logfn: 
     end
     local ignored, reports = r.button.ignored, r.button.reports
     dualsense_feed(&r.button, &r.dev.buf, (@usize)(n), DS_CREATE)
+    if r.button.reports ~= reports then -- a DualSense input report: the rest of it too
+      dualsense_feed(&r.ps, &r.dev.buf, (@usize)(n), DS_PS)
+      dualsense_feed(&r.click, &r.dev.buf, (@usize)(n), DS_TOUCHPAD)
+      dualsense_feed(&r.mute, &r.dev.buf, (@usize)(n), DS_MUTE)
+      r.touching, r.touch_x, r.touch_y = dualsense_touch(&r.dev.buf, (@usize)(n), r.button.layout)
+    end
     if reports == 0 and r.button.reports > 0 then
       r.wait_s, r.logged_open_error = 0, 0 -- it works: searching starts quick again, a later open failure is news
     end
@@ -161,4 +178,17 @@ end
 -- Create for this frame (see dualsense_take): false while no controller is open.
 global function dualsense_reader_take(r: *DualSenseReader): boolean
   return dualsense_take(&r.button)
+end
+
+-- PS, and the touchpad click, for this frame (as dualsense_reader_take).
+global function dualsense_reader_take_ps(r: *DualSenseReader): boolean
+  return dualsense_take(&r.ps)
+end
+
+global function dualsense_reader_take_click(r: *DualSenseReader): boolean
+  return dualsense_take(&r.click)
+end
+
+global function dualsense_reader_take_mute(r: *DualSenseReader): boolean
+  return dualsense_take(&r.mute)
 end
