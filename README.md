@@ -12,10 +12,11 @@
 
 **Vote on what it does next: https://spacegho.st/mods/ffxiv/term/vote/**
 
-**Experimental developer preview.** This is an independent project, not an
-official Ghostty project. Acceptance into the official Dalamud plugin list has
-not been established. Host-side tests do not establish Windows, Wine, macOS,
-controller, or in-game compatibility. See [release readiness](docs/RELEASE_READINESS.md).
+This is an independent project, not an official Ghostty project. Acceptance
+into the official Dalamud plugin list has not been established. The changelog
+distinguishes features seen in game from those still awaiting verification; a
+stable release does not establish Windows, macOS, or controller compatibility. See
+[release readiness](docs/RELEASE_READINESS.md) for the evidence still needed.
 
 A [Ghostty](https://ghostty.org) terminal living inside Final Fantasy XIV, as
 a Dalamud plugin, so the game can double as a desktop. Press

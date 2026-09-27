@@ -1,7 +1,9 @@
 # Release readiness
 
-This is an independent experimental developer preview. Official Ghostty affiliation
-and official Dalamud-list acceptance are not claimed.
+This is an independent plugin. Official Ghostty affiliation and official
+Dalamud-list acceptance are not claimed. A stable tag identifies the release
+channel, not blanket in-game or cross-platform verification; the changelog
+distinguishes features seen in game from those still awaiting verification.
 
 ## Evidence required
 
@@ -21,9 +23,9 @@ with the maintainer rather than silently selecting one. Review native/game-facin
 functionality against current Dalamud submission requirements. Keep experimental
 shadow/HID features clearly labeled and opt-in where applicable.
 
-Keep the repository private until current files, all branch histories, generated
-binaries/PDBs, workflow records and any screenshots have been reviewed for private
-information. Rewriting Git history does not purge external clones or GitHub-managed
-cached pull-request objects. Preserve other contributors' attribution.
+The repository is public. Continue reviewing current files, branch histories,
+generated binaries/PDBs, workflow records and screenshots for private information
+before wider distribution. Rewriting Git history does not purge external clones or
+GitHub-managed cached pull-request objects. Preserve other contributors' attribution.
 
 CI defines reproducible checks; its presence is not evidence of a passing run.
