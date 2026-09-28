@@ -85,12 +85,14 @@ local function link_row(link: *AgentLink, i: integer): void
   if #link.client.platform > 0 then
     imgui.SameLine(0, -1)
     imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkFaint, 255))
-    local p: string
+    local sb: stringbuilder
+    sb:write('  ', link.client.platform)
     if link == &host.local_agent and platform_is_wine() then
-      p = '  ' .. link.client.platform .. ' agent; game via Wine'
+      sb:write(' agent; game via Wine')
     else
-      p = '  ' .. link.client.platform .. ' agent'
+      sb:write(' agent')
     end
+    local p = sb:promote()
     text(p)
     p:destroy()
     imgui.PopStyleColor(1)
