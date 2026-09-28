@@ -810,7 +810,8 @@ global function remotewin_event(link: *AgentLink, ev: *AgentEvent): void
     rw.s.title:destroy()
     rw.s.title = text:copy()
     panel_text(rw.s, 'waiting for the first frame of ', text)
-    sayf(LOG_INFO, 'window %d: stream %d opened: %s (%dx%d)', rw.s.id, ev.id, text, ev.w, ev.h)
+    sayf(LOG_INFO, 'window %d: stream %d opened: %s (%dx%d)', rw.s.id, ev.id, text,
+      (@integer)(ev.w), (@integer)(ev.h))
     never_sweep() -- a match text found a window that is kept out
     -- its key comes from the agent's list (learn_keys); new windows wait for
     -- that list too (in it the window carries our sid)

@@ -302,7 +302,7 @@ function Session:init(id: integer, profile: *Profile, cols: uint16, rows: uint16
         -- no `..` chains: without a GC every intermediate string would leak
         local sb: stringbuilder
         if #agent.node > 0 then sb:write('[ghostty] connecting to agent ', agent.node, ' ...\r\n')
-        else sb:writef('[ghostty] connecting to agent %s:%d ...\r\n', agent.host, agent.port) end
+        else sb:writef('[ghostty] connecting to agent %s:%d ...\r\n', agent.host, (@integer)(agent.port)) end
         local msg = sb:promote()
         self:feed_text(msg)
         msg:destroy()

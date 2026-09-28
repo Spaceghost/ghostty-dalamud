@@ -74,7 +74,7 @@ local function link_row(link: *AgentLink, i: integer): void
     key_row('iroh', link.client.node, '##node')
   else
     local sb: stringbuilder
-    sb:writef('tcp %s:%d', link.client.host, link.client.port)
+    sb:writef('tcp %s:%d', link.client.host, (@integer)(link.client.port))
     local line = sb:promote()
     imgui.PushStyleColorU32(ImGuiCol_Text, chrome_col(ChromeColor.InkFaint, 255))
     text(line)
