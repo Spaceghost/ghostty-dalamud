@@ -17,9 +17,9 @@ Statuses mean exactly what they mean in the Changelog tab in game:
 
 NEW and FIX have been seen working in game and await a release. BETA is built and merged but has not been verified in game yet; SOON is still being built.
 
-### Fixed
+### Merged, not yet verified in game
 
-* Ghostty no longer turns on Dalamud gamepad mode, which covered the game with a gray notice and blocked normal controller input. Controller shortcuts and terminal mappings now start off, so FFXIV keeps the full controller. You can opt in to Ghostty shortcuts in Settings without taking the controller away from the game.
+* Ghostty no longer turns on Dalamud gamepad mode, which covered the game with a gray notice and blocked normal controller input. Controller shortcuts and terminal mappings now start off, so FFXIV keeps the full controller. You can opt in to Ghostty shortcuts in Settings without taking the controller away from the game. Host tests pass; the fix has not yet been tried in game.
 
 ### Being built
 
