@@ -102,43 +102,43 @@ global POLICY_HOOK_COUNT <comptime> = 10
 
 global Policy = @record{
   L: *lua_State,
-  loaded: boolean,
-  error: string,
-  profiles: vector(Profile),
   default_profile: integer,
-  dropdown: DropdownCfg,
   popup_width: integer,
   popup_height: integer,
   popup_font_size: float64,
   popup_rounding: float64,
-  agent: AgentCfg,
-  agents: vector(NamedAgentCfg), -- CONFIG.agents, in the order read
-  toggle_key: string,       -- ImGui key name in lowercase, e.g. "grave"
   toggle_consume_vk: integer,
+  toggle_gamepad_mask: integer, -- Dalamud GamepadButtons flags; 0 = no gamepad toggle
+  world_font_size: float64, -- font size on world panels; 0 = the font's native size (crispest)
+  error: string,
+  toggle_key: string,       -- ImGui key name in lowercase, e.g. "grave"
+  voice_command: string,        -- voice input: the command the agent runs (core/app/voice.nelua)
+  voice_mic: string,            -- and the microphone it is told to use ('' = its own choice)
+  profiles: vector(Profile),
+  agents: vector(NamedAgentCfg), -- CONFIG.agents, in the order read
+  world_pins: vector(string),  -- `/term pin` arguments to apply once a character is loaded
+  controller: ControllerCfg,    -- full focused-terminal controller mapping
+  agent: AgentCfg,
+  dropdown: DropdownCfg,
+  windows: WindowsCfg,
+  last_hook_error: [POLICY_HOOK_COUNT]string,  -- per POLICY_HOOK_*: the last error logged (each distinct text logs once)
+  world_occlusion_tolerance: float32, -- yalms a panel may sit behind the scene before it hides (grows with distance and slope)
+  world_occlusion_edge: float32,      -- pixels over which a covered edge blends
+  loaded: boolean,
   toggle_ctrl: boolean,     -- modifiers that must be held with toggle_key (others must be up)
   toggle_shift: boolean,
   toggle_alt: boolean,
   world_toggle_ctrl: boolean,  -- modifiers for the world/pet terminals toggle
   world_toggle_shift: boolean,
   world_toggle_alt: boolean,
-  toggle_gamepad_mask: integer, -- Dalamud GamepadButtons flags; 0 = no gamepad toggle
   toggle_gamepad_hid: boolean,  -- 'create' or 'ps': a DualSense button, read from the controller's HID reports
-  controller: ControllerCfg,    -- full focused-terminal controller mapping
   toggle_gamepad_ps: boolean,   -- 'ps': the PS button (double press: voice input) rather than Create
   touchpad_keys: boolean,       -- the DualSense touchpad types arrows, Enter and deletes into a focused terminal
-  voice_command: string,        -- voice input: the command the agent runs (core/app/voice.nelua)
-  voice_mic: string,            -- and the microphone it is told to use ('' = its own choice)
   cursor_blink: boolean,
   close_on_exit: boolean,   -- close a terminal when its shell exits (ctrl+d)
   copy_on_select: boolean,  -- releasing a mouse selection copies it to the clipboard
   disabled: boolean,        -- kill switch: the core does nothing per frame
-  world_font_size: float64, -- font size on world panels; 0 = the font's native size (crispest)
-  world_pins: vector(string),  -- `/term pin` arguments to apply once a character is loaded
   world_occlusion: uint8,   -- WORLD_OCCLUSION_* (CONFIG.world.occlusion)
-  world_occlusion_tolerance: float32, -- yalms a panel may sit behind the scene before it hides (grows with distance and slope)
-  world_occlusion_edge: float32,      -- pixels over which a covered edge blends
-  windows: WindowsCfg,
-  last_hook_error: [POLICY_HOOK_COUNT]string,  -- per POLICY_HOOK_*: the last error logged (each distinct text logs once)
 }
 
 global policy: Policy
