@@ -916,14 +916,15 @@ Works from macros and hotbars:
 
 ## Controller
 
-`toggle_gamepad_button` (default `select`: the Xbox View button; on a
-DualSense, Dalamud reports the touchpad click as `select`). Tap shows or hides
+`toggle_gamepad_button` defaults to an empty string, leaving the controller to
+FFXIV. You can opt in with `select` (the Xbox View button; on a DualSense,
+Dalamud reports the touchpad click as `select`). Tap shows or hides
 the drop-down; hold steps to the next terminal and repeats while held; double
 tap goes to the previous one. Valid names: `dpad_up dpad_down dpad_left
 dpad_right north south west east l1 l2 l3 r1 r2 r3 select start create`. An
 empty string disables it.
 
-Controller input inside a focused terminal is enabled by default. Settings →
+Controller input inside a focused terminal is off by default. Settings →
 Keys & controller selects one of these layouts:
 
 | Layout | Intended use |
@@ -936,13 +937,9 @@ Keys & controller selects one of these layouts:
 
 Mapped buttons repeat for `key:` and `text:` bindings; terminal actions such
 as `new_tab`, `paste` and `next_tab` fire once unless a mapping explicitly
-sets `repeat = true`. While a terminal has focus, `controller.capture = true`
-uses Dalamud's `IGamepadState.EnableGamepadNav` service to prevent mapped input,
-including both analogue sticks, from reaching FFXIV. It releases capture as
-soon as focus leaves the terminal and never clears capture it did not enable.
-While the terminal is focused, ImGui gamepad navigation is also explicitly
-prevented from positioning the mouse cursor; any pre-existing preference is
-restored afterward.
+sets `repeat = true`. Ghostty reads mapped buttons while a terminal is focused
+without enabling Dalamud gamepad mode or blocking controller input to FFXIV.
+The game still receives those button presses.
 
 Layouts and their metadata live in `lua/controllers.lua`. A file with that
 name in the plugin config directory takes precedence over the shipped module,
@@ -1284,11 +1281,11 @@ The info-bar entry opens the drop-down on click, the popup on right-click,
 a window on Shift+click, and world screens on Ctrl+click. The optional widget
 uses the same plugin services rather than another terminal core.
 
-Controller gestures default to the game's `select` button: tap to toggle,
-hold to advance, double-tap to go back. On a DualSense, this is the touchpad
-click, not Create. The optional `create` setting uses Windows HID reports;
-its Wine/controller behavior remains unverified. The normal default does not
-open a HID device. Disable controller handling with an empty setting.
+Controller gestures are off by default. Opt in with `select` to tap to toggle,
+hold to advance, and double-tap to go back. On a DualSense, `select` is the
+touchpad click, not Create. The optional `create` setting uses Windows HID
+reports; its Wine/controller behavior remains unverified. The normal default
+does not open a HID device.
 
 ## Experimental rendering
 

@@ -31,8 +31,8 @@ end
 assert(fallbacks >= 2, 'the local ConPTY fallbacks are shipped too')
 assert(w.agent.token_file:find('ghostty%-agent') and w.agent.token_file:find('\\'),
   'the Windows token file is a Windows path')
-assert(w.controller.enabled and w.controller.capture and w.controller.layout == 'terminal',
-  'controller terminal layout is enabled and captured by default')
+assert(not w.controller.enabled and w.controller.layout == 'terminal',
+  'controller terminal layout is opt-in')
 assert(w.controller.layouts.terminal.mapping.south == 'key:enter')
 assert(w.controller.layouts.steamdeck.mapping.dpad_up == 'key:up')
 assert(w.controller.layouts['community-vim'].community, 'community controller layouts ship with attribution')

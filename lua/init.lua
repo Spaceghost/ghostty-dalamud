@@ -31,17 +31,17 @@ local config = {
   toggle_mods = 'ctrl',
   world_toggle_mods = 'ctrl+shift',
   toggle_consume_vk = 0xC0,
-  -- select is Xbox View / DualSense touchpad click. create and ps read a
-  -- DualSense over HID: ps taps the dropdown and a double press is voice input.
-  toggle_gamepad_button = 'select',
-  -- Full controller input while a terminal is focused. Layouts live in
+  -- Optional: select is Xbox View / DualSense touchpad click; create and ps
+  -- read a DualSense over HID. Leave empty to give FFXIV every button.
+  toggle_gamepad_button = '',
+  -- Optional terminal controller layout. Layouts live in
   -- lua/controllers.lua; a controllers.lua in the config directory wins, so
   -- community layouts can be installed without modifying the plugin.
   controller = controllers.config('terminal'),
   -- With create or ps: the touchpad types into a focused terminal. Swipes are
   -- arrows (held at an edge they repeat), a click is Enter, a double click
   -- deletes a word and a held click keeps deleting.
-  touchpad_keys = true,
+  touchpad_keys = false,
   -- Voice input (ps pressed twice): the command the agent runs to listen and
   -- write down what was said, and the microphone it uses ('' = a controller's;
   -- Settings lists the others). The controller's mute button mutes it, and

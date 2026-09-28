@@ -107,7 +107,6 @@ M.settings = {
   ['toggle_gamepad_button'] = 'Controller button: tap toggles the dropdown, hold steps through terminals, double tap steps back (ps: starts and stops voice input).',
   ['controller.enabled'] = 'Use the selected mapping while a terminal has focus.',
   ['controller.layout'] = 'A shipped default, Steam Deck layout, community layout, or your custom mapping.',
-  ['controller.capture'] = 'Ask Dalamud to keep controller presses out of FFXIV while the terminal has focus.',
   ['voice_mic'] = 'Voice input only listens to a controller\'s microphone, unless you choose another here. Mute with the controller\'s mute button; every game starts muted.',
   ['touchpad_keys'] = 'Swipe for arrow keys (hold at an edge to repeat), click for Enter, double click to delete a word, hold the click to keep deleting. Only while a terminal has the keyboard.',
   ['dropdown.height'] = 'How much of the screen height the dropdown takes.',

@@ -203,7 +203,6 @@ global function run_command(cmd: string): cint
   if cmd == 'reload' then
     -- the same teardown as gu_shutdown: nothing may keep steering the game
     showcase_stop()
-    controller_capture_sync(false)
     teardown_effects()
     panels_shutdown() -- pulled windows back to the flat UI; the new policy pulls them in again
     ask_shutdown() -- /ask's hidden sessions end; the reloaded Lua knows nothing of them

@@ -17,6 +17,12 @@ Statuses mean exactly what they mean in the Changelog tab in game:
 
 NEW and FIX have been seen working in game and await a release. BETA is built and merged but has not been verified in game yet; SOON is still being built.
 
+### Fixed
+
+* Ghostty no longer turns on Dalamud gamepad mode, which covered the game with a gray notice and blocked normal controller input. Controller shortcuts and terminal mappings now start off, so FFXIV keeps the full controller. You can opt in to Ghostty shortcuts in Settings without taking the controller away from the game.
+
+### Being built
+
 * Mappy's map goes straight into the world: it becomes a pet the frame its window opens and is never drawn on the flat UI first. Before, whenever the game drew Mappy after Ghostty the map was never seen open and stayed flat. Host tests only; not yet tried in game.
 * Calmer, cuter pets: they follow smoothly without overshooting, bob gently on their own slow beat, keep a small tilt of their own, stack fanned out and peeking over each other instead of standing in columns, and squash a little only when they bump or land. A pet you are typing into or pointing at holds perfectly still so you can read it. Settings, Pets has the knobs; Reduce motion turns it all off. Host tests only; not yet tried in game.
 * Clean first build: the toolchain and the Dalamud references it compiles against are pinned and checked before use, the default shell is chosen per platform, and a fresh clone builds with nothing else installed.

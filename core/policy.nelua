@@ -82,7 +82,6 @@ global ControllerBinding = @record{
 
 global ControllerCfg = @record{
   enabled: boolean,
-  capture: boolean,         -- keep mapped input out of the game while focused
   layout: string,
   bindings: vector(ControllerBinding),
 }
@@ -270,13 +269,12 @@ local function read_controller(L: *lua_State, t: cint): void
   clear_controller_bindings()
   policy.controller.layout:destroy()
   policy.controller.layout = string.copy('terminal')
-  policy.controller.enabled, policy.controller.capture = false, true
+  policy.controller.enabled = false
   local top = lua_gettop(L)
   lua_getfield(L, t, 'controller')
   if lua_type(L, -1) ~= LUA_TTABLE then lua_settop(L, top) return end
   local c = lua_gettop(L)
-  policy.controller.enabled = lua_field_boolean(L, c, 'enabled', true)
-  policy.controller.capture = lua_field_boolean(L, c, 'capture', true)
+  policy.controller.enabled = lua_field_boolean(L, c, 'enabled', false)
   policy.controller.layout:destroy()
   policy.controller.layout = lua_field_string(L, c, 'layout', 'terminal')
 
@@ -432,7 +430,7 @@ local function read_settings(L: *lua_State, t: cint): void
   policy.toggle_gamepad_ps = pad == 'ps'
   pad:destroy()
   read_controller(L, t)
-  policy.touchpad_keys = lua_field_boolean(L, t, 'touchpad_keys', true)
+  policy.touchpad_keys = lua_field_boolean(L, t, 'touchpad_keys', false)
   policy.voice_command:destroy()
   policy.voice_command = lua_field_string(L, t, 'voice_command', 'ghostty-voice')
   policy.voice_mic:destroy()
@@ -697,8 +695,7 @@ if CONFIG.controller == nil then
 else
   local ok, m = pcall(require, 'controllers')
   if ok then
-    if CONFIG.controller.enabled == nil then CONFIG.controller.enabled = true end
-    if CONFIG.controller.capture == nil then CONFIG.controller.capture = true end
+    if CONFIG.controller.enabled == nil then CONFIG.controller.enabled = false end
     if CONFIG.controller.layout == nil then CONFIG.controller.layout = 'terminal' end
     if CONFIG.controller.layouts == nil then CONFIG.controller.layouts = m.layouts end
   end

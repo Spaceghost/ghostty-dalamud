@@ -99,7 +99,7 @@ global ImGuiIO <cimport, nodecl> = @record{
 ##  'ImGuiStyleVar_PopupRounding','ImGuiStyleVar_PopupBorderSize','ImGuiSliderFlags_AlwaysClamp',
 ##  'ImGuiCol_CheckMark','ImGuiCol_SliderGrab','ImGuiCol_SliderGrabActive',
 ##  'ImGuiInputTextFlags_EnterReturnsTrue','ImGuiCol_Button','ImGuiCol_ButtonHovered','ImGuiCol_ButtonActive',
-##  'ImGuiCol_FrameBg','ImGuiCol_Header','ImGuiCol_HeaderHovered','ImGuiConfigFlags_NoMouseCursorChange','ImGuiConfigFlags_NavEnableGamepad','ImGuiConfigFlags_NavEnableSetMousePos',
+##  'ImGuiCol_FrameBg','ImGuiCol_Header','ImGuiCol_HeaderHovered','ImGuiConfigFlags_NoMouseCursorChange',
 ##  'ImGuiInputTextFlags_CtrlEnterForNewLine','ImGuiCol_ScrollbarBg','ImGuiCol_ScrollbarGrab',
 ##  'ImGuiMouseCursor_Hand',
 ## }
