@@ -17,11 +17,17 @@ C.releases = {
     version = 'next', title = 'In the workshop',
     blurb = 'NEW and FIX have been seen working in game and await a release. BETA is built and merged but has not been verified in game yet; SOON is still being built.',
     items = {
-      { 'beta', 'Ghostty no longer turns on Dalamud gamepad mode, which covered the game with a gray notice and blocked normal controller input. Controller shortcuts and terminal mappings now start off, so FFXIV keeps the full controller. You can opt in to Ghostty shortcuts in Settings without taking the controller away from the game. Host tests pass; the fix has not yet been tried in game.' },
       { 'next', 'Mappy\'s map goes straight into the world: it becomes a pet the frame its window opens and is never drawn on the flat UI first. Before, whenever the game drew Mappy after Ghostty the map was never seen open and stayed flat. Host tests only; not yet tried in game.' },
       { 'next', 'Calmer, cuter pets: they follow smoothly without overshooting, bob gently on their own slow beat, keep a small tilt of their own, stack fanned out and peeking over each other instead of standing in columns, and squash a little only when they bump or land. A pet you are typing into or pointing at holds perfectly still so you can read it. Settings, Pets has the knobs; Reduce motion turns it all off. Host tests only; not yet tried in game.' },
       { 'next', 'Clean first build: the toolchain and the Dalamud references it compiles against are pinned and checked before use, the default shell is chosen per platform, and a fresh clone builds with nothing else installed.' },
       { 'next', 'Emoji, CJK and other wide glyphs drawn through the same fallback, with Noto Sans Symbols 2 and an optional monochrome Noto Emoji you drop in yourself.' },
+    },
+  },
+  {
+    version = '0.3.2', title = 'Released 2026-09-27', date = '2026-09-27',
+    blurb = 'BETA entries are in this release but have not been verified in game yet; they become NEW or FIX once they have been seen working.',
+    items = {
+      { 'beta', 'Ghostty no longer turns on Dalamud gamepad mode, which covered the game with a gray notice and blocked normal controller input. Controller shortcuts and terminal mappings now start off, so FFXIV keeps the full controller. You can opt in to Ghostty shortcuts in Settings without taking the controller away from the game. Host tests pass; the fix has not yet been tried in game.' },
     },
   },
   {
