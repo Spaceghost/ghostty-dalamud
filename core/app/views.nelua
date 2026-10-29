@@ -6,14 +6,13 @@ require 'core.app.agent'
 
 -- Visibility -----------------------------------------------------------------------
 
--- Terminal focus must never alter or pause the player's character. One call
--- with false lets an upgrade release a pose left by an older build; after
--- that, visibility and focus have no character-animation side effects.
+-- Follow terminal visibility; Lua decides whether character animation is enabled.
 global function sync_animation(): void
-  if host.animation_cleanup_done then return end
+  local visible = host.dropdown_open or #host.windows > 0 or #host.native > 0 or (host.world_visible and #host.world > 0)
+  if host.animation_cleanup_done and host.anim_out == visible then return end
   host.animation_cleanup_done = true
-  host.anim_out = false
-  local err = policy_anim_toggle(false)
+  host.anim_out = visible
+  local err = policy_anim_toggle(visible)
   if #err > 0 then logf(LOG_WARN, 'animation: %s', err) end
   err:destroy()
 end
