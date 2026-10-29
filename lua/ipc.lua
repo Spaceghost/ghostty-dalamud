@@ -467,7 +467,7 @@ local function panel_list(windows, listed)
     local a = p.place == 'world' and anchor(p.id) or nil
     local e = { id = p.id, kind = p.kind, title = p.title or '', view = panel_view(p, a), focused = p.focused and true or false }
     if p.kind == 'terminal' then
-      e.profile, e.running = p.profile, p.running and true or false
+      e.profile, e.running, e.agent = p.profile, p.running and true or false, p.agent
     elseif p.kind == 'window' then
       local w = by_id[p.id]
       local app = w and w.app or ''
@@ -481,6 +481,11 @@ local function panel_list(windows, listed)
       e.icon = app_icon(listed.apps, app)
     elseif p.app and p.app ~= '' then
       e.app = p.app
+    end
+    local workspace = type(CONFIG) == 'table' and CONFIG.workspace
+    if type(workspace) == 'table' and type(workspace.describe) == 'function' then
+      local described, metadata = pcall(workspace.describe, p.id)
+      if described and type(metadata) == 'table' then e.workspace = metadata end
     end
     if e.view == 'pet' and rank then e.order = rank(p.id) end
     out[#out + 1] = e

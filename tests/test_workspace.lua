@@ -39,6 +39,8 @@ for i=1,5 do workspace.tick(i) end
 assert(#opened==4)
 workspace.tick(6);assert(#opened==4,'reconcile must not duplicate views')
 local label,colour=workspace.nameplate(1);assert(label and colour)
+local metadata=workspace.describe(1);assert(metadata and metadata.label==label and metadata.colour==colour and metadata.key==workspace.panels[1])
+assert(workspace.describe(999999)==nil)
 local key=workspace.panels[1];config.world.anchors[1]={kind='pet'}
 local p=config.world.place(1,1,false,false);assert(p.x==a[key].x and p.z==a[key].z)
 config.world.anchors[1]={kind='at'};assert(config.world.place(1,2,false,false).x==0,'manual pins are preserved')

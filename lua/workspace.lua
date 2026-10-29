@@ -63,7 +63,7 @@ function M.layout(nodes)
       local offset = (col-(columns-1)*0.5)*2.9
       -- Screens sit across their cluster's tangent and face the same centre.
       local x, z = gx+math.cos(angle)*offset, gz-math.sin(angle)*offset
-      result[node.key] = { key=node.key, group=group, depth=entry.depth, colour=colour,
+      result[node.key] = { key=node.key, group=group, depth=entry.depth, colour=colour, parent=node.parent, source=node.source,
         x=x, y=1.8+row*1.9, z=z, yaw=math.atan(-x,-z),
         label=label(label(node.source)..' / '..label(node.title)..(entry.depth>0 and (' / nested '..entry.depth) or '')),
         width=1320, height=740, pixels_per_yalm=600 }
@@ -121,6 +121,14 @@ function M.configure(config, snapshot)
     return p
   end
   return true
+end
+
+-- Snapshot metadata for a shared mod navigator; this never opens or focuses a view.
+function M.describe(id)
+  local item=M.panels[id] and M.placements[M.panels[id]]
+  if not item then return nil end
+  return {key=item.key, parent=item.parent, source=item.source, group=item.group,
+    label=item.label, colour=item.colour, depth=item.depth}
 end
 
 function M.nameplate(id)

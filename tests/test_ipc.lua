@@ -350,6 +350,14 @@ do
     { id = 46, kind = 'terminal', title = 'zsh', view = 'min', focused = false, profile = 'zsh', running = true },
     { id = 47, kind = 'terminal', title = 'fish', view = 'dropdown', focused = false, profile = 'fish', running = true },
   })
+  local previous_config = CONFIG
+  CONFIG = { workspace = { describe = function(id)
+    if id == 40 then return {key='home:1:1', parent='parent', source='home', group='home:tab:1', label='Home / shell', depth=1, colour=0xbb9af7} end
+  end } }
+  local described = json.decode(ipc.snapshot())
+  assert(described.panels[1].workspace.key == 'home:1:1' and described.panels[1].workspace.colour == 0xbb9af7)
+  assert(described.rev ~= p1.rev, 'workspace metadata changes the read snapshot revision')
+  CONFIG = previous_config
   plist[7].title = 'zsh: vim'
   assert(json.decode(ipc.snapshot()).rev ~= p1.rev, 'a panel change moves rev')
   seen = {}
