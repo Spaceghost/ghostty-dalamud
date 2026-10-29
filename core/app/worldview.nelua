@@ -68,6 +68,7 @@ end
 -- Apply CONFIG.world_pins once the character is in the world (retried each
 -- second until the game reports a player).
 global function apply_world_pins(now: float64): void
+  if player_loaded() and (host.reattach_done or not host.local_agent.enabled) then policy_workspace_tick(now) end
   if host.world_pins_done or now - host.world_pins_last_try < 1.0 then return end
   host.world_pins_last_try = now
   if #policy.world_pins == 0 or not (host.reattach_done or not host.local_agent.enabled) then
@@ -1258,6 +1259,32 @@ global function draw_world(now: float64): void
           end
           imgui.DrawListAddLine(dl, vec2(vp.x + 1.5, vp.y), vec2(vp.x + 1.5, vp.y + pl.height), col, 3.0)
           imgui.DrawListAddLine(dl, vec2(vp.x + pl.width - 1.5, vp.y), vec2(vp.x + pl.width - 1.5, vp.y + pl.height), col, 3.0)
+        end
+        -- Every world panel has a nameplate. Workspace panels share their group's
+        -- accent; arbitrary panels retain their existing display name and theme.
+        do
+          local name, colour = policy_workspace_nameplate(s.id)
+          local grouped = #name > 0
+          if #name == 0 then name = s:display_name():copy() end
+          local accent = im_col32((@uint8)((colour >> 16) & 255), (@uint8)((colour >> 8) & 255), (@uint8)(colour & 255), 230)
+          if grouped then
+            local edge = im_col32((@uint8)((colour >> 16) & 255), (@uint8)((colour >> 8) & 255), (@uint8)(colour & 255), 100)
+            for segment = 0, < 32 do
+              local xa = vp.x + pl.width * segment / 32
+              local xb = vp.x + pl.width * (segment + 1) / 32
+              imgui.DrawListAddLine(dl, vec2(xa, vp.y), vec2(xb, vp.y), edge, 2)
+              imgui.DrawListAddLine(dl, vec2(xa, vp.y + pl.height), vec2(xb, vp.y + pl.height), edge, 2)
+            end
+          end
+          -- The plate bends and depth-tests with the panel, below the game's HUD.
+          local plate_w = math.max(0, pl.width - 8)
+          if plate_w > 40 and #name > 0 then
+            imgui.DrawListAddRectFilled(dl, vec2(vp.x + 4, vp.y - 38), vec2(vp.x + plate_w, vp.y - 6), chrome_col(ChromeColor.Panel, 225), 5, 0)
+            imgui.DrawListAddRectFilled(dl, vec2(vp.x + 4, vp.y - 38), vec2(vp.x + 8, vp.y - 6), accent, 0, 0)
+            local clip = ImVec4{vp.x + 12, vp.y - 38, vp.x + plate_w - 4, vp.y - 6}
+            imgui.DrawListAddText(dl, imgui.GetFont(), 22, vec2(vp.x + 14, vp.y - 33), accent, (@cstring)(name.data), (@cstring)(&name.data[#name]), 0, &clip)
+          end
+          name:destroy()
         end
         rain_panel_front(dl, vp, &pl, s.id) -- raindrops on the glass
         bell_panel_border(dl, vp, pl.width, pl.height, s.id)

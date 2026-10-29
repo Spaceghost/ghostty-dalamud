@@ -97,7 +97,8 @@ global POLICY_HOOK_THEME <comptime> = 6
 global POLICY_HOOK_ON_EVENT <comptime> = 7
 global POLICY_HOOK_GALLERY <comptime> = 8
 global POLICY_HOOK_ASK <comptime> = 9
-global POLICY_HOOK_COUNT <comptime> = 10
+global POLICY_HOOK_WORKSPACE <comptime> = 10
+global POLICY_HOOK_COUNT <comptime> = 11
 
 global Policy = @record{
   L: *lua_State,
@@ -924,6 +925,49 @@ global function policy_world_kind(id: integer): string
   end
   lua_pop(L, 3)
   return kind
+end
+
+-- Optional workspace hooks. Inventory and pure placement live in lua/workspace.lua.
+global function policy_workspace_tick(now: float64): void
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return end
+  lua_getglobal(L, 'CONFIG')
+  lua_getfield(L, -1, 'workspace')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return end
+  lua_getfield(L, -1, 'tick')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return end
+  lua_pushnumber(L, now)
+  if lua_pcall(L, 1, 0, 0) ~= LUA_OK then
+    log_hook_error(L, POLICY_HOOK_WORKSPACE, 'workspace.tick')
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+end
+
+global function policy_workspace_nameplate(id: integer): (string, uint32)
+  local text: string
+  local colour: uint32 = 0x7dcfff
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return text, colour end
+  lua_getglobal(L, 'CONFIG')
+  lua_getfield(L, -1, 'workspace')
+  if lua_type(L, -1) ~= LUA_TTABLE then lua_pop(L, 2) return text, colour end
+  lua_getfield(L, -1, 'nameplate')
+  if lua_type(L, -1) ~= LUA_TFUNCTION then lua_pop(L, 3) return text, colour end
+  lua_pushinteger(L, id)
+  if lua_pcall(L, 1, 2, 0) == LUA_OK then
+    if lua_type(L, -2) == LUA_TSTRING then
+      local n: usize = 0
+      local p = lua_tolstring(L, -2, &n)
+      if n <= 512 then text = string.copy(string{data=(@*[0]byte)(p),size=n}) end
+    end
+    if lua_type(L, -1) == LUA_TNUMBER then colour = (@uint32)(lua_tointegerx(L, -1, nilptr)) & 0xffffff end
+    lua_pop(L, 2)
+  else
+    lua_pop(L, 1)
+  end
+  lua_pop(L, 2)
+  return text, colour
 end
 
 -- CONFIG.world.place(terminal_id, time, focused, held) -> placement table or

@@ -1327,3 +1327,9 @@ Built on Ghostty/libghostty-vt, Nelua, Lua, Dalamud, gc-cimgui, FFXIVClientStruc
 and Umbra. Preserve their licenses and contributor attribution when distributing
 builds. Do not infer a project license or official approval from dependency
 licenses or a successful build.
+
+## Neovim world workspace
+
+Existing Neovim panes can be opened as separate live world terminals, with nested
+host tabs grouped by colour and proximity and a nameplate on every panel. See
+[setup and current boundaries](docs/NVIM_WORKSPACE.md).

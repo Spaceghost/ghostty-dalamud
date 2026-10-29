@@ -80,6 +80,8 @@ echo "--- python suites (portability, identity tooling)"
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'
 echo "--- test_defaults (shipped per-platform policy)"
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_defaults.lua
+echo "--- test_workspace (Neovim hierarchy and world grouping)"
+"$ROOT/vendor/nelua-lang/nelua-lua" tests/test_workspace.lua
 echo "--- test_world_spread (panels keeping off each other on screen)"
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_world_spread.lua
 echo "--- test_motion (springs, bob and squash, pets keeping off walls, panels and characters)"
@@ -135,6 +137,7 @@ run test_rain "$ROOT"
 run test_policy "$ROOT"
 run test_world "$ROOT"
 run test_worldpanel "$ROOT"
+run test_workspace_hooks "$ROOT"
 run test_fullflight
 run test_worlddrag "$ROOT"
 run test_worldhud "$ROOT"

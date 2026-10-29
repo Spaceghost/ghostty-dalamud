@@ -195,4 +195,7 @@ local config = {
   settings = settings,
   world_pins = {},
 }
+local workspace = require('workspace')
+local ok, err = workspace.load(config, (GHOSTTY_PLUGIN_DIR or '.') .. '/nvim-workspace.json')
+if ok == nil and ghostty and ghostty.log then ghostty.log('workspace: ' .. tostring(err)) end
 return settings.apply(config)

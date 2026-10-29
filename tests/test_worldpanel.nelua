@@ -1207,11 +1207,11 @@ do
   e:destroy()
   texts = 0
   world_frame(false)
-  assert(texts == near_only, 'the far panel draws no text')
+  assert(texts == near_only + 1, 'the far panel retains its nameplate but skips terminal glyphs')
   host.world_focus = far.id
   texts = 0
   world_frame(false)
-  assert(texts > near_only, 'the far panel draws its text while focused')
+  assert(texts > near_only + 1, 'the far panel draws terminal glyphs as well as its nameplate while focused')
   host.world_focus = 0
   print('world level of detail OK')
 
