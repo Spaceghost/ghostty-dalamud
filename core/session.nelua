@@ -5,6 +5,7 @@ require 'stringbuilder'
 require 'core.ghostty'
 require 'core.termview'
 require 'core.selection'
+require 'core.mouse'
 require 'core.protocol'
 require 'core.agent_client'
 require 'core.sys.conpty'
@@ -59,6 +60,7 @@ global Session = @record{
   cell_w: float32,          -- cell size as last drawn, for mouse hit testing
   cell_h: float32,
   sel: SelectionState,      -- mouse selection gesture (the terminal owns the range itself)
+  mouse_reports: MouseReportState, -- application gestures in dropdown/floating views
   pending_out: ByteQueue,   -- bytes typed before the agent acknowledged OPEN
   unread: boolean,          -- output arrived while the tab was not visible
   bells: integer,           -- BEL characters received; the host turns new ones into the visual bell

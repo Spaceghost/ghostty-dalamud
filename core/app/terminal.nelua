@@ -255,10 +255,33 @@ global function draw_terminal(s: *Session, dl: *ImDrawList, origin: ImVec2, widt
     imgui.GetMousePos(&mouse)
     local inside = mouse.x >= origin.x and mouse.y >= origin.y and mouse.x < origin.x + width and mouse.y < origin.y + height
     -- the terminal's own InvisibleButton is already active on the press frame
-    local press = inside and imgui.IsMouseClicked(ImGuiMouseButton_Left, false)
+    local hovered = inside
       and imgui.IsWindowHovered(ImGuiHoveredFlags_RootAndChildWindows | ImGuiHoveredFlags_AllowWhenBlockedByActiveItem)
-    terminal_mouse(s, mouse.x - origin.x, mouse.y - origin.y, true, press, host.lmb_down, imgui.GetTime())
-    if s.sel.dragging then imgui.SetNextFrameWantCaptureMouse(true) end
+    local io = imgui.GetIO()
+    local tracking = s.view:mouse_tracking() and not io.KeyShift
+    local pressed, down = 0, 0
+    for button = 0, < 3 do
+      if imgui.IsMouseClicked((@cint)(button), false) then pressed = pressed | (1 << button) end
+    end
+    if host.lmb_down then down = down | 1 end
+    if imgui.IsMouseDown(ImGuiMouseButton_Middle) then down = down | 2 end
+    if host.rmb_down then down = down | 4 end
+    -- ImGui orders buttons left/right/middle; terminal reports use left/middle/right.
+    local terminal_pressed = (pressed & 1) | ((pressed & 2) << 1) | ((pressed & 4) >> 1)
+    local col, row = selection_cell_at(mouse.x - origin.x, mouse.y - origin.y, s.cell_w, s.cell_h, s.cols, s.rows)
+    local reports = mouse_report_frame(&s.mouse_reports, col, row, hovered, terminal_pressed, down, tracking and not s.sel.dragging)
+    local mods = (io.KeyAlt and 8 or 0) | (io.KeyCtrl and 16 or 0)
+    for i = 0, < reports.count do
+      local event = reports.events[i]
+      local out: [32]byte
+      local n = s.view:mouse_bytes(event.button, event.action, col, row, mods, &out)
+      if n > 0 then s:write(&out, (@usize)(n)) end
+    end
+    if not tracking or s.sel.dragging then
+      terminal_mouse(s, mouse.x - origin.x, mouse.y - origin.y, true,
+        hovered and (pressed & 1) ~= 0, host.lmb_down, imgui.GetTime())
+    end
+    if s.sel.dragging or s.mouse_reports.buttons ~= 0 then imgui.SetNextFrameWantCaptureMouse(true) end
   end
   focused = terminal_claim_keyboard(focused)
   if focused then

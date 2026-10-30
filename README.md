@@ -774,6 +774,10 @@ the world. Inside a terminal: <kbd>ctrl</kbd>+<kbd>shift</kbd>+<kbd>c</kbd> /
 <kbd>w</kbd> open and close tabs, <kbd>ctrl</kbd>+<kbd>tab</kbd> switches tabs,
 <kbd>ctrl</kbd>+<kbd>=</kbd> / <kbd>-</kbd> / <kbd>0</kbd> zoom.
 
+The dropdown and floating terminals forward clicks, releases and drags to apps
+that enable terminal mouse reporting, including Neovim tab buttons and panes.
+Hold <kbd>Shift</kbd> to select terminal text instead.
+
 Every icon button, taskbar chip and setting explains itself in a tooltip
 after the pointer rests on it for a moment (world screens included). The
 texts are in `lua/tooltips.lua`, ready to be translated; untested in game.
