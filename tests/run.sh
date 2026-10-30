@@ -133,6 +133,7 @@ run test_procpipe
 run test_dualsense
 run test_selection
 run test_mouse
+run test_mouse_replay
 run test_bell "$ROOT"
 run test_rain "$ROOT"
 run test_policy "$ROOT"

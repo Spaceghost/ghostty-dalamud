@@ -777,6 +777,10 @@ the world. Inside a terminal: <kbd>ctrl</kbd>+<kbd>shift</kbd>+<kbd>c</kbd> /
 The dropdown and floating terminals forward clicks, releases and drags to apps
 that enable terminal mouse reporting, including Neovim tab buttons and panes.
 Hold <kbd>Shift</kbd> to select terminal text instead.
+After a reconnect that has lost mouse reporting, toggling Neovim's `mouse`
+option off and back on restores it in an existing session. Updated agents
+preserve these modes when replaying truncated output. `/term mousetrace` records
+one minute of mouse coordinates and report metadata in the plugin log.
 
 Every icon button, taskbar chip and setting explains itself in a tooltip
 after the pointer rests on it for a moment (world screens included). The

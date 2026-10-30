@@ -19,6 +19,7 @@ NEW and FIX have been seen working in game and await a release. BETA is built an
 
 ### Merged, not yet verified in game
 
+* The agent now preserves mouse tracking and SGR coordinate modes independently of its bounded output history. A reset-and-replay restores the current settings, including explicit disables, even after startup escapes have scrolled out of the replay buffer. This fixes silent loss of Neovim clicks after reconnecting to a long-running terminal. Regression tests cover chunked mode changes, truncated replay, ignored title/graphics payloads and the real agent replay path. Updated agent code takes effect on its next restart; existing sessions can recover immediately by toggling Neovim mouse off and on. The running game was verified opening a new tab from a mouse press and release through the game window.
 * Dropdown and floating terminals now send mouse presses, releases and drags to programs that request them, including Neovim tab buttons. Previously these clicks always selected terminal text, so a new-tab button never received its click. Shift retains terminal text selection; a drag started in the grid keeps its release even outside the terminal. Host tests cover button identity, tabline press/release bytes, drag ownership and selection override; Windows cross-build passes. Live click verification is pending.
 
 ### Being built

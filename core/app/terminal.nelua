@@ -22,6 +22,8 @@ global ActionCtx = @record{ s: *Session, in_dropdown: boolean }
 -- would free the session the rest of the frame still draws, so the dropdown
 -- closes it after drawing (dropdown_apply_close_request).
 global terminal_close_request: integer = 0
+global terminal_mouse_trace_until: float64 = 0
+global terminal_mouse_trace_next: float64 = 0
 
 -- Paste the system clipboard. With the agent connected the text comes from
 -- the desktop (wl-paste / xclip) and lands when the reply arrives; without it,
@@ -270,11 +272,21 @@ global function draw_terminal(s: *Session, dl: *ImDrawList, origin: ImVec2, widt
     local terminal_pressed = (pressed & 1) | ((pressed & 2) << 1) | ((pressed & 4) >> 1)
     local col, row = selection_cell_at(mouse.x - origin.x, mouse.y - origin.y, s.cell_w, s.cell_h, s.cols, s.rows)
     local reports = mouse_report_frame(&s.mouse_reports, col, row, hovered, terminal_pressed, down, tracking and not s.sel.dragging)
+    if imgui.GetTime() < terminal_mouse_trace_until and (pressed ~= 0 or imgui.GetTime() >= terminal_mouse_trace_next) then
+      terminal_mouse_trace_next = imgui.GetTime() + 1
+      logf(LOG_INFO, 'mouse trace: session=%d grid=%dx%d cell=%.2fx%.2f origin=%.1f,%.1f pointer=%.1f,%.1f inside=%d hovered=%d tracking=%d shift=%d select=%d pressed=%d down=%d reports=%d',
+        s.id, s.cols, s.rows, s.cell_w, s.cell_h, origin.x, origin.y, mouse.x, mouse.y,
+        inside and 1 or 0, hovered and 1 or 0, tracking and 1 or 0, io.KeyShift and 1 or 0,
+        s.sel.dragging and 1 or 0, terminal_pressed, down, reports.count)
+    end
     local mods = (io.KeyAlt and 8 or 0) | (io.KeyCtrl and 16 or 0)
     for i = 0, < reports.count do
       local event = reports.events[i]
       local out: [32]byte
       local n = s.view:mouse_bytes(event.button, event.action, col, row, mods, &out)
+      if imgui.GetTime() < terminal_mouse_trace_until and event.action ~= 2 then
+        logf(LOG_INFO, 'mouse report: session=%d button=%d action=%d col=%d row=%d bytes=%d', s.id, event.button, event.action, col, row, n)
+      end
       if n > 0 then s:write(&out, (@usize)(n)) end
     end
     if not tracking or s.sel.dragging then

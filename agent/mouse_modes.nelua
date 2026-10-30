@@ -1,0 +1,63 @@
+-- Input modes outlive the bounded output replay. Track real DECSET/DECRST
+-- sequences, ignoring lookalikes inside OSC/DCS strings, across read chunks.
+require 'string'
+require 'stringbuilder'
+global AgentMouseModes = @record{
+  mask: integer,
+  state: integer, -- ground, escape, CSI, string, string escape
+  private: boolean, invalid: boolean, osc: boolean, parameter: boolean,
+  number: integer, pending: integer,
+}
+local modes: [5]integer = { 9, 1000, 1002, 1003, 1006 }
+local function mode_bit(number: integer): integer
+  for i = 0, < 5 do if number == modes[i] then return 1 << i end end
+  return 0
+end
+function AgentMouseModes:feed(data: *[0]uint8, n: usize): void
+  for i = 0, < n do
+    local b = data[i]
+    if b == 24 or b == 26 then self.state = 0
+    elseif self.state == 3 then
+      if b == 7 and self.osc then self.state = 0 elseif b == 27 then self.state = 4 end
+    elseif self.state == 4 then
+      if b == '\\'_b then self.state = 0 elseif b ~= 27 then self.state = 3 end
+    elseif b == 27 then self.state = 1
+    elseif self.state == 1 then
+      self.state = 0
+      if b == '['_b then
+        self.state = 2
+        self.private, self.invalid, self.parameter, self.number, self.pending = false, false, false, 0, 0
+      elseif b == ']'_b or b == 'P'_b or b == '^'_b or b == '_'_b or b == 'X'_b then
+        self.state, self.osc = 3, b == ']'_b
+      elseif b == 'c'_b then self.mask = 0 end
+    elseif self.state == 2 then
+      if b == '?'_b and not self.private and not self.parameter then self.private = true
+      elseif b >= '0'_b and b <= '9'_b then
+        self.parameter = true
+        if self.number > 6553 then self.invalid = true else self.number = self.number * 10 + b - '0'_b end
+      elseif b == ';'_b then
+        self.parameter = true
+        self.pending = self.pending | mode_bit(self.number)
+        self.number = 0
+      elseif b >= 64 and b <= 126 then
+        if self.private and not self.invalid then
+          local bits = self.pending | mode_bit(self.number)
+          if b == 'h'_b then self.mask = self.mask | bits
+          elseif b == 'l'_b then self.mask = self.mask & ~bits end
+        end
+        self.state = 0
+      elseif b >= 32 then self.invalid = true end
+    end
+  end
+end
+function AgentMouseModes:snapshot(): string
+  local sb: stringbuilder
+  -- Clear stale replay modes first; leave the requested reporting mode last.
+  for enabled = 0, < 2 do
+    for i = 0, < 5 do
+      local on = (self.mask & (1 << i)) ~= 0
+      if on == (enabled == 1) then sb:writef('\27[?%d%s', modes[i], on and 'h' or 'l') end
+    end
+  end
+  return sb:promote()
+end

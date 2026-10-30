@@ -110,7 +110,7 @@ exited = false
 argv:clear()
 argv:push('/bin/sh')
 argv:push('-c')
-argv:push('printf replay-me; sleep 3')
+argv:push("printf '\\033[?1002;1006h'; printf replay-me; sleep 3")
 c:open(80, 24, &argv, nilptr)
 for _ = 1, 100 do pump1(&c) if got:find('replay-me', 1, true) > 0 then break end end
 assert(got:find('replay-me', 1, true) > 0)
@@ -159,6 +159,8 @@ for _ = 1, 100 do pump1(&c) if attached_count > 0 then break end end
 do local shown, n = got:gsub('\27', 'ESC') print('replay reset:', shown, n) shown:destroy() end
 assert(got:find('\27c', 1, true) == 1, 'replay starts with a terminal reset')
 assert(got:find('replay-me', 1, true) > 0, 'replayed output')
+assert(got:find('\27[?1002h', 1, true) > 0 and got:find('\27[?1006h', 1, true) > 0,
+  'reset replay ends with the current mouse tracking and SGR modes')
 
 -- attaching while attached replays nothing (every byte already came)
 got:destroy() got = ''

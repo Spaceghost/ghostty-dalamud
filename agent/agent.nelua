@@ -47,6 +47,7 @@ require 'os'
 require 'arg'
 require 'math'
 require 'memory'
+require 'agent.mouse_modes'
 require 'core.sys.net'
 require 'core.protocol'
 require 'agent.logic'
@@ -141,6 +142,7 @@ local Session = @record{
   command: string,
   replay: vector(uint8),   -- ring buffer of recent output
   replay_head: usize,
+  mouse_modes: AgentMouseModes,
   total_out: uint64,       -- output bytes ever read (the ring holds the last #replay of them)
   inbuf: ByteQueue,        -- input the PTY could not take yet (a large paste)
   attached: vector(usize), -- client indexes
@@ -219,6 +221,7 @@ local function find_session(id: uint32): *Session
 end
 
 local function session_append_replay(s: *Session, data: *[0]uint8, n: usize): void
+  s.mouse_modes:feed(data, n)
   s.total_out = s.total_out + n
   local cap = agent.replay_bytes
   if n == 0 or cap == 0 then return end
@@ -260,6 +263,13 @@ local function session_replay_to(s: *Session, c: *Client, has_fed: boolean, fed:
     proto.write_frame_id(&c.outq, PROTO_SDATA, s.id, (@*[0]uint8)(reset.data), reset.size)
   end
   if plan.count > 0 then send_replay_range(s, c, plan.start, plan.count) end
+  if plan.reset then
+    -- The ring may have discarded the app's initial mouse-mode negotiation.
+    -- Restore the actual current modes after replay, including explicit offs.
+    local modes = s.mouse_modes:snapshot()
+    proto.write_frame_id(&c.outq, PROTO_SDATA, s.id, (@*[0]uint8)(modes.data), modes.size)
+    modes:destroy()
+  end
 end
 
 -- Input for the PTY: what it cannot take now waits in `inbuf` (the main loop
