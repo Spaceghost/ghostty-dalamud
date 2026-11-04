@@ -235,7 +235,7 @@ local function write_ppm(path: string, scr: *Screen): boolean
     file:write(row)
   end
   row:destroy()
-  file:close()
+  file:destroy()
   return true
 end
 
