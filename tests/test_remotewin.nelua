@@ -386,7 +386,7 @@ host.local_agent.last_try = 1e9 -- never dial out
 assert(imgui_bind(resolver, nilptr) > 0 and imgui.DrawListAddImage ~= nilptr)
 assert(luaL_loadstring(policy.L, "CONFIG.world.occlusion = 'off'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
 policy_refresh()
-assert(policy.windows.max_w == 1920 and policy.windows.max_h == 1200 and policy.windows.fps == 30, 'lua/windows.lua defaults')
+assert(policy.windows.max_w == 3840 and policy.windows.max_h == 2400 and policy.windows.fps == 30, 'lua/windows.lua defaults')
 host.world_visible, host.world_rez, host.world_last_time = true, 1, now
 io_state.InputQueueCharacters = { Size = 0, Capacity = #chars, Data = (@*[0]uint16)(&chars) }
 
@@ -445,7 +445,7 @@ do
   assert(p ~= nilptr, 'WOPEN sent')
   req = proto.get_u32(p)
   assert(proto.get_u32((@*[0]uint8)(&p[4])) == 0, 'wid 0: by match')
-  assert(proto.get_u16((@*[0]uint8)(&p[8])) == 1920 and proto.get_u16((@*[0]uint8)(&p[10])) == 1200 and p[12] == 30, 'max size and fps from lua/windows.lua')
+  assert(proto.get_u16((@*[0]uint8)(&p[8])) == 3840 and proto.get_u16((@*[0]uint8)(&p[10])) == 2400 and p[12] == 30, 'max size and fps from lua/windows.lua')
   assert(string{data=(@*[0]byte)(&p[13]), size=7} == 'Firefox', 'the match text')
   assert(#host.world == 1 and #host.sessions == 1)
   s = host.world[0]

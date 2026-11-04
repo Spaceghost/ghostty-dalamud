@@ -186,8 +186,8 @@ goes out when it settles.
 * Scaling is to the largest size that fits `max_w`×`max_h` with the window's
   aspect ratio (`wincodec_fit`), by area averaging: each frame pixel is the
   mean of the window area it covers, with the window pixels its edges cut
-  weighted by how much of them it covers. A 2560×1440 window under the
-  default 1920×1200 limit arrives at 1920×1080, not halved to 1280×720.
+  weighted by how much of them it covers. A 5120×2880 window under the
+  default 3840×2400 limit arrives at 3840×2160, not halved to 2560×1440.
   WINPUT coordinates are pixels of the frames as sent; the agent maps each
   back to the window pixel under that frame pixel's centre
   (`wincodec_unscale`) and clamps it to the window. WGEOM boxes cover every
@@ -814,7 +814,9 @@ same and points at `/window` once per session. `/ask [question]` and
 `/agent ask [question]` are `/term ask` the same way.
 
 `@agent` may only name `default` so far. `lua/windows.lua` (`CONFIG.windows`)
-holds the sizes asked for (`max_w`, `max_h`, default 1920×1200), `fps` (30),
+holds the sizes asked for (`max_w`, `max_h`, default 3840×2400 — above a
+1920×1200 window at the compositor's default scale of 2, so the scale is not
+averaged away by the agent's downscale), `fps` (30),
 the panel's `pixels_per_yalm` (700), `width` (1600 panel pixels), `opacity`,
 `auto`: `/term window pull` arguments run once the character is loaded,
 `auto_open` (`all`), `links` (`game`), `never` (`{}`) and `reserved_chords`
