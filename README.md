@@ -1,5 +1,3 @@
-# Ghostty for Dalamud
-
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="images/readme/hero-dark.png">
@@ -8,7 +6,9 @@
   </picture>
 </p>
 
-<img src="images/icon.png" width="96" height="96" align="right" alt="Ghostty icon">
+<h1 align="center">Ghostty</h1>
+
+<p align="center"><em>Eorzea is a terminal multiplexer: a Ghostty terminal living inside FINAL FANTASY XIV.</em></p>
 
 **Vote on what it does next: https://spacegho.st/mods/ffxiv/term/vote/**
 
