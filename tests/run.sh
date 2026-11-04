@@ -200,11 +200,14 @@ echo "--- test_agent"
 echo "testtoken123" > build/agent-token
 # a port per run, so test runs at the same time never share an agent
 PORT="${GHOSTTY_TEST_PORT:-$((20000 + $$ % 20000))}"
-"${SAN_PREFIX[@]}" "build/ghostty-agent$SAN_SUFFIX" --listen "127.0.0.1:$PORT" --token-file build/agent-token --clipboard-file build/agent-clipboard --windows off >build/agent.log 2>&1 &
+# a second --listen: the suite runs over that one, so it gets the whole protocol
+PORT2=$((PORT + 3))
+"${SAN_PREFIX[@]}" "build/ghostty-agent$SAN_SUFFIX" --listen "127.0.0.1:$PORT" --listen "127.0.0.1:$PORT2" --token-file build/agent-token --clipboard-file build/agent-clipboard --windows off >build/agent.log 2>&1 &
 AGENT=$!
 trap 'kill $AGENT 2>/dev/null || true' EXIT
 wait_port "$PORT" "$AGENT" || { cat build/agent.log; exit 1; }
-"${SAN_PREFIX[@]}" "$NCACHE"/test_agent "$PORT" testtoken123 "$AGENT"
+wait_port "$PORT2" "$AGENT" || { cat build/agent.log; exit 1; }
+"${SAN_PREFIX[@]}" "$NCACHE"/test_agent "$PORT2" testtoken123 "$AGENT"
 
 echo "--- test_wg_cli"
 # `ghostty-agent wg`, the QR code, Tailscale detection and the listen rule, on the agent just built

@@ -390,6 +390,8 @@ by you; the plugin reads that same file, so there is nothing to configure when
 the game and the agent are on one machine. Other flags: `--token-file PATH`,
 `--clipboard-file PATH`, `--replay-bytes N`, `--term NAME`, `--windows NAME`.
 
+`--listen` can be given more than once: one agent, the same sessions and token on each address, e.g. `--listen 127.0.0.1:7777 --listen 100.x.y.z:7777` for the game on this machine plus your tailnet. Only the first is required to open at start; a later one that cannot open yet (Tailscale not up) is retried every 10 s. Linux and macOS only.
+
 When the game is on another machine, forward the port and copy the token over:
 `ssh -L 7777:127.0.0.1:7777 …`. The token authenticates the connection but the
 stream is not encrypted, so keep it on loopback, in that tunnel, or on a private
