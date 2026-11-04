@@ -86,6 +86,7 @@ global RemoteWin = @record{
   note_shim: boolean,       -- "needs a newer plugin shim" is on the panel
   -- input
   focused_last: boolean,    -- the panel had the keyboard last frame (a focusing click is not the window's)
+  warned_nokb: boolean,     -- said once that the panel is focused but something else types
   ptr_x: integer, ptr_y: integer, -- last MOVE sent (-1: none)
   buttons: uint8,           -- bits 0 left, 1 right: held down on the window
   keys: [MAX_KEYS]boolean,  -- input_key(i) sent down
@@ -2044,6 +2045,14 @@ global function remotewin_panel(s: *Session, dl: *ImDrawList, vp: ImVec2, width:
   draw_title(s, dl, vp, width)
   -- input: only a focused panel's, and only one terminal or window types per frame
   local keyboard = terminal_claim_keyboard(focused)
+  -- The mouse is this panel's whenever it is focused, but the keyboard is claimed by
+  -- whoever draws first in the frame. When those disagree the panel takes clicks and
+  -- drops every key, which looks like a window that cannot be typed into: say so once.
+  if focused and not keyboard and not rw.warned_nokb then
+    rw.warned_nokb = true
+    logf(LOG_WARN, 'session %d: the panel has the mouse but another view took the keyboard this frame (dropdown=%s, terminal=%s, world_focus=%d)',
+      s.id, tostring(host.dropdown_open), tostring(host.terminal_focused), host.world_focus)
+  end
   if focused then
     poll_pointer(rw, s, on_content, click, mu, mv)
     if keyboard then
