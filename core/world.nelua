@@ -83,7 +83,8 @@ global WorldPlacement = @record{
   pet: boolean,             -- its anchor is a pet (the title button offers a pin), else a pin of some kind
   order_prev: boolean,      -- a pet with a neighbour before it in the pet order (the left edge's arrow)
   order_next: boolean,      -- and after it (the right edge's arrow)
-  hud: boolean,             -- docked to the screen: always in front (no occlusion), no present, no shadow board
+  hud: boolean,             -- docked to the screen, no present; depth-tested only with occluded_hud
+  occluded_hud: boolean,    -- screen-locked placement that still intersects the world's depth buffer
 }
 
 global WorldBasis = @record{

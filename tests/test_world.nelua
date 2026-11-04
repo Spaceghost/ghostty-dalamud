@@ -74,8 +74,10 @@ assert(pok and near(d, 4), 'orbit radius')
 local pok2, p2 = policy_world_place(3, 1.0, false)
 assert(pok2 and not near(p2.x, p.x), 'orbit moves with time')
 
+e:destroy() -- -P nogc: only the failing calls allocate a message; free it
 e = policy_world_command(4, 'bogus')
 assert(#e > 0, 'bad mode reports usage')
+e:destroy()
 e = policy_world_command(1, 'forget')
 pok = policy_world_place(1, 0, false)
 assert(not pok, 'forgotten anchor hides')
@@ -216,6 +218,8 @@ do
   assert(v2 == 'window', 'agent 78 restored as a floating window')
   local v3 = policy_world_restore(33, 79)
   assert(v3 == 'min', 'agent 79 restored minimized')
+  -- -P nogc: each restored view name is a copy of the saved Lua string
+  v1:destroy() v2:destroy() v3:destroy()
   local v4 = policy_world_restore(34, 80)
   assert(#v4 == 0, 'unknown agent: default placement')
   local rok, rp = policy_world_place(31, 20.0, false)
@@ -288,7 +292,9 @@ do
   assert(math.abs(policy.dropdown.height - 0.3) < 1e-6, 'saved dropdown height applied at load')
   local probe: cstring = "assert(CONFIG.world.pet.distance == 4.5, 'saved pet distance applied')"
   assert(luaL_loadstring(policy.L, probe) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, 'lua-side setting applied')
-  os.remove(root .. '/settings.lua')
+  local saved: string = string.format('%s/settings.lua', root)
+  os.remove(saved)
+  saved:destroy()
   print('settings OK')
 end
 

@@ -71,6 +71,10 @@ do
   o3:resize((@usize)(w3 * 4))
   assert(wincodec_qoi_decode((@*[0]uint8)(&e3[0]), #e3, (@*[0]uint8)(&o3[0]), (@usize)(w3 * 4), 0, 0, w3, 1))
   assert(same_rgb((@*[0]uint8)(&v3[0]), (@*[0]uint8)(&o3[0]), w3))
+  -- -P nogc: the buffers are this test's, and the encoders only fill the ones
+  -- they are handed, so the test frees every one of them.
+  src:destroy(); enc:destroy(); dst:destroy(); sub:destroy(); d2:destroy()
+  v3:destroy(); e3:destroy(); o3:destroy()
 end
 
 -- changed tiles
@@ -99,6 +103,7 @@ do
   -- whole window when there is no previous frame
   wincodec_diff(nilptr, 0, (@*[0]uint8)(&b[0]), (@usize)(w * 4), w, h, &rects)
   assert(#rects == 1 and rects[0].w == w and rects[0].h == h)
+  a:destroy(); b:destroy(); rects:destroy()
 end
 
 -- downscaling: the smallest integer factor that fits, box averages, ragged edges
@@ -129,6 +134,7 @@ do
   f, ow, oh = wincodec_downscale((@*[0]uint8)(&src[0]), (@usize)(w * 4), w, h, 5, 5, &out)
   assert(f == 2 and ow == 5 and oh == 3)
   assert(out[0] == 5 and out[1] == 10, 'factor 2 averages four pixels (rounded)')
+  src:destroy(); out:destroy()
 end
 
 -- banding keeps every rectangle's raw size under the limit
@@ -143,6 +149,7 @@ do
     rows = rows + rects[i].h
   end
   assert(rows == 1000)
+  rects:destroy()
 end
 
 -- WFRAME: write, parse, apply; a noisy 1920x1080 key frame spans several WFRAMEs
@@ -180,6 +187,10 @@ local function roundtrip(w: integer, h: integer, seed: integer): (integer, usize
   end
   assert(ended, 'the last WFRAME is flagged END')
   assert(same_rgb((@*[0]uint8)(&src[0]), (@*[0]uint8)(&dst[0]), w * h), 'the frame arrives intact')
+  -- wincodec_write_frames only clears the scratch and body it is handed: their
+  -- caller owns them, and so are the queue and the two images here.
+  src:destroy(); dst:destroy(); rects:destroy(); scratch:destroy(); body:destroy()
+  q:destroy()
   return frames, bytes
 end
 
@@ -187,7 +198,9 @@ do
   local frames, bytes = roundtrip(64, 48, 5)
   assert(frames == 1)
   frames, bytes = roundtrip(1920, 1080, 9)
-  print(('1920x1080 key frame: %d WFRAMEs, %d bytes (raw %d)'):format(frames, bytes, 1920 * 1080 * 4))
+  local line: string = ('1920x1080 key frame: %d WFRAMEs, %d bytes (raw %d)'):format(frames, bytes, 1920 * 1080 * 4)
+  print(line)
+  line:destroy()
   assert(frames >= 2, 'a large frame is split under the budget')
 end
 

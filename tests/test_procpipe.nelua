@@ -22,6 +22,15 @@ require 'os'
 local function usleep(us: cuint): cint <cimport, nodecl> end
 local function kill(pid: cint, sig: cint): cint <cimport, nodecl> end
 
+-- -P nogc: a message built with `..` is allocated whether or not the check
+-- fails, so one is only built on the failing path, which exits right after.
+local function checkf(ok: boolean, fmt: string, ...: varargs): void
+  if not ok then
+    io.stderr:write('FAIL: ', string.format(fmt, ...), '\n')
+    os.exit(1)
+  end
+end
+
 local function argv_of(a: string, b: string, c: string): vector(string)
   local v: vector(string)
   v:push(a:copy())
@@ -78,12 +87,13 @@ do
   -- back as rows of its own width
   local out, code, exited = run('i=0; while [ $i -lt 400 ]; do printf 0123456789; i=$((i+1)); done; printf "\\n"', (@string){})
   assert(exited and code == 0, 'the child exited cleanly')
-  assert(#out == 4001, 'got ' .. #out .. ' bytes, wanted 4001')
-  assert(out:sub(4001, 4001) == '\n', 'one newline, at the end')
+  checkf(#out == 4001, 'got %d bytes, wanted 4001', #out)
+  assert(out:byte(4001) == '\n'_b, 'one newline, at the end')
   assert(out:find('\r', 1, true) == 0, 'no CR was added') -- string.find gives 0 when there is none
   for i = 1, 4000 do
-    local c = out:sub(i, i)
-    assert(c >= '0' and c <= '9', 'byte ' .. i .. ' is not a digit: ' .. c)
+    -- the byte itself: out:sub(i, i) would allocate a string a digit long
+    local c = out:byte(i)
+    checkf(c >= '0'_b and c <= '9'_b, 'byte %d is not a digit: %c', i, c)
   end
   out:destroy()
 end
@@ -93,14 +103,14 @@ end
 do
   local out, code, exited = run('printf "out\\n"; printf "err\\n" >&2', (@string){})
   assert(exited and code == 0)
-  assert(out:find('out\n', 1, true) ~= 0 and out:find('err\n', 1, true) ~= 0, 'both streams: ' .. out)
+  checkf(out:find('out\n', 1, true) ~= 0 and out:find('err\n', 1, true) ~= 0, 'both streams: %s', out)
   out:destroy()
 end
 
 -- the exit status reaches the caller (the panel prints it)
 do
   local out, code, exited = run('exit 7', (@string){})
-  assert(exited and code == 7, 'status 7, got ' .. code)
+  checkf(exited and code == 7, 'status 7, got %d', code)
   out:destroy()
 end
 
@@ -117,7 +127,7 @@ do
     if p:poll_exit() then exited = true break end
     usleep(5000)
   end
-  assert(exited and p.exit_code == 127, 'status 127, got ' .. p.exit_code)
+  checkf(exited and p.exit_code == 127, 'status 127, got %d', p.exit_code)
   p:close()
 end
 
@@ -143,7 +153,7 @@ do
     end
   end
   local out = sb:promote()
-  assert(out == msg, 'cat gave back what was written: [' .. out .. ']')
+  checkf(out == msg, 'cat gave back what was written: [%s]', out)
   out:destroy()
   p:close()
 end

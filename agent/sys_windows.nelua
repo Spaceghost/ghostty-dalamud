@@ -75,7 +75,7 @@ end
 global function agent_write_private(path: string, content: string): boolean
   local f = io.open(path, 'wb')
   if not f:isopen() then return false end
-  f:close()
+  f:destroy()
   local pz = path .. '\0'
   local private = fs_make_private((@cstring)(pz.data))
   pz:destroy()
@@ -85,7 +85,7 @@ global function agent_write_private(path: string, content: string): boolean
   f = io.open(path, 'wb')
   if not f:isopen() then return false end
   f:write(content)
-  f:close()
+  f:destroy()
   return true
 end
 

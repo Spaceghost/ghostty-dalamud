@@ -159,7 +159,7 @@ local function save_png(fr: CaptureFrame, name: string): void
   local f = io.open(path, 'wb')
   check(f:isopen(), 'open ' .. path)
   f:write(png)
-  f:close()
+  f:destroy()
   png:destroy() zs:destroy() hs:destroy()
   print('saved ' .. path)
 end
@@ -427,10 +427,10 @@ do
   local f = io.open(home .. '/applications/ghostty-test-yad.desktop', 'wb')
   check(f:isopen(), 'write the desktop file')
   f:write('[Desktop Entry]\nType=Application\nName=Ghostty Test Viewer\nExec=yad --text-info --width=300 --height=200 --title=ghostty-app-test %U\nIcon=' .. home .. '/icon.svg\nCategories=Utility;\n')
-  f:close()
+  f:destroy()
   f = io.open(home .. '/icon.svg', 'wb')
   f:write('<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16"><circle cx="8" cy="8" r="7" fill="teal"/></svg>')
-  f:close()
+  f:destroy()
   setenv('XDG_DATA_HOME', (@cstring)(home.data), 1)
   local l = be.apps()
   local want = 'app\tghostty-test-yad\tGhostty Test Viewer\t' .. cache .. '/ghostty-agent/icons/ghostty-test-yad-128.png\tUtility;\n'
@@ -502,7 +502,7 @@ local function entry_run(title: string, input: function(h: pointer): void): stri
     local f = io.open(out, 'rb')
     if f:isopen() then
       text = f:read('a')
-      f:close()
+      f:destroy()
       if #text > 0 then break end
     end
   end

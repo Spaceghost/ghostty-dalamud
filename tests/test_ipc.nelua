@@ -186,6 +186,22 @@ local function expect(request: string, check: string): integer
   return v
 end
 
+-- -P nogc: expect borrows its two arguments, so a formatted request or check
+-- is built into a local here and freed after the call.
+local function expect_reqf(fmt: string, a: integer, check: string): integer
+  local request: string = string.format(fmt, a)
+  local v = expect(request, check)
+  request:destroy()
+  return v
+end
+local function expect_checkf(request: string, fmt: string, ...: varargs): integer
+  local check: string = string.format(fmt, ...)
+  local v = expect(request, check)
+  check:destroy()
+  return v
+end
+
+
 -- before the core runs
 expect('{"method":"status"}', 'assert(r.ok == false and r.error == "ghostty is not running")')
 
@@ -196,7 +212,7 @@ assert(logged('ipc:') == 0, 'lua/ipc.lua loaded quietly')
 -- before the first frame: no snapshot yet
 expect('{"method":"window.list"}', 'assert(r.ok == false and r.error:find("starting"))')
 frame()
-expect('{"method":"status"}', string.format('assert(r.ok and r.result == [==[%s]==], r.result)', host.status)) -- the Status channel's text
+expect_checkf('{"method":"status"}', 'assert(r.ok and r.result == [==[%s]==], r.result)', host.status) -- the Status channel's text
 expect('{"method":"agent.status"}', [[
   local a = r.result
   assert(r.ok and a.connected == false and a.windows_ok == false and a.version == 0 and a.agent == '127.0.0.1:7777', RAW)]])
@@ -206,11 +222,11 @@ assert(expect('{"method":"window.list"}', 'return r.result.rev') == rev0, 'nothi
 -- a change the core cannot do yet: the reason arrives in `requests`
 local req0 = expect('{"method":"window.open","params":{"match":"Firefox"}}', 'assert(r.ok and r.result.queued) return r.result.request')
 frame()
-local rev1 = expect('{"method":"window.list"}', string.format([[
+local rev1 = expect_checkf('{"method":"window.list"}', [[
   local q = r.result.requests[1]
   assert(q.request == %d and q.ok == false and q.error == 'the agent is not connected', RAW)
   assert(r.result.rev ~= %d, 'a result moves rev')
-  return r.result.rev]], req0, rev0))
+  return r.result.rev]], req0, rev0)
 assert(logged('ipc: window.open: the agent is not connected') == 1, 'a failed change is logged')
 
 fake_connect('ghostty-agent 3 42')
@@ -231,14 +247,14 @@ local wreq = proto.get_u32((@*[0]uint8)(wopen.data.data))
 assert(wopen.data:subview(14) == 'run:/usr/bin/yad --title x', 'run: prefix')
 assert(logged('asked the agent for run:/usr/bin/yad --title x, pinned here (for XivDesktop)') == 1, 'the caller in the log')
 local pid = host.world[0].id
-local rev2 = expect('{"method":"window.list"}', string.format([[
+local rev2 = expect_checkf('{"method":"window.list"}', [[
   local w = r.result.windows[1]
   assert(#r.result.windows == 1 and w.id == %d and w.sid == 0 and w.state == 'pending' and w.kind == 'pin', RAW)
   assert(w.app == 'yad' and w.title == '' and w.w == 0 and w.focused == false, RAW)
   local q = r.result.requests[#r.result.requests]
   assert(q.request == %d and q.ok and q.method == 'window.open' and q.result.id == %d, RAW)
   assert(r.result.rev ~= %d)
-  return r.result.rev]], pid, req1, pid, rev1))
+  return r.result.rev]], pid, req1, pid, rev1)
 
 -- the agent opens it: live, with its title
 do
@@ -255,41 +271,41 @@ do
   q:destroy()
 end
 frame()
-local rev3 = expect('{"method":"window.list"}', string.format([[
+local rev3 = expect_checkf('{"method":"window.list"}', [[
   local w = r.result.windows[1]
   assert(w.state == 'live' and w.sid == 5 and w.title == 'Yad Window' and r.result.rev ~= %d, RAW)
-  return r.result.rev]], rev2))
+  return r.result.rev]], rev2)
 
 -- focus, place, and a place that fails
-expect(string.format('{"method":"window.focus","params":{"id":%d}}', pid), 'assert(r.ok)')
+expect_reqf('{"method":"window.focus","params":{"id":%d}}', pid, 'assert(r.ok)')
 frame()
 assert(host.world_focus == pid, 'focused')
-expect('{"method":"window.list"}', string.format('assert(r.result.windows[1].focused and r.result.rev ~= %d, RAW)', rev3))
+expect_checkf('{"method":"window.list"}', 'assert(r.result.windows[1].focused and r.result.rev ~= %d, RAW)', rev3)
 host.world_focus = 0
-expect(string.format('{"method":"window.place","params":{"id":%d,"pin":"pet"}}', pid), 'assert(r.ok)')
+expect_reqf('{"method":"window.place","params":{"id":%d,"pin":"pet"}}', pid, 'assert(r.ok)')
 frame()
 expect('{"method":"window.list"}', 'assert(r.result.windows[1].kind == "pet", RAW)')
-local req4 = expect(string.format('{"method":"window.place","params":{"id":%d,"pin":"nowhere"}}', pid), 'return r.result.request')
+local req4 = expect_reqf('{"method":"window.place","params":{"id":%d,"pin":"nowhere"}}', pid, 'return r.result.request')
 local req5 = expect('{"method":"window.focus","params":{"id":999}}', 'return r.result.request')
 frame()
-expect('{"method":"window.list"}', string.format([[
+expect_checkf('{"method":"window.list"}', [[
   local n = #r.result.requests
   local a, b = r.result.requests[n - 1], r.result.requests[n]
   assert(a.request == %d and a.ok == false and a.error ~= '', RAW)
   assert(b.request == %d and b.ok == false and b.error == 'no such world panel', RAW)
-  assert(r.result.windows[1].kind == 'pet', 'unchanged')]], req4, req5))
+  assert(r.result.windows[1].kind == 'pet', 'unchanged')]], req4, req5)
 
 -- XivDesktop's panel methods -----------------------------------------------------------
 -- focus: as a click (the keyboard; no walk-up, no camera turn)
 host.world_focus = 0
 host.cam_active = false
-expect(string.format('{"method":"window.focus","params":{"id":%d}}', pid), 'assert(r.ok)')
+expect_reqf('{"method":"window.focus","params":{"id":%d}}', pid, 'assert(r.ok)')
 frame()
 assert(host.world_focus == pid and host.walk.id == 0 and not host.cam_active, 'focused as by a click, without walking or turning')
-expect('{"method":"focus.get"}', string.format('assert(r.result.id == %d and r.result.kind == "window", RAW)', pid))
+expect_checkf('{"method":"focus.get"}', 'assert(r.result.id == %d and r.result.kind == "window", RAW)', pid)
 -- hide: not placed, asleep (no WACK), unfocused; shown again: placed, awake once drawn
 local hs = find_session(pid)
-expect(string.format('{"method":"window.hide","params":{"id":%d,"hidden":true}}', pid), 'assert(r.ok)')
+expect_reqf('{"method":"window.hide","params":{"id":%d,"hidden":true}}', pid, 'assert(r.ok)')
 frame()
 assert(hs.sleeping and host.world_focus == 0, 'hidden: asleep and unfocused')
 do
@@ -298,12 +314,12 @@ do
 end
 expect('{"method":"window.list"}', 'assert(r.result.windows[1].hidden == true and r.result.windows[1].anchor == "pet", RAW)')
 expect('{"method":"focus.get"}', 'assert(r.result.id == 0 and r.result.kind == nil, RAW)')
-expect(string.format('{"method":"window.focus","params":{"id":%d}}', pid), 'assert(r.ok)')
+expect_reqf('{"method":"window.focus","params":{"id":%d}}', pid, 'assert(r.ok)')
 frame()
 expect('{"method":"window.list"}', [[
   local q = r.result.requests[#r.result.requests]
   assert(not q.ok and q.error:find('hidden'), RAW)]])
-expect(string.format('{"method":"window.hide","params":{"id":%d,"hidden":false}}', pid), 'assert(r.ok)')
+expect_reqf('{"method":"window.hide","params":{"id":%d,"hidden":false}}', pid, 'assert(r.ok)')
 frame()
 do
   local ok, _ = policy_world_place(pid, now, false)
@@ -313,7 +329,7 @@ expect('{"method":"window.list"}', 'assert(r.result.windows[1].hidden == false, 
 hs:wake()
 -- toggle_pet: a pet becomes a pin where it was last shown, and back
 hs.posed, hs.pose_x, hs.pose_y, hs.pose_z, hs.pose_yaw, hs.pose_pitch = true, 12.5, 1.25, 23.5, 0.75, 0
-expect(string.format('{"method":"window.toggle_pet","params":{"id":%d}}', pid), 'assert(r.ok)')
+expect_reqf('{"method":"window.toggle_pet","params":{"id":%d}}', pid, 'assert(r.ok)')
 frame()
 expect('{"method":"window.list"}', 'assert(r.result.windows[1].kind == "pin" and r.result.windows[1].anchor == "pin", RAW)')
 do
@@ -321,7 +337,7 @@ do
   assert(ok and math.abs(pl.x - 12.5) < 1e-3 and math.abs(pl.y - 1.25) < 1e-3 and math.abs(pl.z - 23.5) < 1e-3 and math.abs(pl.yaw - 0.75) < 1e-4,
     'pinned right where it was shown, facing the same way')
 end
-expect(string.format('{"method":"window.toggle_pet","params":{"id":%d}}', pid), 'assert(r.ok)')
+expect_reqf('{"method":"window.toggle_pet","params":{"id":%d}}', pid, 'assert(r.ok)')
 frame()
 expect('{"method":"window.list"}', 'assert(r.result.windows[1].kind == "pet" and r.result.windows[1].anchor == "pet", RAW)')
 -- agent.windows: WLISTR, extra columns passed through, a key matched to the panel by title
@@ -376,7 +392,8 @@ do
   local L = policy.L
   lua_getglobal(L, 'require') lua_pushstring(L, 'world') assert(lua_pcall(L, 1, 1, 0) == LUA_OK)
   lua_getfield(L, -1, 'anchors') lua_rawgeti(L, -1, tid) lua_getfield(L, -1, 'kind')
-  assert(string.copy(lua_tolstring(L, -1, nilptr)) == 'pet', 'terminal.new: a pet by default')
+  -- -P nogc: a view of the Lua string, not a copy nobody would free
+  assert((@string)(lua_tolstring(L, -1, nilptr)) == 'pet', 'terminal.new: a pet by default')
   lua_settop(L, 0)
 end
 host.world_focus = 0
@@ -386,7 +403,7 @@ assert(host.world_focus == pid, 'focus.cycle: the first world panel')
 expect('{"method":"focus.cycle","params":{"dir":"next"}}', 'assert(r.ok)')
 frame()
 assert(host.world_focus == tid, 'then the next')
-expect('{"method":"focus.get"}', string.format('assert(r.result.id == %d and r.result.kind == "terminal", RAW)', tid))
+expect_checkf('{"method":"focus.get"}', 'assert(r.result.id == %d and r.result.kind == "terminal", RAW)', tid)
 expect('{"method":"focus.cycle","params":{"dir":"prev"}}', 'assert(r.ok)')
 frame()
 assert(host.world_focus == pid, 'and back')
@@ -412,7 +429,7 @@ do
   assert(host.world[#host.world - 3] == fake, 'the adopted pet first: the new terminals open at the frame')
   local pet = host.world[#host.world - 2].id
   local pin = host.world[#host.world - 1].id
-  local rev_p = expect('{"method":"panel.list"}', string.format([[
+  local rev_p = expect_checkf('{"method":"panel.list"}', [[
     local by = {}
     for _, p in ipairs(r.result.panels) do by[p.id] = p end
     local function is(id, kind, view) local p = assert(by[id], 'listed: ' .. id) assert(p.kind == kind and p.view == view, RAW) return p end
@@ -427,68 +444,70 @@ do
     assert(a.title == 'Mappy', RAW)
     assert(w.order == 1 and a.order == 2 and pt.order == 3, 'the pets in their order: ' .. RAW)
     assert(by[%d].order == nil, 'a pin has no order')
-    return r.result.rev]], tab.id, mins.id, pet, pin, pid, fake.id, pin))
+    return r.result.rev]], tab.id, mins.id, pet, pin, pid, fake.id, pin)
 
   -- focus a tab: the dropdown opens with it active and the keyboard
   host.world_focus = pid
   set_visible(false)
   host.dropdown_tabs:push(session_new(policy.default_profile - 1, 80, 24)) -- a second tab, active
   host.dropdown_active = 1
-  expect(string.format('{"method":"panel.focus","params":{"id":%d}}', tab.id), 'assert(r.ok)')
+  expect_reqf('{"method":"panel.focus","params":{"id":%d}}', tab.id, 'assert(r.ok)')
   frame()
   assert(host.dropdown_open and host.dropdown_tabs[host.dropdown_active] == tab and host.world_focus == 0, 'the tab is shown')
-  expect('{"method":"panel.list"}', string.format([[
+  expect_checkf('{"method":"panel.list"}', [[
     for _, p in ipairs(r.result.panels) do if p.id == %d then assert(p.focused, RAW) end end
-    assert(r.result.rev ~= %d, 'rev moved')]], tab.id, rev_p))
+    assert(r.result.rev ~= %d, 'rev moved')]], tab.id, rev_p)
   -- focus a minimized terminal: restored into the dropdown
   set_visible(false)
-  expect(string.format('{"method":"panel.focus","params":{"id":%d,"fly":false}}', mins.id), 'assert(r.ok)')
+  expect_reqf('{"method":"panel.focus","params":{"id":%d,"fly":false}}', mins.id, 'assert(r.ok)')
   frame()
   assert(#host.minimized == 0 and host.dropdown_open and host.dropdown_tabs[host.dropdown_active] == mins, 'restored')
   -- focus a pet: the keyboard, and the click's camera turn and walk-up are asked for; fly false: not
-  expect(string.format('{"method":"panel.focus","params":{"id":%d}}', pet), 'assert(r.ok)')
+  expect_reqf('{"method":"panel.focus","params":{"id":%d}}', pet, 'assert(r.ok)')
   frame()
   assert(host.world_focus == pet and world_fly_id == pet, 'focused, flying')
-  expect(string.format('{"method":"panel.focus","params":{"id":%d,"fly":false}}', pin), 'assert(r.ok)')
+  expect_reqf('{"method":"panel.focus","params":{"id":%d,"fly":false}}', pin, 'assert(r.ok)')
   frame()
   assert(host.world_focus == pin and world_fly_id == 0, 'focused, no flight')
   -- order: the adopted pet first, then the window last
-  expect(string.format('{"method":"panel.order","params":{"id":%d,"to":"first"}}', fake.id), 'assert(r.ok)')
-  expect(string.format('{"method":"panel.order","params":{"id":%d,"to":"last"}}', pid), 'assert(r.ok)')
-  expect(string.format('{"method":"panel.order","params":{"id":%d,"to":"left"}}', pin), 'assert(r.ok)')
+  expect_reqf('{"method":"panel.order","params":{"id":%d,"to":"first"}}', fake.id, 'assert(r.ok)')
+  expect_reqf('{"method":"panel.order","params":{"id":%d,"to":"last"}}', pid, 'assert(r.ok)')
+  expect_reqf('{"method":"panel.order","params":{"id":%d,"to":"left"}}', pin, 'assert(r.ok)')
   frame()
-  expect('{"method":"panel.list"}', string.format([[
+  expect_checkf('{"method":"panel.list"}', [[
     local by = {}
     for _, p in ipairs(r.result.panels) do by[p.id] = p end
     assert(by[%d].order == 1 and by[%d].order == 2 and by[%d].order == 3, RAW)
-]], fake.id, pet, pid))
+]], fake.id, pet, pid)
   expect('{"method":"window.list"}', [[
     local q = r.result.requests[#r.result.requests]
     assert(q.method == 'panel.order' and not q.ok and q.error:find('only pets'), RAW)]])
   -- minimize: a terminal to the minimized list, a window hidden; focus brings both back
-  expect(string.format('{"method":"panel.minimize","params":{"id":%d}}', pet), 'assert(r.ok)')
-  expect(string.format('{"method":"panel.minimize","params":{"id":%d}}', pid), 'assert(r.ok)')
+  expect_reqf('{"method":"panel.minimize","params":{"id":%d}}', pet, 'assert(r.ok)')
+  expect_reqf('{"method":"panel.minimize","params":{"id":%d}}', pid, 'assert(r.ok)')
   frame()
   assert(#host.minimized == 1 and host.minimized[0].id == pet, 'minimized')
-  expect('{"method":"panel.list"}', string.format([[
+  expect_checkf('{"method":"panel.list"}', [[
     for _, p in ipairs(r.result.panels) do
       if p.id == %d then assert(p.view == 'min', RAW) end
       if p.id == %d then assert(p.view == 'hidden', RAW) end
-    end]], pet, pid))
-  expect(string.format('{"method":"panel.focus","params":{"id":%d,"fly":false}}', pid), 'assert(r.ok)')
+    end]], pet, pid)
+  expect_reqf('{"method":"panel.focus","params":{"id":%d,"fly":false}}', pid, 'assert(r.ok)')
   frame()
   assert(host.world_focus == pid, 'a hidden window shown and focused')
-  expect('{"method":"panel.list"}', string.format('for _, p in ipairs(r.result.panels) do if p.id == %d then assert(p.view == "pet" and p.focused, RAW) end end', pid))
+  expect_checkf('{"method":"panel.list"}', 'for _, p in ipairs(r.result.panels) do if p.id == %d then assert(p.view == "pet" and p.focused, RAW) end end', pid)
   -- toggle_pet from the minimized list: a pet; place a tab: a HUD panel; close a tab
-  expect(string.format('{"method":"panel.toggle_pet","params":{"id":%d}}', pet), 'assert(r.ok)')
-  expect(string.format('{"method":"panel.place","params":{"id":%d,"pin":"hud 0.5 0.3"}}', tab.id), 'assert(r.ok)')
-  expect(string.format('{"method":"panel.close","params":{"id":%d}}', mins.id), 'assert(r.ok)')
+  expect_reqf('{"method":"panel.toggle_pet","params":{"id":%d}}', pet, 'assert(r.ok)')
+  expect_reqf('{"method":"panel.place","params":{"id":%d,"pin":"hud 0.5 0.3"}}', tab.id, 'assert(r.ok)')
+  -- the panel.close below frees the session: keep its id, not the pointer
+  local mins_id = mins.id
+  expect_reqf('{"method":"panel.close","params":{"id":%d}}', mins_id, 'assert(r.ok)')
   frame()
-  expect('{"method":"panel.list"}', string.format([[
+  expect_checkf('{"method":"panel.list"}', [[
     local by = {}
     for _, p in ipairs(r.result.panels) do by[p.id] = p end
     assert(by[%d].view == 'pet' and by[%d].view == 'hud' and by[%d] == nil, RAW)
-]], pet, tab.id, mins.id))
+]], pet, tab.id, mins_id)
   expect('{"method":"window.list"}', 'for i = #r.result.requests - 2, #r.result.requests do assert(r.result.requests[i].ok, RAW) end')
   -- unknown panels
   expect('{"method":"panel.close","params":{"id":9999}}', 'assert(r.ok)')
@@ -516,7 +535,7 @@ player_here = true
 
 -- close: WCLOSE, the panel gone
 forget()
-expect(string.format('{"method":"window.close","params":{"id":%d}}', pid), 'assert(r.ok)')
+expect_reqf('{"method":"window.close","params":{"id":%d}}', pid, 'assert(r.ok)')
 frame()
 assert(#host.world == 0 and find_session(pid) == nilptr, 'closed')
 assert(count(PROTO_WCLOSE) == 1, 'the stream closed')

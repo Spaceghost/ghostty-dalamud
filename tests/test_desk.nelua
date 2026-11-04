@@ -7,6 +7,8 @@
 -- events turning into reactions that return to the hold.
 require 'core.host'
 require 'string'
+require 'io'
+require 'os'
 require 'stringbuilder'
 require 'arg'
 require 'math'
@@ -23,7 +25,8 @@ do
   assert(w.starts == 2 and w.dones == 2 and w.last_exit == 127, 'ST terminators, extra parameters')
   -- a mark split across reads, byte by byte
   local s = '\27]133;D;2\7'
-  for i = 1, #s do feed(&w, s:sub(i, i)) end
+  -- -P nogc: a view of the one byte, not s:sub(i, i), which would allocate
+  for i = 1, #s do w:scan((@*[0]uint8)(&s.data[i - 1]), 1) end
   assert(w.dones == 3 and w.last_exit == 2, 'split across reads')
   feed(&w, '\27]133;D\7')
   assert(w.dones == 4 and w.last_exit == 0, 'D without a status counts as 0')
@@ -129,6 +132,22 @@ local function take(): string
 end
 local function has(log: string, what: string): boolean return log:find(what, 1, true) > 0 end
 
+-- -P nogc: take() promotes a stringbuilder, so the log it hands back is an
+-- allocation. One variable holds the current one, freed when the next arrives,
+-- and a failing check prints it rather than joining it with `..`.
+local l: string
+local function take_l(): void
+  l:destroy()
+  l = take()
+end
+local function take_empty(): boolean
+  take_l()
+  return #l == 0
+end
+local function checkl(ok: boolean, what: string): void
+  if not ok then io.stderr:write('FAIL: ', what, ': ', l, '\n') os.exit(1) end
+end
+
 local t = 100.0
 local function frame(): void
   policy_anim_frame(t)
@@ -204,8 +223,8 @@ print('scheduler OK')
 lua("CONFIG.animation.enabled = true CONFIG.animation.style = 'desk' CONFIG.animation.desk.seed = 5 CONFIG.animation.reseed(3)")
 for _ = 1, 3 do frame() end
 toggle(true)
-local l = take()
-assert(has(l, 'set 255 0 9287 0;play 9287;'), 'sits down to work: '..l)
+take_l()
+checkl(has(l, 'set 255 0 9287 0;play 9287;'), 'sits down to work')
 assert(desk_want.count == 2, 'asked for a chair and a desk')
 for _ = 1, 5 do frame() end
 assert(creates == 2 and live == 2 and transforms == 0, 'made lazily, not placed while loading')
@@ -225,8 +244,8 @@ do
   local changes = 0
   for _ = 1, 60 * 120 do
     frame()
-    local s = take()
-    if #s > 0 then changes = changes + 1 end
+    take_l()
+    if #l > 0 then changes = changes + 1 end
   end
   assert(changes >= 5 and changes <= 60, 'a mood every 8-25 s over two minutes')
   lua("assert(CONFIG.animation.desk.active() and CONFIG.animation.desk.owns(CONFIG.animation.desk.hold()))")
@@ -239,14 +258,14 @@ for _ = 1, 300 do
   frame()
   if base ~= 3 then break end
 end
-l = take()
+take_l()
 assert(base ~= 3 and has(l, 'set 255 0 '), 'guard puts the mood back')
 
 -- walking off ends the scene cleanly and frees the furniture
 pc.x = 11
 frame()
-l = take()
-assert(has(l, 'set 255 0 0 0;play 3;'), 'stands up: '..l)
+take_l()
+checkl(has(l, 'set 255 0 0 0;play 3;'), 'stands up')
 assert(live == 0 and desk_want.count == 0, 'furniture freed')
 for _ = 1, 10 do frame() end
 assert(live == 0 and creates == 2, 'not back until the terminal opens again')
@@ -260,7 +279,7 @@ toggle(true)
 frame()
 assert(live == 2)
 toggle(false)
-l = take()
+take_l()
 assert(has(l, 'set 255 0 0 0;play 3;'), 'closing: stands up')
 frame()
 assert(live == 0, 'closing: freed')
@@ -310,14 +329,14 @@ assert(desk_block == 0, 'a new zone is not blocked')
 
 -- seated already: the desk steps aside and the phone comes out, seated
 mode, param = 11, 2
-take()
+take_l()
 toggle(true)
 frame()
-l = take()
+take_l()
 assert(live == 0 and has(l, 'play 6303;'), 'seated: the seated device, no furniture')
 toggle(false)
 mode, param = 1, 0
-take()
+take_l()
 
 -- seated variants by sit kind (Emote sheet: ActionTimeline[2] ground,
 -- [3] chair, [4] upper body; ModeParam 1 ground, 2 chair, 3 bed)
@@ -351,33 +370,33 @@ A.preset = 'book'
 mode, param = 11, 2
 toggle(true)
 frame()
-l = take()
-assert(has(l, 'play 7358;') and not has(l, 'set '), 'a chair sit: the chair variant over the sit: '..l)
+take_l()
+checkl(has(l, 'play 7358;') and not has(l, 'set '), 'a chair sit: the chair variant over the sit')
 for _ = 1, 60 do frame() end
-l = take()
-assert(not has(l, 'play 7358;'), 'the variant loops by itself, never restarted each guard tick: '..l)
+take_l()
+checkl(not has(l, 'play 7358;'), 'the variant loops by itself, never restarted each guard tick')
 param = 1 -- now on the ground
 for _ = 1, 20 do frame() end
-l = take()
-assert(has(l, 'play 7359;'), 'another sit kind: its own variant: '..l)
+take_l()
+checkl(has(l, 'play 7359;'), 'another sit kind: its own variant')
 for _ = 1, 60 do frame() end
-l = take()
-assert(not has(l, 'play 7359;'), 'and it too plays once: '..l)
+take_l()
+checkl(not has(l, 'play 7359;'), 'and it too plays once')
 toggle(false)
 frame()
-l = take()
-assert(has(l, 'set 11 1 0 1;'), 'put away: the sit replays through SetMode: '..l)
+take_l()
+checkl(has(l, 'set 11 1 0 1;'), 'put away: the sit replays through SetMode')
 lua("CONFIG.animation.preset = 'pen'")
 mode, param = 11, 1
 toggle(true)
 frame()
-l = take()
-assert(not has(l, 'play '), 'no seated variant: the character is left sitting: '..l)
+take_l()
+checkl(not has(l, 'play '), 'no seated variant: the character is left sitting')
 toggle(false)
 frame()
 lua("CONFIG.animation.preset = 'device' CONFIG.animation.style = CONFIG.animation._style_was")
 mode, param = 1, 0
-take()
+take_l()
 print('seated variants OK')
 
 -- no character: freed (the frame loop's no-world path)
@@ -407,76 +426,77 @@ lua("CONFIG.animation.style = 'phone' CONFIG.animation.reseed(11) CONFIG.animati
 host.anim_out = false
 toggle(true)
 frame()
-l = take()
-assert(has(l, 'set 255 0 6302 0;play 6302;'), 'the phone: '..l)
+take_l()
+checkl(has(l, 'set 255 0 6302 0;play 6302;'), 'the phone')
 -- a bell: one of the bell reactions, then straight back to the device
 policy_anim_event('bell', t, 1, 0)
-l = take()
-assert(has(l, 'play 665;') or has(l, 'play 618;'), 'bell reaction: '..l)
+take_l()
+checkl(has(l, 'play 665;') or has(l, 'play 618;'), 'bell reaction')
 lua("assert(CONFIG.animation.reacting())")
 policy_anim_event('bell', t, 1, 0)
-assert(#take() == 0, 'one reaction at a time')
+assert(take_empty(), 'one reaction at a time')
 for _ = 1, 150 do frame() end
-l = take()
-assert(has(l, 'play 6302;'), 'back to the hold: '..l)
+take_l()
+checkl(has(l, 'play 6302;'), 'back to the hold')
 lua("assert(not CONFIG.animation.reacting())")
 policy_anim_event('bell', t, 1, 0)
-assert(#take() == 0, 'bell cooldown')
+assert(take_empty(), 'bell cooldown')
 -- a failed command (after the gap between reactions)
 t = t + 2
-frame() take()
+frame() take_l()
 policy_anim_event('done', t, 1, 3)
-l = take()
-assert(has(l, 'play 666;') or has(l, 'play 670;') or has(l, 'play 668;') or has(l, 'play 664;'), 'failed: '..l)
+take_l()
+checkl(has(l, 'play 666;') or has(l, 'play 670;') or has(l, 'play 668;') or has(l, 'play 664;'), 'failed')
 for _ = 1, 200 do frame() end
-assert(has(take(), 'play 6302;'))
+take_l()
+assert(has(l, 'play 6302;'))
 -- success: only after a long run
 t = t + 10
 frame()
-take()
+take_l()
 policy_anim_event('done', t, 0, 3)
-assert(#take() == 0, 'a quick success is no news')
+assert(take_empty(), 'a quick success is no news')
 policy_anim_event('done', t, 0, 12)
-l = take()
-assert(has(l, 'play 671;') or has(l, 'play 6216;'), 'long success: '..l)
+take_l()
+checkl(has(l, 'play 671;') or has(l, 'play 6216;'), 'long success')
 for _ = 1, 200 do frame() end
-take()
+take_l()
 -- output: a glance only after a quiet spell and when not typing
 t = t + 30
-frame() take()
+frame() take_l()
 policy_anim_event('output', t, 500, 0)
-l = take()
-assert(has(l, 'play 665;') or has(l, 'play 669;'), 'glance after quiet: '..l)
+take_l()
+checkl(has(l, 'play 665;') or has(l, 'play 669;'), 'glance after quiet')
 for _ = 1, 150 do frame() end
-take()
+take_l()
 policy_anim_event('output', t, 500, 0)
-assert(#take() == 0, 'steady output: no glance')
+assert(take_empty(), 'steady output: no glance')
 t = t + 30
 policy_anim_key(t)
 policy_anim_event('output', t + 0.5, 500, 0)
-assert(#take() == 0, 'typing: no glance')
+assert(take_empty(), 'typing: no glance')
 -- a fidget between 30 and 90 s without typing
 lua("CONFIG.animation.reaction_table.fidget.after_min = 30 CONFIG.animation.reaction_table.fidget.after_max = 90")
 t = t + 60
-frame() take()
+frame() take_l()
 policy_anim_key(t)
 do
   local t0 = t
   local fid = 0.0
   for _ = 1, 60 * 100 do
     frame()
-    local s = take()
-    if fid == 0 and (has(s, 'play 669;') or has(s, 'play 625;') or has(s, 'play 667;')) then fid = t end
+    take_l()
+    if fid == 0 and (has(l, 'play 669;') or has(l, 'play 625;') or has(l, 'play 667;')) then fid = t end
   end
   assert(fid - t0 >= 29 and fid - t0 <= 91, 'fidget after 30-90 s idle')
 end
 -- switched off: nothing
 lua('CONFIG.animation.reactions = false')
 t = t + 60
-frame() take()
+frame() take_l()
 policy_anim_event('bell', t, 1, 0)
 policy_anim_event('done', t, 1, 0)
-assert(#take() == 0, 'reactions off')
+assert(take_empty(), 'reactions off')
 lua('CONFIG.animation.reactions = true')
 -- the same seed, the same reactions
 lua([[
@@ -504,13 +524,13 @@ toggle(false)
 frame()
 mode, param = 11, 1
 toggle(true)
-frame() take()
+frame() take_l()
 t = t + 60
-frame() take()
+frame() take_l()
 policy_anim_event('bell', t, 1, 0)
 for _ = 1, 150 do frame() end
-l = take()
-assert(has(l, 'play 6303;'), 'seated: back to the seated device: '..l)
+take_l()
+checkl(has(l, 'play 6303;'), 'seated: back to the seated device')
 toggle(false)
 mode, param = 1, 0
 print('reactions OK')
@@ -562,4 +582,5 @@ assert(live == 2)
 gu_shutdown()
 assert(live == 0, 'shutdown frees the props')
 for i = 1, creates do paths[i]:destroy() end
+l:destroy()
 print('desk OK')

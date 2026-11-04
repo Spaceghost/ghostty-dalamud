@@ -1,6 +1,8 @@
 -- Session-level behavior that does not need a transport.
 require 'core.session'
 require 'string'
+require 'io'
+require 'os'
 
 -- Regression: the title-changed callback takes (terminal, userdata) only. The
 -- core used to read two extra arguments as the title, which crashed the game
@@ -50,6 +52,7 @@ require 'core.sendtext'
 do
   local u = term_unescape('ls -la\\n^C\\e[A \\\\ \\^C')
   assert(u == 'ls -la\n\3\27[A \\ ^C', 'unescape')
+  u:destroy() -- -P nogc: term_unescape hands back a string of its own
   print('sendtext OK')
 end
 
@@ -71,18 +74,25 @@ do
     end
     return sb:promote()
   end
-  assert(run(&st, {0.1, 0.2, 0, 0}, 2) == 'T', 'tap')
+  -- -P nogc: run's sb:promote() is an allocation, so the gesture string is
+  -- compared and freed in one place instead of at every call
+  local function expect(st: *PadGestureState, seq: [4]float64, n: usize, want: string, what: string): void
+    local got = run(st, seq, n)
+    if got ~= want then
+      io.stderr:write('FAIL: ', what, ': ', got, '\n')
+      os.exit(1)
+    end
+    got:destroy()
+  end
+  expect(&st, {0.1, 0.2, 0, 0}, 2, 'T', 'tap')
   st = {}
-  assert(run(&st, {0.1, 0.18, 0.28, 0.36}, 4) == 'D', 'double tap')
+  expect(&st, {0.1, 0.18, 0.28, 0.36}, 4, 'D', 'double tap')
   st = {}
-  local h = run(&st, {0.1, 1.95, 0, 0}, 2)
-  assert(h == 'HHH', 'hold steps and repeats: '..h)
+  expect(&st, {0.1, 1.95, 0, 0}, 2, 'HHH', 'hold steps and repeats')
   st = {}
-  local d = run(&st, {0.1, 0.2, 0.45, 0.55}, 4)
-  assert(d == 'D', 'a slow second press inside the window (release to press) is a double tap: '..d)
+  expect(&st, {0.1, 0.2, 0.45, 0.55}, 4, 'D', 'a slow second press inside the window (release to press) is a double tap')
   st = {}
-  local th = run(&st, {0.1, 0.2, 0.35, 1.0}, 4)
-  assert(th == 'TH', 'a tap, then a hold: the tap is not lost: '..th)
+  expect(&st, {0.1, 0.2, 0.35, 1.0}, 4, 'TH', 'a tap, then a hold: the tap is not lost')
   st = {}
   assert(pad_gesture_update(&st, true, 0.1) == PadGesture.None)
   assert(pad_gesture_update(&st, false, 0.2) == PadGesture.None)

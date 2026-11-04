@@ -33,9 +33,11 @@ M.pet = {
   step = 0.55,           -- radians between pets stacked on the same side
   stiffness = 5.0,       -- spring stiffness: higher follows more tightly
   damping = 0.8,         -- 1 = settle with no overshoot; lower swings like a pendulum before settling
+  run_stiffness = 10.0,  -- keep the trailing formation with you while running
+  run_damping = 0.92,
   walk_speed = 0.6,      -- yalms per second above which the character counts as moving
   run_speed = 5.5,       -- yalms per second at which run_back is fully applied (running is ~6)
-  run_back = 0.35,       -- radians the slots swing further back while running
+  run_back = 0.75,       -- radians the slots swing further behind while running
   behind_clear = 0.8,    -- radians either side of straight behind you a pet never enters
   camera_clear = 0.85,   -- radians either side of the camera-to-you line a pet never enters
   stack_out = 1.1,       -- yalms further out per pet pair that no longer fits beside you
@@ -174,6 +176,10 @@ M.hud = {
   margin = 16,        -- pixels a docked panel keeps from the side it is docked to
 }
 
+-- A screen-locked map panel: upper-right, facing the camera, but intersected
+-- by the world's depth buffer so walls and terrain flatten it like scenery.
+M.map_hud = { x = 0.82, y = 0.19, scale = 0.30, distance = 12 }
+
 M.defaults = {
   width = 1800,            -- terminal pixels (40 px font)
   height = 1040,
@@ -188,9 +194,9 @@ M.defaults = {
 --             the depth buffer cannot be used)
 --   'off'     panels always draw on top
 M.occlusion = 'depth'
-M.occlusion_tolerance = 0.01  -- yalms a panel may sit behind a surface and still show (no flicker where they touch);
+M.occlusion_tolerance = 0.035 -- yalms a panel may sit behind a surface and still show (reduces depth-buffer flicker);
                               -- the depth test adds more with distance and at grazing angles
-M.occlusion_edge = 1          -- pixels over which a covered edge blends (0 = hard, up to 3)
+M.occlusion_edge = 2          -- pixels over which a covered edge blends (0 = hard, up to 3)
 
 -- Panels draw beneath what other plugins put in the background layer
 -- earlier in the frame, such as Umbra's toolbar at the screen edge. false:
@@ -381,7 +387,11 @@ function M.command(id, args)
     return nil
   end
   if how == 'toggle' then return M.toggle(id, tonumber(a[2]), tonumber(a[3]), tonumber(a[4]), tonumber(a[5]), tonumber(a[6])) end
-  if how == 'hud' then
+  if how == 'map' then
+    local cfg = M.map_hud
+    local err = M.dock(id, cfg.x, cfg.y, cfg.scale, cfg.distance, true, true, true)
+    return err
+  elseif how == 'hud' then
     local x, y = tonumber(a[2]), tonumber(a[3])
     if (a[2] and not x) or (x and not y) then return 'usage: /term pin hud [X Y] [DIST] [SCALE]' end
     return M.dock(id, x, y, tonumber(a[5]), tonumber(a[4]), true)
@@ -412,7 +422,7 @@ function M.command(id, args)
   elseif how == 'orbit' then
     M.anchors[id] = { kind = 'orbit', radius = tonumber(a[2]) or 3.5, speed = tonumber(a[3]) or 0.25, up = 1.8, phase = p.rotation }
   else
-    return 'usage: /term pin [here|me|target|orbit|pet|hud] ...'
+    return 'usage: /term pin [here|me|target|orbit|pet|hud|map] ...'
   end
   return nil
 end
@@ -472,7 +482,7 @@ end
 -- not given comes from where and how big the panel shows now (else the
 -- middle of the screen, at a size that fits). Also the core's drag-to-dock.
 -- `new`: a terminal not in the world yet may be docked too (/term pin hud).
-function M.dock(id, x, y, scale, dist, new)
+function M.dock(id, x, y, scale, dist, new, world_occluded, steady)
   local old = M.anchors[id]
   if not old and not new then return 'not a world terminal' end
   old = old or {}
@@ -498,6 +508,7 @@ function M.dock(id, x, y, scale, dist, new)
     phase = math.random() * 2 * pi,
   }
   for _, k in ipairs(KEEP) do a[k] = old[k] end
+  a.world_occluded, a.steady = world_occluded or false, steady or false
   M.anchors[id] = a
   M._pet_ids = nil
   return nil
@@ -817,7 +828,10 @@ local function slot(k, half_w)
   local side_sign = (k % 2 == 1) and 1 or -1
   local level = (k - 1) // 2
   local run = math.max(0, math.min(1, (body.speed - cfg.walk_speed) / math.max(cfg.run_speed - cfg.walk_speed, 0.1)))
-  local max_side = pi - cfg.behind_clear
+  -- Standing still, keep pets out of the character/camera cones. While moving,
+  -- let the slots swing around behind the character instead of forcing them
+  -- into the radial side arc; the camera-facing clearance still applies at rest.
+  local max_side = pi - cfg.behind_clear * (1 - run)
   local want = cfg.side + level * cfg.step + run * cfg.run_back
   local extra = 0
   if want > max_side then
@@ -974,8 +988,17 @@ function M.place_pet(id, a, p, t, focused)
     rel, dist = slot(k, pet_half_w(a))
     -- the row spaces itself and is laid out around the focused pet, so while
     -- pets are lined up nobody steps aside: only the slots ask for it
-    if not lined_up then spread(t, p) end
-    ang = body.heading + rel + sin(t * 0.11 + a.phase) * cfg.drift + (focused and 0 or (a.sp or 0))
+    if not lined_up then
+      if body.speed <= cfg.walk_speed then
+        spread(t, p)
+      else
+        -- The moving formation has its own trailing slots; do not let the
+        -- idle screen-overlap solver pull those slots back into the side arc.
+        a.sp, a.sp_y = 0, 0
+      end
+    end
+    local spread_angle = body.speed <= cfg.walk_speed and (a.sp or 0) or 0
+    ang = body.heading + rel + sin(t * 0.11 + a.phase) * cfg.drift + (focused and 0 or spread_angle)
   end
   local tx = p.x + sin(ang) * dist
   local tz = p.z + cos(ang) * dist
@@ -999,9 +1022,12 @@ function M.place_pet(id, a, p, t, focused)
   -- lifted before it was focused would keep that lift until the next solve
   if not in_row and not focused then ty = ty + (a.sp_y or 0) end
 
-  local x = spring(a, 'x', tx, dt, cfg.stiffness, cfg.damping)
-  local y = spring(a, 'y', ty, dt, cfg.stiffness, cfg.damping)
-  local z = spring(a, 'z', tz, dt, cfg.stiffness, cfg.damping)
+  local follow = math.max(0, math.min(1, (body.speed - cfg.walk_speed) / math.max(cfg.run_speed - cfg.walk_speed, 0.1)))
+  local stiffness = cfg.stiffness + (cfg.run_stiffness - cfg.stiffness) * follow
+  local damping = cfg.damping + (cfg.run_damping - cfg.damping) * follow
+  local x = spring(a, 'x', tx, dt, stiffness, damping)
+  local y = spring(a, 'y', ty, dt, stiffness, damping)
+  local z = spring(a, 'z', tz, dt, stiffness, damping)
 
   -- hard guarantees on top of the springs: outside the character's personal
   -- space, and (in the slots; the row is spaced already) not overlapping pets
@@ -1031,9 +1057,11 @@ function M.place_pet(id, a, p, t, focused)
   -- you (your facing while moving; the pets' frame while standing still)
   -- and never between the camera and you, wherever the camera turns (focusing
   -- a pet turns it; the other pets step aside rather than fill the view)
-  x, z = clear_of(x, z, p, behind(p), cfg.behind_clear)
-  local cb = camera_back(t)
-  if cb then x, z = clear_of(x, z, p, cb, cfg.camera_clear) end
+  if follow < 0.99 then
+    x, z = clear_of(x, z, p, behind(p), cfg.behind_clear * (1 - follow))
+    local cb = camera_back(t)
+    if cb then x, z = clear_of(x, z, p, cb, cfg.camera_clear * (1 - follow)) end
+  end
   a.placed_at, a.px, a.pz, a.phw = t, x, z, half_w
   a.x, a.z = x, z -- keep the spring from fighting the constraint
 
@@ -1294,13 +1322,19 @@ function M.place_hud(id, a, t)
   local wr, wu = M._turn_r, M._turn_u
   local k, z, mt, md = cfg.stiffness, cfg.damping, cfg.max_tilt, cfg.max_drag
   -- lagging behind the turn: slid back on screen, still facing where the camera looked
-  local lx = hud_spring(h, 'lx', -cfg.drag * wr, md, dt, k, z)
-  local ly = hud_spring(h, 'ly', cfg.drag * wu, md, dt, k, z)
-  local tr = hud_spring(h, 'tr', cfg.tilt * wr, mt, dt, k, z)
-  local tu = hud_spring(h, 'tu', cfg.tilt * wu, mt, dt, k, z)
-  local rl = hud_spring(h, 'rl', -cfg.roll * wr, mt, dt, k, z)
+  local lx, ly, tr, tu, rl
+  if a.steady then
+    h.lx, h.ly, h.tr, h.tu, h.rl = 0, 0, 0, 0, 0
+    lx, ly, tr, tu, rl = 0, 0, 0, 0, 0
+  else
+    lx = hud_spring(h, 'lx', -cfg.drag * wr, md, dt, k, z)
+    ly = hud_spring(h, 'ly', cfg.drag * wu, md, dt, k, z)
+    tr = hud_spring(h, 'tr', cfg.tilt * wr, mt, dt, k, z)
+    tu = hud_spring(h, 'tu', cfg.tilt * wu, mt, dt, k, z)
+    rl = hud_spring(h, 'rl', -cfg.roll * wr, mt, dt, k, z)
+  end
   local sx = a.sx + lx
-  local sy = a.sy + ly + sin(t * cfg.bob_speed + (a.phase or 0)) * cfg.bob
+  local sy = a.sy + ly + (a.steady and 0 or sin(t * cfg.bob_speed + (a.phase or 0)) * cfg.bob)
   local d = a.dist or cfg.distance
   local nx, ny = (2 * sx - 1) * v.tan_x * d, (1 - 2 * sy) * v.tan_y * d
   local x = v.x + v.fx * d + v.rx * nx + v.ux * ny
@@ -1314,7 +1348,7 @@ function M.place_hud(id, a, t)
   local ppy = v.height / (2 * d * v.tan_y * (a.scale or 1))
   local out = placement(a, x, y, zz, yaw, pitch, a.width or M.defaults.width, a.height or M.defaults.height,
     ppy, a.opacity or M.defaults.opacity, 0, t)
-  out.roll, out.hud = rl, true
+  out.roll, out.hud, out.occluded_hud = rl, true, a.world_occluded or false
   -- UI, not part of the world: none of its light, none cast
   out.tint_r, out.tint_g, out.tint_b, out.backlight = 1, 1, 1, 0
   out.light_intensity = 0

@@ -63,7 +63,8 @@ do -- the Lua side, against the real core functions
   luaL_openlibs(L)
   world_lua_register(L)
   fs_lua_register(L)
-  local script = root .. '/tests/test_winpath.lua'
+  local script: string = string.format('%s/tests/test_winpath.lua', root)
+  defer script:destroy() end -- -P nogc
   if luaL_loadfilex(L, (@cstring)(script.data), nilptr) ~= LUA_OK then
     io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
     os.exit(1)
@@ -82,7 +83,9 @@ do -- winpath_read_file through the folder the Lua half just made
   local data = winpath_read_file(shot)
   assert(data == 'PNGDATA', 'read a file through a non-ASCII folder')
   data:destroy()
-  local missing = winpath_read_file(shot .. '.missing')
+  local gone: string = string.format('%s.missing', shot)
+  local missing = winpath_read_file(gone)
+  gone:destroy()
   assert(missing.size == 0, 'nothing back for a file that is not there')
   shot:destroy()
 end

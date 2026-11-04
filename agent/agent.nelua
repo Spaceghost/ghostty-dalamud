@@ -263,7 +263,7 @@ local function clipboard_set(data: *[0]uint8, len: usize): boolean
     local f = io.open(agent.clip_file, 'wb')
     if not f:isopen() then return false end
     f:write(string{data=(@*[0]byte)(data), size=len})
-    f:close()
+    f:destroy()
     return true
   end
   return agent_clipboard_set(data, len)
@@ -274,7 +274,7 @@ local function clipboard_get(): (boolean, string)
     local f = io.open(agent.clip_file, 'rb')
     if not f:isopen() then return true, string.copy('') end
     local content = f:read('a')
-    f:close()
+    f:destroy()
     return true, content
   end
   return agent_clipboard_get()
@@ -544,7 +544,7 @@ local function read_token_file(path: string): string
   local f = io.open(path, 'rb')
   if f:isopen() then
     local content = f:read('a')
-    f:close()
+    f:destroy()
     return agent_trim(content)
   end
   -- generate
@@ -600,7 +600,7 @@ local function open_url_client(listen_spec: string, token_path: string, url: str
     local f = io.open(token_path, 'rb')
     if not f:isopen() then return open_url_fail('no token file ' .. token_path .. ' (is the agent running?)') end
     token = agent_trim(f:read('a'))
-    f:close()
+    f:destroy()
   end
   local host, port = agent_parse_hostport(listen_spec)
   local conn = net.connect(host, port)

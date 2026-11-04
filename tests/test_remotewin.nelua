@@ -386,7 +386,7 @@ host.agent_last_try = 1e9 -- never dial out
 assert(imgui_bind(resolver, nilptr) > 0 and imgui.DrawListAddImage ~= nilptr)
 assert(luaL_loadstring(policy.L, "CONFIG.world.occlusion = 'off'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
 policy_refresh()
-assert(policy.windows.max_w == 1920 and policy.windows.max_h == 1200 and policy.windows.fps == 30, 'lua/windows.lua defaults')
+assert(policy.windows.max_w == 3840 and policy.windows.max_h == 2400 and policy.windows.fps == 30, 'lua/windows.lua defaults')
 host.world_visible, host.world_rez, host.world_last_time = true, 1, now
 io_state.InputQueueCharacters = { Size = 0, Capacity = #chars, Data = (@*[0]uint16)(&chars) }
 
@@ -445,7 +445,7 @@ do
   assert(p ~= nilptr, 'WOPEN sent')
   req = proto.get_u32(p)
   assert(proto.get_u32((@*[0]uint8)(&p[4])) == 0, 'wid 0: by match')
-  assert(proto.get_u16((@*[0]uint8)(&p[8])) == 1920 and proto.get_u16((@*[0]uint8)(&p[10])) == 1200 and p[12] == 30, 'max size and fps from lua/windows.lua')
+  assert(proto.get_u16((@*[0]uint8)(&p[8])) == 3840 and proto.get_u16((@*[0]uint8)(&p[10])) == 2400 and p[12] == 30, 'max size and fps from lua/windows.lua')
   assert(string{data=(@*[0]byte)(&p[13]), size=7} == 'Firefox', 'the match text')
   assert(#host.world == 1 and #host.sessions == 1)
   s = host.world[0]
@@ -459,15 +459,20 @@ do
   p = last(PROTO_WOPEN)
   local frame_len = frames[#frames - 1].data.size
   assert(string{data=(@*[0]byte)(&p[13]), size=frame_len - 13} == 'run:foot -e htop', 'run: prefix')
+  -- forget() below frees the collected frames, and `p` points into one of
+  -- them: read the request id out while the frame is still there.
+  local run_req = proto.get_u32(p)
   local s2 = host.world[1]
-  -- closed before the agent answered: the late WOPENED is closed at once
-  host.world_focus = s2.id
+  -- closed before the agent answered: the late WOPENED is closed at once. The
+  -- close frees the session, so only its id may be looked at afterwards.
+  local s2_id = s2.id
+  host.world_focus = s2_id
   assert(remotewin_command('close') == 0)
   for _ = 1, 90 do world_frame(false) end
-  assert(#host.world == 1 and find_session(s2.id) == nilptr, 'closed')
+  assert(#host.world == 1 and find_session(s2_id) == nilptr, 'closed')
   forget()
   local b: [12]uint8
-  proto.put_u32(&b, proto.get_u32(p))
+  proto.put_u32(&b, run_req)
   proto.put_u32((@*[0]uint8)(&b[4]), 55)
   local q: ByteQueue
   proto.write_frame(&q, PROTO_WOPENED, &b, 12)
@@ -918,6 +923,14 @@ local function send_list(lines: string): void
   peer_send(&q)
   q:destroy()
 end
+
+-- -P nogc: the list is the launch line plus the windows, and joining the two
+-- allocates; send_list only borrows it, so it is freed here.
+local function send_launch_list(head: string, rest: string): void
+  local lines: string = string.format('%s%s', head, rest)
+  send_list(lines)
+  lines:destroy()
+end
 local function last_wopen_text(): string
   peer_collect()
   local i = #frames - 1
@@ -969,7 +982,7 @@ do
   local ok5, pl5 = policy_world_place(s5.id, now, false)
   assert(ok5)
   save_world_state()
-  local path = dir .. '/window-state.lua'
+  local path: string = string.format('%s/window-state.lua', dir)
   local saved = read_file(path)
   assert(saved:find('key:6aa.1', 1, true) > 0 and saved:find('run:yad --calendar', 1, true) > 0, 'saved: key and match')
   assert(saved:find('Firefox', 1, true) > 0 and saved:find('kind = "world"', 1, true) > 0, 'saved: the anchor')
@@ -1037,6 +1050,7 @@ do
   assert(saved:find('7bb', 1, true) == 0 and saved:find('Firefox', 1, true) > 0, 'only the open panel saved')
   saved:destroy()
   while #host.world > 0 do close_terminal(host.world[0]) end
+  path:destroy()
   print('window persistence OK')
 end
 
@@ -1136,12 +1150,12 @@ do
   local LAUNCH: string = '0\t0\t0\tlaunch\trun:COMMAND to start an app in the game\n'
   -- the first list is what was already there
   forget()
-  send_list(LAUNCH .. '3\t640\t400\tyad\tCalendar\t6aa.1\n')
+  send_launch_list(LAUNCH, '3\t640\t400\tyad\tCalendar\t6aa.1\n')
   pump()
   world_frame(false)
   assert(wopens() == 0 and #host.world == 0, 'the baseline opens nothing')
   -- a tab torn off into a window: opened by its id, where open_at says
-  send_list(LAUNCH .. '3\t640\t400\tyad\tCalendar\t6aa.1\n9\t800\t600\tfirefox\tNew Tab\t\n')
+  send_launch_list(LAUNCH, '3\t640\t400\tyad\tCalendar\t6aa.1\n9\t800\t600\tfirefox\tNew Tab\t\n')
   pump()
   world_frame(false)
   assert(wopens() == 1 and last_wopen_wid() == 9 and #host.world == 1, 'a new window: WOPEN #9')
@@ -1154,12 +1168,12 @@ do
   pump()
   for _ = 1, 30 do world_frame(false) end -- shown: its pose is known
   -- ours (sid:) and 5-column lines (not the compositor's) are never opened
-  send_list(LAUNCH .. '3\t640\t400\tyad\tCalendar\t6aa.1\n9\t800\t600\tfirefox\tNew Tab\t\tsid:70\n10\t300\t200\tfoot\tfoot\t\tsid:71\n14\t300\t200\tnotepad\tUntitled\n')
+  send_launch_list(LAUNCH, '3\t640\t400\tyad\tCalendar\t6aa.1\n9\t800\t600\tfirefox\tNew Tab\t\tsid:70\n10\t300\t200\tfoot\tfoot\t\tsid:71\n14\t300\t200\tnotepad\tUntitled\n')
   pump()
   world_frame(false)
   assert(wopens() == 0 and #host.world == 1, 'sid: lines and other desktops are not new windows')
   -- a dialog: pinned beside its window's panel, a little in front
-  send_list(LAUNCH .. '9\t800\t600\tfirefox\tNew Tab\t\tsid:70\n11\t400\t300\tfirefox\tSave As\t\tparent:9\n')
+  send_launch_list(LAUNCH, '9\t800\t600\tfirefox\tNew Tab\t\tsid:70\n11\t400\t300\tfirefox\tSave As\t\tparent:9\n')
   pump()
   world_frame(false)
   assert(wopens() == 1 and last_wopen_wid() == 11, 'the dialog opened')
@@ -1182,7 +1196,7 @@ do
   assert(#host.world == 0, 'the dialog went with its window')
   -- a refused window is not asked for again while it is listed
   forget()
-  send_list(LAUNCH .. '15\t400\t300\tgimp\tGIMP\t\n')
+  send_launch_list(LAUNCH, '15\t400\t300\tgimp\tGIMP\t\n')
   pump()
   world_frame(false)
   assert(wopens() == 1 and last_wopen_wid() == 15)
@@ -1191,7 +1205,7 @@ do
   pump()
   for _ = 1, 200 do world_frame(false) end
   forget()
-  send_list(LAUNCH .. '15\t400\t300\tgimp\tGIMP\t\n16\t400\t300\tgimp\tGIMP 2\t\n')
+  send_launch_list(LAUNCH, '15\t400\t300\tgimp\tGIMP\t\n16\t400\t300\tgimp\tGIMP 2\t\n')
   pump()
   world_frame(false)
   assert(wopens() == 1 and last_wopen_wid() == 16, 'no second try for #15')
@@ -1200,14 +1214,14 @@ do
   assert(luaL_loadstring(policy.L, "CONFIG.windows.auto_open = 'none'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
   policy_refresh()
   forget()
-  send_list(LAUNCH .. '17\t400\t300\tfoot\tfoot\t\n')
+  send_launch_list(LAUNCH, '17\t400\t300\tfoot\tfoot\t\n')
   pump()
   world_frame(false)
   assert(wopens() == 0 and #host.world == 0, "auto_open 'none'")
   -- 'related': only beside a panel of the same app or a dialog's window
   assert(luaL_loadstring(policy.L, "CONFIG.windows.auto_open = 'related'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
   policy_refresh()
-  send_list(LAUNCH .. '17\t400\t300\tfoot\tfoot\t\n18\t400\t300\txterm\txterm\t\n')
+  send_launch_list(LAUNCH, '17\t400\t300\tfoot\tfoot\t\n18\t400\t300\txterm\txterm\t\n')
   pump()
   world_frame(false)
   assert(wopens() == 0, "'related': an unrelated window stays out")
@@ -1231,7 +1245,7 @@ do
   assert(id == 0, 'an app: refused')
   assert(count(PROTO_WOPEN) == 0 and #host.world == 0, 'nothing asked of the agent')
   local LAUNCH: string = '0\t0\t0\tlaunch\trun:COMMAND to start an app in the game\n'
-  send_list(LAUNCH .. '20\t400\t300\t1password\tLock\t\n21\t400\t300\torg.gnome.Nautilus\tFiles\t\n22\t400\t300\tyad\tMy secret notes\t\n23\t400\t300\tyad\tCalendar 2\t\n')
+  send_launch_list(LAUNCH, '20\t400\t300\t1password\tLock\t\n21\t400\t300\torg.gnome.Nautilus\tFiles\t\n22\t400\t300\tyad\tMy secret notes\t\n23\t400\t300\tyad\tCalendar 2\t\n')
   pump()
   world_frame(false)
   assert(count(PROTO_WOPEN) == 1 and last_wopen_wid() == 23, 'auto open skips the kept-out windows')
@@ -1240,7 +1254,7 @@ do
   send_opened(c2.req, 80, 'Calendar 2')
   pump()
   forget()
-  send_list(LAUNCH .. '23\t400\t300\tyad\tSecret plans\t\tsid:80\n')
+  send_launch_list(LAUNCH, '23\t400\t300\tyad\tSecret plans\t\tsid:80\n')
   pump()
   for _ = 1, 120 do world_frame(false) end
   host.agent:flush()
@@ -1313,7 +1327,7 @@ do
   assert(count(PROTO_WOPEN) == 0 and #opened_urls == 1 and logged('link not opened: file:///etc/passwd') == 1, 'file: stays shut')
   -- an app in the compositor opened a link (raise:N): a window without a panel becomes one
   forget()
-  send_list(LAUNCH .. '9\t800\t600\tfirefox\tExample - Browser\t6aa.3\tsid:80\n30\t800\t600\tfirefox\tOther\t\traise:5\n')
+  send_launch_list(LAUNCH, '9\t800\t600\tfirefox\tExample - Browser\t6aa.3\tsid:80\n30\t800\t600\tfirefox\tOther\t\traise:5\n')
   pump()
   world_frame(false)
   assert(count(PROTO_WOPEN) == 1 and last_wopen_wid() == 30, 'raise:5 opens window #30')
@@ -1322,12 +1336,12 @@ do
   pump()
   world_frame(false)
   forget()
-  send_list(LAUNCH .. '9\t800\t600\tfirefox\tExample - Browser\t6aa.3\tsid:80\n30\t800\t600\tfirefox\tOther\t\tsid:81\traise:5\n')
+  send_launch_list(LAUNCH, '9\t800\t600\tfirefox\tExample - Browser\t6aa.3\tsid:80\n30\t800\t600\tfirefox\tOther\t\tsid:81\traise:5\n')
   pump()
   world_frame(false)
   assert(count(PROTO_WOPEN) == 0, 'the same mark: nothing again')
   host.world_focus = 0
-  send_list(LAUNCH .. '9\t800\t600\tfirefox\tExample - Browser\t6aa.3\tsid:80\traise:6\n30\t800\t600\tfirefox\tOther\t\tsid:81\traise:5\n')
+  send_launch_list(LAUNCH, '9\t800\t600\tfirefox\tExample - Browser\t6aa.3\tsid:80\traise:6\n30\t800\t600\tfirefox\tOther\t\tsid:81\traise:5\n')
   pump()
   world_frame(false)
   assert(count(PROTO_WOPEN) == 0 and host.world_focus == br.s.id and logged('an app opened a link in it') == 1, 'a new mark on a panel: focused')
@@ -1371,14 +1385,13 @@ local function fake_texture_file(path: cstring, w: *uint32, h: *uint32): pointer
   return (@pointer)(0x777)
 end
 do
-  local path = dir .. '/build/late-icon-test.png'
+  local path: string = string.format('%s/build/late-icon-test.png', dir)
   os.remove(path)
   local t0 = now
   assert(winpicker_icon(path, t0) == nilptr, 'not there yet')
   host.api.texture_file = fake_texture_file
   local f = io.open(path, 'wb')
   f:write('png')
-  f:close()
   f:destroy()
   assert(winpicker_icon(path, t0 + 1) == nilptr, 'not looked for again at once')
   assert(winpicker_icon(path, t0 + 3.5) == (@pointer)(0x777) and tex_asked == path, 'found a few seconds later: the texture')

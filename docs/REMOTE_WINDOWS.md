@@ -808,7 +808,9 @@ same and points at `/window` once per session. `/ask [question]` and
 `/agent ask [question]` are `/term ask` the same way.
 
 `@agent` may only name `default` so far. `lua/windows.lua` (`CONFIG.windows`)
-holds the sizes asked for (`max_w`, `max_h`, default 1920×1200), `fps` (30),
+holds the sizes asked for (`max_w`, `max_h`, default 3840×2400 — above a
+1920×1200 window at the compositor's default scale of 2, so the scale is not
+averaged away by the agent's downscale), `fps` (30),
 the panel's `pixels_per_yalm` (700), `width` (1600 panel pixels), `opacity`,
 `auto`: `/term window pull` arguments run once the character is loaded,
 `auto_open` (`all`), `links` (`game`), `never` (`{}`) and `reserved_chords`

@@ -29,6 +29,18 @@ function DesktopEntry:destroy(): void
   self.id:destroy() self.name:destroy() self.exec:destroy() self.exec_raw:destroy() self.icon:destroy() self.categories:destroy()
 end
 
+-- `s` ends with `suffix`, ignoring case, without copying either
+local function ends_ci(s: string, suffix: string): boolean
+  if #s < #suffix then return false end
+  local off = (@usize)(#s - #suffix)
+  for i: usize = 0, < (@usize)(#suffix) do
+    local c = s.data[off + i]
+    if c >= 'A'_b and c <= 'Z'_b then c = c + 32 end
+    if c ~= suffix.data[i] then return false end
+  end
+  return true
+end
+
 local function lower_byte(c: byte): byte
   if c >= 65 and c <= 90 then return c + 32 end
   return c
@@ -355,9 +367,9 @@ local function scan_add(out: *vector(DesktopEntry), seen: *vector(string), id: s
   for i = 0, < #seen do if seen[i] == id then return end end
   seen:push(string.copy(id)) -- a hidden entry hides the same id further down too
   local f = io.open(path, 'rb')
-  if not f:isopen() then return end
+  if not f:isopen() then f:destroy() return end -- -P nogc: the stream is heap-allocated
   local text = f:read('a')
-  f:close()
+  f:destroy()
   local ok, e = desktop_parse(id, text)
   text:destroy()
   if ok then out:push(e) end
@@ -370,7 +382,9 @@ global function desktop_scan(dirs: *vector(string)): vector(DesktopEntry)
     local names = desktop_list_dir(dirs[di])
     for i = 0, < #names do
       local nm = names[i]
-      local path = dirs[di] .. '/' .. nm
+      -- -P nogc: one format, not two concats: a chained `..` strands the
+      -- string in the middle with nothing left holding it
+      local path = string.format('%s/%s', dirs[di], nm)
       if #nm > 8 and nm:subview(#nm - 7) == '.desktop' then
         scan_add(&out, &seen, nm, path)
       else
@@ -378,8 +392,8 @@ global function desktop_scan(dirs: *vector(string)): vector(DesktopEntry)
         for k = 0, < #sub do
           local sn = sub[k]
           if #sn > 8 and sn:subview(#sn - 7) == '.desktop' then
-            local id = nm .. '-' .. sn
-            local sp = path .. '/' .. sn
+            local id = string.format('%s-%s', nm, sn)
+            local sp = string.format('%s/%s', path, sn)
             scan_add(&out, &seen, id, sp)
             id:destroy() sp:destroy()
           end
@@ -460,7 +474,7 @@ global function desktop_find_icon(icon: string, dirs: *vector(string)): (string,
     local ctx = DESKTOP_ICON_CONTEXTS[ci]
     for ti = 0, < #DESKTOP_ICON_THEMES do
       for di = 0, < #dirs do
-        local base = dirs[di] .. '/' .. DESKTOP_ICON_THEMES[ti]
+        local base = string.format('%s/%s', dirs[di], DESKTOP_ICON_THEMES[ti])
         if exists(base) then
           for si = 0, < #DESKTOP_ICON_SIZES do
             local sz = DESKTOP_ICON_SIZES[si]
@@ -483,7 +497,7 @@ global function desktop_find_icon(icon: string, dirs: *vector(string)): (string,
   end
   local exts: [3]string = { '.png', '.svg', '.xpm' }
   for k = 0, < 3 do
-    local p = '/usr/share/pixmaps/' .. icon .. exts[k]
+    local p = string.format('/usr/share/pixmaps/%s%s', icon, exts[k])
     if exists(p) then return p, k == 1 and 0 or DESKTOP_ICON_PX end
     p:destroy()
   end
@@ -531,7 +545,7 @@ global function desktop_which(name: string): string
     local c = path:find(':', pos, true)
     local stop = c > 0 and c - 1 or #path
     if stop >= pos then
-      local p = path:subview(pos, stop) .. '/' .. name
+      local p = string.format('%s/%s', path:subview(pos, stop), name)
       if access((@cstring)(p.data), 1) == 0 then path:destroy() return p end
       p:destroy()
     end
@@ -559,7 +573,8 @@ local function write_tmp(sb: *stringbuilder, dst: string): void
 end
 
 global function desktop_icon_job(sb: *stringbuilder, src: string, dst: string, renderer: string): boolean
-  local png = #src > 4 and src:subview(#src - 3):lower() == '.png'
+  -- -P nogc: :lower() would allocate a copy only to compare it
+  local png = #src > 4 and ends_ci(src, '.png')
   if not png and #renderer == 0 then return false end
   if png then
     sb:write('cp -f ') desktop_sh_quote(sb, src) sb:write(' ') write_tmp(sb, dst)

@@ -131,7 +131,7 @@ local state_file = string.format('%s/world-state.lua', dir)
 local function state_saved(): boolean
   local f = io.open(state_file)
   local found = f:isopen()
-  if found then f:close() end
+  if found then f:destroy() end
   return found
 end
 do

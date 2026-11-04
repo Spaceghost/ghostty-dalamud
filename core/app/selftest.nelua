@@ -53,7 +53,9 @@ local function join(dir: string, name: string): string
   if #dir == 0 then return string.copy(name) end
   local last = dir.data[dir.size - 1]
   if last == '/'_b or last == '\\'_b then return dir .. name end
-  return dir .. '/' .. name
+  -- -P nogc: `dir .. '/' .. name` allocates twice and strands the one in the
+  -- middle, so the path is built in one step.
+  return string.format('%s/%s', dir, name)
 end
 
 -- <config>/selftest, created when missing

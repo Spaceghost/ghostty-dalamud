@@ -84,6 +84,11 @@ for d in themes fonts; do
   rm -rf "$DEST/$d.old"
 done
 
+# Dalamud shows a dev plugin's icon and banner only from images/ beside the DLL (IconUrl is for repo installs).
+mkdir -p "$DEST/images"
+[[ -f "$ROOT/images/icon.png" ]] && put "$ROOT/images/icon.png" "$DEST/images/icon.png"
+[[ -f "$ROOT/images/banner.png" ]] && put "$ROOT/images/banner.png" "$DEST/images/image1.png"
+
 loader_changed=0
 put_changed "$SRC/ghostty_loader.dll" "$DEST/ghostty_loader.dll" && loader_changed=1
 # always rewritten: its new write time is what makes the loader swap (and reread lua/)

@@ -92,9 +92,10 @@ local function check_pose(nx: float32, ny: float32, nz: float32, ax: float32, az
   nx, ny, nz = nx / l, ny / l, nz / l
   local yaw, pitch = world_pose_from_normal(nx, ny, nz, ax, az)
   local a = world_axes(yaw, pitch)
-  assert(near(a.nx, nx, 1e-4) and near(a.ny, ny, 1e-4) and near(a.nz, nz, 1e-4), what .. ': front faces the normal')
+  -- -P nogc: `what .. ': ...'` would allocate on every call, passing or not
+  assert(near(a.nx, nx, 1e-4) and near(a.ny, ny, 1e-4) and near(a.nz, nz, 1e-4), what)
   local al = math.sqrt(ax * ax + az * az)
-  assert(a.uy + (a.ux * ax + a.uz * az) / al > 0, what .. ': reads upright')
+  assert(a.uy + (a.ux * ax + a.uz * az) / al > 0, what)
   return yaw, pitch
 end
 
@@ -652,7 +653,9 @@ do
   policy_world_save(&entries)
   entries:destroy()
   assert(lua_ok('local s = dofile(GHOSTTY_PLUGIN_DIR .. "/world-state.lua")[9001] assert(s.kind == "world" and s.zone == 132 and math.abs(s.pitch - 1.2) < 1e-4)'), 'saved as a world pin')
-  os.remove(root .. '/world-state.lua')
+  local state: string = string.format('%s/world-state.lua', root)
+  os.remove(state)
+  state:destroy()
 
   -- another zone hides it; unknown terminals report an error
   territory = 133

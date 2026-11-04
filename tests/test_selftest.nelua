@@ -117,7 +117,11 @@ do
   local hx = selftest_hex64(h)
   print('render ops', calls, hx)
   assert(rok and calls > 20)
-  assert(hx == SELFTEST_RENDER_HASH, 'SELFTEST_RENDER_HASH in core/selftest_logic.nelua must be ' .. hx)
+  if hx ~= SELFTEST_RENDER_HASH then
+    -- -P nogc: the message is built only when it is needed
+    io.stderr:write('SELFTEST_RENDER_HASH in core/selftest_logic.nelua must be ', hx, '\n')
+    os.exit(1)
+  end
   -- the same terminal twice: the same calls
   local rok2, h2, calls2, out2 = selftest_render_ops()
   assert(rok2 and h2 == h and calls2 == calls, 'recorded calls are deterministic')

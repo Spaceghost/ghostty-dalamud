@@ -782,9 +782,10 @@ global function draw_world(now: float64): void
   -- a click that no ImGui window took decides world focus
   -- derez in combat, rez back afterwards
   local pc: GuObject
-  local in_combat = host.api.get_object ~= nilptr and host.api.get_object(WORLD_PLAYER, 0, &pc) ~= 0 and pc.found ~= 0 and pc.in_combat ~= 0
-  -- combat and hiding (ctrl+shift+`) glitch the panels out; showing glitches them in
-  local rez_target: float32 = (in_combat or not host.world_visible) and 0 or 1
+  if host.api.get_object ~= nilptr then host.api.get_object(WORLD_PLAYER, 0, &pc) end
+  -- Only the explicit world-panel toggle hides the panels; combat and running
+  -- should not make the terminals or windows blink out.
+  local rez_target: float32 = host.world_visible and 1 or 0
   local rez_speed: float32 = rez_target == 0 and 2.2 or 1.6 -- per second
   if host.world_rez < rez_target then host.world_rez = math.min(rez_target, host.world_rez + wdt * rez_speed)
   elseif host.world_rez > rez_target then host.world_rez = math.max(rez_target, host.world_rez - wdt * rez_speed) end
@@ -895,7 +896,7 @@ global function draw_world(now: float64): void
     if s.posed then s.pose_x, s.pose_y, s.pose_z, s.pose_yaw, s.pose_pitch = pl.x, pl.y, pl.z, pl.yaw, pl.pitch end
     -- the shadow board follows the pose the panel is drawn at (carried or
     -- presented); full screen leaves the world, so the board goes
-    occluder_panel(s.id, ok and not pl.hud and not s.sleeping and prez * (1 - ft) > 0, &pl, &host.world_tuning)
+    occluder_panel(s.id, ok and (not pl.hud or pl.occluded_hud) and not s.sleeping and prez * (1 - ft) > 0, &pl, &host.world_tuning)
     if ok and full_this then pl = world_flight_pose(pl, ft) end
     if ok then
       local b = world_basis(pl)
@@ -1097,9 +1098,10 @@ global function draw_world(now: float64): void
         -- included); off once the full-screen flight starts moving the vertices
         -- away from the surface the shader intersects
         -- a HUD panel is always in front
-        local depth_on = not pl.hud and occlusion == WORLD_OCCLUSION_DEPTH and depthpass_panel_begin(dl, &b, ft > 0 and 0 or 1)
+        local depth_eligible = not pl.hud or pl.occluded_hud
+        local depth_on = depth_eligible and occlusion == WORLD_OCCLUSION_DEPTH and depthpass_panel_begin(dl, &b, ft > 0 and 0 or 1)
         local panel_occ: *WorldOccluder = nilptr
-        if occlusion ~= WORLD_OCCLUSION_OFF and not depth_on and not pl.hud then panel_occ = &occ end
+        if occlusion ~= WORLD_OCCLUSION_OFF and not depth_on and depth_eligible then panel_occ = &occ end
         local first = dl.VtxBuffer.Size
         local first_cmd = dl.CmdBuffer.Size
         local first_idx = dl.IdxBuffer.Size
@@ -1249,7 +1251,7 @@ global function draw_world(now: float64): void
         end
         world_transform_vertices(dl, first_cmd, first, &cam, &b, vp, vp, prez, now, ft, flat, panel_occ)
         -- beneath the game's HUD: cut where it is shown (not once flown full screen)
-        if host.hud_mask.n > 0 and ft < 0.5 then hudmask_cut(dl, first_idx, first, &host.hud_mask, imgui.DrawListPrimReserve) end
+        if host.hud_mask.n > 0 and ft < 0.5 and not pl.occluded_hud then hudmask_cut(dl, first_idx, first, &host.hud_mask, imgui.DrawListPrimReserve) end
         if depth_on then depthpass_panel_end(dl) end
         if resizing_this then -- its size beside the cursor, flat on the screen
           local terminal = s.kind ~= TransportKind.Window and s.kind ~= TransportKind.Panel

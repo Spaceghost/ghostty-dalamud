@@ -74,7 +74,7 @@ local config = {
     -- /agent ask [question]. Their /help lines are in lua/tooltips.lua.
     -- A name another plugin holds is retried; {} registers none.
     verb_commands = { ['/window'] = 'window', ['/ask'] = 'ask', ['/agent'] = 'agent' },
-    help = 'Show/hide the terminal. window [n|list|pull [match]|close] | new [n] | pin [here|me|target|orbit] | unpin | ask [question] | theme [name] | shot [panel] [clean] | clip [seconds] | share | config | reload',
+    help = 'Show/hide the terminal. window [n|list|pull [match]|close] | new [n] | pin [here|me|target|orbit|pet|hud|map] | unpin | ask [question] | theme [name] | shot [panel] [clean] | clip [seconds] | share | config | reload',
     -- Server info bar entry. 'auto' shows it only while no Umbra toolbar
     -- widget is showing ghostty's status; 'always' | 'never'.
     dtr = {

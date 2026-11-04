@@ -759,6 +759,7 @@ global function policy_world_place(id: integer, t: float64, focused: boolean): (
     pl.order_prev = lua_field_boolean(L, r, 'order_prev', false)
     pl.order_next = lua_field_boolean(L, r, 'order_next', false)
     pl.hud = lua_field_boolean(L, r, 'hud', false)
+    pl.occluded_hud = lua_field_boolean(L, r, 'occluded_hud', false)
     ok = true
   end
   lua_pop(L, 3)

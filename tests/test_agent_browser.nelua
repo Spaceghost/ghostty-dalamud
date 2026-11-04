@@ -32,12 +32,16 @@ end
 do
   local url = "https://example.org/it's?a=1&b=$(x)"
   local q = "'https://example.org/it'\\''s?a=1&b=$(x)'"
+  -- -P nogc: the expected line is built once and freed, not per comparison
+  local want_ff: string = string.format('firefox %s', q)
+  local want_cr: string = string.format('/usr/bin/google-chrome-stable %s', q)
   local c = browser_expand('firefox %u', url, 'Firefox', 'firefox')
-  eq(c, 'firefox ' .. q, 'Exec %u')
+  eq(c, want_ff, 'Exec %u')
   c:destroy()
   c = browser_expand('/usr/bin/google-chrome-stable %U', url, 'Chrome', '')
-  eq(c, '/usr/bin/google-chrome-stable ' .. q, 'Exec %U')
+  eq(c, want_cr, 'Exec %U')
   c:destroy()
+  want_ff:destroy() want_cr:destroy()
   c = browser_expand('flatpak run --branch=stable --arch=x86_64 --command=firefox --file-forwarding org.mozilla.firefox @@u %u @@', 'https://x.org', 'Firefox', '')
   eq(c, "flatpak run --branch=stable --arch=x86_64 --command=firefox --file-forwarding org.mozilla.firefox @@u 'https://x.org' @@", 'Flatpak Exec')
   c:destroy()

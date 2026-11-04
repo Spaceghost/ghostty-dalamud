@@ -146,11 +146,13 @@ do
   assert(ok and st.rings == 1 and near(st.max_radius, 5.5), 'sonar preset')
   err = policy_bell_command('nope')
   assert(#err > 0, 'unknown preset explains usage')
+  err:destroy() -- -P nogc: the message comes back as a copy of the Lua string
   local shown = 0
   for i = 1, 10 do
     local more, label = policy_bell_demo(i)
     if not more then break end
     assert(#label > 0)
+    label:destroy()
     shown = shown + 1
   end
   assert(shown == 5, 'demo shows every preset once')

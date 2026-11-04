@@ -22,7 +22,8 @@ do
   luaL_openlibs(L)
   world_lua_register(L)
   fs_lua_register(L)
-  local script = root .. '/tests/test_platform.lua'
+  local script: string = string.format('%s/tests/test_platform.lua', root)
+  defer script:destroy() end -- -P nogc
   if luaL_loadfilex(L, (@cstring)(script.data), nilptr) ~= LUA_OK then
     io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
     os.exit(1)
@@ -39,10 +40,12 @@ end
 -- policy_open_profile: only agent profiles, only while the agent is down,
 -- only to a conpty profile that exists
 do
-  local dir = scratch .. '/platform'
-  local luadir = dir .. '/lua'
+  local dir: string = string.format('%s/platform', scratch)
+  local luadir: string = string.format('%s/lua', dir)
+  local init: string = string.format('%s/init.lua', luadir)
+  defer dir:destroy() luadir:destroy() init:destroy() end -- -P nogc
   assert(fs_mkdir((@cstring)(dir.data)) and fs_mkdir((@cstring)(luadir.data)))
-  local f = io.open(luadir .. '/init.lua', 'wb')
+  local f = io.open(init, 'wb')
   f:write([[
 return { profiles = {
   { name = 'a', transport = 'agent', command = { 'x' }, fallback = 'a (local)' },
@@ -53,7 +56,7 @@ return { profiles = {
   { name = 'e', transport = 'conpty', command = { 'cmd.exe' }, fallback = 'a' },
 } }
 ]])
-  f:close()
+  f:destroy()
   assert(policy_load(dir), policy.error)
   local a = policy_profile(0)
   assert(a.fallback == 'a (local)' and policy_profile(1).fallback == '')

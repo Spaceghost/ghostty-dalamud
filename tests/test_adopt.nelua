@@ -474,7 +474,8 @@ if #arg >= 2 then
   luaL_openlibs(L)
   world_lua_register(L)
   fs_lua_register(L)
-  local script = root .. '/tests/test_adopt.lua'
+  local script: string = string.format('%s/tests/test_adopt.lua', root)
+  defer script:destroy() end -- -P nogc
   if luaL_loadfilex(L, (@cstring)(script.data), nilptr) ~= LUA_OK then
     io.stderr:write((@cstring)(lua_tolstring(L, -1, nilptr)), '\n')
     os.exit(1)

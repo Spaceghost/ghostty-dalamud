@@ -1,17 +1,42 @@
 -- Which platform the code runs on, as Lua sees it through ghostty.platform():
 -- 'windows' (native Windows), 'wine' (a Windows build running under Wine or
--- Proton: ntdll exports wine_get_version), 'linux', 'macos' or 'posix'.
+-- Proton), 'linux', 'macos' or 'posix'.
 -- The name is a static string; callers never free it.
 require 'string'
 
 ## if ccinfo.is_windows then
 ## cinclude '<windows.h>'
+## linklib 'advapi32'
 local function GetModuleHandleA(name: cstring): pointer <cimport, nodecl> end
 local function GetProcAddress(mod: pointer, name: cstring): pointer <cimport, nodecl> end
+local HKEY: type <cimport, nodecl> = @pointer
+local function RegOpenKeyExA(key: HKEY, sub: cstring, opts: uint32, sam: uint32, out: *HKEY): clong <cimport, nodecl> end
+local function RegCloseKey(key: HKEY): clong <cimport, nodecl> end
+local HKEY_LOCAL_MACHINE: HKEY <cimport, nodecl>
+local KEY_READ: uint32 <cimport, nodecl>
+
+-- ntdll's wine_get_version is the usual marker, but Wine staging builds with
+-- HideWineExports (XIVLauncher's wine-xiv-staging among them) hide it from the
+-- game, which then passed for native Windows: /ask looked for almanac in the
+-- Wine prefix instead of asking the agent on the host. Every Wine prefix has
+-- HKLM\Software\Wine, and Windows does not, so that decides when the export is
+-- missing.
+local wine_known: boolean = false
+local wine_cached: boolean = false
 
 global function platform_is_wine(): boolean
+  if wine_known then return wine_cached end
   local ntdll = GetModuleHandleA('ntdll.dll')
-  return ntdll ~= nilptr and GetProcAddress(ntdll, 'wine_get_version') ~= nilptr
+  local wine = ntdll ~= nilptr and GetProcAddress(ntdll, 'wine_get_version') ~= nilptr
+  if not wine then
+    local key: HKEY = nilptr
+    if RegOpenKeyExA(HKEY_LOCAL_MACHINE, 'Software\\Wine', 0, KEY_READ, &key) == 0 then
+      RegCloseKey(key)
+      wine = true
+    end
+  end
+  wine_known, wine_cached = true, wine
+  return wine
 end
 
 global function platform_name(): string

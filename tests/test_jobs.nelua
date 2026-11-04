@@ -275,7 +275,7 @@ do -- a job without the keep flag dies with the connection that opened it
   local alive = f:isopen()
   if alive then
     local st = f:read('a')
-    f:close()
+    f:destroy()
     -- a reaped child may still show as a zombie for a moment; anything else is a leak
     alive = st:find(') Z ', 1, true) == 0
     st:destroy()
@@ -360,7 +360,7 @@ do -- 8 MiB of output while the client stops reading: flow control, nothing lost
   local f = io.open('/proc/' .. agent_pid .. '/status', 'rb')
   assert(f:isopen(), 'agent /proc status')
   local st = f:read('a')
-  f:close()
+  f:destroy()
   local at = st:find('VmRSS:', 1, true)
   assert(at > 0)
   local kb = 0
@@ -368,7 +368,14 @@ do -- 8 MiB of output while the client stops reading: flow control, nothing lost
   while i <= #st and (st:byte(i) == 32 or st:byte(i) == 9) do i = i + 1 end
   while i <= #st and st:byte(i) >= 48 and st:byte(i) <= 57 do kb = kb * 10 + (st:byte(i) - 48) i = i + 1 end
   print('agent VmRSS kB while 8 MiB of job output goes unread:', kb)
-  assert(kb > 0 and kb < 24 * 1024, 'the agent stops reading the job instead of buffering it all')
+  -- A sanitizer's shadow memory and redzones are in the agent's RSS too, so
+  -- the budget makes room for them; what is checked either way is that the
+  -- 8 MiB of unread job output is not sitting in the agent.
+  local budget = 24 * 1024
+  local san = os.getenv('SAN')
+  if #san > 0 then budget = 48 * 1024 end
+  san:destroy()
+  assert(kb > 0 and kb < budget, 'the agent stops reading the job instead of buffering it all')
   c.paused = false
   for _ = 1, 20000 do c:pump() if jexit_count > 0 then break end end
   print('job output bytes:', out_bytes, 'exit', jexit_status)

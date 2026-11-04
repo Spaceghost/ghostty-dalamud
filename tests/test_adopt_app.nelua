@@ -363,12 +363,17 @@ local function panel_screen(id: integer, u: float32, v: float32): ImVec2
   assert(pok)
   return vec2(sx, sy)
 end
-local function saved(): string
-  local f = io.open(dir .. '/adopted.lua')
-  if not f:isopen() then return '' end
+-- -P nogc: the path and the file's text are both allocations; saved_has reads
+-- the list, answers the one question asked of it and frees both.
+local adopted_path: string = string.format('%s/adopted.lua', dir)
+local function saved_has(needle: string): boolean
+  local f = io.open(adopted_path)
+  if not f:isopen() then f:destroy() return false end
   local s = f:read('a')
-  f:close()
-  return s
+  f:destroy()
+  local found = s:find(needle, 1, true) > 0
+  s:destroy()
+  return found
 end
 local function has_text(needle: string): boolean
   for i = 0, < #texts do if texts[i]:find(needle, 1, true) > 0 then return true end end
@@ -376,7 +381,7 @@ local function has_text(needle: string): boolean
 end
 
 -- Setup ------------------------------------------------------------------------------------------
-os.remove(dir .. '/adopted.lua')
+os.remove(adopted_path)
 assert(gu_init(&api, (@cstring)(dir.data)) == 0, 'init')
 host.agent_last_try = 1e9 -- never dial out
 assert(imgui_bind(resolver, nilptr) > 0)
@@ -418,8 +423,7 @@ do
   assert(#set_pos == 1 and set_pos[0].x == 0 and set_pos[0].y == 50, 'moved inside the screen')
   assert(prim_verts > 0 and tex_pushes > 0, 'its drawing is on the pet, with its texture')
   assert(has_text('back to UI') and has_text('Chat 2'), 'the title strip: back to UI and the label')
-  local mentions = saved():find('"chat2"', 1, true)
-  assert(mentions > 0, 'the pulled list is saved')
+  assert(saved_has('"chat2"'), 'the pulled list is saved')
   print('adopt OK')
 end
 
@@ -505,7 +509,7 @@ do
   assert((win.Flags & ImGuiWindowFlags_NoMouseInputs) == 0, 'flags given back')
   assert(set_pos[#set_pos - 1].x == -50, 'its own position given back')
   assert(live_hooks(ImGuiContextHookType_RenderPre) == 0, 'hooks off across the reload')
-  assert(saved():find('"chat2"', 1, true) > 0, 'the list survives the reload')
+  assert(saved_has('"chat2"'), 'the list survives the reload')
   host.world_visible, host.world_rez = true, 1
   io_state.InputQueueCharacters = { Size = 0, Capacity = #chars, Data = (@*[0]uint16)(&chars) }
   assert(luaL_loadstring(policy.L, "CONFIG.world.occlusion = 'off'") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
@@ -525,20 +529,28 @@ end
 -- Release ---------------------------------------------------------------------------------------------
 do
   local n_pos = #set_pos
+  -- release frees the session: keep its id, not the pointer
+  local s_id = s.id
   assert(run_command('release') == 0, 'no name: the newest')
-  assert(#host.world == 0 and adopt_count() == 0 and find_session(s.id) == nilptr, 'closed at once')
+  assert(#host.world == 0 and adopt_count() == 0 and find_session(s_id) == nilptr, 'closed at once')
   assert((win.Flags & ImGuiWindowFlags_NoMouseInputs) == 0, 'its flags as they were')
   assert(#set_pos == n_pos, 'on screen from the start: not moved back')
   assert(live_hooks(ImGuiContextHookType_RenderPre) == 0 and imgui.GetMousePos == fake_mouse, 'hooks off')
   frame(false, true)
   assert(win_dl.CmdBuffer.Size == 1, 'drawn on the screen again')
-  assert(saved():find('"chat2"', 1, true) == 0, 'the saved list is empty')
+  assert(not saved_has('"chat2"'), 'the saved list is empty')
   print('release OK')
 end
 
 -- Fitting: the window takes the pet's shape; the HUD --------------------------------------------------
 local function lua_run(code: string): void
   assert(luaL_loadstring(policy.L, (@cstring)(code.data)) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, code)
+end
+-- -P nogc: the formatted snippet is this helper's to free
+local function lua_runf(fmt: string, a: integer): void
+  local code: string = string.format(fmt, a)
+  lua_run(code)
+  code:destroy()
 end
 local function inner_aspect(): float32
   return (win.InnerRect.Max.x - win.InnerRect.Min.x) / (win.InnerRect.Max.y - win.InnerRect.Min.y)
@@ -565,7 +577,7 @@ do
   assert(near(inner_aspect(), ba, 0.01), 'the same shape')
   assert(near(win.Size.x, 400, 1) and near(win.Size.y, 200, 1), 'which is the size it had')
   -- the pet is resized (as the grips or a policy do: the anchor's width and height)
-  lua_run(string.format("local a = require('world').anchors[%d]; a.width = a.width * 1.6; a.height = a.height * 0.9", s.id))
+  lua_runf("local a = require('world').anchors[%d]; a.width = a.width * 1.6; a.height = a.height * 0.9", s.id)
   for _ = 1, 3 do frame(false, true) end
   ba, bw, bh = box_aspect(s.id)
   assert(#set_size > 0, 'the window was resized')
@@ -581,7 +593,7 @@ do
   local dx, dy = adopt_to_window(&m, PANEL_PAD + bw, PANEL_TITLE + bh)
   assert(cx >= win.InnerRect.Min.x - 0.5 and cy >= win.InnerRect.Min.y - 0.5 and dx <= win.InnerRect.Max.x + 0.5 and dy <= win.InnerRect.Max.y + 0.5, 'no gap')
   -- far larger than the screen: a smaller window, scaled up, still on the screen
-  lua_run(string.format("local a = require('world').anchors[%d]; a.width = 5000; a.height = 3000", s.id))
+  lua_runf("local a = require('world').anchors[%d]; a.width = 5000; a.height = 3000", s.id)
   for _ = 1, 3 do frame(false, true) end
   ba = box_aspect(s.id)
   assert(win.Size.x <= 2560 + 0.5 and win.Size.y <= 1440 + 0.5, 'fits the screen')
@@ -590,7 +602,7 @@ do
   -- the HUD: read from the shim, the full-screen layer left out
   assert(host.hud_mask.n == 1 and host.hud_mask.r[0].x == 900, 'the hotbar counts, the name plates do not')
   -- the pointer on the pet but on a HUD element over it: not into the window
-  lua_run(string.format("local a = require('world').anchors[%d]; a.width = 900; a.height = 600", s.id))
+  lua_runf("local a = require('world').anchors[%d]; a.width = 900; a.height = 600", s.id)
   host.world_focus = s.id
   for _ = 1, 150 do frame(false, true) end
   local ok, pl = policy_world_place(s.id, now, true)
@@ -646,7 +658,7 @@ do
   enter_pressed = false
   assert(#sent == 1 and sent[0] == 'hi', 'sent through the game\'s chat box')
   assert(io_state.InputQueueCharacters.Size == 0, 'the characters were ours')
-  assert(saved():find('"chat"', 1, true) > 0, 'saved')
+  assert(saved_has('"chat"'), 'saved')
   -- back to the flat UI
   assert(run_command('release chat') == 0)
   assert(not chatpanel_open() and #host.world == 0, 'closed')
@@ -688,7 +700,7 @@ do
   assert(panel_flight_active(m.s.id), 'flying out from the flat map')
   for _ = 1, 3 do frame(false, true) end
   assert(m.entry.state == AdoptState.Adopted and prim_verts > 0, 'the map on the pet')
-  assert(saved():find('mappy', 1, true) == 0, 'automatic windows are not in the saved list')
+  assert(not saved_has('mappy'), 'automatic windows are not in the saved list')
   -- its plugin closes the map: the pet goes quietly, and comes back when it opens
   for _ = 1, 60 do frame(false, false) end
   assert(adopt_count() == 0 and #host.world == 0, 'gone with its window')
@@ -713,11 +725,12 @@ do
   assert(run_command('adopt mappy') == 0 and adopt_count() == 1 and not adopt_at(0).automatic, 'pulled by hand')
   for _ = 1, 3 do frame(false, true) end
   assert(adopt_at(0).entry.state == AdoptState.Adopted, 'and drawn')
-  assert(saved():find('"mappy"', 1, true) > 0, 'a hand-pulled one is saved')
+  assert(saved_has('"mappy"'), 'a hand-pulled one is saved')
   assert(run_command('release') == 0)
   print('mappy OK')
 end
 
 gu_shutdown()
 free(win) free(ctx) free(events)
+adopted_path:destroy()
 print('test_adopt_app OK')
