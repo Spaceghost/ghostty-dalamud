@@ -189,7 +189,7 @@ local function d3d_target(tex: *pointer, w: *uint32, h: *uint32, fmt: *cint): ci
   ID3D11Texture2D_GetDesc((@*ID3D11Texture2D)(t), &desc)
   if desc.SampleDesc.Count > 1 then
     ID3D11Texture2D_Release((@*ID3D11Texture2D)(t))
-    return 0
+    return -1 -- multisampled: a staging copy needs a resolve we do not do
   end
   $tex, $w, $h, $fmt = t, (@uint32)(desc.Width), (@uint32)(desc.Height), desc.Format
   return 1
@@ -243,6 +243,19 @@ local function api_target(tex: *pointer, w: *uint32, h: *uint32, fmt: *cint): ci
     return d3d_target(tex, w, h, fmt)
   ## else
     return 0
+  ## end
+end
+
+-- The immediate context, taken outside the callback. `d3d_target` needs it to
+-- ask what is bound, and the callback itself cannot make one, so arming has to
+-- do it: before this ran at arm time the context was only ever created by
+-- `d3d_stage`, which the callback reaches only after `d3d_target` has already
+-- succeeded, so it never existed and every shot failed as "no render target".
+local function api_bind(device: pointer): void
+  if capture_fake ~= nilptr then return end
+  ## if ccinfo.is_windows then
+  local dev = (@*ID3D11Device)(device)
+  if dev ~= nilptr then context_for(dev) end
   ## end
 end
 
@@ -336,6 +349,7 @@ global function capture_arm(device: pointer, x: uint32, y: uint32, w: uint32, h:
   if device == nilptr then return fail('Dalamud reports no D3D11 device') end
   if w > CAPTURE_MAX_SIDE or h > CAPTURE_MAX_SIDE then return fail('the frame is too large to read back') end
   capture.device = device
+  api_bind(device)
   capture.x, capture.y, capture.w, capture.h = x, y, w, h
   capture.state = CaptureState.Armed
   capture.waited = 0
@@ -365,8 +379,13 @@ global function capture_render_cb(list: pointer, cmd: pointer): void
   if capture.state ~= CaptureState.Armed then return end
   local tex: pointer = nilptr
   local fw: uint32, fh: uint32, fmt: cint = 0, 0, 0
-  if api_target(&tex, &fw, &fh, &fmt) == 0 or tex == nilptr then
-    fail('the renderer has no single-sampled render target bound')
+  local got = api_target(&tex, &fw, &fh, &fmt)
+  if got < 0 then
+    fail('the render target is multisampled; turn the game\'s anti-aliasing off for the shot')
+    return
+  end
+  if got == 0 or tex == nilptr then
+    fail('the renderer has no render target bound')
     return
   end
   defer api_release(tex) end
