@@ -35,9 +35,11 @@ M.pet = {
   step = 0.55,           -- radians between pets stacked on the same side
   stiffness = 5.0,       -- spring stiffness: higher follows more tightly
   damping = 0.95,        -- 1 = settle with no overshoot; lower swings like a pendulum before settling
+  run_stiffness = 10.0,  -- keep the trailing formation with you while running
+  run_damping = 0.92,
   walk_speed = 0.6,      -- yalms per second above which the character counts as moving
   run_speed = 5.5,       -- yalms per second at which run_back is fully applied (running is ~6)
-  run_back = 0.35,       -- radians the slots swing further back while running
+  run_back = 0.75,       -- radians the slots swing further behind while running
   behind_clear = 0.8,    -- radians either side of straight behind you a pet never enters
   camera_clear = 0.85,   -- radians either side of the camera-to-you line a pet never enters
   stack_out = 1.1,       -- yalms further out per pet pair that no longer fits beside you
@@ -893,7 +895,10 @@ local function slot(k, half_w)
   local side_sign = (k % 2 == 1) and 1 or -1
   local level = (k - 1) // 2
   local run = math.max(0, math.min(1, (body.speed - cfg.walk_speed) / math.max(cfg.run_speed - cfg.walk_speed, 0.1)))
-  local max_side = pi - cfg.behind_clear
+  -- Standing still, keep pets out of the character/camera cones. While moving,
+  -- let the slots swing around behind the character instead of forcing them
+  -- into the radial side arc; the camera-facing clearance still applies at rest.
+  local max_side = pi - cfg.behind_clear * (1 - run)
   local want = cfg.side + level * cfg.step + run * cfg.run_back
   local extra = 0
   if want > max_side then
@@ -1445,8 +1450,17 @@ function M.place_pet(id, a, p, t, focused, held)
     level, side = (k - 1) // 2, (k % 2 == 1) and 1 or -1
     -- the row spaces itself and is laid out around the focused pet, so while
     -- pets are lined up nobody steps aside: only the slots ask for it
-    if not lined_up then spread(t, p) end
-    ang = body.heading + rel + sin(t * 0.11 + phase) * cfg.drift + (focused and 0 or (a.sp or 0))
+    if not lined_up then
+      if body.speed <= cfg.walk_speed then
+        spread(t, p)
+      else
+        -- The moving formation has its own trailing slots; do not let the
+        -- idle screen-overlap solver pull those slots back into the side arc.
+        a.sp, a.sp_y = 0, 0
+      end
+    end
+    local spread_angle = body.speed <= cfg.walk_speed and (a.sp or 0) or 0
+    ang = body.heading + rel + sin(t * 0.11 + phase) * cfg.drift + (focused and 0 or spread_angle)
   end
   local base_y = p.y + (in_row and a.lu_y or math.max(cfg.height_above, half_h + 0.2))
   -- a tier up when another pet would be covering this one on screen (M.pet.spread)
@@ -1503,6 +1517,10 @@ function M.place_pet(id, a, p, t, focused, held)
   local stiff = cfg.stiffness
   if not reduce then stiff = stiff * math.max(0.55, 1 - ((cfg.follow or EMPTY).stagger or 0) * (k - 1)) end
   local zeta = reduce and math.max(cfg.damping, 1) or cfg.damping
+  -- running: stiffer and less bouncy, so the trailing formation keeps up
+  local follow = math.max(0, math.min(1, (body.speed - cfg.walk_speed) / math.max(cfg.run_speed - cfg.walk_speed, 0.1)))
+  stiff = stiff + ((cfg.run_stiffness or stiff) - stiff) * follow
+  zeta = zeta + ((cfg.run_damping or zeta) - zeta) * follow
   local x = spring(a, 'x', tx, dt, stiff, zeta)
   local y = spring(a, 'y', ty, dt, stiff, zeta)
   local z = spring(a, 'z', tz, dt, stiff, zeta)
@@ -1565,9 +1583,14 @@ function M.place_pet(id, a, p, t, focused, held)
       end
     end
   end
-  local cx, cz = clear_of(x, z, p, behind(p), cfg.behind_clear)
-  local cb = camera_back(t)
-  if cb then cx, cz = clear_of(cx, cz, p, cb, cfg.camera_clear) end
+  -- the cones narrow as you run (the formation trails behind you then) and
+  -- are gone at full speed
+  local cx, cz = x, z
+  if follow < 0.99 then
+    cx, cz = clear_of(x, z, p, behind(p), cfg.behind_clear * (1 - follow))
+    local cb = camera_back(t)
+    if cb then cx, cz = clear_of(cx, cz, p, cb, cfg.camera_clear * (1 - follow)) end
+  end
   local moved = math.sqrt((cx - x) ^ 2 + (cz - z) ^ 2)
   if moved > 1e-6 then
     contact(a, (cx - x) / moved, (cz - z) / moved, 0, x, z, t) -- only the speed into the cone's edge
