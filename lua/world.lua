@@ -260,9 +260,9 @@ M.ground = { lift = 0.04 }
 --             the depth buffer cannot be used)
 --   'off'     panels always draw on top
 M.occlusion = 'depth'
-M.occlusion_tolerance = 0.01  -- yalms a panel may sit behind a surface and still show (no flicker where they touch);
+M.occlusion_tolerance = 0.035 -- yalms a panel may sit behind a surface and still show (reduces depth-buffer flicker);
                               -- the depth test adds more with distance and at grazing angles
-M.occlusion_edge = 1          -- pixels over which a covered edge blends (0 = hard, up to 3)
+M.occlusion_edge = 2          -- pixels over which a covered edge blends (0 = hard, up to 3)
 
 -- Panels draw beneath what other plugins put in the background layer
 -- earlier in the frame, such as Umbra's toolbar at the screen edge. false:

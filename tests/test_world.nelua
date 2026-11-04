@@ -611,7 +611,7 @@ do
   assert(world_occlusion_mode('off') == WORLD_OCCLUSION_OFF)
   assert(world_occlusion_mode('bogus') == WORLD_OCCLUSION_DEPTH)
   assert(policy.world_occlusion == WORLD_OCCLUSION_DEPTH, 'lua/world.lua default is depth')
-  assert(math.abs(policy.world_occlusion_tolerance - 0.01) < 1e-6 and policy.world_occlusion_edge == 1, 'default tolerance and edge')
+  assert(math.abs(policy.world_occlusion_tolerance - 0.035) < 1e-6 and policy.world_occlusion_edge == 2, 'default tolerance and edge (lua/world.lua)')
   local function run_lua(code: cstring): void
     assert(luaL_loadstring(policy.L, code) == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK, code)
     policy_refresh()
@@ -620,7 +620,7 @@ do
   assert(policy.world_occlusion == WORLD_OCCLUSION_CAPSULE and policy.world_occlusion_edge == 2, 'settings changes apply live')
   run_lua("CONFIG.world.occlusion_tolerance = 0 CONFIG.world.occlusion_edge = 9")
   assert(math.abs(policy.world_occlusion_tolerance - 0.005) < 1e-6 and policy.world_occlusion_edge == 3, 'tolerance and edge are kept in range')
-  run_lua("CONFIG.world.occlusion_tolerance = 0.01 CONFIG.world.occlusion_edge = 1")
+  run_lua("CONFIG.world.occlusion_tolerance = 0.035 CONFIG.world.occlusion_edge = 2")
   run_lua("CONFIG.world.occlusion = 'off'")
   assert(policy.world_occlusion == WORLD_OCCLUSION_OFF)
   run_lua("CONFIG.world.occlusion = 'nonsense'")
