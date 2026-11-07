@@ -128,9 +128,9 @@ do
   c:destroy()
 end
 
--- /term reload detaches agent shells instead of closing them (even when the new
--- config fails to load), lets go of the full-screen panel, drag, camera, walk
--- and animation, and saves the layout only when LISTR has restored it.
+-- Invalid reloads preserve the active UI and agent sessions. A valid reload
+-- detaches shells instead of closing them, releases interaction effects, and
+-- saves the layout only when LISTR has restored it.
 local state_file = string.format('%s/world-state.lua', dir)
 local function state_saved(): boolean
   local f = io.open(state_file)
@@ -152,6 +152,12 @@ do
   boot.install_dir = string.copy('build/test-scratch/no-such-config')
   local before = host.local_agent.client.outq:len()
   assert(gu_command('reload') == 2, 'reload without lua/init.lua fails')
+  assert(host.local_agent.client.outq:len() == before and #host.sessions > 0, 'rejected reload keeps sessions attached')
+  assert(host.world_full_id == s.id and host.drag.id == s.id and host.walk.id == s.id and host.anim_out, 'rejected reload keeps the active UI')
+  assert(not state_saved(), 'rejected reload writes no layout')
+  host.dir:destroy() boot.install_dir:destroy()
+  host.dir, boot.install_dir = good_dir, good_install
+  assert(gu_command('reload') == 0, 'valid reload commits')
   local detached, closed = 0, 0
   local p = host.local_agent.client.outq:peek()
   local pos: usize = before
@@ -170,12 +176,9 @@ do
   assert(host.walk.id == 0 and not host.anim_out, 'walk and animation released')
   assert(not state_saved(), 'reload before LISTR saves no layout')
   host.local_agent.client.state = AgentState.Disconnected -- nothing behind it
-  host.dir:destroy() boot.install_dir:destroy()
-  host.dir, boot.install_dir = good_dir, good_install
 end
--- Once LISTR restored the layout, reload saves it first. Even when the new
--- config fails to load, the (now empty) layout waits for the next LISTR: the
--- periodic save must not write it over the saved one.
+-- Once LISTR restored the layout, an accepted reload saves it first. Rejected
+-- reloads leave it intact; committed reloads await LISTR before saving again.
 assert(gu_command('reload') == 0, 'reload')
 do
   assert(gu_command('new') == 0 and #host.sessions == 1)
@@ -188,11 +191,13 @@ do
   host.dir = string.copy('build/test-scratch/no-such-config')
   boot.install_dir = string.copy('build/test-scratch/no-such-config')
   assert(gu_command('reload') == 2, 'failed reload after LISTR')
-  assert(state_saved(), 'reload after LISTR saves the layout')
-  assert(not host.layout_restored, 'the layout waits for the next LISTR')
-  host.local_agent.client.state = AgentState.Disconnected
+  assert(not state_saved() and host.layout_restored and #host.sessions == 1, 'rejected reload preserves the restored layout')
   host.dir:destroy() boot.install_dir:destroy()
   host.dir, boot.install_dir = good_dir, good_install
+  assert(gu_command('reload') == 0, 'valid reload after LISTR')
+  assert(state_saved(), 'accepted reload after LISTR saves the layout')
+  assert(not host.layout_restored, 'the layout waits for the next LISTR')
+  host.local_agent.client.state = AgentState.Disconnected
   os.remove(state_file)
 end
 state_file:destroy()
