@@ -1060,3 +1060,523 @@ menus, resizes, wheel scrolling having a visible effect, the game side.
 The macOS agent (`ghostty-agent-macos-arm64`, `-x86_64`) cross-compiles
 with the ScreenCaptureKit backend and is a valid Mach-O; it has never been
 run on a Mac, so no part of the macOS backend is verified.
+
+### Host portal capture prototype (accepted desktop vote)
+
+`tools/portal_capture.py` provides `PortalCapture(GioPortalTransport()).start()`
+for a consent-based single-window ScreenCast session. It keeps the host session
+bus connection alive, selects WINDOW only, waits for portal responses, and opens
+the returned PipeWire remote FD. The object exposes `stream` (node, preferred
+serial target, properties) and `pipewire_fd`; call `close()` to revoke capture
+and close the FD. Closing capture does not close the host application. It does
+not request persistent permission. The transport requires Python PyGObject/Gio.
+
+This is an unconnected host prototype, not an available `--windows` backend or
+a Send to game command. `tests/test_portal_capture.py` tests negotiation order,
+single-window validation, old-portal node fallback and FD/session cleanup using
+a fake transport. No desktop picker or real PipeWire stream has been exercised.
+Session-closed signals now revoke local capture and release its FD and signal
+subscription. The transport exposes `pump()` for dispatching revocations; the
+future agent must call it regularly. Tests also cover revocation during FD
+acquisition. The remaining implementation needs agent handle and stream integration, input permission/forwarding,
+Shell window-menu entry and a host-to-game handoff. ScreenCast alone does not
+authorize input forwarding. The generic portal picker also cannot guarantee that
+a window named by a Shell entry is what the player selects.
+
+The protocol follows the [ScreenCast portal specification](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.ScreenCast.html).
+
+`PipeWireFrames(capture)` now consumes the portal FD through GStreamer's
+`pipewiresrc`, converts to BGRA and keeps at most one queued frame. `frame()`
+is nonblocking and returns copied pixels with width, height, packed stride and
+serial, or `None` while waiting. It pumps portal events, stops on revocation,
+and reports stream errors/EOS. Call its `close()` before closing the capture.
+Portal v6 streams use `target-object` with the stream serial; older streams
+use the node path. This requires GStreamer introspection, PipeWire, videoconvert
+and appsink. No automatic input forwarding is provided.
+
+Eight host tests pass, including actual GStreamer mapping of a synthetic 2×2
+BGRA source and bounds/padding checks. This verifies the frame-reading code,
+not portal capture of a real desktop window. Agent backend/stream integration,
+Shell window identity, consent interaction and game rendering remain unfinished.
+
+The helper now accepts `--socket-fd N`, an inherited private Unix stream socket,
+and sends packed frames to its parent. The PGF1 header is little-endian
+`<4sIIQI`: magic `PGF1`, width, height, monotonically increasing serial, payload
+byte count. The payload is packed top-down BGRA (`width * height * 4` bytes).
+Dimensions are capped at 8192 each; the reader validates the header before
+reading/allocating its payload. EOF ends capture; partial headers or payloads
+are errors. A two-second stalled-writer timeout ends the helper and cleans up
+its pipeline/session. No network listener or public IPC endpoint is created.
+
+Twelve host tests cover frame mapping, real Unix socket send/receive, fragmented
+reads, invalid headers and truncation. The executable's help path is exercised
+without opening the desktop chooser. Native agent process spawning and the
+PGF1 reader remain to be implemented; this is still not a working game handoff.
+
+`agent/portal_frames.nelua` now decodes PGF1 on the native side. It accepts
+fragmented bytes into a bounded queue, checks dimensions/length/monotonic serial,
+and exposes borrowed packed pixels until the caller consumes the frame. Invalid
+headers latch a failure; EOF with buffered bytes is truncation. The host
+`test_portal_frames` executable verifies fragmented input, replayed serials,
+invalid dimensions and payload sizes, and EOF handling. This decoder is not yet
+registered with a capture backend; helper spawning, socket reads and capture
+handle lifecycle remain unfinished.
+
+`agent/portal_process.nelua` adds the Linux child-process wrapper. It invokes
+`python3 HELPER --socket-fd 3` using argv (no shell), creates a private Unix
+socket, sets the parent end nonblocking, and limits reads per pump. Complete
+frames replace the latest packed pixels; malformed input or EOF ends capture.
+`close()` closes/reaps the child and releases decoder/pixel storage. Host
+`test_portal_process` spawns a real fixture child and verifies two frames and
+clean EOF. The real portal helper has not been exercised through this wrapper;
+capture-backend registration and game handoff remain unfinished.
+
+The Linux agent now registers the experimental `--windows portal` backend.
+Set `GHOSTTY_PORTAL_HELPER` to the absolute path of `tools/portal_capture.py`.
+Opening window ID 0 with empty match or `portal:` starts the desktop picker;
+exact IDs/app matching are rejected. The helper's first complete frame changes
+the capture handle from pending to live; EOF/revocation ends it. Captured pixels
+use the agent's existing frame encoding/streaming path. Capture close/release
+stops the helper and leaves the original desktop application running.
+
+This backend is **view only**: input events are not forwarded. It does not yet
+implement the GNOME Shell entry or an identity-preserving Send to game handoff.
+`test_capture_portal` compiles and exercises pending/live state, fixture pixels,
+invalid window selection and close/poll cleanup through the real capture
+interface. Neither real desktop portal consent nor game rendering is verified.
+
+`tools/test-portal-agent.py` starts a loopback fixture agent with a temporary
+fixture token and runs the compiled `test_agent_portal` client. That client
+opens picker capture through WOPEN, receives WOPENED, decodes WFRAME pixels
+through the real QOI/frame codec, and observes WEND after helper EOF. This
+end-to-end host test passes with the Linux portal backend. It demonstrates the
+network stream path using synthetic pixels; it does not exercise a desktop
+chooser, real PipeWire remote, input permission or game rendering. The runner
+accepts `GHOSTTY_PORTAL_TEST_AGENT` to select the built agent and is included in
+the host test script.
+
+Input permission groundwork: `GioPortalTransport(remote_input=True)` now uses
+RemoteDesktop for CreateSession/SelectDevices/Start and ScreenCast for
+SelectSources/OpenPipeWireRemote on that same session. It requests keyboard
+and pointer without persistent permission, then retains only the granted device
+bits. Default ScreenCast sessions always expose zero granted devices. Revocation
+and close clear the grant. Fifteen host tests pass, including Gio variant and
+interface routing checks with a fake bus. The CLI/backend remain view-only:
+there is no input event transport or Notify/libei forwarding yet, so the new
+negotiation mode is not enabled by the agent.
+
+See the [Remote Desktop portal specification](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html)
+for the combined session lifecycle and device grants.
+
+The helper's `PortalCapture.pointer(event, frame_size)` now dispatches move,
+button and wheel events only while POINTER permission is granted. It scales
+captured-pixel coordinates into the stream's logical size, clamps them to the
+image, validates button/coordinate values, maps left/right/middle to Evdev
+buttons, and accumulates 1/120 wheel units into discrete axis steps. Gio emits
+RemoteDesktop NotifyPointerMotionAbsolute/NotifyPointerButton/
+NotifyPointerAxisDiscrete calls. Sixteen host tests pass, including grant denial,
+coordinate scaling, button mapping and fractional wheel accumulation. These
+methods are not yet connected to the inherited-socket input path, and real
+portal input has not been exercised. The running agent backend remains view-only.
+
+The helper now decodes private PGI1 input records on the same Unix socket as
+PGF1 output. Header format is little-endian `<4sBBHiiiiiHH`: magic, kind, down,
+HID, x, y, button, dx, dy, modifiers and UTF-8 text length. Kinds match WINPUT
+1–6. Text is capped at 4096 bytes and is allowed only for text events; the queue
+is capped at 64 KiB. Malformed input latches failure and partial EOF is rejected.
+The loop polls socket input without blocking and dispatches events after the
+first captured frame establishes its pixel dimensions.
+
+`--input` requests Remote Desktop consent and connects decoded pointer events
+to the permission-checked dispatcher. Default helper operation remains
+ScreenCast/view-only. Eighteen tests pass, including actual socket input delivery
+and dispatch from the frame loop. Native agent event writing/opt-in wiring and
+keyboard/text forwarding remain unfinished; no real desktop input was exercised.
+
+Native input transport is now wired. `GHOSTTY_PORTAL_INPUT=1` makes the Linux
+backend spawn the helper with `--input`; the helper requests Remote Desktop
+consent and gates pointer dispatch on the resulting grant. CaptureInput events
+are serialized as PGI1 and queued on the private socket. Writes are nonblocking
+and suppress SIGPIPE; a full 64 KiB input queue ends capture rather than silently
+losing a release event. Default operation still discards input. The compiled
+`test_portal_input` passes a button event through the capture interface and
+verifies its exact bytes in a real fixture helper. Keyboard/text dispatch and
+real desktop portal input remain unfinished.
+
+The input dispatcher now handles KEY and TEXT when KEYBOARD permission is
+present. KEY uses the agent's existing USB HID-to-Evdev mapping and modifier
+mask conventions; unsupported HID usages are ignored. TEXT emits Unicode
+keysyms, with Enter/Tab/Backspace mappings and validation before any typing.
+Held keys are released on explicit session close. `--input` now routes decoded
+keyboard and pointer events to this dispatcher. Twenty helper tests pass,
+covering grant denial, modifier ordering, HID mapping, Unicode, control-character
+rejection and held-key cleanup. These tests use a fake portal transport; actual
+NotifyKeyboard calls, host layout behavior and in-game input remain unverified.
+
+Helper shutdown now requests SIGTERM and allows a bounded 100 ms grace period
+for Python `finally` cleanup before force-killing a stalled child. The helper
+handles SIGTERM as normal exit, so capture close can release held keys and
+close its portal session. The real-child input fixture test confirms its
+cleanup marker is written before native close returns. Twenty helper tests and
+the native input test pass. Slow or blocked portal cleanup can still exceed the
+grace period; real portal shutdown/input behavior remains unverified.
+
+Interactive game-test constraint: switch game chat to `/party` or another
+user-approved restricted channel before entering commands. Host tests use
+fixture processes and loopback protocol clients and do not enter game chat.
+
+Portal input cleanup: the helper tracks pressed mouse buttons and releases
+remaining presses before closing an active portal session. Permission revocation
+discards that state without sending input to the closed session. Explicit button
+releases are removed from the tracked set, and repeated close is harmless.
+`python3 tests/test_portal_capture.py` passes 22 host tests, including the new
+close-order and revocation cases. Real desktop and game verification remains open.
+
+Portal capture identity: live captures now have positive session-local IDs in
+WLIST, with list-generation updates and wid_of support. Opening an existing ID
+attaches to the same helper and pixels without another chooser. References keep
+the capture alive until the last stream closes; stale IDs are rejected. The
+native test_capture_portal fixture verifies listing, shared attachment, survival
+after one close, final cleanup, and stale-ID refusal. External-client handoff
+retention, Shell integration, and real desktop/game verification remain open.
+
+Portal handoff entry point: `ghostty-agent --send-to-game` authenticates to
+the running agent and requests the portal window chooser. Portal requests now
+use the existing raise marker for game list watchers. Disconnected live captures
+remain attachable for at most 30 seconds; attachment cancels expiry, and orphaned
+ended captures are collected. This preserves the same helper/stream during the
+client transition. Native sharing/release tests pass; the rebuilt agent passes
+the loopback stream test and the real CLI request against a synthetic helper.
+This does not yet prove the watcher-to-panel transition or identify the specific
+Shell window: Shell integration and desktop/game validation remain required.
+
+Portal watcher handoff verified on the host: the test runner authenticates
+a separate WLIST watch client, invokes the actual send-to-game CLI, waits for
+its disconnect, receives the positive capture ID with raise marker, opens that
+ID, and receives WOPENED plus WFRAME. A fixture helper-start marker proves this
+attachment does not spawn a second chooser/helper. The production agent binary
+passes both the existing codec reconstruction test and this new handoff test.
+This verifies the agent protocol transition, not game panel rendering, Shell
+window identity, desktop portal permission behavior, or actual host input.
+
+GNOME identity research: upstream gnomescreencast.c passes ShellWindow ID as
+Mutter RecordWindow window-id, but publishes stream->id as the portal stream id.
+That latter identifier is the selection record, not the Shell window identity.
+Do not compare it to Meta.Window identity or claim a generic portal chooser
+selected the menu window. Sources inspected 2026-09-30:
+https://raw.githubusercontent.com/GNOME/xdg-desktop-portal-gnome/main/src/gnomescreencast.c
+https://raw.githubusercontent.com/GNOME/gnome-shell/main/js/ui/windowMenu.js
+A Shell-specific identity bridge is still required for the voted behavior.
+
+Loading-screen camera fix: panel camera easing now cancels both active zoom and
+pending restoration when the host scene flags report BetweenAreas (either game
+condition), and discards the old scene zoom distance. It performs no camera
+write in that state and cannot resume the old animation on arrival. Production
+core/host.nelua analysis and C generation pass; game behavior remains unverified
+and this does not identify every possible source of the reported zoom effect.
+
+Portal release failures: cleanup now attempts every held key and mouse-button
+release even if one D-Bus notification fails, then closes the session and clears
+local input state. The first notification error is preserved for the caller.
+The failure-injection test verifies remaining releases, session closure, cleared
+state, and harmless repeated close; all 23 Python host tests pass.
+
+Clipboard sensitive offers: clip_read_app now checks all offered formats
+before requesting text and refuses to relay offers containing password-manager
+or concealed-content markers. Such selections remain app-owned. The policy
+recognizes x-kde-passwordManagerHint, application/x-nspasteboard-concealed-type,
+and ExcludeClipboardContentFromMonitorProcessing, as used by KeePassXC:
+https://raw.githubusercontent.com/keepassxreboot/keepassxc/develop/src/gui/Clipboard.cpp
+Native policy tests pass and Wayland-enabled source analysis/C generation pass.
+Actual compositor behavior and host clipboard sensitive metadata still require
+verification; unmarked secrets cannot be inferred from plain text.
+
+Clipboard request correlation foundation: AgentClient clip_get_for(req)
+tags its local FIFO while retaining the existing untagged wire protocol and
+clip_get() terminal API. Successful and unavailable read events preserve the
+request ID; correlated events do not consume terminal paste state. Native tests
+verify FIFO tags, legacy request zero, and unsupported-agent callbacks. Production
+host analysis/C generation pass. Lua IPC snapshot/read/write methods and runtime
+synchronization are not implemented yet.
+
+Clipboard permission replies and write acknowledgements: capability-denied
+reads now produce an unavailable CLIP event retaining their request ID; denied
+writes dequeue only a matching write. clip_set_for(req,text) carries a local
+request ID through successful OK replies and error replies, with legacy
+clip_set(text) retaining request zero. Socketpair tests exercise the production
+dispatcher for denied read/write, subsequent successful read, and tagged write
+acknowledgement. Native tests pass; read-only IPC is already available, while
+public write IPC and automatic synchronization remain unfinished.
+
+Clipboard write IPC implemented: tagged successful OK and denied ERR events
+complete the matching default-agent write request. Lua validation rejects NUL
+and oversized input; tests cover write routing and those refusals. Lua IPC suite
+and production host Nelua analysis/C generation pass. End-to-end game/agent IPC
+verification, sensitive metadata, opt-in settings and runtime sync remain open.
+
+Windows clipboard metadata validation: image-only/no-text selections are
+unavailable to synchronization, while legacy manual-paste empty behavior stays
+compatible. Zero-sized or unterminated UTF-16 allocations and conversion/size
+failures report unavailable rather than successful empty text. This prevents
+non-text or invalid input from clearing the game clipboard through sync.
+Windows-target source analysis/C generation pass. The Windows native
+agent rebuild including these validation changes succeeds (existing lwIP export
+warning only). Clipboard runtime behavior remains unverified.
+
+Linux compositor source snapshots: copied app offers now retain their source
+selection. Each async text transfer carries a generation; a replaced source
+cannot publish stale text to either the metadata snapshot or host clipboard.
+Sensitive MIME offers create a known-sensitive empty snapshot without requesting
+text. The agent metadata handler uses this current app-offer snapshot when the
+Wayland compositor is built and active. Host-proxy/outside-desktop selections
+remain unavailable for metadata; this is not yet complete host clipboard sync.
+Generation tests pass (stale completion, new source, sensitive refusal, empty
+text) and Wayland-enabled source analysis/C generation pass. Native wlroots
+compile/runtime and source-owner teardown pass in the isolated Fedora test
+container described below. Game synchronization remains unverified.
+
+Compositor clipboard text validation now runs before snapshot publication
+and host forwarding: UTF-8 must be well formed with Unicode scalar values, no
+NUL, and at most 65536 bytes. Invalid/oversized reads remain unavailable; failed
+pipe reads do not publish partial text. Native offer tests exercise invalid
+continuations, overlong encodings, surrogates, out-of-range scalars, embedded
+NUL, UTF-8 success and the size limit. The live Wayland compositor fixture now
+asserts safe metadata while its copied app source is still selected, but that
+fixture passes in the isolated Fedora 44 container with wlroots 0.20.2.
+
+Headless compositor test environment (2026-09-30): a local Fedora 44 image
+was used to create the isolated Podman container ghostty-vote-compositor-tests,
+with this repository mounted at /work. Matching wlroots 0.20, Wayland, XKB,
+pixman development packages, GCC, Lua, yad, Xwayland and librsvg2-tools are installed
+inside it; host system libraries are unchanged. tools/test-wayland-container.sh
+checks dependencies, compiles the actual compositor fixture with container GCC,
+and runs it on a private temporary XDG runtime socket, with inherited desktop
+displays unset. Outputs are under build/container-wayland-results. The runner
+uses an absolute output directory because generated desktop files require
+absolute icon paths. Its app-icon assertion checks the actual versioned cache
+filename, including the source fingerprint.
+
+Compositor shutdown now clears cached clipboard text and advances its source
+generation, invalidating outstanding reads. The full native compositor fixture
+passes (exit 0, `wayland compositor OK`): Wayland and X11 rendering/input,
+Unicode text input, host-to-app paste, app-to-host copy, current safe source
+metadata, source-close invalidation, shutdown invalidation, application catalog
+and SVG icon caching. Log: build/container-wayland-test.log; image artifacts:
+build/container-wayland-results. Optional nested compositor coverage is skipped
+when cage is absent. A real GTK source additionally exercises safe and concealed MIME offers,
+including a data-request callback log. External host clipboard coverage,
+Windows/Wine and game integration remain unverified.
+
+Real clipboard source regression (2026-09-30): tests/fixtures/clipboard_offer.py
+publishes GTK3 offers using gtk_clipboard_set_with_data. The safe control logs a
+text request and forwards its text. The concealed offer logs successful
+publication but no data request; its snapshot is known-sensitive/empty, and the
+host write count does not advance. This exposed a stale keyboard-focus surface
+after closing a window: AddressSanitizer reported heap-use-after-free in
+on_new_ti. top_unmapped/top_free now clear the stored surface and notify keyboard
+and text-input focus leave before destruction. The expanded sanitized suite
+reaches `wayland compositor OK` without the invalid-access failure; LeakSanitizer
+still reports 16957 bytes in 364 allocations at process exit (including Nelua
+string/log allocations), so this is not a clean sanitizer pass. The fixture
+runner accepts GHOSTTY_TEST_CFLAGS for instrumented builds; libasan is installed
+only in the isolated test container. GTK API reference:
+https://docs.gtk.org/gtk3/method.Clipboard.set_with_data.html
+
+Empty and oversized source offers (2026-09-30): accepted empty UTF-8 text now
+calls the host clipboard setter with a zero-length payload. Previously the
+nonempty guard silently retained the old host text. The real GTK fixture tests
+safe, concealed, empty and 65537-byte text offers. Empty text is read and
+forwarded, clearing the host string; oversized text remains unavailable and
+does not advance the host write count. The full native suite passes (exit 0,
+`wayland compositor OK`) with all four client modes. The latest normal-run log
+is build/container-wayland-test.log.
+
+External Wayland metadata investigation: wl-paste --watch in wl-clipboard 2.3
+sets CLIPBOARD_STATE=sensitive for x-kde-passwordManagerHint, but its source
+requests the text transfer before launching the command. It does not provide
+the never-request-sensitive-text guarantee exercised by our compositor fixture,
+nor cover all supported sensitive MIME hints. Separate list-types/text calls
+remain unsuitable for owner-consistent metadata. A direct per-offer data-control
+client (or a desktop-specific equivalent where that protocol is unavailable)
+is still required for external host synchronization. Primary source inspected:
+https://github.com/bugaevc/wl-clipboard/blob/master/src/wl-paste.c
+
+External Wayland reader (2026-09-30): tools/clipboard_snapshot.c uses the
+ext-data-control-v1 protocol. Each offer retains its MIME classification and
+selected-source generation. Sensitive hints are checked before receive; pipe
+reads run alongside compositor events, rejecting source replacement, overflow,
+no-text, disconnect and timeout. The one-shot helper emits a flags byte and at
+most 65536 bytes only on successful completion. agent/sys_posix.nelua invokes
+it without a shell, bounds the response and wait, requires successful child
+exit, and validates UTF-8/NUL/sensitive-empty invariants before publishing.
+GHOSTTY_CLIPBOARD_HELPER overrides the installed default
+/usr/libexec/ghostty-agent/clipboard-snapshot. With a compositor backend, the
+agent reads this external offer only while the internal selection uses the host
+proxy; pending/unsafe internal app offers cannot fall back to unrelated host
+text. Fedora Wayland RPM builds compile/install the helper, and source packaging
+includes its source/build script. Package builds have not yet been rerun.
+
+Verification: native helper builds with -Wall -Wextra -Werror; eight synthetic
+agent transport cases pass (safe, empty, sensitive, leaked sensitive text,
+unknown flags, invalid UTF-8, overflow and failed child). Actual external Sway
+integration passes safe text, empty text, oversized rejection and a concealed
+data-control source whose log proves no data request. Logs:
+build/external-clipboard-test.log. The source module and full Linux agent compile
+successfully; Wayland-enabled analysis/C generation pass. Test setup uses the
+isolated Fedora container, Sway/wl-clipboard, and UID 1000 clipboardtest with a
+private runtime directory. Sway's cap_sys_nice file capability was removed only
+inside the container because it prevented execution under the container's
+capability bound. tools/test-clipboard-container.sh reproduces these tests.
+Actual authenticated agent/helper integration, stale-source runtime tests,
+GNOME/other compositors without ext-data-control, X11, Windows/Wine, and game
+synchronization still need work. Protocol definition comes from the installed
+wayland-protocols ext-data-control-v1.xml.
+
+Authenticated external clipboard verification (2026-09-30): the headless Sway
+runner now invokes tools/test-clipboard-agent.py with the current compiled
+Linux agent, an ephemeral localhost port, and a private fixture token file.
+Unauthenticated metadata reads are refused. Authenticated safe/empty reads return
+PROTO_CLIP_META with known-safe flags; oversized text returns unavailable;
+concealed text returns known-sensitive flags with no text or source-data request.
+Safe/empty cases also send CLIP_SET then read back the synthetic game text from
+the real external compositor through the agent/helper. All four authenticated
+cases pass. A separate native slow source logs an actual data request, blocks
+its write, and is replaced while the reader waits: the helper exits nonzero
+with no output instead of publishing old text. This stale-source helper runtime
+case passes. It does not prove atomic host writes after the Desktop plugin's
+poll; that race still requires implementation. Latest log:
+build/external-clipboard-test.log. The agent fixture is built without the
+internal Wayland backend, so backend-provider routing still needs native runtime
+verification in that build, although Wayland-enabled source analysis passes.
+
+Wayland-enabled authenticated routing (2026-09-30): a full native GCC agent
+build with wlroots 0.20.2 completes. The external runner passes all four
+metadata cases and host write/readback using that build with --windows wayland.
+Additional internal GTK safe/concealed offers are published via WOPEN/WINPUT;
+the external host clipboard is then changed to different text. Metadata still
+comes from the selected internal app, sensitive source text is never requested,
+and closing the internal source restores external host metadata. Both routing
+cases pass over the authenticated agent connection. Latest log:
+build/wayland-agent-clipboard-test.log. These are isolated protocol tests, not
+actual game/Wine integration. The source tarball was regenerated with netlab
+omitted for this packaging check and contains the new clipboard sources/build
+script; output: build/clipboard-package-check/ghostty-agent-0.3.1.13-src.tar.gz.
+
+Installed RPM verification (2026-09-30): Fedora 44 rpmbuild -tb --with wayland
+--without netlab completes, including package checks. The RPM file list includes
+/usr/libexec/ghostty-agent/clipboard-snapshot and portal_capture.py. Testing the
+installed default helper path exposed an invalid free of a constant path string;
+agent/sys_posix.nelua now creates an owned copy before the normal cleanup path.
+The source tarball/RPM were regenerated and installed in the isolated container.
+The installed /usr/bin/ghostty-agent, with no GHOSTTY_CLIPBOARD_HELPER override,
+passes authenticated external safe/empty/oversized/concealed metadata, host
+write/readback, internal GTK safe/concealed provider routing, and source-close
+return to external metadata. The runner also passes slow-source replacement
+rejection. Log: build/installed-agent-clipboard-test.log. The internal fixture
+waits for a metadata reply completing its initial copy before replacing external
+text, because GTK publication precedes the async app-to-host transfer. This
+barrier does not assert arbitrary simultaneous copies are atomic. Test-container
+/tmp/.X11-unix permissions were restored to standard 1777 for non-root clients.
+Build log: build/clipboard-rpm-check.log. Review artifact (not published/released):
+build/clipboard-package-check/ghostty-agent-0.3.1.13-1.fc44.x86_64.rpm.
+This package check omits netlab; full release configuration and real user desktop,
+Windows/Wine and game integration still require verification.
+
+Compositor app notifications, private bus foundation (2026-09-30):
+tools/app_notifications.py starts a new dbus-daemon session bus, exports
+org.freedesktop.Notifications, and sends its address to the native owner over
+an inherited private socket. It never connects to or claims the user's existing
+session notification service. Notify/GetCapabilities/GetServerInformation and
+CloseNotification are implemented; replacement IDs update one active record.
+App/desktop-entry/summary/body UTF-8 byte limits are 256/256/512/4096; retained
+records and outgoing events are bounded to 64, with 32768-byte JSON frame limits
+including worst-case escaping. App-supplied icon paths are not relayed; the
+frontend must use catalog icons. Parent disconnect/SIGTERM shuts down the helper
+and its bus daemon. Dependencies: Python3, python3-dbus-next and dbus-daemon.
+Three container tests pass: replacement/close state, byte/retention bounds, and
+real private D-Bus Notify/replace/close/parent-disconnect with socket removal.
+The runtime test uses synthetic messages only. Primary API reference:
+https://specifications.freedesktop.org/notification/latest-single/
+
+This is a foundation, not completed notification delivery: assigning the private
+bus to launched compositor apps, native process lifecycle and agent event
+forwarding, Ghostty IPC, title-only/privacy/rate controls, app catalog icons,
+focus-on-click, packaging, and game toast verification remain unfinished.
+
+Native app-notification wiring (2026-09-30): agent/notification_process.nelua
+spawns the Python service on a private socket with its own process group,
+nonblocking reads, bounded frame/event queues, and owned bus-address storage.
+The helper framing is now u32 length + u8 type: type 1 carries the ready Unix
+bus address (max 1024 bytes); type 2 carries notification/closed JSON (max 32768
+bytes). Compositor startup waits at most one second for readiness. Only launched
+child apps get DBUS_SESSION_BUS_ADDRESS; the parent environment is unchanged.
+The backend polls the helper FD, immediately schedules pending bounded event
+batches, and shuts down the helper/private bus with the compositor. The native
+helper's stdout/stderr are suppressed to avoid logging private notification
+contents. Missing dependencies/helper leave capture unavailable for notifications.
+Source packaging now includes the native module and Python helper; Wayland RPM
+installation/dependency rules were added but that updated RPM is not built yet.
+
+The full native compositor fixture passes rendering/input/clipboard cases and
+an app launched through the real backend receiving the private bus and sending
+an event back to the native compositor. Log: build/container-wayland-test.log.
+The agent forwards PROTO_APP_NOTIFY (53) only to authenticated window watchers
+with CAP_WINDOWS, capped by per-client output queue size; it drains at most eight
+events per loop. An actual native agent fixture forwards a 20-message synthetic
+burst in order and confirms an authenticated non-watcher gets no unsolicited
+messages. Its parent bus address is intentionally invalid, proving the app uses
+the supplied private bus. Log: build/notification-agent-test.log. Normal helper
+shutdown and private-service disconnect tests pass; forced crash cleanup is not
+yet runtime-tested. Ghostty event cache/IPC, Desktop toast privacy/title-only,
+rate controls, app icons and focus-on-click, updated package and game verification
+remain unfinished. No actual notification toasts are implemented by this batch.
+
+Notification cache and IPC (2026-09-30): core/notification_cache.nelua stores
+at most 64 bounded UTF-8 events with receipt sequence, source route and process
+nonce. agent_event receives PROTO_APP_NOTIFY into the cache for local and extra
+agent links; reconnect/config removal discards the affected route's records,
+and host teardown frees them. The native Lua getter exports opaque payloads;
+lua/ipc.lua validates JSON kind/id/metadata/text byte limits and exposes the
+read-only agent.notifications snapshot. Native cache tests and Lua call/frame
+tests pass, including malformed/oversized filtering and optional getter failure.
+Full core/host.nelua analysis/C generation and Wayland-enabled source analysis
+pass. Actual in-game native-host/IPC behavior is not yet verified.
+
+XivDesktop now has a strict typed snapshot parser and a notification inbox that
+baselines initial reads, enabling, unavailable IPC and revision resets; disabled
+period messages are never replayed on enabling, even if the first enabled poll
+has a newer revision. The backend has a read adapter but no toast polling/service
+is hooked up yet. All 467 Desktop Core tests pass, including wire bounds/route/
+nonce/close events and inbox replay prevention. Title-only/privacy/rate policy,
+icons/focus actions, rebuilt notification package, and real game delivery remain
+unfinished.
+
+Notification package and lifecycle verification (2026-09-30): the updated source
+archive and Fedora 44 RPM build/check pass with Wayland enabled and netlab
+omitted. Artifacts are local under build/notification-package-check and are not
+released. RPM inspection confirms the installed app_notifications.py helper and
+Recommends for python3-dbus-next and dbus-daemon. After installation in the
+isolated container, tools/test-notification-agent.py --agent
+/usr/bin/ghostty-agent --installed-helpers passes all 20 synthetic messages through
+the default helper path, verifies that the app received a private Unix bus rather
+than the deliberately invalid parent bus, and verifies that an authenticated
+non-watcher receives no unsolicited notification frame.
+
+The new tests/test_notification_process.nelua starts a real private bus, checks
+orderly shutdown, then kills the helper abruptly and verifies that native close
+terminates its bus process as well. Both source and installed helper runs pass.
+The fixture is a child subreaper solely to reap an orphan after its forced-crash
+case in the container; production behavior is unchanged. The compositor test
+runner now includes this cleanup check. Logs: build/notification-rpm-check.log,
+build/notification-installed-agent-test.log, and
+build/notification-installed-process-test.log. Full release/netlab packaging is
+not verified by this reduced package build.
+
+Desktop toast delivery is now connected, with opt-in enablement, title-only
+by default, private-app/panel and veil/duty suppression, content scrubbing before
+Dalamud's dismissal fade, rate limits, catalog icons, and route-matched
+click-to-focus. The production lifecycle controller has eight sink-backed tests,
+including replacements, closes, nonce changes, stale clicks, and disabled-period
+replay; exact route/app/live-panel selection is also covered. All 478 Desktop
+Core tests pass and the plugin builds with two existing AskBackend warnings.
+Actual native-host IPC and game toast/icon/focus behavior remain unverified.

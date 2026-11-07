@@ -19,6 +19,8 @@ local lakitu = require('lakitu')
 local gallery = require('gallery')
 local native = require('native')
 local controllers = require('controllers')
+local phone = require('phone')
+phone.bind(world, animation)
 
 -- The agent connection and profiles for where the game runs (native Windows,
 -- or Wine/Proton on Linux): see lua/platform.lua. The token authenticates the
@@ -31,17 +33,17 @@ local config = {
   toggle_mods = 'ctrl',
   world_toggle_mods = 'ctrl+shift',
   toggle_consume_vk = 0xC0,
-  -- select is Xbox View / DualSense touchpad click. create and ps read a
-  -- DualSense over HID: ps taps the dropdown and a double press is voice input.
-  toggle_gamepad_button = 'select',
-  -- Full controller input while a terminal is focused. Layouts live in
+  -- Optional: select is Xbox View / DualSense touchpad click; create and ps
+  -- read a DualSense over HID. Leave empty to give FFXIV every button.
+  toggle_gamepad_button = '',
+  -- Optional terminal controller layout. Layouts live in
   -- lua/controllers.lua; a controllers.lua in the config directory wins, so
   -- community layouts can be installed without modifying the plugin.
   controller = controllers.config('terminal'),
   -- With create or ps: the touchpad types into a focused terminal. Swipes are
   -- arrows (held at an edge they repeat), a click is Enter, a double click
   -- deletes a word and a held click keeps deleting.
-  touchpad_keys = true,
+  touchpad_keys = false,
   -- Voice input (ps pressed twice): the command the agent runs to listen and
   -- write down what was said, and the microphone it uses ('' = a controller's;
   -- Settings lists the others). The controller's mute button mutes it, and
@@ -92,7 +94,7 @@ local config = {
     -- functions): /window pull | run CMD | list | close, /ask [question],
     -- /agent ask [question], /netlab. Their /help lines are in lua/tooltips.lua.
     -- A name another plugin holds is retried; {} registers none.
-    verb_commands = { ['/window'] = 'window', ['/ask'] = 'ask', ['/agent'] = 'agent', ['/cam'] = 'cam', ['/netlab'] = 'netlab' },
+    verb_commands = { ['/window'] = 'window', ['/ask'] = 'ask', ['/agent'] = 'agent', ['/cam'] = 'cam', ['/netlab'] = 'netlab', ['/phone'] = 'phone' },
     help = 'Show/hide the terminal. window [n|list|pull [match]|close] | new [n] | native [new [n]|off|status] | pin [here|me|target|orbit] | unpin | ask [question] | netlab [demo] | theme [name] | shot [panel] [clean] | clip [seconds] | share | config | reload',
     -- Server info bar entry. 'auto' shows it only while no Umbra toolbar
     -- widget is showing ghostty's status; 'always' | 'never'.
@@ -150,6 +152,7 @@ local config = {
   on_key = keymap.on_key,
   world = world,
   animation = animation,
+  phone = phone,
   bell = bell,
   -- Rain on world panels when it rains in the world, and a wiper behind the glass (lua/rain.lua).
   rain = rain,

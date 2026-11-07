@@ -131,11 +131,31 @@ changes['window.hide'] = function(p)
   return { id = id, hidden = p.hidden }
 end
 
+changes['agent.clipboard.read'] = function(p) return {} end
+changes['agent.clipboard.write'] = function(p)
+  if type(p.text) ~= 'string' or #p.text > 65536 or p.text:find('\0', 1, true) or not utf8.len(p.text) then
+    return false, 'clipboard text must be valid UTF-8 without NUL, at most 65536 bytes'
+  end
+  return {text=p.text}
+end
+
+changes['agent.icons.render'] = function(p)
+  if math.type(p.size) ~= 'integer' or p.size < 16 or p.size > 512 then return false, 'size must be 16..512' end
+  if type(p.icons) ~= 'table' or #p.icons < 1 or #p.icons > 64 then return false, 'icons must contain 1..64 names' end
+  local names = {}
+  for _, name in ipairs(p.icons) do
+    if type(name) ~= 'string' or #name == 0 or #name > 1024 or name:find('%c') then return false, 'invalid icon name' end
+    names[#names+1] = name
+  end
+  return {size=p.size, names=table.concat(names, '\n') .. '\n'}
+end
+
 changes['agent.windows.refresh'] = function(p)
   local agent, err = opt_string(p, 'agent', true)
   if agent == false then return false, err end
   if agent and agent ~= 'default' then return false, 'agent may only be "default" so far' end
-  return {}
+  if p.icon_size ~= nil and (math.type(p.icon_size) ~= 'integer' or p.icon_size < 16 or p.icon_size > 512) then return false, 'icon_size must be an integer from 16 to 512' end
+  return { icon_size = p.icon_size }
 end
 
 changes['terminal.new'] = function(p)
@@ -237,6 +257,9 @@ local reads = {
   ['agent.status'] = function(s) return s.agent end,
   ['agent.windows'] = function(s) return s.agent_windows end,
   ['agent.apps'] = function(s) return s.agent_apps end,
+  ['agent.clipboard'] = function(s) return s.agent_clipboard end,
+  ['agent.notifications'] = function(s) return s.agent_notifications end,
+  ['agent.icons'] = function(s) return s.agent_icons or json.array() end,
   ['focus.get'] = function(s) return s.focus end,
   ['status'] = function(s) return s.status end,
   ['cam.state'] = function(s) return s.cam end,
@@ -286,6 +309,13 @@ M.results = {}
 local function anchor(id)
   local ok, world = pcall(require, 'world')
   return ok and world.anchors and world.anchors[id] or nil
+end
+
+-- Optional full placement args; absent on an older world policy or when a
+-- fixed pin is in another territory and cannot be expressed around the player.
+local function placement_args(id)
+  local ok, world = pcall(require, 'world')
+  return ok and type(world.placement_args) == 'function' and (world.placement_args(id) or json.null) or nil
 end
 
 -- A world panel's anchor as it is: pet, pin (fixed in the world), me or
@@ -387,8 +417,18 @@ function M.run(text)
     result, err = ghostty.panel_hide(p.id, p.hidden)
   elseif req.method == 'window.toggle_pet' then
     result, err = ghostty.panel_toggle_pet(p.id)
+  elseif req.method == 'agent.clipboard.write' then
+    local request
+    request, err = ghostty.agent_clipboard_write(p.text)
+    if request then result = { request = request } end
+  elseif req.method == 'agent.clipboard.read' then
+    local request
+    request, err = ghostty.agent_clipboard_read()
+    if request then result = { request = request } end
+  elseif req.method == 'agent.icons.render' then
+    result, err = ghostty.agent_icons_render(p.size, p.names)
   elseif req.method == 'agent.windows.refresh' then
-    result, err = ghostty.agent_windows_refresh()
+    result, err = ghostty.agent_windows_refresh(p.icon_size)
   elseif req.method == 'terminal.new' then
     local id
     id, err = ghostty.terminal_new({ profile = p.profile and tostring(p.profile) or nil, pin = p.pin, agent = p.agent })
@@ -465,7 +505,7 @@ local function panel_list(windows, listed)
   local rank = ok and type(world) == 'table' and world.pet_rank or nil
   for _, p in ipairs(ghostty.panels()) do
     local a = p.place == 'world' and anchor(p.id) or nil
-    local e = { id = p.id, kind = p.kind, title = p.title or '', view = panel_view(p, a), focused = p.focused and true or false }
+    local e = { pin = placement_args(p.id), id = p.id, kind = p.kind, title = p.title or '', view = panel_view(p, a), focused = p.focused and true or false }
     if p.kind == 'terminal' then
       e.profile, e.running = p.profile, p.running and true or false
     elseif p.kind == 'window' then
@@ -490,6 +530,39 @@ end
 
 -- What the reads answer from, as JSON; `rev` moves whenever the windows,
 -- the panels or the request results change.
+local function notification_snapshot()
+  if type(ghostty.agent_notifications) ~= 'function' then return nil end
+  local ok, raw = pcall(ghostty.agent_notifications)
+  if not ok or type(raw) ~= 'table' or math.type(raw.rev) ~= 'integer' or raw.rev < 0 or type(raw.events) ~= 'table' then return nil end
+  local out = json.array()
+  local function text(v, limit)
+    return type(v) == 'string' and #v <= limit and not v:find('%z') and utf8.len(v) ~= nil
+  end
+  for index, record in ipairs(raw.events) do
+    if index > 64 then break end
+    if type(record) == 'table' and math.type(record.seq) == 'integer' and record.seq > 0 and record.seq <= raw.rev
+      and math.type(record.nonce) == 'integer' and record.nonce >= 0
+      and text(record.source, 128) and record.source ~= '' and text(record.payload, 32768) then
+      local event = json.decode(record.payload)
+      if type(event) == 'table' and math.type(event.id) == 'integer' and event.id > 0 and event.id <= 4294967295 then
+        local valid = event.kind == 'closed'
+        if event.kind == 'notification' then
+          valid = text(event.app, 256) and text(event.desktop_entry, 256) and text(event.summary, 512) and text(event.body, 4096)
+            and math.type(event.urgency) == 'integer' and event.urgency >= 0 and event.urgency <= 2
+        end
+        if valid then
+          local item = { seq = record.seq, source = record.source, nonce = record.nonce, kind = event.kind, id = event.id }
+          if event.kind == 'notification' then
+            item.app, item.desktop_entry, item.summary, item.body, item.urgency = event.app, event.desktop_entry, event.summary, event.body, event.urgency
+          end
+          out[#out + 1] = item
+        end
+      end
+    end
+  end
+  return { rev = raw.rev, events = out }
+end
+
 function M.snapshot()
   local listed = ghostty.agent_windows and ghostty.agent_windows() or { windows = {}, apps = {} }
   local windows = json.array()
@@ -499,7 +572,7 @@ function M.snapshot()
       id = w.id, sid = w.sid, title = w.title, app = w.app, w = w.w, h = w.h,
       state = w.state, kind = kind_of(w), focused = w.focused,
       hidden = (a and a.hidden) and true or false, anchor = anchor_name(a),
-      agent = w.agent or 'default', key = w.key or '',
+      agent = w.agent or 'default', key = w.key or '', pin = placement_args(w.id),
     }
   end
   local requests = json.array()
@@ -518,6 +591,8 @@ function M.snapshot()
     wins[i] = { wid = e.wid, w = e.w, h = e.h, app = e.app, title = e.title, key = e.key, extra = extra }
   end
   for i, a in ipairs(listed.apps) do apps[i] = { id = a.id, name = a.name, icon = a.icon, categories = a.categories } end
+  local icons = listed.icons and #listed.icons > 0 and json.array() or nil
+  for i, icon in ipairs(listed.icons or {}) do icons[i] = { icon = icon.icon, size = icon.size, png = icon.png } end
   local focus = { id = 0 }
   for _, p in ipairs(ghostty.world_panels and ghostty.world_panels() or {}) do
     if p.focused then focus = { id = p.id, kind = p.window and 'window' or 'terminal' } end
@@ -532,7 +607,9 @@ function M.snapshot()
   return json.encode({
     rev = rev, windows = windows, requests = requests, panels = panels,
     agent = ghostty.agent_status(), status = ghostty.status(),
-    agent_windows = wins, agent_apps = apps, focus = focus, cam = cam,
+    agent_clipboard = ghostty.agent_clipboard_result and ghostty.agent_clipboard_result() or nil,
+    agent_notifications = notification_snapshot(),
+    agent_windows = wins, agent_apps = apps, agent_icons = icons, focus = focus, cam = cam,
   })
 end
 

@@ -112,9 +112,9 @@ global function kitty_draw_layer(dl: *ImDrawList, terminal: GhosttyTerminal, c: 
     if ghostty_kitty_graphics_placement_render_info(c.iter, image, terminal, &info) ~= GHOSTTY_SUCCESS or not info.viewport_visible then continue end
     local tex = cached(c, id)
     if not upload(c, tex, image) or tex.tex.srv == nilptr then continue end
-    local x0 = origin.x + info.viewport_col * cell_w + xo
-    local y0 = origin.y + info.viewport_row * cell_h + yo
-    local x1, y1 = x0 + info.pixel_width, y0 + info.pixel_height
+    local x0 = origin.x + (@float32)(info.viewport_col) * cell_w + (@float32)(xo)
+    local y0 = origin.y + (@float32)(info.viewport_row) * cell_h + (@float32)(yo)
+    local x1, y1 = x0 + (@float32)(info.pixel_width), y0 + (@float32)(info.pixel_height)
     local u0 = (@float64)(info.source_x) / tex.tex.w
     local v0 = (@float64)(info.source_y) / tex.tex.h
     local u1 = (@float64)(info.source_x + info.source_width) / tex.tex.w

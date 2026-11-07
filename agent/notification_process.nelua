@@ -1,0 +1,62 @@
+-- Private per-compositor bus helper, never connected to the user's session bus.
+require 'core.protocol'
+require 'string'
+require 'utf8'
+## if ccinfo.is_linux then
+## cemitdecl "\n#include <sys/socket.h>\n#include <sys/wait.h>\n#include <fcntl.h>\n#include <unistd.h>\n#include <signal.h>\n#include <errno.h>\n#include <spawn.h>\nextern char **environ;\nstatic int notification_spawn(const char *path, int *pid_out) {\n int fds[2]; if(socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0, fds)) return -1;\n int child=fcntl(fds[1],F_DUPFD_CLOEXEC,10); close(fds[1]);\n if(child<0){close(fds[0]);return -1;}\n posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);\n posix_spawn_file_actions_addclose(&fa,fds[0]);\n posix_spawn_file_actions_adddup2(&fa,child,3);\n posix_spawn_file_actions_addclose(&fa,child);\n posix_spawn_file_actions_addopen(&fa,1,\"/dev/null\",O_WRONLY,0);\n posix_spawn_file_actions_addopen(&fa,2,\"/dev/null\",O_WRONLY,0);\n posix_spawnattr_t attr; posix_spawnattr_init(&attr);\n posix_spawnattr_setflags(&attr,POSIX_SPAWN_SETPGROUP);\n posix_spawnattr_setpgroup(&attr,0);\n char *argv[]={\"python3\",(char*)path,\"--socket-fd\",\"3\",NULL};\n pid_t pid;int rc=posix_spawnp(&pid,\"python3\",&fa,&attr,argv,environ);\n posix_spawnattr_destroy(&attr);posix_spawn_file_actions_destroy(&fa);close(child);\n if(rc){close(fds[0]);return -1;}\n int flags=fcntl(fds[0],F_GETFL,0);\n if(flags<0||fcntl(fds[0],F_SETFL,flags|O_NONBLOCK)<0){close(fds[0]);kill(-pid,SIGKILL);waitpid(pid,NULL,0);return -1;}\n *pid_out=pid;return fds[0];\n}\nstatic long notification_read(int fd,void *buf,unsigned long size) {\n long n=read(fd,buf,size);if(n<0&&(errno==EAGAIN||errno==EWOULDBLOCK||errno==EINTR))return -2;return n;\n}\nstatic void notification_stop(int fd,int pid) {\n if(fd>=0)close(fd);\n if(pid<=0)return;\n int status;pid_t r=waitpid(pid,&status,WNOHANG);\n for(int i=0;r==0&&i<50;i++){usleep(5000);r=waitpid(pid,&status,WNOHANG);}\n /* The process group includes the private bus, so forced stop cannot orphan it. */\n kill(-pid,SIGKILL);if(r==0){while(waitpid(pid,&status,0)<0&&errno==EINTR){}}\n}"
+local function notification_spawn(path: cstring, pid: *cint): cint <cimport, nodecl> end
+local function notification_read(fd: cint, buf: pointer, size: culong): clong <cimport, nodecl> end
+local function notification_stop(fd: cint, pid: cint): void <cimport, nodecl> end
+
+global NotificationProcess = @record{
+  fd: cint, pid: cint, active: boolean, ended: boolean,
+  reader: ByteQueue, address: string, events: vector(string),
+}
+function NotificationProcess:open(path: string): boolean
+  if self.active or #path == 0 then return false end
+  local z = path .. '\0'
+  self.fd = notification_spawn((@cstring)(z.data), &self.pid)
+  z:destroy()
+  self.active = self.fd >= 0
+  return self.active
+end
+function NotificationProcess:pump(): void
+  if not self.active or self.ended then return end
+  local chunk: [16384]uint8
+  for turn=1,8 do
+    local n = notification_read(self.fd, &chunk, 16384)
+    if n == -2 then return end
+    if n <= 0 then self.ended = true return end
+    if self.reader:len() + (@usize)(n) > 65538 then self.ended = true return end
+    self.reader:push((@*[0]uint8)(&chunk), (@usize)(n))
+    while self.reader:len() >= 4 do
+      local p = self.reader:peek()
+      local size = (@usize)(proto.get_u32(p))
+      if size < 2 or size > 32769 then self.ended = true return end
+      if self.reader:len() < size + 4 then break end
+      local text = string{data=(@*[0]byte)(&p[5]), size=size-1}
+      local count, _ = utf8.len(text)
+      if count < 0 then self.ended = true return end
+      if p[4] == 1 and #self.address == 0 and #text <= 1024 and text:sub(1,5) == 'unix:' then
+        self.address = text:copy()
+      elseif p[4] == 2 and #self.address > 0 then
+        if #self.events == 64 then self.events[0]:destroy() self.events:remove(0) end
+        self.events:push(text:copy())
+      else self.ended = true return end
+      self.reader:consume(size + 4)
+    end
+  end
+end
+function NotificationProcess:pop(): string
+  if #self.events == 0 then return (@string){} end
+  local event = self.events[0]
+  self.events:remove(0)
+  return event
+end
+function NotificationProcess:close(): void
+  if self.active then notification_stop(self.fd, self.pid) end
+  for i=0,<#self.events do self.events[i]:destroy() end
+  self.events:destroy() self.address:destroy() self.reader:destroy()
+  $self = {}
+end
+## end

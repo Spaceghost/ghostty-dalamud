@@ -269,9 +269,28 @@ function AgentWindows:handle(ci: usize, q: *ByteQueue, typ: uint8, payload: *[0]
     -- backend has no list of them)
     -- WLIST "watch": the window list now and again whenever it changes
     local arg = string{data=(@*[0]byte)(payload), size=len}
-    if arg == 'apps' then
+    if arg:subview(1, math.min(6, #arg)) == 'icons ' then
+      local newline = arg:find('\n', 1, true)
+      local pixels = newline > 0 and tonumber(arg:subview(7, newline-1)) or 0
+      if pixels < 16 or pixels > 512 or pixels ~= math.floor(pixels) or self.backend.icons == nilptr or #arg > 65632 then
+        local reason: string = 'standalone icons unsupported or invalid'
+        proto.write_frame(q, PROTO_ERR, (@*[0]uint8)(reason.data), reason.size)
+        return true
+      end
+      local text = self.backend.icons((@integer)(pixels), arg:subview(newline+1))
+      proto.write_frame(q, PROTO_WLISTR, (@*[0]uint8)(text.data), text.size)
+      text:destroy()
+    elseif arg == 'apps' or arg:subview(1, math.min(5, #arg)) == 'apps ' then
       local text: string
-      if self.backend.apps ~= nilptr then text = self.backend.apps() end
+      if arg ~= 'apps' then
+        local pixels = tonumber(arg:subview(6))
+        if not pixels or pixels ~= math.floor(pixels) or pixels < 16 or pixels > 512 or self.backend.apps_sized == nilptr then
+          local reason: string = 'icon size unsupported or invalid (16..512)'
+          proto.write_frame(q, PROTO_ERR, (@*[0]uint8)(reason.data), reason.size)
+          return true
+        end
+        text = self.backend.apps_sized((@integer)(pixels))
+      elseif self.backend.apps ~= nilptr then text = self.backend.apps() end
       proto.write_frame(q, PROTO_WLISTR, (@*[0]uint8)(text.data), text.size)
       text:destroy()
     else
@@ -307,7 +326,7 @@ function AgentWindows:handle(ci: usize, q: *ByteQueue, typ: uint8, payload: *[0]
     why:destroy()
     self.streams:push(WinStream{
       sid = self.next_sid, client = ci, req = req, h = h, max_w = max_w, max_h = max_h,
-      interval = 1.0 / (@float64)(fps), link = #match > 4 and match:subview(1, 4) == 'url:',
+      interval = 1.0 / (@float64)(fps), link = (#match > 4 and match:subview(1, 4) == 'url:') or (self.backend.name == 'portal' and match == 'portal:'),
     })
     self.next_sid = self.next_sid + 1
     if self.next_sid == 0 then self.next_sid = 1 end

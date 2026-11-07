@@ -354,6 +354,13 @@ expect('{"method":"agent.windows"}', [[
   assert(w[2].wid == 7 and w[2].app == 'firefox' and w[2].title == 'Mozilla Firefox' and w[2].key == '' and #w[2].extra == 0, RAW)
   assert(w[3].wid == 0, RAW)]])
 expect('{"method":"agent.apps"}', 'assert(#r.result == 1 and r.result[1].id == "foot" and r.result[1].categories == "System;TerminalEmulator;", RAW)')
+
+forget()
+expect('{"method":"agent.icons.render","params":{"size":48,"icons":["custom.svg","other icon"]}}', 'assert(r.ok, RAW)')
+frame()
+assert(count(PROTO_WLIST) == 1, 'one standalone icon batch sent')
+assert(last(PROTO_WLIST).data == 'icons 48\ncustom.svg\nother icon\n', 'size and icon names survive IPC to the agent')
+
 -- CONFIG.windows.never: other plugins do not see them either
 assert(luaL_loadstring(policy.L, "CONFIG.windows.never = { 'foot', 'firefox' }") == LUA_OK and lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
 policy_refresh()
@@ -586,6 +593,21 @@ do
   local after = expect('{"method":"window.focus","params":{"id":1}}', 'return r.result.request')
   assert(after ~= before, 'fresh ids')
   frame()
+end
+
+-- Icon-only WLISTR replies never replace the windows or launchable app lists.
+do
+  local windows_before, apps_before = #winlist.windows, #winlist.apps
+  local reply: string = 'icons\nicon\tcustom.svg\t48\t/cache/custom.png\n'
+  assert(winlist_parse('', (@*[0]uint8)(reply.data), reply.size))
+  assert(#winlist.windows == windows_before and #winlist.apps == apps_before)
+  assert(#winlist.icons == 1 and winlist.icons[0].icon == 'custom.svg' and winlist.icons[0].size == 48)
+  local changed: string = 'icons\nicon\tcustom.svg\t48\t/cache/new.png\nicon\tother.svg\t64\t/cache/other.png\nicon\tbad.svg\t999\t/cache/bad.png\n'
+  assert(winlist_parse('', (@*[0]uint8)(changed.data), changed.size))
+  assert(#winlist.icons == 2 and winlist.icons[0].png == '/cache/new.png')
+  assert(#winlist.windows == windows_before and #winlist.apps == apps_before)
+  frame()
+  expect('{"method":"agent.icons"}', 'assert(r.ok and #r.result == 2 and r.result[1].icon == "custom.svg" and r.result[1].png == "/cache/new.png" and r.result[2].size == 64, RAW)')
 end
 
 gu_shutdown()

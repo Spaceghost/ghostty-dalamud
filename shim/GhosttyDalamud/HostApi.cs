@@ -105,7 +105,6 @@ internal static unsafe class HostApi
         Api->PushMonoFontPx = &PushMonoFontPx;
         Api->NearbyCharacters = &NearbyCharacters;
         Api->RaycastMode    = &RaycastMode;
-        Api->GamepadNav     = &GamepadNav;
         Api->CastInfo       = &CastInfo;
     }
 
@@ -271,7 +270,21 @@ internal static unsafe class HostApi
     [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
     private static int GameAction(byte* verb, byte* arg)
     {
-        try { return GameLinks.Action(Str(verb), Str(arg)); } catch { return 0; }
+        try {
+            if (Str(verb) == "phone-state") {
+                string state = Str(arg);
+                if (state == "get") return Plugin.PhoneState;
+                if (int.TryParse(state, out int value) && value >= 0 && value <= 2) { Plugin.PhoneState = value; return 1; }
+                return 0;
+            }
+            if (Str(verb) == "phone-app") {
+                string app = Str(arg);
+                if (Plugin.Condition[Dalamud.Game.ClientState.Conditions.ConditionFlag.InCombat]) return 2;
+                Plugin.GameFramework.RunOnFrameworkThread(() => Plugin.Phone?.Open(app));
+                return 1;
+            }
+            return GameLinks.Action(Str(verb), Str(arg));
+        } catch { return 0; }
     }
 
     // A game icon (by icon id) as an ImTextureID, 0 until Dalamud has loaded it.
@@ -582,18 +595,6 @@ internal static unsafe class HostApi
         try { return Plugin.Gamepad.Raw((GamepadButtons)mask) > 0 ? 1 : 0; } catch { return 0; }
     }
 
-    // EnableGamepadNav, rather than the ImGui flag alone, activates Dalamud's
-    // poll detour. That detour snapshots input for plugins and then zeros both
-    // sticks and gamepad buttons before FFXIV sees them.
-    [UnmanagedCallersOnly(CallConvs = [typeof(CallConvCdecl)])]
-    private static int GamepadNav(int enabled)
-    {
-        try {
-            if (enabled >= 0) Plugin.Gamepad.EnableGamepadNav = enabled != 0;
-            return Plugin.Gamepad.EnableGamepadNav ? 1 : 0;
-        } catch { return 0; }
-    }
-
     // The game's walk input (same hook as vnavmesh's OverrideMovement) --------------------------
     // The original fills in the player's own input, then the core may steer a
     // walk-up while the player is not steering.
@@ -649,6 +650,10 @@ internal static unsafe class HostApi
     private static int SetCameraState(float dirH, float dirV, float distance)
     {
         try {
+            // Every native camera caller must leave area transitions to the game.
+            var conditions = Plugin.Condition;
+            if (conditions[Dalamud.Game.ClientState.Conditions.ConditionFlag.BetweenAreas]
+                || conditions[Dalamud.Game.ClientState.Conditions.ConditionFlag.BetweenAreas51]) return 0;
             var cm = FFXIVClientStructs.FFXIV.Client.Game.Control.CameraManager.Instance();
             if (cm == null || cm->Camera == null) return 0;
             var c = cm->Camera;

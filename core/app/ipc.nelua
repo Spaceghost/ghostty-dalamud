@@ -799,13 +799,118 @@ local function l_agent_windows(L: *lua_State): cint
     lua_rawseti(L, -2, na)
   end
   lua_setfield(L, -2, 'apps')
+  lua_createtable(L, (@cint)(#winlist.icons), 0)
+  for i = 0, < #winlist.icons do
+    local icon = &winlist.icons[i]
+    lua_createtable(L, 0, 3)
+    push_str(L, icon.icon, 'icon')
+    push_str(L, icon.png, 'png')
+    lua_pushinteger(L, icon.size) lua_setfield(L, -2, 'size')
+    lua_rawseti(L, -2, i + 1)
+  end
+  lua_setfield(L, -2, 'icons')
   lua_pushinteger(L, winlist.answers) lua_setfield(L, -2, 'answers')
+  return 1
+end
+
+local function l_agent_clipboard_read(L: *lua_State): cint
+  if host.clipboard_pending ~= 0 then return push_fail(L, 'clipboard read already pending') end
+  local agent, err = window_clipboard_agent()
+  if agent == nilptr then return push_fail(L, err) end
+  host.clipboard_request = host.clipboard_request + 1
+  if host.clipboard_request == 0 then host.clipboard_request = 1 end
+  host.clipboard_pending = host.clipboard_request
+  host.clipboard_started = os.now()
+  host.clipboard_client = agent
+  host.clipboard_status = -1
+  host.clipboard_writing = false
+  host.clipboard_sensitivity_known = false
+  host.clipboard_sensitive = false
+  host.clipboard_text:destroy()
+  agent:clip_get_for(host.clipboard_request)
+  lua_pushinteger(L, host.clipboard_request)
+  return 1
+end
+
+local function l_agent_clipboard_write(L: *lua_State): cint
+  if host.clipboard_pending ~= 0 then return push_fail(L, 'clipboard request already pending') end
+  local len: usize = 0
+  local data = lua_tolstring(L, 1, &len)
+  if data == nilptr or len > 65536 then return push_fail(L, 'invalid clipboard text') end
+  for i=0, <len do if (@*[0]uint8)(data)[i] == 0 then return push_fail(L, 'clipboard text contains NUL') end end
+  local agent, err = window_clipboard_agent()
+  if agent == nilptr then return push_fail(L, err) end
+  if agent.clip_off then return push_fail(L, 'agent clipboard unavailable') end
+  host.clipboard_request = host.clipboard_request + 1
+  if host.clipboard_request == 0 then host.clipboard_request = 1 end
+  host.clipboard_pending = host.clipboard_request
+  host.clipboard_started = os.now()
+  host.clipboard_client = agent
+  host.clipboard_status = -1
+  host.clipboard_writing = true
+  host.clipboard_text:destroy()
+  agent:clip_set_for(host.clipboard_request, string{data=(@*[0]byte)(data), size=len})
+  lua_pushinteger(L, host.clipboard_request)
+  return 1
+end
+
+local function l_agent_notifications(L: *lua_State): cint
+  lua_createtable(L, 0, 2)
+  lua_pushinteger(L, host.notifications.revision) lua_setfield(L, -2, 'rev')
+  lua_createtable(L, (@cint)(#host.notifications.records), 0)
+  for i=0,<#host.notifications.records do
+    local record = &host.notifications.records[i]
+    lua_createtable(L, 0, 4)
+    lua_pushinteger(L, record.seq) lua_setfield(L, -2, 'seq')
+    lua_pushinteger(L, record.nonce) lua_setfield(L, -2, 'nonce')
+    push_str(L, record.source, 'source')
+    push_str(L, record.payload, 'payload')
+    lua_rawseti(L, -2, i + 1)
+  end
+  lua_setfield(L, -2, 'events')
+  return 1
+end
+
+local function l_agent_clipboard_result(L: *lua_State): cint
+  if os.now() - host.clipboard_started > 10 then
+    host.clipboard_pending = 0
+    host.clipboard_status = -1
+    host.clipboard_text:destroy()
+  end
+  lua_createtable(L, 0, 5)
+  lua_pushinteger(L, host.clipboard_request) lua_setfield(L, -2, 'request')
+  lua_pushboolean(L, host.clipboard_pending ~= 0 and 1 or 0) lua_setfield(L, -2, 'pending')
+  lua_pushboolean(L, host.clipboard_request > 0 and host.clipboard_pending == 0 and host.clipboard_status >= 0 and 1 or 0) lua_setfield(L, -2, 'available')
+  push_str(L, host.clipboard_writing and 'write' or 'read', 'operation')
+  push_str(L, host.clipboard_text, 'text')
+  -- Existing CLIP replies carry no sensitive-offer metadata. Sync must fail closed.
+  lua_pushboolean(L, host.clipboard_sensitivity_known and 1 or 0) lua_setfield(L, -2, 'sensitivity_known')
+  lua_pushboolean(L, host.clipboard_sensitive and 1 or 0) lua_setfield(L, -2, 'sensitive')
+  return 1
+end
+
+local function l_agent_icons_render(L: *lua_State): cint
+  local size = (@integer)(lua_tointegerx(L, 1, nilptr))
+  local len: usize = 0
+  local data = lua_tolstring(L, 2, &len)
+  if data == nilptr then return push_fail(L, 'icon names required') end
+  local names = string.copy(string{data=(@*[0]byte)(data), size=len})
+  local ok, err = window_agent_icons(size, names)
+  names:destroy()
+  if not ok then return push_fail(L, err) end
+  lua_pushboolean(L, 1)
   return 1
 end
 
 -- ghostty.agent_windows_refresh() -> true: WLIST sent (the answer lands in agent_windows)
 local function l_agent_windows_refresh(L: *lua_State): cint
-  local ok, err = window_agent_list('')
+  local ok: boolean
+  local err: string
+  if lua_type(L, 1) == LUA_TNUMBER then
+    ok, err = window_agent_list_sized((@integer)(lua_tointegerx(L, 1, nilptr)))
+  else
+    ok, err = window_agent_list('')
+  end
   if not ok then return push_fail(L, err) end
   lua_pushboolean(L, 1)
   return 1
@@ -872,6 +977,11 @@ global function ipc_lua_register(L: *lua_State): void
   lua_pushcclosure(L, l_panel_toggle_pet, 0) lua_setfield(L, -2, 'panel_toggle_pet')
   lua_pushcclosure(L, l_terminal_new, 0) lua_setfield(L, -2, 'terminal_new')
   lua_pushcclosure(L, l_agent_windows, 0) lua_setfield(L, -2, 'agent_windows')
+  lua_pushcclosure(L, l_agent_clipboard_write, 0) lua_setfield(L, -2, 'agent_clipboard_write')
+  lua_pushcclosure(L, l_agent_clipboard_read, 0) lua_setfield(L, -2, 'agent_clipboard_read')
+  lua_pushcclosure(L, l_agent_clipboard_result, 0) lua_setfield(L, -2, 'agent_clipboard_result')
+  lua_pushcclosure(L, l_agent_notifications, 0) lua_setfield(L, -2, 'agent_notifications')
+  lua_pushcclosure(L, l_agent_icons_render, 0) lua_setfield(L, -2, 'agent_icons_render')
   lua_pushcclosure(L, l_agent_windows_refresh, 0) lua_setfield(L, -2, 'agent_windows_refresh')
   lua_pushcclosure(L, l_keys_reserve, 0) lua_setfield(L, -2, 'keys_reserve')
   lua_pushcclosure(L, l_panels, 0) lua_setfield(L, -2, 'panels')

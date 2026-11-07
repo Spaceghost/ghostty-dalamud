@@ -82,7 +82,6 @@ global ControllerBinding = @record{
 
 global ControllerCfg = @record{
   enabled: boolean,
-  capture: boolean,         -- keep mapped input out of the game while focused
   layout: string,
   bindings: vector(ControllerBinding),
 }
@@ -102,43 +101,43 @@ global POLICY_HOOK_COUNT <comptime> = 10
 
 global Policy = @record{
   L: *lua_State,
-  loaded: boolean,
-  error: string,
-  profiles: vector(Profile),
   default_profile: integer,
-  dropdown: DropdownCfg,
   popup_width: integer,
   popup_height: integer,
   popup_font_size: float64,
   popup_rounding: float64,
-  agent: AgentCfg,
-  agents: vector(NamedAgentCfg), -- CONFIG.agents, in the order read
-  toggle_key: string,       -- ImGui key name in lowercase, e.g. "grave"
   toggle_consume_vk: integer,
+  toggle_gamepad_mask: integer, -- Dalamud GamepadButtons flags; 0 = no gamepad toggle
+  world_font_size: float64, -- font size on world panels; 0 = the font's native size (crispest)
+  error: string,
+  toggle_key: string,       -- ImGui key name in lowercase, e.g. "grave"
+  voice_command: string,        -- voice input: the command the agent runs (core/app/voice.nelua)
+  voice_mic: string,            -- and the microphone it is told to use ('' = its own choice)
+  profiles: vector(Profile),
+  agents: vector(NamedAgentCfg), -- CONFIG.agents, in the order read
+  world_pins: vector(string),  -- `/term pin` arguments to apply once a character is loaded
+  controller: ControllerCfg,    -- full focused-terminal controller mapping
+  agent: AgentCfg,
+  dropdown: DropdownCfg,
+  windows: WindowsCfg,
+  last_hook_error: [POLICY_HOOK_COUNT]string,  -- per POLICY_HOOK_*: the last error logged (each distinct text logs once)
+  world_occlusion_tolerance: float32, -- yalms a panel may sit behind the scene before it hides (grows with distance and slope)
+  world_occlusion_edge: float32,      -- pixels over which a covered edge blends
+  loaded: boolean,
   toggle_ctrl: boolean,     -- modifiers that must be held with toggle_key (others must be up)
   toggle_shift: boolean,
   toggle_alt: boolean,
   world_toggle_ctrl: boolean,  -- modifiers for the world/pet terminals toggle
   world_toggle_shift: boolean,
   world_toggle_alt: boolean,
-  toggle_gamepad_mask: integer, -- Dalamud GamepadButtons flags; 0 = no gamepad toggle
   toggle_gamepad_hid: boolean,  -- 'create' or 'ps': a DualSense button, read from the controller's HID reports
-  controller: ControllerCfg,    -- full focused-terminal controller mapping
   toggle_gamepad_ps: boolean,   -- 'ps': the PS button (double press: voice input) rather than Create
   touchpad_keys: boolean,       -- the DualSense touchpad types arrows, Enter and deletes into a focused terminal
-  voice_command: string,        -- voice input: the command the agent runs (core/app/voice.nelua)
-  voice_mic: string,            -- and the microphone it is told to use ('' = its own choice)
   cursor_blink: boolean,
   close_on_exit: boolean,   -- close a terminal when its shell exits (ctrl+d)
   copy_on_select: boolean,  -- releasing a mouse selection copies it to the clipboard
   disabled: boolean,        -- kill switch: the core does nothing per frame
-  world_font_size: float64, -- font size on world panels; 0 = the font's native size (crispest)
-  world_pins: vector(string),  -- `/term pin` arguments to apply once a character is loaded
   world_occlusion: uint8,   -- WORLD_OCCLUSION_* (CONFIG.world.occlusion)
-  world_occlusion_tolerance: float32, -- yalms a panel may sit behind the scene before it hides (grows with distance and slope)
-  world_occlusion_edge: float32,      -- pixels over which a covered edge blends
-  windows: WindowsCfg,
-  last_hook_error: [POLICY_HOOK_COUNT]string,  -- per POLICY_HOOK_*: the last error logged (each distinct text logs once)
 }
 
 global policy: Policy
@@ -270,13 +269,12 @@ local function read_controller(L: *lua_State, t: cint): void
   clear_controller_bindings()
   policy.controller.layout:destroy()
   policy.controller.layout = string.copy('terminal')
-  policy.controller.enabled, policy.controller.capture = false, true
+  policy.controller.enabled = false
   local top = lua_gettop(L)
   lua_getfield(L, t, 'controller')
   if lua_type(L, -1) ~= LUA_TTABLE then lua_settop(L, top) return end
   local c = lua_gettop(L)
-  policy.controller.enabled = lua_field_boolean(L, c, 'enabled', true)
-  policy.controller.capture = lua_field_boolean(L, c, 'capture', true)
+  policy.controller.enabled = lua_field_boolean(L, c, 'enabled', false)
   policy.controller.layout:destroy()
   policy.controller.layout = lua_field_string(L, c, 'layout', 'terminal')
 
@@ -432,7 +430,7 @@ local function read_settings(L: *lua_State, t: cint): void
   policy.toggle_gamepad_ps = pad == 'ps'
   pad:destroy()
   read_controller(L, t)
-  policy.touchpad_keys = lua_field_boolean(L, t, 'touchpad_keys', true)
+  policy.touchpad_keys = lua_field_boolean(L, t, 'touchpad_keys', false)
   policy.voice_command:destroy()
   policy.voice_command = lua_field_string(L, t, 'voice_command', 'ghostty-voice')
   policy.voice_mic:destroy()
@@ -688,8 +686,13 @@ end
   -- an init.lua from before a module existed (the user's copy in the config
   -- home is never replaced) gets the shipped module's defaults
   if luaL_loadstring(L, [[
-for _, n in ipairs({ 'themes', 'tooltips', 'assistant', 'ask', 'windows', 'adopt', 'rain', 'gallery' }) do
+for _, n in ipairs({ 'themes', 'tooltips', 'assistant', 'ask', 'windows', 'adopt', 'rain', 'gallery', 'phone' }) do
   if CONFIG[n] == nil then local ok, m = pcall(require, n) if ok then CONFIG[n] = m end end
+end
+if CONFIG.phone and CONFIG.phone.bind and CONFIG.world then CONFIG.phone.bind(CONFIG.world, CONFIG.animation) end
+if CONFIG.host then
+  if CONFIG.host.verb_commands == nil then CONFIG.host.verb_commands = { ['/window']='window', ['/ask']='ask', ['/agent']='agent' } end
+  if CONFIG.host.verb_commands['/phone'] == nil then CONFIG.host.verb_commands['/phone'] = 'phone' end
 end
 if CONFIG.controller == nil then
   local ok, m = pcall(require, 'controllers')
@@ -697,8 +700,7 @@ if CONFIG.controller == nil then
 else
   local ok, m = pcall(require, 'controllers')
   if ok then
-    if CONFIG.controller.enabled == nil then CONFIG.controller.enabled = true end
-    if CONFIG.controller.capture == nil then CONFIG.controller.capture = true end
+    if CONFIG.controller.enabled == nil then CONFIG.controller.enabled = false end
     if CONFIG.controller.layout == nil then CONFIG.controller.layout = 'terminal' end
     if CONFIG.controller.layouts == nil then CONFIG.controller.layouts = m.layouts end
   end
@@ -793,6 +795,37 @@ end
 -- One directory for both homes (tests, and anything embedding the core plainly).
 global function policy_load(dir: string): boolean
   return policy_load_dirs(dir, dir, '', 'test')
+end
+
+-- Prepare a new VM while the current policy, poses and sessions remain live.
+-- Configuration errors therefore cannot tear down the last working phone UI.
+local prepared_policy: Policy
+
+global function policy_prepare_dirs(install: string, config: string, configs_root: string, host_name: string): (boolean, string)
+  local live = policy
+  if prepared_policy.L ~= nilptr then
+    policy = prepared_policy
+    prepared_policy = {}
+    policy_unload()
+  end
+  policy = {}
+  local ok = policy_load_dirs(install, config, configs_root, host_name)
+  local err: string
+  if ok then prepared_policy = policy
+  else
+    err = policy.error:copy()
+    policy_unload()
+  end
+  policy = live
+  return ok, err
+end
+
+global function policy_commit_prepared(): boolean
+  if not prepared_policy.loaded then return false end
+  policy_unload()
+  policy = prepared_policy
+  prepared_policy = {}
+  return true
 end
 
 -- Ask the keymap for an action name for a key chord. Returns an empty string

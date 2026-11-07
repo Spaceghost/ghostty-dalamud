@@ -456,6 +456,17 @@ global function desktop_find_icon(icon: string, dirs: *vector(string)): (string,
     end
     return (@string){}, 0
   end
+  if #icon > 4 then
+    local ext = icon:subview(#icon - 3):lower()
+    local named_extension = ext == '.png' or ext == '.svg' or ext == '.xpm'
+    ext:destroy()
+    if named_extension then
+      local name = icon:sub(1, #icon - 4)
+      local path, pixels = desktop_find_icon(name, dirs)
+      name:destroy()
+      return path, pixels
+    end
+  end
   for ci = 0, < #DESKTOP_ICON_CONTEXTS do
     local ctx = DESKTOP_ICON_CONTEXTS[ci]
     for ti = 0, < #DESKTOP_ICON_THEMES do
@@ -512,6 +523,22 @@ global function desktop_icon_png(cache: string, short_id: string, size: integer)
   return string.format('%s/%s-%d.png', cache, short_id, size == 0 and DESKTOP_ICON_PX or size)
 end
 
+-- Source identity and modification time are part of the cache name: a theme
+-- change or updated SVG must not reuse an app's old PNG.
+## cemitdecl "\n#include <stdint.h>\n#include <sys/stat.h>\nstatic uint64_t ghostty_icon_stamp(const char *path) {\n  struct stat st;\n  if (stat(path, &st) != 0) return 0;\n#if defined(__APPLE__)\n  uint64_t sec = (uint64_t)st.st_mtimespec.tv_sec, ns = (uint64_t)st.st_mtimespec.tv_nsec;\n#elif defined(_WIN32)\n  uint64_t sec = (uint64_t)st.st_mtime, ns = 0;\n#else\n  uint64_t sec = (uint64_t)st.st_mtim.tv_sec, ns = (uint64_t)st.st_mtim.tv_nsec;\n#endif\n  return (sec * UINT64_C(1000000007)) ^ ns ^ ((uint64_t)st.st_size * UINT64_C(1099511628211));\n}\n"
+local function ghostty_icon_stamp(path: cstring): uint64 <cimport,nodecl> end
+
+global function desktop_icon_key(cache: string, short_id: string, source: string, size: integer, stamp: uint64): string
+  local hash: uint64 = 14695981039346656037
+  for i = 1, #source do hash = (hash ~ source:byte(i)) * 1099511628211 end
+  hash = (hash ~ stamp) * 1099511628211
+  return string.format('%s/%s-%d-%016x.png', cache, short_id, size == 0 and DESKTOP_ICON_PX or size, hash)
+end
+
+global function desktop_icon_cached_png(cache: string, short_id: string, source: string, size: integer): string
+  return desktop_icon_key(cache, short_id, source, size, ghostty_icon_stamp((@cstring)(source.data)))
+end
+
 -- `s` in single quotes for sh.
 global function desktop_sh_quote(sb: *stringbuilder, s: string): void
   sb:writebyte(39)
@@ -558,7 +585,8 @@ local function write_tmp(sb: *stringbuilder, dst: string): void
   sb:write('.$$.tmp')
 end
 
-global function desktop_icon_job(sb: *stringbuilder, src: string, dst: string, renderer: string): boolean
+global function desktop_icon_job_size(sb: *stringbuilder, src: string, dst: string, renderer: string, pixels: integer): boolean
+  if pixels < 16 or pixels > 512 then return false end
   local png = false
   if #src > 4 then
     local ext = src:subview(#src - 3):lower()
@@ -572,12 +600,32 @@ global function desktop_icon_job(sb: *stringbuilder, src: string, dst: string, r
     local rsvg = #renderer >= 12 and renderer:subview(#renderer - 11) == 'rsvg-convert'
     desktop_sh_quote(sb, renderer)
     if rsvg then
-      sb:writef(' -w %d -h %d -a -o ', DESKTOP_ICON_PX, DESKTOP_ICON_PX) write_tmp(sb, dst) sb:write(' ') desktop_sh_quote(sb, src)
+      sb:writef(' -w %d -h %d -a -o ', pixels, pixels) write_tmp(sb, dst) sb:write(' ') desktop_sh_quote(sb, src)
     else
       sb:write(' -background none ') desktop_sh_quote(sb, src)
-      sb:writef(' -resize %dx%d png:', DESKTOP_ICON_PX, DESKTOP_ICON_PX) write_tmp(sb, dst)
+      sb:writef(' -resize %dx%d png:', pixels, pixels) write_tmp(sb, dst)
     end
   end
   sb:write(' && mv -f ') write_tmp(sb, dst) sb:write(' ') desktop_sh_quote(sb, dst) sb:write('\n')
   return true
+end
+
+-- Existing app-list callers keep their 128 px default.
+global function desktop_icon_job(sb: *stringbuilder, src: string, dst: string, renderer: string): boolean
+  return desktop_icon_job_size(sb, src, dst, renderer, DESKTOP_ICON_PX)
+end
+
+-- Render an icon name/path independently of installed-app rows. The caller
+-- runs the returned job script off the compositor thread and replies by icon.
+global function desktop_icon_request(icon: string, pixels: integer, dirs: *vector(string), cache: string, renderer: string, jobs: *stringbuilder): string
+  if pixels < 16 or pixels > 512 or #icon == 0 or #icon > 1024 then return (@string){} end
+  for i = 1, #icon do if icon:byte(i) < 32 or icon:byte(i) == 127 then return (@string){} end end
+  local source, size = desktop_find_icon(icon, dirs)
+  if #source == 0 then return source end
+  local target = desktop_icon_cached_png(cache, 'requested', source, pixels)
+  if access((@cstring)(target.data), 0) ~= 0 and not desktop_icon_job_size(jobs, source, target, renderer, pixels) then
+    target:destroy() target = (@string){}
+  end
+  source:destroy()
+  return target
 end

@@ -10,6 +10,23 @@ require 'vector'
 
 local function near(a: float32, b: float32): boolean return math.abs(a - b) < 0.01 end
 
+-- Fullscreen promotion never drops/duplicates a session or reorders its peers.
+for count = 1, 5 do
+  for promoted = -1, count do
+    local seen: [5]boolean
+    local previous = -1
+    for slot = 0, < count do
+      local index = world_draw_index(slot, count, promoted)
+      assert(index >= 0 and index < count and not seen[index])
+      seen[index] = true
+      if promoted >= 0 and promoted < count then
+        if slot == count - 1 then assert(index == promoted)
+        else assert(index > previous and index ~= promoted) previous = index end
+      else assert(index == slot) end
+    end
+  end
+end
+
 -- Camera at the origin looking down -Z with a symmetric perspective (w = -z).
 local cam: GuCamera = { width = 1000, height = 500 }
 cam.m[0] = 1  -- x

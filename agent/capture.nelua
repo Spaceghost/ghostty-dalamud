@@ -68,6 +68,8 @@ global CaptureBackend = @record{
   wait_ms: function(): integer,
   -- optional (nilptr: none): WLISTR text of installed apps for WLIST "apps"
   apps: function(): string,
+  apps_sized: function(pixels: integer): string,
+  icons: function(pixels: integer, names: string): string,
   -- optional (nilptr: `close`): the stream's client went away; forget the
   -- handle but leave the window and its app alone, to be opened again
   release: function(h: pointer): void,
@@ -79,6 +81,9 @@ global CaptureBackend = @record{
 }
 
 require 'agent.capture_test'
+## if ccinfo.is_linux then
+require 'agent.capture_portal'
+## end
 
 -- Platform backends compiled into this agent. Flip one to true when its file lands.
 ## CAPTURE_BUILT = { wayland = WAYLAND and true or false, -- -D WAYLAND: tools/wayland-flags.sh
@@ -110,6 +115,12 @@ global function capture_select(name: string): (boolean, CaptureBackend, string)
     return false, (@CaptureBackend){}, 'window capture is off (--windows off)'
   elseif name == 'test' then
     return capture_test_backend()
+  elseif name == 'portal' then
+    ## if ccinfo.is_linux then
+    return capture_portal_backend()
+    ## else
+    return false, (@CaptureBackend){}, 'portal capture requires Linux'
+    ## end
   elseif name == 'wayland' then
     ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
     return capture_wayland_backend()

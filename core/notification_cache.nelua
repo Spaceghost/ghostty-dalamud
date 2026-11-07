@@ -1,0 +1,35 @@
+-- Bounded opaque notification events. Lua validates the JSON before exposing IPC.
+require 'string'
+require 'vector'
+require 'utf8'
+global NotificationRecord = @record{ seq: uint64, source: string, nonce: uint64, payload: string }
+global NotificationCache = @record{ revision: uint64, records: vector(NotificationRecord) }
+local function destroy_record(record: *NotificationRecord): void
+  record.source:destroy() record.payload:destroy()
+end
+function NotificationCache:push(source: string, nonce: uint64, payload: string): boolean
+  if #source == 0 or #source > 128 or #payload == 0 or #payload > 32768 then return false end
+  local count, _ = utf8.len(payload)
+  if count < 0 then return false end
+  for i=0,<#payload do if payload.data[i] == 0 then return false end end
+  if #self.records == 64 then destroy_record(&self.records[0]) self.records:remove(0) end
+  self.revision = self.revision + 1
+  self.records:push(NotificationRecord{seq=self.revision,source=source:copy(),nonce=nonce,payload=payload:copy()})
+  return true
+end
+function NotificationCache:remove_source(source: string): void
+  local i = #self.records - 1
+  local changed = false
+  while i >= 0 do
+    if self.records[i].source == source then
+      destroy_record(&self.records[i]) self.records:remove((@usize)(i)) changed = true
+    end
+    i = i - 1
+  end
+  if changed then self.revision = self.revision + 1 end
+end
+function NotificationCache:destroy(): void
+  for i=0,<#self.records do destroy_record(&self.records[i]) end
+  self.records:destroy()
+  self.revision = 0
+end

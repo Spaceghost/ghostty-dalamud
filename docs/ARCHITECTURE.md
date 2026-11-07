@@ -138,11 +138,8 @@
    The focused terminal also polls the configured `CONFIG.controller` button
    map through the shim's raw Dalamud gamepad state. `key:` mappings take the
    same encoder path; terminal actions share the keyboard action dispatcher.
-   When capture is enabled, the shim owns Dalamud's `EnableGamepadNav` only for
-   the focused interval. Its poll detour zeros both analogue sticks before
-   FFXIV sees them; changing ImGui's navigation flag alone does not. A capture
-   enabled elsewhere is never cleared, and gamepad-driven mouse positioning is
-   suppressed during focus and restored afterward.
+   The shim reads raw button state without enabling Dalamud gamepad mode or
+   blocking the controller's input to FFXIV.
 6. `render_termview` walks the render-state rows/cells: merged background
    runs, one `AddText` per glyph cell, underline/strike lines and cursor. Kitty
    graphics placements are read from libghostty-vt and drawn through bounded
@@ -706,7 +703,7 @@ the agent compiles them in.
 | `test_ghostty` | libghostty-vt binding: sized-struct sizes against `ghostty_type_json()` |
 | `test_render` | a terminal rendered through a fake ImGui, checked by its draw calls |
 | `test_glyphfb` | fallback glyphs (`core/glyphfb.nelua`, docs/GLYPHS.md): code points above U+FFFF (emoji included) and BMP glyphs the ImGui font lacks rasterized with stb_truetype from `fonts/` into a fake D3D11 atlas and drawn as tinted images at their cells (2D snapped, world unsnapped), wide glyphs over exactly two cells, the lazily read font chain and a font added behind it, the tofu box with hex digits for a code point no font has, `ImFont_FindGlyph` in place of `ImFont_FindGlyphNoFallback`, the cache, a full atlas starting over, device changes |
-| `test_session` | session behaviour without a transport, local sessions, agent LIST parsing, `/term send` escapes, gamepad gestures, mapped controller repeat/key encoding/capture ownership, key repeat |
+| `test_session` | session behaviour without a transport, local sessions, agent LIST parsing, `/term send` escapes, gamepad gestures, mapped controller repeat/key encoding, key repeat |
 | `test_dualsense` | DualSense input reports (USB, Bluetooth with its CRC, Bluetooth simple, short and foreign reports), Create edges, ids in HID interface paths, the HID reader against fake devices: scan, devices passed over by their path, open, report queue, unplug, rescans backing off, device arrivals, close |
 | `test_selection` | mouse selection: hit mapping, click counting, word and line units, copied text |
 | `test_bell` | the visual bell: BEL counting, ring and glow maths, the Lua style, its triangles |

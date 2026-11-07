@@ -1,0 +1,16 @@
+require 'agent.portal_process'
+require 'arg'
+local function usleep(usec: cuint): cint <cimport, nodecl> end
+local process: PortalProcess
+assert(#arg >= 1 and process:open(arg[1], false))
+for i=1,5000 do
+  process:pump()
+  if process.ended then break end
+  usleep(1000)
+end
+assert(process.ended and not process.reader.failed)
+assert(process.w == 1 and process.h == 1 and process.serial == 2)
+assert(process.pixels.size == 4 and process.pixels[0] == 66 and process.pixels[3] == 65)
+process:close()
+assert(not process.active)
+print('portal process OK')

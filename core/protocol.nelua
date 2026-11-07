@@ -101,6 +101,9 @@ global PROTO_NLREPLY: uint8 <comptime> = 49   -- req u32, ok u8, text (a subscri
 global PROTO_NLSTAT: uint8 <comptime> = 50    -- JSON: what the netlab panel draws, to connections that asked (watch)
 global PROTO_NLFRAME: uint8 <comptime> = 51   -- sub u32, group u64, index u32, flags u8, lat_us u32, then WFRAME frames: one picture
 
+global PROTO_CLIP_META: uint8 <comptime> = 52 -- metadata CLIP_GET: flags u8 (1 known, 2 sensitive), UTF-8 text
+global PROTO_APP_NOTIFY: uint8 <comptime> = 53 -- bounded JSON notification/closed event; authorised window watchers only
+
 -- JOPEN flags
 global JOB_FLAG_KEEP: uint8 <comptime> = 1    -- bit 0: outlive the connection; JATTACH picks it up again
 

@@ -9,7 +9,7 @@ using Dalamud.Plugin.Services;
 
 namespace GhosttyDalamud;
 
-public sealed unsafe class Plugin : IDalamudPlugin
+public sealed unsafe class Plugin : IAsyncDalamudPlugin
 {
     [PluginService] internal static IDalamudPluginInterface Pi { get; private set; } = null!;
     [PluginService] internal static ICommandManager Commands { get; private set; } = null!;
@@ -37,6 +37,10 @@ public sealed unsafe class Plugin : IDalamudPlugin
     private bool walkHooked;
     private bool subscribed;
     private bool disposed;
+    private PhoneModules.PhoneApplication? phone;
+    private PhoneModules.LuaReloadWatcher? luaWatcher;
+    internal static PhoneModules.PhoneApplication? Phone { get; private set; }
+    internal static int PhoneState { get; set; } = 1;
 
     public Plugin()
     {
@@ -71,6 +75,9 @@ public sealed unsafe class Plugin : IDalamudPlugin
             Pi.ActivePluginsChanged += OnPluginsChanged;
             if (Native.Chat != null) Chat.ChatMessageUnhandled += OnChat;
             subscribed = true;
+            phone = new PhoneModules.PhoneApplication();
+            Phone = phone;
+            luaWatcher = new PhoneModules.LuaReloadWatcher(install, Pi.ConfigDirectory.FullName);
         }
         catch
         {
@@ -87,10 +94,17 @@ public sealed unsafe class Plugin : IDalamudPlugin
 
     private void OnDraw()
     {
+        if (luaWatcher?.Take() == true) Native.Post(GuEvent.Chat, 0, 0, 0, 0, "reload");
         string? error = nativeCache?.Refresh();
         if (error != null) Log.Warning("Ghostty native cache update: " + error);
         Native.Frame();
     }
+    public System.Threading.Tasks.Task LoadAsync(System.Threading.CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return System.Threading.Tasks.Task.CompletedTask;
+    }
+    public System.Threading.Tasks.ValueTask DisposeAsync() => PhoneModules.PhoneApplication.Shutdown(phone, Dispose);
     private static void OnOpenMain() => Native.Post(GuEvent.OpenMain, 0, 0, 0, 0, string.Empty);
     private static void OnOpenConfig() => Native.Post(GuEvent.OpenConfig, 0, 0, 0, 0, string.Empty);
     private static void OnPluginsChanged(IActivePluginsChangedEventArgs args) => Native.Post(GuEvent.PluginsChanged, 0, 0, 0, 0, string.Empty);
@@ -106,6 +120,8 @@ public sealed unsafe class Plugin : IDalamudPlugin
     {
         if (disposed) return;
         disposed = true;
+        Phone = null;
+        luaWatcher?.Dispose();
         if (subscribed)
         {
             Pi.UiBuilder.Draw -= OnDraw;

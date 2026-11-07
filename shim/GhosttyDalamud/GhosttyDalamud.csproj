@@ -10,6 +10,7 @@
     <Platforms>x64</Platforms>
     <PlatformTarget>x64</PlatformTarget>
     <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
     <LangVersion>14.0</LangVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
@@ -19,9 +20,9 @@
     <OutputPath>../../build/plugin/GhosttyDalamud/</OutputPath>
     <RootNamespace>GhosttyDalamud</RootNamespace>
     <AssemblyName>GhosttyDalamud</AssemblyName>
-    <Version>0.3.1.13</Version>
-    <AssemblyVersion>0.3.1.13</AssemblyVersion>
-    <FileVersion>0.3.1.13</FileVersion>
+    <Version>0.4.0.0</Version>
+    <AssemblyVersion>0.4.0.0</AssemblyVersion>
+    <FileVersion>0.4.0.0</FileVersion>
     <Authors>Johnneylee Jack Rollins</Authors>
     <RepositoryUrl>https://github.com/Spaceghost/ghostty-dalamud</RepositoryUrl>
     <Description>Ghostty terminal inside FFXIV (libghostty-vt core written in Nelua, policy in Lua).</Description>
@@ -52,6 +53,7 @@
     <Reference Include="InteropGenerator.Runtime"><HintPath>$(DalamudLibPath)InteropGenerator.Runtime.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Lumina"><HintPath>$(DalamudLibPath)Lumina.dll</HintPath><Private>false</Private></Reference>
     <Reference Include="Lumina.Excel"><HintPath>$(DalamudLibPath)Lumina.Excel.dll</HintPath><Private>false</Private></Reference>
+    <Reference Include="Serilog"><HintPath>$(DalamudLibPath)Serilog.dll</HintPath><Private>false</Private></Reference>
   </ItemGroup>
   <Target Name="RequireGhosttyNativeBuild" BeforeTargets="PrepareForBuild">
     <Error Condition="!Exists('$(MSBuildProjectDirectory)/../../build/dist/ghostty_core.dll')"

@@ -99,8 +99,7 @@ end
 
 function M.config(layout)
   return {
-    enabled = true,
-    capture = true,
+    enabled = false,
     layout = layout or 'terminal',
     layouts = M.layouts,
     -- Set mapping to a table to use it instead of the selected layout.

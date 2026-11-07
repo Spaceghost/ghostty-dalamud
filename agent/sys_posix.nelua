@@ -5,6 +5,7 @@ require 'string'
 require 'stringbuilder'
 require 'io'
 require 'os'
+require 'agent.clipboard_policy'
 
 ## cinclude '<sys/types.h>'
 ## cinclude '<sys/wait.h>'
@@ -182,4 +183,62 @@ global function agent_clipboard_get(): (boolean, string)
   local status: cint = 0
   if waitpid(pid, &status, WNOHANG) == 0 then kill(pid, SIGKILL) waitpid(pid, &status, 0) end
   return true, sb:promote()
+end
+
+-- The helper owns one Wayland data offer, checks its MIME hints before any
+-- text request, and discards transfers if the selected source changes.
+global function agent_clipboard_get_metadata(): (boolean, string, uint8)
+  local path = os.getenv('GHOSTTY_CLIPBOARD_HELPER')
+  if #path == 0 then
+    path:destroy()
+    path = string.copy('/usr/libexec/ghostty-agent/clipboard-snapshot')
+  end
+  local fds: [2]cint
+  if pipe(&fds) ~= 0 then path:destroy() return false, (@string){}, 0 end
+  local pid = fork()
+  if pid < 0 then close(fds[0]) close(fds[1]) path:destroy() return false, (@string){}, 0 end
+  if pid == 0 then
+    dup2(fds[1], 1)
+    close(fds[0]) close(fds[1])
+    local argv: [2]cstring = { (@cstring)(path.data), nilptr }
+    execvp(argv[0], &argv)
+    _exit(127)
+  end
+  path:destroy()
+  close(fds[1])
+  local sb: stringbuilder
+  local buf: [8192]uint8
+  local pf: [1]pollfd = { { fd = fds[0], events = POLLIN } }
+  local complete = false
+  local deadline = os.now() + 2.0
+  while #sb <= 65537 and os.now() < deadline do
+    if poll(&pf, 1, 1000) <= 0 then break end
+    local n = read(fds[0], &buf, 8192)
+    if n == 0 then complete = true break end
+    if n < 0 then break end
+    sb:write(string{data=(@*[0]byte)(&buf), size=(@usize)(n)})
+  end
+  close(fds[0])
+  local status: cint = 0
+  local waited = waitpid(pid, &status, WNOHANG)
+  if waited == 0 then
+    -- EOF can precede child exit; allow bounded cleanup before cancelling.
+    for _ = 1, 20 do
+      usleep(1000)
+      waited = waitpid(pid, &status, WNOHANG)
+      if waited ~= 0 then break end
+    end
+    if waited == 0 then kill(pid, SIGKILL) waited = waitpid(pid, &status, 0) end
+  end
+  local raw = sb:promote()
+  if waited ~= pid or not complete or not WIFEXITED(status) or WEXITSTATUS(status) ~= 0 or #raw < 1 or #raw > 65537 then
+    raw:destroy() return false, (@string){}, 0
+  end
+  local flags = raw:byte(1)
+  local text = raw:sub(2):copy()
+  raw:destroy()
+  if (flags ~= 1 and flags ~= 3) or (flags == 3 and #text > 0) or not clipboard_valid_text(text) then
+    text:destroy() return false, (@string){}, 0
+  end
+  return true, text, (@uint8)(flags)
 end

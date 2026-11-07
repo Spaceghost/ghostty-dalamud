@@ -1,3 +1,7 @@
+require 'agent.clipboard_policy'
+require 'agent.clipboard_offer'
+require 'agent.notification_process'
+local notifications: NotificationProcess
 -- The Linux window backend (`--windows wayland`): ghostty-agent is itself a
 -- headless Wayland compositor built on wlroots, and the game is its only
 -- display. The plugin runs inside FFXIV under Wine, a Windows PE process that
@@ -302,6 +306,7 @@ local function wlr_seat_pointer_notify_button(s: *wlr_seat, t: uint32, button: u
 local function wlr_seat_pointer_notify_axis(s: *wlr_seat, t: uint32, orientation: uint32, value: float64, discrete: int32, source: uint32, dir: uint32): void <cimport, nodecl> end
 local function wlr_seat_pointer_notify_frame(s: *wlr_seat): void <cimport, nodecl> end
 local function wlr_seat_keyboard_notify_enter(s: *wlr_seat, surf: *wlr_surface, keycodes: *[0]uint32, n: usize, mods: *wlr_keyboard_modifiers): void <cimport, nodecl> end
+local function wlr_seat_keyboard_notify_clear_focus(s: *wlr_seat): void <cimport, nodecl> end
 local function wlr_seat_keyboard_notify_key(s: *wlr_seat, t: uint32, key: uint32, state: uint32): void <cimport, nodecl> end
 local function wlr_seat_keyboard_notify_modifiers(s: *wlr_seat, mods: *wlr_keyboard_modifiers): void <cimport, nodecl> end
 local function wlr_keyboard_init(kb: *wlr_keyboard, impl: *wlr_keyboard_impl, name: cstring): void <cimport, nodecl> end
@@ -538,6 +543,7 @@ local wc: record{
   deco_mgr: *wlr_xdg_decoration_manager_v1,
   instance: string,           -- this agent run, in launch ids (hex of start time and pid)
   launches: integer,          -- launches so far
+  icon_pixels: integer,
   icon_pids: vector(cint),    -- icon cache jobs still running (WLIST "apps")
   icon_queued: vector(string), -- the icons they make
   xkb_ctx: *xkb_context,
@@ -1013,6 +1019,11 @@ local function spawn(cmd: string): cint
   -- X11 apps reach our Xwayland; nothing reaches the host's X server
   if #wc.x_display > 0 then setenv('DISPLAY', (@cstring)(wc.x_display.data), 1) else unsetenv('DISPLAY') end
   setenv('WAYLAND_DISPLAY', (@cstring)(wc.socket.data), 1)
+  if notifications.active and not notifications.ended and #notifications.address > 0 then
+    setenv('DBUS_SESSION_BUS_ADDRESS', (@cstring)(notifications.address.data), 1)
+    unsetenv('DBUS_STARTER_ADDRESS')
+    unsetenv('DBUS_STARTER_BUS_TYPE')
+  end
   if #wc.runtime_dir > 0 then setenv('XDG_RUNTIME_DIR', (@cstring)(wc.runtime_dir.data), 1) end
   setenv('XDG_SESSION_TYPE', 'wayland', 1)
   setenv('GDK_BACKEND', 'wayland', 1)
@@ -1108,8 +1119,8 @@ end
 --     reads the host clipboard when an app pastes: pastes get whatever was
 --     copied last in the game, on the desktop or in another app.
 --   * When an app copies text, it is read from the app, put on the host
---     clipboard, and our host source takes the selection back (it serves
---     the same text from then on).
+--     clipboard if its source generation is still current. The app remains
+--     the selection owner, preserving MIME hints for metadata snapshots.
 -- X11 apps take part through Xwayland's selection bridge. The primary
 -- selection (middle click) works between apps but is not bridged.
 
@@ -1119,6 +1130,7 @@ local clip_get_fn: ClipGet
 local clip_set_fn: ClipSet
 
 local CLIP_MIMES: [5]string = { 'text/plain;charset=utf-8', 'text/plain', 'UTF8_STRING', 'TEXT', 'STRING' }
+local clipboard_offer: ClipboardOffer
 local CLIP_READ_MAX: usize <comptime> = 1024 * 1024
 
 -- One transfer between a pipe and a buffer: writing our text to an app that
@@ -1128,6 +1140,7 @@ local Xfer = @record{
   src: *wl_event_source,
   buf: vector(uint8),
   off: usize,
+  generation: uint64,
 }
 
 local proxy_src: wlr_data_source
@@ -1216,17 +1229,22 @@ local function on_xfer_read(fd: cint, mask: uint32, data: pointer): cint
       done = true
       break
     elseif errno ~= EINTR then
-      if errno ~= EAGAIN then done = true end
+      if errno ~= EAGAIN then x.off = 1 done = true end
       break
     end
   end
   if done then
-    if x.off == 0 and #x.buf > 0 and clip_set_fn ~= nilptr then
-      clip_set_fn(&x.buf[0], #x.buf)
+    local accepted = false
+    if x.off == 0 and x.generation == clipboard_offer.generation then
+      local bytes = #x.buf > 0 and (@*[0]byte)(&x.buf[0]) or nilptr
+      accepted = clipboard_offer:complete(x.generation, string{data=bytes, size=#x.buf})
+    end
+    if accepted and clip_set_fn ~= nilptr then
+      local bytes = #x.buf > 0 and &x.buf[0] or nilptr
+      clip_set_fn(bytes, #x.buf)
       log('clipboard: ' .. tostring(#x.buf) .. ' bytes copied in an app went to the host clipboard')
     end
     xfer_end(x)
-    proxy_install()
   end
   return 0
 end
@@ -1237,6 +1255,10 @@ local function clip_read_app(src: *wlr_data_source): void
   local mime: cstring = nilptr
   local n = src.mime_types.size // #@cstring
   local arr = (@*[0]cstring)(src.mime_types.data)
+  -- Keep sensitive selections inside their source app; never request their text.
+  for i = 0, < (@integer)(n) do
+    if clipboard_sensitive_mime((@string)(arr[i])) then clipboard_offer:select(true) return end
+  end
   for k = 0, < #CLIP_MIMES do
     for i = 0, < (@integer)(n) do
       if (@string)(arr[i]) == CLIP_MIMES[k] then mime = arr[i] break end
@@ -1249,6 +1271,7 @@ local function clip_read_app(src: *wlr_data_source): void
   wlr_data_source_send(src, mime, fds[1]) -- the source owns (and closes) the write end
   local x = new(@Xfer)
   x.fd = fds[0]
+  x.generation = clipboard_offer.generation
   x.src = wl_event_loop_add_fd(wc.loop, fds[0], WL_EVENT_READABLE, on_xfer_read, x)
   if x.src == nilptr then xfer_end(x) end
   wl_display_flush_clients(wc.display)
@@ -1257,6 +1280,7 @@ end
 local function on_set_selection(l: *wl_listener, data: pointer): void
   if clip_get_fn == nilptr then return end
   local src = wc.seat.selection_source
+  clipboard_offer:select(false)
   if src == &proxy_src then return end
   if src == nilptr then proxy_install() return end -- its app went: back to the host's
   clip_read_app(src)
@@ -1275,6 +1299,17 @@ end
 
 -- The game copied (CLIP_SET, already on the host clipboard): an app's own
 -- selection gives way to our host source, so pastes here get the new text.
+global function capture_wayland_clipboard_snapshot(): (boolean, string, uint8)
+  if not wc.started or wc.seat.selection_source == nilptr or wc.seat.selection_source == &proxy_src or not clipboard_offer.ready then
+    return false, (@string){}, 0
+  end
+  return true, string.copy(clipboard_offer.text), clipboard_offer.sensitive and 3 or 1
+end
+
+global function capture_wayland_clipboard_uses_host(): boolean
+  return not wc.started or wc.seat.selection_source == nilptr or wc.seat.selection_source == &proxy_src
+end
+
 global function capture_wayland_clipboard_changed(): void
   if wc.started and wc.seat.selection_source ~= &proxy_src then proxy_install() end
 end
@@ -1397,18 +1432,26 @@ local function top_mapped(t: *Top): void
   log('window ' .. tostring(t.id) .. (t.x11 ~= nilptr and ' (X11)' or '') .. ' mapped: ' .. top_app(t) .. ' "' .. top_title(t) .. '"')
 end
 
+local function clear_top_focus(t: *Top): void
+  if wc.focused ~= t then return end
+  wc.focused = nilptr
+  wc.kb_surface = nilptr
+  ti_focus(nilptr)
+  wlr_seat_keyboard_notify_clear_focus(wc.seat)
+end
+
 local function top_unmapped(t: *Top): void
   t.mapped = false
   wc.list_serial = wc.list_serial + 1
   end_caps_of(t, 'window closed')
-  if wc.focused == t then wc.focused = nilptr end
+  clear_top_focus(t)
 end
 
 -- Forget `t`: its streams end, its output and scene go. Popups still shown
 -- in it lose their place and show nowhere.
 local function top_free(t: *Top): void
   end_caps_of(t, 'window closed')
-  if wc.focused == t then wc.focused = nilptr end
+  clear_top_focus(t)
   for i = 0, < #t.popups do
     local pp = t.popups[i]
     pp.top = nilptr
@@ -2455,11 +2498,11 @@ local function wl_apps(): string
     local src, size = desktop_find_icon(es[i].icon, &idirs)
     local png: string
     if #src > 0 then
-      png = desktop_icon_png(cache, desktop_short_id(es[i].id), size)
+      png = desktop_icon_cached_png(cache, desktop_short_id(es[i].id), src, size == 0 and (wc.icon_pixels > 0 and wc.icon_pixels or DESKTOP_ICON_PX) or size)
       local queued = false
       for q = 0, < #wc.icon_queued do if wc.icon_queued[q] == png then queued = true break end end
       if not queued and access((@cstring)(png.data), 0) ~= 0 then
-        if desktop_icon_job(&jobs, src, png, renderer) then
+        if desktop_icon_job_size(&jobs, src, png, renderer, wc.icon_pixels > 0 and wc.icon_pixels or DESKTOP_ICON_PX) then
           njobs = njobs + 1
           wc.icon_queued:push(string.copy(png))
         else
@@ -2498,6 +2541,63 @@ local function wl_apps(): string
   for i = 0, < #idirs do idirs[i]:destroy() end
   idirs:destroy()
   return sb:promote()
+end
+
+local function wl_icons(pixels: integer, names: string): string
+  -- Completed jobs may be retried if rendering failed; never leave a queued
+  -- icon suppressed merely because no app-list refresh happened afterward.
+  local k = #wc.icon_pids - 1
+  while k >= 0 do
+    local child = child_of(wc.icon_pids[k])
+    if child == nilptr or child.done then wc.icon_pids:remove((@usize)(k)) end
+    k = k - 1
+  end
+  if #wc.icon_pids == 0 then
+    for i = 0, < #wc.icon_queued do wc.icon_queued[i]:destroy() end
+    wc.icon_queued:clear()
+  end
+  local dirs = desktop_icon_dirs()
+  local cache = desktop_icon_cache_dir()
+  local renderer = desktop_icon_renderer()
+  local jobs: stringbuilder
+  local reply: stringbuilder
+  reply:write('icons\n')
+  local start, count = 1, 0
+  while start <= #names and count < 64 do
+    local stop = names:find('\n', start, true)
+    if stop == 0 then stop = #names + 1 end
+    local icon = names:subview(start, stop-1)
+    if #icon > 0 then
+      local piece: stringbuilder
+      local png = desktop_icon_request(icon, pixels, &dirs, cache, renderer, &piece)
+      local body = piece:promote()
+      local queued = false
+      for i = 0, < #wc.icon_queued do if wc.icon_queued[i] == png then queued = true break end end
+      if not queued and #body > 0 then jobs:write(body) wc.icon_queued:push(png:copy()) end
+      if #png > 0 then reply:writef('icon\t%s\t%d\t%s\n', icon, pixels, png) end
+      body:destroy() png:destroy()
+      count = count + 1
+    end
+    start = stop + 1
+  end
+  local body = jobs:promote()
+  if #body > 0 then
+    local script: stringbuilder
+    script:write('mkdir -p ') desktop_sh_quote(&script, cache) script:write('\n', body)
+    local command = script:promote()
+    local pid = spawn(command)
+    if pid > 0 then wc.children:push(Child{pid=pid}) wc.icon_pids:push(pid) end
+    command:destroy()
+  end
+  body:destroy() renderer:destroy() cache:destroy()
+  for i = 0, < #dirs do dirs[i]:destroy() end
+  dirs:destroy()
+  return reply:promote()
+end
+
+local function wl_apps_sized(pixels: integer): string
+  wc.icon_pixels = pixels
+  return wl_apps()
 end
 
 local function wl_state(h: pointer): (integer, string)
@@ -2587,6 +2687,8 @@ local function wl_release(h: pointer): void
 end
 
 local function wl_pump(): void
+  notifications:pump()
+  if notifications.ended then notifications:close() end
   wl_event_loop_dispatch(wc.loop, 0)
   reap_children()
   local now = os.now()
@@ -2611,10 +2713,16 @@ end
 local function wl_poll_fds(fds: *[0]cint, max: integer): integer
   if max < 1 then return 0 end
   fds[0] = wl_event_loop_get_fd(wc.loop)
+  if max >= 2 and notifications.active and not notifications.ended then fds[1] = notifications.fd return 2 end
   return 1
 end
 
+global function capture_wayland_notification_pop(): string
+  return notifications:pop()
+end
+
 local function wl_wait_ms(): integer
+  if #notifications.events > 0 then return 0 end -- drain bounded event batches even after the helper fd is empty
   for i = 0, < #wc.tops do
     local t = wc.tops[i]
     -- damage waiting for the output's next frame (its timer wakes the loop fd too)
@@ -2950,6 +3058,21 @@ local function start(): (boolean, string)
   wc.next_id = 1
   wc.instance = string.format('%x', ((@int64)(os.time()) << 20) ~ (@int64)(getpid()))
   wc.started = true
+  local notification_path = os.getenv('GHOSTTY_NOTIFICATION_HELPER')
+  if #notification_path == 0 then
+    notification_path:destroy()
+    notification_path = string.copy('/usr/libexec/ghostty-agent/app_notifications.py')
+  end
+  if notifications:open(notification_path) then
+    local deadline = os.now() + 1.0
+    repeat
+      notifications:pump()
+      if notifications.ended or #notifications.address > 0 then break end
+      usleep(5000)
+    until os.now() >= deadline
+    if notifications.ended or #notifications.address == 0 then notifications:close() end
+  end
+  notification_path:destroy()
   log('compositor on WAYLAND_DISPLAY=' .. wc.socket .. ' (' .. wc.runtime_dir .. ')')
   setup_link_env()
   proxy_install()
@@ -2969,13 +3092,15 @@ global function capture_wayland_backend(): (boolean, CaptureBackend, string)
     list = wl_list, open = wl_open, state = wl_state, title = wl_title,
     frame = wl_frame, input = wl_input, close = wl_close,
     pump = wl_pump, poll_fds = wl_poll_fds, wait_ms = wl_wait_ms,
-    apps = wl_apps, release = wl_release, list_serial = wl_list_serial, wid_of = wl_wid_of,
+    apps = wl_apps, apps_sized = wl_apps_sized, icons = wl_icons, release = wl_release, list_serial = wl_list_serial, wid_of = wl_wid_of,
   }, ''
 end
 
 -- End every app we launched (their whole process groups) and the compositor.
 -- For agent exit and tests; the backend cannot be used afterwards.
 global function capture_wayland_shutdown(): void
+  notifications:close()
+  clipboard_offer:select(false) -- discard cached text and invalidate outstanding reads
   if not wc.started then return end
   for i = 0, < #wc.children do
     if not wc.children[i].done then kill(-wc.children[i].pid, SIGTERM) end

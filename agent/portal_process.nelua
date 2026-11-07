@@ -1,0 +1,65 @@
+-- Linux host helper process and nonblocking private frame transport.
+require 'agent.portal_frames'
+require 'memory'
+require 'string'
+## if ccinfo.is_linux then
+## cemitdecl "\n#include <sys/socket.h>\n#include <sys/wait.h>\n#include <fcntl.h>\n#include <unistd.h>\n#include <signal.h>\n#include <errno.h>\n#include <spawn.h>\nextern char **environ;\nstatic int portal_spawn(const char *path, int *pid_out, int input) {\n int fds[2]; if(socketpair(AF_UNIX, SOCK_STREAM|SOCK_CLOEXEC, 0, fds)) return -1;\n int child=fcntl(fds[1], F_DUPFD_CLOEXEC, 10); close(fds[1]);\n if(child<0) {close(fds[0]); return -1;}\n posix_spawn_file_actions_t fa; posix_spawn_file_actions_init(&fa);\n posix_spawn_file_actions_addclose(&fa,fds[0]);\n posix_spawn_file_actions_adddup2(&fa,child,3);\n posix_spawn_file_actions_addclose(&fa,child);\n char *argv[]={\"python3\",(char*)path,\"--socket-fd\",\"3\",input ? \"--input\" : NULL,NULL};\n pid_t pid; int rc=posix_spawnp(&pid,\"python3\",&fa,NULL,argv,environ);\n posix_spawn_file_actions_destroy(&fa); close(child);\n if(rc) {close(fds[0]); return -1;}\n int flags=fcntl(fds[0],F_GETFL,0);\n if(flags<0 || fcntl(fds[0],F_SETFL,flags|O_NONBLOCK)<0) {close(fds[0]);kill(pid,SIGKILL);waitpid(pid,NULL,0);return -1;}\n *pid_out=pid;return fds[0];\n}\nstatic long portal_read(int fd, void *buf, unsigned long size) {\n long n=read(fd,buf,size); if(n<0 && (errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR)) return -2;return n;\n}\nstatic void portal_stop(int fd,int pid) {\n if(fd>=0)close(fd);\n if(pid>0) {\n int status; pid_t r=waitpid(pid,&status,WNOHANG);\n if(r==0) {\n  kill(pid,SIGTERM);\n  /* Bounded grace for helper finally blocks; never wait on a desktop chooser. */\n  for(int i=0;i<20;i++) { r=waitpid(pid,&status,WNOHANG); if(r!=0)break; usleep(5000); }\n  if(r==0) {kill(pid,SIGKILL);while(waitpid(pid,&status,0)<0 && errno==EINTR){}}\n }\n}\n}\n\nstatic long portal_write(int fd, const void *buf, unsigned long size) { long n=send(fd,buf,size,MSG_NOSIGNAL); if(n<0 && (errno==EAGAIN || errno==EWOULDBLOCK || errno==EINTR))return -2;return n; }\n"
+local function portal_spawn(path: cstring, pid: *cint, input: cint): cint <cimport, nodecl> end
+local function portal_read(fd: cint, buf: pointer, size: culong): clong <cimport, nodecl> end
+local function portal_write(fd: cint, buf: pointer, size: culong): clong <cimport, nodecl> end
+local function portal_stop(fd: cint, pid: cint): void <cimport, nodecl> end
+
+global PortalProcess = @record{
+  fd: cint, pid: cint, active: boolean, ended: boolean,
+  reader: PortalFrameReader, output: ByteQueue, input_enabled: boolean,
+  pixels: vector(uint8), w: uint32, h: uint32, serial: uint64,
+}
+function PortalProcess:open(path: string, input: boolean): boolean
+  if self.active or #path == 0 then return false end
+  local z = path .. '\0'
+  self.fd = portal_spawn((@cstring)(z.data), &self.pid, input and 1 or 0)
+  z:destroy()
+  self.input_enabled = input
+  self.active = self.fd >= 0
+  return self.active
+end
+function PortalProcess:enqueue(data: *[0]uint8, size: usize): boolean
+  if not self.active or self.ended or not self.input_enabled then return false end
+  if size > 65536 - self.output:len() then self.ended = true return false end
+  self.output:push(data, size)
+  return true
+end
+function PortalProcess:pump(): void
+  if not self.active or self.ended then return end
+  while self.output:len() > 0 do
+    local sent = portal_write(self.fd, self.output:peek(), (@culong)(self.output:len()))
+    if sent == -2 then break end
+    if sent <= 0 then self.ended = true return end
+    self.output:consume((@usize)(sent))
+  end
+  local chunk: array(uint8, 65536)
+  -- Bound work per loop; unfinished input wakes the next loop.
+  for turn=1,16 do
+    local n = portal_read(self.fd, &chunk, 65536)
+    if n == -2 then break end
+    if n <= 0 then self.reader:eof() self.ended = true break end
+    if not self.reader:push((@*[0]uint8)(&chunk), (@usize)(n)) then self.ended = true break end
+    while true do
+      local ready, w, h, serial, pixels, size = self.reader:peek()
+      if not ready then break end
+      self.pixels:resize(size)
+      memory.copy(&self.pixels.data[0], pixels, size)
+      self.w, self.h, self.serial = w, h, serial
+      self.reader:consume()
+    end
+    if self.reader.failed then self.ended = true break end
+  end
+end
+function PortalProcess:close(): void
+  if self.active then portal_stop(self.fd, self.pid) end
+  self.reader:destroy()
+  self.output:destroy()
+  self.pixels:destroy()
+  $self = {}
+end
+## end

@@ -19,6 +19,8 @@ local function OpenClipboard(owner: pointer): cint <cimport, nodecl> end
 local function CloseClipboard(): cint <cimport, nodecl> end
 local function EmptyClipboard(): cint <cimport, nodecl> end
 local function SetClipboardData(format: uint32, h: pointer): pointer <cimport, nodecl> end
+local function RegisterClipboardFormatA(name: cstring): uint32 <cimport, nodecl> end
+local function IsClipboardFormatAvailable(format: uint32): cint <cimport, nodecl> end
 local function GetClipboardData(format: uint32): pointer <cimport, nodecl> end
 local function GlobalAlloc(flags: uint32, n: usize): pointer <cimport, nodecl> end
 local function GlobalFree(h: pointer): pointer <cimport, nodecl> end
@@ -119,16 +121,31 @@ local function clip_do_set(data: *[0]uint8, len: usize): boolean
 end
 
 -- The clipboard's text as UTF-8; empty when it holds no text.
-local function clip_do_get(): (boolean, string)
-  if not open_clipboard() then return false, (@string){} end
+local function clip_do_get(metadata: boolean): (boolean, string, uint8)
+  if not open_clipboard() then return false, (@string){}, 0 end
+  local flags: uint8 = 0
+  if metadata then
+    local names: [5]cstring = {'ExcludeClipboardContentFromMonitorProcessing', 'CanIncludeInClipboardHistory', 'CanUploadToCloudClipboard', 'x-kde-passwordManagerHint', 'application/x-nspasteboard-concealed-type'}
+    flags = 1
+    for i=0, <#names do
+      local format = RegisterClipboardFormatA(names[i])
+      if format == 0 then CloseClipboard() return false, (@string){}, 0 end
+      if IsClipboardFormatAvailable(format) ~= 0 then flags = 3 end
+    end
+    if flags == 3 then CloseClipboard() return true, (@string){}, flags end
+  end
   local h = GetClipboardData(CF_UNICODETEXT)
-  if h == nilptr then CloseClipboard() return true, (@string){} end
+  if h == nilptr then CloseClipboard() return not metadata, (@string){}, 0 end
   local w = (@*[0]uint16)(GlobalLock(h))
-  if w == nilptr then CloseClipboard() return true, (@string){} end
+  if w == nilptr then CloseClipboard() return false, (@string){}, 0 end
   local cap = GlobalSize(h) // 2
   local wlen: usize = 0
   while wlen < cap and w[wlen] ~= 0 do wlen = wlen + 1 end
+  if cap == 0 or wlen == cap then
+    GlobalUnlock(h) CloseClipboard() return false, (@string){}, 0
+  end
   local out: string
+  local valid = true
   if wlen > 0 then
     local n = WideCharToMultiByte(CP_UTF8, 0, w, (@cint)(wlen), nilptr, 0, nilptr, nilptr)
     if n > 0 and (@usize)(n) <= AGENT_CLIP_MAX then
@@ -137,11 +154,11 @@ local function clip_do_get(): (boolean, string)
       WideCharToMultiByte(CP_UTF8, 0, w, (@cint)(wlen), (@*[0]cchar)(span.data), n, nilptr, nilptr)
       sb:commit((@usize)(n))
       out = sb:promote()
-    end
+    else valid = false end
   end
   GlobalUnlock(h)
   CloseClipboard()
-  return true, out
+  return valid, out, valid and flags or 0
 end
 
 -- Clipboard calls run on a short-lived thread the loop waits for at most a
@@ -155,6 +172,8 @@ local CLIP_ABANDONED: clong <comptime> = 2
 
 local ClipJob = @record{
   set: boolean,
+  metadata: boolean,
+  sensitivity: uint8,
   data: string,  -- CLIP_SET: a copy of the text
   ok: boolean,
   out: string,   -- CLIP_GET: the text
@@ -172,7 +191,7 @@ local function clip_thread(arg: pointer): uint32
   if job.set then
     job.ok = clip_do_set((@*[0]uint8)(job.data.data), job.data.size)
   else
-    job.ok, job.out = clip_do_get()
+    job.ok, job.out, job.sensitivity = clip_do_get(job.metadata)
   end
   if InterlockedCompareExchange(&job.state, CLIP_DONE, CLIP_PENDING) == CLIP_ABANDONED then free_job(job) end
   return 0
@@ -210,4 +229,15 @@ global function agent_clipboard_get(): (boolean, string)
   job.out = (@string){}
   free_job(job)
   return ok, out
+end
+
+-- Exclusion checks and text belong to the same OpenClipboard interval.
+global function agent_clipboard_get_metadata(): (boolean, string, uint8)
+  local job = new(@ClipJob)
+  job.metadata = true
+  if not clip_run(job) then return false, (@string){}, 0 end
+  local ok, out, flags = job.ok, job.out, job.sensitivity
+  job.out = (@string){}
+  free_job(job)
+  return ok, out, flags
 end

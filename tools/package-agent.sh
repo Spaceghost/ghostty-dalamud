@@ -78,6 +78,13 @@ done < <(git ls-files -z -- agent core compat toolchain.env \
   tools/netlab-flags.sh tools/build-moq-iroh.sh tools/rust-toolchain.sh \
   packaging/ghostty-agent.service packaging/README-agent.md packaging/ghostty-agent.1 packaging/ghostty-voice)
 
+# Portal capture includes a Python runtime helper and newly added native modules.
+# Include them explicitly so a source package from this worktree is buildable.
+for f in tools/portal_capture.py tools/app_notifications.py tools/clipboard_snapshot.c tools/build-clipboard-helper.sh core/notification_cache.nelua agent/notification_process.nelua agent/portal_frames.nelua agent/portal_process.nelua agent/capture_portal.nelua agent/clipboard_policy.nelua agent/clipboard_offer.nelua; do
+  mkdir -p "$DST/$(dirname "$f")"
+  cp -p "$f" "$DST/$f"
+done
+
 # git archive emits tracked files only, so a host-built nelua-lua never travels:
 # `make` would then say "up to date" and the foreign-libc interpreter would fail
 # to exec inside the container.

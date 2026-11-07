@@ -70,6 +70,7 @@ BuildRequires:  cargo
 %if %{with wayland}
 BuildRequires:  pkgconfig(wlroots-0.20)
 BuildRequires:  pkgconfig(wayland-server)
+BuildRequires:  pkgconfig(wayland-client)
 BuildRequires:  pkgconfig(xkbcommon)
 BuildRequires:  pkgconfig(pixman-1)
 BuildRequires:  wayland-protocols-devel
@@ -95,6 +96,8 @@ Suggests:       tmux
 Recommends:     xorg-x11-server-Xwayland
 Recommends:     librsvg2-tools
 Recommends:     xdg-utils
+Recommends:     python3-dbus-next
+Recommends:     dbus-daemon
 Suggests:       ImageMagick
 %endif
 
@@ -142,6 +145,7 @@ CC=gcc JOBS=%{?_smp_build_ncpus} ./tools/build-agent.sh \
 # A silently degraded package would carry none of the sonames that keep it off an
 # older Fedora, so prove the backend really linked.
 readelf -d build/dist/ghostty-agent | grep -q 'libwlroots-0.20\.so'
+bash tools/build-clipboard-helper.sh build/dist/clipboard-snapshot
 %endif
 %if %{with netlab}
 # and that netlab did (the binary is not stripped yet)
@@ -150,6 +154,11 @@ nm build/dist/ghostty-agent | grep -q ' T moqi_node_new$'
 
 %install
 install -Dpm0755 build/dist/ghostty-agent %{buildroot}%{_bindir}/ghostty-agent
+install -Dpm0644 tools/portal_capture.py %{buildroot}%{_libexecdir}/ghostty-agent/portal_capture.py
+%if %{with wayland}
+install -Dpm0755 build/dist/clipboard-snapshot %{buildroot}%{_libexecdir}/ghostty-agent/clipboard-snapshot
+install -Dpm0644 tools/app_notifications.py %{buildroot}%{_libexecdir}/ghostty-agent/app_notifications.py
+%endif
 install -Dpm0755 packaging/ghostty-voice %{buildroot}%{_bindir}/ghostty-voice
 install -Dpm0644 packaging/ghostty-agent.service %{buildroot}%{_userunitdir}/ghostty-agent.service
 install -Dpm0644 packaging/ghostty-agent.1 %{buildroot}%{_mandir}/man1/ghostty-agent.1
@@ -186,5 +195,10 @@ wait "$agent" || true
 %doc README-agent.md
 %{_bindir}/ghostty-agent
 %{_bindir}/ghostty-voice
+%{_libexecdir}/ghostty-agent/portal_capture.py
+%if %{with wayland}
+%{_libexecdir}/ghostty-agent/clipboard-snapshot
+%{_libexecdir}/ghostty-agent/app_notifications.py
+%endif
 %{_userunitdir}/ghostty-agent.service
 %{_mandir}/man1/ghostty-agent.1*

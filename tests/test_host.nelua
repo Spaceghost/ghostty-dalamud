@@ -207,10 +207,11 @@ local function fake_gamepad_down(mask: cint): cint return (pad_bits & mask) ~= 0
 local in_front = true
 local function fake_foreground(): boolean return in_front end
 do
-  assert(policy.toggle_gamepad_mask == 0x4000 and not policy.toggle_gamepad_hid, 'shipped default: select')
+  assert(policy.toggle_gamepad_mask == 0 and not policy.toggle_gamepad_hid, 'shipped default: no controller toggle')
   assert(game_foreground(), 'no foreground check off Windows')
   local have, down, pressed = poll_toggle_pad(1.0, fake_foreground)
   assert(not have and not down and not pressed, 'no gamepad callbacks: nothing')
+  policy.toggle_gamepad_mask = 0x4000 -- opt in to select for the source test
   host.api.gamepad_down = fake_gamepad_down
   pad_bits = 0x4000
   have, down = poll_toggle_pad(1.02, fake_foreground)

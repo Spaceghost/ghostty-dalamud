@@ -1,0 +1,52 @@
+-- Small Lua boundary shared by the shell and teardown. No game pointers or
+-- callback lifetimes escape a call, so the existing core loader can swap it.
+require 'core.policy'
+
+global phone_dispatch: function(arg: string): cint
+
+local function l_phone_command(L: *lua_State): cint
+  local n: usize = 0
+  local arg = lua_tolstring(L, 1, &n)
+  if arg == nilptr or phone_dispatch == nilptr then lua_pushinteger(L, 4) return 1 end
+  lua_pushinteger(L, phone_dispatch(string{ data = (@*[0]byte)(arg), size = n }))
+  return 1
+end
+
+global function phone_lua_register(L: *lua_State): void
+  lua_getglobal(L, 'ghostty')
+  if lua_type(L, -1) == LUA_TTABLE then
+    lua_pushcclosure(L, l_phone_command, 0)
+    lua_setfield(L, -2, 'phone_command')
+  end
+  lua_pop(L, 1)
+end
+
+global function policy_phone_call(op: cstring, arg: string, now: float64, blocked: boolean): cint
+  local L = policy.L
+  if L == nilptr or not policy.loaded then return 0 end
+  local top = lua_gettop(L)
+  defer lua_settop(L, top) end
+  lua_getglobal(L, 'CONFIG')
+  if lua_type(L, -1) ~= LUA_TTABLE then return 0 end
+  lua_getfield(L, -1, 'phone')
+  if lua_type(L, -1) ~= LUA_TTABLE then return 0 end
+  lua_getfield(L, -1, op)
+  if lua_type(L, -1) ~= LUA_TFUNCTION then return 0 end
+  local nargs: cint = 0
+  if (@string)(op) == 'command' then
+    lua_pushlstring(L, (@cstring)(arg.data), #arg)
+    nargs = 1
+  elseif (@string)(op) == 'frame' then
+    lua_pushnumber(L, now)
+    lua_pushboolean(L, blocked and 1 or 0)
+    nargs = 2
+  end
+  if lua_pcall(L, nargs, 1, 0) ~= LUA_OK then
+    local msg = lua_tolstring(L, -1, nilptr)
+    if world_host.log ~= nilptr then
+      if msg ~= nilptr then world_host.log(msg) else world_host.log('phone: Lua hook failed') end
+    end
+    return -1
+  end
+  return (@cint)(lua_tointegerx(L, -1, nilptr))
+end

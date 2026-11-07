@@ -12,6 +12,15 @@ require 'core.lua'
 require 'core.imgui'
 require 'core.ui'
 
+-- Stable draw order with a fullscreen surface above all other world panels.
+-- Invalid/no promoted index leaves the original order unchanged.
+global function world_draw_index(slot: integer, count: integer, promoted: integer): integer
+  if promoted < 0 or promoted >= count then return slot end
+  if slot == count - 1 then return promoted end
+  if slot >= promoted then return slot + 1 end
+  return slot
+end
+
 -- Filled by the shim. Layouts must match GuObject/GuCamera in shim/Native.cs.
 global GuObject = @record{
   x: float32, y: float32, z: float32,

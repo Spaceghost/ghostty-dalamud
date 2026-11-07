@@ -354,9 +354,11 @@ global WinListEntry = @record{
   raise: uint32,              -- "raise:N": a link from an app asked to show it (N counts up per request)
 }
 global WinAppEntry = @record{ agent: string, id: string, name: string, icon: string, categories: string } -- owned
+global WinIconEntry = @record{ agent: string, icon: string, size: integer, png: string }
 global WinList = @record{
   windows: vector(WinListEntry),
   apps: vector(WinAppEntry),
+  icons: vector(WinIconEntry),
   answers: integer,           -- WLISTRs received (a new answer moves it)
 }
 global winlist: WinList
@@ -374,6 +376,8 @@ local function winlist_clear(): void
     a.agent:destroy() a.id:destroy() a.name:destroy() a.icon:destroy() a.categories:destroy()
   end
   winlist.apps:clear()
+  for i = 0, < #winlist.icons do winlist.icons[i].agent:destroy() winlist.icons[i].icon:destroy() winlist.icons[i].png:destroy() end
+  winlist.icons:clear()
 end
 
 -- A decimal number (no sign), or false.
@@ -420,6 +424,7 @@ global function winlist_parse(agent: string, data: *[0]uint8, len: usize): boole
   local windows: vector(WinListEntry)
   local apps: vector(WinAppEntry)
   local app_lines = 0
+  local icon_lines = 0
   local cols: vector(string)
   local start: usize = 0
   for pos: usize = 0, <= len do
@@ -427,7 +432,29 @@ global function winlist_parse(agent: string, data: *[0]uint8, len: usize): boole
       if pos > start then
         split_tabs(string{data=(@*[0]byte)(&data[start]), size=pos-start}, &cols)
         local kind: string = #cols > 0 and cols[0] or ''
-        if kind == 'app' or kind == 'term' or kind == 'desktop' then
+        if kind == 'icons' or kind == 'icon' then
+          icon_lines = icon_lines + 1
+          if kind == 'icon' and #cols == 4 then
+            local valid, pixels = parse_count(cols[2])
+            if valid and pixels >= 16 and pixels <= 512 and #cols[1] > 0 and #cols[1] <= 1024 and #cols[3] <= 4096 then
+              -- Keep other batches; update the matching icon/size instead of app rows.
+              local found = false
+              for k = 0, < #winlist.icons do
+                local entry = &winlist.icons[k]
+                if entry.agent == agent and entry.icon == cols[1] and entry.size == pixels then
+                  entry.png:destroy() entry.png = cols[3]:copy() found = true break
+                end
+              end
+              if not found then
+                if #winlist.icons >= 512 then
+                  winlist.icons[0].agent:destroy() winlist.icons[0].icon:destroy() winlist.icons[0].png:destroy()
+                  winlist.icons:remove(0)
+                end
+                winlist.icons:push(WinIconEntry{agent=agent:copy(), icon=cols[1]:copy(), size=pixels, png=cols[3]:copy()})
+              end
+            end
+          end
+        elseif kind == 'app' or kind == 'term' or kind == 'desktop' then
           app_lines = app_lines + 1
           if kind == 'app' and #cols >= 3 then -- terminal apps and nested desktops: not shown yet
             local a: WinAppEntry = { agent = agent:copy(), id = cols[1]:copy(), name = cols[2]:copy() }
@@ -465,6 +492,16 @@ global function winlist_parse(agent: string, data: *[0]uint8, len: usize): boole
     end
   end
   cols:destroy()
+  if icon_lines > 0 then
+    for i = 0, < #windows do
+      windows[i].agent:destroy() windows[i].app:destroy() windows[i].title:destroy() windows[i].key:destroy()
+      for k = 0, < #windows[i].extra do windows[i].extra[k]:destroy() end
+      windows[i].extra:destroy()
+    end
+    for i = 0, < #apps do apps[i].agent:destroy() apps[i].id:destroy() apps[i].name:destroy() apps[i].icon:destroy() apps[i].categories:destroy() end
+    windows:destroy() apps:destroy()
+    return true -- metadata-only: never replace windows or launchable apps
+  end
   local apps_answer = app_lines > 0 and #windows == 0
   -- Replace this link's rows, keep every other link's. The rows of other links
   -- move across untouched (no copy, no free); only this link's old rows are
@@ -810,7 +847,8 @@ global function remotewin_event(link: *AgentLink, ev: *AgentEvent): void
     rw.s.title:destroy()
     rw.s.title = text:copy()
     panel_text(rw.s, 'waiting for the first frame of ', text)
-    sayf(LOG_INFO, 'window %d: stream %d opened: %s (%dx%d)', rw.s.id, ev.id, text, ev.w, ev.h)
+    sayf(LOG_INFO, 'window %d: stream %d opened: %s (%dx%d)', rw.s.id, ev.id, text,
+      (@integer)(ev.w), (@integer)(ev.h))
     never_sweep() -- a match text found a window that is kept out
     -- its key comes from the agent's list (learn_keys); new windows wait for
     -- that list too (in it the window carries our sid)
@@ -1214,6 +1252,24 @@ global function window_list(out: *vector(WindowInfo)): void
       agent = 'default', key = winlist_key(rw),
     })
   end
+end
+
+global function window_clipboard_agent(): (*AgentClient, string) return agent_for('') end
+
+global function window_agent_icons(pixels: integer, names: string): (boolean, string)
+  if pixels < 16 or pixels > 512 or #names > 65600 then return false, 'invalid icon request' end
+  local agent, err = agent_for('')
+  if agent == nilptr then return false, err end
+  if not agent:wlist_icons(pixels, names) then return false, 'agent does not support window requests' end
+  return true, ''
+end
+
+global function window_agent_list_sized(pixels: integer): (boolean, string)
+  if pixels < 16 or pixels > 512 then return false, 'icon size must be 16..512' end
+  local agent, err = agent_for('')
+  if agent == nilptr then return false, err end
+  agent:wlist_apps_size(pixels)
+  return true, ''
 end
 
 -- Ask the agent for its window list (answered in the log, WLISTR).

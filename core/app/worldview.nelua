@@ -17,6 +17,7 @@ require 'core.app.resize'
 require 'core.app.cursor'
 require 'core.depthpass'
 require 'core.tooltip'
+require 'core.phone'
 
 -- World panels ------------------------------------------------------------------
 -- The camera DirH that looks along (dx, dz): DirH is calibrated against the
@@ -328,6 +329,7 @@ end
 -- boards, the desk scene's furniture, the character animation, the walk and the head aim. gu_shutdown,
 -- /term reload and the kill switch all do this.
 global function teardown_effects(): void
+  policy_phone_call('reset', '', 0, true)
   lights_destroy_all()
   occluders_destroy_all()
   local anim_err = policy_anim_toggle(false)
@@ -539,6 +541,14 @@ end
 local cam_written_h: float32 = 0 -- heading written last frame
 local cam_written = false
 local function camera_tick(wdt: float32): void
+  -- Area transitions replace the game's camera. A saved panel zoom belongs
+  -- to the old scene and must not animate either the loading screen or arrival.
+  if host.api.scene_flags ~= nilptr and host.api.scene_flags() & 4 ~= 0 then
+    host.cam_active, host.cam_restore = false, false
+    host.cam_saved_d = 0
+    cam_written = false
+    return
+  end
   if not host.cam_active then cam_written = false end
   -- leaving full screen after a double-click: give the camera its zoom back
   if host.world_full_id == 0 and host.cam_saved_d > 0 and not host.cam_restore then
@@ -869,7 +879,18 @@ global function draw_world(now: float64): void
   local look_on = false
   local look_x: float32, look_y: float32, look_z: float32 = 0, 0, 0
   host.world_hover, host.world_hover_now = host.world_hover_now, 0
-  for i = 0, < #host.world do
+  -- A world terminal promoted to fullscreen is UI, not another world surface.
+  -- Paint it last (including its return animation), without changing saved
+  -- session/pet order. Otherwise later sessions paint through it.
+  local promoted = -1
+  local promoted_id = host.world_full_id ~= 0 and host.world_full_id or host.world_full_last
+  if host.world_full_t > 0 then
+    for i = 0, < #host.world do
+      if host.world[i].id == promoted_id then promoted = i break end
+    end
+  end
+  for draw_index = 0, < #host.world do
+    local i = world_draw_index(draw_index, #host.world, promoted)
     local s = host.world[i]
     -- each panel glitches in when it appears or wakes, and out before it closes
     local appear_target: float32 = s.leaving and 0 or 1

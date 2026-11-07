@@ -1,0 +1,83 @@
+require 'core.agent_client'
+## cinclude '<sys/socket.h>'
+## cinclude '<fcntl.h>'
+local function socketpair(domain: cint, typ: cint, protocol: cint, fds: *[2]cint): cint <cimport, nodecl> end
+local function fcntl(fd: cint, cmd: cint, ...: cvarargs): cint <cimport, nodecl> end
+local AF_UNIX: cint <cimport, nodecl, const>
+local SOCK_STREAM: cint <cimport, nodecl, const>
+local F_GETFL: cint <cimport, nodecl, const>
+local F_SETFL: cint <cimport, nodecl, const>
+local O_NONBLOCK: cint <cimport, nodecl, const>
+local reply_req: uint32
+local reply_status: int32
+local write_ack: uint32
+local known, sensitive: boolean
+local reply_length: usize
+local function receive(ctx: pointer, ev: *AgentEvent): void
+  if ev.typ == PROTO_OK then write_ack = ev.req end
+  if ev.typ == PROTO_CLIP then
+    reply_req, reply_status = ev.req, ev.status
+    known, sensitive, reply_length = ev.sensitivity_known, ev.sensitive, ev.len
+  end
+end
+local client: AgentClient
+client.state = AgentState.Ready
+client.on_event = receive
+client:clip_set('copy')
+client:clip_get_for(42)
+client:clip_get()
+assert(#client.clip_fifo == 3)
+assert(client.clip_fifo[0].kind == PROTO_CLIP_SET and client.clip_fifo[0].req == 0)
+assert(client.clip_fifo[1].kind == PROTO_CLIP_GET and client.clip_fifo[1].req == 42)
+assert(client.clip_fifo[2].req == 0)
+client.clip_off = true
+client:clip_get_for(99)
+assert(reply_req == 99 and reply_status == -1)
+client:clip_get()
+assert(reply_req == 0 and reply_status == -1)
+client:destroy()
+local fds: [2]cint
+assert(socketpair(AF_UNIX, SOCK_STREAM, 0, &fds) == 0)
+fcntl(fds[0], F_SETFL, fcntl(fds[0], F_GETFL, 0) | O_NONBLOCK)
+local live: AgentClient
+live.sock = fds[0]
+live.state = AgentState.Ready
+live.on_event = receive
+live:clip_get_for(101)
+local denied = 'not permitted: this peer may not read the clipboard'
+proto.write_frame(&live.inq, PROTO_ERR, (@*[0]uint8)(denied.data), denied.size)
+live:pump(0)
+assert(reply_req == 101 and reply_status == -1 and #live.clip_fifo == 0)
+live:clip_set('copy')
+local denied_write = 'not permitted: this peer may not set the clipboard'
+proto.write_frame(&live.inq, PROTO_ERR, (@*[0]uint8)(denied_write.data), denied_write.size)
+live:pump(0)
+assert(#live.clip_fifo == 0)
+live:clip_get_for(102)
+local copied = 'notes'
+proto.write_frame(&live.inq, PROTO_CLIP, (@*[0]uint8)(copied.data), copied.size)
+live:pump(0)
+assert(reply_req == 102 and reply_status == 0 and #live.clip_fifo == 0)
+live:clip_set_for(103, 'text')
+local ack = 'clipboard set'
+proto.write_frame(&live.inq, PROTO_OK, (@*[0]uint8)(ack.data), ack.size)
+live:pump(0)
+assert(write_ack == 103 and #live.clip_fifo == 0)
+live:clip_get_for(104)
+local safe = '\1notes'
+proto.write_frame(&live.inq, PROTO_CLIP_META, (@*[0]uint8)(safe.data), safe.size)
+live:pump(0)
+assert(reply_req == 104 and known and not sensitive and reply_length == 5)
+live:clip_get_for(105)
+local secret = '\3private'
+proto.write_frame(&live.inq, PROTO_CLIP_META, (@*[0]uint8)(secret.data), secret.size)
+live:pump(0)
+assert(reply_req == 105 and known and sensitive and reply_length == 0)
+live:clip_get_for(106)
+local malformed = '\4invalid'
+proto.write_frame(&live.inq, PROTO_CLIP_META, (@*[0]uint8)(malformed.data), malformed.size)
+live:pump(0)
+assert(reply_req == 106 and reply_status == -1 and reply_length == 0)
+live:destroy()
+net.close(fds[1])
+print('clipboard request correlation and denied replies OK')

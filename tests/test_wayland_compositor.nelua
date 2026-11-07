@@ -433,10 +433,16 @@ do
   f:close()
   setenv('XDG_DATA_HOME', (@cstring)(home.data), 1)
   local l = be.apps()
-  local want = 'app\tghostty-test-yad\tGhostty Test Viewer\t' .. cache .. '/ghostty-agent/icons/ghostty-test-yad-128.png\tUtility;\n'
-  check(l:find(want, 1, true) > 0, 'the made-up app listed with its icon path')
+  local prefix = 'app\tghostty-test-yad\tGhostty Test Viewer\t'
+  local start = l:find(prefix, 1, true)
+  check(start > 0, 'the made-up app listed: ' .. l)
+  local path_start = start + #prefix
+  local path_end = l:find('\t', path_start, true)
+  check(path_end > path_start, 'the app has an icon path')
+  local png = l:sub(path_start, path_end - 1)
+  check(png:find(cache .. '/ghostty-agent/icons/ghostty-test-yad-128-', 1, true) == 1 and png:sub(-4) == '.png', 'the app uses its versioned cached icon: ' .. png)
+  check(l:sub(path_end, path_end + 9) == '\tUtility;\n', 'the app retains its categories')
   l:destroy()
-  local png = cache .. '/ghostty-agent/icons/ghostty-test-yad-128.png'
   local t1 = os.now()
   while access((@cstring)(png.data), 0) ~= 0 and os.now() - t1 < 10 do turn(50) end
   check(access((@cstring)(png.data), 0) == 0, 'the icon was cached as ' .. png)
@@ -543,11 +549,100 @@ do
     end
     local t2 = os.now()
     while host_sets == sets0 and os.now() - t2 < 3 do turn(20) end
+    local snapshot_ok, snapshot_text, snapshot_flags = capture_wayland_clipboard_snapshot()
+    check(snapshot_ok and snapshot_flags == 1 and snapshot_text == 'copied in the app ✓', 'metadata belongs to the current copied source')
+    snapshot_text:destroy()
     e = { kind = WIN_INPUT_TEXT, text = '\n' }
     be.input(h, &e)
   end)
   print('host clipboard after the copy: ' .. host_clip)
   check(host_clip == 'copied in the app ✓', 'the app\'s copy reached the host clipboard')
+  local available, stale_text, stale_flags = capture_wayland_clipboard_snapshot()
+  check(not available and #stale_text == 0 and stale_flags == 0, 'closing the source invalidates clipboard metadata')
+  stale_text:destroy()
+end
+
+-- A real GTK source advertises text and, optionally, a concealed-data MIME.
+-- The safe control proves the get callback/log are live; sensitive offers must
+-- never invoke that callback or change the host clipboard.
+do
+  local modes: [4]string = {'safe', 'sensitive', 'empty', 'oversized'}
+  for index = 0, < #modes do
+    local mode = modes[index]
+    local log = outdir .. '/clipboard-offer-' .. mode .. '.txt'
+    os.execute("rm -f '" .. log .. "'")
+    local command = "run:python3 '" .. os.getenv('PWD') .. "/tests/fixtures/clipboard_offer.py' '" .. log .. "' " .. mode
+    local h, err = be.open(0, command)
+    check(h ~= nilptr, 'clipboard offer client: ' .. err)
+    local state, why = wait_live(h, 30)
+    check(state == CAPTURE_LIVE, 'clipboard offer mapped: ' .. why)
+    run_for(0.5)
+    local before = host_sets
+    local e: CaptureInput = { kind = WIN_INPUT_TEXT, text = '\n' }
+    be.input(h, &e)
+    local deadline = os.now() + 3
+    local available: boolean
+    local text: string
+    local flags: uint8
+    repeat
+      turn(20)
+      available, text, flags = capture_wayland_clipboard_snapshot()
+      if available then break end
+      text:destroy()
+    until os.now() >= deadline
+    if mode == 'oversized' then
+      check(not available and #text == 0 and flags == 0 and host_sets == before, 'oversized text stays unavailable and is not forwarded')
+    elseif mode ~= 'sensitive' then
+      local expected = mode == 'empty' and '' or 'fixture clipboard text'
+      check(available and flags == 1 and text == expected and host_sets > before and host_clip == expected, 'safe offer read and forwarded, including empty text')
+    else
+      check(available and flags == 3 and #text == 0 and host_sets == before, 'sensitive offer has no text or host write')
+    end
+    text:destroy()
+    run_for(0.2)
+    local file = io.open(log, 'rb')
+    check(file:isopen(), 'clipboard offer activity log exists')
+    local activity = file:read('a')
+    file:close()
+    check(activity:find('published:1', 1, true) > 0, 'GTK accepted the offer')
+    local requested = activity:find('requested:', 1, true) > 0
+    check(requested == (mode ~= 'sensitive'), 'only safe source data was requested: ' .. activity)
+    activity:destroy()
+    be.close(h)
+    run_for(0.3)
+  end
+end
+
+-- A launched app uses the compositor's new private notification bus. Its
+-- event returns through the native helper socket, not the user's desktop bus.
+do
+  local marker = outdir .. '/notification-client.txt'
+  os.execute("rm -f '" .. marker .. "'")
+  local command = "run:python3 '" .. os.getenv('PWD') .. "/tests/fixtures/notify_client.py' '" .. marker .. "'"
+  local h, err = be.open(0, command)
+  check(h ~= nilptr, 'notification app launched: ' .. err)
+  local deadline = os.now() + 5
+  local event: string
+  repeat
+    turn(20)
+    event = capture_wayland_notification_pop()
+    if #event > 0 then break end
+  until os.now() >= deadline
+  check(event:find('"summary":"Synthetic compositor message"', 1, true) > 0, 'launched app notification reaches native compositor')
+  check(event:find('"desktop_entry":"fixture.desktop"', 1, true) > 0, 'notification retains app identity')
+  event:destroy()
+  local result: string
+  deadline = os.now() + 3
+  repeat
+    turn(20)
+    local file = io.open(marker, 'rb')
+    if file:isopen() then result = file:read('a') file:close() end
+    if #result > 0 then break end
+  until os.now() >= deadline
+  check(#result > 0, 'notification client completed')
+  check(result:sub(1,5) == 'unix:', 'app received private bus address')
+  result:destroy()
+  be.close(h)
 end
 
 -- an open by match that never shows up times out as pending; not waited
@@ -566,4 +661,7 @@ while st == CAPTURE_PENDING and os.now() - t0 < 5 do turn(50) st, sw = be.state(
 check(st == CAPTURE_ENDED and sw:find('status 3', 1, true) > 0, 'exit status: ' .. sw)
 be.close(h3)
 capture_wayland_shutdown()
+local available, stale_text, stale_flags = capture_wayland_clipboard_snapshot()
+check(not available and #stale_text == 0 and stale_flags == 0, 'shutdown invalidates clipboard metadata')
+stale_text:destroy()
 print('wayland compositor OK')

@@ -1,0 +1,28 @@
+require 'agent.capture'
+local function usleep(usec: cuint): cint <cimport, nodecl> end
+local ok, backend, why = capture_select('portal')
+assert(ok, why)
+local refused, reason = backend.open(12, '')
+assert(refused == nilptr and #reason > 0)
+reason:destroy()
+local handle, err = backend.open(0, 'portal:')
+assert(handle ~= nilptr, err)
+err:destroy()
+local state, _ = backend.state(handle)
+assert(state == CAPTURE_PENDING)
+local input: CaptureInput = {kind = WIN_INPUT_BUTTON, x = 10, y = 20, button = 1, down = true}
+backend.input(handle, &input)
+local frame: CaptureFrame
+for i=1,5000 do
+  backend.pump()
+  if backend.frame(handle, &frame) then break end
+  usleep(1000)
+end
+assert(frame.w == 1 and frame.h == 1 and frame.stride == 4 and frame.serial == 1)
+assert(frame.pixels[0] == 80 and frame.pixels[3] == 83)
+local live, _ = backend.state(handle)
+assert(live == CAPTURE_LIVE)
+backend.close(handle)
+local fds: array(cint, 4)
+assert(backend.poll_fds((@*[0]cint)(&fds), 4) == 0 and backend.wait_ms() == -1)
+print('portal input transport OK')

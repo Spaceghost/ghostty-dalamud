@@ -80,6 +80,8 @@ echo "--- python suites (portability, identity tooling)"
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests -p 'test_*.py'
 echo "--- test_defaults (shipped per-platform policy)"
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_defaults.lua
+"$ROOT/vendor/nelua-lang/nelua-lua" tests/test_phone.lua
+"$ROOT/vendor/nelua-lang/nelua-lua" tests/test_plate_placement.lua "$ROOT"
 echo "--- test_world_spread (panels keeping off each other on screen)"
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_world_spread.lua
 echo "--- test_motion (springs, bob and squash, pets keeping off walls, panels and characters)"
@@ -93,6 +95,7 @@ echo "--- test_agenthosts (private host overlay and pairing line)"
 if [[ "${SKIP_SHIM:-0}" != 1 ]] && command -v dotnet >/dev/null; then
   echo "--- native cache isolation (C#, no game)"
   DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 dotnet run --project tests/cache/CacheTests.csproj -c Release
+  DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1 dotnet run --project tests/phone-input/PhoneInputTests.csproj -c Release
 else
   echo "--- native cache isolation skipped (no dotnet, or SKIP_SHIM=1)"
 fi
@@ -110,6 +113,15 @@ run test_wg_config "$ROOT/build/test-scratch/wg" # wireguard.conf, and a live se
 run test_pngenc
 run test_capture
 run test_capture_win32
+run test_clipboard_requests
+run test_clipboard_offer
+run test_clipboard_policy
+run test_clipboard_helper "$ROOT/tests/fixtures/clipboard_snapshot_reply.py"
+run test_notification_cache
+run test_portal_frames # private host portal helper framing
+run test_portal_process "$ROOT/tests/portal_process_fixture.py"
+GHOSTTY_PORTAL_HELPER="$ROOT/tests/portal_process_fixture.py" GHOSTTY_PORTAL_FIXTURE_HOLD=1 run test_capture_portal
+GHOSTTY_PORTAL_HELPER="$ROOT/tests/portal_input_fixture.py" GHOSTTY_PORTAL_INPUT=1 run test_portal_input
 # shellcheck source=tools/wayland-flags.sh
 source "$ROOT/tools/wayland-flags.sh" # the agent's Wayland compositor, when vendor/wayland-sdk is there
 # shellcheck source=tools/netlab-flags.sh
@@ -138,6 +150,7 @@ run test_worldpanel "$ROOT"
 run test_fullflight
 run test_worlddrag "$ROOT"
 run test_worldhud "$ROOT"
+run test_phone
 run test_remotewin "$ROOT"
 run test_adopt "$ROOT" "$ROOT/build/test-scratch"
 run test_hudmask
@@ -224,6 +237,8 @@ trap 'kill $AGENT $WAGENT 2>/dev/null || true' EXIT
 wait_port "$WPORT" "$WAGENT" || { cat build/agent-windows.log; exit 1; }
 # the first agent runs --windows off: window requests are refused with the reason
 "${SAN_PREFIX[@]}" "$NCACHE"/test_agent_windows "$WPORT" testtoken123 "$PORT"
+"$NELUA" --cc "$CC" -P nogc --cache-dir "$NCACHE" -L . -b tests/test_agent_portal.nelua
+GHOSTTY_PORTAL_TEST_AGENT="$ROOT/build/ghostty-agent$SAN_SUFFIX" python3 tools/test-portal-agent.py
 
 echo "--- test_netlab_agent"
 "$NELUA" --cc "$CC" -P nogc --cache-dir "$NCACHE" -L . -b tests/test_netlab_agent.nelua

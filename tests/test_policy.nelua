@@ -15,10 +15,10 @@ assert(policy.dropdown.rounding == 8 and policy.dropdown.margin == 12 and not po
 assert(policy.popup_rounding == 6)
 assert(policy.copy_on_select, 'copy_on_select defaults on')
 assert(policy.dropdown.width == 0.5 and policy.dropdown.min_width == 1200 and policy.dropdown.align == 'center')
-assert(policy.toggle_gamepad_mask == 0x4000, 'select -> GamepadButtons.Select')
+assert(policy.toggle_gamepad_mask == 0, 'no controller toggle by default')
 assert(policy.toggle_ctrl and not policy.toggle_shift and not policy.toggle_alt, 'toggle is ctrl+grave')
 assert(policy_gamepad_mask('start') == 0x8000 and policy_gamepad_mask('l1') == 0x100 and policy_gamepad_mask('nope') == 0)
-assert(policy.controller.enabled and policy.controller.capture and policy.controller.layout == 'terminal')
+assert(not policy.controller.enabled and policy.controller.layout == 'terminal')
 assert(#policy.controller.bindings >= 14, 'default focused-terminal controller mapping')
 assert(policy.controller.bindings[0].mask == 1 and policy.controller.bindings[0].action == 'key:up'
   and policy.controller.bindings[0].repeatable, 'dpad up maps to a repeating terminal key')

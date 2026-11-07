@@ -1,10 +1,10 @@
 {
   "Author": "Johnneylee Jack Rollins",
-  "Name": "Ghostty",
+  "Name": "Tomestone · Ghostty",
   "InternalName": "GhosttyDalamud",
-  "AssemblyVersion": "0.3.1.13",
-  "Punchline": "Eorzea is a terminal multiplexer.",
-  "Description": "Developer preview. A Quake-style dropdown, floating windows and terminals pinned in the world, connected to shells on your own machine through ghostty-agent, or to local ConPTY on Windows. /term to toggle. Works with or without Umbra; with Umbra, the Ghostty toolbar widget shows its status and a popup terminal. Target-platform and in-game verification are still in progress.",
+  "AssemblyVersion": "0.4.0.0",
+  "Punchline": "A phone for your non-combat interface.",
+  "Description": "Developer preview. One plugin hosts a Nelua/Lua phone shell with Journal, Character, Inventory, Workshop, Correspondence, Grimoire and Ghostty terminals. /phone summons its world projections; /phone hud phases the focused panel onto the HUD. Combat HUD modules are excluded. Native chat is suppressed; combat Enter focuses Grimoire. Lua edits reload automatically. Disable separate copies of the embedded plugins before loading. Some native UI workflows still need adapters and in-game validation.",
   "RepoUrl": "https://github.com/Spaceghost/ghostty-dalamud",
   "ApplicableVersion": "any",
   "DalamudApiLevel": 15,
@@ -14,6 +14,6 @@
   "LoadRequiredState": 0,
   "LoadSync": false,
   "LoadPriority": 0,
-  "CanUnloadAsync": false,
+  "CanUnloadAsync": true,
   "AcceptsFeedback": false
 }

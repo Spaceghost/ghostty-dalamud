@@ -104,8 +104,8 @@ end
 
 -- Give the view back at once, without easing: teardown and the blocked cases,
 -- where easing something that is about to stop drawing is worse than a jump.
-local function drop_view(): void
-  if steering and can_steer() and saved_d > 0 then
+local function drop_view(restore: boolean): void
+  if restore and steering and can_steer() and saved_d > 0 then
     host.api.set_camera_state(saved_h, saved_v, saved_d)
   end
   steering, giving_back, saved_d = false, false, 0
@@ -120,7 +120,7 @@ global function lakitu_destroy_all(): void
 end
 
 global function lakitu_teardown(): void
-  drop_view()
+  drop_view(true)
   lakitu_destroy_all()
   lakitu_off()
   lakitu_block = 0
@@ -275,7 +275,8 @@ global function lakitu_sync(now: float64): void
     if lakitu_shot.stage ~= LAKITU_SHOT_IDLE then
       shot_finish(false, nilptr, 'the camera was put away before the shot')
     end
-    if steering or giving_back then drop_view() end
+    -- A saved view belongs to the old scene, not its loading screen or arrival.
+    if steering or giving_back then drop_view((lakitu_block & (4 | LAKITU_BLOCK_NO_CHARACTER)) == 0) end
     if obj ~= nilptr then obj_free() end
     az_live = false
     lakitu_live = {}
@@ -289,7 +290,11 @@ global function lakitu_sync(now: float64): void
     az_live = false
     lakitu_live = {}
   end
-  if territory ~= 0 and pc.territory ~= territory then obj_free() end
+  if territory ~= 0 and pc.territory ~= territory then
+    obj_free()
+    drop_view(false)
+    az_live = false
+  end
   territory = pc.territory
 
   -- Where the camera wants to be: an azimuth around the character, turning

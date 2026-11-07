@@ -1,0 +1,31 @@
+-- Exercise the actual Lua boundary, including errors and repeated reloads.
+require 'core.phone'
+require 'string'
+
+for i = 1, 3 do
+  assert(policy_load('.'))
+  local top = lua_gettop(policy.L)
+  assert(policy_phone_call('frame', '', 0, false) == 1)
+  assert(policy_phone_call('command', 'open', 0, false) == 0)
+  -- Disable game pose calls: this test embeds no game services.
+  assert(luaL_loadstring(policy.L, 'CONFIG.phone.pose = false') == LUA_OK)
+  assert(lua_pcall(policy.L, 0, 0, 0) == LUA_OK)
+  assert(policy_phone_call('frame', '', 0, false) == 2)
+  assert(policy_phone_call('frame', '', 1, true) == 1)
+  assert(policy_phone_call('command', 'invalid', 0, false) == -1)
+  assert(policy_phone_call('reset', '', 0, false) == 0)
+  assert(lua_gettop(policy.L) == top, 'all success and error paths restore the Lua stack')
+  policy_unload()
+end
+assert(policy_load('.'))
+local live = policy.L
+local ok, err = policy_prepare_dirs('/missing-phone-test-root', '/missing-phone-test-root', '', 'test')
+assert(not ok and #err > 0 and policy.loaded and policy.L == live, 'a failed reload retains the live VM')
+err:destroy()
+ok, err = policy_prepare_dirs('.', '.', '', 'test')
+assert(ok and policy.L == live, 'preparing a valid reload does not replace the live policy yet')
+err:destroy()
+assert(policy_commit_prepared() and policy.loaded and policy.L ~= live, 'commit installs the prepared policy')
+assert(not policy_commit_prepared(), 'prepared policies can only be committed once')
+policy_unload()
+print('phone Lua boundary OK')

@@ -13,6 +13,7 @@ require 'core.input'
 require 'core.policy'
 require 'core.session'
 require 'core.agent_client'
+require 'core.notification_cache'
 require 'core.world'
 require 'core.depthpass'
 require 'core.hudmask'
@@ -160,10 +161,6 @@ global GuHostApi = @record{
   -- ghostty.raycast falls back to `raycast`
   raycast_mode: function(ox: float32, oy: float32, oz: float32, dx: float32, dy: float32, dz: float32,
                          max: float32, mode: cint, hx: *float32, hy: *float32, hz: *float32): cint,
-  -- Dalamud IGamepadState.EnableGamepadNav: -1 query, 0 off, 1 on. Unlike
-  -- changing ImGui ConfigFlags directly, this activates the detour that keeps
-  -- both analogue sticks and buttons out of FFXIV. nilptr in older shims.
-  gamepad_nav: function(enabled: cint): cint,
   -- what your character is casting: action id, seconds in, seconds long; 0
   -- when not casting. nilptr in older shims: pets do not follow a teleport in
   cast_info: function(action: *uint32, current: *float32, total: *float32): cint,
@@ -259,6 +256,16 @@ global Host = @record{
   walk: WorldWalk,                  -- walking up to the clicked panel
   walk_time: float64,
   walk_user_moved: boolean,         -- the game's walk input saw the player steering
+  clipboard_request: uint32,
+  notifications: NotificationCache,
+  clipboard_pending: uint32,
+  clipboard_text: string,
+  clipboard_status: int32,
+  clipboard_writing: boolean,
+  clipboard_sensitivity_known: boolean,
+  clipboard_sensitive: boolean,
+  clipboard_started: float64,
+  clipboard_client: *AgentClient,
   paste_target: integer,            -- session waiting for the system clipboard (agent CLIP reply)
   paste_agent: *AgentClient,        -- link whose CLIP reply paste_target awaits
   -- /term bell demo: steps through the bell styles
@@ -313,8 +320,6 @@ global Host = @record{
   dualsense: DualSenseReader,       -- toggle_gamepad_button = 'create': the controller read over HID
   controller_buttons: [16]ControllerRepeat, -- focused-terminal mapped buttons
   controller_frame: cint,          -- last frame mappings were polled (a gap resets them)
-  controller_capture_owned: boolean, -- this core set ImGui's gamepad capture flag
-  controller_mouse_nav_suppressed: boolean, -- restore a pre-existing gamepad-moves-mouse flag after capture
   select_idx: integer,
   -- raw mouse buttons (Dalamud only forwards clicks to ImGui while it wants the mouse)
   lmb_down: boolean, rmb_down: boolean,

@@ -1,0 +1,10 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net10.0</TargetFramework><ImplicitUsings>enable</ImplicitUsings><Nullable>enable</Nullable></PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../shim/GhosttyDalamud/PhoneModules/Imported/Grimoire/CombatEnterCapture.cs" Link="CombatEnterCapture.cs" />
+    <Compile Include="../../shim/GhosttyDalamud/PhoneModules/Imported/Grimoire/ChatVisibilityLease.cs" Link="ChatVisibilityLease.cs" />
+    <Compile Include="../../shim/GhosttyDalamud/PhoneModules/Imported/Grimoire/SpellWeave.cs" Link="SpellWeave.cs" />
+    <Compile Include="../../shim/GhosttyDalamud/PhoneModules/Imported/Grimoire/BackspaceGesture.cs" Link="BackspaceGesture.cs" />
+    <Reference Include="System.Reflection.MetadataLoadContext"><HintPath>../../vendor/dalamud/System.Reflection.MetadataLoadContext.dll</HintPath><Private>true</Private></Reference>
+  </ItemGroup>
+</Project>

@@ -32,7 +32,6 @@ S.schema = {
     { 'toggle_gamepad_button', 'combo', PAD, 'Controller button (tap / hold / double tap; create, ps = DualSense over HID)' },
     { 'controller.enabled', 'checkbox', 'Controller input in a focused terminal' },
     { 'controller.layout', 'combo', controllers.order, 'Controller layout (custom uses controller.mapping)' },
-    { 'controller.capture', 'checkbox', 'Keep controller input out of the game while focused (never moves the mouse)' },
     { 'touchpad_keys', 'checkbox', 'DualSense touchpad types into a focused terminal (create or ps)' },
     { 'voice_mic', 'mic', 'Voice input listens to' },
   } },

@@ -1,0 +1,43 @@
+require 'agent.portal_frames'
+local frame: array(uint8, 28)
+frame[0], frame[1], frame[2], frame[3] = 80, 71, 70, 49
+proto.put_u32((@*[0]uint8)(&frame[4]), 1)
+proto.put_u32((@*[0]uint8)(&frame[8]), 1)
+proto.put_u64((@*[0]uint8)(&frame[12]), 17)
+proto.put_u32((@*[0]uint8)(&frame[20]), 4)
+frame[24], frame[25], frame[26], frame[27] = 66, 71, 82, 65
+local reader: PortalFrameReader
+for i=0,27 do
+  assert(reader:push((@*[0]uint8)(&frame[i]), 1))
+  local ready, w, h, serial, pixels, size = reader:peek()
+  assert(ready == (i == 27))
+  if ready then assert(w == 1 and h == 1 and serial == 17 and size == 4 and pixels[0] == 66 and pixels[3] == 65) end
+end
+assert(reader:consume() and reader:eof())
+assert(reader:push((@*[0]uint8)(&frame[0]), 28))
+reader:peek()
+assert(reader.failed, 'replayed serial refused')
+reader:destroy()
+local bad: PortalFrameReader
+frame[0] = 0
+assert(bad:push((@*[0]uint8)(&frame[0]), 24))
+bad:peek()
+assert(bad.failed and not bad:eof())
+bad:destroy()
+local partial: PortalFrameReader
+assert(partial:push((@*[0]uint8)(&frame[0]), 3))
+assert(not partial:eof(), 'partial frame EOF is failure')
+partial:destroy()
+frame[0] = 80
+for scenario=1,4 do
+  proto.put_u32((@*[0]uint8)(&frame[4]), scenario == 1 and 8193 or 1)
+  proto.put_u32((@*[0]uint8)(&frame[8]), scenario == 2 and 0 or 1)
+  proto.put_u64((@*[0]uint8)(&frame[12]), scenario == 3 and 0 or 18)
+  proto.put_u32((@*[0]uint8)(&frame[20]), scenario == 4 and 4294967295 or 4)
+  local invalid: PortalFrameReader
+  assert(invalid:push((@*[0]uint8)(&frame[0]), 24))
+  invalid:peek()
+  assert(invalid.failed and invalid.queue:len() == 24, 'invalid header does not allocate its advertised payload')
+  invalid:destroy()
+end
+print('portal frames OK')

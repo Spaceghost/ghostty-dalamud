@@ -1,0 +1,150 @@
+-- Experimental Linux host window capture with opt-in portal input forwarding.
+require 'agent.portal_process'
+require 'os'
+require 'vector'
+local function access(path: cstring, mode: cint): cint <cimport, nodecl> end
+local portal_helper: string
+local portal_input_enabled: boolean
+local PortalHandle = @record{ process: PortalProcess, wid: uint32, refs: integer, expires: float64 }
+local portal_handles: vector(*PortalHandle)
+local portal_next_id: uint32
+local portal_list_generation: uint64
+local function portal_wid(h: pointer): uint32 return (@*PortalHandle)(h).wid end
+local function portal_serial(): uint64 return portal_list_generation end
+local function portal_list(): string
+  local text = string.copy('0\t0\t0\tportal\tChoose a host window in the desktop portal\n')
+  for i=0, <#portal_handles do
+    local h = portal_handles[i]
+    if not h.process.ended and h.process.serial > 0 then
+      local row = tostring(h.wid) .. '\t' .. tostring(h.process.w) .. '\t' .. tostring(h.process.h) .. '\tportal\tHost window (portal)\n'
+      local next = text .. row
+      text:destroy() row:destroy() text = next
+    end
+  end
+  return text
+end
+local function portal_open(wid: uint32, match: string): (pointer, string)
+  if wid ~= 0 then
+    for i=0, <#portal_handles do
+      local h = portal_handles[i]
+      if h.wid == wid and not h.process.ended then
+        h.refs = h.refs + 1
+        h.expires = 0
+        return h, (@string){}
+      end
+    end
+    return nilptr, string.copy('portal capture ID is no longer available')
+  end
+  if #match ~= 0 and match ~= 'portal:' then
+    return nilptr, string.copy('portal capture requires the desktop window picker; no exact window matching yet')
+  end
+  local handle = new(@PortalHandle)
+  if not handle.process:open(portal_helper, portal_input_enabled) then delete(handle) return nilptr, string.copy('could not start portal capture helper') end
+  portal_next_id = portal_next_id + 1
+  if portal_next_id == 0 then portal_next_id = 1 end
+  handle.wid, handle.refs = portal_next_id, 1
+  portal_handles:push(handle)
+  return handle, (@string){}
+end
+local function portal_state(h: pointer): (integer, string)
+  local handle = &(@*PortalHandle)(h).process
+  if handle.ended then return CAPTURE_ENDED, 'portal capture ended or was refused' end
+  if handle.serial > 0 then return CAPTURE_LIVE, '' end
+  return CAPTURE_PENDING, ''
+end
+local function portal_title(h: pointer): string
+  if (@*PortalHandle)(h).process.input_enabled then return 'Host window (portal; input requested)' end
+  return 'Host window (portal; view only)'
+end
+local function portal_frame(h: pointer, out: *CaptureFrame): boolean
+  local handle = &(@*PortalHandle)(h).process
+  if handle.serial == 0 then return false end
+  out.pixels = (@*[0]uint8)(&handle.pixels.data[0])
+  out.w, out.h, out.stride, out.serial = (@integer)(handle.w), (@integer)(handle.h), (@usize)(handle.w) * 4, handle.serial
+  out.boxes, out.nbox = nilptr, 0
+  return true
+end
+local function portal_input(h: pointer, ev: *CaptureInput): void
+  local handle = &(@*PortalHandle)(h).process
+  if not handle.input_enabled or handle.ended then return end
+  if #ev.text > 4096 then handle.ended = true return end
+  local header: array(uint8, 32)
+  header[0], header[1], header[2], header[3] = 80, 71, 73, 49
+  header[4], header[5] = ev.kind, ev.down and 1 or 0
+  proto.put_u16((@*[0]uint8)(&header[6]), ev.hid)
+  proto.put_u32((@*[0]uint8)(&header[8]), (@uint32)(ev.x))
+  proto.put_u32((@*[0]uint8)(&header[12]), (@uint32)(ev.y))
+  proto.put_u32((@*[0]uint8)(&header[16]), (@uint32)(ev.button))
+  proto.put_u32((@*[0]uint8)(&header[20]), (@uint32)(ev.dx))
+  proto.put_u32((@*[0]uint8)(&header[24]), (@uint32)(ev.dy))
+  proto.put_u16((@*[0]uint8)(&header[28]), (@uint16)(ev.mods))
+  proto.put_u16((@*[0]uint8)(&header[30]), (@uint16)(#ev.text))
+  if not handle:enqueue((@*[0]uint8)(&header), 32) then return end
+  if #ev.text > 0 then handle:enqueue((@*[0]uint8)(ev.text.data), (@usize)(#ev.text)) end
+end
+local function portal_close(h: pointer): void
+  local handle = (@*PortalHandle)(h)
+  handle.refs = handle.refs - 1
+  if handle.refs > 0 then return end
+  for i=0, <#portal_handles do
+    if portal_handles[i] == handle then portal_handles:remove(i) break end
+  end
+  handle.process:close()
+  portal_list_generation = portal_list_generation + 1
+  delete(handle)
+end
+-- Disconnected launch clients leave a bounded opportunity for the game to attach.
+local function portal_release(h: pointer): void
+  local handle = (@*PortalHandle)(h)
+  if handle.refs == 1 and not handle.process.ended and handle.process.serial > 0 then
+    handle.refs = 0
+    handle.expires = os.now() + 30.0
+  else
+    portal_close(h)
+  end
+end
+local function portal_pump(): void
+  local i = 0
+  while i < #portal_handles do
+    local process = &portal_handles[i].process
+    local live = process.serial > 0 and not process.ended
+    local width, height = process.w, process.h
+    process:pump()
+    if live ~= (process.serial > 0 and not process.ended) or width ~= process.w or height ~= process.h then
+      portal_list_generation = portal_list_generation + 1
+    end
+    local handle = portal_handles[i]
+    if handle.refs == 0 and (process.ended or os.now() >= handle.expires) then
+      handle.refs = 1
+      portal_close(handle)
+    else
+      i = i + 1
+    end
+  end
+end
+local function portal_poll(fds: *[0]cint, max: integer): integer
+  local n = 0
+  for i=0, <#portal_handles do
+    local handle = &portal_handles[i].process
+    if n < max and handle.active and not handle.ended then fds[n] = handle.fd n = n + 1 end
+  end
+  return n
+end
+local function portal_wait(): integer return #portal_handles > 0 and 20 or -1 end
+global function capture_portal_backend(): (boolean, CaptureBackend, string)
+  portal_helper:destroy()
+  portal_helper = os.getenv('GHOSTTY_PORTAL_HELPER')
+  local input = os.getenv('GHOSTTY_PORTAL_INPUT')
+  portal_input_enabled = input == '1'
+  input:destroy()
+  if #portal_helper == 0 then portal_helper = string.copy('/usr/libexec/ghostty-agent/portal_capture.py') end
+  local z = portal_helper .. '\0'
+  local readable = access((@cstring)(z.data), 4) == 0
+  z:destroy()
+  if not readable then return false, (@CaptureBackend){}, 'portal helper missing; set GHOSTTY_PORTAL_HELPER to tools/portal_capture.py' end
+  return true, CaptureBackend{
+    name = 'portal', list = portal_list, open = portal_open, state = portal_state,
+    title = portal_title, frame = portal_frame, input = portal_input, close = portal_close,
+    release = portal_release, wid_of = portal_wid, list_serial = portal_serial, pump = portal_pump, poll_fds = portal_poll, wait_ms = portal_wait,
+  }, ''
+end

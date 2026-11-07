@@ -7,6 +7,7 @@ require 'core.app.rain'
 require 'core.app.lakitu'
 require 'core.app.capture'
 require 'core.app.nativeview'
+require 'core.app.phone'
 local strconv: type = require 'detail.strconv'
 
 -- A terminal or profile number, optionally written "#3". False for anything
@@ -192,6 +193,7 @@ end
 local window_hint_shown = false -- `/term window pull|list|close` points at /window once
 
 global function run_command(cmd: string): cint
+  if cmd == 'phone reload' then return run_command('reload') end
   -- "verb arg...": verbs match whole words ("minimize" is not "min")
   local verb: string = cmd
   local arg: string
@@ -200,10 +202,13 @@ global function run_command(cmd: string): cint
     verb = cmd:subview(1, sp - 1)
     arg = cmd:subview(sp + 1)
   end
-  if cmd == 'reload' then
+  if verb == 'phone' then
+    return phone_command(arg)
+  elseif cmd == 'reload' then
+    if not prepare_policy() then return 2 end
+    local phone_state = policy_phone_call('state', '', 0, false)
     -- the same teardown as gu_shutdown: nothing may keep steering the game
     showcase_stop()
-    controller_capture_sync(false)
     teardown_effects()
     panels_shutdown() -- pulled windows back to the flat UI; the new policy pulls them in again
     ask_shutdown() -- /ask's hidden sessions end; the reloaded Lua knows nothing of them
@@ -233,7 +238,12 @@ global function run_command(cmd: string): cint
     host.local_agent.listed = false
     host.reattach_done = false
     host.layout_restored = false -- the layout is gone until the next LISTR
-    return load_policy() and 0 or 2
+    if not load_policy() then return 2 end
+    if phone_state > 0 then
+      policy_phone_call('command', 'open', 0, false)
+      if phone_state == 1 then policy_phone_call('command', 'close', 0, false) end
+    end
+    return 0
   elseif cmd == 'showcase' then
     return showcase_start()
   elseif cmd == 'showcase off' then

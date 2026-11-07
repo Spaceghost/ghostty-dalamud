@@ -3,6 +3,7 @@
 -- Where terminals live and whether they show: dropdown tabs, floating windows,
 -- minimized and world panels; visibility toggles and focus stepping.
 require 'core.app.agent'
+require 'core.phone'
 
 -- Visibility -----------------------------------------------------------------------
 
@@ -51,6 +52,10 @@ end
 global function toggle_visible(): void
   if host.last_toggle_frame == host.frame then return end
   host.last_toggle_frame = host.frame
+  if policy_phone_call('toggle_if_enabled', '', 0, false) > 0 then
+    if host.api.consume_key ~= nilptr then host.api.consume_key((@cint)(policy.toggle_consume_vk)) end
+    return
+  end
   set_visible(not host.dropdown_open)
   if host.api.consume_key ~= nilptr then host.api.consume_key((@cint)(policy.toggle_consume_vk)) end
 end

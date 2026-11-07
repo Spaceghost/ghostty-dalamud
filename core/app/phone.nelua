@@ -1,0 +1,93 @@
+-- One shell inside the existing plugin; reuse sessions, projection, native
+-- chat and draw-list adoption rather than adding a second Dalamud plugin.
+require 'core.app.panels'
+require 'core.phone'
+
+local previous: cint = 0
+local available = false
+
+global function phone_command(arg: string): cint
+  if arg == 'terminal' then
+    local s = session_new(policy.default_profile - 1, 80, 24)
+    if s ~= nilptr and not make_pet(s) then session_remove(s) end
+    return s ~= nilptr and 0 or 4
+  elseif arg == 'settings' then
+    host.settings_open = true
+    return 0
+  elseif arg == 'hud' then
+    if host.world_focus == 0 then
+      log(LOG_WARN, 'phone: focus a projected panel first')
+      return 4
+    end
+    host.world_full_id, host.world_full_last = host.world_focus, host.world_focus
+    return 0
+  elseif arg == 'world' then
+    host.world_full_id = 0
+    return 0
+  elseif arg == 'reload' then
+    -- Handled by run_command, using its full teardown/reload path.
+    return 3
+  end
+  local rc = policy_phone_call('command', arg, 0, false)
+  if arg == 'status' then
+    logf(LOG_INFO, 'phone: state %d (0 off, 1 closed, 2 open); /phone hud phases the focused panel onto the HUD', previous)
+  end
+  return rc < 0 and 4 or 0
+end
+
+phone_dispatch = phone_command
+
+global function phone_draw(): void
+  if previous == 0 or not available then return end
+  -- Render normally into an on-screen source window; the existing RenderPre
+  -- adopter removes its draw lists before presentation and projects a copy.
+  imgui.SetNextWindowSize(vec2(480, 380), ImGuiCond_FirstUseEver)
+  if imgui.Begin('Phone###ghostty_phone', nilptr, ImGuiWindowFlags_NoDocking) then
+    policy_phone_call('draw', '', 0, false)
+  end
+  imgui.End()
+end
+
+global function phone_frame(now: float64, live: boolean, in_world: boolean): void
+  local pc: GuObject
+  local blocked = not live or not in_world
+  if not blocked then
+    blocked = host.api.get_object == nilptr or host.api.get_object(WORLD_PLAYER, 0, &pc) == 0
+      or pc.found == 0 or pc.in_combat ~= 0 or pc.mounted ~= 0
+    if host.api.scene_flags ~= nilptr then blocked = blocked or (host.api.scene_flags() & 15) ~= 0 end
+  end
+  available = not blocked
+  local state = policy_phone_call('frame', '', now, blocked)
+  if state < 0 then
+    policy_phone_call('reset', '', now, true)
+    state = 1 -- failure gives up focus and the pose; no stale game control
+  end
+  if state == 2 then
+    -- Existing custom UI surfaces use the same world renderer. New sessions
+    -- opened while the device is out join it on their next frame.
+    while #host.dropdown_tabs > 0 do
+      local s = host.dropdown_tabs[0]
+      take_out_of_views(s)
+      if not make_pet(s) then restore(s) break end
+    end
+    while #host.windows > 0 do
+      local s = host.windows[0]
+      take_out_of_views(s)
+      if not make_pet(s) then restore(s) break end
+    end
+    while #host.native > 0 do
+      local s = host.native[0]
+      take_out_of_views(s)
+      if not make_pet(s) then restore(s) break end
+    end
+    host.dropdown_open = false
+    set_world_visible(true)
+  elseif state == 1 then
+    set_world_visible(false)
+    host.world_full_id, host.world_focus = 0, 0
+  elseif previous > 0 then
+    -- /phone off exits the shell without throwing away its sessions.
+    set_world_visible(true)
+  end
+  previous = state
+end

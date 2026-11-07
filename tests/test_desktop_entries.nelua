@@ -109,6 +109,9 @@ local p, sz = desktop_find_icon('calc', &idirs)
 check(p == keep(root .. '/sys/icons/hicolor/128x128/apps/calc.png') and sz == 128, 'the 128 px png first: ', p)
 local p2, sz2 = desktop_find_icon('org.example.TextEditor', &idirs)
 check(p2:find('scalable', 1, true) > 0 and sz2 == 0, 'scalable svg: ', p2)
+local suffixed, suffixed_size = desktop_find_icon('org.example.TextEditor.svg', &idirs)
+check(suffixed == p2 and suffixed_size == 0, 'icon names with SVG extension resolve')
+suffixed:destroy()
 local p3 = desktop_find_icon('no-such-icon-anywhere-xyz', &idirs)
 check(#p3 == 0, 'no icon')
 local p4, sz4 = desktop_find_icon(keep(root .. '/sys/icons/hicolor/48x48/apps/calc.png'), &idirs)
@@ -124,6 +127,18 @@ do
   check(l == 'app\torg.example.TextEditor\tText Editor\t/home/u/.cache/ghostty-agent/icons/org.example.TextEditor-128.png\tUtility;TextEditor;\nterm\thtop\tHtop\t\tSystem;\thtop\n',
     'list lines: ', l)
   l:destroy() e4:destroy() sb:destroy()
+end
+
+-- Cache identity changes for themes, source updates and requested sizes.
+do
+  local a = desktop_icon_key('/cache', 'app', '/theme/a.svg', 0, 100)
+  local b = desktop_icon_key('/cache', 'app', '/theme/b.svg', 0, 100)
+  local c = desktop_icon_key('/cache', 'app', '/theme/a.svg', 0, 101)
+  local d = desktop_icon_key('/cache', 'app', '/theme/a.svg', 64, 100)
+  local same = desktop_icon_key('/cache', 'app', '/theme/a.svg', 0, 100)
+  check(a == same and a ~= b and a ~= c and a ~= d, 'icon source, timestamp and size distinguish cache entries')
+  check(a:find('app-128-', 1, true) > 0, 'scalable icon uses render size')
+  a:destroy() b:destroy() c:destroy() d:destroy() same:destroy()
 end
 
 -- cache jobs: a PNG is copied, an SVG rendered (by whatever this host has)
@@ -156,6 +171,53 @@ do
     check(head == '\x89PNG\r\n\x1a\n', 'the rendered icon is a PNG')
     head:destroy()
   end
+  -- The requested raster size reaches the PNG, not just its cache filename.
+  if svg_ok then
+    for pixels = 32, 192, 160 do
+      local target = desktop_icon_key(cache, 'sized', p2, pixels, 1)
+      local sized: stringbuilder
+      check(desktop_icon_job_size(&sized, p2, target, renderer, pixels), 'requested-size SVG job')
+      local command = sized:promote()
+      check(os.execute(command) ~= nil, 'requested-size renderer succeeds')
+      local image = io.open(target, 'rb')
+      local header = image:read(24)
+      image:destroy()
+      local width = header:byte(17)*16777216 + header:byte(18)*65536 + header:byte(19)*256 + header:byte(20)
+      local height = header:byte(21)*16777216 + header:byte(22)*65536 + header:byte(23)*256 + header:byte(24)
+      check(width == pixels and height == pixels, 'SVG PNG has requested dimensions')
+      header:destroy() command:destroy() target:destroy()
+    end
+  end
+  local invalid: stringbuilder
+  check(not desktop_icon_job_size(&invalid, p2, d2, renderer, 0), 'zero raster size refused')
+  check(not desktop_icon_job_size(&invalid, p2, d2, renderer, 513), 'oversized raster refused')
+  local invalid_command = invalid:promote()
+  check(#invalid_command == 0, 'invalid request emits no command')
+  invalid_command:destroy()
+  invalid:destroy()
+  if svg_ok then
+    local private_source = cache .. '/not an installed app.svg'
+    write_file(private_source, '<svg xmlns="http://www.w3.org/2000/svg" width="48" height="48"><rect width="48" height="48" fill="red"/></svg>')
+    local request_jobs: stringbuilder
+    local requested = desktop_icon_request(private_source, 48, &idirs, cache, renderer, &request_jobs)
+    check(#requested > 0, 'arbitrary SVG source produces an independent request')
+    local request_script = request_jobs:promote()
+    check(os.execute(request_script) ~= nil, 'arbitrary icon request job succeeds')
+    local image = io.open(requested, 'rb')
+    local header = image:read(24)
+    image:destroy()
+    check(header:byte(20) == 48 and header:byte(24) == 48, 'arbitrary icon renders at requested size')
+    local repeated: stringbuilder
+    local cached = desktop_icon_request(private_source, 48, &idirs, cache, renderer, &repeated)
+    local repeated_script = repeated:promote()
+    check(cached == requested and #repeated_script == 0, 'cached arbitrary icon needs no repeated render')
+    cached:destroy() repeated_script:destroy() header:destroy() request_script:destroy() requested:destroy() private_source:destroy()
+  end
+  local before = desktop_icon_cached_png(cache, 'org.example.Calc', p, sz)
+  write_file(p, 'updated png source')
+  local updated = desktop_icon_cached_png(cache, 'org.example.Calc', p, sz)
+  check(before ~= updated, 'real source metadata changes its cached PNG path')
+  before:destroy() updated:destroy()
   d1:destroy() d2:destroy() script:destroy()
 end
 for i = 0, < #built do built[i]:destroy() end

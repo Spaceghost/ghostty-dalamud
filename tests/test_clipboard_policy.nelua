@@ -1,0 +1,8 @@
+require 'agent.clipboard_policy'
+assert(clipboard_sensitive_mime('x-kde-passwordManagerHint'))
+assert(clipboard_sensitive_mime('application/x-nspasteboard-concealed-type'))
+assert(clipboard_sensitive_mime('ExcludeClipboardContentFromMonitorProcessing'))
+assert(not clipboard_sensitive_mime('text/plain;charset=utf-8'))
+assert(not clipboard_sensitive_mime('text/plain'))
+assert(not clipboard_sensitive_mime('image/png'))
+print('clipboard MIME policy OK')

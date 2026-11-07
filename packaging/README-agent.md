@@ -159,3 +159,20 @@ time it needs one, and does without politely when it is not there.
 ## Licence
 
 MIT. See `LICENSE`.
+
+### Experimental host portal capture
+
+The package installs the Python helper at
+`/usr/libexec/ghostty-agent/portal_capture.py`. `--windows portal` discovers that
+path by default; `GHOSTTY_PORTAL_HELPER` overrides it for source-tree testing or
+nonstandard install prefixes. Missing/unreadable helpers are reported before
+capture starts. Portal capture also requires Python 3, PyGObject/Gio, GStreamer
+introspection and its PipeWire/video-conversion/appsink elements in the host
+session. These optional runtime capabilities have not been certified in the RPM.
+
+Default capture is view-only. `GHOSTTY_PORTAL_INPUT=1` requests Remote Desktop
+keyboard/pointer consent when the picker opens; only granted devices are used.
+This remains experimental: exact Shell window identity and in-game behavior
+are not verified. Packaging validation here checks archive contents and the
+expanded RPM install/file manifest; it does not certify an installed RPM or
+real desktop portal capture.

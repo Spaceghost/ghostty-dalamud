@@ -122,7 +122,8 @@ global function dualsense_reader_poll(r: *DualSenseReader, now: float64, logfn: 
         r.failed_again = true
       else
         r.logged_open_error = r.dev.last_error
-        ds_log(logfn, 2, 'DualSense %04x:%04x found but could not be opened (error %d)', r.dev.vid, r.dev.pid, r.dev.last_error)
+        ds_log(logfn, 2, 'DualSense %04x:%04x found but could not be opened (error %d)',
+          (@integer)(r.dev.vid), (@integer)(r.dev.pid), r.dev.last_error)
       end
       return
     elseif step ~= HidStep.Opened then
@@ -134,14 +135,16 @@ global function dualsense_reader_poll(r: *DualSenseReader, now: float64, logfn: 
     r.logged_layout, r.logged_ignored = DsLayout.None, false
     hid_set_input_buffers(&r.dev, DS_INPUT_BUFFERS) -- a failure only costs latency
     if not r.quiet then
-      ds_log(logfn, 1, 'DualSense %04x:%04x opened for its Create and PS buttons and touchpad (%d byte reports)', r.dev.vid, r.dev.pid, r.dev.input_len)
+      ds_log(logfn, 1, 'DualSense %04x:%04x opened for its Create and PS buttons and touchpad (%d byte reports)',
+        (@integer)(r.dev.vid), (@integer)(r.dev.pid), (@integer)(r.dev.input_len))
     end
   end
   for _ = 1, DS_READS_PER_FRAME do
     local n = hid_read(&r.dev)
     if n < 0 then
       if not r.quiet then
-        ds_log(logfn, 2, 'DualSense %04x:%04x closed: read failed (error %d)', r.dev.vid, r.dev.pid, r.dev.last_error)
+        ds_log(logfn, 2, 'DualSense %04x:%04x closed: read failed (error %d)',
+          (@integer)(r.dev.vid), (@integer)(r.dev.pid), r.dev.last_error)
       end
       r.quiet = r.button.reports == 0 -- reopened and failing again: say it once
       hid_close(&r.dev)

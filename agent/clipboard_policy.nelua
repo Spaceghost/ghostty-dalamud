@@ -1,0 +1,15 @@
+-- Sensitive offer markers must be checked before requesting any clipboard text.
+require 'string'
+global function clipboard_sensitive_mime(mime: string): boolean
+  return mime == 'x-kde-passwordManagerHint'
+      or mime == 'application/x-nspasteboard-concealed-type'
+      or mime == 'ExcludeClipboardContentFromMonitorProcessing'
+end
+
+require 'utf8'
+global function clipboard_valid_text(text: string): boolean
+  if #text > 65536 then return false end
+  for i=0, <#text do if text.data[i] == 0 then return false end end
+  local count, _ = utf8.len(text)
+  return count >= 0
+end

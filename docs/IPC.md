@@ -256,6 +256,11 @@ The window panels, oldest first, and the results of recent changes.
 * `anchor`: the world anchor as it is, also while `full` or `tab`: `pet`,
   `pin` (fixed in the world), `me` or `target` (following a character),
   `orbit`, `hud` (docked to the screen), or `none`.
+* `pin` (additive): canonical placement arguments for saved layouts. Fixed pins
+  use `at ANGLE DIST HEIGHT YAW PITCH`, with angle and yaw relative to the
+  current player; absent if the pin is in another territory or its anchor
+  cannot be expressed. HUD/follow/orbit/pet arguments preserve their settings.
+  `panel.list` provides the same optional field.
 * `hidden`: hidden by `window.hide` (not drawn, not streamed).
 * `focused`: the panel has the keyboard.
 * `agent`: the agent streaming it (`default`, the only one so far).
@@ -595,3 +600,51 @@ by the test) and of a hidden window, `panel.order`, `panel.minimize`,
 (`gu_call` through the loader, with and without a core). The threading is by
 design and review: the host build's lock is a no-op, as for the event queue.
 **Not yet observed in game**, and no plugin has called it yet.
+
+`agent.windows.refresh` accepts optional `icon_size` (integer 16–512). It queues a sized host app-list request; default calls retain the existing window/app refresh. Matching Wayland backends remember the requested raster size for later app lists. A backend without the sized callback reports an unsupported-size error, leaving legacy app lists available. Rasterization runs as the existing background icon job, so PNG paths can precede file creation.
+
+`agent.icons` reads standalone icon metadata as `[{icon,size,png}]`. WLISTR batches beginning with `icons` contain `icon\tNAME\tSIZE\tPNG` rows and do not replace windows or launchable apps. Replies are accumulated by agent/name/size (bounded to 512 entries); malformed sizes are skipped. `agent.icons.render` queues a bounded request `{size:16..512,icons:[NAME,...]}` (1..64 names, each at most 1024 UTF-8 bytes without control characters). The agent sends metadata-only replies while background rendering proceeds; callers must wait for the PNG file before applying it. Catalog polling/application remains unfinished.
+
+Experimental clipboard read: `agent.clipboard.read` queues a default-agent
+read and returns `{request}`. `agent.clipboard` reads the frame snapshot with
+`request`, `pending`, `available`, `text`, and `sensitivity_known`. Results expire
+after ten seconds. Only one read may wait at once; terminal paste remains on
+its separate request-zero path. This is explicit read-only access, not automatic
+synchronization. Current agent text replies do not prove sensitivity metadata,
+so `sensitivity_known` is false and callers must not use them for automatic sync.
+
+`agent.clipboard.write` accepts `{text}` (UTF-8, no NUL, at most 65536
+bytes), queues the write, and returns `{request}`. Poll `agent.clipboard`: its
+`operation` is `read` or `write`; `pending=false` and `available=true` for the
+matching write request means the agent acknowledged the write. Denial or expiry
+reports unavailable. Reads and writes share a single outstanding request slot.
+This explicit transport does not enable automatic clipboard synchronization.
+
+Clipboard sensitivity transport: correlated CLIP_GET requests send payload
+`metadata`; updated agents reply with PROTO_CLIP_META (52), a flags byte
+(bit 0 known, bit 1 sensitive) followed by text. Legacy empty CLIP_GET still
+receives plain CLIP. Older agents replying with plain CLIP are treated as unknown.
+Sensitive payload text is discarded by the client before entering the IPC cache.
+Malformed flags yield unavailable. IPC results now expose `sensitive` as well
+as `sensitivity_known`. Current platform providers still report unknown; this
+transport alone does not prove safe clipboard contents or enable automatic sync.
+
+Metadata providers: the Windows agent checks registered exclusion/concealed
+formats while holding OpenClipboard, returns known-safe text only when none
+are present, and returns known-sensitive with no text otherwise. Presence is
+conservative; flag values are not interpreted. The worker timeout still bounds
+the agent loop. Linux metadata reads currently report unavailable, because
+separate format/text CLI reads cannot prove one source offer; legacy terminal
+paste is unchanged. Clipboard-file fixtures report unknown sensitivity.
+
+App notification snapshots: `agent.notifications` is a read-only method returning
+`{rev, events}` when supported. Each event carries monotonic `seq`, agent route
+`source`, process `nonce`, notification `id`, and `kind` (`notification` or
+`closed`). Notifications additionally have `app`, `desktop_entry`, `summary`,
+`body`, and urgency 0..2. Ghostty retains at most 64 events, validates the helper
+JSON in Lua, and removes a route's old cached events when its connection becomes
+ready again. The cache revision can advance when records are removed. Missing
+support returns no snapshot; consumers must reset their baseline. Consumers
+must skip the initial/enabled/reconnected backlog and only process subsequent
+sequences, including close events. This read returns private app text; UI clients
+must apply title-only/privacy settings and rate limits before displaying it.

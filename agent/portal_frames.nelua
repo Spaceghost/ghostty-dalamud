@@ -1,0 +1,57 @@
+-- Private portal-helper PGF1 framing, independent of the public agent protocol.
+require 'core.protocol'
+
+global PortalFrameReader = @record{
+  queue: ByteQueue,
+  failed: boolean,
+  serial: uint64,
+}
+global PORTAL_FRAME_HEADER: usize <comptime> = 24
+global PORTAL_FRAME_LIMIT: usize <comptime> = 268435456
+
+function PortalFrameReader:push(data: *[0]uint8, size: usize): boolean
+  if self.failed then return false end
+  if size > PORTAL_FRAME_LIMIT + PORTAL_FRAME_HEADER - self.queue:len() then
+    self.failed = true
+    return false
+  end
+  self.queue:push(data, size)
+  return true
+end
+
+-- Pixels are borrowed until consume()/push()/destroy(). No allocation follows
+-- an untrusted header: dimensions, exact payload size and serial are checked first.
+function PortalFrameReader:peek(): (boolean, uint32, uint32, uint64, *[0]uint8, usize)
+  if self.failed or self.queue:len() < PORTAL_FRAME_HEADER then return false, 0, 0, 0, nilptr, 0 end
+  local p = self.queue:peek()
+  local w = proto.get_u32((@*[0]uint8)(&p[4]))
+  local h = proto.get_u32((@*[0]uint8)(&p[8]))
+  local serial = proto.get_u64((@*[0]uint8)(&p[12]))
+  local size = (@usize)(proto.get_u32((@*[0]uint8)(&p[20])))
+  if p[0] ~= 80 or p[1] ~= 71 or p[2] ~= 70 or p[3] ~= 49
+      or w == 0 or w > 8192 or h == 0 or h > 8192
+      or serial == 0 or serial <= self.serial
+      or size ~= (@usize)(w) * (@usize)(h) * 4 or size > PORTAL_FRAME_LIMIT then
+    self.failed = true
+    return false, 0, 0, 0, nilptr, 0
+  end
+  if self.queue:len() < PORTAL_FRAME_HEADER + size then return false, 0, 0, 0, nilptr, 0 end
+  return true, w, h, serial, (@*[0]uint8)(&p[24]), size
+end
+
+function PortalFrameReader:consume(): boolean
+  local ready, _, _, serial, _, size = self:peek()
+  if not ready then return false end
+  self.serial = serial
+  self.queue:consume(PORTAL_FRAME_HEADER + size)
+  return true
+end
+
+function PortalFrameReader:eof(): boolean
+  if self.queue:len() ~= 0 then self.failed = true end
+  return not self.failed
+end
+
+function PortalFrameReader:destroy(): void
+  self.queue:destroy()
+end

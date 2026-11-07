@@ -1,0 +1,414 @@
+{
+  "xivhudCommit": "854e424",
+  "adaptations": [
+    "Embedded module classes have no Dalamud plugin interfaces",
+    "Per-module configuration and one outer UI entry point",
+    "Journal/Character native and external hosting disabled",
+    "Chat collection enabled independently of phone presentation",
+    "Embedded Grimoire shares the outer Kami lifecycle",
+    "Floating notice cards replaced by the phone notification center",
+    "Tap/hold Backspace edits and clears the weave; combat Enter is intercepted before native chat"
+  ],
+  "files": [
+    {
+      "source": "xivhud-journal/src/XivHud.Journal/Configuration.cs",
+      "output": "XivHud.Journal/Configuration.cs",
+      "sourceSha256": "e823ea0fd445d1e5aae0bf40b06b6fed94c8f4cf1b59f5cbe656ed64a5017f61"
+    },
+    {
+      "source": "xivhud-journal/src/XivHud.Journal/JournalCommandPolicy.cs",
+      "output": "XivHud.Journal/JournalCommandPolicy.cs",
+      "sourceSha256": "2cac387c3707bebb78c046d5f4d1554300d56bee7d061eb6e2f6da2a32ff1ecb"
+    },
+    {
+      "source": "xivhud-journal/src/XivHud.Journal/JournalControllerClient.cs",
+      "output": "XivHud.Journal/JournalControllerClient.cs",
+      "sourceSha256": "8604bc7e95d113784a67f764e9d862ef9914c825a5bbfac1c36e6003532daa52"
+    },
+    {
+      "source": "xivhud-journal/src/XivHud.Journal/JournalControllerInput.cs",
+      "output": "XivHud.Journal/JournalControllerInput.cs",
+      "sourceSha256": "de1cdcc72bcc47628cd36ef93c0ffe7f36d15718ae074e6accbfaf63d51f11a5"
+    },
+    {
+      "source": "xivhud-journal/src/XivHud.Journal/JournalControllerIntent.cs",
+      "output": "XivHud.Journal/JournalControllerIntent.cs",
+      "sourceSha256": "2787d19320e057a11512c3e2647f8abd6457a1169cbf61c74af1dfbea48b4999"
+    },
+    {
+      "source": "xivhud-journal/src/XivHud.Journal/JournalData.cs",
+      "output": "XivHud.Journal/JournalData.cs",
+      "sourceSha256": "6e8c3f151a2038becf23c062c2213e16eccc1e6443865c5e6b1ad71698f73eaf"
+    },
+    {
+      "source": "xivhud-journal/src/XivHud.Journal/JournalEntry.cs",
+      "output": "XivHud.Journal/JournalEntry.cs",
+      "sourceSha256": "1c9087a96cd46b935dd12926044f4a33dc2f2227fa3a0dbb4c09cf3466576209"
+    },
+    {
+      "source": "xivhud-journal/src/XivHud.Journal/JournalPopupLayout.cs",
+      "output": "XivHud.Journal/JournalPopupLayout.cs",
+      "sourceSha256": "28ee5d72eeddd0cb414a0793db59aa3e4253f4c46c8763371f1576ce3c7d4a93"
+    },
+    {
+      "source": "xivhud-journal/src/XivHud.Journal/JournalText.cs",
+      "output": "XivHud.Journal/JournalText.cs",
+      "sourceSha256": "c7aa2fb8c9411c670012d3f07d69e4f23feaf23f52bed420a207f00110ff9936"
+    },
+    {
+      "source": "xivhud-journal/src/XivHud.Journal/JournalTracker.cs",
+      "output": "XivHud.Journal/JournalTracker.cs",
+      "sourceSha256": "90c66d7c2dd4d17219b87eaac57407a1e2bfa88de3ebad67ba5ffa2c9c6c116a"
+    },
+    {
+      "source": "xivhud-journal/src/XivHud.Journal/JournalTrackerPolicy.cs",
+      "output": "XivHud.Journal/JournalTrackerPolicy.cs",
+      "sourceSha256": "7cf1931b678f404e2d3a685e6e5f3bb987f5c879275874c5f507dc75fb5f6909"
+    },
+    {
+      "source": "xivhud-journal/src/XivHud.Journal/JournalWindow.cs",
+      "output": "XivHud.Journal/JournalWindow.cs",
+      "sourceSha256": "f14facdf62c7d5ff74b8e6ddcbd6306a50f61b065c36f48f5a106f676fe071ee"
+    },
+    {
+      "source": "xivhud-journal/src/XivHud.Journal/NativeJournalBridge.cs",
+      "output": "XivHud.Journal/NativeJournalBridge.cs",
+      "sourceSha256": "50b64640da35c783a446a5e3fcfb0a010834867ed26e4bb79912d28b722f5043"
+    },
+    {
+      "source": "xivhud-journal/src/XivHud.Journal/Plugin.cs",
+      "output": "XivHud.Journal/Plugin.cs",
+      "sourceSha256": "937f9346b4b1bb6d010ad0cd377fdd11669989ee9cbbf4d3bc2ad8e6ef45e72f"
+    },
+    {
+      "source": "xivhud-character/src/XivHud.Character/CharacterControllerClient.cs",
+      "output": "XivHud.Character/CharacterControllerClient.cs",
+      "sourceSha256": "27874cd97f58648d417781232e6a4993fc6a9f2382ae79843c5956410f3a880a"
+    },
+    {
+      "source": "xivhud-character/src/XivHud.Character/CharacterControllerInput.cs",
+      "output": "XivHud.Character/CharacterControllerInput.cs",
+      "sourceSha256": "381bc8e97f3d516cd01ae5509626c9fbc86d519fd7c4f0e28abe55c38310fd54"
+    },
+    {
+      "source": "xivhud-character/src/XivHud.Character/CharacterControllerIntent.cs",
+      "output": "XivHud.Character/CharacterControllerIntent.cs",
+      "sourceSha256": "fe0052c73f21eec1f4b1fa85b0ab4f4a2cf19f6c21701357ac62c835abde9bfe"
+    },
+    {
+      "source": "xivhud-character/src/XivHud.Character/CharacterData.cs",
+      "output": "XivHud.Character/CharacterData.cs",
+      "sourceSha256": "1cdfa9d1e5a753a6d21f61a07af16efd1362ca4d755844cf92035e5631d78ad5"
+    },
+    {
+      "source": "xivhud-character/src/XivHud.Character/CharacterMath.cs",
+      "output": "XivHud.Character/CharacterMath.cs",
+      "sourceSha256": "c7cd9fcab98621c607053db5c23359fc2272ef755d6e30e38660c9c4c529cf09"
+    },
+    {
+      "source": "xivhud-character/src/XivHud.Character/CharacterPopupLayout.cs",
+      "output": "XivHud.Character/CharacterPopupLayout.cs",
+      "sourceSha256": "549674a1f61fbf6e628c2b94d87e9e1a09b5d0736d4e26de9f0d3dfd7568cc59"
+    },
+    {
+      "source": "xivhud-character/src/XivHud.Character/CharacterWindow.cs",
+      "output": "XivHud.Character/CharacterWindow.cs",
+      "sourceSha256": "5ad88e6649a094559b8c40453318e5291af5d3574b2bcf740e50925c897e803f"
+    },
+    {
+      "source": "xivhud-character/src/XivHud.Character/Configuration.cs",
+      "output": "XivHud.Character/Configuration.cs",
+      "sourceSha256": "579e24037290563c54cf7c68254d9531e3674aaae51ed5cae46a47b680d8f0c1"
+    },
+    {
+      "source": "xivhud-character/src/XivHud.Character/NativeCharacterBridge.cs",
+      "output": "XivHud.Character/NativeCharacterBridge.cs",
+      "sourceSha256": "a445e6c0aee92d81b3c8d2055110c0d1c846b033be73ccb823ea9d9b4731e38f"
+    },
+    {
+      "source": "xivhud-character/src/XivHud.Character/Plugin.cs",
+      "output": "XivHud.Character/Plugin.cs",
+      "sourceSha256": "7e423a05ef1a6187c87f781749b84f49f70fb380ac2ee573cdab2ec040a97f2d"
+    },
+    {
+      "source": "xivhud-chat/src/XivHud.Chat/ChatWindow.cs",
+      "output": "XivHud.Chat/ChatWindow.cs",
+      "sourceSha256": "2a5cd9b4a604c740a09a4d7748c3a445cff9e7f17d6ea64082ee8541db4d5a83"
+    },
+    {
+      "source": "xivhud-chat/src/XivHud.Chat/Configuration.cs",
+      "output": "XivHud.Chat/Configuration.cs",
+      "sourceSha256": "faee628cb709f1f1efcdf340feb0a9c0965d2c289fcd6c661d70ea02b48aba46"
+    },
+    {
+      "source": "xivhud-chat/src/XivHud.Chat/NativeChatInput.cs",
+      "output": "XivHud.Chat/NativeChatInput.cs",
+      "sourceSha256": "4e4d585de6e86e882357b744208f124e7de0f6e71d295f9ac5174e43c851c98f"
+    },
+    {
+      "source": "xivhud-chat/src/XivHud.Chat/Plugin.cs",
+      "output": "XivHud.Chat/Plugin.cs",
+      "sourceSha256": "9d16b3daec1ed137fe32b9a17234c464d21770e1a0a1564097273d7dc1c0afb1"
+    },
+    {
+      "source": "xivhud-chat/src/XivHud.Chat.Core/ChatComposer.cs",
+      "output": "XivHud.Chat.Core/ChatComposer.cs",
+      "sourceSha256": "2e086ad9a8bcf41ab9e38012eef9928fe42f7ded995915acb232738d2f41796d"
+    },
+    {
+      "source": "xivhud-chat/src/XivHud.Chat.Core/ChatStore.cs",
+      "output": "XivHud.Chat.Core/ChatStore.cs",
+      "sourceSha256": "ded17b5711726d7f6f09ef6e0080d7e535a43c52d919dffcdd483154ae22e6df"
+    },
+    {
+      "source": "xivhud-chat/src/XivHud.Chat.Core/NotificationStore.cs",
+      "output": "XivHud.Chat.Core/NotificationStore.cs",
+      "sourceSha256": "dceda2cbb170e6769fdc4a5c2cc9d466823755b706e74fdd235df431f53024f4"
+    },
+    {
+      "source": "xivhud-inventory/src/XivHud.Inventory/ModuleWindow.cs",
+      "output": "XivHud.Inventory/ModuleWindow.cs",
+      "sourceSha256": "948b977008ed979f0a73996714afeee654507a31f54e74cc4c26371332288884"
+    },
+    {
+      "source": "xivhud-inventory/src/XivHud.Inventory/Plugin.cs",
+      "output": "XivHud.Inventory/Plugin.cs",
+      "sourceSha256": "69e2ca19113011f571ff3641d3726033cd984ad07eef7ffcf02afff7e541192f"
+    },
+    {
+      "source": "xivhud-crafting/src/XivHud.Crafting/ModuleWindow.cs",
+      "output": "XivHud.Crafting/ModuleWindow.cs",
+      "sourceSha256": "24287298e962834e121fea8d30d2f6f0e2e49c2140b3096203aa19d48540c469"
+    },
+    {
+      "source": "xivhud-crafting/src/XivHud.Crafting/Plugin.cs",
+      "output": "XivHud.Crafting/Plugin.cs",
+      "sourceSha256": "09aaf9d28a564728f40871337fbbb3aeeb9d1e2e2b1b01924828ca0372350aae"
+    },
+    {
+      "source": "xivhud-items/src/XivHud.Items.Core/Models.cs",
+      "output": "XivHud.Items.Core/Models.cs",
+      "sourceSha256": "778cb4a595550aa9ca719530ba044d2fa7ea249b117967ae2273242552d12f70"
+    },
+    {
+      "source": "xivhud-items/src/XivHud.Items.Dalamud/ItemData.cs",
+      "output": "XivHud.Items.Dalamud/ItemData.cs",
+      "sourceSha256": "94e546b0f0082a057d9f122d57d20867fa2823393f1e49dc8292fd3134e52998"
+    },
+    {
+      "source": "xivhud-windowing/src/XivHud.Protocol/HudCommands.cs",
+      "output": "XivHud.Protocol/HudCommands.cs",
+      "sourceSha256": "00c0c46048882297a455dd880d433a14e41bf50e80ed0718408fcf0127d630ca"
+    },
+    {
+      "source": "xivhud-windowing/src/XivHud.Protocol/HudEndpoint.cs",
+      "output": "XivHud.Protocol/HudEndpoint.cs",
+      "sourceSha256": "ace35d21cd46847d711d732eb5872f0c744d1fbe1e87d6ecfa661de64b78b5ef"
+    },
+    {
+      "source": "xivhud-windowing/src/XivHud.Protocol/ScreenLayout.cs",
+      "output": "XivHud.Protocol/ScreenLayout.cs",
+      "sourceSha256": "a416f5dad3484071de9d17fb80247a75a7973eb194643eae30f351c54217abe1"
+    },
+    {
+      "source": "xivhud-windowing/src/XivHud.Windowing/GhosttyWindowHost.cs",
+      "output": "XivHud.Windowing/GhosttyWindowHost.cs",
+      "sourceSha256": "240853b7fc773fa958d396e9e4d46d7427f86b4c8a852c0cb8c6a8b3771d5b18"
+    },
+    {
+      "source": "xivhud-windowing/src/XivHud.Windowing/IWindowHost.cs",
+      "output": "XivHud.Windowing/IWindowHost.cs",
+      "sourceSha256": "7cc1732fdbcdd722e346f2493eb793c2d6c08a9fa8658fd5809e1f6cdee5b0a9"
+    },
+    {
+      "source": "xivhud-windowing/src/XivHud.Windowing/WindowHostRouter.cs",
+      "output": "XivHud.Windowing/WindowHostRouter.cs",
+      "sourceSha256": "d3c020bdd737d6e99aefddae188e739cd9bbdc47b29910340bd7a5cd6e216748"
+    },
+    {
+      "source": "xivhud-windowing/src/XivHud.Windowing.Dalamud/KamiNativeWindowBackend.cs",
+      "output": "XivHud.Windowing.Dalamud/KamiNativeWindowBackend.cs",
+      "sourceSha256": "bb2c0ac673aa30942860a3c98cba770e102194861449f0eef52fa636e396fb45"
+    },
+    {
+      "source": "xivhud-windowing/src/XivHud.Windowing.Dalamud/NativeGameWindowHost.cs",
+      "output": "XivHud.Windowing.Dalamud/NativeGameWindowHost.cs",
+      "sourceSha256": "2a42041d1c386ccac2671a5e93faab480818a498f0575f381cf550c3486a4eca"
+    },
+    {
+      "source": "xivhud-windowing/src/XivHud.Windowing.Dalamud/NativeWindowCapture.cs",
+      "output": "XivHud.Windowing.Dalamud/NativeWindowCapture.cs",
+      "sourceSha256": "27df858dde1e5981bbd60aff62983b01b477a870900ae2044814e33d0610e735"
+    },
+    {
+      "source": "xivhud-windowing/src/XivHud.Windowing.Dalamud/NativeWindowFocus.cs",
+      "output": "XivHud.Windowing.Dalamud/NativeWindowFocus.cs",
+      "sourceSha256": "6809938f98ffff0bb9f13f2cfde0f7f8531aed446fb227d9b439e12bd8f81ffd"
+    },
+    {
+      "source": "xivhud-windowing/src/XivHud.Windowing.Dalamud/NativeWindowShutdown.cs",
+      "output": "XivHud.Windowing.Dalamud/NativeWindowShutdown.cs",
+      "sourceSha256": "ca94e8fab20c64ec576973b5bd46ac22471abd083bc9705ec20a37763887b9e5"
+    },
+    {
+      "source": "xivhud-dalamud/src/XivHud.Core/ControllerFocusLease.cs",
+      "output": "XivHud.Core/ControllerFocusLease.cs",
+      "sourceSha256": "94950a099197c57e959908639507fc7754cb1a1046bd4ddaa18658745d992976"
+    },
+    {
+      "source": "xivhud-dalamud/src/XivHud.Core/HudVisibilityLease.cs",
+      "output": "XivHud.Core/HudVisibilityLease.cs",
+      "sourceSha256": "bb7b65bc35a221ca0dc3d67cecfae55e9e850c0f70e2f0cd532a01cfdf1853df"
+    },
+    {
+      "source": "xivhud-dalamud/src/XivHud.Core/NavigatorSession.cs",
+      "output": "XivHud.Core/NavigatorSession.cs",
+      "sourceSha256": "1b3c2c909de48068f8fc87ef3994fd23b2add25945fcaff8a19c8990bfd744f8"
+    },
+    {
+      "source": "xivhud-dalamud/src/XivHud.Core/SurfaceActions.cs",
+      "output": "XivHud.Core/SurfaceActions.cs",
+      "sourceSha256": "7d9be477777a18ef4ff9bdbc2185ae9a9aace3f04a6cc2f61a4a4eca3a434fb0"
+    },
+    {
+      "source": "xivhud-dalamud/src/XivHud.Core/SurfaceCatalog.cs",
+      "output": "XivHud.Core/SurfaceCatalog.cs",
+      "sourceSha256": "e757b5035e124436efe0132944f4cfc0c54fb070baf653713d4c989c150ec180"
+    },
+    {
+      "source": "shared/IllustratedStyle.cs",
+      "output": "Style/IllustratedStyle.cs",
+      "sourceSha256": "ac47fb43e77dea6a1f8c12b4db7d480cf2c2b8e67ea1eb7dfac9f8e6711e883e"
+    },
+    {
+      "source": "shared/IllustratedChrome.cs",
+      "output": "Style/IllustratedChrome.cs",
+      "sourceSha256": "ecbbc2de9acbcbbe3b0bac3f68a094d9ef0e46f75db590f4720116999707b3d5"
+    },
+    {
+      "source": "shared/WorkspaceLayout.cs",
+      "output": "Style/WorkspaceLayout.cs",
+      "sourceSha256": "2f096267f0d1dd67919d152644e9d9ba41f5ea5946730241648b293a00444176"
+    },
+    {
+      "source": "xivhud-dalamud/src/XivHud.Plugin/ControllerBroker.cs",
+      "output": "Controller/ControllerBroker.cs",
+      "sourceSha256": "d4a3456fde4d6a1d040b53f143c35446a554efbfb8b37ee2c80faa3307c004a0"
+    },
+    {
+      "source": "xivspell/plugin/ActionEffects.cs",
+      "output": "Grimoire/ActionEffects.cs",
+      "sourceSha256": "2949af62ead320809a38fd5d651499733c1188ebfce3ea3ab43841b2f79de4b7"
+    },
+    {
+      "source": "xivspell/plugin/BackspaceGesture.cs",
+      "output": "Grimoire/BackspaceGesture.cs",
+      "sourceSha256": "c975f9dd4bdf60ab426cca9831bad69a65dea4610a470bb2ef063e71d3dd8a0e"
+    },
+    {
+      "source": "xivspell/plugin/CastPlayback.cs",
+      "output": "Grimoire/CastPlayback.cs",
+      "sourceSha256": "15561d32073194693358cd6e6edc3cdbd5e3546d7da8f747a40a82a32879f8d5"
+    },
+    {
+      "source": "xivspell/plugin/ChatVisibilityLease.cs",
+      "output": "Grimoire/ChatVisibilityLease.cs",
+      "sourceSha256": "67104b5ccfea496c233e3b66a669d455c00be1ae055863ddc1e50046b08f24ce"
+    },
+    {
+      "source": "xivspell/plugin/CombatEnterCapture.cs",
+      "output": "Grimoire/CombatEnterCapture.cs",
+      "sourceSha256": "4d67ad5855263274131da5b8f2617aeafca5a22e94092ed3e465ed807cc98076"
+    },
+    {
+      "source": "xivspell/plugin/CombatInput.cs",
+      "output": "Grimoire/CombatInput.cs",
+      "sourceSha256": "3325aed79c6c9dd21eaf2ccc585df685c4c8957cb125bab2f94c644ea9b80ff6"
+    },
+    {
+      "source": "xivspell/plugin/CommandBar.cs",
+      "output": "Grimoire/CommandBar.cs",
+      "sourceSha256": "cfec2533a4f9103ef3ccba9ebb65c54e19e79bdcff312cc19e5a501b0dc6bba7"
+    },
+    {
+      "source": "xivspell/plugin/ControllerComposer.cs",
+      "output": "Grimoire/ControllerComposer.cs",
+      "sourceSha256": "92e023d2e2a7086b9899b342c357295bb29a31e469192c784ee9f17f47a62650"
+    },
+    {
+      "source": "xivspell/plugin/ControllerInput.cs",
+      "output": "Grimoire/ControllerInput.cs",
+      "sourceSha256": "91a8a3e5f4e615ad59c278c4c7f09f51c9462fa781211db495981c0d1591e923"
+    },
+    {
+      "source": "xivspell/plugin/EditorContrast.cs",
+      "output": "Grimoire/EditorContrast.cs",
+      "sourceSha256": "f39284acbf1b65b23e0493e60b427b4731b583bc05faea65f111d3578be937fc"
+    },
+    {
+      "source": "xivspell/plugin/Follow.cs",
+      "output": "Grimoire/Follow.cs",
+      "sourceSha256": "01bd19738b0ad0bd7db191a7299bc31687d664bfadcf1d40e93739c40fa6df0a"
+    },
+    {
+      "source": "xivspell/plugin/GrimoirePad.cs",
+      "output": "Grimoire/GrimoirePad.cs",
+      "sourceSha256": "baffd3f7297fcef7aca583fc65a4a8eb628f614664bd8d9c7838d1db54ed76ff"
+    },
+    {
+      "source": "xivspell/plugin/NativeChatSuppression.cs",
+      "output": "Grimoire/NativeChatSuppression.cs",
+      "sourceSha256": "e7bf9e86a9189df2f1b61b8ab656dc937d23de48a89f01f1d7ad01d8945f881e"
+    },
+    {
+      "source": "xivspell/plugin/PadLease.cs",
+      "output": "Grimoire/PadLease.cs",
+      "sourceSha256": "b1b8e5ccf883b82b7e292ca0993b34ace5463ed52db8c56fadd65cf2b07d328b"
+    },
+    {
+      "source": "xivspell/plugin/Plugin.cs",
+      "output": "Grimoire/Plugin.cs",
+      "sourceSha256": "680277b2db9aff19c2870134877feff7aac681411dd106f0840cd31c949424f4"
+    },
+    {
+      "source": "xivspell/plugin/SpellAppearance.cs",
+      "output": "Grimoire/SpellAppearance.cs",
+      "sourceSha256": "d1c10b24c8be7a763767064e0073cba33321bc462aa94390f4460ac4e920067a"
+    },
+    {
+      "source": "xivspell/plugin/SpellCooldown.cs",
+      "output": "Grimoire/SpellCooldown.cs",
+      "sourceSha256": "faefcf7a88a303941cdc971bc8e4191a9b57f104b53e74a66da87de32d59f39f"
+    },
+    {
+      "source": "xivspell/plugin/SpellEditor.cs",
+      "output": "Grimoire/SpellEditor.cs",
+      "sourceSha256": "039a5dee8b5e0787e8526429fb23c25b80adfc30f1e62dd946222e45ea88b9c8"
+    },
+    {
+      "source": "xivspell/plugin/SpellKeyboard.cs",
+      "output": "Grimoire/SpellKeyboard.cs",
+      "sourceSha256": "e6b5c5d6636443ee73a4f192619cfe7fe5b61a1552ae7912a04c3a094ebc60ca"
+    },
+    {
+      "source": "xivspell/plugin/SpellWeave.cs",
+      "output": "Grimoire/SpellWeave.cs",
+      "sourceSha256": "5d4c2db0e150917013f994cc25b6028d52eb8eb77fcf974547ac9a5736b2ae00"
+    },
+    {
+      "source": "xivspell/plugin/TargetBoundary.cs",
+      "output": "Grimoire/TargetBoundary.cs",
+      "sourceSha256": "4c35fd0c13115fe37c5df97950f6479a93cc08afa8577e4c05dd27173f60a003"
+    },
+    {
+      "source": "xivspell/plugin/Targeting.cs",
+      "output": "Grimoire/Targeting.cs",
+      "sourceSha256": "f1b579ee13a73f5e364c3788a40d9149f009f9419a2edad869eebe074f55aab9"
+    },
+    {
+      "source": "xivspell/plugin/WeavePresentation.cs",
+      "output": "Grimoire/WeavePresentation.cs",
+      "sourceSha256": "289c1856f498736779013af0abf4bf4e7000cdaca8ecd5dcfec5775b3c674d62"
+    }
+  ]
+}

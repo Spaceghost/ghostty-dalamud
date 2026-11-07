@@ -31,6 +31,11 @@ local placements -- name -> 'ground'; loaded on first use
 -- to tell "not installed or not loaded" from "window not open". `native`
 -- names the game's own chat log instead of an ImGui window.
 M.windows = {
+  phone = { title = '###ghostty_phone', label = 'Phone' },
+  settings = { title = '###ghostty_settings', label = 'Settings' },
+  agents = { title = '###ghostty_agents', label = 'Agents' },
+  netlab = { title = '###ghostty_netlab', label = 'Netlab' },
+  windows = { title = '###ghostty_window_picker', label = 'Windows' },
   -- ChatTwo 1.40.6.0: the main window is ImGui.Begin("Chat 2###chat2")
   chat2 = { title = '###chat2', plugin = 'ChatTwo', label = 'Chat 2' },
   -- Mappy 3.2.0.0, Windows/MapWindow.cs
@@ -125,6 +130,14 @@ function M.auto_names()
       out[#out + 1] = name
     end
   end
+  if CONFIG and CONFIG.phone and CONFIG.phone.enabled then
+    for _, name in ipairs({ 'phone', 'settings', 'agents', 'netlab', 'windows', 'ask' }) do
+      if not seen[name] then seen[name] = true out[#out + 1] = name end
+    end
+    for name in pairs(CONFIG.phone.source_windows or {}) do
+      if not seen[name] then seen[name] = true out[#out + 1] = name end
+    end
+  end
   table.sort(out)
   return table.concat(out, '\n')
 end
@@ -134,7 +147,7 @@ end
 -- with no plugin check.
 function M.resolve(name)
   if type(name) ~= 'string' or name == '' then return nil, 'usage: /window adopt NAME (chat2, chat, or a window title)' end
-  local w = M.windows[name:lower()]
+  local w = M.windows[name:lower()] or (CONFIG and CONFIG.phone and CONFIG.phone.source_windows or {})[name]
   if w and w.native then return 'native', '', '', w.label or name end
   if w then return 'imgui', w.title, w.plugin or '', w.label or name end
   return 'imgui', name, '', (name:gsub('##.*$', ''))
@@ -201,6 +214,7 @@ end
 -- just the opt-in ground preference by window name, including automatic Mappy,
 -- so closing and reopening a window or reloading the plugin keeps its pose.
 function M.attach(id, name)
+  if CONFIG and CONFIG.phone and CONFIG.phone.source_opened then CONFIG.phone.source_opened(name) end
   if M.windows[name:lower()] then name = name:lower() end
   attached[id] = name
   if saved_placements()[name] == 'ground' and type(world) == 'table' and type(world.command) == 'function' then

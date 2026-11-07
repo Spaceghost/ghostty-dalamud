@@ -1,0 +1,17 @@
+require 'core.notification_cache'
+local cache: NotificationCache
+assert(cache:push('local', 10, '{"id":1}'))
+assert(cache:push('remote', 20, '{"id":1}'))
+assert(cache.records[0].nonce == 10 and cache.records[1].source == 'remote')
+cache:remove_source('local')
+assert(#cache.records == 1 and cache.records[0].source == 'remote' and cache.revision == 3)
+local revision = cache.revision
+assert(not cache:push('local', 10, '\xff'))
+assert(not cache:push('local', 10, '{}\0'))
+assert(cache.revision == revision)
+for i=1,70 do assert(cache:push('local', 11, '{}')) end
+assert(#cache.records == 64 and cache.records[0].seq < cache.records[63].seq)
+cache:remove_source('local')
+assert(#cache.records == 0)
+cache:destroy()
+print('notification cache OK')

@@ -10,6 +10,7 @@ require 'core.app.ask'
 require 'core.app.gamelink'
 require 'core.app.netlab'
 require 'core.sys.platform'
+require 'core.phone'
 
 global function update_status(): void
   local sb: stringbuilder
@@ -61,11 +62,20 @@ global function draw_settings(): void
   host.settings_open = open
 end
 
+global function prepare_policy(): boolean
+  local install: string = #boot.install_dir > 0 and boot.install_dir or host.dir
+  local host_name: string = boot.host_kind == HOST_KIND_DALAMUD and 'dalamud' or 'test'
+  local ok, err = policy_prepare_dirs(install, host.dir, boot.configs_root, host_name)
+  if not ok then logf(LOG_ERROR, 'lua reload rejected; keeping the current UI: %s', err) end
+  err:destroy()
+  return ok
+end
+
 global function load_policy(): boolean
   -- plain embedding (tests, gu_init): one directory is both homes
   local install: string = #boot.install_dir > 0 and boot.install_dir or host.dir
   local host_name: string = boot.host_kind == HOST_KIND_DALAMUD and 'dalamud' or 'test'
-  if not policy_load_dirs(install, host.dir, boot.configs_root, host_name) then
+  if not policy_commit_prepared() and not policy_load_dirs(install, host.dir, boot.configs_root, host_name) then
     logf(LOG_ERROR, 'lua config failed: %s', policy.error)
     return false
   end
@@ -85,6 +95,7 @@ global function load_policy(): boolean
     end
   end
   boot_lua_register(policy.L)
+  phone_lua_register(policy.L)
   gallery_lua_register(policy.L) -- ghostty.http_upload / game_string for lua/gallery.lua
   ask_lua_register(policy.L) -- ghostty.ask_spawn / ask_cancel / ask_echo / ask_pin for lua/ask.lua
   gamelink_lua_register(policy.L) -- ghostty.game_lookup / game_action and game icons for lua/asklinks.lua

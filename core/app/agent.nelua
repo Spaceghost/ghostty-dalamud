@@ -105,7 +105,9 @@ global agent_use_fallbacks: function(link: *AgentLink): void
 global function agent_event(ctx: pointer, ev: *AgentEvent): void
   -- every link sets ctx to itself; the local one leaves it nilptr
   local link: *AgentLink = ctx ~= nilptr and (@*AgentLink)(ctx) or &host.local_agent
-  if ev.typ >= PROTO_WLISTR and ev.typ <= PROTO_WGEOM then
+  if ev.typ == PROTO_APP_NOTIFY then
+    host.notifications:push(link.name, link.client.nonce, string{data=(@*[0]byte)(ev.data),size=ev.len})
+  elseif ev.typ >= PROTO_WLISTR and ev.typ <= PROTO_WGEOM then
     if agent_window_event ~= nilptr then agent_window_event(link, ev) end
   elseif ev.typ >= PROTO_NLREPLY and ev.typ <= PROTO_NLFRAME then
     -- the panel speaks NLCTL to the local agent only (core/app/netlab.nelua)
@@ -197,11 +199,32 @@ global function agent_event(ctx: pointer, ev: *AgentEvent): void
     local s = find_agent_session(&link.client, ev.id)
     if s ~= nilptr then s:attached(ev.has_offset, ev.offset) end
   elseif ev.typ == PROTO_ERR then
+    if host.clipboard_writing and ev.req ~= 0 and ev.req == host.clipboard_pending and host.clipboard_client == &link.client then
+      host.clipboard_pending = 0
+      host.clipboard_status = -1
+    end
     -- only logged: failed OPENs and unknown ATTACH ids come as OPENED / EXIT
     logf(LOG_WARN, 'agent: %s', string{data=(@*[0]byte)(ev.data), size=ev.len})
   elseif ev.typ == PROTO_OK then
+    if host.clipboard_writing and ev.req ~= 0 and ev.req == host.clipboard_pending and host.clipboard_client == &link.client then
+      host.clipboard_pending = 0
+      host.clipboard_status = 0
+    end
     -- handshake / attach acks
   elseif ev.typ == PROTO_CLIP then
+    if ev.req ~= 0 then
+      if ev.req == host.clipboard_pending and host.clipboard_client == &link.client then
+        host.clipboard_pending = 0
+        host.clipboard_text:destroy()
+        host.clipboard_status = ev.status
+        host.clipboard_sensitivity_known = ev.sensitivity_known
+        host.clipboard_sensitive = ev.sensitive
+        if ev.status >= 0 and ev.len <= 65536 then
+          host.clipboard_text = string.copy(string{data=(@*[0]byte)(ev.data), size=ev.len})
+        else host.clipboard_status = -1 end
+      end
+      return -- correlated IPC reads must never consume a terminal paste
+    end
     -- the system clipboard arrived for a paste
     if host.paste_agent ~= nilptr and host.paste_agent ~= &link.client then return end
     local target = host.paste_target
@@ -307,6 +330,7 @@ global function agent_extras_teardown(): void
       end
     end
     link.client:destroy()
+    host.notifications:remove_source(link.name)
     link.error_shown:destroy()
     link.label:destroy()
     link.name:destroy()
@@ -423,6 +447,7 @@ end
 
 -- The connection became Ready (first connect or a reconnect).
 function agent_on_ready(link: *AgentLink): void
+  host.notifications:remove_source(link.name) -- old connection events are never replayed on reconnect
   local nonce = link.client.nonce
   -- a different agent process: its session ids mean other shells (or none).
   -- That includes a version 1 agent (nonce 0) replaced by a version 2 one:

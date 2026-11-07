@@ -1,0 +1,21 @@
+require 'string'
+require 'agent.clipboard_policy'
+global ClipboardOffer = @record{
+  generation: uint64,
+  text: string,
+  ready: boolean,
+  sensitive: boolean,
+}
+function ClipboardOffer:select(sensitive: boolean): uint64
+  self.generation = self.generation + 1
+  self.text:destroy()
+  self.ready, self.sensitive = sensitive, sensitive
+  return self.generation
+end
+function ClipboardOffer:complete(generation: uint64, text: string): boolean
+  if generation ~= self.generation or self.sensitive or not clipboard_valid_text(text) then return false end
+  self.text:destroy()
+  self.text = string.copy(text)
+  self.ready = true
+  return true
+end

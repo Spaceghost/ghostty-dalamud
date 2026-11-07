@@ -1,0 +1,19 @@
+require 'agent.sys_posix'
+require 'arg'
+require 'os'
+## cinclude '<stdlib.h>'
+local function setenv(name: cstring, value: cstring, overwrite: cint): cint <cimport, nodecl> end
+assert(#arg == 1, 'synthetic executable helper path required')
+setenv('GHOSTTY_CLIPBOARD_HELPER', (@cstring)(arg[1].data), 1)
+local modes: [8]string = {'safe', 'empty', 'sensitive', 'sensitive-text', 'unknown', 'invalid', 'oversized', 'failed'}
+for index = 0, < #modes do
+  local mode = modes[index]
+  setenv('GHOSTTY_TEST_CLIPBOARD_REPLY', (@cstring)(mode.data), 1)
+  local ok, text, flags = agent_clipboard_get_metadata()
+  if mode == 'safe' then assert(ok and flags == 1 and text == 'fixture text', mode)
+  elseif mode == 'empty' then assert(ok and flags == 1 and #text == 0, mode)
+  elseif mode == 'sensitive' then assert(ok and flags == 3 and #text == 0, mode)
+  else assert(not ok and flags == 0 and #text == 0, mode) end
+  text:destroy()
+end
+print('clipboard helper transport OK')

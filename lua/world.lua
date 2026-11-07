@@ -473,7 +473,7 @@ function M.command(id, args)
     local ang = p.rotation + (tonumber(a[2]) or 0)
     local dist = tonumber(a[3]) or 3
     local x, z = p.x + sin(ang) * dist, p.z + cos(ang) * dist
-    M.anchors[id] = { kind = 'world', zone = p.territory, x = x, y = p.y + (tonumber(a[4]) or 1.7), z = z, yaw = atan(p.x - x, p.z - z) }
+    M.anchors[id] = { kind = 'world', zone = p.territory, x = x, y = p.y + (tonumber(a[4]) or 1.7), z = z, yaw = a[5] and p.rotation + (tonumber(a[5]) or 0) or atan(p.x - x, p.z - z), pitch = tonumber(a[6]) or 0 }
   elseif how == 'me' then
     M.anchors[id] = { kind = 'follow', player = true, forward = tonumber(a[2]) or 2.0, up = tonumber(a[3]) or 1.7, turn = pi }
   elseif how == 'target' then
@@ -490,6 +490,37 @@ function M.command(id, args)
     return 'usage: /term pin [here|me|target|orbit|pet|ground|hud] ...'
   end
   if M.anchor_changed then M.anchor_changed(id, M.anchors[id].kind) end
+  return nil
+end
+
+-- Canonical placement arguments for named layouts. Fixed world pins are saved
+-- relative to the character, so applying a layout in another zone is meaningful.
+function M.placement_args(id)
+  local a = M.anchors[id]
+  if not a then return nil end
+  local function args(kind, ...)
+    local out = {kind}
+    for _, n in ipairs({...}) do
+      if type(n) ~= 'number' or n ~= n or n == math.huge or n == -math.huge then return nil end
+      out[#out + 1] = string.format('%.17g', n)
+    end
+    return table.concat(out, ' ')
+  end
+  if a.kind == 'pet' then return 'pet' end
+  if a.kind == 'ground' then return 'ground' end
+  if a.kind == 'hud' then return args('hud', a.sx or 0.5, a.sy or 0.5, a.dist or M.hud.distance, a.scale or 1) end
+  if a.kind == 'orbit' then return args('orbit', a.radius or 3.5, a.speed or 0.25) end
+  if a.kind == 'follow' then
+    if a.player then return args('me', a.forward or 2, a.up or 1.7) end
+    return args('target', a.up or 3.2)
+  end
+  if a.kind == 'world' then
+    local p = ghostty.player()
+    if not p or a.zone ~= p.territory or not a.x or not a.y or not a.z or not a.yaw then return nil end
+    local dx, dz = a.x - p.x, a.z - p.z
+    return args('at', atan(dx, dz) - p.rotation, math.sqrt(dx*dx + dz*dz), a.y - p.y,
+      a.yaw - p.rotation, a.pitch or 0)
+  end
   return nil
 end
 
@@ -2014,6 +2045,15 @@ function M.place(id, t, focused, held)
   note_focus(id, t, focused)
   local a = M.anchors[id]
   if not a or a.hidden then return nil end
+
+  if M.phone and M.phone.enabled then
+    local p = ghostty.player()
+    local ph = p and M.phone.layout(id, a, p)
+    if not ph then return nil end
+    return placement(a, ph.x, ph.y, ph.z, ph.yaw, 0,
+      a.width or M.defaults.width, a.height or M.defaults.height,
+      ph.ppm, ph.opacity, 0, t)
+  end
 
   if a.kind == 'world' then
     if a.zone and a.zone ~= ghostty.zone() then return nil end

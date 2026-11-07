@@ -12,6 +12,8 @@ global AgentState = @enum(cint){ Disconnected = 0, Connecting, Handshake, Ready,
 global AgentEvent = @record{
   typ: uint8,       -- PROTO_* from the agent
   id: uint32,
+  sensitivity_known: boolean,
+  sensitive: boolean,
   status: int32,    -- EXIT: exit status; CLIP: -1 when the agent has no clipboard for us
   data: *[0]uint8,  -- valid only during the callback
   len: usize,
@@ -55,7 +57,7 @@ global AgentClient = @record{
   nonce: uint64,               -- changes when the agent restarts; 0 = unknown (version 1)
   caps: AgentCaps,             -- what the agent says it can do (core/agent_caps.nelua); known false: it did not say
   attach_fifo: vector(uint32), -- version 1: ATTACH ids waiting for OK "attached" / ERR "no such session"
-  clip_fifo: vector(uint8),    -- CLIP_SET / CLIP_GET waiting for their reply
+  clip_fifo: vector(record{kind: uint8, req: uint32}),    -- CLIP_SET / CLIP_GET waiting for their reply
   clip_off: boolean,           -- the agent does not know clipboard frames: stop sending them
   read_chunks: integer,        -- 16 KiB socket reads per pump; 0 = 8 (window streams ask for more)
   next_job_req: uint32,        -- JOPEN request ids, matched by JOPENED's req
@@ -223,24 +225,29 @@ end
 
 -- The host's system clipboard (the desktop the agent runs on). An agent that
 -- answers these with ERR "unknown frame" gets no more of them on this connection.
-function AgentClient:clip_set(text: string): void
+function AgentClient:clip_set_for(req: uint32, text: string): void
   if self.state ~= AgentState.Ready or self.clip_off then return end
   proto.write_frame(&self.outq, PROTO_CLIP_SET, (@*[0]uint8)(text.data), text.size)
-  self.clip_fifo:push(PROTO_CLIP_SET)
+  self.clip_fifo:push({kind=PROTO_CLIP_SET, req=req})
 end
+
+function AgentClient:clip_set(text: string): void self:clip_set_for(0, text) end
 
 -- Answered by a CLIP event; its status is -1 (and no text) when the agent has
 -- no clipboard for us, so the caller can fall back to its own.
-function AgentClient:clip_get(): void
+function AgentClient:clip_get_for(req: uint32): void
   if self.state ~= AgentState.Ready then return end
   if self.clip_off then
-    local ev: AgentEvent = { typ = PROTO_CLIP, status = -1 }
+    local ev: AgentEvent = { typ = PROTO_CLIP, status = -1, req = req }
     emit(self, &ev)
     return
   end
-  proto.write_frame(&self.outq, PROTO_CLIP_GET, nilptr, 0)
-  self.clip_fifo:push(PROTO_CLIP_GET)
+  local metadata = 'metadata'
+  proto.write_frame(&self.outq, PROTO_CLIP_GET, req ~= 0 and (@*[0]uint8)(metadata.data) or nilptr, req ~= 0 and metadata.size or 0)
+  self.clip_fifo:push({kind=PROTO_CLIP_GET, req=req})
 end
+
+function AgentClient:clip_get(): void self:clip_get_for(0) end
 
 function AgentClient:list(): void
   if self.state ~= AgentState.Ready then return end
@@ -324,6 +331,23 @@ end
 function AgentClient:wlist(): boolean
   if not self:windows_ok() then return windows_refuse(self) end
   proto.write_frame(&self.outq, PROTO_WLIST, nilptr, 0)
+  return true
+end
+
+function AgentClient:wlist_icons(pixels: integer, names: string): boolean
+  if not self:windows_ok() then return windows_refuse(self) end
+  local payload = string.format('icons %d\n%s', pixels, names)
+  proto.write_frame(&self.outq, PROTO_WLIST, (@*[0]uint8)(payload.data), payload.size)
+  payload:destroy()
+  return true
+end
+
+function AgentClient:wlist_apps_size(pixels: integer): boolean
+  if not self:windows_ok() then return windows_refuse(self) end
+  if pixels < 16 or pixels > 512 then return false end
+  local what = string.format('apps %d', pixels)
+  proto.write_frame(&self.outq, PROTO_WLIST, (@*[0]uint8)(what.data), what.size)
+  what:destroy()
   return true
 end
 
@@ -511,11 +535,11 @@ local function parse_greeting(self: *AgentClient, text: string): void
 end
 
 -- A clipboard request got its reply: which kind it was (0 when none waited).
-local function clip_reply(self: *AgentClient): uint8
-  if #self.clip_fifo == 0 then return 0 end
-  local kind = self.clip_fifo[0]
+local function clip_reply(self: *AgentClient): (uint8, uint32)
+  if #self.clip_fifo == 0 then return 0, 0 end
+  local request = self.clip_fifo[0]
   self.clip_fifo:remove(0)
-  return kind
+  return request.kind, request.req
 end
 
 local function dispatch(self: *AgentClient): void
@@ -534,14 +558,18 @@ local function dispatch(self: *AgentClient): void
         ev = { typ = PROTO_ATTACHED, id = self.attach_fifo[0] }
         self.attach_fifo:remove(0)
       elseif text == 'clipboard set' then
-        clip_reply(self)
+        local _, req = clip_reply(self)
+        ev.req = req
       end
     elseif typ == PROTO_ERR then
       if self.state == AgentState.Handshake then
         set_error(self, text)
         handshake_failed = true
-      elseif (text == 'unknown frame' or text == 'clipboard unavailable') and #self.clip_fifo > 0 then
-        local kind = clip_reply(self)
+      elseif #self.clip_fifo > 0 and (text == 'unknown frame' or text == 'clipboard unavailable'
+          or (text == 'not permitted: this peer may not read the clipboard' and self.clip_fifo[0].kind == PROTO_CLIP_GET)
+          or (text == 'not permitted: this peer may not set the clipboard' and self.clip_fifo[0].kind == PROTO_CLIP_SET)) then
+        local kind, req = clip_reply(self)
+        ev.req = req
         if text == 'unknown frame' then
           deliver = false -- said once below, not for every request still on its way
           if not self.clip_off then
@@ -553,7 +581,7 @@ local function dispatch(self: *AgentClient): void
         end
         if kind == PROTO_CLIP_GET then
           if deliver then emit(self, &ev) end
-          ev = { typ = PROTO_CLIP, status = -1 } -- the paste still gets its answer
+          ev = { typ = PROTO_CLIP, status = -1, req = req } -- the paste still gets its answer
           deliver = true
         end
       elseif self.version < 2 and text == 'no such session' and #self.attach_fifo > 0 then
@@ -577,7 +605,19 @@ local function dispatch(self: *AgentClient): void
         deliver = false -- malformed: an OPENED without an id must not take a waiting session
       end
     elseif typ == PROTO_CLIP then
-      clip_reply(self)
+      local _, req = clip_reply(self)
+      ev.req = req
+    elseif typ == PROTO_CLIP_META then
+      local _, req = clip_reply(self)
+      ev.typ, ev.req = PROTO_CLIP, req
+      if len < 1 or payload[0] > 3 then
+        ev.status, ev.data, ev.len = -1, nilptr, 0
+      else
+        ev.sensitivity_known = payload[0] & 1 ~= 0
+        ev.sensitive = payload[0] & 2 ~= 0
+        ev.data, ev.len = &payload[1], len - 1
+        if ev.sensitive then ev.data, ev.len = nilptr, 0 end
+      end
     elseif typ == PROTO_WOPENED then
       -- req, sid, w, h, title (sid 0: refused, the text says why)
       if len >= 12 then

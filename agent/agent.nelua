@@ -21,7 +21,7 @@
 --
 -- Usage: ghostty-agent [--listen 127.0.0.1:7777] [--iroh] [--token-file PATH]
 --                      [--clipboard-file PATH] [--replay-bytes N] [--term xterm-256color]
---                      [--windows auto|off|test|wayland|win32|mac]
+--                      [--windows auto|off|test|wayland|portal|win32|mac]
 --                      [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|gpu|none]
 --                      [--wayland-browser CMD] [--wayland-browser-profile NAME]
 --                      [--iroh [--iroh-secret PATH] [--iroh-allowlist PATH]]
@@ -209,6 +209,25 @@ end
 
 local function send_text(c: *Client, typ: uint8, text: string): void
   proto.write_frame(&c.outq, typ, (@*[0]uint8)(text.data), text.size)
+end
+
+local function pump_notifications(): void
+  ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
+  for turn=1,8 do
+    local event = capture_wayland_notification_pop()
+    if #event == 0 then break end
+    for wi=0,<#windows.watchers do
+      local ci = windows.watchers[wi]
+      if ci < #agent.clients then
+        local c = &agent.clients[ci]
+        if c.authed and (c.caps & CAP_WINDOWS) ~= 0 and c.outq:len() <= 262144 then
+          send_text(c, PROTO_APP_NOTIFY, event)
+        end
+      end
+    end
+    event:destroy()
+  end
+  ## end
 end
 
 local function find_session(id: uint32): *Session
@@ -527,8 +546,25 @@ local function handle_frame(ci: usize, typ: uint8, payload: *[0]uint8, len: usiz
       send_text(c, PROTO_ERR, 'clipboard unavailable')
     end
   elseif typ == PROTO_CLIP_GET then
-    local ok, text = clipboard_get()
-    if ok then send_text(c, PROTO_CLIP, text) else send_text(c, PROTO_ERR, 'clipboard unavailable') end
+    local metadata = string{data=(@*[0]byte)(payload), size=len} == 'metadata'
+    local ok: boolean
+    local text: string
+    local flags: uint8 = 0
+    if metadata and #agent.clip_file == 0 then
+      ## if CAPTURE_BUILT.wayland and ccinfo.is_linux then
+      if capture_wayland_clipboard_uses_host() then ok, text, flags = agent_clipboard_get_metadata()
+      else ok, text, flags = capture_wayland_clipboard_snapshot() end
+      ## else
+      ok, text, flags = agent_clipboard_get_metadata()
+      ## end
+    else ok, text = clipboard_get() end
+    if ok then
+      if metadata then
+        local body = string.copy(string{data=(@*[0]byte)(&flags), size=1}) .. text
+        send_text(c, PROTO_CLIP_META, body)
+        body:destroy()
+      else send_text(c, PROTO_CLIP, text) end
+    else send_text(c, PROTO_ERR, 'clipboard unavailable') end
     text:destroy()
   elseif typ == PROTO_HELLO then
     send_text(c, PROTO_OK, 'already authenticated')
@@ -853,12 +889,12 @@ end
 -- (docs/REMOTE_WINDOWS.md "Opening URLs").
 -- the reason in pieces, so none of them has to be concatenated (and leaked) first
 local function open_url_fail(...: varargs): integer
-  io.stderr:write('ghostty-agent --open-url: ', ...)
+  io.stderr:write('ghostty-agent window request: ', ...)
   io.stderr:write('\n')
   return 1
 end
 
-local function open_url_client(listen_spec: string, token_path: string, url: string): integer
+local function open_url_client(listen_spec: string, token_path: string, requested_match: string): integer
   ## if ccinfo.is_windows then
   return open_url_fail('links open in the Linux compositor only')
   ## else
@@ -893,7 +929,7 @@ local function open_url_client(listen_spec: string, token_path: string, url: str
   proto.write_frame(&outq, PROTO_HELLO, (@*[0]uint8)(token.data), token.size)
   local req: uint32 = 1
   do
-    local match = 'url:' .. url
+    local match = string.copy(requested_match)
     local body: vector(uint8)
     body:resize(13 + match.size)
     local b = (@*[0]uint8)(&body[0])
@@ -1028,6 +1064,7 @@ local function main(): integer
   local browser_profile: string = '' -- empty: GHOSTTY_WAYLAND_BROWSER_PROFILE, else the browser's own profile
   local open_url: string = ''       -- --open-url: a client of the running agent, not an agent
   local has_open_url = false
+  local send_to_game = false
   local listen_given = false
   local iroh_on = false             -- --iroh: listen over iroh as well as TCP
   local iroh_secret: string = ''    -- --iroh-secret PATH: empty means an ephemeral key
@@ -1042,6 +1079,7 @@ local function main(): integer
   while i <= #arg do
     local a = arg[i]
     if a == '--listen' and i < #arg then listen_spec = arg[i+1] listen_given = true i = i + 1
+    elseif a == '--send-to-game' then send_to_game = true
     elseif a == '--open-url' and i < #arg then open_url = arg[i+1] has_open_url = true i = i + 1
     elseif a == '--wayland-browser' and i < #arg then browser = arg[i+1] i = i + 1
     elseif a == '--wayland-browser-profile' and i < #arg then browser_profile = arg[i+1] i = i + 1
@@ -1063,6 +1101,7 @@ local function main(): integer
       io.write('usage: ghostty-agent [--listen HOST:PORT] [--token-file PATH] [--clipboard-file PATH] [--replay-bytes N] [--term NAME] [--windows NAME] [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|gpu|none] [--wayland-browser CMD] [--wayland-browser-profile NAME] [--wireguard auto|on|off|always] [--wireguard-config PATH] [--allow-insecure-listen]\n',
                '                     [--iroh] [--iroh-secret PATH] [--iroh-allowlist PATH]\n',
                '       ghostty-agent [--listen HOST:PORT] [--token-file PATH] --open-url URL\n',
+               '       ghostty-agent [--listen HOST:PORT] [--token-file PATH] --send-to-game\n',
                '       ghostty-agent pair [--host SAFE_ADDRESS] [--port N] [--token-file PATH]\n',
                '       ghostty-agent wg add NAME [--endpoint HOST[:PORT]] | list | show | remove NAME | forward ... | unforward ...\n')
       return 0
@@ -1072,7 +1111,12 @@ local function main(): integer
     end
     i = i + 1
   end
-  if has_open_url then return open_url_client(listen_given and listen_spec or '', token_path, open_url) end
+  if send_to_game and has_open_url then
+    io.stderr:write('--send-to-game and --open-url are separate requests\n')
+    return 2
+  end
+  if send_to_game then return open_url_client(listen_given and listen_spec or '', token_path, 'portal:') end
+  if has_open_url then return open_url_client(listen_given and listen_spec or '', token_path, 'url:' .. open_url) end
   if #token_path == 0 then token_path = agent_default_token_path() end
   if wg_mode ~= 'auto' and wg_mode ~= 'on' and wg_mode ~= 'off' and wg_mode ~= 'always' then
     io.stderr:write('--wireguard takes auto, on, off or always\n')
@@ -1292,6 +1336,7 @@ local function main(): integer
     for ci = 0, < #agent.clients do pump_client(ci) end
     for si = 0, < #agent.sessions do pump_session(si) end
     windows:pump()
+    pump_notifications()
     windows:tick(os.now())
     jobs:pump(os.now())
     clips:tick(os.now())
@@ -1387,6 +1432,7 @@ local function main(): integer
     for ci = 0, < #agent.clients do pump_client(ci) end
     for si = 0, < #agent.sessions do pump_session(si) end
     windows:pump()
+    pump_notifications()
     windows:tick(os.now())
     jobs:pump(os.now())
     clips:tick(os.now())

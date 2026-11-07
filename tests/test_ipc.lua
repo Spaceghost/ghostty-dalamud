@@ -107,6 +107,13 @@ do
   eq(call({ method = 'agent.status' }).result, { connected = false })
   eq(call('{"method":"status","params":null}').result, 'ghostty 2')
   assert(#queued == 0, 'reads queue nothing')
+  do
+    local previous = snap
+    snap = json.encode({ agent_notifications = { rev = 2, events = json.array({ { seq = 2, source = 'local', nonce = 10, kind = 'closed', id = 7 } }) } })
+    local notifications = call({ method = 'agent.notifications' }).result
+    assert(notifications.rev == 2 and notifications.events[1].id == 7 and #queued == 0, 'notification snapshot is a read-only IPC method')
+    snap = previous
+  end
 
   -- changes: checked, queued, ids increasing
   local r1 = call({ method = 'window.open', params = { run = 'yad --title x' }, caller = 'XivDesktop' })
@@ -156,6 +163,14 @@ do
   refused({ method = 'window.hide', params = { hidden = true } }, 'id must be')
   refused({ method = 'window.toggle_pet', params = { id = -1 } }, 'id must be')
   refused({ method = 'agent.windows.refresh', params = { agent = 'other' } }, 'default')
+  refused({method='agent.clipboard.write', params={text='bad\0text'}}, 'clipboard text')
+  refused({method='agent.clipboard.write', params={text=string.rep('x',65537)}}, 'clipboard text')
+  refused({ method = 'agent.icons.render', params = { size=0, icons={'x'} } }, 'size')
+  refused({ method = 'agent.icons.render', params = { size=48, icons={'x\nother'} } }, 'icon name')
+  refused({ method = 'agent.icons.render', params = { size=48, icons={} } }, 'icons')
+  refused({ method = 'agent.windows.refresh', params = { icon_size = 0 } }, 'icon_size')
+  refused({ method = 'agent.windows.refresh', params = { icon_size = 513 } }, 'icon_size')
+  refused({ method = 'agent.windows.refresh', params = { icon_size = '64' } }, 'icon_size')
   refused({ method = 'terminal.new', params = { profile = 0 } }, 'profile must be')
   refused({ method = 'terminal.new', params = { profile = '' } }, 'profile must not be empty')
   refused({ method = 'terminal.new', params = { profile = true } }, 'profile must be a string')
@@ -247,6 +262,26 @@ do
     agent_apps = json.array(), focus = { id = 0 }, panels = json.array() })
   assert(json.decode(ipc.snapshot()).rev == s1.rev, 'nothing changed: the same rev')
 
+  do
+    local message = { kind = 'notification', id = 7, app = 'Fixture', desktop_entry = 'fixture.desktop', summary = 'Synthetic title', body = 'Synthetic body', urgency = 1 }
+    ghostty.agent_notifications = function() return { rev = 5, events = {
+      { seq = 1, source = 'local', nonce = 10, payload = json.encode(message) },
+      { seq = 2, source = 'local', nonce = 10, payload = '{malformed' },
+      { seq = 3, source = 'local', nonce = 10, payload = json.encode({ kind = 'notification', id = 0 }) },
+      { seq = 4, source = 'local', nonce = 10, payload = json.encode({ kind = 'notification', id = 8, app = '', desktop_entry = '', summary = '', body = string.rep('x', 4097), urgency = 1 }) },
+      { seq = 5, source = 'remote', nonce = 20, payload = '{"kind":"closed","id":7}' },
+      { seq = 6, source = 'local', nonce = 10, payload = json.encode(message) },
+    } } end
+    local notifications = json.decode(ipc.snapshot()).agent_notifications
+    assert(notifications.rev == 5 and #notifications.events == 2, 'invalid notification events are filtered')
+    local first = notifications.events[1]
+    assert(first.seq == 1 and first.source == 'local' and first.nonce == 10 and first.body == 'Synthetic body')
+    assert(notifications.events[2].kind == 'closed' and notifications.events[2].source == 'remote')
+    ghostty.agent_notifications = function() error('fixture getter failed') end
+    assert(json.decode(ipc.snapshot()).agent_notifications == nil, 'optional getter failure leaves snapshot usable')
+    ghostty.agent_notifications = nil
+  end
+
   ipc.run(queued[1]) -- window.open run yad, for XivDesktop
   assert(calls[1].run == 'yad --title x' and calls[1].caller == 'XivDesktop')
   local s2 = json.decode(ipc.snapshot())
@@ -309,12 +344,19 @@ do
   local seen = {}
   ghostty.panel_hide = function(id, hidden) seen.hide = { id, hidden } return true end
   ghostty.panel_toggle_pet = function(id) seen.toggle = id return nil, 'not a world terminal' end
-  ghostty.agent_windows_refresh = function() seen.refresh = true return true end
+  ghostty.agent_clipboard_write = function(text) seen.clipboard_text = text return 74 end
+  ghostty.agent_clipboard_read = function() return 73 end
+  ghostty.agent_icons_render = function(size, names) seen.icons_size = size seen.icons_names = names return true end
+  ghostty.agent_windows_refresh = function(size) seen.refresh = true seen.icon_size = size return true end
   ghostty.terminal_new = function(t) seen.new = t return 31 end
   assert(run('window.hide', { id = 21, hidden = false }, 310).ok and seen.hide[1] == 21 and seen.hide[2] == false)
   q = run('window.toggle_pet', { id = 21 }, 311)
   assert(not q.ok and q.error == 'not a world terminal' and seen.toggle == 21)
   assert(run('agent.windows.refresh', {}, 312).ok and seen.refresh)
+  assert(run('agent.windows.refresh', {icon_size = 64}, 313).ok and seen.icon_size == 64)
+  assert(run('agent.clipboard.write', {text='notes'}, 316).result.request == 74 and seen.clipboard_text == 'notes')
+  assert(run('agent.clipboard.read', {}, 315).result.request == 73)
+  assert(run('agent.icons.render', {size=48, names='custom.svg\nother icon\n'}, 314).ok and seen.icons_size == 48 and seen.icons_names == 'custom.svg\nother icon\n')
   q = run('terminal.new', { profile = 2 }, 313)
   assert(q.ok and q.result.id == 31 and seen.new.profile == '2' and seen.new.pin == nil, 'a numeric profile goes as text')
   -- panel.*: every panel, the view each is in, and the changes reaching ghostty.panel_*
@@ -375,5 +417,13 @@ do
   assert(run('panel.order', { id = 41, to = 'first' }, 409).ok and seen.cmd[1] == 41 and seen.cmd[2] == 'order first')
   q = run('panel.order', { id = 42, to = 'last' }, 410)
   assert(not q.ok and q.error:find('only pets'), 'a pin has no place in the order')
+  world.placement_args = function(id) return 'hud 0.2 0.7 2.4 0.9' end
+  local placed = json.decode(ipc.snapshot())
+  for _, w in ipairs(placed.windows) do assert(w.pin == 'hud 0.2 0.7 2.4 0.9', 'window placement reaches IPC') end
+  assert(#placed.panels > 0)
+  for _, p in ipairs(placed.panels) do assert(p.pin == 'hud 0.2 0.7 2.4 0.9', 'panel placement reaches IPC') end
+  world.placement_args = function() return nil end
+  local missing = json.decode(ipc.snapshot())
+  for _, w in ipairs(missing.windows) do assert(w.pin == json.null, 'unsupported placement is distinguishable from old policy') end
   print('ipc frame side OK')
 end

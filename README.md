@@ -30,6 +30,11 @@ plugin does not fetch the catalogue in the background.
 
 ## Design
 
+The experimental [phone shell](docs/PHONE.md) adds `/phone`: summon the device,
+project supported UI in front of the character, and phase a focused panel onto
+the 2D HUD. Native game-window migration and xivspell consolidation remain
+unfinished; the coverage table records the current implementation.
+
 The terminal uses [libghostty-vt](https://github.com/ghostty-org/ghostty) for VT
 state and renders into Dalamud's ImGui draw lists. The repository contains a
 Quake-style drop-down, floating windows, world panels, selection and keyboard
@@ -915,14 +920,15 @@ Works from macros and hotbars:
 
 ## Controller
 
-`toggle_gamepad_button` (default `select`: the Xbox View button; on a
-DualSense, Dalamud reports the touchpad click as `select`). Tap shows or hides
+`toggle_gamepad_button` defaults to an empty string, leaving the controller to
+FFXIV. You can opt in with `select` (the Xbox View button; on a DualSense,
+Dalamud reports the touchpad click as `select`). Tap shows or hides
 the drop-down; hold steps to the next terminal and repeats while held; double
 tap goes to the previous one. Valid names: `dpad_up dpad_down dpad_left
 dpad_right north south west east l1 l2 l3 r1 r2 r3 select start create`. An
 empty string disables it.
 
-Controller input inside a focused terminal is enabled by default. Settings →
+Controller input inside a focused terminal is off by default. Settings →
 Keys & controller selects one of these layouts:
 
 | Layout | Intended use |
@@ -935,13 +941,9 @@ Keys & controller selects one of these layouts:
 
 Mapped buttons repeat for `key:` and `text:` bindings; terminal actions such
 as `new_tab`, `paste` and `next_tab` fire once unless a mapping explicitly
-sets `repeat = true`. While a terminal has focus, `controller.capture = true`
-uses Dalamud's `IGamepadState.EnableGamepadNav` service to prevent mapped input,
-including both analogue sticks, from reaching FFXIV. It releases capture as
-soon as focus leaves the terminal and never clears capture it did not enable.
-While the terminal is focused, ImGui gamepad navigation is also explicitly
-prevented from positioning the mouse cursor; any pre-existing preference is
-restored afterward.
+sets `repeat = true`. Ghostty reads mapped buttons while a terminal is focused
+without enabling Dalamud gamepad mode or blocking controller input to FFXIV.
+The game still receives those button presses.
 
 Layouts and their metadata live in `lua/controllers.lua`. A file with that
 name in the plugin config directory takes precedence over the shipped module,
@@ -1283,11 +1285,11 @@ The info-bar entry opens the drop-down on click, the popup on right-click,
 a window on Shift+click, and world screens on Ctrl+click. The optional widget
 uses the same plugin services rather than another terminal core.
 
-Controller gestures default to the game's `select` button: tap to toggle,
-hold to advance, double-tap to go back. On a DualSense, this is the touchpad
-click, not Create. The optional `create` setting uses Windows HID reports;
-its Wine/controller behavior remains unverified. The normal default does not
-open a HID device. Disable controller handling with an empty setting.
+Controller gestures are off by default. Opt in with `select` to tap to toggle,
+hold to advance, and double-tap to go back. On a DualSense, `select` is the
+touchpad click, not Create. The optional `create` setting uses Windows HID
+reports; its Wine/controller behavior remains unverified. The normal default
+does not open a HID device.
 
 ## Experimental rendering
 
@@ -1329,3 +1331,9 @@ Built on Ghostty/libghostty-vt, Nelua, Lua, Dalamud, gc-cimgui, FFXIVClientStruc
 and Umbra. Preserve their licenses and contributor attribution when distributing
 builds. Do not infer a project license or official approval from dependency
 licenses or a successful build.
+
+Named layouts can read canonical `pin` arguments from the optional field in `window.list` and `panel.list`. Fixed anchors include position and orientation relative to the current player; pins in another territory report null. `at ANGLE DIST HEIGHT [YAW PITCH]` restores that relative pose, and existing three-argument commands retain their behavior. Host coverage: `tests/test_plate_placement.lua` and the IPC frame suite. In-game behavior remains unverified.
+
+SVG app icons are rendered by the existing host background icon job when a renderer is available. Cached icon names now include a fingerprint of the source path, nanosecond modification metadata (where supported), source size and raster size, so app updates and theme changes select a fresh PNG. Host coverage includes source identity, metadata changes and actual ImageMagick SVG rendering in tests/test_desktop_entries.nelua. The compositor-specific call site still needs compilation with matching libwlroots-0.20; Sized app-list requests now route through refresh IPC; arbitrary XivDesktop SVG-only icon routing remains unfinished.
+
+`tools/check-wayland-source.sh` analyzes the actual Wayland-enabled agent and generates C even on hosts without wlroots 0.20. This verifies the sized-icon callback and dispatch at the Nelua type level; it does not compile/link the native output or establish compositor runtime behavior. The current host has wlroots 0.19, so matching native integration remains outstanding.

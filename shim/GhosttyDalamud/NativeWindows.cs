@@ -33,6 +33,7 @@ internal static unsafe class NativeWindows
     private const int NotStarted = 0, Starting = 1, Ready = 2, Failed = 3;
     private static volatile int _path;
     internal static volatile bool Stopping;
+    internal static Task StartupTask { get; private set; } = Task.CompletedTask;
 
     // Plugin start: KamiToolKit comes up in the background; until then the core waits.
     public static void Start()
@@ -41,7 +42,8 @@ internal static unsafe class NativeWindows
         Stopping = false;
         Task started;
         try { started = StartKami(); }
-        catch (Exception e) { StartFailed(e); return; }
+        catch (Exception e) { StartupTask = Task.FromException(e); StartFailed(e); return; }
+        StartupTask = started;
         // no await here: these classes are unsafe, and an unsafe context cannot await
         started.ContinueWith(t => {
             if (t.IsCompletedSuccessfully) _path = Stopping ? Failed : Ready;
