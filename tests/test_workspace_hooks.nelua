@@ -1,0 +1,37 @@
+-- Lua/native workspace hook stack and fallback behavior, without the game.
+require 'core.host'
+require 'core.policy'
+require 'arg'
+local api: GuHostApi = { size = #GuHostApi }
+local dir: string = arg[1]
+assert(gu_init(&api, (@cstring)(dir.data)) == 0)
+local L = policy.L
+local before = lua_gettop(L)
+policy_workspace_tick(1)
+local name, colour = policy_workspace_nameplate(1)
+assert(#name == 0 and colour == 0x7dcfff)
+name:destroy()
+assert(lua_gettop(L) == before)
+local code: cstring = [[
+CONFIG.workspace = {
+ tick = function(now) error('expected workspace hook failure') end,
+ nameplate = function(id) return 'host / tab / nested 1', 0x9ece6a end,
+}
+]]
+assert(luaL_loadstring(L, code) == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
+for i = 1, 500 do
+  policy_workspace_tick(i)
+  local text, rgb = policy_workspace_nameplate(i)
+  assert(text == 'host / tab / nested 1' and rgb == 0x9ece6a)
+  text:destroy()
+  assert(lua_gettop(L) == before, 'workspace hooks must balance the Lua stack even on errors')
+end
+assert(luaL_loadstring(L, 'CONFIG.workspace.nameplate = function() error("expected nameplate failure") end') == LUA_OK and lua_pcall(L, 0, 0, 0) == LUA_OK)
+for _ = 1, 100 do
+  local text, _ = policy_workspace_nameplate(1)
+  assert(#text == 0)
+  text:destroy()
+  assert(lua_gettop(L) == before)
+end
+gu_shutdown()
+print('workspace native hooks: success/failure paths and stack balance OK')

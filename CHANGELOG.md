@@ -19,6 +19,28 @@ NEW and FIX have been seen working in game and await a release. BETA is built an
 
 ### Merged, not yet verified in game
 
+* The agent now preserves mouse tracking and SGR coordinate modes independently of its bounded output history. A reset-and-replay restores the current settings, including explicit disables, even after startup escapes have scrolled out of the replay buffer. This fixes silent loss of Neovim clicks after reconnecting to a long-running terminal. Regression tests cover chunked mode changes, truncated replay, ignored title/graphics payloads and the real agent replay path. Updated agent code takes effect on its next restart; existing sessions can recover immediately by toggling Neovim mouse off and on. The running game was verified opening a new tab from a mouse press and release through the game window.
+* Dropdown and floating terminals now send mouse presses, releases and drags to programs that request them, including Neovim tab buttons. Previously these clicks always selected terminal text, so a new-tab button never received its click. Shift retains terminal text selection; a drag started in the grid keeps its release even outside the terminal. Host tests cover button identity, tabline press/release bytes, drag ownership and selection override; Windows cross-build passes. Live click verification is pending.
+
+### Being built
+
+* Mappy's map goes straight into the world: it becomes a pet the frame its window opens and is never drawn on the flat UI first. Before, whenever the game drew Mappy after Ghostty the map was never seen open and stayed flat. Host tests only; not yet tried in game.
+* Calmer, cuter pets: they follow smoothly without overshooting, bob gently on their own slow beat, keep a small tilt of their own, stack fanned out and peeking over each other instead of standing in columns, and squash a little only when they bump or land. A pet you are typing into or pointing at holds perfectly still so you can read it. Settings, Pets has the knobs; Reduce motion turns it all off. Host tests only; not yet tried in game.
+* Clean first build: the toolchain and the Dalamud references it compiles against are pinned and checked before use, the default shell is chosen per platform, and a fresh clone builds with nothing else installed.
+* Emoji, CJK and other wide glyphs drawn through the same fallback, with Noto Sans Symbols 2 and an optional monochrome Noto Emoji you drop in yourself.
+
+## [0.3.2] — Released 2026-09-27
+
+BETA entries are in this release but have not been verified in game yet; they become NEW or FIX once they have been seen working.
+
+* Ghostty no longer turns on Dalamud gamepad mode, which covered the game with a gray notice and blocked normal controller input. Controller shortcuts and terminal mappings now start off, so FFXIV keeps the full controller. You can opt in to Ghostty shortcuts in Settings without taking the controller away from the game. Host tests pass; the fix has not yet been tried in game.
+
+## [0.3.1] — Released 2026-09-27
+
+BETA entries are in this release but have not been verified in game yet; they become NEW or FIX once they have been seen working.
+
+### Merged, not yet verified in game
+
 * Terminal graphics use the Kitty graphics protocol: inline RGB/RGBA and PNG images are decoded, kept in a bounded GPU cache and drawn in Kitty's below-background, below-text and above-text layers. It works in every Ghostty terminal surface; sixels are not needed. Host renderer and Windows cross-build tests pass; not yet tried in game.
 * Focusing or typing in a terminal never changes, holds or pauses your character animation. An upgrade clears a pose left by an older build once, then terminal focus has no character-animation side effects at all. Host tests only; not yet tried in game.
 * Add another terminal host without editing Lua: Settings, Agent hosts pairs with a machine over SSH key authentication, keeps its token in an owner-only generated file, and adds bash and tmux to the + menu after /term reload. The default link is the actual game host, named from its hostname; every terminal and game-window title carries its host decoration, and a new window inherits the host of the window that created it. Passwords are never captured and manually configured hosts are left alone. Host tests only; not yet tried in game.
@@ -28,9 +50,12 @@ NEW and FIX have been seen working in game and await a release. BETA is built an
 
 * Ground placement for chat, Mappy and other world panels: /term pin ground lays the focused panel flat at your feet and keeps its top pointed along the camera's horizontal view as you turn and walk. Chat and Mappy remember this placement when reopened or reloaded; /term pin pet returns them to floating pets. Seen working in game with chat and Mappy. Look down or use third-person view to read a panel under your feet.
 
-### Merged, not yet verified in game
+### Fixed
 
 * Terminals open on Linux again when the game runs under a Wine that hides it is Wine: XIVLauncher's own Wine (and many Proton builds) hides the marker the plugin looked for, so it took Linux for Windows and kept starting Wine's stand-in PowerShell, which closes at once. It now also recognises Wine by its path to your Linux files and by its registry, and opens your shells through ghostty-agent. Under Wine it also finds the agent's token in your Linux home (Wine gives the game no HOME, so it read the Wine prefix's C:\users folder and the agent answered "bad token"). Seen connecting in game with XIVLauncher's wine-xiv 10.8.
+
+### Merged, not yet verified in game
+
 * The DualSense for terminals: set the controller button to ps and the PS button shows and hides the dropdown (ctrl+`), and pressed twice starts voice input: say it, press twice again, and what you said is pasted into the terminal for you to check (the agent listens and writes it down with ghostty-voice and whisper.cpp). It only ever listens to a controller's microphone, or one you choose in Settings from the microphones the agent's machine has; the controller's mute button mutes it, the game remembers that while you play, and every game starts muted. The touchpad types into the terminal that has the keyboard: swipe for arrow keys, one per step of the swipe, and hold at an edge to repeat; click for Enter, double click to delete a word, hold the click to keep deleting. Host tests only; not yet tried in game.
 * Pets follow you into a teleport: casting Teleport or Return, they are drawn in after you over the last moment of the cast, spiralling into you as they shrink and fade, gone before the screen goes black, and they pop back out once you arrive. A cast cut short lets them float back. With Reduce motion they simply fade in to you. Host tests only; not yet tried in game.
 * Richer /ask answers: headings, bold and italic, lists and checklists, tables, quotes and code blocks with a copy button, word-wrapped to the panel and faded in as they stream. Links everywhere: web pages open in your browser on click; map coordinates, zones and aetherytes put a flag on the map and open it; items link into your chat input (never sent); quests open in your journal and duties in the Duty Finder, with the game's own icons and tooltips; slash commands go into your chat input and only run after you press Run (chat is never sent). Two or three follow-up questions sit under each answer, and a right-click on one asks it in a new conversation that links back. Nothing acts in combat. Host tests only; not yet tried in game.
@@ -46,20 +71,7 @@ NEW and FIX have been seen working in game and await a release. BETA is built an
 * A camera that hovers around you: /cam puts one on an orbit beside your character, and /cam shot makes the view its view, so it frames you instead of looking out of your eyes. Move it with left, right, up, down, in and out, set it circling with orbit, and turn the shot off to have the view eased back exactly where it was found. The game draws one view, so the camera borrows it rather than adding a second one; taking a picture from it without disturbing your own view is the next piece. Presenting a screen takes the camera back. Not yet tried in game.
 * The camera takes pictures for other plugins: cam.shoot over GhosttyDalamud.v1.Call swings the camera to a pose you give it, photographs you from there, and puts your view back where it was, so a plugin can get a front-angle picture of your character without taking your camera away. /cam shoot does the same by hand. The whole round trip is a handful of frames. Not yet tried in game.
 * Take a meeting from inside the game: /cam zoom puts the game on a camera device on your Linux host, so Zoom, Meet or anything else that opens a webcam opens the game instead. The frames go straight out through v4l2loopback with nothing recorded, and frames the device cannot keep up with are dropped rather than queued, so the game never waits for the call. Needs the v4l2loopback module loaded with exclusive_caps on, or nothing can open the device. Linux hosts only. Not yet tried in game.
-
-### Being built
-
-* Mappy's map goes straight into the world: it becomes a pet the frame its window opens and is never drawn on the flat UI first. Before, whenever the game drew Mappy after Ghostty the map was never seen open and stayed flat. Host tests only; not yet tried in game.
-
-### Merged, not yet verified in game
-
 * Pets hang on walls like paintings: a pet whose place would be in a wall flattens against it, turned to face out from the wallpaper, and slides along it beside you as you walk; when its place is clear again it peels off and floats back. No more squeezing, floating over or blinking out and back in. Posts, stalks and clutter are left alone (the game draws them across the screen), a stray answer from the game's collision is never taken for a wall, and it keeps clear of corners and alcoves. Mobs and NPCs are kept clear of as they come (a short one walks under a pet as it tucks up its hem); other players walking past are let pass. /term world rays and /term world anim show what they see and do. Settings: how quickly it flattens and peels, and how clear its place must be before it lets go. Host tests cover walls, corners, alcoves, doorways, corridors, clutter and noise; not yet seen in game.
-
-### Being built
-
-* Calmer, cuter pets: they follow smoothly without overshooting, bob gently on their own slow beat, keep a small tilt of their own, stack fanned out and peeking over each other instead of standing in columns, and squash a little only when they bump or land. A pet you are typing into or pointing at holds perfectly still so you can read it. Settings, Pets has the knobs; Reduce motion turns it all off. Host tests only; not yet tried in game.
-* Clean first build: the toolchain and the Dalamud references it compiles against are pinned and checked before use, the default shell is chosen per platform, and a fresh clone builds with nothing else installed.
-* Emoji, CJK and other wide glyphs drawn through the same fallback, with Noto Sans Symbols 2 and an optional monochrome Noto Emoji you drop in yourself.
 
 ## [0.3.0] — Released 2026-09-20
 

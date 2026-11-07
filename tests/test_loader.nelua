@@ -255,4 +255,9 @@ assert(fns.command('reload-core') == 0 and logged('ghostty core active') == 8, '
 fns.frame()
 fns.shutdown()
 dlclose(lib)
+-- -P nogc: the log lines and the last status are this test's to free
+st:destroy()
+core_bytes:destroy()
+for i = 0, < #lines do lines[i]:destroy() end
+lines:destroy()
 print('loader OK')

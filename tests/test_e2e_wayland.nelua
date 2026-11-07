@@ -118,7 +118,7 @@ local function write_ppm(path: string): void
     end
     f:write(string{data=(@*[0]byte)(&row[0]), size=#row})
   end
-  f:close()
+  f:destroy()
 end
 
 client:connect(os.now())
@@ -198,7 +198,7 @@ local function clip_now(): string
   local f = io.open(clipfile, 'rb')
   if not f:isopen() then return (@string){} end
   local t = f:read('a')
-  f:close()
+  f:destroy()
   return t
 end
 if #clipfile > 0 then

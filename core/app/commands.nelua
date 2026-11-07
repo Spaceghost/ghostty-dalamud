@@ -194,6 +194,12 @@ local window_hint_shown = false -- `/term window pull|list|close` points at /win
 
 global function run_command(cmd: string): cint
   if cmd == 'phone reload' then return run_command('reload') end
+  if cmd == 'mousetrace' then
+    if imgui.GetTime == nilptr then return 4 end
+    terminal_mouse_trace_until = imgui.GetTime() + 60
+    terminal_mouse_trace_next = 0
+    return 0
+  end
   -- "verb arg...": verbs match whole words ("minimize" is not "min")
   local verb: string = cmd
   local arg: string

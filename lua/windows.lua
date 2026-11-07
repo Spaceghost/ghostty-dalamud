@@ -24,7 +24,16 @@ local M = {}
 M.agent = nil
 -- Largest frame the agent sends; bigger windows are scaled down there (by
 -- whole factors), so this bounds bandwidth and the plugin's memory per window.
-M.max_w, M.max_h = 1920, 1200
+--
+-- Keep it above the window's size times the compositor's scale, or the scale
+-- buys nothing. On Linux the agent renders apps at GHOSTTY_WAYLAND_SCALE
+-- (default 2) so text is crisp on a panel seen up close, which makes a
+-- 1600x1000 window 3200x2000 output pixels. A cap below that sends the agent's
+-- whole-factor downscale back over it: the 2x render is averaged away and the
+-- panel ends up blurrier than scale 1 would have been, which reads in game as
+-- a huge, soft UI. 3840x2400 leaves room for a 1920x1200 window at 2x.
+-- The core clamps each to 64..4096 (core/policy.nelua).
+M.max_w, M.max_h = 3840, 2400
 -- Frames per second at most; the agent sends nothing while a window is still.
 M.fps = 30
 -- World size: panel pixels per yalm, and a new window panel's width in panel

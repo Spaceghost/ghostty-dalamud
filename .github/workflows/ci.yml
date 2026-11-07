@@ -81,6 +81,11 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Notification fixture dependency
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ghostty-python"
+          "$RUNNER_TEMP/ghostty-python/bin/python" -m pip install dbus-next==0.2.3
+          echo "$RUNNER_TEMP/ghostty-python/bin" >> "$GITHUB_PATH"
       - run: python3 -m unittest discover -s tests -p 'test_*.py' -v
 
   # A branch of this repository is already built by its push; only pull requests

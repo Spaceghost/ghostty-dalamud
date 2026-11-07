@@ -131,6 +131,9 @@ adopted plugin windows (Mappy …) and the chat. What a keyboard palette lists.
   hidden by `window.hide` or `panel.minimize`; also a panel with no place yet).
 * `focused`: it has the keyboard: the focused world panel, or the dropdown's
   active tab while the dropdown is out and no world panel has it.
+* `workspace` (optional): `key`, `parent`, `source`, `group`, `label`, `depth`,
+  and RGB `colour` for Neovim workspace panes. Shared navigators use these cached
+  fields to preserve nesting and group identity. Reading them never opens a view.
 * `order` (pets only): the pet's place in the lineup, from 1 (the leftmost;
   `/term order`, the arrows on a pet's edges).
 

@@ -82,6 +82,8 @@ echo "--- test_defaults (shipped per-platform policy)"
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_defaults.lua
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_phone.lua
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_plate_placement.lua "$ROOT"
+echo "--- test_workspace (Neovim hierarchy and world grouping)"
+"$ROOT/vendor/nelua-lang/nelua-lua" tests/test_workspace.lua
 echo "--- test_world_spread (panels keeping off each other on screen)"
 "$ROOT/vendor/nelua-lang/nelua-lua" tests/test_world_spread.lua
 echo "--- test_motion (springs, bob and squash, pets keeping off walls, panels and characters)"
@@ -142,11 +144,14 @@ run test_session
 run test_procpipe
 run test_dualsense
 run test_selection
+run test_mouse
+run test_mouse_replay
 run test_bell "$ROOT"
 run test_rain "$ROOT"
 run test_policy "$ROOT"
 run test_world "$ROOT"
 run test_worldpanel "$ROOT"
+run test_workspace_hooks "$ROOT"
 run test_fullflight
 run test_worlddrag "$ROOT"
 run test_worldhud "$ROOT"
@@ -208,11 +213,14 @@ echo "--- test_agent"
 echo "testtoken123" > build/agent-token
 # a port per run, so test runs at the same time never share an agent
 PORT="${GHOSTTY_TEST_PORT:-$((20000 + $$ % 20000))}"
-"${SAN_PREFIX[@]}" "build/ghostty-agent$SAN_SUFFIX" --listen "127.0.0.1:$PORT" --token-file build/agent-token --clipboard-file build/agent-clipboard --windows off >build/agent.log 2>&1 &
+# a second --listen: the suite runs over that one, so it gets the whole protocol
+PORT2=$((PORT + 3))
+"${SAN_PREFIX[@]}" "build/ghostty-agent$SAN_SUFFIX" --listen "127.0.0.1:$PORT" --listen "127.0.0.1:$PORT2" --token-file build/agent-token --clipboard-file build/agent-clipboard --windows off >build/agent.log 2>&1 &
 AGENT=$!
 trap 'kill $AGENT 2>/dev/null || true' EXIT
 wait_port "$PORT" "$AGENT" || { cat build/agent.log; exit 1; }
-"${SAN_PREFIX[@]}" "$NCACHE"/test_agent "$PORT" testtoken123 "$AGENT"
+wait_port "$PORT2" "$AGENT" || { cat build/agent.log; exit 1; }
+"${SAN_PREFIX[@]}" "$NCACHE"/test_agent "$PORT2" testtoken123 "$AGENT"
 
 echo "--- test_wg_cli"
 # `ghostty-agent wg`, the QR code, Tailscale detection and the listen rule, on the agent just built

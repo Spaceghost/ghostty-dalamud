@@ -1,0 +1,38 @@
+-- Mouse-report ownership for ImGui terminal views. Only a press in the grid
+-- starts a reported gesture; its release belongs to that session even outside.
+global MouseReportState = @record{
+  buttons: integer,
+  col: integer, row: integer,
+  positioned: boolean,
+}
+global MouseReport = @record{ button: integer, action: integer }
+global MouseReportBatch = @record{ events: [7]MouseReport, count: integer }
+
+global function mouse_report_frame(state: *MouseReportState, col: integer, row: integer,
+    hovered: boolean, pressed: integer, down: integer, enabled: boolean): MouseReportBatch
+  local batch: MouseReportBatch
+  for button = 0, < 3 do
+    local bit = 1 << button
+    if (state.buttons & bit) ~= 0 and ((down & bit) == 0 or not enabled) then
+      batch.events[batch.count] = { button = button, action = 1 }
+      batch.count = batch.count + 1
+      state.buttons = state.buttons & ~bit
+    elseif enabled and hovered and (pressed & bit) ~= 0 and (state.buttons & bit) == 0 then
+      batch.events[batch.count] = { button = button, action = 0 }
+      batch.count = batch.count + 1
+      state.buttons = state.buttons | bit
+    end
+  end
+  if enabled and (hovered or state.buttons ~= 0) then
+    if batch.count == 0 and (not state.positioned or col ~= state.col or row ~= state.row) then
+      local button = 3 -- no held button: emitted only in any-motion mode
+      for b = 0, < 3 do if (state.buttons & (1 << b)) ~= 0 then button = b break end end
+      batch.events[batch.count] = { button = button, action = 2 }
+      batch.count = batch.count + 1
+    end
+    state.col, state.row, state.positioned = col, row, true
+  else
+    state.positioned = false
+  end
+  return batch
+end

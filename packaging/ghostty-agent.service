@@ -19,6 +19,10 @@ After=graphical-session.target
 
 [Service]
 Type=simple
+# A user unit starts with systemd's bare PATH, without the player's ~/.local/bin,
+# which is where pip, pipx and uv put `almanac`: /ask then ended with status 127
+# ("not found") while the same command worked in any shell.
+Environment=PATH=%h/.local/bin:%h/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin
 ExecStart=/usr/bin/ghostty-agent --listen 127.0.0.1:7777
 Restart=on-failure
 RestartSec=5

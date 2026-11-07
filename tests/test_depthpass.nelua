@@ -290,7 +290,7 @@ do
   assert(p.v[34] == 0.5 and p.v[35] == 0.5, 'depth rendered at half resolution: half a texel per pixel')
   assert(p.v[32] == 2560 and p.v[33] == 1440, 'viewport')
   assert(p.v[40] == 2560 and p.v[41] == 1440 and p.v[42] == 1280 and p.v[43] == 720, 'depth texture: allocated, then rendered size')
-  assert(math.abs(p.v[37] - 0.01) < 1e-6 and p.v[38] == 1, 'tolerance and edge width from lua/world.lua')
+  assert(math.abs(p.v[37] - 0.035) < 1e-6 and p.v[38] == 2, 'tolerance and edge width from lua/world.lua')
   -- every panel vertex is on the surface the shader intersects, at its depth
   local _, pl = policy_world_place(501, now, false)
   local want = pl.z - EYE_Z

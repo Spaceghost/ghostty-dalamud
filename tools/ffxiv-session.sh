@@ -77,13 +77,23 @@ do_start() {
   Start XIVLauncher by hand once, tick Auto-login, and log in. The credentials
   stay in your keyring; this script never sees them. Until then nothing can
   bring the game back unattended."
-    command -v flatpak >/dev/null || die 'no flatpak on PATH'
-    flatpak info "$XL_APP" >/dev/null 2>&1 || die "$XL_APP is not installed"
-    log "launching $XL_APP"
+    # xiv.nix's `xiv launch` (GPU choice, CPU pinning) when present; plain flatpak otherwise.
+    # systemd's user PATH often lacks the Nix profile, so look there too.
+    local -a launch
+    local xiv_bin
+    xiv_bin=$(command -v xiv || echo "$HOME/.nix-profile/bin/xiv")
+    if [[ -x "$xiv_bin" ]]; then
+      launch=("$xiv_bin" launch)
+    else
+      command -v flatpak >/dev/null || die 'no flatpak on PATH'
+      flatpak info "$XL_APP" >/dev/null 2>&1 || die "$XL_APP is not installed"
+      launch=(flatpak run "$XL_APP")
+    fi
+    log "launching: ${launch[*]}"
     # Detached and with its own log: a service must not die with this shell,
     # and a launch that fails silently is the thing that wastes an evening.
     mkdir -p "$XLCORE/logs"
-    setsid flatpak run "$XL_APP" >>"$XLCORE/logs/ffxiv-session.log" 2>&1 < /dev/null &
+    setsid "${launch[@]}" >>"$XLCORE/logs/ffxiv-session.log" 2>&1 < /dev/null &
   fi
 
   local waited=0

@@ -1,5 +1,3 @@
-# Ghostty for Dalamud
-
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="images/readme/hero-dark.png">
@@ -8,14 +6,17 @@
   </picture>
 </p>
 
-<img src="images/icon.png" width="96" height="96" align="right" alt="Ghostty icon">
+<h1 align="center">Ghostty</h1>
+
+<p align="center"><em>Eorzea is a terminal multiplexer: a Ghostty terminal living inside FINAL FANTASY XIV.</em></p>
 
 **Vote on what it does next: https://spacegho.st/mods/ffxiv/term/vote/**
 
-**Experimental developer preview.** This is an independent project, not an
-official Ghostty project. Acceptance into the official Dalamud plugin list has
-not been established. Host-side tests do not establish Windows, Wine, macOS,
-controller, or in-game compatibility. See [release readiness](docs/RELEASE_READINESS.md).
+This is an independent project, not an official Ghostty project. Acceptance
+into the official Dalamud plugin list has not been established. The changelog
+distinguishes features seen in game from those still awaiting verification; a
+stable release does not establish Windows, macOS, or controller compatibility. See
+[release readiness](docs/RELEASE_READINESS.md) for the evidence still needed.
 
 A [Ghostty](https://ghostty.org) terminal living inside Final Fantasy XIV, as
 a Dalamud plugin, so the game can double as a desktop. Press
@@ -393,6 +394,8 @@ The first start writes a token to `~/.config/ghostty-agent/token`, readable only
 by you; the plugin reads that same file, so there is nothing to configure when
 the game and the agent are on one machine. Other flags: `--token-file PATH`,
 `--clipboard-file PATH`, `--replay-bytes N`, `--term NAME`, `--windows NAME`.
+
+`--listen` can be given more than once: one agent, the same sessions and token on each address, e.g. `--listen 127.0.0.1:7777 --listen 100.x.y.z:7777` for the game on this machine plus your tailnet. Only the first is required to open at start; a later one that cannot open yet (Tailscale not up) is retried every 10 s. Linux and macOS only.
 
 When the game is on another machine, forward the port and copy the token over:
 `ssh -L 7777:127.0.0.1:7777 …`. The token authenticates the connection but the
@@ -777,6 +780,14 @@ the world. Inside a terminal: <kbd>ctrl</kbd>+<kbd>shift</kbd>+<kbd>c</kbd> /
 `copy_on_select`), <kbd>ctrl</kbd>+<kbd>shift</kbd>+<kbd>t</kbd> /
 <kbd>w</kbd> open and close tabs, <kbd>ctrl</kbd>+<kbd>tab</kbd> switches tabs,
 <kbd>ctrl</kbd>+<kbd>=</kbd> / <kbd>-</kbd> / <kbd>0</kbd> zoom.
+
+The dropdown and floating terminals forward clicks, releases and drags to apps
+that enable terminal mouse reporting, including Neovim tab buttons and panes.
+Hold <kbd>Shift</kbd> to select terminal text instead.
+After a reconnect that has lost mouse reporting, toggling Neovim's `mouse`
+option off and back on restores it in an existing session. Updated agents
+preserve these modes when replaying truncated output. `/term mousetrace` records
+one minute of mouse coordinates and report metadata in the plugin log.
 
 Every icon button, taskbar chip and setting explains itself in a tooltip
 after the pointer rests on it for a moment (world screens included). The
@@ -1337,3 +1348,8 @@ Named layouts can read canonical `pin` arguments from the optional field in `win
 SVG app icons are rendered by the existing host background icon job when a renderer is available. Cached icon names now include a fingerprint of the source path, nanosecond modification metadata (where supported), source size and raster size, so app updates and theme changes select a fresh PNG. Host coverage includes source identity, metadata changes and actual ImageMagick SVG rendering in tests/test_desktop_entries.nelua. The compositor-specific call site still needs compilation with matching libwlroots-0.20; Sized app-list requests now route through refresh IPC; arbitrary XivDesktop SVG-only icon routing remains unfinished.
 
 `tools/check-wayland-source.sh` analyzes the actual Wayland-enabled agent and generates C even on hosts without wlroots 0.20. This verifies the sized-icon callback and dispatch at the Nelua type level; it does not compile/link the native output or establish compositor runtime behavior. The current host has wlroots 0.19, so matching native integration remains outstanding.
+## Neovim world workspace
+
+Existing Neovim panes can be opened as separate live world terminals, with nested
+host tabs grouped by colour and proximity and a nameplate on every panel. See
+[setup and current boundaries](docs/NVIM_WORKSPACE.md).

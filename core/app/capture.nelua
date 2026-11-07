@@ -43,6 +43,16 @@ global CLIP_KIND_MP4: uint8 <comptime> = 1
 -- (docs/MEETINGS.md). It runs until it is stopped and writes no file.
 global CLIP_KIND_CAM: uint8 <comptime> = 2
 
+-- A shot too large for the gallery is offered as a downscaled copy beside it:
+-- the full-resolution PNG the player asked for always stays on disk, and only
+-- the copy that goes up is shrunk. The plugin does the shrinking because the
+-- site cannot: its worker checks image bytes without decoding a pixel.
+-- The first copy is bounded by SHOT_SHARE_MAX_SIDE; when that is still over
+-- the cap the bound halves, up to SHOT_SHARE_TRIES times.
+global SHOT_SHARE_MAX_BYTES: usize <comptime> = 8 * 1024 * 1024
+global SHOT_SHARE_MAX_SIDE: integer <comptime> = 2560
+global SHOT_SHARE_TRIES: integer <comptime> = 3
+
 -- Rows of PNG a frame may encode: about 48 KB of pixels, so the work per frame
 -- stays in the low milliseconds whatever the shot's width.
 local PNG_BYTES_PER_FRAME: integer <comptime> = 48 * 1024
@@ -66,7 +76,7 @@ local HUD_MAX_SECONDS: float64 <comptime> = 4.0
 ## }
 global CAPTURE_HUD_ADDONS: integer <comptime> = #[#HUD_ADDONS]#
 
-local ShotStage = @enum{ None = 0, Hiding, Arm, Wait, Encode }
+local ShotStage = @enum{ None = 0, Hiding, Arm, Wait, Encode, ShareScale, ShareEncode }
 
 local Shot = @record{
   stage: ShotStage,
@@ -76,6 +86,11 @@ local Shot = @record{
   settle: integer,        -- frames left before arming
   path: string,
   enc: PngEnc,
+  -- the downscaled copy offered when the full shot is over the gallery's cap
+  share_path: string,
+  share_side: integer,    -- the bound this attempt scales to
+  share_w: integer, share_h: integer,
+  tries: integer,
 }
 
 local ClipStage = @enum{ None = 0, Sizing, Opening, Running, Ending }
@@ -126,6 +141,9 @@ local hud_hidden: boolean = false
 local hud_at: float64 = 0
 -- reused between frames so a clip never allocates once it is running
 local clip_small: vector(uint8)
+-- the downscaled pixels of a shared shot; the encoder borrows them, so it
+-- outlives the stage that fills it
+local shot_small: vector(uint8)
 local clip_qoi: vector(uint8)
 
 -- Paths -----------------------------------------------------------------------
@@ -432,6 +450,19 @@ local function shot_fail(why: string): void
   shot_done(false, (@string){}, why)
   sayf(LOG_WARN, 'shot: %s', why)
   shot.path:destroy()
+  shot.share_path:destroy()
+  png_enc_destroy(&shot.enc)
+  shot = {}
+  capture_reset()
+end
+
+-- The full-resolution shot is already on disk and good; only the smaller copy
+-- for the gallery could not be made. Say so and stop, without failing the shot.
+local function shot_share_give_up(why: string): void
+  sayf(LOG_WARN, 'shot: saved %s, but it is not going to the gallery: %s', shot.path, why)
+  shot_done(true, shot.path, (@string){}) -- the shot itself is good
+  shot.path:destroy()
+  shot.share_path:destroy()
   png_enc_destroy(&shot.enc)
   shot = {}
   capture_reset()
@@ -474,20 +505,84 @@ local function shot_tick(now: float64): void
     if rows > 64 then rows = 64 end
     if not png_step(&shot.enc, rows) then return end
     local written = write_bytes(shot.path, &shot.enc.out)
-    local bytes = #shot.enc.out
+    local bytes = (@usize)(#shot.enc.out)
     png_enc_destroy(&shot.enc)
-    capture_reset() -- the pixels the encoder borrowed are free again
     if not written then
       shot_fail('the file could not be written into the screenshots folder')
+      return
+    end
+    sayf(LOG_INFO, 'shot: %dx%d, %d KB', (@integer)(capture.w), (@integer)(capture.h), bytes // 1024)
+    -- Over the gallery's cap and meant to be shared: keep the pixels and
+    -- encode a smaller copy of them; the file just written stays as it is.
+    if shot.share and bytes > SHOT_SHARE_MAX_BYTES then
+      shot.share_side = SHOT_SHARE_MAX_SIDE
+      shot.tries = 0
+      shot.stage = ShotStage.ShareScale
       return
     end
     local path = shot.path
     shot.path = (@string){}
     shot.stage = ShotStage.None
-    sayf(LOG_INFO, 'shot: %dx%d, %d KB', (@integer)(capture.w), (@integer)(capture.h), bytes // 1024)
+    capture_reset() -- the pixels the encoder borrowed are free again
     shot_done(true, path, (@string){})
     if shot.share then offer(path) end
     path:destroy()
+  end
+  if shot.stage == ShotStage.ShareScale then
+    local f, sw, sh = wincodec_downscale((@*[0]uint8)(&capture.pixels[0]),
+      (@usize)(capture.w) * 4, (@integer)(capture.w), (@integer)(capture.h),
+      shot.share_side, shot.share_side, &shot_small)
+    if f <= 1 then
+      -- already within the bound and still too large: nothing to shrink
+      shot_share_give_up('the shot is over the gallery\'s 8 MB and cannot be made smaller')
+      return
+    end
+    shot.share_w, shot.share_h = sw, sh
+    if #shot.share_path == 0 then
+      local dir = capture_dir()
+      defer dir:destroy() end
+      shot.share_path = shot_path(dir, '_share.png')
+    end
+    if not png_begin(&shot.enc, (@*[0]uint8)(&shot_small[0]), (@usize)(sw) * 4, sw, sh, true) then
+      shot_share_give_up('the smaller copy could not be encoded')
+      return
+    end
+    shot.stage = ShotStage.ShareEncode
+    return
+  end
+  if shot.stage == ShotStage.ShareEncode then
+    local rows = PNG_BYTES_PER_FRAME // math.max(1, shot.share_w * 3)
+    if rows < 2 then rows = 2 end
+    if rows > 64 then rows = 64 end
+    if not png_step(&shot.enc, rows) then return end
+    local bytes = (@usize)(#shot.enc.out)
+    local written = write_bytes(shot.share_path, &shot.enc.out)
+    png_enc_destroy(&shot.enc)
+    if not written then
+      shot_share_give_up('the smaller copy could not be written into the screenshots folder')
+      return
+    end
+    shot.tries = shot.tries + 1
+    if bytes > SHOT_SHARE_MAX_BYTES and shot.tries < SHOT_SHARE_TRIES then
+      shot.share_side = shot.share_side // 2
+      shot.stage = ShotStage.ShareScale
+      return
+    end
+    if bytes > SHOT_SHARE_MAX_BYTES then
+      shot_share_give_up('even the smallest copy it makes is over the gallery\'s 8 MB')
+      return
+    end
+    local path = shot.share_path
+    local full = shot.path
+    shot.share_path, shot.path = (@string){}, (@string){}
+    shot.stage = ShotStage.None
+    capture_reset()
+    sayf(LOG_INFO, 'shot: %s is over the gallery\'s 8 MB; offering a %dx%d copy, %d KB',
+      full, shot.share_w, shot.share_h, bytes // 1024)
+    shot_done(true, full, (@string){})
+    offer(path)
+    path:destroy()
+    full:destroy()
   end
 end
 
@@ -728,10 +823,12 @@ global function capture_app_shutdown(): void
   hud_restore()
   if clip.cid ~= 0 then host.local_agent.client:cend(clip.cid, true) end
   shot.path:destroy()
+  shot.share_path:destroy()
   png_enc_destroy(&shot.enc)
   shot = {}
   clip = {}
   clip_small:destroy()
+  shot_small:destroy()
   clip_qoi:destroy()
   capture_shutdown()
 end

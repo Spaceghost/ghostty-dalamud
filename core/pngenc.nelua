@@ -160,7 +160,11 @@ local function compress_to(e: *PngEnc, limit: usize): void
       local tries = 0
       local maxl = left
       if maxl > MAX_MATCH then maxl = MAX_MATCH end
-      while cand >= 0 and tries < MAX_CHAIN do
+      -- `best_len < maxl` is what keeps the quick reject below in bounds: with
+      -- a match already as long as the input left, `fl[p + best_len]` would be
+      -- the byte after `limit`, and on the last call that is the byte after the
+      -- filtered buffer itself. No candidate could beat that match either.
+      while cand >= 0 and tries < MAX_CHAIN and best_len < maxl do
         local dist = p - (@usize)(cand)
         if dist == 0 or dist > WSIZE then break end
         if best_len == 0 or fl[(@usize)(cand) + best_len] == fl[p + best_len] then

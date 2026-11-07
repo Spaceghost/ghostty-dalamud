@@ -1,0 +1,32 @@
+require 'agent.mouse_modes'
+require 'core.termview'
+require 'string'
+local modes: AgentMouseModes
+local function track(s: string) modes:feed((@*[0]uint8)(s.data), s.size) end
+local view: TermView
+assert(view:init(80, 24))
+local function replay(s: string) view:feed((@*[0]uint8)(s.data), s.size) end
+track('\27[?100') track('2;1006h')
+local on = modes:snapshot()
+replay('\27coutput whose startup sequence has been discarded') replay(on)
+assert(view:mouse_tracking())
+local out: [32]byte
+local n = view:mouse_bytes(0, 0, 40, 0, 0, &out)
+assert((@string){data=(@*[0]byte)(&out),size=(@usize)(n)} == '\27[<0;41;1M')
+on:destroy()
+-- Title/graphics payloads and malformed CSI cannot change input modes.
+track('\27]0;fake \27[?1002l\7\27Pfake \27[?1006l\27\\')
+track('\27P\7fake \27[?1002l\27\\\27[0;?1002l')
+track('\27[?1002;999999999999999999999l')
+assert(modes.mask == 20)
+track('\27[?1002;1006l')
+local off = modes:snapshot()
+replay('\27c\27[?1002;1006hstale tail') replay(off)
+assert(not view:mouse_tracking())
+off:destroy()
+track('\27[?9;1000;1003h')
+assert(modes.mask == 11)
+track('\27c')
+assert(modes.mask == 0)
+view:destroy()
+print('truncated replay preserves current mouse modes and explicit disables')

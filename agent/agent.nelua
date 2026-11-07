@@ -19,7 +19,7 @@
 -- (docs/NETLAB.md, NLCTL) is agent/netlab.nelua: a window published as a moq
 -- broadcast over iroh, subscribers to it, and their stats for the panel.
 --
--- Usage: ghostty-agent [--listen 127.0.0.1:7777] [--iroh] [--token-file PATH]
+-- Usage: ghostty-agent [--listen 127.0.0.1:7777 [--listen 100.x.y.z:7777]] [--iroh] [--token-file PATH]
 --                      [--clipboard-file PATH] [--replay-bytes N] [--term xterm-256color]
 --                      [--windows auto|off|test|wayland|portal|win32|mac]
 --                      [--wayland-socket NAME] [--xkb-layout LAYOUT] [--wayland-render-node PATH|auto|gpu|none]
@@ -47,6 +47,7 @@ require 'os'
 require 'arg'
 require 'math'
 require 'memory'
+require 'agent.mouse_modes'
 require 'core.sys.net'
 require 'core.protocol'
 require 'agent.logic'
@@ -141,6 +142,7 @@ local Session = @record{
   command: string,
   replay: vector(uint8),   -- ring buffer of recent output
   replay_head: usize,
+  mouse_modes: AgentMouseModes,
   total_out: uint64,       -- output bytes ever read (the ring holds the last #replay of them)
   inbuf: ByteQueue,        -- input the PTY could not take yet (a large paste)
   attached: vector(usize), -- client indexes
@@ -173,6 +175,10 @@ local Client = @record{
 
 local Agent = @record{
   listen_sock: NetSocket,
+  extra_specs: vector(string),     -- --listen given more than once: the 2nd and later
+  extra_socks: vector(NetSocket),  -- parallel to extra_specs; invalid until opened
+  extra_logged: vector(boolean),   -- a failure is logged once per address, not every retry
+  extra_retry: number,             -- os.now() of the next attempt at unopened ones
   clients: vector(Client),
   sessions: vector(Session),
   next_id: uint32,
@@ -238,6 +244,7 @@ local function find_session(id: uint32): *Session
 end
 
 local function session_append_replay(s: *Session, data: *[0]uint8, n: usize): void
+  s.mouse_modes:feed(data, n)
   s.total_out = s.total_out + n
   local cap = agent.replay_bytes
   if n == 0 or cap == 0 then return end
@@ -279,6 +286,13 @@ local function session_replay_to(s: *Session, c: *Client, has_fed: boolean, fed:
     proto.write_frame_id(&c.outq, PROTO_SDATA, s.id, (@*[0]uint8)(reset.data), reset.size)
   end
   if plan.count > 0 then send_replay_range(s, c, plan.start, plan.count) end
+  if plan.reset then
+    -- The ring may have discarded the app's initial mouse-mode negotiation.
+    -- Restore the actual current modes after replay, including explicit offs.
+    local modes = s.mouse_modes:snapshot()
+    proto.write_frame_id(&c.outq, PROTO_SDATA, s.id, (@*[0]uint8)(modes.data), modes.size)
+    modes:destroy()
+  end
 end
 
 -- Input for the PTY: what it cannot take now waits in `inbuf` (the main loop
@@ -998,6 +1012,57 @@ local function log_connection(c: NetSocket): void
   from:destroy()
 end
 
+-- The 2nd and later --listen addresses: the same agent, sessions and token on
+-- each (say loopback for the game here, the tailnet address for other
+-- machines). Unlike the first, one that cannot be opened is not fatal: a
+-- tailnet address does not exist until Tailscale is up, so it is retried
+-- every 10 s and logged once.
+local function open_extra_listens(insecure: boolean): void
+  local now = os.now()
+  if now < agent.extra_retry then return end
+  agent.extra_retry = now + 10
+  local ts: Tailscale
+  local detected = false
+  for k = 0, < #agent.extra_specs do
+    if not net.is_valid(agent.extra_socks[k]) then
+      if not detected then ts:detect() detected = true end
+      local spec = agent.extra_specs[k]
+      local host, port = agent_parse_hostport(spec)
+      local ok, why = listen_allowed(host, &ts)
+      if ok or insecure then
+        local sock = net.listen(host, port)
+        if net.is_valid(sock) then
+          agent.extra_socks[k] = sock
+          agent.extra_logged[k] = false
+          if not ok then log_parts('WARNING: listening on ', spec, ' in the clear (--allow-insecure-listen): ', why) end
+          log_parts('listening on ', spec, ' too')
+        elseif not agent.extra_logged[k] then
+          agent.extra_logged[k] = true
+          log_parts('cannot listen on ', spec, ' yet; retrying every 10 s')
+        end
+      elseif not agent.extra_logged[k] then
+        agent.extra_logged[k] = true
+        log_parts('not listening on ', spec, ': ', why, ' (retrying every 10 s; --allow-insecure-listen overrides)')
+      end
+      host:destroy()
+      why:destroy()
+    end
+  end
+  if detected then ts:destroy() end
+end
+
+local function accept_on(sock: NetSocket, insecure: boolean): void
+  local c = net.accept(sock)
+  while net.is_valid(c) do
+    -- No allowlist on the socket path: the token is the whole
+    -- authorisation there, as it was before grants existed.
+    if insecure then log_connection(c) end
+    local cl: Client = { sock = c, alive = true, caps = CAP_ALL }
+    agent.clients:push(cl)
+    c = net.accept(sock)
+  end
+end
+
 local function main(): integer
   agent_sys_init()
   if #arg >= 1 and arg[1] == 'wg' then -- `ghostty-agent wg ...` (agent/wg_cli.nelua)
@@ -1078,7 +1143,9 @@ local function main(): integer
   local i = 1
   while i <= #arg do
     local a = arg[i]
-    if a == '--listen' and i < #arg then listen_spec = arg[i+1] listen_given = true i = i + 1
+    if a == '--listen' and i < #arg then
+      if listen_given then agent.extra_specs:push(string.copy(arg[i+1])) else listen_spec = arg[i+1] end
+      listen_given = true i = i + 1
     elseif a == '--send-to-game' then send_to_game = true
     elseif a == '--open-url' and i < #arg then open_url = arg[i+1] has_open_url = true i = i + 1
     elseif a == '--wayland-browser' and i < #arg then browser = arg[i+1] i = i + 1
@@ -1150,6 +1217,18 @@ local function main(): integer
   end
   local pid = agent_pid()
   log_parts('listening on ', listen_spec, ' (pid ', pid, ')')
+  ## if ccinfo.is_windows then
+  if #agent.extra_specs > 0 then
+    log('one --listen on Windows; reach other addresses through the WireGuard or ssh -L')
+    return 2
+  end
+  ## else
+  for k = 0, < #agent.extra_specs do
+    agent.extra_socks:push(net.invalid())
+    agent.extra_logged:push(false)
+  end
+  open_extra_listens(insecure_listen)
+  ## end
   if iroh_on then
     ## if IROH_BUILT then
     local v = gi_abi_version()
@@ -1230,7 +1309,7 @@ local function main(): integer
     text:destroy()
     if ts.detected and (wg_mode == 'on' or peers) then
       local addr = ts:address()
-      log_parts('Tailscale detected (', ts.why, '): WireGuard not started. To reach this agent from another machine, listen on your tailnet address: --listen ',
+      log_parts('Tailscale detected (', ts.why, '): WireGuard not started. To reach this agent from another machine, add your tailnet address as a second --listen ',
           (#addr > 0 and addr or 'YOUR-TAILNET-ADDRESS'), ':', port, ' (or --wireguard always)')
       addr:destroy()
     elseif wg_mode == 'on' then
@@ -1350,6 +1429,11 @@ local function main(): integer
     local n: usize = 0
     fds[n] = { fd = net.socket_fd(agent.listen_sock), events = POLLIN }
     n = n + 1
+    for k = 0, < #agent.extra_socks do
+      if net.is_valid(agent.extra_socks[k]) and n < 512 then
+        fds[n] = { fd = net.socket_fd(agent.extra_socks[k]), events = POLLIN } n = n + 1
+      end
+    end
     for ci = 0, < #agent.clients do
       ## if IROH_BUILT then
       -- An iroh client has no fd of its own; the endpoint's one wakeup fd
@@ -1419,15 +1503,11 @@ local function main(): integer
     poll(&fds, n, windows_cap(250))
     ## end
 
-    local c = net.accept(agent.listen_sock)
-    while net.is_valid(c) do
-      -- No allowlist on the socket path: the token is the whole
-      -- authorisation there, as it was before grants existed.
-      if insecure_listen then log_connection(c) end
-      local cl: Client = { sock = c, alive = true, caps = CAP_ALL }
-      agent.clients:push(cl)
-      c = net.accept(agent.listen_sock)
+    accept_on(agent.listen_sock, insecure_listen)
+    for k = 0, < #agent.extra_socks do
+      if net.is_valid(agent.extra_socks[k]) then accept_on(agent.extra_socks[k], insecure_listen) end
     end
+    if #agent.extra_socks > 0 then open_extra_listens(insecure_listen) end
     wg:pump(os.now())
     for ci = 0, < #agent.clients do pump_client(ci) end
     for si = 0, < #agent.sessions do pump_session(si) end
@@ -1453,6 +1533,9 @@ local function main(): integer
     gi_shutdown()
   end
   ## end
+  for k = 0, < #agent.extra_socks do
+    if net.is_valid(agent.extra_socks[k]) then net.close(agent.extra_socks[k]) end
+  end
   wg:stop() -- keys wiped, forwards closed
   netlab:destroy() -- its endpoints close, so peers see the connections end
   jobs:shutdown() -- jobs are not orphaned behind the agent, kept or not
