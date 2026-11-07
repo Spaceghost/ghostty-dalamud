@@ -142,7 +142,12 @@ do
   local s = host.sessions[0]
   s.awaiting_open = false -- as if the agent had OPENED it
   s.agent_id = 4242
-  host.local_agent.client.state = AgentState.Ready -- frames are only queued on a live connection
+  -- Keep this fake transport outside agent_setup, which replaces the real
+  -- client on a committed reload. Inspect the session's teardown frames.
+  local transport: AgentClient
+  transport:init('127.0.0.1', 0, '')
+  transport.state = AgentState.Ready
+  s.agent = &transport
   host.world_full_id, host.drag.id, host.cam_saved_d = s.id, s.id, 3
   host.walk.id, host.anim_out = s.id, true
   host.layout_restored = false -- no LISTR yet: what is on screen is not the saved layout
@@ -150,18 +155,18 @@ do
   local good_dir, good_install = host.dir, boot.install_dir
   host.dir = string.copy('build/test-scratch/no-such-config')
   boot.install_dir = string.copy('build/test-scratch/no-such-config')
-  local before = host.local_agent.client.outq:len()
+  local before = transport.outq:len()
   assert(gu_command('reload') == 2, 'reload without lua/init.lua fails')
-  assert(host.local_agent.client.outq:len() == before and #host.sessions > 0, 'rejected reload keeps sessions attached')
+  assert(transport.outq:len() == before and #host.sessions > 0, 'rejected reload keeps sessions attached')
   assert(host.world_full_id == s.id and host.drag.id == s.id and host.walk.id == s.id and host.anim_out, 'rejected reload keeps the active UI')
   assert(not state_saved(), 'rejected reload writes no layout')
   host.dir:destroy() boot.install_dir:destroy()
   host.dir, boot.install_dir = good_dir, good_install
   assert(gu_command('reload') == 0, 'valid reload commits')
   local detached, closed = 0, 0
-  local p = host.local_agent.client.outq:peek()
+  local p = transport.outq:peek()
   local pos: usize = before
-  while pos + 9 <= host.local_agent.client.outq:len() do
+  while pos + 9 <= transport.outq:len() do
     local typ = p[pos]
     local len = proto.get_u32((@*[0]uint8)(&p[pos + 1]))
     if len == 4 and proto.get_u32((@*[0]uint8)(&p[pos + 5])) == 4242 then
@@ -175,7 +180,7 @@ do
   assert(host.world_full_id == 0 and host.drag.id == 0 and host.cam_restore, 'full screen, drag and camera released')
   assert(host.walk.id == 0 and not host.anim_out, 'walk and animation released')
   assert(not state_saved(), 'reload before LISTR saves no layout')
-  host.local_agent.client.state = AgentState.Disconnected -- nothing behind it
+  transport:destroy()
 end
 -- Once LISTR restored the layout, an accepted reload saves it first. Rejected
 -- reloads leave it intact; committed reloads await LISTR before saving again.
