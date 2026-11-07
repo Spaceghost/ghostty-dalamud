@@ -96,12 +96,12 @@ do
   assert(fs_mkdir((@cstring)(base.data)) and fs_mkdir((@cstring)(config.data)))
   local lua_dir = keep(config .. '/lua')
   assert(fs_mkdir((@cstring)(lua_dir.data)))
-  write(keep(config .. '/lua/world.lua'), "return 'config world'\n")
+  write(keep(config .. '/lua/world.lua'), "local w = dofile(GHOSTTY_INSTALL_DIR .. '/lua/world.lua'); w.config_probe = 'config world'; return w\n")
   write(keep(config .. '/lua/init.lua'), [[
 local keymap = require('keymap') -- only shipped: found beside the plugin
 return {
   toggle_key = 'f12',
-  probe_world = require('world'), -- the config copy shadows the shipped module
+  probe_world = require('world').config_probe, -- the config copy shadows the shipped module
   plugin_dir = GHOSTTY_PLUGIN_DIR,
   on_key = keymap.on_key,
   profiles = { { name = 'probe', command = 'true' } },

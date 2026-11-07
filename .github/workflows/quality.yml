@@ -51,7 +51,7 @@ jobs:
       - name: Install the tools the checks use
         run: |
           sudo apt-get update -q
-          sudo apt-get install -y -q shellcheck lua-check valgrind clang
+          sudo apt-get install -y -q shellcheck lua-check valgrind clang python3-dbus-next
           tools/ci/fetch-tool.sh actionlint
           tools/ci/fetch-tool.sh gitleaks
           echo "$HOME/.local/bin" >>"$GITHUB_PATH"

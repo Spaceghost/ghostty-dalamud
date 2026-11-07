@@ -92,6 +92,11 @@ jobs:
             build/zig-cache-win
           key: zig-build-${{ runner.os }}-${{ runner.arch }}-${{ runner.environment }}-${{ hashFiles('toolchain.env') }}
 
+      - name: Notification fixture dependency
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ghostty-python"
+          "$RUNNER_TEMP/ghostty-python/bin/python" -m pip install dbus-next==0.2.3
+          echo "$RUNNER_TEMP/ghostty-python/bin" >> "$GITHUB_PATH"
       - name: Test, build and package
         env:
           RELEASE_TAG: ${{ env.TAG }}

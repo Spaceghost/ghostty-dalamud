@@ -29,6 +29,11 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
+      - name: Notification fixture dependency
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ghostty-python"
+          "$RUNNER_TEMP/ghostty-python/bin/python" -m pip install dbus-next==0.2.3
+          echo "$RUNNER_TEMP/ghostty-python/bin" >> "$GITHUB_PATH"
       - run: python3 -m unittest discover -s tests -p 'test_*.py' -v
       - run: for script in tools/*.sh tests/run.sh; do bash -n "$script"; done
   candidate:
@@ -73,6 +78,11 @@ jobs:
           with open(os.environ['GITHUB_PATH'], 'a') as output:
               output.write(str(binary.parent) + '\n')
           PY
+      - name: Notification fixture dependency
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ghostty-python"
+          "$RUNNER_TEMP/ghostty-python/bin/python" -m pip install dbus-next==0.2.3
+          echo "$RUNNER_TEMP/ghostty-python/bin" >> "$GITHUB_PATH"
       - name: Build, host-test and validate the candidate
         run: tools/build-release.sh
       - name: Retain candidate and generated restore evidence
