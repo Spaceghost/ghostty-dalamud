@@ -374,6 +374,10 @@ do
   policy.world_toggle_ctrl, policy.world_toggle_shift, policy.world_toggle_alt = false, false, false
   local s = new(@Session)
   local ctx: ActionCtx = { s = s, in_dropdown = true }
+  -- This block tests the legacy terminal surface. The new phone shell owns
+  -- the same toggle chord when enabled, so select the fallback explicitly.
+  local saved_phone = policy_phone_call('state', '', 0, false)
+  policy_phone_call('command', 'off', 0, false)
   host.dropdown_open = false
   host.frame = 1
   chord_io.KeyCtrl, chord_io.KeyAlt = true, false
@@ -392,6 +396,9 @@ do
   assert(key_action(&ctx, 'grave', nilptr) and not host.world_visible, 'ctrl+shift+` toggles the world terminals')
   host.world:clear()
   host.dropdown_open = false
+  if saved_phone > 0 then
+    policy_phone_call('command', saved_phone == 2 and 'open' or 'on', 0, false)
+  end
   imgui.GetIO = nilptr
   delete(s)
   print('toggle chords OK')
