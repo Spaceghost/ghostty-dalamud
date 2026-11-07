@@ -5,7 +5,7 @@ require 'string'
 for i = 1, 3 do
   assert(policy_load('.'))
   local top = lua_gettop(policy.L)
-  assert(policy_phone_call('frame', '', 0, false) == 1)
+  assert(policy_phone_call('frame', '', 0, false) == 0, 'phone layout starts disabled')
   assert(policy_phone_call('command', 'open', 0, false) == 0)
   -- Disable game pose calls: this test embeds no game services.
   assert(luaL_loadstring(policy.L, 'CONFIG.phone.pose = false') == LUA_OK)

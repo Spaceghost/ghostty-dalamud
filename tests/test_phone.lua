@@ -10,7 +10,8 @@ local A = { enabled = false, style = 'desk', preset = 'book', custom_timeline = 
   on_frame = function() calls.frames = calls.frames + 1 end }
 P.bind(W, A)
 assert(not P.enabled and P.frame(0, false) == 0, 'phone layout is opt-in and cannot hide existing world panels at startup')
-P.command('on')
+P.command('open')
+P.command('close')
 assert(P.enabled and P.frame(0,false)==1, 'explicit enabling starts the phone put away')
 P.command('off')
 assert(P.frame(0, false) == 0)

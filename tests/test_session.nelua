@@ -397,7 +397,8 @@ do
   host.world:clear()
   host.dropdown_open = false
   if saved_phone > 0 then
-    policy_phone_call('command', saved_phone == 2 and 'open' or 'on', 0, false)
+    policy_phone_call('command', 'open', 0, false)
+    if saved_phone == 1 then policy_phone_call('command', 'close', 0, false) end
   end
   imgui.GetIO = nilptr
   delete(s)
