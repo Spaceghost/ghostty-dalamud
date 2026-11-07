@@ -2,7 +2,7 @@
 -- module owns when the device is out and where its projections appear.
 -- A closed phone keeps its panels alive, but projects nothing.
 local M = {
-  enabled = true, opened = false, progress = 0,
+  enabled = false, opened = false, progress = 0,
   duration = 0.32, distance = 2.2, height = 1.65,
   columns = 3, gap = 0.18, pixels_per_yalm = 900,
   pose = true, reduce_motion = false,

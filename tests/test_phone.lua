@@ -9,7 +9,9 @@ local A = { enabled = false, style = 'desk', preset = 'book', custom_timeline = 
   on_toggle = function(v) calls[v and 'out' or 'away'] = calls[v and 'out' or 'away'] + 1 end,
   on_frame = function() calls.frames = calls.frames + 1 end }
 P.bind(W, A)
-assert(P.enabled and P.frame(0, false) == 1, 'the phone starts put away')
+assert(not P.enabled and P.frame(0, false) == 0, 'phone layout is opt-in and cannot hide existing world panels at startup')
+P.command('on')
+assert(P.enabled and P.frame(0,false)==1, 'explicit enabling starts the phone put away')
 P.command('off')
 assert(P.frame(0, false) == 0)
 assert(P.toggle_if_enabled() == 0)
